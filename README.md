@@ -3,7 +3,7 @@ Nexus Terminal is a unified SSH + Serial command center for VS Code with a stabi
 SSH runs in-process, while Serial runs in an isolated sidecar process.
 
 ## MVP Status
-- Implemented: core architecture, Command Center TreeView, Tunnel Patch Bay with drag/drop, Silent Auth, isolated tunnel forwarding, serial sidecar IPC, terminal/tunnel logging, unit + integration tests.
+- Implemented: core architecture, Command Center TreeView, Tunnel Patch Bay with drag/drop, dedicated Tunnel Monitor panel, Silent Auth, isolated tunnel forwarding, serial sidecar IPC + serial terminals, terminal/tunnel logging, unit + integration tests.
 - Remaining (intentional MVP gap): full serial terminal session UX, deep traffic panel visuals, and browser-host parity.
 
 ## Quick Start

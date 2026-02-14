@@ -14,6 +14,7 @@ import { TunnelManager } from "./services/tunnel/tunnelManager";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { NexusTreeProvider, ServerTreeItem } from "./ui/nexusTreeProvider";
 import { promptServerConfig, promptTunnelProfile } from "./ui/prompts";
+import { TunnelMonitorViewProvider } from "./ui/tunnelMonitorView";
 import { TunnelTreeItem, TunnelTreeProvider } from "./ui/tunnelTreeProvider";
 
 type ServerTerminalMap = Map<string, Set<vscode.Terminal>>;
@@ -229,6 +230,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await startTunnel(core, tunnelManager, profile, server);
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
+  const tunnelMonitorProvider = new TunnelMonitorViewProvider();
+  const tunnelMonitorRegistration = vscode.window.registerWebviewViewProvider(
+    TunnelMonitorViewProvider.viewType,
+    tunnelMonitorProvider
+  );
 
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
     treeDataProvider: nexusTreeProvider,
@@ -245,6 +251,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const snapshot = core.getSnapshot();
     nexusTreeProvider.setSnapshot(snapshot);
     tunnelTreeProvider.setSnapshot(snapshot);
+    tunnelMonitorProvider.setSnapshot(snapshot);
   };
   syncViews();
 
@@ -488,6 +495,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     commandCenterView,
     tunnelView,
+    tunnelMonitorRegistration,
     refreshCommand,
     addServerCommand,
     removeServerCommand,

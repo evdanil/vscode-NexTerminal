@@ -54,6 +54,7 @@ Design principle: reliability over resource sharing.
 3. Drag tunnel from **Tunnel Patch Bay** onto a server in **Command Center**.
 4. Tunnel starts as local listener and forwards to remote destination.
 5. Active tunnels show traffic counters (bytes in/out).
+6. **Tunnel Monitor** panel shows live route, server, counters, and start time.
 
 ### 4.5 Serial Sidecar
 1. Run `Nexus: List Serial Ports`.
@@ -67,6 +68,7 @@ Design principle: reliability over resource sharing.
 ### 5.1 Views
 - `nexusCommandCenter`: servers and active sessions.
 - `nexusTunnels`: tunnel profiles and active traffic state.
+- `nexusTunnelMonitor`: dedicated traffic/status panel for active tunnels.
 
 ### 5.2 Commands
 - `nexus.refresh`
@@ -104,11 +106,11 @@ Implemented (~90% target):
 - Nexus core state manager.
 - Silent Auth workflow with secret invalidation + save/retry.
 - Tunnel Patch Bay model with drag/drop start.
+- Dedicated Tunnel Monitor sidebar panel for active tunnel traffic/status.
 - Dedicated terminal/tunnel connection model.
 - Interactive serial terminal sessions through sidecar-managed ports.
 - Logging for terminal/tunnel events.
 - Build/test/packaging scripts.
 
 Deferred (~10%):
-- Dedicated advanced tunnel analytics panel beyond tree descriptions.
 - Full browser-host feature parity for Node-dependent runtime features.

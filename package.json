@@ -17,6 +17,7 @@
     "onStartupFinished",
     "onView:nexusCommandCenter",
     "onView:nexusTunnels",
+    "onView:nexusTunnelMonitor",
     "onCommand:nexus.server.add",
     "onCommand:nexus.server.connect",
     "onCommand:nexus.serial.connect"
@@ -40,6 +41,11 @@
         {
           "id": "nexusTunnels",
           "name": "Tunnel Patch Bay"
+        },
+        {
+          "id": "nexusTunnelMonitor",
+          "name": "Tunnel Monitor",
+          "type": "webview"
         }
       ]
     },
