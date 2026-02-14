@@ -55,6 +55,7 @@ Design principle: reliability over resource sharing.
 4. Tunnel starts as local listener and forwards to remote destination.
 5. Active tunnels show traffic counters (bytes in/out).
 6. **Tunnel Monitor** panel shows live route, server, counters, and start time.
+7. Connection mode can be profile-based: `isolated`, `shared`, or `ask every start`.
 
 ### 4.5 Serial Sidecar
 1. Run `Nexus: List Serial Ports`.
@@ -62,6 +63,14 @@ Design principle: reliability over resource sharing.
 3. Sidecar returns ports (empty when `serialport` module is unavailable).
 4. Run `Nexus: Connect Serial Port` to open an interactive serial terminal.
 5. Use `Nexus: Disconnect Serial Session` to close an active serial terminal session.
+
+### 4.6 Logging and Rotation
+1. Terminal and tunnel logs are enabled automatically.
+2. Each log file rotates when it reaches configured max size.
+3. Rotation defaults: `10MB` file size and `1` rotated file.
+4. Settings:
+   - `nexus.logging.maxFileSizeMb`
+   - `nexus.logging.maxRotatedFiles` (`0-99`)
 
 ## 5. Commands and Views
 

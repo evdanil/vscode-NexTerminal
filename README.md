@@ -29,5 +29,10 @@ npm run package:vsix
 - `Nexus: Disconnect Serial Session`
 - `Nexus: List Serial Ports`
 
+## Key Settings
+- `nexus.logging.maxFileSizeMb` (default `10`)
+- `nexus.logging.maxRotatedFiles` (default `1`, range `0-99`)
+- `nexus.tunnel.defaultConnectionMode` (`isolated` or `shared`)
+
 ## Documentation
 - Functional documentation: `docs/functional-documentation.md`

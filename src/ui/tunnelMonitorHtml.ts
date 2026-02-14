@@ -31,6 +31,7 @@ export function renderTunnelMonitorHtml(snapshot: SessionSnapshot): string {
   <td>${escapeHtml(name)}</td>
   <td>${escapeHtml(serverName)}</td>
   <td>${escapeHtml(`${active.localPort} -> ${active.remoteIP}:${active.remotePort}`)}</td>
+  <td>${escapeHtml(active.connectionMode)}</td>
   <td>${escapeHtml(formatBytes(active.bytesIn))}</td>
   <td>${escapeHtml(formatBytes(active.bytesOut))}</td>
   <td>${escapeHtml(startedAt)}</td>
@@ -46,6 +47,7 @@ export function renderTunnelMonitorHtml(snapshot: SessionSnapshot): string {
       <th>Tunnel</th>
       <th>Server</th>
       <th>Route</th>
+      <th>Mode</th>
       <th>Inbound</th>
       <th>Outbound</th>
       <th>Started</th>

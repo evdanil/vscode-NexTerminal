@@ -1,4 +1,6 @@
 export type AuthType = "password" | "key" | "agent";
+export type TunnelConnectionMode = "isolated" | "shared" | "ask";
+export type ResolvedTunnelConnectionMode = Exclude<TunnelConnectionMode, "ask">;
 
 export interface ServerConfig {
   id: string;
@@ -20,6 +22,7 @@ export interface TunnelProfile {
   remotePort: number;
   defaultServerId?: string;
   autoStart: boolean;
+  connectionMode?: TunnelConnectionMode;
 }
 
 export interface ActiveSession {
@@ -39,4 +42,5 @@ export interface ActiveTunnel {
   startedAt: number;
   bytesIn: number;
   bytesOut: number;
+  connectionMode: ResolvedTunnelConnectionMode;
 }

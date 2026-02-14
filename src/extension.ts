@@ -2,7 +2,12 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory } from "./logging/terminalLogger";
-import type { ServerConfig, TunnelProfile } from "./models/config";
+import type {
+  ResolvedTunnelConnectionMode,
+  ServerConfig,
+  TunnelConnectionMode,
+  TunnelProfile
+} from "./models/config";
 import { SerialPty } from "./services/serial/serialPty";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
 import { SilentAuthSshFactory } from "./services/ssh/silentAuth";
@@ -24,6 +29,10 @@ let tunnelManagerRef: TunnelManager | undefined;
 let serialSidecarRef: SerialSidecarManager | undefined;
 let terminalsByServerRef: ServerTerminalMap | undefined;
 let serialTerminalsRef: SerialTerminalMap | undefined;
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
 
 async function pickServer(core: NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -92,6 +101,37 @@ async function promptBaudRate(defaultValue = 115200): Promise<number | undefined
     return undefined;
   }
   return Number(baudInput);
+}
+
+function getDefaultTunnelConnectionMode(): ResolvedTunnelConnectionMode {
+  const configured = vscode.workspace
+    .getConfiguration("nexus.tunnel")
+    .get<ResolvedTunnelConnectionMode>("defaultConnectionMode", "isolated");
+  return configured === "shared" ? "shared" : "isolated";
+}
+
+async function resolveTunnelConnectionMode(
+  profile: TunnelProfile,
+  interactive: boolean
+): Promise<ResolvedTunnelConnectionMode | undefined> {
+  const profileMode: TunnelConnectionMode = profile.connectionMode ?? getDefaultTunnelConnectionMode();
+  if (profileMode !== "ask") {
+    return profileMode;
+  }
+  if (!interactive) {
+    return getDefaultTunnelConnectionMode();
+  }
+  const pick = await vscode.window.showQuickPick(
+    [
+      { label: "Isolated per connection", value: "isolated" as ResolvedTunnelConnectionMode },
+      { label: "Shared SSH connection", value: "shared" as ResolvedTunnelConnectionMode }
+    ],
+    {
+      title: `Tunnel mode for "${profile.name}"`,
+      canPickMany: false
+    }
+  );
+  return pick?.value;
 }
 
 function getConnectedServerIds(core: NexusCore): string[] {
@@ -166,13 +206,14 @@ async function startTunnel(
   core: NexusCore,
   tunnelManager: TunnelManager,
   profile: TunnelProfile,
-  server: ServerConfig
+  server: ServerConfig,
+  connectionMode: ResolvedTunnelConnectionMode
 ): Promise<void> {
   if (!core.isServerConnected(server.id)) {
     vscode.window.showWarningMessage(`Server "${server.name}" is not connected. Open a session first.`);
     return;
   }
-  await tunnelManager.start(profile, server);
+  await tunnelManager.start(profile, server, { connectionMode });
 }
 
 async function stopTunnelByProfile(core: NexusCore, tunnelManager: TunnelManager, profileId: string): Promise<void> {
@@ -208,7 +249,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const core = new NexusCore(repository);
   await core.initialize();
 
-  const loggerFactory = new TerminalLoggerFactory(path.join(context.globalStorageUri.fsPath, "logs"));
+  const loggingConfig = vscode.workspace.getConfiguration("nexus.logging");
+  const maxFileSizeMb = clamp(Math.floor(loggingConfig.get<number>("maxFileSizeMb", 10)), 1, 1024);
+  const maxRotatedFiles = clamp(Math.floor(loggingConfig.get<number>("maxRotatedFiles", 1)), 0, 99);
+  const loggerFactory = new TerminalLoggerFactory(path.join(context.globalStorageUri.fsPath, "logs"), {
+    maxFileSizeBytes: maxFileSizeMb * 1024 * 1024,
+    maxRotatedFiles
+  });
   const sshFactory = new SilentAuthSshFactory(new Ssh2Connector(), new VscodeSecretVault(context), new VscodePasswordPrompt());
   const tunnelManager = new TunnelManager(sshFactory);
   const sidecarPath = path.join(__dirname, "services", "serial", "serialSidecarWorker.js");
@@ -227,7 +274,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (!profile || !server) {
       return;
     }
-    await startTunnel(core, tunnelManager, profile, server);
+    const connectionMode = await resolveTunnelConnectionMode(profile, true);
+    if (!connectionMode) {
+      return;
+    }
+    await startTunnel(core, tunnelManager, profile, server, connectionMode);
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
   const tunnelMonitorProvider = new TunnelMonitorViewProvider();
@@ -301,7 +352,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
           for (const tunnel of core.getSnapshot().tunnels) {
             if (tunnel.autoStart && tunnel.defaultServerId === server.id) {
-              void startTunnel(core, tunnelManager, tunnel, server);
+              const mode = tunnel.connectionMode === "shared" ? "shared" : getDefaultTunnelConnectionMode();
+              void startTunnel(core, tunnelManager, tunnel, server, mode);
             }
           }
         },
@@ -345,7 +397,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (!server) {
       return;
     }
-    await startTunnel(core, tunnelManager, profile, server);
+    const connectionMode = await resolveTunnelConnectionMode(profile, true);
+    if (!connectionMode) {
+      return;
+    }
+    await startTunnel(core, tunnelManager, profile, server, connectionMode);
   }
 
   async function stopTunnelCommand(arg?: unknown): Promise<void> {
@@ -390,7 +446,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (!server) {
       return;
     }
-    await disconnectServer(server);
+    await disconnectServer(server.id);
     await core.removeServer(server.id);
   });
 

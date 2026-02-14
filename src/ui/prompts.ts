@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 import * as vscode from "vscode";
-import type { AuthType, ServerConfig, TunnelProfile } from "../models/config";
+import type { AuthType, ServerConfig, TunnelConnectionMode, TunnelProfile } from "../models/config";
 
 async function requiredInput(title: string, prompt: string, value = "", password = false): Promise<string | undefined> {
   const result = await vscode.window.showInputBox({
@@ -112,6 +112,20 @@ export async function promptTunnelProfile(seed?: Partial<TunnelProfile>): Promis
   if (!autoStartPick) {
     return undefined;
   }
+  const connectionModePick = (await vscode.window.showQuickPick(
+    [
+      { label: "Isolated per connection (recommended)", value: "isolated" as TunnelConnectionMode },
+      { label: "Shared SSH connection", value: "shared" as TunnelConnectionMode },
+      { label: "Ask every start", value: "ask" as TunnelConnectionMode }
+    ],
+    {
+      title: "Tunnel connection mode",
+      canPickMany: false
+    }
+  ))?.value;
+  if (!connectionModePick) {
+    return undefined;
+  }
 
   return {
     id: seed?.id ?? uuidv4(),
@@ -120,6 +134,7 @@ export async function promptTunnelProfile(seed?: Partial<TunnelProfile>): Promis
     remoteIP,
     remotePort,
     defaultServerId: seed?.defaultServerId,
-    autoStart: autoStartPick === "Yes"
+    autoStart: autoStartPick === "Yes",
+    connectionMode: connectionModePick
   };
 }

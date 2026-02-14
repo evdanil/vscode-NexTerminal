@@ -1,6 +1,6 @@
 import * as net from "node:net";
 import { randomUUID } from "node:crypto";
-import type { ActiveTunnel, ServerConfig, TunnelProfile } from "../../models/config";
+import type { ActiveTunnel, ResolvedTunnelConnectionMode, ServerConfig, TunnelProfile } from "../../models/config";
 import type { SshConnection } from "../ssh/contracts";
 
 export interface TunnelSshFactory {
@@ -22,6 +22,8 @@ interface ActiveTunnelRuntime {
   listenerServer: net.Server;
   sockets: Set<net.Socket>;
   sshConnections: Set<SshConnection>;
+  sharedConnection?: SshConnection;
+  isStopping: boolean;
 }
 
 function listen(server: net.Server, port: number): Promise<void> {
@@ -56,7 +58,11 @@ export class TunnelManager {
     return this.activeByProfile.get(profileId);
   }
 
-  public async start(profile: TunnelProfile, serverConfig: ServerConfig): Promise<ActiveTunnel> {
+  public async start(
+    profile: TunnelProfile,
+    serverConfig: ServerConfig,
+    options?: { connectionMode?: ResolvedTunnelConnectionMode }
+  ): Promise<ActiveTunnel> {
     const existingActiveId = this.activeByProfile.get(profile.id);
     if (existingActiveId) {
       const runtime = this.activeTunnels.get(existingActiveId);
@@ -74,7 +80,8 @@ export class TunnelManager {
       remotePort: profile.remotePort,
       startedAt: Date.now(),
       bytesIn: 0,
-      bytesOut: 0
+      bytesOut: 0,
+      connectionMode: options?.connectionMode ?? "isolated"
     };
 
     const listenerServer = net.createServer((socket) => {
@@ -96,7 +103,8 @@ export class TunnelManager {
       serverConfig,
       listenerServer,
       sockets: new Set(),
-      sshConnections: new Set()
+      sshConnections: new Set(),
+      isStopping: false
     };
     this.activeTunnels.set(activeTunnel.id, runtime);
     this.activeByProfile.set(profile.id, activeTunnel.id);
@@ -109,6 +117,7 @@ export class TunnelManager {
     if (!runtime) {
       return;
     }
+    runtime.isStopping = true;
     this.activeByProfile.delete(runtime.profile.id);
     this.activeTunnels.delete(activeTunnelId);
 
@@ -118,6 +127,7 @@ export class TunnelManager {
     for (const sshConnection of runtime.sshConnections) {
       sshConnection.dispose();
     }
+    runtime.sharedConnection = undefined;
     await closeServer(runtime.listenerServer);
     this.emit({ type: "stopped", tunnelId: activeTunnelId });
   }
@@ -134,9 +144,17 @@ export class TunnelManager {
     }
     runtime.sockets.add(socket);
     let sshConnection: SshConnection | undefined;
+    let shouldDisposeConnection = true;
+    const useSharedConnection = runtime.active.connectionMode === "shared";
+    let cleaned = false;
     try {
-      sshConnection = await this.sshFactory.connect(runtime.serverConfig);
-      runtime.sshConnections.add(sshConnection);
+      if (useSharedConnection) {
+        sshConnection = await this.getOrCreateSharedConnection(runtime, activeTunnelId);
+        shouldDisposeConnection = false;
+      } else {
+        sshConnection = await this.sshFactory.connect(runtime.serverConfig);
+        runtime.sshConnections.add(sshConnection);
+      }
       const remoteStream = await sshConnection.openDirectTcp(runtime.profile.remoteIP, runtime.profile.remotePort);
 
       socket.on("data", (chunk: Buffer) => {
@@ -159,9 +177,15 @@ export class TunnelManager {
       });
 
       const cleanup = (): void => {
+        if (cleaned) {
+          return;
+        }
+        cleaned = true;
         runtime.sockets.delete(socket);
-        runtime.sshConnections.delete(sshConnection!);
-        sshConnection?.dispose();
+        if (shouldDisposeConnection && sshConnection) {
+          runtime.sshConnections.delete(sshConnection);
+          sshConnection.dispose();
+        }
       };
 
       socket.on("error", cleanup);
@@ -173,8 +197,13 @@ export class TunnelManager {
       remoteStream.pipe(socket);
     } catch (error) {
       runtime.sockets.delete(socket);
-      if (sshConnection) {
+      if (sshConnection && shouldDisposeConnection) {
         runtime.sshConnections.delete(sshConnection);
+      }
+      if (useSharedConnection && sshConnection && runtime.sharedConnection === sshConnection) {
+        runtime.sharedConnection = undefined;
+        runtime.sshConnections.delete(sshConnection);
+        sshConnection.dispose();
       }
       this.emit({
         type: "error",
@@ -183,8 +212,36 @@ export class TunnelManager {
         error
       });
       socket.destroy();
-      sshConnection?.dispose();
+      if (shouldDisposeConnection) {
+        sshConnection?.dispose();
+      }
     }
+  }
+
+  private async getOrCreateSharedConnection(
+    runtime: ActiveTunnelRuntime,
+    activeTunnelId: string
+  ): Promise<SshConnection> {
+    if (runtime.sharedConnection) {
+      return runtime.sharedConnection;
+    }
+    const sharedConnection = await this.sshFactory.connect(runtime.serverConfig);
+    runtime.sharedConnection = sharedConnection;
+    runtime.sshConnections.add(sharedConnection);
+    sharedConnection.onClose(() => {
+      runtime.sshConnections.delete(sharedConnection);
+      if (runtime.sharedConnection === sharedConnection) {
+        runtime.sharedConnection = undefined;
+      }
+      if (!runtime.isStopping && this.activeTunnels.has(activeTunnelId)) {
+        this.emit({
+          type: "error",
+          tunnelId: activeTunnelId,
+          message: `Shared SSH connection closed for tunnel ${runtime.profile.name}`
+        });
+      }
+    });
+    return sharedConnection;
   }
 
   private emit(event: TunnelEvent): void {

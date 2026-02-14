@@ -48,7 +48,8 @@ describe("renderTunnelMonitorHtml", () => {
           remotePort: 5432,
           startedAt: Date.now(),
           bytesIn: 1024,
-          bytesOut: 2048
+          bytesOut: 2048,
+          connectionMode: "isolated"
         }
       ]
     });
@@ -58,5 +59,6 @@ describe("renderTunnelMonitorHtml", () => {
     expect(html).toContain("Server &lt;A&gt;");
     expect(html).toContain("1.0 KB");
     expect(html).toContain("2.0 KB");
+    expect(html).toContain("isolated");
   });
 });

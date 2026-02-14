@@ -90,7 +90,8 @@ describe("NexusCore", () => {
       remotePort: 6379,
       startedAt: Date.now(),
       bytesIn: 0,
-      bytesOut: 0
+      bytesOut: 0,
+      connectionMode: "isolated"
     });
     core.updateTunnelTraffic("active-1", 128, 256);
 

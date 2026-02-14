@@ -151,4 +151,42 @@ describe("TunnelManager integration", () => {
     await manager.stop(activeTunnel.id);
     expect(events.some((event) => event.type === "stopped")).toBe(true);
   });
+
+  it("reuses one SSH connection in shared mode", async () => {
+    const remotePort = await getFreePort();
+    echoServer = await startEchoServer(remotePort);
+    const localPort = await getFreePort();
+
+    const profile: TunnelProfile = {
+      id: "tunnel-shared",
+      name: "Shared Tunnel",
+      localPort,
+      remoteIP: "127.0.0.1",
+      remotePort,
+      autoStart: false,
+      connectionMode: "shared"
+    };
+    const server: ServerConfig = {
+      id: "server-shared",
+      name: "Server Shared",
+      host: "127.0.0.1",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      isHidden: false
+    };
+
+    const sshFactory = new DirectTcpSshFactory();
+    manager = new TunnelManager(sshFactory);
+    const activeTunnel = await manager.start(profile, server, { connectionMode: "shared" });
+
+    const first = await exchangeMessage(localPort, "alpha");
+    const second = await exchangeMessage(localPort, "beta");
+
+    expect(first).toBe("alpha");
+    expect(second).toBe("beta");
+    expect(sshFactory.connectCount).toBe(1);
+
+    await manager.stop(activeTunnel.id);
+  });
 });
