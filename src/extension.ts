@@ -2,7 +2,8 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory } from "./logging/terminalLogger";
-import type { ActiveTunnel, ServerConfig, TunnelProfile } from "./models/config";
+import type { ServerConfig, TunnelProfile } from "./models/config";
+import { SerialPty } from "./services/serial/serialPty";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
 import { SilentAuthSshFactory } from "./services/ssh/silentAuth";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
@@ -16,10 +17,12 @@ import { promptServerConfig, promptTunnelProfile } from "./ui/prompts";
 import { TunnelTreeItem, TunnelTreeProvider } from "./ui/tunnelTreeProvider";
 
 type ServerTerminalMap = Map<string, Set<vscode.Terminal>>;
+type SerialTerminalMap = Map<string, vscode.Terminal>;
 
 let tunnelManagerRef: TunnelManager | undefined;
 let serialSidecarRef: SerialSidecarManager | undefined;
 let terminalsByServerRef: ServerTerminalMap | undefined;
+let serialTerminalsRef: SerialTerminalMap | undefined;
 
 async function pickServer(core: NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -53,6 +56,41 @@ async function pickTunnel(core: NexusCore): Promise<TunnelProfile | undefined> {
     { title: "Select Tunnel Profile" }
   );
   return pick?.profile;
+}
+
+async function pickSerialPort(serialSidecar: SerialSidecarManager): Promise<string | undefined> {
+  const ports = await serialSidecar.listPorts();
+  if (ports.length === 0) {
+    vscode.window.showInformationMessage("No serial ports found (or serial module unavailable).");
+    return undefined;
+  }
+  const pick = await vscode.window.showQuickPick(
+    ports.map((port) => ({
+      label: port.path,
+      description: port.manufacturer ?? ""
+    })),
+    { title: "Select Serial Port" }
+  );
+  return pick?.label;
+}
+
+async function promptBaudRate(defaultValue = 115200): Promise<number | undefined> {
+  const baudInput = await vscode.window.showInputBox({
+    title: "Serial Baud Rate",
+    value: `${defaultValue}`,
+    ignoreFocusOut: true,
+    validateInput: (value) => {
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        return "Enter a positive integer baud rate";
+      }
+      return undefined;
+    }
+  });
+  if (!baudInput) {
+    return undefined;
+  }
+  return Number(baudInput);
 }
 
 function getConnectedServerIds(core: NexusCore): string[] {
@@ -175,10 +213,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const sidecarPath = path.join(__dirname, "services", "serial", "serialSidecarWorker.js");
   const serialSidecar = new SerialSidecarManager(sidecarPath);
   const terminalsByServer: ServerTerminalMap = new Map();
+  const serialTerminals: SerialTerminalMap = new Map();
 
   tunnelManagerRef = tunnelManager;
   serialSidecarRef = serialSidecar;
   terminalsByServerRef = terminalsByServer;
+  serialTerminalsRef = serialTerminals;
 
   const nexusTreeProvider = new NexusTreeProvider(async (serverId, tunnelProfileId) => {
     const profile = core.getTunnel(tunnelProfileId);
@@ -374,23 +414,71 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const startTunnelCmd = vscode.commands.registerCommand("nexus.tunnel.start", startTunnelCommand);
   const stopTunnelCmd = vscode.commands.registerCommand("nexus.tunnel.stop", stopTunnelCommand);
 
-  const listSerialPortsCommand = vscode.commands.registerCommand("nexus.serial.listPorts", async () => {
+  const connectSerialCommand = vscode.commands.registerCommand("nexus.serial.connect", async () => {
     try {
-      const ports = await serialSidecar.listPorts();
-      if (ports.length === 0) {
-        void vscode.window.showInformationMessage("No serial ports found (or serial module unavailable).");
+      const portPath = await pickSerialPort(serialSidecar);
+      if (!portPath) {
         return;
       }
-      const pick = await vscode.window.showQuickPick(
-        ports.map((port) => ({
-          label: port.path,
-          description: port.manufacturer ?? ""
-        })),
-        { title: "Available Serial Ports" }
-      );
-      if (pick) {
-        void vscode.window.showInformationMessage(`Selected serial port: ${pick.label}`);
+      const baudRate = await promptBaudRate();
+      if (!baudRate) {
+        return;
       }
+
+      const terminalName = `Nexus Serial: ${portPath}`;
+      let terminalRef: vscode.Terminal | undefined;
+      const pty = new SerialPty(
+        serialSidecar,
+        { path: portPath, baudRate },
+        {
+          onSessionOpened: (sessionId) => {
+            if (terminalRef) {
+              serialTerminals.set(sessionId, terminalRef);
+            }
+          },
+          onSessionClosed: (sessionId) => {
+            serialTerminals.delete(sessionId);
+          }
+        },
+        loggerFactory.create("terminal", `serial-${portPath}`)
+      );
+
+      const terminal = vscode.window.createTerminal({ name: terminalName, pty });
+      terminalRef = terminal;
+      terminal.show();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown serial connection error";
+      void vscode.window.showErrorMessage(`Failed to open serial terminal: ${message}`);
+    }
+  });
+
+  const disconnectSerialCommand = vscode.commands.registerCommand("nexus.serial.disconnect", async () => {
+    if (serialTerminals.size === 0) {
+      void vscode.window.showInformationMessage("No active serial sessions.");
+      return;
+    }
+
+    const pick = await vscode.window.showQuickPick(
+      [...serialTerminals.entries()].map(([sessionId, terminal]) => ({
+        label: terminal.name,
+        description: sessionId,
+        terminal
+      })),
+      { title: "Disconnect serial session" }
+    );
+    if (!pick) {
+      return;
+    }
+    pick.terminal.dispose();
+  });
+
+  const listSerialPortsCommand = vscode.commands.registerCommand("nexus.serial.listPorts", async () => {
+    try {
+      const portPath = await pickSerialPort(serialSidecar);
+      if (!portPath) {
+        return;
+      }
+      void vscode.window.showInformationMessage(`Selected serial port: ${portPath}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown serial error";
       void vscode.window.showErrorMessage(`Failed to list serial ports: ${message}`);
@@ -409,11 +497,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     removeTunnelCommand,
     startTunnelCmd,
     stopTunnelCmd,
+    connectSerialCommand,
+    disconnectSerialCommand,
     listSerialPortsCommand,
     {
       dispose: () => {
         unsubscribeCore();
         unsubscribeTunnel();
+        for (const [, terminal] of serialTerminals.entries()) {
+          terminal.dispose();
+        }
+        serialTerminals.clear();
         serialSidecar.dispose();
         void tunnelManager.stopAll();
       }
@@ -429,6 +523,12 @@ export async function deactivate(): Promise<void> {
       }
     }
     terminalsByServerRef.clear();
+  }
+  if (serialTerminalsRef) {
+    for (const [, terminal] of serialTerminalsRef.entries()) {
+      terminal.dispose();
+    }
+    serialTerminalsRef.clear();
   }
   serialSidecarRef?.dispose();
   if (tunnelManagerRef) {

@@ -59,6 +59,8 @@ Design principle: reliability over resource sharing.
 1. Run `Nexus: List Serial Ports`.
 2. Extension asks sidecar process over JSON-RPC.
 3. Sidecar returns ports (empty when `serialport` module is unavailable).
+4. Run `Nexus: Connect Serial Port` to open an interactive serial terminal.
+5. Use `Nexus: Disconnect Serial Session` to close an active serial terminal session.
 
 ## 5. Commands and Views
 
@@ -77,6 +79,8 @@ Design principle: reliability over resource sharing.
 - `nexus.tunnel.start`
 - `nexus.tunnel.stop`
 - `nexus.serial.listPorts`
+- `nexus.serial.connect`
+- `nexus.serial.disconnect`
 
 ## 6. Test Strategy
 
@@ -86,6 +90,7 @@ Design principle: reliability over resource sharing.
 
 ### 6.2 Integration Tests
 - `test/integration/tunnelManager.integration.test.ts`: local echo-server forwarding through real TCP sockets and traffic event verification.
+- `test/integration/serialSidecarManager.integration.test.ts`: sidecar request/response and notification flow with a mock worker process.
 
 Run:
 ```bash
@@ -100,10 +105,10 @@ Implemented (~90% target):
 - Silent Auth workflow with secret invalidation + save/retry.
 - Tunnel Patch Bay model with drag/drop start.
 - Dedicated terminal/tunnel connection model.
+- Interactive serial terminal sessions through sidecar-managed ports.
 - Logging for terminal/tunnel events.
 - Build/test/packaging scripts.
 
 Deferred (~10%):
-- Full interactive serial terminal UI session (open/write/read in integrated terminal).
 - Dedicated advanced tunnel analytics panel beyond tree descriptions.
 - Full browser-host feature parity for Node-dependent runtime features.

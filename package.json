@@ -18,7 +18,8 @@
     "onView:nexusCommandCenter",
     "onView:nexusTunnels",
     "onCommand:nexus.server.add",
-    "onCommand:nexus.server.connect"
+    "onCommand:nexus.server.connect",
+    "onCommand:nexus.serial.connect"
   ],
   "contributes": {
     "viewsContainers": {
@@ -82,6 +83,14 @@
       {
         "command": "nexus.serial.listPorts",
         "title": "Nexus: List Serial Ports"
+      },
+      {
+        "command": "nexus.serial.connect",
+        "title": "Nexus: Connect Serial Port"
+      },
+      {
+        "command": "nexus.serial.disconnect",
+        "title": "Nexus: Disconnect Serial Session"
       }
     ],
     "menus": {
@@ -139,6 +148,14 @@
         },
         {
           "command": "nexus.serial.listPorts",
+          "when": "true"
+        },
+        {
+          "command": "nexus.serial.connect",
+          "when": "true"
+        },
+        {
+          "command": "nexus.serial.disconnect",
           "when": "true"
         }
       ]

@@ -24,6 +24,8 @@ npm run package:vsix
 - `Nexus: Add Tunnel`
 - `Nexus: Start Tunnel`
 - `Nexus: Stop Tunnel`
+- `Nexus: Connect Serial Port`
+- `Nexus: Disconnect Serial Session`
 - `Nexus: List Serial Ports`
 
 ## Documentation
