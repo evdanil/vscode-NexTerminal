@@ -110,6 +110,7 @@ Implemented (~90% target):
 - Dedicated terminal/tunnel connection model.
 - Interactive serial terminal sessions through sidecar-managed ports.
 - Logging for terminal/tunnel events.
+- Browser-host fallback entrypoint with safe "desktop required" UX instead of activation failure.
 - Build/test/packaging scripts.
 
 Deferred (~10%):

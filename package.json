@@ -13,6 +13,7 @@
     "Other"
   ],
   "main": "./dist/extension.js",
+  "browser": "./dist/webExtension.js",
   "activationEvents": [
     "onStartupFinished",
     "onView:nexusCommandCenter",

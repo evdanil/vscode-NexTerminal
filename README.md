@@ -4,7 +4,8 @@ SSH runs in-process, while Serial runs in an isolated sidecar process.
 
 ## MVP Status
 - Implemented: core architecture, Command Center TreeView, Tunnel Patch Bay with drag/drop, dedicated Tunnel Monitor panel, Silent Auth, isolated tunnel forwarding, serial sidecar IPC + serial terminals, terminal/tunnel logging, unit + integration tests.
-- Remaining (intentional MVP gap): full serial terminal session UX, deep traffic panel visuals, and browser-host parity.
+- Implemented for web host: graceful browser entrypoint with informative fallback views/commands (no hard activation failure).
+- Remaining (intentional MVP gap): full browser feature parity for SSH/serial runtime capabilities.
 
 ## Quick Start
 ```bash
