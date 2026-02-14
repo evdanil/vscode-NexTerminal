@@ -1,0 +1,170 @@
+{
+  "name": "vscode-nexterminal",
+  "displayName": "Nexus Terminal",
+  "description": "Unified SSH and Serial command center for VS Code.",
+  "version": "0.1.0",
+  "publisher": "nexus",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Terminal",
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:nexusCommandCenter",
+    "onView:nexusTunnels",
+    "onCommand:nexus.server.add",
+    "onCommand:nexus.server.connect"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "nexus",
+          "title": "Nexus",
+          "icon": "media/nexus.svg"
+        }
+      ]
+    },
+    "views": {
+      "nexus": [
+        {
+          "id": "nexusCommandCenter",
+          "name": "Command Center"
+        },
+        {
+          "id": "nexusTunnels",
+          "name": "Tunnel Patch Bay"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "nexus.refresh",
+        "title": "Nexus: Refresh"
+      },
+      {
+        "command": "nexus.server.add",
+        "title": "Nexus: Add Server"
+      },
+      {
+        "command": "nexus.server.remove",
+        "title": "Nexus: Remove Server"
+      },
+      {
+        "command": "nexus.server.connect",
+        "title": "Nexus: Connect Server"
+      },
+      {
+        "command": "nexus.server.disconnect",
+        "title": "Nexus: Disconnect Server"
+      },
+      {
+        "command": "nexus.tunnel.add",
+        "title": "Nexus: Add Tunnel"
+      },
+      {
+        "command": "nexus.tunnel.remove",
+        "title": "Nexus: Remove Tunnel"
+      },
+      {
+        "command": "nexus.tunnel.start",
+        "title": "Nexus: Start Tunnel"
+      },
+      {
+        "command": "nexus.tunnel.stop",
+        "title": "Nexus: Stop Tunnel"
+      },
+      {
+        "command": "nexus.serial.listPorts",
+        "title": "Nexus: List Serial Ports"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "nexus.refresh",
+          "when": "view =~ /^nexus/",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "nexus.server.connect",
+          "when": "view == nexusCommandCenter && viewItem == nexus.server",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.server.disconnect",
+          "when": "view == nexusCommandCenter && viewItem == nexus.session",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.server.remove",
+          "when": "view == nexusCommandCenter && viewItem == nexus.server",
+          "group": "navigation"
+        },
+        {
+          "command": "nexus.tunnel.start",
+          "when": "view == nexusTunnels && viewItem == nexus.tunnel",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.tunnel.stop",
+          "when": "view == nexusTunnels && viewItem == nexus.activeTunnel",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.tunnel.remove",
+          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "nexus.refresh",
+          "when": "true"
+        },
+        {
+          "command": "nexus.server.add",
+          "when": "true"
+        },
+        {
+          "command": "nexus.tunnel.add",
+          "when": "true"
+        },
+        {
+          "command": "nexus.serial.listPorts",
+          "when": "true"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "clean": "rimraf dist coverage",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "watch": "tsc -p tsconfig.json --watch",
+    "test": "vitest run --coverage",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "package:vsix": "vsce package"
+  },
+  "dependencies": {
+    "ssh2": "^1.17.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/ssh2": "^1.15.5",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.3.2",
+    "@vitest/coverage-v8": "^3.0.9",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.9"
+  }
+}

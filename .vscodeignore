@@ -1,0 +1,11 @@
+**/.git/**
+**/.vscode/**
+**/.idea/**
+**/node_modules/**
+coverage/**
+src/**
+test/**
+docs/**
+*.ts
+tsconfig*.json
+vitest.config.ts
