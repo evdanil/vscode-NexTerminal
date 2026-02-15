@@ -150,6 +150,16 @@
         "command": "nexus.serial.disconnect",
         "title": "Nexus: Disconnect Serial Session",
         "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "nexus.group.connect",
+        "title": "Nexus: Connect All in Group",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "nexus.group.disconnect",
+        "title": "Nexus: Disconnect All in Group",
+        "icon": "$(debug-disconnect)"
       }
     ],
     "menus": {
@@ -245,6 +255,16 @@
           "command": "nexus.serial.add",
           "when": "view == nexusCommandCenter && viewItem == nexus.group",
           "group": "navigation@2"
+        },
+        {
+          "command": "nexus.group.connect",
+          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.group.disconnect",
+          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "group": "inline@2"
         },
         {
           "command": "nexus.serial.connect",

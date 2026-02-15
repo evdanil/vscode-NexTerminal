@@ -81,6 +81,27 @@ describe("renderFormHtml", () => {
     expect(html).toContain("Cancel");
   });
 
+  it("renders combobox fields with datalist", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "combobox",
+          key: "group",
+          label: "Group",
+          suggestions: ["Dev", "Prod"],
+          placeholder: "Pick or type...",
+          value: "Dev"
+        }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain('list="list-group"');
+    expect(html).toContain('<datalist id="list-group">');
+    expect(html).toContain('<option value="Dev">');
+    expect(html).toContain('<option value="Prod">');
+  });
+
   it("includes vscode api script", () => {
     const definition: FormDefinition = {
       title: "Test",

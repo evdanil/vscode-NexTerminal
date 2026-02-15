@@ -12,7 +12,8 @@ export class WebviewFormPanel {
     definition: FormDefinition,
     private readonly onSubmit: (values: FormValues) => void,
     private readonly onCancel: () => void,
-    private readonly onBrowse?: (key: string) => Promise<string | undefined>
+    private readonly onBrowse?: (key: string) => Promise<string | undefined>,
+    private readonly onCreateInline?: (key: string) => void
   ) {
     this.panel = vscode.window.createWebviewPanel(
       `nexus.form.${formId}`,
@@ -40,6 +41,9 @@ export class WebviewFormPanel {
           void this.panel.webview.postMessage({ type: "browseResult", key: message.key, path: result });
         }
       }
+      if (message.type === "createInline" && this.onCreateInline) {
+        this.onCreateInline(message.key);
+      }
     });
 
     this.panel.onDidDispose(() => {
@@ -55,6 +59,7 @@ export class WebviewFormPanel {
       onSubmit: (values: FormValues) => void;
       onCancel?: () => void;
       onBrowse?: (key: string) => Promise<string | undefined>;
+      onCreateInline?: (key: string) => void;
     }
   ): WebviewFormPanel {
     const existing = WebviewFormPanel.activePanels.get(formId);
@@ -67,10 +72,17 @@ export class WebviewFormPanel {
       definition,
       options.onSubmit,
       options.onCancel ?? (() => {}),
-      options.onBrowse
+      options.onBrowse,
+      options.onCreateInline
     );
     WebviewFormPanel.activePanels.set(formId, instance);
     return instance;
+  }
+
+  public addSelectOption(key: string, value: string, label: string): void {
+    if (!this.disposed) {
+      void this.panel.webview.postMessage({ type: "addSelectOption", key, value, label });
+    }
   }
 
   public sendValidationErrors(errors: Record<string, string>): void {

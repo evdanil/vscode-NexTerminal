@@ -5,7 +5,7 @@ import type { AuthType, ServerConfig } from "../models/config";
 import { SshPty } from "../services/ssh/sshPty";
 import { serverFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
-import { ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
+import { GroupTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { resolveTunnelConnectionMode, startTunnel } from "./tunnelCommands";
 import type { CommandContext, ServerTerminalMap } from "./types";
@@ -89,7 +89,7 @@ function collectGroups(ctx: CommandContext): string[] {
   return [...groups].sort((a, b) => a.localeCompare(b));
 }
 
-function formValuesToServer(values: FormValues, existingId?: string): ServerConfig | undefined {
+export function formValuesToServer(values: FormValues, existingId?: string, preserveIsHidden = false): ServerConfig | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const host = typeof values.host === "string" ? values.host.trim() : "";
   const username = typeof values.username === "string" ? values.username.trim() : "";
@@ -105,9 +105,11 @@ function formValuesToServer(values: FormValues, existingId?: string): ServerConf
     authType: (values.authType as AuthType) ?? "password",
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
     group: typeof values.group === "string" && values.group ? values.group : undefined,
-    isHidden: values.isHidden === true
+    isHidden: preserveIsHidden
   };
 }
+
+export { browseForKey, collectGroups };
 
 async function browseForKey(): Promise<string | undefined> {
   const uris = await vscode.window.showOpenDialog({
@@ -218,7 +220,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const definition = serverFormDefinition(existing, existingGroups);
       WebviewFormPanel.open("server-edit", definition, {
         onSubmit: async (values) => {
-          const updated = formValuesToServer(values, existing.id);
+          const updated = formValuesToServer(values, existing.id, existing.isHidden);
           if (!updated) {
             return;
           }
@@ -251,6 +253,30 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
     }),
 
     vscode.commands.registerCommand("nexus.server.connect", (arg?: unknown) => connectServer(ctx, arg)),
-    vscode.commands.registerCommand("nexus.server.disconnect", (arg?: unknown) => disconnectServer(ctx, arg))
+    vscode.commands.registerCommand("nexus.server.disconnect", (arg?: unknown) => disconnectServer(ctx, arg)),
+
+    vscode.commands.registerCommand("nexus.group.connect", async (arg?: unknown) => {
+      if (!(arg instanceof GroupTreeItem)) {
+        return;
+      }
+      const servers = ctx.core
+        .getSnapshot()
+        .servers.filter((s) => s.group === arg.groupName && !s.isHidden);
+      for (const server of servers) {
+        void connectServer(ctx, server.id);
+      }
+    }),
+
+    vscode.commands.registerCommand("nexus.group.disconnect", async (arg?: unknown) => {
+      if (!(arg instanceof GroupTreeItem)) {
+        return;
+      }
+      const servers = ctx.core
+        .getSnapshot()
+        .servers.filter((s) => s.group === arg.groupName && !s.isHidden);
+      for (const server of servers) {
+        await disconnectServer(ctx, server.id);
+      }
+    })
   ];
 }

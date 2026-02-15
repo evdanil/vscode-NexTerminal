@@ -9,11 +9,12 @@ import type {
 } from "../models/config";
 import type { SilentAuthSshFactory } from "../services/ssh/silentAuth";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
-import { tunnelFormDefinition } from "../ui/formDefinitions";
+import { serverFormDefinition, tunnelFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { TunnelTreeItem } from "../ui/tunnelTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { isTunnelRouteChanged } from "../utils/tunnelProfile";
+import { browseForKey, collectGroups, formValuesToServer } from "./serverCommands";
 import type { CommandContext } from "./types";
 
 export function getDefaultTunnelConnectionMode(): ResolvedTunnelConnectionMode {
@@ -217,48 +218,53 @@ async function stopTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<vo
   await ctx.tunnelManager.stop(pick.active.id);
 }
 
-function formValuesToTunnel(values: FormValues, existingId?: string, defaultServerId?: string): TunnelProfile | undefined {
+function formValuesToTunnel(values: FormValues, existingId?: string, existingConnectionMode?: TunnelConnectionMode): TunnelProfile | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   if (!name) {
     return undefined;
   }
+  const serverId = typeof values.defaultServerId === "string" && values.defaultServerId ? values.defaultServerId : undefined;
   return {
     id: existingId ?? randomUUID(),
     name,
     localPort: typeof values.localPort === "number" ? values.localPort : 0,
     remoteIP: typeof values.remoteIP === "string" ? values.remoteIP.trim() : "127.0.0.1",
     remotePort: typeof values.remotePort === "number" ? values.remotePort : 0,
-    defaultServerId,
+    defaultServerId: serverId,
     autoStart: values.autoStart === true,
-    connectionMode: (values.connectionMode as TunnelConnectionMode) ?? "isolated"
+    connectionMode: existingConnectionMode
   };
 }
 
 export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.tunnel.add", () => {
-      const definition = tunnelFormDefinition();
-      WebviewFormPanel.open("tunnel-add", definition, {
+      const servers = ctx.core.getSnapshot().servers.filter((s) => !s.isHidden);
+      const definition = tunnelFormDefinition(undefined, { servers });
+      const panel = WebviewFormPanel.open("tunnel-add", definition, {
         onSubmit: async (values) => {
           const profile = formValuesToTunnel(values);
           if (!profile) {
             return;
           }
-          const servers = ctx.core.getSnapshot().servers.filter((s) => !s.isHidden);
-          if (servers.length > 0) {
-            const pick = await vscode.window.showQuickPick(
-              servers.map((server) => ({
-                label: server.name,
-                description: `${server.username}@${server.host}:${server.port}`,
-                server
-              })),
-              { title: "Assign tunnel to a server (optional)" }
-            );
-            if (pick) {
-              profile.defaultServerId = pick.server.id;
-            }
-          }
           await ctx.core.addOrUpdateTunnel(profile);
+        },
+        onCreateInline: (key) => {
+          if (key === "defaultServerId") {
+            const existingGroups = collectGroups(ctx);
+            const serverDef = serverFormDefinition(undefined, existingGroups);
+            WebviewFormPanel.open("tunnel-add-server", serverDef, {
+              onSubmit: async (serverValues) => {
+                const server = formValuesToServer(serverValues);
+                if (!server) {
+                  return;
+                }
+                await ctx.core.addOrUpdateServer(server);
+                panel.addSelectOption("defaultServerId", server.id, server.name);
+              },
+              onBrowse: browseForKey
+            });
+          }
         }
       });
     }),
@@ -268,10 +274,11 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       if (!existing) {
         return;
       }
-      const definition = tunnelFormDefinition(existing);
-      WebviewFormPanel.open("tunnel-edit", definition, {
+      const servers = ctx.core.getSnapshot().servers.filter((s) => !s.isHidden);
+      const definition = tunnelFormDefinition(existing, { servers });
+      const panel = WebviewFormPanel.open("tunnel-edit", definition, {
         onSubmit: async (values) => {
-          const updated = formValuesToTunnel(values, existing.id, existing.defaultServerId);
+          const updated = formValuesToTunnel(values, existing.id, existing.connectionMode);
           if (!updated) {
             return;
           }
@@ -308,6 +315,23 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
             return;
           }
           await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, updated, server, mode);
+        },
+        onCreateInline: (key) => {
+          if (key === "defaultServerId") {
+            const existingGroups = collectGroups(ctx);
+            const serverDef = serverFormDefinition(undefined, existingGroups);
+            WebviewFormPanel.open("tunnel-edit-server", serverDef, {
+              onSubmit: async (serverValues) => {
+                const server = formValuesToServer(serverValues);
+                if (!server) {
+                  return;
+                }
+                await ctx.core.addOrUpdateServer(server);
+                panel.addSelectOption("defaultServerId", server.id, server.name);
+              },
+              onBrowse: browseForKey
+            });
+          }
         }
       });
     }),

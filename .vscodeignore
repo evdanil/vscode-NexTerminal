@@ -19,7 +19,7 @@ package-lock.json
 .claude/**
 CLAUDE.md
 
-# Node modules (vsce bundles dependencies automatically)
+# Node modules — strip everything except .js, .json, .node, .d.ts
 node_modules/.package-lock.json
 node_modules/**/test/**
 node_modules/**/tests/**
@@ -29,11 +29,17 @@ node_modules/**/examples/**
 node_modules/**/.github/**
 node_modules/**/.travis.yml
 node_modules/**/.eslintrc*
+node_modules/**/.eslintignore
 node_modules/**/.prettierrc*
 node_modules/**/tsconfig.json
 node_modules/**/*.ts
 !node_modules/**/*.d.ts
 node_modules/**/*.map
+node_modules/**/*.mjs
+node_modules/**/*.md
+node_modules/**/*.txt
+node_modules/**/LICENSE
+node_modules/**/LICENCE
 node_modules/**/CHANGELOG*
 node_modules/**/CHANGES*
 node_modules/**/HISTORY*
@@ -45,3 +51,59 @@ node_modules/**/gulpfile*
 node_modules/**/bower.json
 node_modules/**/.editorconfig
 node_modules/**/.gitattributes
+node_modules/**/.releaserc
+
+# Native addon source and build artifacts
+node_modules/**/*.cpp
+node_modules/**/*.cc
+node_modules/**/*.c
+node_modules/**/*.h
+node_modules/**/*.gyp
+node_modules/**/*.gypi
+node_modules/**/*.mk
+node_modules/**/*.bat
+node_modules/**/*.exe
+node_modules/**/*.o
+node_modules/**/*.a
+node_modules/**/*.inl
+node_modules/**/*.patch
+node_modules/**/*.sh
+node_modules/**/*.cs
+node_modules/**/*.svg
+node_modules/**/*.dot
+node_modules/**/*.target.mk
+node_modules/**/build/config.gypi
+node_modules/**/build/binding.Makefile
+node_modules/**/build/Release/.deps/**
+node_modules/**/build/Release/obj.target/**
+node_modules/**/build/**/*.Makefile
+
+# Unused serialport sub-packages (we only use @serialport/stream + bindings-cpp)
+node_modules/@serialport/binding-mock/**
+node_modules/@serialport/parser-byte-length/**
+node_modules/@serialport/parser-cctalk/**
+node_modules/@serialport/parser-delimiter/**
+node_modules/@serialport/parser-inter-byte-timeout/**
+node_modules/@serialport/parser-packet-length/**
+node_modules/@serialport/parser-readline/**
+node_modules/@serialport/parser-ready/**
+node_modules/@serialport/parser-regex/**
+node_modules/@serialport/parser-slip-encoder/**
+node_modules/@serialport/parser-spacepacket/**
+
+# Misc junk files
+node_modules/**/.npmignore
+node_modules/**/.clang-format
+node_modules/**/.dockerignore
+node_modules/**/.grenrc.yml
+node_modules/**/.pre-commit-config.yaml
+node_modules/**/Jenkinsfile
+node_modules/**/Vagrantfile
+node_modules/**/Dockerfile
+node_modules/**/WORKSPACE
+node_modules/**/BUILD.bazel
+node_modules/**/*.bzl
+node_modules/**/*.cmake*
+node_modules/**/cmake/**
+node_modules/**/deps/**/scripts/**
+node_modules/**/deps/**/patches/**

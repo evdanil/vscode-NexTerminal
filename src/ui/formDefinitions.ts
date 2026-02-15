@@ -3,10 +3,6 @@ import type { FormDefinition } from "./formTypes";
 
 export function serverFormDefinition(seed?: Partial<ServerConfig>, existingGroups?: string[]): FormDefinition {
   const isEdit = Boolean(seed?.id);
-  const groupOptions = [
-    { label: "(No group)", value: "" },
-    ...(existingGroups ?? []).map((g) => ({ label: g, value: g }))
-  ];
 
   return {
     title: isEdit ? "Edit Server" : "Add Server",
@@ -28,19 +24,28 @@ export function serverFormDefinition(seed?: Partial<ServerConfig>, existingGroup
       },
       { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath },
       {
-        type: "select",
+        type: "combobox",
         key: "group",
         label: "Group",
-        options: groupOptions,
+        suggestions: existingGroups ?? [],
+        placeholder: "Type a new group or pick existing...",
         value: seed?.group ?? ""
-      },
-      { type: "checkbox", key: "isHidden", label: "Hidden (jump host — not shown in server list)", value: seed?.isHidden ?? false }
+      }
     ]
   };
 }
 
-export function tunnelFormDefinition(seed?: Partial<TunnelProfile>): FormDefinition {
+export interface TunnelFormOptions {
+  servers?: Array<{ id: string; name: string; host: string; username: string }>;
+}
+
+export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: TunnelFormOptions): FormDefinition {
   const isEdit = Boolean(seed?.id);
+  const serverOptions = [
+    { label: "(Assign later)", value: "" },
+    ...(options?.servers ?? []).map((s) => ({ label: s.name, value: s.id })),
+    { label: "Create new server...", value: "__create__server" }
+  ];
 
   return {
     title: isEdit ? "Edit Tunnel" : "Add Tunnel",
@@ -49,28 +54,20 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>): FormDefinit
       { type: "number", key: "localPort", label: "Local Port", required: true, min: 1, max: 65535, placeholder: "5432", value: seed?.localPort },
       { type: "text", key: "remoteIP", label: "Remote IP", required: true, placeholder: "127.0.0.1", value: seed?.remoteIP ?? "127.0.0.1" },
       { type: "number", key: "remotePort", label: "Remote Port", required: true, min: 1, max: 65535, placeholder: "5432", value: seed?.remotePort },
-      { type: "checkbox", key: "autoStart", label: "Auto-start when server connects", value: seed?.autoStart ?? false },
       {
         type: "select",
-        key: "connectionMode",
-        label: "Connection Mode",
-        options: [
-          { label: "Isolated (one SSH connection per tunnel client)", value: "isolated" },
-          { label: "Shared (single SSH connection for all clients)", value: "shared" },
-          { label: "Ask every time", value: "ask" }
-        ],
-        value: seed?.connectionMode ?? "isolated"
-      }
+        key: "defaultServerId",
+        label: "Server",
+        options: serverOptions,
+        value: seed?.defaultServerId ?? ""
+      },
+      { type: "checkbox", key: "autoStart", label: "Auto-start when server connects", value: seed?.autoStart ?? false }
     ]
   };
 }
 
 export function serialFormDefinition(seed?: Partial<SerialProfile>, existingGroups?: string[]): FormDefinition {
   const isEdit = Boolean(seed?.id);
-  const groupOptions = [
-    { label: "(No group)", value: "" },
-    ...(existingGroups ?? []).map((g) => ({ label: g, value: g }))
-  ];
 
   return {
     title: isEdit ? "Edit Serial Profile" : "Add Serial Profile",
@@ -130,10 +127,11 @@ export function serialFormDefinition(seed?: Partial<SerialProfile>, existingGrou
       },
       { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", value: seed?.rtscts ?? false },
       {
-        type: "select",
+        type: "combobox",
         key: "group",
         label: "Group",
-        options: groupOptions,
+        suggestions: existingGroups ?? [],
+        placeholder: "Type a new group or pick existing...",
         value: seed?.group ?? ""
       }
     ]

@@ -31,9 +31,19 @@ function renderField(field: FormFieldDescriptor): string {
     case "select":
       return `<div class="form-group">
   <label for="${id}">${escapeHtml(field.label)}</label>
-  <select id="${id}" name="${field.key}">
+  <select id="${id}" name="${field.key}" class="create-inline-select">
     ${field.options.map((opt) => `<option value="${escapeHtml(opt.value)}"${opt.value === field.value ? " selected" : ""}>${escapeHtml(opt.label)}</option>`).join("\n    ")}
   </select>
+  <div class="field-error" id="error-${field.key}"></div>
+</div>`;
+
+    case "combobox":
+      return `<div class="form-group">
+  <label for="${id}">${escapeHtml(field.label)}</label>
+  <input type="text" id="${id}" name="${field.key}" list="list-${field.key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "Type or select...")}" />
+  <datalist id="list-${field.key}">
+    ${field.suggestions.map((s) => `<option value="${escapeHtml(s)}">`).join("\n    ")}
+  </datalist>
   <div class="field-error" id="error-${field.key}"></div>
 </div>`;
 
@@ -221,11 +231,41 @@ export function renderFormHtml(definition: FormDefinition): string {
         });
       }
 
+      // Handle select fields with __create__ values (e.g., "Create new server...")
+      for (const sel of document.querySelectorAll(".create-inline-select")) {
+        sel.addEventListener("change", () => {
+          if (sel.value.startsWith("__create__")) {
+            const key = sel.name;
+            sel.value = sel.dataset.prev || "";
+            vscode.postMessage({ type: "createInline", key: key });
+          } else {
+            sel.dataset.prev = sel.value;
+          }
+        });
+      }
+
       window.addEventListener("message", (event) => {
         const msg = event.data;
         if (msg.type === "browseResult") {
           const input = document.getElementById("field-" + msg.key);
           if (input) input.value = msg.path;
+        }
+        if (msg.type === "addSelectOption") {
+          const sel = document.getElementById("field-" + msg.key);
+          if (sel) {
+            const opt = document.createElement("option");
+            opt.value = msg.value;
+            opt.textContent = msg.label;
+            // Insert before the last option (which is "Create new...")
+            const createOpt = sel.querySelector('option[value^="__create__"]');
+            if (createOpt) {
+              sel.insertBefore(opt, createOpt);
+            } else {
+              sel.appendChild(opt);
+            }
+            sel.value = msg.value;
+            sel.dataset.prev = msg.value;
+          }
         }
         if (msg.type === "validationError") {
           for (const errEl of document.querySelectorAll(".field-error")) {
