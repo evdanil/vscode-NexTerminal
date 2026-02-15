@@ -308,6 +308,25 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       pick.terminal.dispose();
     }),
 
+    vscode.commands.registerCommand("nexus.serial.copyInfo", async (arg?: unknown) => {
+      const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
+      if (!profile) {
+        return;
+      }
+      const info = `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`;
+      await vscode.env.clipboard.writeText(info);
+      void vscode.window.showInformationMessage(`Copied: ${info}`);
+    }),
+
+    vscode.commands.registerCommand("nexus.serial.duplicate", async (arg?: unknown) => {
+      const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
+      if (!profile) {
+        return;
+      }
+      const copy = { ...profile, id: randomUUID(), name: `${profile.name} (copy)` };
+      await ctx.core.addOrUpdateSerialProfile(copy);
+    }),
+
     vscode.commands.registerCommand("nexus.serial.listPorts", async () => {
       try {
         const ports = await listSerialPorts(ctx.serialSidecar);

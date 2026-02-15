@@ -255,6 +255,25 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
     vscode.commands.registerCommand("nexus.server.connect", (arg?: unknown) => connectServer(ctx, arg)),
     vscode.commands.registerCommand("nexus.server.disconnect", (arg?: unknown) => disconnectServer(ctx, arg)),
 
+    vscode.commands.registerCommand("nexus.server.copyInfo", async (arg?: unknown) => {
+      const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
+      if (!server) {
+        return;
+      }
+      const info = `${server.username}@${server.host}:${server.port}`;
+      await vscode.env.clipboard.writeText(info);
+      void vscode.window.showInformationMessage(`Copied: ${info}`);
+    }),
+
+    vscode.commands.registerCommand("nexus.server.duplicate", async (arg?: unknown) => {
+      const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
+      if (!server) {
+        return;
+      }
+      const copy = { ...server, id: randomUUID(), name: `${server.name} (copy)` };
+      await ctx.core.addOrUpdateServer(copy);
+    }),
+
     vscode.commands.registerCommand("nexus.group.connect", async (arg?: unknown) => {
       if (!(arg instanceof GroupTreeItem)) {
         return;

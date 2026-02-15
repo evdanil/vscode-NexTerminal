@@ -354,6 +354,46 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
     }),
 
     vscode.commands.registerCommand("nexus.tunnel.start", (arg?: unknown) => startTunnelCommand(ctx, arg)),
-    vscode.commands.registerCommand("nexus.tunnel.stop", (arg?: unknown) => stopTunnelCommand(ctx, arg))
+    vscode.commands.registerCommand("nexus.tunnel.stop", (arg?: unknown) => stopTunnelCommand(ctx, arg)),
+
+    vscode.commands.registerCommand("nexus.tunnel.restart", async (arg?: unknown) => {
+      const profile = toTunnelFromArg(ctx.core, arg);
+      if (!profile) {
+        return;
+      }
+      const active = ctx.core.getSnapshot().activeTunnels.find((t) => t.profileId === profile.id);
+      if (!active) {
+        return;
+      }
+      const server = ctx.core.getServer(active.serverId);
+      if (!server) {
+        return;
+      }
+      await ctx.tunnelManager.stop(active.id);
+      const mode = await resolveTunnelConnectionMode(profile, false);
+      if (!mode) {
+        return;
+      }
+      await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, mode);
+    }),
+
+    vscode.commands.registerCommand("nexus.tunnel.copyInfo", async (arg?: unknown) => {
+      const profile = toTunnelFromArg(ctx.core, arg) ?? (await pickTunnel(ctx.core));
+      if (!profile) {
+        return;
+      }
+      const info = `localhost:${profile.localPort} → ${profile.remoteIP}:${profile.remotePort}`;
+      await vscode.env.clipboard.writeText(info);
+      void vscode.window.showInformationMessage(`Copied: ${info}`);
+    }),
+
+    vscode.commands.registerCommand("nexus.tunnel.duplicate", async (arg?: unknown) => {
+      const profile = toTunnelFromArg(ctx.core, arg) ?? (await pickTunnel(ctx.core));
+      if (!profile) {
+        return;
+      }
+      const copy = { ...profile, id: randomUUID(), name: `${profile.name} (copy)` };
+      await ctx.core.addOrUpdateTunnel(copy);
+    })
   ];
 }

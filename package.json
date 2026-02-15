@@ -66,101 +66,32 @@
       }
     ],
     "commands": [
-      {
-        "command": "nexus.refresh",
-        "title": "Nexus: Refresh",
-        "icon": "$(refresh)"
-      },
-      {
-        "command": "nexus.server.add",
-        "title": "Nexus: Add Server",
-        "icon": "$(add)"
-      },
-      {
-        "command": "nexus.server.remove",
-        "title": "Nexus: Remove Server",
-        "icon": "$(trash)"
-      },
-      {
-        "command": "nexus.server.edit",
-        "title": "Nexus: Edit Server",
-        "icon": "$(edit)"
-      },
-      {
-        "command": "nexus.server.connect",
-        "title": "Nexus: Connect Server",
-        "icon": "$(plug)"
-      },
-      {
-        "command": "nexus.server.disconnect",
-        "title": "Nexus: Disconnect Server",
-        "icon": "$(debug-disconnect)"
-      },
-      {
-        "command": "nexus.tunnel.add",
-        "title": "Nexus: Add Tunnel",
-        "icon": "$(add)"
-      },
-      {
-        "command": "nexus.tunnel.remove",
-        "title": "Nexus: Remove Tunnel",
-        "icon": "$(trash)"
-      },
-      {
-        "command": "nexus.tunnel.edit",
-        "title": "Nexus: Edit Tunnel",
-        "icon": "$(edit)"
-      },
-      {
-        "command": "nexus.tunnel.start",
-        "title": "Nexus: Start Tunnel",
-        "icon": "$(play)"
-      },
-      {
-        "command": "nexus.tunnel.stop",
-        "title": "Nexus: Stop Tunnel",
-        "icon": "$(debug-stop)"
-      },
-      {
-        "command": "nexus.serial.add",
-        "title": "Nexus: Add Serial Profile",
-        "icon": "$(add)"
-      },
-      {
-        "command": "nexus.serial.edit",
-        "title": "Nexus: Edit Serial Profile",
-        "icon": "$(edit)"
-      },
-      {
-        "command": "nexus.serial.remove",
-        "title": "Nexus: Remove Serial Profile",
-        "icon": "$(trash)"
-      },
-      {
-        "command": "nexus.serial.listPorts",
-        "title": "Nexus: List Serial Ports",
-        "icon": "$(search)"
-      },
-      {
-        "command": "nexus.serial.connect",
-        "title": "Nexus: Connect Serial Port",
-        "icon": "$(plug)"
-      },
-      {
-        "command": "nexus.serial.disconnect",
-        "title": "Nexus: Disconnect Serial Session",
-        "icon": "$(debug-disconnect)"
-      },
-      {
-        "command": "nexus.group.connect",
-        "title": "Nexus: Connect All in Group",
-        "icon": "$(plug)"
-      },
-      {
-        "command": "nexus.group.disconnect",
-        "title": "Nexus: Disconnect All in Group",
-        "icon": "$(debug-disconnect)"
-      }
+      { "command": "nexus.refresh", "title": "Nexus: Refresh", "icon": "$(refresh)" },
+      { "command": "nexus.server.add", "title": "Nexus: Add Server", "icon": "$(add)" },
+      { "command": "nexus.server.edit", "title": "Edit", "icon": "$(edit)" },
+      { "command": "nexus.server.remove", "title": "Remove", "icon": "$(trash)" },
+      { "command": "nexus.server.connect", "title": "Connect", "icon": "$(plug)" },
+      { "command": "nexus.server.disconnect", "title": "Disconnect", "icon": "$(debug-disconnect)" },
+      { "command": "nexus.server.copyInfo", "title": "Copy Connection Info", "icon": "$(clippy)" },
+      { "command": "nexus.server.duplicate", "title": "Duplicate", "icon": "$(copy)" },
+      { "command": "nexus.tunnel.add", "title": "Nexus: Add Tunnel", "icon": "$(add)" },
+      { "command": "nexus.tunnel.edit", "title": "Edit", "icon": "$(edit)" },
+      { "command": "nexus.tunnel.remove", "title": "Remove", "icon": "$(trash)" },
+      { "command": "nexus.tunnel.start", "title": "Start", "icon": "$(play)" },
+      { "command": "nexus.tunnel.stop", "title": "Stop", "icon": "$(debug-stop)" },
+      { "command": "nexus.tunnel.restart", "title": "Restart", "icon": "$(debug-restart)" },
+      { "command": "nexus.tunnel.copyInfo", "title": "Copy Tunnel Info", "icon": "$(clippy)" },
+      { "command": "nexus.tunnel.duplicate", "title": "Duplicate", "icon": "$(copy)" },
+      { "command": "nexus.serial.add", "title": "Nexus: Add Serial Profile", "icon": "$(add)" },
+      { "command": "nexus.serial.edit", "title": "Edit", "icon": "$(edit)" },
+      { "command": "nexus.serial.remove", "title": "Remove", "icon": "$(trash)" },
+      { "command": "nexus.serial.listPorts", "title": "Nexus: Scan Serial Ports", "icon": "$(search)" },
+      { "command": "nexus.serial.connect", "title": "Connect", "icon": "$(plug)" },
+      { "command": "nexus.serial.disconnect", "title": "Disconnect", "icon": "$(debug-disconnect)" },
+      { "command": "nexus.serial.copyInfo", "title": "Copy Port Info", "icon": "$(clippy)" },
+      { "command": "nexus.serial.duplicate", "title": "Duplicate", "icon": "$(copy)" },
+      { "command": "nexus.group.connect", "title": "Connect All", "icon": "$(plug)" },
+      { "command": "nexus.group.disconnect", "title": "Disconnect All", "icon": "$(debug-disconnect)" }
     ],
     "menus": {
       "view/title": [
@@ -206,181 +137,85 @@
         }
       ],
       "view/item/context": [
-        {
-          "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.server",
-          "group": "inline"
-        },
-        {
-          "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
-          "group": "inline"
-        },
-        {
-          "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
-          "group": "inline"
-        },
-        {
-          "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
-          "group": "inline"
-        },
-        {
-          "command": "nexus.server.remove",
-          "when": "view == nexusCommandCenter && viewItem == nexus.server",
-          "group": "navigation"
-        },
-        {
-          "command": "nexus.server.edit",
-          "when": "view == nexusCommandCenter && viewItem == nexus.server",
-          "group": "navigation@1"
-        },
-        {
-          "command": "nexus.server.remove",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
-          "group": "navigation"
-        },
-        {
-          "command": "nexus.server.edit",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
-          "group": "navigation@1"
-        },
-        {
-          "command": "nexus.server.add",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
-          "group": "navigation@1"
-        },
-        {
-          "command": "nexus.serial.add",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
-          "group": "navigation@2"
-        },
-        {
-          "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
-          "group": "inline@1"
-        },
-        {
-          "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
-          "group": "inline@2"
-        },
-        {
-          "command": "nexus.serial.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfile",
-          "group": "inline"
-        },
-        {
-          "command": "nexus.serial.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfileConnected",
-          "group": "inline"
-        },
-        {
-          "command": "nexus.serial.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serialSessionNode",
-          "group": "inline"
-        },
-        {
-          "command": "nexus.serial.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.(serialProfile|serialProfileConnected)$/",
-          "group": "navigation"
-        },
-        {
-          "command": "nexus.serial.edit",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.(serialProfile|serialProfileConnected)$/",
-          "group": "navigation@1"
-        },
-        {
-          "command": "nexus.tunnel.start",
-          "when": "view == nexusTunnels && viewItem == nexus.tunnel",
-          "group": "inline"
-        },
-        {
-          "command": "nexus.tunnel.stop",
-          "when": "view == nexusTunnels && viewItem == nexus.activeTunnel",
-          "group": "inline"
-        },
-        {
-          "command": "nexus.tunnel.remove",
-          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/",
-          "group": "navigation"
-        },
-        {
-          "command": "nexus.tunnel.edit",
-          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/",
-          "group": "navigation@1"
-        }
+        {"command":"nexus.server.connect","when":"view == nexusCommandCenter && viewItem == nexus.server","group":"inline"},
+        {"command":"nexus.server.connect","when":"view == nexusCommandCenter && viewItem == nexus.serverConnected","group":"inline@1"},
+        {"command":"nexus.server.disconnect","when":"view == nexusCommandCenter && viewItem == nexus.serverConnected","group":"inline@2"},
+        {"command":"nexus.server.disconnect","when":"view == nexusCommandCenter && viewItem == nexus.sessionNode","group":"inline"},
+
+        {"command":"nexus.server.connect","when":"view == nexusCommandCenter && viewItem == nexus.server","group":"0_connect"},
+        {"command":"nexus.server.connect","when":"view == nexusCommandCenter && viewItem == nexus.serverConnected","group":"0_connect@1"},
+        {"command":"nexus.server.disconnect","when":"view == nexusCommandCenter && viewItem == nexus.serverConnected","group":"0_connect@2"},
+
+        {"command":"nexus.server.edit","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/","group":"1_manage@1"},
+        {"command":"nexus.server.duplicate","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/","group":"1_manage@2"},
+
+        {"command":"nexus.server.copyInfo","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/","group":"2_clipboard"},
+
+        {"command":"nexus.server.remove","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/","group":"3_destructive"},
+
+        {"command":"nexus.group.connect","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"inline@1"},
+        {"command":"nexus.group.disconnect","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"inline@2"},
+        {"command":"nexus.group.connect","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"0_connect@1"},
+        {"command":"nexus.group.disconnect","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"0_connect@2"},
+        {"command":"nexus.server.add","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"1_manage@1"},
+        {"command":"nexus.serial.add","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"1_manage@2"},
+
+        {"command":"nexus.serial.connect","when":"view == nexusCommandCenter && viewItem == nexus.serialProfile","group":"inline"},
+        {"command":"nexus.serial.disconnect","when":"view == nexusCommandCenter && viewItem == nexus.serialProfileConnected","group":"inline"},
+        {"command":"nexus.serial.disconnect","when":"view == nexusCommandCenter && viewItem == nexus.serialSessionNode","group":"inline"},
+
+        {"command":"nexus.serial.connect","when":"view == nexusCommandCenter && viewItem == nexus.serialProfile","group":"0_connect"},
+        {"command":"nexus.serial.disconnect","when":"view == nexusCommandCenter && viewItem == nexus.serialProfileConnected","group":"0_connect"},
+
+        {"command":"nexus.serial.edit","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected)?$/","group":"1_manage@1"},
+        {"command":"nexus.serial.duplicate","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected)?$/","group":"1_manage@2"},
+
+        {"command":"nexus.serial.copyInfo","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected)?$/","group":"2_clipboard"},
+
+        {"command":"nexus.serial.remove","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected)?$/","group":"3_destructive"},
+
+        {"command":"nexus.tunnel.start","when":"view == nexusTunnels && viewItem == nexus.tunnel","group":"inline"},
+        {"command":"nexus.tunnel.stop","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"inline@1"},
+        {"command":"nexus.tunnel.restart","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"inline@2"},
+
+        {"command":"nexus.tunnel.start","when":"view == nexusTunnels && viewItem == nexus.tunnel","group":"0_connect"},
+        {"command":"nexus.tunnel.stop","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"0_connect@1"},
+        {"command":"nexus.tunnel.restart","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"0_connect@2"},
+
+        {"command":"nexus.tunnel.edit","when":"view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/","group":"1_manage@1"},
+        {"command":"nexus.tunnel.duplicate","when":"view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/","group":"1_manage@2"},
+
+        {"command":"nexus.tunnel.copyInfo","when":"view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/","group":"2_clipboard"},
+
+        {"command":"nexus.tunnel.remove","when":"view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/","group":"3_destructive"}
       ],
       "commandPalette": [
-        {
-          "command": "nexus.refresh",
-          "when": "true"
-        },
-        {
-          "command": "nexus.server.add",
-          "when": "true"
-        },
-        {
-          "command": "nexus.tunnel.add",
-          "when": "true"
-        },
-        {
-          "command": "nexus.serial.listPorts",
-          "when": "true"
-        },
-        {
-          "command": "nexus.serial.add",
-          "when": "true"
-        },
-        {
-          "command": "nexus.serial.edit",
-          "when": "true"
-        },
-        {
-          "command": "nexus.serial.remove",
-          "when": "true"
-        },
-        {
-          "command": "nexus.serial.connect",
-          "when": "true"
-        },
-        {
-          "command": "nexus.serial.disconnect",
-          "when": "true"
-        },
-        {
-          "command": "nexus.server.edit",
-          "when": "true"
-        },
-        {
-          "command": "nexus.tunnel.edit",
-          "when": "true"
-        },
-        {
-          "command": "nexus.server.connect",
-          "when": "true"
-        },
-        {
-          "command": "nexus.server.disconnect",
-          "when": "true"
-        },
-        {
-          "command": "nexus.server.remove",
-          "when": "true"
-        },
-        {
-          "command": "nexus.tunnel.remove",
-          "when": "true"
-        },
-        {
-          "command": "nexus.tunnel.start",
-          "when": "true"
-        },
-        {
-          "command": "nexus.tunnel.stop",
-          "when": "true"
-        }
+        {"command":"nexus.refresh","when":"true"},
+        {"command":"nexus.server.add","when":"true"},
+        {"command":"nexus.server.edit","when":"true"},
+        {"command":"nexus.server.connect","when":"true"},
+        {"command":"nexus.server.disconnect","when":"true"},
+        {"command":"nexus.server.remove","when":"true"},
+        {"command":"nexus.server.copyInfo","when":"true"},
+        {"command":"nexus.server.duplicate","when":"true"},
+        {"command":"nexus.tunnel.add","when":"true"},
+        {"command":"nexus.tunnel.edit","when":"true"},
+        {"command":"nexus.tunnel.start","when":"true"},
+        {"command":"nexus.tunnel.stop","when":"true"},
+        {"command":"nexus.tunnel.restart","when":"true"},
+        {"command":"nexus.tunnel.remove","when":"true"},
+        {"command":"nexus.tunnel.copyInfo","when":"true"},
+        {"command":"nexus.tunnel.duplicate","when":"true"},
+        {"command":"nexus.serial.add","when":"true"},
+        {"command":"nexus.serial.edit","when":"true"},
+        {"command":"nexus.serial.connect","when":"true"},
+        {"command":"nexus.serial.disconnect","when":"true"},
+        {"command":"nexus.serial.remove","when":"true"},
+        {"command":"nexus.serial.listPorts","when":"true"},
+        {"command":"nexus.serial.copyInfo","when":"true"},
+        {"command":"nexus.serial.duplicate","when":"true"},
+        {"command":"nexus.group.connect","when":"false"},
+        {"command":"nexus.group.disconnect","when":"false"}
       ]
     },
     "keybindings": [
