@@ -5,6 +5,10 @@
   "version": "0.1.6",
   "publisher": "nexus",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/evdanil/vscode-NexTerminal.git"
+  },
   "engines": {
     "vscode": "^1.95.0"
   },
