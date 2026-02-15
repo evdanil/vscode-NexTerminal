@@ -63,7 +63,7 @@ Passwords stored separately via VS Code `SecretStorage` with key pattern `passwo
 
 ### UI components
 - **NexusTreeProvider**: Command Center sidebar — servers, sessions, serial profiles. Supports drag-and-drop of tunnel profiles onto servers
-- **TunnelTreeProvider**: Tunnel Patch Bay — tunnel profiles with live traffic counters
+- **TunnelTreeProvider**: Port Forwarding — tunnel profiles with live traffic counters
 - **TunnelMonitorViewProvider**: Webview panel rendering tunnel status HTML (no scripts, static render via `renderTunnelMonitorHtml()`)
 
 ### Data models (`src/models/config.ts`)

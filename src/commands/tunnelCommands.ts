@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type {
@@ -8,8 +9,10 @@ import type {
 } from "../models/config";
 import type { SilentAuthSshFactory } from "../services/ssh/silentAuth";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
+import { tunnelFormDefinition } from "../ui/formDefinitions";
+import type { FormValues } from "../ui/formTypes";
 import { TunnelTreeItem } from "../ui/tunnelTreeProvider";
-import { promptTunnelProfile } from "../ui/prompts";
+import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { isTunnelRouteChanged } from "../utils/tunnelProfile";
 import type { CommandContext } from "./types";
 
@@ -214,28 +217,50 @@ async function stopTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<vo
   await ctx.tunnelManager.stop(pick.active.id);
 }
 
+function formValuesToTunnel(values: FormValues, existingId?: string, defaultServerId?: string): TunnelProfile | undefined {
+  const name = typeof values.name === "string" ? values.name.trim() : "";
+  if (!name) {
+    return undefined;
+  }
+  return {
+    id: existingId ?? randomUUID(),
+    name,
+    localPort: typeof values.localPort === "number" ? values.localPort : 0,
+    remoteIP: typeof values.remoteIP === "string" ? values.remoteIP.trim() : "127.0.0.1",
+    remotePort: typeof values.remotePort === "number" ? values.remotePort : 0,
+    defaultServerId,
+    autoStart: values.autoStart === true,
+    connectionMode: (values.connectionMode as TunnelConnectionMode) ?? "isolated"
+  };
+}
+
 export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
-    vscode.commands.registerCommand("nexus.tunnel.add", async () => {
-      const profile = await promptTunnelProfile(undefined, { mode: "add" });
-      if (!profile) {
-        return;
-      }
-      const servers = ctx.core.getSnapshot().servers.filter((s) => !s.isHidden);
-      if (servers.length > 0) {
-        const pick = await vscode.window.showQuickPick(
-          servers.map((server) => ({
-            label: server.name,
-            description: `${server.username}@${server.host}:${server.port}`,
-            server
-          })),
-          { title: "Select Nexus Server" }
-        );
-        if (pick) {
-          profile.defaultServerId = pick.server.id;
+    vscode.commands.registerCommand("nexus.tunnel.add", () => {
+      const definition = tunnelFormDefinition();
+      WebviewFormPanel.open("tunnel-add", definition, {
+        onSubmit: async (values) => {
+          const profile = formValuesToTunnel(values);
+          if (!profile) {
+            return;
+          }
+          const servers = ctx.core.getSnapshot().servers.filter((s) => !s.isHidden);
+          if (servers.length > 0) {
+            const pick = await vscode.window.showQuickPick(
+              servers.map((server) => ({
+                label: server.name,
+                description: `${server.username}@${server.host}:${server.port}`,
+                server
+              })),
+              { title: "Assign tunnel to a server (optional)" }
+            );
+            if (pick) {
+              profile.defaultServerId = pick.server.id;
+            }
+          }
+          await ctx.core.addOrUpdateTunnel(profile);
         }
-      }
-      await ctx.core.addOrUpdateTunnel(profile);
+      });
     }),
 
     vscode.commands.registerCommand("nexus.tunnel.edit", async (arg?: unknown) => {
@@ -243,45 +268,48 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       if (!existing) {
         return;
       }
-      const updated = await promptTunnelProfile(existing, { mode: "edit" });
-      if (!updated) {
-        return;
-      }
-      updated.id = existing.id;
-      updated.defaultServerId = existing.defaultServerId;
+      const definition = tunnelFormDefinition(existing);
+      WebviewFormPanel.open("tunnel-edit", definition, {
+        onSubmit: async (values) => {
+          const updated = formValuesToTunnel(values, existing.id, existing.defaultServerId);
+          if (!updated) {
+            return;
+          }
 
-      const previousActive = ctx.core
-        .getSnapshot()
-        .activeTunnels.find((tunnel) => tunnel.profileId === existing.id);
-      await ctx.core.addOrUpdateTunnel(updated);
+          const previousActive = ctx.core
+            .getSnapshot()
+            .activeTunnels.find((tunnel) => tunnel.profileId === existing.id);
+          await ctx.core.addOrUpdateTunnel(updated);
 
-      if (!previousActive || !isTunnelRouteChanged(existing, updated)) {
-        return;
-      }
+          if (!previousActive || !isTunnelRouteChanged(existing, updated)) {
+            return;
+          }
 
-      const restartChoice = await vscode.window.showWarningMessage(
-        `Tunnel "${updated.name}" route changed while active. Restart now to apply new route?`,
-        "Restart now",
-        "Keep current route"
-      );
-      if (restartChoice !== "Restart now") {
-        void vscode.window.showInformationMessage("Route changes will apply the next time the tunnel starts.");
-        return;
-      }
+          const restartChoice = await vscode.window.showWarningMessage(
+            `Tunnel "${updated.name}" route changed while active. Restart now to apply new route?`,
+            "Restart now",
+            "Keep current route"
+          );
+          if (restartChoice !== "Restart now") {
+            void vscode.window.showInformationMessage("Route changes will apply the next time the tunnel starts.");
+            return;
+          }
 
-      await ctx.tunnelManager.stop(previousActive.id);
-      const server = ctx.core.getServer(previousActive.serverId);
-      if (!server) {
-        void vscode.window.showWarningMessage(
-          "Tunnel stopped. Could not restart automatically because its server profile is unavailable."
-        );
-        return;
-      }
-      const mode = await resolveTunnelConnectionMode(updated, false);
-      if (!mode) {
-        return;
-      }
-      await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, updated, server, mode);
+          await ctx.tunnelManager.stop(previousActive.id);
+          const server = ctx.core.getServer(previousActive.serverId);
+          if (!server) {
+            void vscode.window.showWarningMessage(
+              "Tunnel stopped. Could not restart automatically because its server profile is unavailable."
+            );
+            return;
+          }
+          const mode = await resolveTunnelConnectionMode(updated, false);
+          if (!mode) {
+            return;
+          }
+          await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, updated, server, mode);
+        }
+      });
     }),
 
     vscode.commands.registerCommand("nexus.tunnel.remove", async (arg?: unknown) => {

@@ -42,7 +42,7 @@
         },
         {
           "id": "nexusTunnels",
-          "name": "Tunnel Patch Bay"
+          "name": "Port Forwarding"
         },
         {
           "id": "nexusTunnelMonitor",
@@ -195,6 +195,11 @@
         {
           "command": "nexus.server.connect",
           "when": "view == nexusCommandCenter && viewItem == nexus.server",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.server.connect",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
           "group": "inline"
         },
         {

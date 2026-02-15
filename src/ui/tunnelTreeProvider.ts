@@ -15,7 +15,10 @@ export class TunnelTreeItem extends vscode.TreeItem {
     super(profile.name, vscode.TreeItemCollapsibleState.None);
     this.id = `tunnel:${profile.id}`;
     this.contextValue = activeTunnelId ? "nexus.activeTunnel" : "nexus.tunnel";
-    this.iconPath = new vscode.ThemeIcon(activeTunnelId ? "radio-tower" : "debug-start");
+    this.iconPath = new vscode.ThemeIcon(
+      activeTunnelId ? "circle-filled" : "circle-outline",
+      new vscode.ThemeColor(activeTunnelId ? "testing.iconPassed" : "descriptionForeground")
+    );
     const mode = profile.connectionMode ?? "isolated";
     this.description = activeTunnelId
       ? `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort} | ${mode} | in ${formatBytes(bytesIn ?? 0)} out ${formatBytes(bytesOut ?? 0)}`

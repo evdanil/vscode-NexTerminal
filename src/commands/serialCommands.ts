@@ -1,14 +1,17 @@
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import type { SerialProfile } from "../models/config";
+import type { SerialDataBits, SerialParity, SerialProfile, SerialStopBits } from "../models/config";
 import { SerialPty } from "../services/serial/serialPty";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
-import { toParityCode } from "../utils/helpers";
+import { serialFormDefinition } from "../ui/formDefinitions";
+import type { FormValues } from "../ui/formTypes";
 import {
   GroupTreeItem,
   SerialProfileTreeItem,
   SerialSessionTreeItem
 } from "../ui/nexusTreeProvider";
-import { promptSerialProfile } from "../ui/prompts";
+import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import { toParityCode } from "../utils/helpers";
 import type { CommandContext } from "./types";
 
 async function pickSerialProfile(
@@ -130,16 +133,40 @@ function collectGroups(ctx: CommandContext): string[] {
   return [...groups].sort((a, b) => a.localeCompare(b));
 }
 
+function formValuesToSerial(values: FormValues, existingId?: string): SerialProfile | undefined {
+  const name = typeof values.name === "string" ? values.name.trim() : "";
+  const portPath = typeof values.path === "string" ? values.path.trim() : "";
+  if (!name || !portPath) {
+    return undefined;
+  }
+  return {
+    id: existingId ?? randomUUID(),
+    name,
+    path: portPath,
+    baudRate: typeof values.baudRate === "string" ? Number(values.baudRate) : 115200,
+    dataBits: (typeof values.dataBits === "string" ? Number(values.dataBits) : 8) as SerialDataBits,
+    stopBits: (typeof values.stopBits === "string" ? Number(values.stopBits) : 1) as SerialStopBits,
+    parity: (values.parity as SerialParity) ?? "none",
+    rtscts: values.rtscts === true,
+    group: typeof values.group === "string" && values.group ? values.group : undefined
+  };
+}
+
 export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
-    vscode.commands.registerCommand("nexus.serial.add", async (arg?: unknown) => {
+    vscode.commands.registerCommand("nexus.serial.add", (arg?: unknown) => {
       const group = toGroupFromArg(arg);
       const existingGroups = collectGroups(ctx);
-      const profile = await promptSerialProfile(group ? { group } : undefined, { mode: "add", existingGroups });
-      if (!profile) {
-        return;
-      }
-      await ctx.core.addOrUpdateSerialProfile(profile);
+      const definition = serialFormDefinition(group ? { group } : undefined, existingGroups);
+      WebviewFormPanel.open("serial-add", definition, {
+        onSubmit: async (values) => {
+          const profile = formValuesToSerial(values);
+          if (!profile) {
+            return;
+          }
+          await ctx.core.addOrUpdateSerialProfile(profile);
+        }
+      });
     }),
 
     vscode.commands.registerCommand("nexus.serial.edit", async (arg?: unknown) => {
@@ -148,17 +175,21 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const existingGroups = collectGroups(ctx);
-      const updated = await promptSerialProfile(existing, { mode: "edit", existingGroups });
-      if (!updated) {
-        return;
-      }
-      updated.id = existing.id;
-      await ctx.core.addOrUpdateSerialProfile(updated);
-      if (ctx.core.isSerialProfileConnected(existing.id)) {
-        void vscode.window.showInformationMessage(
-          "Serial profile updated. Existing sessions keep current settings until reconnect."
-        );
-      }
+      const definition = serialFormDefinition(existing, existingGroups);
+      WebviewFormPanel.open("serial-edit", definition, {
+        onSubmit: async (values) => {
+          const updated = formValuesToSerial(values, existing.id);
+          if (!updated) {
+            return;
+          }
+          await ctx.core.addOrUpdateSerialProfile(updated);
+          if (ctx.core.isSerialProfileConnected(existing.id)) {
+            void vscode.window.showInformationMessage(
+              "Serial profile updated. Existing sessions keep current settings until reconnect."
+            );
+          }
+        }
+      });
     }),
 
     vscode.commands.registerCommand("nexus.serial.remove", async (arg?: unknown) => {

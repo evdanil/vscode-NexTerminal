@@ -13,7 +13,7 @@ describe("renderTunnelMonitorHtml", () => {
     });
 
     expect(html).toContain("Active tunnels: 0");
-    expect(html).toContain("No active tunnels. Start one from the Tunnel Patch Bay.");
+    expect(html).toContain("No active tunnels. Start one from Port Forwarding.");
   });
 
   it("renders tunnel rows and escapes HTML-sensitive fields", () => {

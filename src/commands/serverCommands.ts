@@ -1,8 +1,12 @@
+import { randomUUID } from "node:crypto";
+import * as os from "node:os";
 import * as vscode from "vscode";
-import type { ServerConfig } from "../models/config";
+import type { AuthType, ServerConfig } from "../models/config";
 import { SshPty } from "../services/ssh/sshPty";
+import { serverFormDefinition } from "../ui/formDefinitions";
+import type { FormValues } from "../ui/formTypes";
 import { ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
-import { promptServerConfig } from "../ui/prompts";
+import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { resolveTunnelConnectionMode, startTunnel } from "./tunnelCommands";
 import type { CommandContext, ServerTerminalMap } from "./types";
 
@@ -85,6 +89,38 @@ function collectGroups(ctx: CommandContext): string[] {
   return [...groups].sort((a, b) => a.localeCompare(b));
 }
 
+function formValuesToServer(values: FormValues, existingId?: string): ServerConfig | undefined {
+  const name = typeof values.name === "string" ? values.name.trim() : "";
+  const host = typeof values.host === "string" ? values.host.trim() : "";
+  const username = typeof values.username === "string" ? values.username.trim() : "";
+  if (!name || !host || !username) {
+    return undefined;
+  }
+  return {
+    id: existingId ?? randomUUID(),
+    name,
+    host,
+    port: typeof values.port === "number" ? values.port : 22,
+    username,
+    authType: (values.authType as AuthType) ?? "password",
+    keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
+    group: typeof values.group === "string" && values.group ? values.group : undefined,
+    isHidden: values.isHidden === true
+  };
+}
+
+async function browseForKey(): Promise<string | undefined> {
+  const uris = await vscode.window.showOpenDialog({
+    canSelectFiles: true,
+    canSelectMany: false,
+    title: "Select SSH Private Key",
+    defaultUri: vscode.Uri.file(os.homedir() + "/.ssh/"),
+    openLabel: "Select Key",
+    filters: { "All Files": ["*"] }
+  });
+  return uris?.[0]?.fsPath;
+}
+
 async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
@@ -158,13 +194,19 @@ async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<voi
 
 export function registerServerCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
-    vscode.commands.registerCommand("nexus.server.add", async () => {
+    vscode.commands.registerCommand("nexus.server.add", () => {
       const existingGroups = collectGroups(ctx);
-      const server = await promptServerConfig(undefined, { mode: "add", existingGroups });
-      if (!server) {
-        return;
-      }
-      await ctx.core.addOrUpdateServer(server);
+      const definition = serverFormDefinition(undefined, existingGroups);
+      WebviewFormPanel.open("server-add", definition, {
+        onSubmit: async (values) => {
+          const server = formValuesToServer(values);
+          if (!server) {
+            return;
+          }
+          await ctx.core.addOrUpdateServer(server);
+        },
+        onBrowse: browseForKey
+      });
     }),
 
     vscode.commands.registerCommand("nexus.server.edit", async (arg?: unknown) => {
@@ -173,17 +215,22 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const existingGroups = collectGroups(ctx);
-      const updated = await promptServerConfig(existing, { mode: "edit", existingGroups });
-      if (!updated) {
-        return;
-      }
-      updated.id = existing.id;
-      await ctx.core.addOrUpdateServer(updated);
-      if (ctx.core.isServerConnected(existing.id)) {
-        void vscode.window.showInformationMessage(
-          "Server profile updated. Existing sessions keep current connection settings until reconnect."
-        );
-      }
+      const definition = serverFormDefinition(existing, existingGroups);
+      WebviewFormPanel.open("server-edit", definition, {
+        onSubmit: async (values) => {
+          const updated = formValuesToServer(values, existing.id);
+          if (!updated) {
+            return;
+          }
+          await ctx.core.addOrUpdateServer(updated);
+          if (ctx.core.isServerConnected(existing.id)) {
+            void vscode.window.showInformationMessage(
+              "Server profile updated. Existing sessions keep current connection settings until reconnect."
+            );
+          }
+        },
+        onBrowse: browseForKey
+      });
     }),
 
     vscode.commands.registerCommand("nexus.server.remove", async (arg?: unknown) => {

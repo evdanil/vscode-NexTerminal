@@ -48,7 +48,7 @@ export function renderTunnelMonitorHtml(snapshot: SessionSnapshot): string {
 ${tunnelRows}
   </tbody>
 </table>`
-      : `<div class="empty-state">No active tunnels. Start one from the Tunnel Patch Bay.</div>`;
+      : `<div class="empty-state">No active tunnels. Start one from Port Forwarding.</div>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
