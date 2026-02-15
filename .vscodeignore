@@ -5,6 +5,7 @@ docs/**
 *.ts
 tsconfig*.json
 vitest.config.ts
+esbuild.mjs
 
 # Dev/build artifacts
 coverage/**
@@ -19,8 +20,21 @@ package-lock.json
 .claude/**
 CLAUDE.md
 
-# Node modules — strip everything except .js, .json, .node, .d.ts
+# Node modules — only serialport (native) is needed at runtime; everything else is bundled
 node_modules/.package-lock.json
+
+# Exclude all node_modules EXCEPT serialport and its native dependencies
+node_modules/ssh2/**
+node_modules/asn1/**
+node_modules/bcrypt-pbkdf/**
+node_modules/tweetnacl/**
+node_modules/safer-buffer/**
+node_modules/cpu-features/**
+node_modules/nan/**
+node_modules/buildcheck/**
+node_modules/esbuild/**
+
+# Strip non-essential files from remaining node_modules
 node_modules/**/test/**
 node_modules/**/tests/**
 node_modules/**/docs/**
@@ -52,6 +66,7 @@ node_modules/**/bower.json
 node_modules/**/.editorconfig
 node_modules/**/.gitattributes
 node_modules/**/.releaserc
+node_modules/**/.npmignore
 
 # Native addon source and build artifacts
 node_modules/**/*.cpp
@@ -77,8 +92,18 @@ node_modules/**/build/binding.Makefile
 node_modules/**/build/Release/.deps/**
 node_modules/**/build/Release/obj.target/**
 node_modules/**/build/**/*.Makefile
+node_modules/**/Jenkinsfile
+node_modules/**/Vagrantfile
+node_modules/**/Dockerfile
+node_modules/**/WORKSPACE
+node_modules/**/BUILD.bazel
+node_modules/**/*.bzl
+node_modules/**/*.cmake*
+node_modules/**/cmake/**
+node_modules/**/deps/**/scripts/**
+node_modules/**/deps/**/patches/**
 
-# Unused serialport sub-packages (we only use @serialport/stream + bindings-cpp)
+# Unused serialport sub-packages (only stream + bindings-cpp needed)
 node_modules/@serialport/binding-mock/**
 node_modules/@serialport/parser-byte-length/**
 node_modules/@serialport/parser-cctalk/**
@@ -90,20 +115,3 @@ node_modules/@serialport/parser-ready/**
 node_modules/@serialport/parser-regex/**
 node_modules/@serialport/parser-slip-encoder/**
 node_modules/@serialport/parser-spacepacket/**
-
-# Misc junk files
-node_modules/**/.npmignore
-node_modules/**/.clang-format
-node_modules/**/.dockerignore
-node_modules/**/.grenrc.yml
-node_modules/**/.pre-commit-config.yaml
-node_modules/**/Jenkinsfile
-node_modules/**/Vagrantfile
-node_modules/**/Dockerfile
-node_modules/**/WORKSPACE
-node_modules/**/BUILD.bazel
-node_modules/**/*.bzl
-node_modules/**/*.cmake*
-node_modules/**/cmake/**
-node_modules/**/deps/**/scripts/**
-node_modules/**/deps/**/patches/**

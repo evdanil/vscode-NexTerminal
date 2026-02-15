@@ -429,12 +429,14 @@
   },
   "scripts": {
     "clean": "rimraf dist coverage",
-    "build": "npm run clean && tsc -p tsconfig.json",
-    "watch": "tsc -p tsconfig.json --watch",
+    "compile": "tsc -p tsconfig.json --noEmit",
+    "build": "npm run clean && npm run compile && node esbuild.mjs",
+    "build:production": "npm run clean && npm run compile && node esbuild.mjs --production",
+    "watch": "tsc -p tsconfig.json --watch --noEmit",
     "test": "vitest run --coverage",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
-    "package:vsix": "vsce package"
+    "package:vsix": "npm run build:production && vsce package"
   },
   "dependencies": {
     "serialport": "^13.0.0",
@@ -444,8 +446,9 @@
     "@types/node": "^22.13.10",
     "@types/ssh2": "^1.15.5",
     "@types/vscode": "^1.95.0",
-    "@vscode/vsce": "^3.3.2",
     "@vitest/coverage-v8": "^3.0.9",
+    "@vscode/vsce": "^3.3.2",
+    "esbuild": "^0.27.3",
     "rimraf": "^6.0.1",
     "typescript": "^5.8.2",
     "vitest": "^3.0.9"

@@ -5,9 +5,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Development Commands
 
 ```bash
-npm run build          # Clean + compile TypeScript to dist/
-npm run watch          # Watch mode recompilation
-npm run package:vsix   # Package as installable VSIX
+npm run build          # Clean + type-check + esbuild bundle to dist/
+npm run build:production  # Same but minified, no sourcemaps
+npm run compile        # Type-check only (no emit)
+npm run watch          # Watch mode type-checking
+npm run package:vsix   # Production build + package as installable VSIX
 npm test               # Run all tests with coverage
 npm run test:unit      # Run unit tests only (test/unit/)
 npm run test:integration  # Run integration tests only (test/integration/)
@@ -21,7 +23,7 @@ To run tests matching a pattern: `npx vitest run -t "pattern"`
 - **Runtime:** VS Code Extension (desktop + web fallback)
 - **Language:** TypeScript (strict, ES2022 target, CommonJS output)
 - **Test framework:** Vitest with v8 coverage
-- **No bundler** — direct tsc compilation to `dist/`
+- **Bundler:** esbuild (bundles all source + pure-JS deps; native `serialport` stays external)
 - **No linter/formatter** configured
 
 ## Architecture
