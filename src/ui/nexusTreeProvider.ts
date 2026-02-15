@@ -1,10 +1,11 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
-import type { ActiveSession, ServerConfig } from "../models/config";
+import type { ActiveSerialSession, ActiveSession, SerialProfile, ServerConfig } from "../models/config";
+import { toParityCode } from "../utils/helpers";
 
 const TUNNEL_DRAG_MIME = "application/vnd.nexus.tunnelProfile";
 
-class GroupTreeItem extends vscode.TreeItem {
+export class GroupTreeItem extends vscode.TreeItem {
   public constructor(public readonly groupName: string) {
     super(groupName, vscode.TreeItemCollapsibleState.Expanded);
     this.contextValue = "nexus.group";
@@ -19,22 +20,49 @@ export class ServerTreeItem extends vscode.TreeItem {
     this.id = `server:${server.id}`;
     this.tooltip = `${server.username}@${server.host}:${server.port}`;
     this.description = `${server.username}@${server.host}`;
-    this.contextValue = connected ? "nexus.session" : "nexus.server";
-    this.iconPath = new vscode.ThemeIcon(connected ? "plug" : "debug-disconnect");
+    this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
+    this.iconPath = new vscode.ThemeIcon(
+      connected ? "plug" : "debug-disconnect",
+      new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
+    );
   }
 }
 
-class SessionTreeItem extends vscode.TreeItem {
+export class SessionTreeItem extends vscode.TreeItem {
   public constructor(public readonly session: ActiveSession) {
     super(session.terminalName, vscode.TreeItemCollapsibleState.None);
     this.id = `session:${session.id}`;
-    this.contextValue = "nexus.session";
+    this.contextValue = "nexus.sessionNode";
     this.description = "active";
     this.iconPath = new vscode.ThemeIcon("terminal");
   }
 }
 
-type NexusTreeItem = GroupTreeItem | ServerTreeItem | SessionTreeItem;
+export class SerialProfileTreeItem extends vscode.TreeItem {
+  public constructor(public readonly profile: SerialProfile, connected: boolean) {
+    super(profile.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
+    this.id = `serial:${profile.id}`;
+    this.tooltip = `${profile.path} @ ${profile.baudRate}`;
+    this.description = `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`;
+    this.contextValue = connected ? "nexus.serialProfileConnected" : "nexus.serialProfile";
+    this.iconPath = new vscode.ThemeIcon(
+      connected ? "plug" : "debug-disconnect",
+      new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
+    );
+  }
+}
+
+export class SerialSessionTreeItem extends vscode.TreeItem {
+  public constructor(public readonly session: ActiveSerialSession) {
+    super(session.terminalName, vscode.TreeItemCollapsibleState.None);
+    this.id = `serial-session:${session.id}`;
+    this.contextValue = "nexus.serialSessionNode";
+    this.description = "active";
+    this.iconPath = new vscode.ThemeIcon("terminal");
+  }
+}
+
+type NexusTreeItem = GroupTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem;
 
 export class NexusTreeProvider
   implements vscode.TreeDataProvider<NexusTreeItem>, vscode.TreeDragAndDropController<NexusTreeItem>
@@ -43,7 +71,9 @@ export class NexusTreeProvider
   private snapshot: SessionSnapshot = {
     servers: [],
     tunnels: [],
+    serialProfiles: [],
     activeSessions: [],
+    activeSerialSessions: [],
     activeTunnels: []
   };
 
@@ -75,15 +105,25 @@ export class NexusTreeProvider
       return this.getRootItems();
     }
     if (element instanceof GroupTreeItem) {
-      return this.snapshot.servers
+      const servers = this.snapshot.servers
         .filter((server) => server.group === element.groupName && !server.isHidden)
         .sort((a, b) => a.name.localeCompare(b.name))
         .map((server) => this.toServerItem(server));
+      const serialProfiles = this.snapshot.serialProfiles
+        .filter((profile) => profile.group === element.groupName)
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((profile) => this.toSerialProfileItem(profile));
+      return [...servers, ...serialProfiles];
     }
     if (element instanceof ServerTreeItem) {
       return this.snapshot.activeSessions
         .filter((session) => session.serverId === element.server.id)
         .map((session) => new SessionTreeItem(session));
+    }
+    if (element instanceof SerialProfileTreeItem) {
+      return this.snapshot.activeSerialSessions
+        .filter((session) => session.profileId === element.profile.id)
+        .map((session) => new SerialSessionTreeItem(session));
     }
     return [];
   }
@@ -109,7 +149,8 @@ export class NexusTreeProvider
 
   private getRootItems(): NexusTreeItem[] {
     const groupNames = new Set<string>();
-    const ungrouped: ServerConfig[] = [];
+    const ungroupedServers: ServerConfig[] = [];
+    const ungroupedSerialProfiles: SerialProfile[] = [];
     for (const server of this.snapshot.servers) {
       if (server.isHidden) {
         continue;
@@ -117,17 +158,34 @@ export class NexusTreeProvider
       if (server.group) {
         groupNames.add(server.group);
       } else {
-        ungrouped.push(server);
+        ungroupedServers.push(server);
+      }
+    }
+    for (const profile of this.snapshot.serialProfiles) {
+      if (profile.group) {
+        groupNames.add(profile.group);
+      } else {
+        ungroupedSerialProfiles.push(profile);
       }
     }
 
     const groupItems = [...groupNames].sort((a, b) => a.localeCompare(b)).map((group) => new GroupTreeItem(group));
-    const serverItems = ungrouped.sort((a, b) => a.name.localeCompare(b.name)).map((server) => this.toServerItem(server));
-    return [...groupItems, ...serverItems];
+    const serverItems = ungroupedServers
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((server) => this.toServerItem(server));
+    const serialItems = ungroupedSerialProfiles
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((profile) => this.toSerialProfileItem(profile));
+    return [...groupItems, ...serverItems, ...serialItems];
   }
 
   private toServerItem(server: ServerConfig): ServerTreeItem {
     const connected = this.snapshot.activeSessions.some((session) => session.serverId === server.id);
     return new ServerTreeItem(server, connected);
+  }
+
+  private toSerialProfileItem(profile: SerialProfile): SerialProfileTreeItem {
+    const connected = this.snapshot.activeSerialSessions.some((session) => session.profileId === profile.id);
+    return new SerialProfileTreeItem(profile, connected);
   }
 }

@@ -1,6 +1,9 @@
 export type AuthType = "password" | "key" | "agent";
 export type TunnelConnectionMode = "isolated" | "shared" | "ask";
 export type ResolvedTunnelConnectionMode = Exclude<TunnelConnectionMode, "ask">;
+export type SerialParity = "none" | "even" | "odd" | "mark" | "space";
+export type SerialDataBits = 5 | 6 | 7 | 8;
+export type SerialStopBits = 1 | 2;
 
 export interface ServerConfig {
   id: string;
@@ -25,9 +28,28 @@ export interface TunnelProfile {
   connectionMode?: TunnelConnectionMode;
 }
 
+export interface SerialProfile {
+  id: string;
+  name: string;
+  group?: string;
+  path: string;
+  baudRate: number;
+  dataBits: SerialDataBits;
+  stopBits: SerialStopBits;
+  parity: SerialParity;
+  rtscts: boolean;
+}
+
 export interface ActiveSession {
   id: string;
   serverId: string;
+  terminalName: string;
+  startedAt: number;
+}
+
+export interface ActiveSerialSession {
+  id: string;
+  profileId: string;
   terminalName: string;
   startedAt: number;
 }

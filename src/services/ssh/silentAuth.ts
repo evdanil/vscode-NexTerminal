@@ -17,6 +17,14 @@ function isAuthError(error: unknown): boolean {
   );
 }
 
+function isPassphraseError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const message = error.message.toLowerCase();
+  return message.includes("encrypted") || message.includes("passphrase") || message.includes("bad decrypt");
+}
+
 export class SilentAuthSshFactory {
   public constructor(
     private readonly connector: SshConnector,
@@ -25,6 +33,21 @@ export class SilentAuthSshFactory {
   ) {}
 
   public async connect(server: ServerConfig): Promise<SshConnection> {
+    if (server.authType === "key") {
+      try {
+        return await this.connector.connect(server, {});
+      } catch (error) {
+        if (!isPassphraseError(error)) {
+          throw error;
+        }
+        const passphrase = await this.passphrasePrompt(server);
+        if (!passphrase) {
+          throw new Error(`Passphrase entry canceled for ${server.name}`);
+        }
+        return this.connector.connect(server, { passphrase });
+      }
+    }
+
     if (server.authType !== "password") {
       return this.connector.connect(server, {});
     }
@@ -54,5 +77,13 @@ export class SilentAuthSshFactory {
       await this.vault.delete(key);
     }
     return connection;
+  }
+
+  private async passphrasePrompt(server: ServerConfig): Promise<string | undefined> {
+    const result = await this.prompt.prompt({
+      ...server,
+      name: `${server.name} (key passphrase)`
+    });
+    return result?.password;
   }
 }

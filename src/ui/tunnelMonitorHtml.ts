@@ -1,4 +1,5 @@
 import type { SessionSnapshot } from "../core/contracts";
+import { formatBytes } from "../utils/helpers";
 
 function escapeHtml(value: string): string {
   return value
@@ -7,16 +8,6 @@ function escapeHtml(value: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} KB`;
-  }
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export function renderTunnelMonitorHtml(snapshot: SessionSnapshot): string {
@@ -41,16 +32,16 @@ export function renderTunnelMonitorHtml(snapshot: SessionSnapshot): string {
 
   const body =
     tunnelRows.length > 0
-      ? `<table>
+      ? `<table role="table" aria-label="Active tunnel connections">
   <thead>
     <tr>
-      <th>Tunnel</th>
-      <th>Server</th>
-      <th>Route</th>
-      <th>Mode</th>
-      <th>Inbound</th>
-      <th>Outbound</th>
-      <th>Started</th>
+      <th scope="col">Tunnel</th>
+      <th scope="col">Server</th>
+      <th scope="col">Route</th>
+      <th scope="col">Mode</th>
+      <th scope="col">Inbound</th>
+      <th scope="col">Outbound</th>
+      <th scope="col">Started</th>
     </tr>
   </thead>
   <tbody>
@@ -65,20 +56,10 @@ ${tunnelRows}
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <style>
-    :root {
-      --bg: #0f1b2d;
-      --bg-accent: #16425b;
-      --text: #f4f7fb;
-      --muted: #a8bfd1;
-      --border: #2b4862;
-      --row: #102235;
-      --row-alt: #142c43;
-      --good: #42c59a;
-    }
     body {
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      background: linear-gradient(155deg, var(--bg) 0%, var(--bg-accent) 100%);
-      color: var(--text);
+      font-family: var(--vscode-font-family);
+      background: var(--vscode-editor-background);
+      color: var(--vscode-editor-foreground);
       margin: 0;
       padding: 12px;
     }
@@ -92,43 +73,43 @@ ${tunnelRows}
       width: 100%;
       border-collapse: collapse;
       font-size: 12px;
-      border: 1px solid var(--border);
+      border: 1px solid var(--vscode-panel-border);
       border-radius: 8px;
       overflow: hidden;
-      background: rgba(0, 0, 0, 0.15);
+      background: var(--vscode-editor-background);
     }
     th {
       text-align: left;
-      background: rgba(0, 0, 0, 0.2);
-      color: var(--muted);
+      background: var(--vscode-list-hoverBackground);
+      color: var(--vscode-descriptionForeground);
       font-weight: 600;
       padding: 8px 10px;
-      border-bottom: 1px solid var(--border);
+      border-bottom: 1px solid var(--vscode-panel-border);
     }
     td {
       padding: 8px 10px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      border-bottom: 1px solid var(--vscode-panel-border);
     }
     tr:nth-child(odd) td {
-      background: var(--row);
+      background: var(--vscode-editor-background);
     }
     tr:nth-child(even) td {
-      background: var(--row-alt);
+      background: var(--vscode-list-hoverBackground);
     }
     tr:last-child td {
       border-bottom: none;
     }
     .empty-state {
-      border: 1px dashed var(--border);
+      border: 1px dashed var(--vscode-panel-border);
       border-radius: 10px;
       padding: 20px 12px;
       text-align: center;
-      color: var(--muted);
-      background: rgba(0, 0, 0, 0.2);
+      color: var(--vscode-descriptionForeground);
+      background: var(--vscode-editor-background);
     }
     .summary {
       margin: 0 0 10px 0;
-      color: var(--good);
+      color: var(--vscode-terminal-ansiGreen);
       font-size: 12px;
       font-weight: 600;
     }

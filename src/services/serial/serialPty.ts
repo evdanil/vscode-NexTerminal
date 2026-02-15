@@ -1,18 +1,17 @@
 import * as vscode from "vscode";
 import type { SessionLogger } from "../../logging/terminalLogger";
+import { toParityCode } from "../../utils/helpers";
+import type { OpenPortParams } from "./protocol";
 
 export interface SerialTransport {
-  openPort(path: string, baudRate: number): Promise<string>;
+  openPort(options: OpenPortParams): Promise<string>;
   writePort(sessionId: string, data: Buffer): Promise<void>;
   closePort(sessionId: string): Promise<void>;
   onDidReceiveData(listener: (sessionId: string, data: Buffer) => void): () => void;
   onDidReceiveError(listener: (sessionId: string, message: string) => void): () => void;
 }
 
-export interface SerialPtyOptions {
-  path: string;
-  baudRate: number;
-}
+export type SerialPtyOptions = OpenPortParams;
 
 export interface SerialPtyCallbacks {
   onSessionOpened(sessionId: string): void;
@@ -87,15 +86,19 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
 
   private async start(): Promise<void> {
     try {
-      const sessionId = await this.transport.openPort(this.options.path, this.options.baudRate);
+      const sessionId = await this.transport.openPort(this.options);
       if (this.disposed) {
         await this.transport.closePort(sessionId);
         return;
       }
       this.sidecarSessionId = sessionId;
       this.callbacks.onSessionOpened(sessionId);
-      this.logger.log(`serial connected path=${this.options.path} baud=${this.options.baudRate}`);
-      this.writeEmitter.fire(`\r\n[Nexus Serial] Connected ${this.options.path} @ ${this.options.baudRate}\r\n`);
+      this.logger.log(
+        `serial connected path=${this.options.path} baud=${this.options.baudRate} parity=${this.options.parity ?? "none"} dataBits=${this.options.dataBits ?? 8} stopBits=${this.options.stopBits ?? 1} rtscts=${this.options.rtscts ? "on" : "off"}`
+      );
+      this.writeEmitter.fire(
+        `\r\n[Nexus Serial] Connected ${this.options.path} @ ${this.options.baudRate} (${this.options.dataBits ?? 8}${toParityCode(this.options.parity)}${this.options.stopBits ?? 1})\r\n`
+      );
 
       this.dataSubscription = this.transport.onDidReceiveData((eventSessionId, data) => {
         if (eventSessionId !== this.sidecarSessionId) {
@@ -119,4 +122,5 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.dispose();
     }
   }
+
 }

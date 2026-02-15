@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import * as readline from "node:readline";
-import type { RpcNotification, RpcRequest, RpcResponse, SerialPortInfo } from "./protocol";
+import type { OpenPortParams, RpcNotification, RpcRequest, RpcResponse, SerialPortInfo } from "./protocol";
 
 type PortRecord = {
   write(data: Buffer, callback: (error?: Error | null) => void): void;
@@ -12,6 +12,10 @@ type PortRecord = {
 type SerialPortCtor = new (options: {
   path: string;
   baudRate: number;
+  dataBits?: 5 | 6 | 7 | 8;
+  stopBits?: 1 | 2;
+  parity?: "none" | "even" | "odd" | "mark" | "space";
+  rtscts?: boolean;
   autoOpen: boolean;
 }) => PortRecord & { open(callback: (error?: Error | null) => void): void };
 
@@ -42,7 +46,7 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
   if (request.method === "listPorts") {
     const module = await loadSerialModule();
     if (!module) {
-      return response(request.id, []);
+      return response(request.id, undefined, "serialport module not installed");
     }
     const results = await module.SerialPort.list();
     return response(request.id, results);
@@ -54,8 +58,8 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
       return response(request.id, undefined, "serialport module not installed");
     }
 
-    const params = request.params as { path?: string; baudRate?: number };
-    if (!params.path || !params.baudRate) {
+    const params = request.params as OpenPortParams | undefined;
+    if (!params || !params.path || !params.baudRate) {
       return response(request.id, undefined, "invalid openPort parameters");
     }
 
@@ -63,6 +67,10 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
     const port = new module.SerialPort({
       path: params.path,
       baudRate: params.baudRate,
+      dataBits: params.dataBits,
+      stopBits: params.stopBits,
+      parity: params.parity,
+      rtscts: params.rtscts,
       autoOpen: false
     });
     await new Promise<void>((resolve, reject) => {

@@ -1,0 +1,296 @@
+import * as vscode from "vscode";
+import type { SerialProfile } from "../models/config";
+import { SerialPty } from "../services/serial/serialPty";
+import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
+import { toParityCode } from "../utils/helpers";
+import {
+  GroupTreeItem,
+  SerialProfileTreeItem,
+  SerialSessionTreeItem
+} from "../ui/nexusTreeProvider";
+import { promptSerialProfile } from "../ui/prompts";
+import type { CommandContext } from "./types";
+
+async function pickSerialProfile(
+  core: import("../core/nexusCore").NexusCore
+): Promise<SerialProfile | undefined> {
+  const profiles = core.getSnapshot().serialProfiles;
+  if (profiles.length === 0) {
+    vscode.window.showWarningMessage("No Nexus serial profiles configured");
+    return undefined;
+  }
+  const pick = await vscode.window.showQuickPick(
+    profiles
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((profile) => ({
+        label: profile.name,
+        description: `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`,
+        profile
+      })),
+    { title: "Select Serial Profile" }
+  );
+  return pick?.profile;
+}
+
+function isSerialRuntimeMissingError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes("serialport module not installed") || lower.includes("cannot find module 'serialport'");
+}
+
+function toSerialProfileFromArg(
+  core: import("../core/nexusCore").NexusCore,
+  arg: unknown
+): SerialProfile | undefined {
+  if (arg instanceof SerialProfileTreeItem) {
+    return arg.profile;
+  }
+  if (arg instanceof SerialSessionTreeItem) {
+    return core.getSerialProfile(arg.session.profileId);
+  }
+  if (typeof arg === "object" && arg) {
+    const withProfile = arg as { profile?: SerialProfile };
+    if (withProfile.profile?.id) {
+      return core.getSerialProfile(withProfile.profile.id) ?? withProfile.profile;
+    }
+    const withSession = arg as { session?: { profileId?: string } };
+    if (withSession.session?.profileId) {
+      return core.getSerialProfile(withSession.session.profileId);
+    }
+  }
+  if (typeof arg === "string") {
+    return core.getSerialProfile(arg);
+  }
+  return undefined;
+}
+
+function toSerialSessionIdFromArg(arg: unknown): string | undefined {
+  if (arg instanceof SerialSessionTreeItem) {
+    return arg.session.id;
+  }
+  if (typeof arg === "object" && arg) {
+    const withSession = arg as { session?: { id?: string } };
+    if (withSession.session?.id) {
+      return withSession.session.id;
+    }
+  }
+  return undefined;
+}
+
+function toGroupFromArg(arg: unknown): string | undefined {
+  if (arg instanceof GroupTreeItem) {
+    return arg.groupName;
+  }
+  if (typeof arg === "object" && arg) {
+    const withGroup = arg as { groupName?: string };
+    if (withGroup.groupName) {
+      return withGroup.groupName;
+    }
+  }
+  return undefined;
+}
+
+async function listSerialPorts(
+  serialSidecar: SerialSidecarManager
+): Promise<Array<{ path: string; manufacturer?: string }>> {
+  try {
+    const ports = await serialSidecar.listPorts();
+    if (ports.length === 0) {
+      void vscode.window.showInformationMessage(
+        "No serial ports detected. Verify device connection, drivers, and OS permissions."
+      );
+    }
+    return ports;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown serial runtime error";
+    if (isSerialRuntimeMissingError(message)) {
+      void vscode.window.showErrorMessage(
+        "Serial runtime missing or incompatible. Reinstall/upgrade Nexus Terminal and ensure host supports native serial modules."
+      );
+      return [];
+    }
+    void vscode.window.showErrorMessage(`Failed to query serial ports: ${message}`);
+    return [];
+  }
+}
+
+function collectGroups(ctx: CommandContext): string[] {
+  const snapshot = ctx.core.getSnapshot();
+  const groups = new Set<string>();
+  for (const server of snapshot.servers) {
+    if (server.group) {
+      groups.add(server.group);
+    }
+  }
+  for (const profile of snapshot.serialProfiles) {
+    if (profile.group) {
+      groups.add(profile.group);
+    }
+  }
+  return [...groups].sort((a, b) => a.localeCompare(b));
+}
+
+export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[] {
+  return [
+    vscode.commands.registerCommand("nexus.serial.add", async (arg?: unknown) => {
+      const group = toGroupFromArg(arg);
+      const existingGroups = collectGroups(ctx);
+      const profile = await promptSerialProfile(group ? { group } : undefined, { mode: "add", existingGroups });
+      if (!profile) {
+        return;
+      }
+      await ctx.core.addOrUpdateSerialProfile(profile);
+    }),
+
+    vscode.commands.registerCommand("nexus.serial.edit", async (arg?: unknown) => {
+      const existing = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
+      if (!existing) {
+        return;
+      }
+      const existingGroups = collectGroups(ctx);
+      const updated = await promptSerialProfile(existing, { mode: "edit", existingGroups });
+      if (!updated) {
+        return;
+      }
+      updated.id = existing.id;
+      await ctx.core.addOrUpdateSerialProfile(updated);
+      if (ctx.core.isSerialProfileConnected(existing.id)) {
+        void vscode.window.showInformationMessage(
+          "Serial profile updated. Existing sessions keep current settings until reconnect."
+        );
+      }
+    }),
+
+    vscode.commands.registerCommand("nexus.serial.remove", async (arg?: unknown) => {
+      const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
+      if (!profile) {
+        return;
+      }
+      const confirm = await vscode.window.showWarningMessage(
+        `Remove serial profile "${profile.name}" and disconnect all sessions?`,
+        { modal: true },
+        "Remove"
+      );
+      if (confirm !== "Remove") {
+        return;
+      }
+      for (const [sessionId, entry] of ctx.serialTerminals.entries()) {
+        if (entry.profileId === profile.id) {
+          entry.terminal.dispose();
+          ctx.serialTerminals.delete(sessionId);
+        }
+      }
+      await ctx.core.removeSerialProfile(profile.id);
+    }),
+
+    vscode.commands.registerCommand("nexus.serial.connect", async (arg?: unknown) => {
+      try {
+        const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
+        if (!profile) {
+          return;
+        }
+        const terminalName = `Nexus Serial: ${profile.name}`;
+        let terminalRef: vscode.Terminal | undefined;
+        const pty = new SerialPty(
+          ctx.serialSidecar,
+          {
+            path: profile.path,
+            baudRate: profile.baudRate,
+            dataBits: profile.dataBits,
+            stopBits: profile.stopBits,
+            parity: profile.parity,
+            rtscts: profile.rtscts
+          },
+          {
+            onSessionOpened: (sessionId) => {
+              if (terminalRef) {
+                ctx.serialTerminals.set(sessionId, { terminal: terminalRef, profileId: profile.id });
+              }
+              ctx.core.registerSerialSession({
+                id: sessionId,
+                profileId: profile.id,
+                terminalName,
+                startedAt: Date.now()
+              });
+            },
+            onSessionClosed: (sessionId) => {
+              ctx.serialTerminals.delete(sessionId);
+              ctx.core.unregisterSerialSession(sessionId);
+            }
+          },
+          ctx.loggerFactory.create("terminal", `serial-${profile.id}`)
+        );
+
+        const terminal = vscode.window.createTerminal({ name: terminalName, pty });
+        terminalRef = terminal;
+        terminal.show();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "unknown serial connection error";
+        if (isSerialRuntimeMissingError(message)) {
+          void vscode.window.showErrorMessage(
+            "Serial runtime missing or incompatible. Reinstall/upgrade Nexus Terminal and ensure host supports native serial modules."
+          );
+          return;
+        }
+        void vscode.window.showErrorMessage(`Failed to open serial terminal: ${message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("nexus.serial.disconnect", async (arg?: unknown) => {
+      const sessionId = toSerialSessionIdFromArg(arg);
+      if (sessionId) {
+        const selected = ctx.serialTerminals.get(sessionId);
+        if (selected) {
+          selected.terminal.dispose();
+          ctx.serialTerminals.delete(sessionId);
+        }
+        return;
+      }
+
+      const profile = toSerialProfileFromArg(ctx.core, arg);
+      if (profile) {
+        for (const [activeSessionId, entry] of ctx.serialTerminals.entries()) {
+          if (entry.profileId === profile.id) {
+            entry.terminal.dispose();
+            ctx.serialTerminals.delete(activeSessionId);
+          }
+        }
+        return;
+      }
+
+      if (ctx.serialTerminals.size === 0) {
+        void vscode.window.showInformationMessage("No active serial sessions.");
+        return;
+      }
+
+      const pick = await vscode.window.showQuickPick(
+        [...ctx.serialTerminals.entries()].map(([sid, entry]) => ({
+          label: entry.terminal.name,
+          description: sid,
+          terminal: entry.terminal
+        })),
+        { title: "Disconnect serial session" }
+      );
+      if (!pick) {
+        return;
+      }
+      pick.terminal.dispose();
+    }),
+
+    vscode.commands.registerCommand("nexus.serial.listPorts", async () => {
+      try {
+        const ports = await listSerialPorts(ctx.serialSidecar);
+        if (ports.length === 0) {
+          return;
+        }
+        const formatted = ports
+          .map((port) => `${port.path}${port.manufacturer ? ` (${port.manufacturer})` : ""}`)
+          .join(", ");
+        void vscode.window.showInformationMessage(`Detected serial ports: ${formatted}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "unknown serial error";
+        void vscode.window.showErrorMessage(`Failed to list serial ports: ${message}`);
+      }
+    })
+  ];
+}

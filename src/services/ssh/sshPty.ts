@@ -18,6 +18,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   private stream?: Duplex;
   private connection?: SshConnection;
   private disposed = false;
+  private connectFailed = false;
 
   public constructor(
     private readonly serverConfig: ServerConfig,
@@ -38,8 +39,17 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   }
 
   public handleInput(data: string): void {
+    if (this.connectFailed) {
+      this.dispose();
+      return;
+    }
     this.logger.log(`stdin ${JSON.stringify(data)}`);
     this.stream?.write(data);
+  }
+
+  public setDimensions(dimensions: vscode.TerminalDimensions): void {
+    const channel = this.stream as { setWindow?: (rows: number, cols: number, height: number, width: number) => void };
+    channel?.setWindow?.(dimensions.rows, dimensions.columns, 0, 0);
   }
 
   public dispose(): void {
@@ -79,8 +89,10 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown SSH error";
       this.logger.log(`connect failed ${message}`);
+      this.connectFailed = true;
       this.writeEmitter.fire(`\r\n[Nexus SSH] Connection failed: ${message}\r\n`);
-      this.dispose();
+      this.writeEmitter.fire("\r\n[Nexus SSH] Press any key to close this terminal.\r\n");
+      void vscode.window.showErrorMessage(`Nexus SSH connection failed for ${this.serverConfig.name}: ${message}`);
     }
   }
 }

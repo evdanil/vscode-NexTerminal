@@ -25,6 +25,7 @@ Design principle: reliability over resource sharing.
 
 ## 3. Data Models
 - `ServerConfig` and `TunnelProfile` defined in `src/models/config.ts`.
+- `SerialProfile` defined in `src/models/config.ts` (`path`, `baudRate`, `dataBits`, `stopBits`, `parity`, `rtscts`, optional `group`).
 - Persisted via `VscodeConfigRepository` into `globalState`.
 - Password secrets persisted via VS Code `SecretStorage` using key pattern `password-${serverId}`.
 
@@ -34,6 +35,7 @@ Design principle: reliability over resource sharing.
 1. Run `Nexus: Add Server`.
 2. Fill host/auth details.
 3. Server appears in **Command Center**.
+4. Right-click server item to connect/disconnect/edit/remove.
 
 ### 4.2 Silent Auth (Password mode)
 1. Lookup in secret vault.
@@ -50,19 +52,22 @@ Design principle: reliability over resource sharing.
 
 ### 4.4 Tunnel Patch Bay
 1. Create tunnel profile with `Nexus: Add Tunnel`.
-2. Connect a server session first.
-3. Drag tunnel from **Tunnel Patch Bay** onto a server in **Command Center**.
-4. Tunnel starts as local listener and forwards to remote destination.
-5. Active tunnels show traffic counters (bytes in/out).
-6. **Tunnel Monitor** panel shows live route, server, counters, and start time.
-7. Connection mode can be profile-based: `isolated`, `shared`, or `ask every start`.
+2. Start a tunnel directly from **Tunnel Patch Bay** (or drag it onto a server in **Command Center**).
+3. Nexus resolves server target (`defaultServerId` first, then prompts if needed).
+4. Tunnel start performs SSH auth preflight and prompts for credentials when required.
+5. Tunnel starts as local listener and forwards to remote destination.
+6. Active tunnels show traffic counters (bytes in/out).
+7. **Tunnel Monitor** panel shows live route, server, counters, and start time.
+8. Connection mode can be profile-based: `isolated`, `shared`, or `ask every start`.
+9. Right-click tunnel item to start/stop/edit/remove.
 
 ### 4.5 Serial Sidecar
-1. Run `Nexus: List Serial Ports`.
-2. Extension asks sidecar process over JSON-RPC.
-3. Sidecar returns ports (empty when `serialport` module is unavailable).
-4. Run `Nexus: Connect Serial Port` to open an interactive serial terminal.
-5. Use `Nexus: Disconnect Serial Session` to close an active serial terminal session.
+1. Create a serial profile with `Nexus: Add Serial Profile` (name + group + line settings).
+2. Profiles appear in **Command Center** and support right-click connect/edit/remove.
+3. Run `Nexus: Connect Serial Port` (or item context action) to open an interactive serial terminal.
+4. Active serial sessions are shown under the profile node in **Command Center**.
+5. Use `Nexus: Disconnect Serial Session` from profile/session context menu or command.
+6. `Nexus: List Serial Ports` reports detected ports and manufacturers for diagnostics.
 
 ### 4.6 Logging and Rotation
 1. Terminal and tunnel logs are enabled automatically.
@@ -83,12 +88,17 @@ Design principle: reliability over resource sharing.
 - `nexus.refresh`
 - `nexus.server.add`
 - `nexus.server.remove`
+- `nexus.server.edit`
 - `nexus.server.connect`
 - `nexus.server.disconnect`
 - `nexus.tunnel.add`
 - `nexus.tunnel.remove`
+- `nexus.tunnel.edit`
 - `nexus.tunnel.start`
 - `nexus.tunnel.stop`
+- `nexus.serial.add`
+- `nexus.serial.edit`
+- `nexus.serial.remove`
 - `nexus.serial.listPorts`
 - `nexus.serial.connect`
 - `nexus.serial.disconnect`

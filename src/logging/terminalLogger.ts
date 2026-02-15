@@ -1,11 +1,4 @@
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  renameSync,
-  statSync,
-  unlinkSync
-} from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import * as path from "node:path";
 
 export interface SessionLogger {
@@ -28,53 +21,75 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 class RotatingFileSessionLogger implements SessionLogger {
+  private fd: number;
   private currentSize: number;
+  private closed = false;
 
   public constructor(
     private readonly filepath: string,
     private readonly rotation: LoggerRotationOptions
   ) {
     this.currentSize = this.readCurrentSize();
+    this.fd = openSync(filepath, "a");
   }
 
   public log(line: string): void {
+    if (this.closed) {
+      return;
+    }
     const entry = `${new Date().toISOString()} ${line}\n`;
     const entrySize = Buffer.byteLength(entry, "utf8");
     if (this.currentSize + entrySize > this.rotation.maxFileSizeBytes) {
       this.rotate();
       this.currentSize = 0;
     }
-    appendFileSync(this.filepath, entry, { encoding: "utf8" });
+    writeSync(this.fd, entry);
     this.currentSize += entrySize;
   }
 
   public close(): void {
-    return;
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    closeSync(this.fd);
   }
 
   private readCurrentSize(): number {
     try {
-      return statSync(this.filepath).size;
+      return existsSync(this.filepath) ? statSync(this.filepath).size : 0;
     } catch {
       return 0;
     }
   }
 
   private rotate(): void {
+    closeSync(this.fd);
+
     if (this.rotation.maxRotatedFiles > 0) {
       for (let index = this.rotation.maxRotatedFiles; index >= 1; index -= 1) {
         const source = index === 1 ? this.filepath : `${this.filepath}.${index - 1}`;
         const target = `${this.filepath}.${index}`;
-        if (existsSync(target)) {
+        try {
           unlinkSync(target);
+        } catch {
+          // target doesn't exist — fine
         }
-        if (existsSync(source)) {
+        try {
           renameSync(source, target);
+        } catch {
+          // source doesn't exist — fine
         }
       }
-    } else if (existsSync(this.filepath)) {
-      unlinkSync(this.filepath);
+    } else {
+      try {
+        unlinkSync(this.filepath);
+      } catch {
+        // file doesn't exist — fine
+      }
     }
+
+    this.fd = openSync(this.filepath, "a");
   }
 }
 

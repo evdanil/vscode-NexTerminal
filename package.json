@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH and Serial command center for VS Code.",
-  "version": "0.1.0",
+  "version": "0.1.6",
   "publisher": "nexus",
   "license": "MIT",
   "engines": {
@@ -21,6 +21,7 @@
     "onView:nexusTunnelMonitor",
     "onCommand:nexus.server.add",
     "onCommand:nexus.server.connect",
+    "onCommand:nexus.serial.add",
     "onCommand:nexus.serial.connect"
   ],
   "contributes": {
@@ -50,54 +51,101 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "nexusCommandCenter",
+        "contents": "No servers or serial devices configured.\n[Add SSH Server](command:nexus.server.add)\n[Add Serial Device](command:nexus.serial.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+      },
+      {
+        "view": "nexusTunnels",
+        "contents": "No port-forwarding tunnels configured.\n[Add Tunnel](command:nexus.tunnel.add)\nTip: Drag a tunnel onto a server in Command Center to start it."
+      }
+    ],
     "commands": [
       {
         "command": "nexus.refresh",
-        "title": "Nexus: Refresh"
+        "title": "Nexus: Refresh",
+        "icon": "$(refresh)"
       },
       {
         "command": "nexus.server.add",
-        "title": "Nexus: Add Server"
+        "title": "Nexus: Add Server",
+        "icon": "$(add)"
       },
       {
         "command": "nexus.server.remove",
-        "title": "Nexus: Remove Server"
+        "title": "Nexus: Remove Server",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "nexus.server.edit",
+        "title": "Nexus: Edit Server",
+        "icon": "$(edit)"
       },
       {
         "command": "nexus.server.connect",
-        "title": "Nexus: Connect Server"
+        "title": "Nexus: Connect Server",
+        "icon": "$(plug)"
       },
       {
         "command": "nexus.server.disconnect",
-        "title": "Nexus: Disconnect Server"
+        "title": "Nexus: Disconnect Server",
+        "icon": "$(debug-disconnect)"
       },
       {
         "command": "nexus.tunnel.add",
-        "title": "Nexus: Add Tunnel"
+        "title": "Nexus: Add Tunnel",
+        "icon": "$(add)"
       },
       {
         "command": "nexus.tunnel.remove",
-        "title": "Nexus: Remove Tunnel"
+        "title": "Nexus: Remove Tunnel",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "nexus.tunnel.edit",
+        "title": "Nexus: Edit Tunnel",
+        "icon": "$(edit)"
       },
       {
         "command": "nexus.tunnel.start",
-        "title": "Nexus: Start Tunnel"
+        "title": "Nexus: Start Tunnel",
+        "icon": "$(play)"
       },
       {
         "command": "nexus.tunnel.stop",
-        "title": "Nexus: Stop Tunnel"
+        "title": "Nexus: Stop Tunnel",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "nexus.serial.add",
+        "title": "Nexus: Add Serial Profile",
+        "icon": "$(add)"
+      },
+      {
+        "command": "nexus.serial.edit",
+        "title": "Nexus: Edit Serial Profile",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.serial.remove",
+        "title": "Nexus: Remove Serial Profile",
+        "icon": "$(trash)"
       },
       {
         "command": "nexus.serial.listPorts",
-        "title": "Nexus: List Serial Ports"
+        "title": "Nexus: List Serial Ports",
+        "icon": "$(search)"
       },
       {
         "command": "nexus.serial.connect",
-        "title": "Nexus: Connect Serial Port"
+        "title": "Nexus: Connect Serial Port",
+        "icon": "$(plug)"
       },
       {
         "command": "nexus.serial.disconnect",
-        "title": "Nexus: Disconnect Serial Session"
+        "title": "Nexus: Disconnect Serial Session",
+        "icon": "$(debug-disconnect)"
       }
     ],
     "menus": {
@@ -106,6 +154,41 @@
           "command": "nexus.refresh",
           "when": "view =~ /^nexus/",
           "group": "navigation"
+        },
+        {
+          "command": "nexus.server.add",
+          "when": "view == nexusCommandCenter",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nexus.server.connect",
+          "when": "view == nexusCommandCenter",
+          "group": "navigation@2"
+        },
+        {
+          "command": "nexus.serial.add",
+          "when": "view == nexusCommandCenter",
+          "group": "navigation@3"
+        },
+        {
+          "command": "nexus.server.disconnect",
+          "when": "view == nexusCommandCenter",
+          "group": "navigation@4"
+        },
+        {
+          "command": "nexus.tunnel.add",
+          "when": "view == nexusTunnels",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nexus.tunnel.start",
+          "when": "view == nexusTunnels",
+          "group": "navigation@2"
+        },
+        {
+          "command": "nexus.tunnel.stop",
+          "when": "view == nexusTunnels",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
@@ -116,13 +199,68 @@
         },
         {
           "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.session",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.server.disconnect",
+          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
           "group": "inline"
         },
         {
           "command": "nexus.server.remove",
           "when": "view == nexusCommandCenter && viewItem == nexus.server",
           "group": "navigation"
+        },
+        {
+          "command": "nexus.server.edit",
+          "when": "view == nexusCommandCenter && viewItem == nexus.server",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nexus.server.remove",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
+          "group": "navigation"
+        },
+        {
+          "command": "nexus.server.edit",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nexus.server.add",
+          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nexus.serial.add",
+          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "group": "navigation@2"
+        },
+        {
+          "command": "nexus.serial.connect",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfile",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.serial.disconnect",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfileConnected",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.serial.disconnect",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serialSessionNode",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.serial.remove",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.(serialProfile|serialProfileConnected)$/",
+          "group": "navigation"
+        },
+        {
+          "command": "nexus.serial.edit",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.(serialProfile|serialProfileConnected)$/",
+          "group": "navigation@1"
         },
         {
           "command": "nexus.tunnel.start",
@@ -138,6 +276,11 @@
           "command": "nexus.tunnel.remove",
           "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/",
           "group": "navigation"
+        },
+        {
+          "command": "nexus.tunnel.edit",
+          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/",
+          "group": "navigation@1"
         }
       ],
       "commandPalette": [
@@ -158,15 +301,67 @@
           "when": "true"
         },
         {
+          "command": "nexus.serial.add",
+          "when": "true"
+        },
+        {
+          "command": "nexus.serial.edit",
+          "when": "true"
+        },
+        {
+          "command": "nexus.serial.remove",
+          "when": "true"
+        },
+        {
           "command": "nexus.serial.connect",
           "when": "true"
         },
         {
           "command": "nexus.serial.disconnect",
           "when": "true"
+        },
+        {
+          "command": "nexus.server.edit",
+          "when": "true"
+        },
+        {
+          "command": "nexus.tunnel.edit",
+          "when": "true"
+        },
+        {
+          "command": "nexus.server.connect",
+          "when": "true"
+        },
+        {
+          "command": "nexus.server.disconnect",
+          "when": "true"
+        },
+        {
+          "command": "nexus.server.remove",
+          "when": "true"
+        },
+        {
+          "command": "nexus.tunnel.remove",
+          "when": "true"
+        },
+        {
+          "command": "nexus.tunnel.start",
+          "when": "true"
+        },
+        {
+          "command": "nexus.tunnel.stop",
+          "when": "true"
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "nexus.server.add",
+        "key": "ctrl+shift+n",
+        "mac": "cmd+shift+n",
+        "when": "!terminalFocus"
+      }
+    ],
     "configuration": {
       "title": "Nexus Terminal",
       "properties": {
@@ -175,20 +370,30 @@
           "default": 10,
           "minimum": 1,
           "maximum": 1024,
-          "description": "Maximum size of each Nexus log file in MB before rotation."
+          "order": 1,
+          "markdownDescription": "Maximum size of each Nexus log file in MB before rotation."
         },
         "nexus.logging.maxRotatedFiles": {
           "type": "number",
           "default": 1,
           "minimum": 0,
           "maximum": 99,
-          "description": "How many rotated log files Nexus keeps per log stream."
+          "order": 2,
+          "markdownDescription": "How many rotated log files Nexus keeps per log stream."
         },
         "nexus.tunnel.defaultConnectionMode": {
           "type": "string",
-          "enum": ["isolated", "shared"],
+          "enum": [
+            "isolated",
+            "shared"
+          ],
           "default": "isolated",
-          "description": "Default SSH connection mode for tunnels."
+          "order": 3,
+          "markdownDescription": "Default SSH connection mode for tunnels.",
+          "enumDescriptions": [
+            "Each tunnel gets its own SSH connection (more reliable)",
+            "Tunnels share a single SSH connection to the same server (lower resource usage)"
+          ]
         }
       }
     }
@@ -203,8 +408,8 @@
     "package:vsix": "vsce package"
   },
   "dependencies": {
-    "ssh2": "^1.17.0",
-    "uuid": "^11.1.0"
+    "serialport": "^13.0.0",
+    "ssh2": "^1.17.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",

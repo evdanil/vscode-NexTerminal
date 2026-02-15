@@ -1,4 +1,11 @@
-import type { ActiveSession, ActiveTunnel, ServerConfig, TunnelProfile } from "../models/config";
+import type {
+  ActiveSerialSession,
+  ActiveSession,
+  ActiveTunnel,
+  SerialProfile,
+  ServerConfig,
+  TunnelProfile
+} from "../models/config";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 
 type NexusListener = (snapshot: SessionSnapshot) => void;
@@ -7,23 +14,30 @@ export class NexusCore {
   private readonly listeners = new Set<NexusListener>();
   private readonly servers = new Map<string, ServerConfig>();
   private readonly tunnels = new Map<string, TunnelProfile>();
+  private readonly serialProfiles = new Map<string, SerialProfile>();
   private readonly activeSessions = new Map<string, ActiveSession>();
+  private readonly activeSerialSessions = new Map<string, ActiveSerialSession>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
 
   public constructor(private readonly repository: ConfigRepository) {}
 
   public async initialize(): Promise<void> {
-    const [servers, tunnels] = await Promise.all([
+    const [servers, tunnels, serialProfiles] = await Promise.all([
       this.repository.getServers(),
-      this.repository.getTunnels()
+      this.repository.getTunnels(),
+      this.repository.getSerialProfiles()
     ]);
     this.servers.clear();
     this.tunnels.clear();
+    this.serialProfiles.clear();
     for (const server of servers) {
       this.servers.set(server.id, server);
     }
     for (const tunnel of tunnels) {
       this.tunnels.set(tunnel.id, tunnel);
+    }
+    for (const profile of serialProfiles) {
+      this.serialProfiles.set(profile.id, profile);
     }
     this.emitChanged();
   }
@@ -32,7 +46,9 @@ export class NexusCore {
     return {
       servers: [...this.servers.values()],
       tunnels: [...this.tunnels.values()],
+      serialProfiles: [...this.serialProfiles.values()],
       activeSessions: [...this.activeSessions.values()],
+      activeSerialSessions: [...this.activeSerialSessions.values()],
       activeTunnels: [...this.activeTunnels.values()]
     };
   }
@@ -50,9 +66,22 @@ export class NexusCore {
     return this.tunnels.get(id);
   }
 
+  public getSerialProfile(id: string): SerialProfile | undefined {
+    return this.serialProfiles.get(id);
+  }
+
   public isServerConnected(serverId: string): boolean {
     for (const session of this.activeSessions.values()) {
       if (session.serverId === serverId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public isSerialProfileConnected(profileId: string): boolean {
+    for (const session of this.activeSerialSessions.values()) {
+      if (session.profileId === profileId) {
         return true;
       }
     }
@@ -82,6 +111,23 @@ export class NexusCore {
     this.emitChanged();
   }
 
+  public async addOrUpdateSerialProfile(profile: SerialProfile): Promise<void> {
+    this.serialProfiles.set(profile.id, profile);
+    await this.repository.saveSerialProfiles([...this.serialProfiles.values()]);
+    this.emitChanged();
+  }
+
+  public async removeSerialProfile(profileId: string): Promise<void> {
+    this.serialProfiles.delete(profileId);
+    for (const [sessionId, session] of this.activeSerialSessions.entries()) {
+      if (session.profileId === profileId) {
+        this.activeSerialSessions.delete(sessionId);
+      }
+    }
+    await this.repository.saveSerialProfiles([...this.serialProfiles.values()]);
+    this.emitChanged();
+  }
+
   public async removeTunnel(tunnelId: string): Promise<void> {
     this.tunnels.delete(tunnelId);
     for (const [activeId, tunnel] of this.activeTunnels.entries()) {
@@ -95,6 +141,16 @@ export class NexusCore {
 
   public registerSession(session: ActiveSession): void {
     this.activeSessions.set(session.id, session);
+    this.emitChanged();
+  }
+
+  public registerSerialSession(session: ActiveSerialSession): void {
+    this.activeSerialSessions.set(session.id, session);
+    this.emitChanged();
+  }
+
+  public unregisterSerialSession(sessionId: string): void {
+    this.activeSerialSessions.delete(sessionId);
     this.emitChanged();
   }
 

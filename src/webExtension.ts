@@ -36,13 +36,18 @@ class StaticTunnelMonitorProvider implements vscode.WebviewViewProvider {
 const unsupportedCommands = [
   "nexus.refresh",
   "nexus.server.add",
+  "nexus.server.edit",
   "nexus.server.remove",
   "nexus.server.connect",
   "nexus.server.disconnect",
   "nexus.tunnel.add",
+  "nexus.tunnel.edit",
   "nexus.tunnel.remove",
   "nexus.tunnel.start",
   "nexus.tunnel.stop",
+  "nexus.serial.add",
+  "nexus.serial.edit",
+  "nexus.serial.remove",
   "nexus.serial.listPorts",
   "nexus.serial.connect",
   "nexus.serial.disconnect"

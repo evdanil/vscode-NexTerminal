@@ -24,5 +24,5 @@ export interface SshConnection {
 }
 
 export interface SshConnector {
-  connect(server: ServerConfig, auth: { password?: string }): Promise<SshConnection>;
+  connect(server: ServerConfig, auth: { password?: string; passphrase?: string }): Promise<SshConnection>;
 }

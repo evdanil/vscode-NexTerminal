@@ -49,18 +49,21 @@ class Ssh2Connection implements SshConnection {
   }
 }
 
-async function toConnectConfig(server: ServerConfig, password?: string): Promise<ConnectConfig> {
+async function toConnectConfig(server: ServerConfig, password?: string, passphrase?: string): Promise<ConnectConfig> {
   const base: ConnectConfig = {
     host: server.host,
     port: server.port,
     username: server.username,
-    readyTimeout: 15_000
+    readyTimeout: 15_000,
+    keepaliveInterval: 10_000,
+    keepaliveCountMax: 3
   };
 
   if (server.authType === "password") {
     return {
       ...base,
-      password
+      password,
+      tryKeyboard: true
     };
   }
 
@@ -78,16 +81,24 @@ async function toConnectConfig(server: ServerConfig, password?: string): Promise
   const privateKey = await readFile(server.keyPath);
   return {
     ...base,
-    privateKey
+    privateKey,
+    passphrase
   };
 }
 
 export class Ssh2Connector implements SshConnector {
-  public async connect(server: ServerConfig, auth: { password?: string }): Promise<SshConnection> {
-    const config = await toConnectConfig(server, auth.password);
+  public async connect(server: ServerConfig, auth: { password?: string; passphrase?: string }): Promise<SshConnection> {
+    const config = await toConnectConfig(server, auth.password, auth.passphrase);
     const client = new Client();
     return new Promise((resolve, reject) => {
       let settled = false;
+      client.on("keyboard-interactive", (_name, _instructions, _lang, prompts, finish) => {
+        if (server.authType === "password" && auth.password) {
+          finish(prompts.map(() => auth.password!));
+          return;
+        }
+        finish([]);
+      });
       client.on("ready", () => {
         settled = true;
         resolve(new Ssh2Connection(client));

@@ -6,7 +6,9 @@ describe("renderTunnelMonitorHtml", () => {
     const html = renderTunnelMonitorHtml({
       servers: [],
       tunnels: [],
+      serialProfiles: [],
       activeSessions: [],
+      activeSerialSessions: [],
       activeTunnels: []
     });
 
@@ -37,7 +39,9 @@ describe("renderTunnelMonitorHtml", () => {
           autoStart: false
         }
       ],
+      serialProfiles: [],
       activeSessions: [],
+      activeSerialSessions: [],
       activeTunnels: [
         {
           id: "a1",

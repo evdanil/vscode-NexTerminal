@@ -1,3 +1,5 @@
+import type { SerialDataBits, SerialParity, SerialStopBits } from "../../models/config";
+
 export interface RpcRequest {
   id: string;
   method: string;
@@ -30,6 +32,10 @@ export interface SerialPortInfo {
 export interface OpenPortParams {
   path: string;
   baudRate: number;
+  dataBits?: SerialDataBits;
+  stopBits?: SerialStopBits;
+  parity?: SerialParity;
+  rtscts?: boolean;
 }
 
 export interface OpenPortResult {

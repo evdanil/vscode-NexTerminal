@@ -46,6 +46,7 @@ export class TunnelManager {
   private readonly listeners = new Set<TunnelListener>();
   private readonly activeTunnels = new Map<string, ActiveTunnelRuntime>();
   private readonly activeByProfile = new Map<string, string>();
+  private trafficTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   public constructor(private readonly sshFactory: TunnelSshFactory) {}
 
@@ -129,6 +130,17 @@ export class TunnelManager {
     }
     runtime.sharedConnection = undefined;
     await closeServer(runtime.listenerServer);
+    const pendingTimer = this.trafficTimers.get(activeTunnelId);
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      this.trafficTimers.delete(activeTunnelId);
+      this.emit({
+        type: "traffic",
+        tunnelId: activeTunnelId,
+        bytesIn: runtime.active.bytesIn,
+        bytesOut: runtime.active.bytesOut
+      });
+    }
     this.emit({ type: "stopped", tunnelId: activeTunnelId });
   }
 
@@ -159,21 +171,11 @@ export class TunnelManager {
 
       socket.on("data", (chunk: Buffer) => {
         runtime.active.bytesOut += chunk.length;
-        this.emit({
-          type: "traffic",
-          tunnelId: activeTunnelId,
-          bytesIn: runtime.active.bytesIn,
-          bytesOut: runtime.active.bytesOut
-        });
+        this.scheduleTrafficEmit(activeTunnelId, runtime);
       });
       remoteStream.on("data", (chunk: Buffer) => {
         runtime.active.bytesIn += chunk.length;
-        this.emit({
-          type: "traffic",
-          tunnelId: activeTunnelId,
-          bytesIn: runtime.active.bytesIn,
-          bytesOut: runtime.active.bytesOut
-        });
+        this.scheduleTrafficEmit(activeTunnelId, runtime);
       });
 
       const cleanup = (): void => {
@@ -242,6 +244,22 @@ export class TunnelManager {
       }
     });
     return sharedConnection;
+  }
+
+  private scheduleTrafficEmit(tunnelId: string, runtime: ActiveTunnelRuntime): void {
+    if (this.trafficTimers.has(tunnelId)) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.trafficTimers.delete(tunnelId);
+      this.emit({
+        type: "traffic",
+        tunnelId,
+        bytesIn: runtime.active.bytesIn,
+        bytesOut: runtime.active.bytesOut
+      });
+    }, 500);
+    this.trafficTimers.set(tunnelId, timer);
   }
 
   private emit(event: TunnelEvent): void {

@@ -7,7 +7,9 @@ export class TunnelMonitorViewProvider implements vscode.WebviewViewProvider {
   private snapshot: SessionSnapshot = {
     servers: [],
     tunnels: [],
+    serialProfiles: [],
     activeSessions: [],
+    activeSerialSessions: [],
     activeTunnels: []
   };
   private view?: vscode.WebviewView;

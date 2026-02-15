@@ -1,8 +1,8 @@
 **/.git/**
 **/.vscode/**
 **/.idea/**
-**/node_modules/**
 coverage/**
+*.vsix
 src/**
 test/**
 docs/**

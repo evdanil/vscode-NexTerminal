@@ -21,10 +21,15 @@ npm run package:vsix
 
 ## Main Commands
 - `Nexus: Add Server`
+- `Nexus: Edit Server`
 - `Nexus: Connect Server`
 - `Nexus: Add Tunnel`
-- `Nexus: Start Tunnel`
+- `Nexus: Edit Tunnel`
+- `Nexus: Start Tunnel` (does not require an already-open SSH terminal session)
 - `Nexus: Stop Tunnel`
+- `Nexus: Add Serial Profile`
+- `Nexus: Edit Serial Profile`
+- `Nexus: Remove Serial Profile`
 - `Nexus: Connect Serial Port`
 - `Nexus: Disconnect Serial Session`
 - `Nexus: List Serial Ports`

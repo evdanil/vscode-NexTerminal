@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as readline from "node:readline";
-import type { RpcNotification, RpcRequest, RpcResponse, SerialPortInfo } from "./protocol";
+import type { OpenPortParams, RpcNotification, RpcRequest, RpcResponse, SerialPortInfo } from "./protocol";
 
 type DataListener = (sessionId: string, data: Buffer) => void;
 type ErrorListener = (sessionId: string, message: string) => void;
@@ -34,8 +34,19 @@ export class SerialSidecarManager {
     return (result as SerialPortInfo[]) ?? [];
   }
 
-  public async openPort(path: string, baudRate: number): Promise<string> {
-    const result = await this.request("openPort", { path, baudRate });
+  public async openPort(path: string, baudRate: number): Promise<string>;
+
+  public async openPort(options: OpenPortParams): Promise<string>;
+
+  public async openPort(pathOrOptions: string | OpenPortParams, baudRate?: number): Promise<string> {
+    const params: OpenPortParams =
+      typeof pathOrOptions === "string"
+        ? {
+            path: pathOrOptions,
+            baudRate: baudRate ?? 115200
+          }
+        : pathOrOptions;
+    const result = await this.request("openPort", params);
     const sessionId = (result as { sessionId?: string }).sessionId;
     if (!sessionId) {
       throw new Error("Serial sidecar returned invalid openPort response");
@@ -91,14 +102,26 @@ export class SerialSidecarManager {
       this.pending.set(id, { resolve, reject });
     });
     child.stdin.write(`${JSON.stringify(payload)}\n`);
-    return responsePromise;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Serial sidecar RPC timed out after 10s (method=${method})`));
+      }, 10_000);
+    });
+    return Promise.race([responsePromise, timeoutPromise]);
   }
 
   private handleMessage(line: string): void {
     if (!line.trim()) {
       return;
     }
-    const payload = JSON.parse(line) as RpcResponse | RpcNotification;
+    let payload: RpcResponse | RpcNotification;
+    try {
+      payload = JSON.parse(line) as RpcResponse | RpcNotification;
+    } catch {
+      console.warn("[Nexus Serial] Failed to parse sidecar message:", line.slice(0, 200));
+      return;
+    }
     if ("id" in payload) {
       const deferred = this.pending.get(payload.id);
       if (!deferred) {

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
 import type { TunnelProfile } from "../models/config";
+import { formatBytes } from "../utils/helpers";
 
 const TUNNEL_DRAG_MIME = "application/vnd.nexus.tunnelProfile";
 
@@ -23,16 +24,6 @@ export class TunnelTreeItem extends vscode.TreeItem {
   }
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes}B`;
-  }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)}KB`;
-  }
-  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-}
-
 export class TunnelTreeProvider
   implements vscode.TreeDataProvider<TunnelTreeItem>, vscode.TreeDragAndDropController<TunnelTreeItem>
 {
@@ -40,7 +31,9 @@ export class TunnelTreeProvider
   private snapshot: SessionSnapshot = {
     servers: [],
     tunnels: [],
+    serialProfiles: [],
     activeSessions: [],
+    activeSerialSessions: [],
     activeTunnels: []
   };
 

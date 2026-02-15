@@ -38,7 +38,14 @@ describe("SerialSidecarManager integration", () => {
     expect(ports).toHaveLength(1);
     expect(ports[0].path).toBe("COM9");
 
-    const sessionId = await manager.openPort("COM9", 115200);
+    const sessionId = await manager.openPort({
+      path: "COM9",
+      baudRate: 115200,
+      dataBits: 8,
+      stopBits: 1,
+      parity: "none",
+      rtscts: false
+    });
     expect(sessionId).toBe("session-1");
 
     await manager.writePort(sessionId, Buffer.from("hello", "utf8"));
@@ -59,6 +66,14 @@ describe("SerialSidecarManager integration", () => {
     const sidecarPath = path.resolve(__dirname, "..", "fixtures", "mockSerialSidecar.js");
     const manager = new SerialSidecarManager(sidecarPath);
     await expect(manager.openPort("ERR", 115200)).rejects.toThrow("failed to open mock serial port");
+    manager.dispose();
+  });
+
+  it("propagates missing serial module errors", async () => {
+    const sidecarPath = path.resolve(__dirname, "..", "fixtures", "mockSerialMissingModule.js");
+    const manager = new SerialSidecarManager(sidecarPath);
+    await expect(manager.listPorts()).rejects.toThrow("serialport module not installed");
+    await expect(manager.openPort("COM1", 115200)).rejects.toThrow("serialport module not installed");
     manager.dispose();
   });
 });
