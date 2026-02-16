@@ -18,18 +18,21 @@ export class NexusCore {
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly activeSerialSessions = new Map<string, ActiveSerialSession>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
+  private readonly explicitGroups = new Set<string>();
 
   public constructor(private readonly repository: ConfigRepository) {}
 
   public async initialize(): Promise<void> {
-    const [servers, tunnels, serialProfiles] = await Promise.all([
+    const [servers, tunnels, serialProfiles, groups] = await Promise.all([
       this.repository.getServers(),
       this.repository.getTunnels(),
-      this.repository.getSerialProfiles()
+      this.repository.getSerialProfiles(),
+      this.repository.getGroups()
     ]);
     this.servers.clear();
     this.tunnels.clear();
     this.serialProfiles.clear();
+    this.explicitGroups.clear();
     for (const server of servers) {
       this.servers.set(server.id, server);
     }
@@ -38,6 +41,9 @@ export class NexusCore {
     }
     for (const profile of serialProfiles) {
       this.serialProfiles.set(profile.id, profile);
+    }
+    for (const group of groups) {
+      this.explicitGroups.add(group);
     }
     this.emitChanged();
   }
@@ -49,7 +55,8 @@ export class NexusCore {
       serialProfiles: [...this.serialProfiles.values()],
       activeSessions: [...this.activeSessions.values()],
       activeSerialSessions: [...this.activeSerialSessions.values()],
-      activeTunnels: [...this.activeTunnels.values()]
+      activeTunnels: [...this.activeTunnels.values()],
+      explicitGroups: [...this.explicitGroups]
     };
   }
 
@@ -177,6 +184,27 @@ export class NexusCore {
   public unregisterTunnel(activeTunnelId: string): void {
     this.activeTunnels.delete(activeTunnelId);
     this.emitChanged();
+  }
+
+  public async addGroup(name: string): Promise<void> {
+    this.explicitGroups.add(name);
+    await this.repository.saveGroups([...this.explicitGroups]);
+    this.emitChanged();
+  }
+
+  public async removeExplicitGroup(name: string): Promise<void> {
+    this.explicitGroups.delete(name);
+    await this.repository.saveGroups([...this.explicitGroups]);
+    this.emitChanged();
+  }
+
+  public async renameExplicitGroup(oldName: string, newName: string): Promise<void> {
+    if (this.explicitGroups.has(oldName)) {
+      this.explicitGroups.delete(oldName);
+      this.explicitGroups.add(newName);
+      await this.repository.saveGroups([...this.explicitGroups]);
+      this.emitChanged();
+    }
   }
 
   private emitChanged(): void {

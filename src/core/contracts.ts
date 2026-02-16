@@ -14,6 +14,8 @@ export interface ConfigRepository {
   saveTunnels(tunnels: TunnelProfile[]): Promise<void>;
   getSerialProfiles(): Promise<SerialProfile[]>;
   saveSerialProfiles(profiles: SerialProfile[]): Promise<void>;
+  getGroups(): Promise<string[]>;
+  saveGroups(groups: string[]): Promise<void>;
 }
 
 export interface SessionSnapshot {
@@ -23,4 +25,5 @@ export interface SessionSnapshot {
   activeSessions: ActiveSession[];
   activeSerialSessions: ActiveSerialSession[];
   activeTunnels: ActiveTunnel[];
+  explicitGroups: string[];
 }

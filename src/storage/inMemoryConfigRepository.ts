@@ -5,7 +5,8 @@ export class InMemoryConfigRepository implements ConfigRepository {
   public constructor(
     private servers: ServerConfig[] = [],
     private tunnels: TunnelProfile[] = [],
-    private serialProfiles: SerialProfile[] = []
+    private serialProfiles: SerialProfile[] = [],
+    private groups: string[] = []
   ) {}
 
   public async getServers(): Promise<ServerConfig[]> {
@@ -30,5 +31,13 @@ export class InMemoryConfigRepository implements ConfigRepository {
 
   public async saveSerialProfiles(profiles: SerialProfile[]): Promise<void> {
     this.serialProfiles = [...profiles];
+  }
+
+  public async getGroups(): Promise<string[]> {
+    return [...this.groups];
+  }
+
+  public async saveGroups(groups: string[]): Promise<void> {
+    this.groups = [...groups];
   }
 }

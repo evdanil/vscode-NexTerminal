@@ -9,27 +9,35 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+function visibleWhenAttrs(field: FormFieldDescriptor): string {
+  if (!field.visibleWhen) {
+    return "";
+  }
+  return ` data-visible-when-field="${escapeHtml(field.visibleWhen.field)}" data-visible-when-value="${escapeHtml(field.visibleWhen.value)}"`;
+}
+
 function renderField(field: FormFieldDescriptor): string {
   const id = `field-${field.key}`;
   const req = "required" in field && field.required ? " required" : "";
+  const vw = visibleWhenAttrs(field);
 
   switch (field.type) {
     case "text":
-      return `<div class="form-group">
+      return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
   <input type="text" id="${id}" name="${field.key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
   <div class="field-error" id="error-${field.key}"></div>
 </div>`;
 
     case "number":
-      return `<div class="form-group">
+      return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
   <input type="number" id="${id}" name="${field.key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
   <div class="field-error" id="error-${field.key}"></div>
 </div>`;
 
     case "select":
-      return `<div class="form-group">
+      return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}</label>
   <select id="${id}" name="${field.key}" class="create-inline-select">
     ${field.options.map((opt) => `<option value="${escapeHtml(opt.value)}"${opt.value === field.value ? " selected" : ""}>${escapeHtml(opt.label)}</option>`).join("\n    ")}
@@ -38,7 +46,7 @@ function renderField(field: FormFieldDescriptor): string {
 </div>`;
 
     case "combobox":
-      return `<div class="form-group">
+      return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}</label>
   <input type="text" id="${id}" name="${field.key}" list="list-${field.key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "Type or select...")}" />
   <datalist id="list-${field.key}">
@@ -48,7 +56,7 @@ function renderField(field: FormFieldDescriptor): string {
 </div>`;
 
     case "checkbox":
-      return `<div class="form-group form-group-checkbox">
+      return `<div class="form-group form-group-checkbox"${vw}>
   <label>
     <input type="checkbox" id="${id}" name="${field.key}"${field.value ? " checked" : ""} />
     ${escapeHtml(field.label)}
@@ -56,7 +64,7 @@ function renderField(field: FormFieldDescriptor): string {
 </div>`;
 
     case "file":
-      return `<div class="form-group">
+      return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}</label>
   <div class="file-input-row">
     <input type="text" id="${id}" name="${field.key}" value="${escapeHtml(field.value ?? "")}" readonly />
@@ -96,6 +104,8 @@ export function renderFormHtml(definition: FormDefinition): string {
     .form-group-checkbox {
       margin-top: 8px;
     }
+    .form-group[data-visible-when-field] { display: none; }
+    .form-group[data-visible-when-field].field-visible { display: block; }
     label {
       display: block;
       margin-bottom: 4px;
@@ -204,6 +214,38 @@ export function renderFormHtml(definition: FormDefinition): string {
     (function() {
       const vscode = acquireVsCodeApi();
       const form = document.getElementById("nexus-form");
+
+      function updateVisibility() {
+        for (const group of document.querySelectorAll("[data-visible-when-field]")) {
+          const watchedField = group.dataset.visibleWhenField;
+          const watchedValue = group.dataset.visibleWhenValue;
+          const control = form.elements[watchedField];
+          if (!control) continue;
+          const visible = control.value === watchedValue;
+          group.classList.toggle("field-visible", visible);
+          for (const input of group.querySelectorAll("input, select, textarea")) {
+            if (visible) {
+              if (input.dataset.wasRequired === "true") input.required = true;
+            } else {
+              input.dataset.wasRequired = input.required ? "true" : "false";
+              input.required = false;
+            }
+          }
+        }
+      }
+
+      var watchedFields = new Set();
+      for (const group of document.querySelectorAll("[data-visible-when-field]")) {
+        watchedFields.add(group.dataset.visibleWhenField);
+      }
+      for (var fieldName of watchedFields) {
+        var control = form.elements[fieldName];
+        if (control) {
+          control.addEventListener("change", updateVisibility);
+          control.addEventListener("input", updateVisibility);
+        }
+      }
+      updateVisibility();
 
       form.addEventListener("submit", (e) => {
         e.preventDefault();

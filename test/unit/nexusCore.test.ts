@@ -152,6 +152,36 @@ describe("NexusCore", () => {
     expect(core.getSnapshot().activeTunnels).toHaveLength(0);
   });
 
+  it("manages explicit groups", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("Dev");
+    await core.addGroup("Prod");
+    expect(core.getSnapshot().explicitGroups).toContain("Dev");
+    expect(core.getSnapshot().explicitGroups).toContain("Prod");
+    expect(core.getSnapshot().explicitGroups).toHaveLength(2);
+
+    await core.removeExplicitGroup("Dev");
+    expect(core.getSnapshot().explicitGroups).not.toContain("Dev");
+    expect(core.getSnapshot().explicitGroups).toHaveLength(1);
+
+    await core.renameExplicitGroup("Prod", "Production");
+    expect(core.getSnapshot().explicitGroups).not.toContain("Prod");
+    expect(core.getSnapshot().explicitGroups).toContain("Production");
+    expect(core.getSnapshot().explicitGroups).toHaveLength(1);
+  });
+
+  it("loads explicit groups from repository on initialize", async () => {
+    const repository = new InMemoryConfigRepository([], [], [], ["Saved Group"]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    expect(core.getSnapshot().explicitGroups).toContain("Saved Group");
+    expect(core.getSnapshot().explicitGroups).toHaveLength(1);
+  });
+
   it("persists serial profile CRUD and tracks serial sessions", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

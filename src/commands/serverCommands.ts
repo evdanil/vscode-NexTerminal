@@ -77,6 +77,9 @@ function removeTerminal(serverId: string, terminal: vscode.Terminal, terminalsBy
 function collectGroups(ctx: CommandContext): string[] {
   const snapshot = ctx.core.getSnapshot();
   const groups = new Set<string>();
+  for (const group of snapshot.explicitGroups) {
+    groups.add(group);
+  }
   for (const server of snapshot.servers) {
     if (server.group) {
       groups.add(server.group);
@@ -214,18 +217,7 @@ async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<voi
 export function registerServerCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.server.add", () => {
-      const existingGroups = collectGroups(ctx);
-      const definition = serverFormDefinition(undefined, existingGroups);
-      WebviewFormPanel.open("server-add", definition, {
-        onSubmit: async (values) => {
-          const server = formValuesToServer(values);
-          if (!server) {
-            return;
-          }
-          await ctx.core.addOrUpdateServer(server);
-        },
-        onBrowse: browseForKey
-      });
+      void vscode.commands.executeCommand("nexus.profile.add");
     }),
 
     vscode.commands.registerCommand("nexus.server.edit", async (arg?: unknown) => {
@@ -334,6 +326,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           await ctx.core.addOrUpdateSerialProfile({ ...profile, group: trimmedName });
         }
       }
+      await ctx.core.renameExplicitGroup(oldName, trimmedName);
     }),
 
     vscode.commands.registerCommand("nexus.group.connect", async (arg?: unknown) => {

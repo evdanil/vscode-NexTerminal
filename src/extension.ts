@@ -19,6 +19,7 @@ import { TunnelTreeProvider } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
 import { registerSettingsCommands } from "./commands/settingsCommands";
 import { registerConfigCommands } from "./commands/configCommands";
+import { registerProfileCommands } from "./commands/profileCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -167,6 +168,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const serverDisposables = registerServerCommands(ctx);
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
+  const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(settingsTreeProvider, () => ctx.sessionLogDir);
   const configDisposables = registerConfigCommands(core);
 
@@ -180,6 +182,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ...serverDisposables,
     ...tunnelDisposables,
     ...serialDisposables,
+    ...profileDisposables,
     ...settingsDisposables,
     ...configDisposables,
     {

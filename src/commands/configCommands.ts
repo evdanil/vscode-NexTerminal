@@ -8,6 +8,7 @@ interface NexusConfigExport {
   servers: ServerConfig[];
   tunnels: TunnelProfile[];
   serialProfiles: SerialProfile[];
+  groups?: string[];
   settings: Record<string, unknown>;
 }
 
@@ -67,6 +68,7 @@ export function registerConfigCommands(core: NexusCore): vscode.Disposable[] {
         servers: snapshot.servers,
         tunnels: snapshot.tunnels,
         serialProfiles: snapshot.serialProfiles,
+        groups: snapshot.explicitGroups,
         settings: readSettings()
       };
 
@@ -134,6 +136,9 @@ export function registerConfigCommands(core: NexusCore): vscode.Disposable[] {
         for (const profile of snapshot.serialProfiles) {
           await core.removeSerialProfile(profile.id);
         }
+        for (const group of snapshot.explicitGroups) {
+          await core.removeExplicitGroup(group);
+        }
       }
 
       const existingIds = mode.value === "merge"
@@ -161,6 +166,14 @@ export function registerConfigCommands(core: NexusCore): vscode.Disposable[] {
         if (!existingIds.has(profile.id)) {
           await core.addOrUpdateSerialProfile(profile);
           imported++;
+        }
+      }
+
+      if (Array.isArray(data.groups)) {
+        for (const group of data.groups) {
+          if (typeof group === "string" && group) {
+            await core.addGroup(group);
+          }
         }
       }
 

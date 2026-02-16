@@ -36,7 +36,10 @@ const unsupportedCommands = [
   "nexus.serial.remove",
   "nexus.serial.listPorts",
   "nexus.serial.connect",
-  "nexus.serial.disconnect"
+  "nexus.serial.disconnect",
+  "nexus.profile.add",
+  "nexus.group.add",
+  "nexus.group.remove"
 ];
 
 export function activate(context: vscode.ExtensionContext): void {

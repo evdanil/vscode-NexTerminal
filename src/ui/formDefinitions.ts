@@ -139,3 +139,115 @@ export function serialFormDefinition(seed?: Partial<SerialProfile>, existingGrou
     ]
   };
 }
+
+export interface UnifiedProfileSeed {
+  profileType?: "ssh" | "serial";
+  group?: string;
+}
+
+export function unifiedProfileFormDefinition(seed?: UnifiedProfileSeed, existingGroups?: string[]): FormDefinition {
+  const sshVw = { field: "profileType", value: "ssh" };
+  const serialVw = { field: "profileType", value: "serial" };
+
+  return {
+    title: "Add Profile",
+    fields: [
+      {
+        type: "select",
+        key: "profileType",
+        label: "Profile Type",
+        options: [
+          { label: "SSH Server", value: "ssh" },
+          { label: "Serial Port", value: "serial" }
+        ],
+        value: seed?.profileType ?? "ssh"
+      },
+      { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server or Arduino" },
+      // SSH fields
+      { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", visibleWhen: sshVw },
+      { type: "number", key: "port", label: "Port", required: true, min: 1, max: 65535, value: 22, visibleWhen: sshVw },
+      { type: "text", key: "username", label: "Username", required: true, placeholder: "root", visibleWhen: sshVw },
+      {
+        type: "select",
+        key: "authType",
+        label: "Authentication",
+        options: [
+          { label: "Password", value: "password" },
+          { label: "Private Key", value: "key" },
+          { label: "SSH Agent", value: "agent" }
+        ],
+        value: "password",
+        visibleWhen: sshVw
+      },
+      { type: "file", key: "keyPath", label: "Private Key File", visibleWhen: sshVw },
+      // Serial fields
+      { type: "text", key: "path", label: "Port Path", required: true, placeholder: "COM3 or /dev/ttyUSB0", visibleWhen: serialVw },
+      {
+        type: "select",
+        key: "baudRate",
+        label: "Baud Rate",
+        options: [
+          { label: "9600", value: "9600" },
+          { label: "19200", value: "19200" },
+          { label: "38400", value: "38400" },
+          { label: "57600", value: "57600" },
+          { label: "115200", value: "115200" },
+          { label: "230400", value: "230400" },
+          { label: "460800", value: "460800" },
+          { label: "921600", value: "921600" }
+        ],
+        value: "115200",
+        visibleWhen: serialVw
+      },
+      {
+        type: "select",
+        key: "dataBits",
+        label: "Data Bits",
+        options: [
+          { label: "8", value: "8" },
+          { label: "7", value: "7" },
+          { label: "6", value: "6" },
+          { label: "5", value: "5" }
+        ],
+        value: "8",
+        visibleWhen: serialVw
+      },
+      {
+        type: "select",
+        key: "stopBits",
+        label: "Stop Bits",
+        options: [
+          { label: "1", value: "1" },
+          { label: "2", value: "2" }
+        ],
+        value: "1",
+        visibleWhen: serialVw
+      },
+      {
+        type: "select",
+        key: "parity",
+        label: "Parity",
+        options: [
+          { label: "None", value: "none" },
+          { label: "Even", value: "even" },
+          { label: "Odd", value: "odd" },
+          { label: "Mark", value: "mark" },
+          { label: "Space", value: "space" }
+        ],
+        value: "none",
+        visibleWhen: serialVw
+      },
+      { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", visibleWhen: serialVw },
+      // Shared fields (always visible)
+      { type: "checkbox", key: "logSession", label: "Log session transcript", value: true },
+      {
+        type: "combobox",
+        key: "group",
+        label: "Group",
+        suggestions: existingGroups ?? [],
+        placeholder: "Type a new group or pick existing...",
+        value: seed?.group ?? ""
+      }
+    ]
+  };
+}

@@ -13,6 +13,7 @@ import {
 } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { toParityCode } from "../utils/helpers";
+import { collectGroups } from "./serverCommands";
 import type { CommandContext } from "./types";
 
 async function pickSerialProfile(
@@ -81,7 +82,7 @@ function toSerialSessionIdFromArg(arg: unknown): string | undefined {
   return undefined;
 }
 
-function toGroupFromArg(arg: unknown): string | undefined {
+export function toGroupFromArg(arg: unknown): string | undefined {
   if (arg instanceof GroupTreeItem) {
     return arg.groupName;
   }
@@ -118,23 +119,7 @@ async function listSerialPorts(
   }
 }
 
-function collectGroups(ctx: CommandContext): string[] {
-  const snapshot = ctx.core.getSnapshot();
-  const groups = new Set<string>();
-  for (const server of snapshot.servers) {
-    if (server.group) {
-      groups.add(server.group);
-    }
-  }
-  for (const profile of snapshot.serialProfiles) {
-    if (profile.group) {
-      groups.add(profile.group);
-    }
-  }
-  return [...groups].sort((a, b) => a.localeCompare(b));
-}
-
-function formValuesToSerial(values: FormValues, existingId?: string): SerialProfile | undefined {
+export function formValuesToSerial(values: FormValues, existingId?: string): SerialProfile | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const portPath = typeof values.path === "string" ? values.path.trim() : "";
   if (!name || !portPath) {
@@ -156,19 +141,8 @@ function formValuesToSerial(values: FormValues, existingId?: string): SerialProf
 
 export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
-    vscode.commands.registerCommand("nexus.serial.add", (arg?: unknown) => {
-      const group = toGroupFromArg(arg);
-      const existingGroups = collectGroups(ctx);
-      const definition = serialFormDefinition(group ? { group } : undefined, existingGroups);
-      WebviewFormPanel.open("serial-add", definition, {
-        onSubmit: async (values) => {
-          const profile = formValuesToSerial(values);
-          if (!profile) {
-            return;
-          }
-          await ctx.core.addOrUpdateSerialProfile(profile);
-        }
-      });
+    vscode.commands.registerCommand("nexus.serial.add", () => {
+      void vscode.commands.executeCommand("nexus.profile.add");
     }),
 
     vscode.commands.registerCommand("nexus.serial.edit", async (arg?: unknown) => {

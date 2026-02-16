@@ -33,4 +33,23 @@ describe("package contributions", () => {
     expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.serverConnected"))).toBe(true);
     expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.serialProfileConnected"))).toBe(true);
   });
+
+  it("contributes unified profile.add, group.add, and group.remove commands", () => {
+    const commands = packageJson.contributes.commands.map((item) => item.command);
+    expect(commands).toContain("nexus.profile.add");
+    expect(commands).toContain("nexus.group.add");
+    expect(commands).toContain("nexus.group.remove");
+  });
+
+  it("has a single add button in the command center title bar", () => {
+    const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+    const commandCenterNavItems = titleMenuItems.filter(
+      (item) => item.when === "view == nexusCommandCenter" && typeof item.group === "string" && item.group.startsWith("navigation")
+    );
+    const addCommands = commandCenterNavItems.filter(
+      (item) => item.command === "nexus.profile.add" || item.command === "nexus.server.add" || item.command === "nexus.serial.add"
+    );
+    expect(addCommands).toHaveLength(1);
+    expect(addCommands[0].command).toBe("nexus.profile.add");
+  });
 });

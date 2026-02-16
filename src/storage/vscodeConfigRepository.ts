@@ -6,6 +6,7 @@ import { validateServerConfig, validateTunnelProfile, validateSerialProfile } fr
 const SERVERS_KEY = "nexus.servers";
 const TUNNELS_KEY = "nexus.tunnels";
 const SERIAL_PROFILES_KEY = "nexus.serialProfiles";
+const GROUPS_KEY = "nexus.groups";
 
 export class VscodeConfigRepository implements ConfigRepository {
   public constructor(private readonly context: vscode.ExtensionContext) {}
@@ -53,5 +54,13 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async saveSerialProfiles(profiles: SerialProfile[]): Promise<void> {
     await this.context.globalState.update(SERIAL_PROFILES_KEY, profiles);
+  }
+
+  public async getGroups(): Promise<string[]> {
+    return this.context.globalState.get<string[]>(GROUPS_KEY, []);
+  }
+
+  public async saveGroups(groups: string[]): Promise<void> {
+    await this.context.globalState.update(GROUPS_KEY, groups);
   }
 }

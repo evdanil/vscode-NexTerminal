@@ -25,7 +25,8 @@
     "onCommand:nexus.server.add",
     "onCommand:nexus.server.connect",
     "onCommand:nexus.serial.add",
-    "onCommand:nexus.serial.connect"
+    "onCommand:nexus.serial.connect",
+    "onCommand:nexus.profile.add"
   ],
   "contributes": {
     "viewsContainers": {
@@ -57,7 +58,7 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "No servers or serial devices configured.\n[Add SSH Server](command:nexus.server.add)\n[Add Serial Device](command:nexus.serial.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+        "contents": "No servers or serial devices configured.\n[Add Profile](command:nexus.profile.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
       },
       {
         "view": "nexusTunnels",
@@ -99,6 +100,9 @@
       { "command": "nexus.settings.openJson", "title": "Open VS Code Settings", "icon": "$(settings-gear)" },
       { "command": "nexus.settings.openLogDir", "title": "Open Log Directory", "icon": "$(folder-opened)" },
       { "command": "nexus.tunnel.openBrowser", "title": "Open in Browser", "icon": "$(globe)" },
+      { "command": "nexus.profile.add", "title": "Nexus: Add Profile", "icon": "$(add)" },
+      { "command": "nexus.group.add", "title": "Nexus: New Group", "icon": "$(new-folder)" },
+      { "command": "nexus.group.remove", "title": "Remove Group", "icon": "$(trash)" },
       { "command": "nexus.config.export", "title": "Nexus: Export Configuration", "icon": "$(cloud-upload)" },
       { "command": "nexus.config.import", "title": "Nexus: Import Configuration", "icon": "$(cloud-download)" }
     ],
@@ -110,7 +114,7 @@
           "group": "navigation"
         },
         {
-          "command": "nexus.server.add",
+          "command": "nexus.profile.add",
           "when": "view == nexusCommandCenter",
           "group": "navigation@1"
         },
@@ -120,14 +124,14 @@
           "group": "navigation@2"
         },
         {
-          "command": "nexus.serial.add",
+          "command": "nexus.server.disconnect",
           "when": "view == nexusCommandCenter",
           "group": "navigation@3"
         },
         {
-          "command": "nexus.server.disconnect",
+          "command": "nexus.group.add",
           "when": "view == nexusCommandCenter",
-          "group": "navigation@4"
+          "group": "1_manage@1"
         },
         {
           "command": "nexus.tunnel.add",
@@ -188,8 +192,8 @@
         {"command":"nexus.group.connect","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"0_connect@1"},
         {"command":"nexus.group.disconnect","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"0_connect@2"},
         {"command":"nexus.group.rename","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"1_manage@1"},
-        {"command":"nexus.server.add","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"1_manage@2"},
-        {"command":"nexus.serial.add","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"1_manage@3"},
+        {"command":"nexus.profile.add","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"1_manage@2"},
+        {"command":"nexus.group.remove","when":"view == nexusCommandCenter && viewItem == nexus.group","group":"3_destructive"},
 
         {"command":"nexus.serial.connect","when":"view == nexusCommandCenter && viewItem == nexus.serialProfile","group":"inline"},
         {"command":"nexus.serial.disconnect","when":"view == nexusCommandCenter && viewItem == nexus.serialProfileConnected","group":"inline"},
@@ -253,6 +257,9 @@
         {"command":"nexus.serial.duplicate","when":"true"},
         {"command":"nexus.server.rename","when":"true"},
         {"command":"nexus.serial.rename","when":"true"},
+        {"command":"nexus.profile.add","when":"true"},
+        {"command":"nexus.group.add","when":"true"},
+        {"command":"nexus.group.remove","when":"false"},
         {"command":"nexus.group.connect","when":"false"},
         {"command":"nexus.group.disconnect","when":"false"},
         {"command":"nexus.group.rename","when":"false"},
@@ -267,7 +274,7 @@
     },
     "keybindings": [
       {
-        "command": "nexus.server.add",
+        "command": "nexus.profile.add",
         "key": "ctrl+shift+n",
         "mac": "cmd+shift+n",
         "when": "!terminalFocus"

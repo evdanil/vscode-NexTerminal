@@ -110,4 +110,65 @@ describe("renderFormHtml", () => {
     const html = renderFormHtml(definition);
     expect(html).toContain("acquireVsCodeApi");
   });
+
+  it("renders visibleWhen data attributes on fields", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "profileType",
+          label: "Type",
+          options: [
+            { label: "SSH", value: "ssh" },
+            { label: "Serial", value: "serial" }
+          ],
+          value: "ssh"
+        },
+        {
+          type: "text",
+          key: "host",
+          label: "Host",
+          required: true,
+          visibleWhen: { field: "profileType", value: "ssh" }
+        }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain('data-visible-when-field="profileType"');
+    expect(html).toContain('data-visible-when-value="ssh"');
+  });
+
+  it("includes CSS for visibleWhen hidden/visible states", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "text",
+          key: "x",
+          label: "X",
+          visibleWhen: { field: "y", value: "z" }
+        }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain(".form-group[data-visible-when-field] { display: none; }");
+    expect(html).toContain(".form-group[data-visible-when-field].field-visible { display: block; }");
+  });
+
+  it("includes updateVisibility JS function", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "text",
+          key: "x",
+          label: "X",
+          visibleWhen: { field: "y", value: "z" }
+        }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain("updateVisibility");
+  });
 });

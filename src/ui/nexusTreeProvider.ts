@@ -80,7 +80,8 @@ export class NexusTreeProvider
     serialProfiles: [],
     activeSessions: [],
     activeSerialSessions: [],
-    activeTunnels: []
+    activeTunnels: [],
+    explicitGroups: []
   };
 
   public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME];
@@ -191,6 +192,9 @@ export class NexusTreeProvider
     const groupNames = new Set<string>();
     const ungroupedServers: ServerConfig[] = [];
     const ungroupedSerialProfiles: SerialProfile[] = [];
+    for (const group of this.snapshot.explicitGroups) {
+      groupNames.add(group);
+    }
     for (const server of this.snapshot.servers) {
       if (server.isHidden) {
         continue;
