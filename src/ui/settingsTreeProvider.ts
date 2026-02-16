@@ -47,6 +47,13 @@ const SETTINGS: SettingDescriptor[] = [
     label: "Default Tunnel Mode",
     icon: "git-merge",
     format: (v) => (v === "shared" ? "Shared" : "Isolated")
+  },
+  {
+    key: "openLocation",
+    section: "nexus.terminal",
+    label: "Terminal Open Location",
+    icon: "layout",
+    format: (v) => (v === "editor" ? "Editor Tab" : "Panel")
   }
 ];
 

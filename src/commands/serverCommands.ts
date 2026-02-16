@@ -185,7 +185,12 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
         ctx.loggerFactory.create("terminal", server.id),
         createSessionTranscript(ctx.sessionLogDir, server.name, server.logSession !== false)
       );
-      const terminal = vscode.window.createTerminal({ name: terminalName, pty });
+      const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
+      const terminal = vscode.window.createTerminal({
+        name: terminalName,
+        pty,
+        location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+      });
       terminalRef = terminal;
       addTerminal(server.id, terminal, ctx.terminalsByServer);
       terminal.show();

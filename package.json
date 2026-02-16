@@ -324,6 +324,20 @@
             "Each tunnel gets its own SSH connection (more reliable)",
             "Tunnels share a single SSH connection to the same server (lower resource usage)"
           ]
+        },
+        "nexus.terminal.openLocation": {
+          "type": "string",
+          "enum": [
+            "panel",
+            "editor"
+          ],
+          "default": "panel",
+          "order": 6,
+          "markdownDescription": "Where to open SSH and serial terminals.",
+          "enumDescriptions": [
+            "Open in the terminal panel (default)",
+            "Open as an editor tab"
+          ]
         }
       }
     }

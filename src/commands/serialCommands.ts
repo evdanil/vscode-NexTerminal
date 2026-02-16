@@ -222,7 +222,12 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
           createSessionTranscript(ctx.sessionLogDir, profile.name, profile.logSession !== false)
         );
 
-        const terminal = vscode.window.createTerminal({ name: terminalName, pty });
+        const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
+        const terminal = vscode.window.createTerminal({
+          name: terminalName,
+          pty,
+          location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+        });
         terminalRef = terminal;
         terminal.show();
       } catch (error) {

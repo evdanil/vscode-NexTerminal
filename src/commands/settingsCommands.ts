@@ -88,6 +88,18 @@ export function registerSettingsCommands(
           return;
         }
         newValue = Number(input);
+      } else if (key === "openLocation") {
+        const pick = await vscode.window.showQuickPick(
+          [
+            { label: "Panel", description: "Open in the terminal panel (default)", value: "panel" },
+            { label: "Editor Tab", description: "Open as an editor tab", value: "editor" }
+          ],
+          { title: "Terminal Open Location" }
+        );
+        if (!pick) {
+          return;
+        }
+        newValue = pick.value;
       } else {
         return;
       }
