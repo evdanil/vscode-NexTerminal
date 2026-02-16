@@ -109,6 +109,21 @@ export class TunnelManager {
     };
     this.activeTunnels.set(activeTunnel.id, runtime);
     this.activeByProfile.set(profile.id, activeTunnel.id);
+
+    // Eagerly establish shared SSH connection so auth (including 2FA)
+    // happens at tunnel start time, not on first client connect.
+    if (activeTunnel.connectionMode === "shared") {
+      try {
+        await this.getOrCreateSharedConnection(runtime, activeTunnel.id);
+      } catch (error) {
+        // Auth failed or was canceled — tear down the listener
+        this.activeTunnels.delete(activeTunnel.id);
+        this.activeByProfile.delete(profile.id);
+        await closeServer(listenerServer);
+        throw error;
+      }
+    }
+
     this.emit({ type: "started", tunnel: activeTunnel });
     return activeTunnel;
   }

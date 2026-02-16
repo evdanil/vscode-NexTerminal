@@ -20,8 +20,8 @@ import type { CommandContext } from "./types";
 export function getDefaultTunnelConnectionMode(): ResolvedTunnelConnectionMode {
   const configured = vscode.workspace
     .getConfiguration("nexus.tunnel")
-    .get<ResolvedTunnelConnectionMode>("defaultConnectionMode", "isolated");
-  return configured === "shared" ? "shared" : "isolated";
+    .get<ResolvedTunnelConnectionMode>("defaultConnectionMode", "shared");
+  return configured === "isolated" ? "isolated" : "shared";
 }
 
 export async function resolveTunnelConnectionMode(

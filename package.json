@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar.",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -317,12 +317,12 @@
             "isolated",
             "shared"
           ],
-          "default": "isolated",
+          "default": "shared",
           "order": 5,
           "markdownDescription": "Default SSH connection mode for tunnels.",
           "enumDescriptions": [
-            "Each tunnel gets its own SSH connection (more reliable)",
-            "Tunnels share a single SSH connection to the same server (lower resource usage)"
+            "Each TCP client gets its own SSH connection (use only when connection isolation is critical)",
+            "All clients share a single SSH connection (recommended — works with 2FA, lower resource usage)"
           ]
         },
         "nexus.terminal.openLocation": {
