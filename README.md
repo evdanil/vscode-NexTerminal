@@ -77,4 +77,4 @@ See [docs/functional-documentation.md](docs/functional-documentation.md) for det
 
 ## License
 
-[MIT](LICENSE)
+[Apache 2.0](LICENSE)

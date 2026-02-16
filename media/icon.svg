@@ -1,0 +1,67 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect width="256" height="256" rx="24" fill="#1a1a2e"/>
+
+  <!-- Subtle grid pattern -->
+  <line x1="64" y1="0" x2="64" y2="256" stroke="#ffffff" stroke-width="0.3" opacity="0.05"/>
+  <line x1="128" y1="0" x2="128" y2="256" stroke="#ffffff" stroke-width="0.3" opacity="0.05"/>
+  <line x1="192" y1="0" x2="192" y2="256" stroke="#ffffff" stroke-width="0.3" opacity="0.05"/>
+  <line x1="0" y1="64" x2="256" y2="64" stroke="#ffffff" stroke-width="0.3" opacity="0.05"/>
+  <line x1="0" y1="128" x2="256" y2="128" stroke="#ffffff" stroke-width="0.3" opacity="0.05"/>
+  <line x1="0" y1="192" x2="256" y2="192" stroke="#ffffff" stroke-width="0.3" opacity="0.05"/>
+
+  <!-- Central hub - outer ring -->
+  <circle cx="128" cy="128" r="32" stroke="#4fc3f7" stroke-width="3" fill="none" opacity="0.9"/>
+  <!-- Central hub - inner glow -->
+  <circle cx="128" cy="128" r="20" fill="#4fc3f7" opacity="0.15"/>
+  <!-- Central hub - core dot -->
+  <circle cx="128" cy="128" r="10" fill="#4fc3f7"/>
+
+  <!-- Connection lines -->
+  <!-- Top -->
+  <line x1="128" y1="96" x2="128" y2="52" stroke="#4fc3f7" stroke-width="2.5" stroke-linecap="round" opacity="0.7"/>
+  <!-- Bottom -->
+  <line x1="128" y1="160" x2="128" y2="204" stroke="#4fc3f7" stroke-width="2.5" stroke-linecap="round" opacity="0.7"/>
+  <!-- Left -->
+  <line x1="96" y1="128" x2="52" y2="128" stroke="#4fc3f7" stroke-width="2.5" stroke-linecap="round" opacity="0.7"/>
+  <!-- Right -->
+  <line x1="160" y1="128" x2="204" y2="128" stroke="#4fc3f7" stroke-width="2.5" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- Top-left diagonal -->
+  <line x1="106" y1="106" x2="72" y2="72" stroke="#81d4fa" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+  <!-- Bottom-right diagonal -->
+  <line x1="150" y1="150" x2="184" y2="184" stroke="#81d4fa" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+
+  <!-- Terminal nodes (screens/devices) -->
+  <!-- Top node -->
+  <rect x="112" y="28" width="32" height="24" rx="4" stroke="#e0e0e0" stroke-width="2" fill="#1a1a2e"/>
+  <line x1="118" y1="37" x2="138" y2="37" stroke="#4fc3f7" stroke-width="1.5" stroke-linecap="round" opacity="0.8"/>
+  <line x1="118" y1="43" x2="130" y2="43" stroke="#4fc3f7" stroke-width="1.5" stroke-linecap="round" opacity="0.5"/>
+
+  <!-- Bottom node -->
+  <rect x="112" y="204" width="32" height="24" rx="4" stroke="#e0e0e0" stroke-width="2" fill="#1a1a2e"/>
+  <line x1="118" y1="213" x2="138" y2="213" stroke="#4fc3f7" stroke-width="1.5" stroke-linecap="round" opacity="0.8"/>
+  <line x1="118" y1="219" x2="132" y2="219" stroke="#4fc3f7" stroke-width="1.5" stroke-linecap="round" opacity="0.5"/>
+
+  <!-- Left node -->
+  <rect x="28" y="116" width="24" height="24" rx="4" stroke="#e0e0e0" stroke-width="2" fill="#1a1a2e"/>
+  <line x1="34" y1="125" x2="46" y2="125" stroke="#4fc3f7" stroke-width="1.5" stroke-linecap="round" opacity="0.8"/>
+  <line x1="34" y1="131" x2="42" y2="131" stroke="#4fc3f7" stroke-width="1.5" stroke-linecap="round" opacity="0.5"/>
+
+  <!-- Right node -->
+  <rect x="204" y="116" width="24" height="24" rx="4" stroke="#e0e0e0" stroke-width="2" fill="#1a1a2e"/>
+  <line x1="210" y1="125" x2="222" y2="125" stroke="#4fc3f7" stroke-width="1.5" stroke-linecap="round" opacity="0.8"/>
+  <line x1="210" y1="131" x2="218" y2="131" stroke="#4fc3f7" stroke-width="1.5" stroke-linecap="round" opacity="0.5"/>
+
+  <!-- Diagonal endpoint dots -->
+  <circle cx="68" cy="68" r="8" fill="#81d4fa" opacity="0.5"/>
+  <circle cx="68" cy="68" r="4" fill="#81d4fa" opacity="0.8"/>
+  <circle cx="188" cy="188" r="8" fill="#81d4fa" opacity="0.5"/>
+  <circle cx="188" cy="188" r="4" fill="#81d4fa" opacity="0.8"/>
+
+  <!-- Data flow dots on connections -->
+  <circle cx="128" cy="76" r="2.5" fill="#4fc3f7" opacity="0.9"/>
+  <circle cx="76" cy="128" r="2.5" fill="#4fc3f7" opacity="0.9"/>
+  <circle cx="180" cy="128" r="2.5" fill="#4fc3f7" opacity="0.9"/>
+  <circle cx="128" cy="180" r="2.5" fill="#4fc3f7" opacity="0.9"/>
+</svg>

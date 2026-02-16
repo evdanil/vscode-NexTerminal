@@ -3,8 +3,9 @@
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar.",
   "version": "2.0.0",
-  "publisher": "nexus",
-  "license": "MIT",
+  "publisher": "sentriflow",
+  "license": "Apache-2.0",
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/evdanil/vscode-NexTerminal.git"
