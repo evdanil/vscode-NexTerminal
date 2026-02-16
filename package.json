@@ -14,7 +14,6 @@
     "vscode": "^1.95.0"
   },
   "categories": [
-    "Terminal",
     "Other"
   ],
   "main": "./dist/extension.js",
