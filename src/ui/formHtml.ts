@@ -29,7 +29,7 @@ function renderField(field: FormFieldDescriptor): string {
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
   <div class="file-input-row">
     <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
-    <button type="button" class="browse-btn scan-btn" data-key="${key}">Scan</button>
+    <button type="button" class="scan-btn" data-key="${key}">Scan</button>
   </div>
   <div class="field-error" id="error-${key}"></div>
 </div>`;
@@ -167,7 +167,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
     .file-input-row input {
       flex: 1;
     }
-    .browse-btn {
+    .browse-btn, .scan-btn {
       padding: 5px 12px;
       background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
       color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
@@ -177,7 +177,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       font-size: 12px;
       white-space: nowrap;
     }
-    .browse-btn:hover {
+    .browse-btn:hover, .scan-btn:hover {
       background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground));
     }
     .clear-btn {
