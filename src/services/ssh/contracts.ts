@@ -29,6 +29,15 @@ export interface SshConnection {
   dispose(): void;
 }
 
+export type KeyboardInteractiveHandler = (
+  name: string,
+  instructions: string,
+  prompts: Array<{ prompt: string; echo: boolean }>
+) => Promise<string[]>;
+
 export interface SshConnector {
-  connect(server: ServerConfig, auth: { password?: string; passphrase?: string }): Promise<SshConnection>;
+  connect(
+    server: ServerConfig,
+    auth: { password?: string; passphrase?: string; onKeyboardInteractive?: KeyboardInteractiveHandler }
+  ): Promise<SshConnection>;
 }

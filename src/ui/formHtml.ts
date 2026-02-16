@@ -70,6 +70,7 @@ function renderField(field: FormFieldDescriptor): string {
   <div class="file-input-row">
     <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" readonly />
     <button type="button" class="browse-btn" data-key="${key}">Browse</button>
+    <button type="button" class="clear-btn" data-key="${key}" title="Clear">✕</button>
   </div>
   <div class="field-error" id="error-${key}"></div>
 </div>`;
@@ -168,6 +169,21 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
     }
     .browse-btn:hover {
       background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground));
+    }
+    .clear-btn {
+      padding: 5px 8px;
+      background: transparent;
+      color: var(--vscode-foreground);
+      border: 1px solid var(--vscode-input-border, transparent);
+      border-radius: 2px;
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1;
+      opacity: 0.7;
+    }
+    .clear-btn:hover {
+      opacity: 1;
+      background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground));
     }
     .field-error {
       color: var(--vscode-errorForeground);
@@ -276,6 +292,13 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       for (const btn of document.querySelectorAll(".browse-btn")) {
         btn.addEventListener("click", () => {
           vscode.postMessage({ type: "browse", key: btn.dataset.key });
+        });
+      }
+
+      for (const btn of document.querySelectorAll(".clear-btn")) {
+        btn.addEventListener("click", () => {
+          const input = document.getElementById("field-" + btn.dataset.key);
+          if (input) input.value = "";
         });
       }
 

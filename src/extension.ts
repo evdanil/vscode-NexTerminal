@@ -34,7 +34,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     maxFileSizeBytes: maxFileSizeMb * 1024 * 1024,
     maxRotatedFiles
   });
-  const sshFactory = new SilentAuthSshFactory(new Ssh2Connector(), new VscodeSecretVault(context), new VscodePasswordPrompt());
+  const sshFactory = new SilentAuthSshFactory(
+    new Ssh2Connector(),
+    new VscodeSecretVault(context),
+    new VscodePasswordPrompt(),
+    (message, isPassword) =>
+      Promise.resolve(
+        vscode.window.showInputBox({
+          title: "Nexus SSH",
+          prompt: message.replace(/:\s*$/, ""),
+          password: isPassword,
+          ignoreFocusOut: true
+        })
+      )
+  );
   const tunnelManager = new TunnelManager(sshFactory);
   const extensionRoot = path.resolve(__dirname, "..");
   const sidecarPath = path.join(__dirname, "services", "serial", "serialSidecarWorker.js");

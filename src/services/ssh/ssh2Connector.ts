@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
 import { Client, type ConnectConfig } from "ssh2";
 import type { ServerConfig } from "../../models/config";
-import type { PtyOptions, SshConnection, SshConnector } from "./contracts";
+import type { KeyboardInteractiveHandler, PtyOptions, SshConnection, SshConnector } from "./contracts";
 
 class Ssh2Connection implements SshConnection {
   private readonly closeListeners = new Set<() => void>();
@@ -61,14 +61,14 @@ async function toConnectConfig(server: ServerConfig, password?: string, passphra
     username: server.username,
     readyTimeout: 15_000,
     keepaliveInterval: 10_000,
-    keepaliveCountMax: 3
+    keepaliveCountMax: 3,
+    tryKeyboard: true
   };
 
   if (server.authType === "password") {
     return {
       ...base,
-      password,
-      tryKeyboard: true
+      password
     };
   }
 
@@ -92,13 +92,33 @@ async function toConnectConfig(server: ServerConfig, password?: string, passphra
 }
 
 export class Ssh2Connector implements SshConnector {
-  public async connect(server: ServerConfig, auth: { password?: string; passphrase?: string }): Promise<SshConnection> {
+  public async connect(
+    server: ServerConfig,
+    auth: { password?: string; passphrase?: string; onKeyboardInteractive?: KeyboardInteractiveHandler }
+  ): Promise<SshConnection> {
     const config = await toConnectConfig(server, auth.password, auth.passphrase);
     const client = new Client();
     return new Promise((resolve, reject) => {
       let settled = false;
-      client.on("keyboard-interactive", (_name, _instructions, _lang, prompts, finish) => {
-        if (server.authType === "password" && auth.password) {
+      client.on("keyboard-interactive", (name, instructions, _lang, prompts, finish) => {
+        if (auth.onKeyboardInteractive) {
+          const mapped = prompts.map((p) => ({
+            prompt: p.prompt,
+            echo: p.echo ?? false
+          }));
+          auth.onKeyboardInteractive(name, instructions, mapped).then(
+            (responses) => finish(responses),
+            (error) => {
+              client.end();
+              if (!settled) {
+                reject(error);
+              }
+            }
+          );
+          return;
+        }
+        // Legacy fallback: auto-fill password for all prompts
+        if (auth.password) {
           finish(prompts.map(() => auth.password!));
           return;
         }
