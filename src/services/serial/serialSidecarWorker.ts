@@ -29,11 +29,14 @@ function writeLine(message: RpcResponse | RpcNotification): void {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
-async function loadSerialModule(): Promise<SerialPortModule | undefined> {
-  const moduleName = "serialport";
+let serialLoadError = "serialport module not available";
+
+function loadSerialModule(): SerialPortModule | undefined {
   try {
-    return (await import(moduleName)) as SerialPortModule;
-  } catch {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return require("serialport") as SerialPortModule;
+  } catch (error) {
+    serialLoadError = error instanceof Error ? error.message : String(error);
     return undefined;
   }
 }
@@ -42,20 +45,34 @@ function response(id: string, result?: unknown, error?: string): RpcResponse {
   return error ? { id, error: { message: error } } : { id, result };
 }
 
+function friendlyOpenError(portPath: string, error: Error): Error {
+  const msg = error.message;
+  if (msg.includes("File not found")) {
+    return new Error(`Port ${portPath} not found. Check that the device is connected and the port name is correct.`);
+  }
+  if (msg.includes("Access denied") || msg.includes("Permission denied")) {
+    return new Error(`Permission denied on ${portPath}. Another application may have the port open, or you lack access rights.`);
+  }
+  if (msg.includes("resource busy") || msg.includes("already in use")) {
+    return new Error(`Port ${portPath} is busy. Another application may already be using it.`);
+  }
+  return error;
+}
+
 async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
   if (request.method === "listPorts") {
-    const module = await loadSerialModule();
+    const module = loadSerialModule();
     if (!module) {
-      return response(request.id, undefined, "serialport module not installed");
+      return response(request.id, undefined, serialLoadError);
     }
     const results = await module.SerialPort.list();
     return response(request.id, results);
   }
 
   if (request.method === "openPort") {
-    const module = await loadSerialModule();
+    const module = loadSerialModule();
     if (!module) {
-      return response(request.id, undefined, "serialport module not installed");
+      return response(request.id, undefined, serialLoadError);
     }
 
     const params = request.params as OpenPortParams | undefined;
@@ -74,7 +91,7 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
       autoOpen: false
     });
     await new Promise<void>((resolve, reject) => {
-      port.open((error) => (error ? reject(error) : resolve()));
+      port.open((error) => (error ? reject(friendlyOpenError(params.path, error)) : resolve()));
     });
     port.on("data", (data: Buffer) => {
       writeLine({

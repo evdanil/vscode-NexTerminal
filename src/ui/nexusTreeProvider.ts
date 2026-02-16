@@ -4,6 +4,7 @@ import type { ActiveSerialSession, ActiveSession, SerialProfile, ServerConfig } 
 import { toParityCode } from "../utils/helpers";
 
 const TUNNEL_DRAG_MIME = "application/vnd.nexus.tunnelProfile";
+const ITEM_DRAG_MIME = "application/vnd.nexus.item";
 
 export class GroupTreeItem extends vscode.TreeItem {
   public constructor(public readonly groupName: string) {
@@ -64,6 +65,11 @@ export class SerialSessionTreeItem extends vscode.TreeItem {
 
 type NexusTreeItem = GroupTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem;
 
+export interface NexusTreeCallbacks {
+  onTunnelDropped(serverId: string, tunnelProfileId: string): Promise<void>;
+  onItemGroupChanged(itemType: "server" | "serial", itemId: string, newGroup: string | undefined): Promise<void>;
+}
+
 export class NexusTreeProvider
   implements vscode.TreeDataProvider<NexusTreeItem>, vscode.TreeDragAndDropController<NexusTreeItem>
 {
@@ -77,11 +83,11 @@ export class NexusTreeProvider
     activeTunnels: []
   };
 
-  public readonly dragMimeTypes = [TUNNEL_DRAG_MIME];
-  public readonly dropMimeTypes = [TUNNEL_DRAG_MIME];
+  public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME];
+  public readonly dropMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME];
 
   public constructor(
-    private readonly onTunnelDropped: (serverId: string, tunnelProfileId: string) => Promise<void>
+    private readonly callbacks: NexusTreeCallbacks
   ) {}
 
   public readonly onDidChangeTreeData: vscode.Event<NexusTreeItem | undefined> =
@@ -129,22 +135,56 @@ export class NexusTreeProvider
   }
 
   public async handleDrag(
-    _source: readonly NexusTreeItem[],
-    _dataTransfer: vscode.DataTransfer
+    source: readonly NexusTreeItem[],
+    dataTransfer: vscode.DataTransfer
   ): Promise<void> {
-    return;
+    const item = source[0];
+    if (item instanceof ServerTreeItem) {
+      dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "server", id: item.server.id })));
+    } else if (item instanceof SerialProfileTreeItem) {
+      dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "serial", id: item.profile.id })));
+    }
   }
 
   public async handleDrop(target: NexusTreeItem | undefined, dataTransfer: vscode.DataTransfer): Promise<void> {
-    if (!(target instanceof ServerTreeItem)) {
+    // Handle tunnel drop onto server
+    if (target instanceof ServerTreeItem) {
+      const tunnelTransfer = dataTransfer.get(TUNNEL_DRAG_MIME);
+      if (tunnelTransfer) {
+        const tunnelProfileId = await tunnelTransfer.asString();
+        await this.callbacks.onTunnelDropped(target.server.id, tunnelProfileId);
+        return;
+      }
+    }
+
+    // Handle item (server/serial) drop onto group or root (ungroup)
+    const itemTransfer = dataTransfer.get(ITEM_DRAG_MIME);
+    if (!itemTransfer) {
       return;
     }
-    const transfer = dataTransfer.get(TUNNEL_DRAG_MIME);
-    if (!transfer) {
+    const raw = await itemTransfer.asString();
+    let parsed: { type: string; id: string };
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
       return;
     }
-    const tunnelProfileId = await transfer.asString();
-    await this.onTunnelDropped(target.server.id, tunnelProfileId);
+    if (parsed.type !== "server" && parsed.type !== "serial") {
+      return;
+    }
+
+    let newGroup: string | undefined;
+    if (target instanceof GroupTreeItem) {
+      newGroup = target.groupName;
+    } else if (target === undefined) {
+      // Dropped on root — remove from group
+      newGroup = undefined;
+    } else {
+      // Dropped on something else (server, session, etc.) — ignore
+      return;
+    }
+
+    await this.callbacks.onItemGroupChanged(parsed.type as "server" | "serial", parsed.id, newGroup);
   }
 
   private getRootItems(): NexusTreeItem[] {

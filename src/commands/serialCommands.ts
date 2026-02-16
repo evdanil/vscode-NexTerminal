@@ -318,6 +318,23 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       void vscode.window.showInformationMessage(`Copied: ${info}`);
     }),
 
+    vscode.commands.registerCommand("nexus.serial.rename", async (arg?: unknown) => {
+      const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
+      if (!profile) {
+        return;
+      }
+      const newName = await vscode.window.showInputBox({
+        title: "Rename Serial Profile",
+        value: profile.name,
+        prompt: "Enter new name",
+        validateInput: (value) => (value.trim() ? null : "Name cannot be empty")
+      });
+      if (!newName || newName.trim() === profile.name) {
+        return;
+      }
+      await ctx.core.addOrUpdateSerialProfile({ ...profile, name: newName.trim() });
+    }),
+
     vscode.commands.registerCommand("nexus.serial.duplicate", async (arg?: unknown) => {
       const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
       if (!profile) {

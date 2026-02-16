@@ -33,8 +33,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   const sshFactory = new SilentAuthSshFactory(new Ssh2Connector(), new VscodeSecretVault(context), new VscodePasswordPrompt());
   const tunnelManager = new TunnelManager(sshFactory);
+  const extensionRoot = path.resolve(__dirname, "..");
   const sidecarPath = path.join(__dirname, "services", "serial", "serialSidecarWorker.js");
-  const serialSidecar = new SerialSidecarManager(sidecarPath);
+  const serialSidecar = new SerialSidecarManager(sidecarPath, extensionRoot);
   const terminalsByServer: ServerTerminalMap = new Map();
   const serialTerminals: SerialTerminalMap = new Map();
 
@@ -48,17 +49,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     serialTerminals
   };
 
-  const nexusTreeProvider = new NexusTreeProvider(async (serverId, tunnelProfileId) => {
-    const profile = core.getTunnel(tunnelProfileId);
-    const server = core.getServer(serverId);
-    if (!profile || !server) {
-      return;
+  const nexusTreeProvider = new NexusTreeProvider({
+    async onTunnelDropped(serverId, tunnelProfileId) {
+      const profile = core.getTunnel(tunnelProfileId);
+      const server = core.getServer(serverId);
+      if (!profile || !server) {
+        return;
+      }
+      const connectionMode = await resolveTunnelConnectionMode(profile, true);
+      if (!connectionMode) {
+        return;
+      }
+      await startTunnel(core, tunnelManager, sshFactory, profile, server, connectionMode);
+    },
+    async onItemGroupChanged(itemType, itemId, newGroup) {
+      if (itemType === "server") {
+        const server = core.getServer(itemId);
+        if (server) {
+          await core.addOrUpdateServer({ ...server, group: newGroup });
+        }
+      } else {
+        const profile = core.getSerialProfile(itemId);
+        if (profile) {
+          await core.addOrUpdateSerialProfile({ ...profile, group: newGroup });
+        }
+      }
     }
-    const connectionMode = await resolveTunnelConnectionMode(profile, true);
-    if (!connectionMode) {
-      return;
-    }
-    await startTunnel(core, tunnelManager, sshFactory, profile, server, connectionMode);
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
   const tunnelMonitorProvider = new TunnelMonitorViewProvider();

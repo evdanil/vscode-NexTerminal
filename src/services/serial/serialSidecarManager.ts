@@ -17,7 +17,10 @@ export class SerialSidecarManager {
   private readonly dataListeners = new Set<DataListener>();
   private readonly errorListeners = new Set<ErrorListener>();
 
-  public constructor(private readonly sidecarScriptPath: string) {}
+  public constructor(
+    private readonly sidecarScriptPath: string,
+    private readonly extensionRoot?: string
+  ) {}
 
   public onDidReceiveData(listener: DataListener): () => void {
     this.dataListeners.add(listener);
@@ -76,7 +79,9 @@ export class SerialSidecarManager {
       return this.processRef;
     }
     const child = spawn(process.execPath, [this.sidecarScriptPath], {
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: this.extensionRoot,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" }
     });
     child.on("exit", () => {
       const error = new Error("Serial sidecar exited unexpectedly");
@@ -85,6 +90,9 @@ export class SerialSidecarManager {
       }
       this.pending.clear();
       this.processRef = undefined;
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      console.warn("[Nexus Serial Sidecar stderr]", chunk.toString("utf8").trim());
     });
     const rl = readline.createInterface({ input: child.stdout });
     rl.on("line", (line) => {

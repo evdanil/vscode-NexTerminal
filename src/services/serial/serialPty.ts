@@ -25,6 +25,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   private dataSubscription?: () => void;
   private errorSubscription?: () => void;
   private disposed = false;
+  private failed = false;
 
   public constructor(
     private readonly transport: SerialTransport,
@@ -45,6 +46,10 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   }
 
   public handleInput(data: string): void {
+    if (this.failed) {
+      this.dispose();
+      return;
+    }
     if (!this.sidecarSessionId) {
       return;
     }
@@ -118,8 +123,8 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown serial connection error";
       this.logger.log(`serial connect failed ${message}`);
-      this.writeEmitter.fire(`\r\n[Nexus Serial] Connection failed: ${message}\r\n`);
-      this.dispose();
+      this.writeEmitter.fire(`\r\n[Nexus Serial] Connection failed: ${message}\r\n\r\nPress any key to close.\r\n`);
+      this.failed = true;
     }
   }
 

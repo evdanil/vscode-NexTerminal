@@ -103,15 +103,4 @@ node_modules/**/cmake/**
 node_modules/**/deps/**/scripts/**
 node_modules/**/deps/**/patches/**
 
-# Unused serialport sub-packages (only stream + bindings-cpp needed)
-node_modules/@serialport/binding-mock/**
-node_modules/@serialport/parser-byte-length/**
-node_modules/@serialport/parser-cctalk/**
-node_modules/@serialport/parser-delimiter/**
-node_modules/@serialport/parser-inter-byte-timeout/**
-node_modules/@serialport/parser-packet-length/**
-node_modules/@serialport/parser-readline/**
-node_modules/@serialport/parser-ready/**
-node_modules/@serialport/parser-regex/**
-node_modules/@serialport/parser-slip-encoder/**
-node_modules/@serialport/parser-spacepacket/**
+# serialport: all sub-packages must be included (index.js re-exports everything)

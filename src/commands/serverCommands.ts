@@ -274,6 +274,51 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       await ctx.core.addOrUpdateServer(copy);
     }),
 
+    vscode.commands.registerCommand("nexus.server.rename", async (arg?: unknown) => {
+      const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
+      if (!server) {
+        return;
+      }
+      const newName = await vscode.window.showInputBox({
+        title: "Rename Server",
+        value: server.name,
+        prompt: "Enter new name",
+        validateInput: (value) => (value.trim() ? null : "Name cannot be empty")
+      });
+      if (!newName || newName.trim() === server.name) {
+        return;
+      }
+      await ctx.core.addOrUpdateServer({ ...server, name: newName.trim() });
+    }),
+
+    vscode.commands.registerCommand("nexus.group.rename", async (arg?: unknown) => {
+      if (!(arg instanceof GroupTreeItem)) {
+        return;
+      }
+      const oldName = arg.groupName;
+      const newName = await vscode.window.showInputBox({
+        title: "Rename Group",
+        value: oldName,
+        prompt: "Enter new group name",
+        validateInput: (value) => (value.trim() ? null : "Group name cannot be empty")
+      });
+      if (!newName || newName.trim() === oldName) {
+        return;
+      }
+      const trimmedName = newName.trim();
+      const snapshot = ctx.core.getSnapshot();
+      for (const server of snapshot.servers) {
+        if (server.group === oldName) {
+          await ctx.core.addOrUpdateServer({ ...server, group: trimmedName });
+        }
+      }
+      for (const profile of snapshot.serialProfiles) {
+        if (profile.group === oldName) {
+          await ctx.core.addOrUpdateSerialProfile({ ...profile, group: trimmedName });
+        }
+      }
+    }),
+
     vscode.commands.registerCommand("nexus.group.connect", async (arg?: unknown) => {
       if (!(arg instanceof GroupTreeItem)) {
         return;
