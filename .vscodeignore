@@ -21,6 +21,8 @@ package-lock.json
 CLAUDE.md
 
 # Node modules — only serialport (native) is needed at runtime; everything else is bundled
+# Override .gitignore's node_modules/ exclusion so vsce includes it
+!node_modules/
 node_modules/.package-lock.json
 
 # Exclude all node_modules EXCEPT serialport and its native dependencies
