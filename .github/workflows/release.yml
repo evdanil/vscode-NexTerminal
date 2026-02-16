@@ -39,8 +39,7 @@ jobs:
         run: rm -rf node_modules/@serialport/bindings-cpp/build
 
       - name: Package VSIX
-        run: npx @vscode/vsce package --no-dependencies
-
+        run: npx @vscode/vsce package 
       - name: Verify VSIX contents
         run: |
           VSIX_FILE=$(ls *.vsix)
