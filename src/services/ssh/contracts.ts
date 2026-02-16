@@ -16,8 +16,14 @@ export interface SecretVault {
   delete(key: string): Promise<void>;
 }
 
+export interface PtyOptions {
+  term?: string;
+  rows?: number;
+  cols?: number;
+}
+
 export interface SshConnection {
-  openShell(): Promise<Duplex>;
+  openShell(ptyOptions?: PtyOptions): Promise<Duplex>;
   openDirectTcp(remoteIP: string, remotePort: number): Promise<Duplex>;
   onClose(listener: () => void): () => void;
   dispose(): void;

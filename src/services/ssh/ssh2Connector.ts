@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
 import { Client, type ConnectConfig } from "ssh2";
 import type { ServerConfig } from "../../models/config";
-import type { SshConnection, SshConnector } from "./contracts";
+import type { PtyOptions, SshConnection, SshConnector } from "./contracts";
 
 class Ssh2Connection implements SshConnection {
   private readonly closeListeners = new Set<() => void>();
@@ -15,9 +15,14 @@ class Ssh2Connection implements SshConnection {
     });
   }
 
-  public async openShell(): Promise<Duplex> {
+  public async openShell(ptyOptions?: PtyOptions): Promise<Duplex> {
     return new Promise((resolve, reject) => {
-      this.client.shell((error: Error | undefined, stream: Duplex) => {
+      const wndopts = {
+        term: ptyOptions?.term ?? "xterm-256color",
+        rows: ptyOptions?.rows ?? 24,
+        cols: ptyOptions?.cols ?? 80
+      };
+      this.client.shell(wndopts, (error: Error | undefined, stream: Duplex) => {
         if (error) {
           reject(error);
           return;

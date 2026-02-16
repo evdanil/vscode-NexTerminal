@@ -32,8 +32,8 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
   public readonly onDidClose: vscode.Event<void> = this.closeEmitter.event;
 
-  public open(): void {
-    void this.start();
+  public open(initialDimensions?: vscode.TerminalDimensions): void {
+    void this.start(initialDimensions);
   }
 
   public close(): void {
@@ -70,10 +70,14 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.callbacks.onSessionClosed(this.sessionId);
   }
 
-  private async start(): Promise<void> {
+  private async start(dimensions?: vscode.TerminalDimensions): Promise<void> {
     try {
       this.connection = await this.sshFactory.connect(this.serverConfig);
-      this.stream = await this.connection.openShell();
+      this.stream = await this.connection.openShell({
+        term: "xterm-256color",
+        rows: dimensions?.rows,
+        cols: dimensions?.columns
+      });
       this.callbacks.onSessionOpened(this.sessionId);
       this.logger.log(`connected to ${this.serverConfig.name}`);
 
