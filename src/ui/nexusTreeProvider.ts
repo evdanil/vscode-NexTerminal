@@ -18,7 +18,7 @@ export class GroupTreeItem extends vscode.TreeItem {
 export class ServerTreeItem extends vscode.TreeItem {
   public constructor(public readonly server: ServerConfig, connected: boolean) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
-    this.id = `server:${server.id}`;
+    this.id = `server:${server.id}:${connected ? "on" : "off"}`;
     this.tooltip = `${server.username}@${server.host}:${server.port}`;
     this.description = `${server.username}@${server.host}`;
     this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
@@ -42,7 +42,7 @@ export class SessionTreeItem extends vscode.TreeItem {
 export class SerialProfileTreeItem extends vscode.TreeItem {
   public constructor(public readonly profile: SerialProfile, connected: boolean) {
     super(profile.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
-    this.id = `serial:${profile.id}`;
+    this.id = `serial:${profile.id}:${connected ? "on" : "off"}`;
     this.tooltip = `${profile.path} @ ${profile.baudRate}`;
     this.description = `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`;
     this.contextValue = connected ? "nexus.serialProfileConnected" : "nexus.serialProfile";

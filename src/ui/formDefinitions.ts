@@ -23,6 +23,7 @@ export function serverFormDefinition(seed?: Partial<ServerConfig>, existingGroup
         value: seed?.authType ?? "password"
       },
       { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath },
+      { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.logSession ?? true },
       {
         type: "combobox",
         key: "group",
@@ -126,6 +127,7 @@ export function serialFormDefinition(seed?: Partial<SerialProfile>, existingGrou
         value: seed?.parity ?? "none"
       },
       { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", value: seed?.rtscts ?? false },
+      { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.logSession ?? true },
       {
         type: "combobox",
         key: "group",

@@ -19,10 +19,9 @@ export class TunnelTreeItem extends vscode.TreeItem {
       activeTunnelId ? "circle-filled" : "circle-outline",
       new vscode.ThemeColor(activeTunnelId ? "testing.iconPassed" : "descriptionForeground")
     );
-    const mode = profile.connectionMode ?? "isolated";
     this.description = activeTunnelId
-      ? `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort} | ${mode} | in ${formatBytes(bytesIn ?? 0)} out ${formatBytes(bytesOut ?? 0)}`
-      : `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort} | ${mode}`;
+      ? `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort} | in ${formatBytes(bytesIn ?? 0)} out ${formatBytes(bytesOut ?? 0)}`
+      : `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort}`;
     this.tooltip = this.description;
   }
 }

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as vscode from "vscode";
 import type { AuthType, ServerConfig } from "../models/config";
+import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { serverFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
@@ -105,7 +106,8 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     authType: (values.authType as AuthType) ?? "password",
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
     group: typeof values.group === "string" && values.group ? values.group : undefined,
-    isHidden: preserveIsHidden
+    isHidden: preserveIsHidden,
+    logSession: values.logSession !== false
   };
 }
 
@@ -168,7 +170,8 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
             }
           }
         },
-        ctx.loggerFactory.create("terminal", server.id)
+        ctx.loggerFactory.create("terminal", server.id),
+        createSessionTranscript(ctx.sessionLogDir, server.name, server.logSession !== false)
       );
       const terminal = vscode.window.createTerminal({ name: terminalName, pty });
       terminalRef = terminal;

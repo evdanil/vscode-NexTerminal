@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { SerialDataBits, SerialParity, SerialProfile, SerialStopBits } from "../models/config";
+import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SerialPty } from "../services/serial/serialPty";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
 import { serialFormDefinition } from "../ui/formDefinitions";
@@ -148,6 +149,7 @@ function formValuesToSerial(values: FormValues, existingId?: string): SerialProf
     stopBits: (typeof values.stopBits === "string" ? Number(values.stopBits) : 1) as SerialStopBits,
     parity: (values.parity as SerialParity) ?? "none",
     rtscts: values.rtscts === true,
+    logSession: values.logSession !== false,
     group: typeof values.group === "string" && values.group ? values.group : undefined
   };
 }
@@ -249,7 +251,8 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
               ctx.core.unregisterSerialSession(sessionId);
             }
           },
-          ctx.loggerFactory.create("terminal", `serial-${profile.id}`)
+          ctx.loggerFactory.create("terminal", `serial-${profile.id}`),
+          createSessionTranscript(ctx.sessionLogDir, profile.name, profile.logSession !== false)
         );
 
         const terminal = vscode.window.createTerminal({ name: terminalName, pty });

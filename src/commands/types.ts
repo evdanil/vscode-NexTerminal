@@ -14,6 +14,7 @@ export interface CommandContext {
   serialSidecar: SerialSidecarManager;
   sshFactory: SilentAuthSshFactory;
   loggerFactory: TerminalLoggerFactory;
+  sessionLogDir: string;
   terminalsByServer: ServerTerminalMap;
   serialTerminals: SerialTerminalMap;
 }

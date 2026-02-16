@@ -22,7 +22,6 @@
     "onStartupFinished",
     "onView:nexusCommandCenter",
     "onView:nexusTunnels",
-    "onView:nexusTunnelMonitor",
     "onCommand:nexus.server.add",
     "onCommand:nexus.server.connect",
     "onCommand:nexus.serial.add",
@@ -42,16 +41,11 @@
       "nexus": [
         {
           "id": "nexusCommandCenter",
-          "name": "Command Center"
+          "name": "Connectivity Hub"
         },
         {
           "id": "nexusTunnels",
           "name": "Port Forwarding"
-        },
-        {
-          "id": "nexusTunnelMonitor",
-          "name": "Tunnel Monitor",
-          "type": "webview"
         }
       ]
     },
@@ -62,7 +56,7 @@
       },
       {
         "view": "nexusTunnels",
-        "contents": "No port-forwarding tunnels configured.\n[Add Tunnel](command:nexus.tunnel.add)\nTip: Drag a tunnel onto a server in Command Center to start it."
+        "contents": "No port-forwarding tunnels configured.\n[Add Tunnel](command:nexus.tunnel.add)\nTip: Drag a tunnel onto a server in Connectivity Hub to start it."
       }
     ],
     "commands": [
@@ -254,6 +248,18 @@
           "order": 2,
           "markdownDescription": "How many rotated log files Nexus keeps per log stream."
         },
+        "nexus.logging.sessionTranscripts": {
+          "type": "boolean",
+          "default": true,
+          "order": 3,
+          "markdownDescription": "Log session transcripts for SSH and serial connections by default. Can be overridden per profile."
+        },
+        "nexus.logging.sessionLogDirectory": {
+          "type": "string",
+          "default": "",
+          "order": 4,
+          "markdownDescription": "Directory for session transcript logs. Leave empty to use the default extension storage location."
+        },
         "nexus.tunnel.defaultConnectionMode": {
           "type": "string",
           "enum": [
@@ -261,7 +267,7 @@
             "shared"
           ],
           "default": "isolated",
-          "order": 3,
+          "order": 5,
           "markdownDescription": "Default SSH connection mode for tunnels.",
           "enumDescriptions": [
             "Each tunnel gets its own SSH connection (more reliable)",

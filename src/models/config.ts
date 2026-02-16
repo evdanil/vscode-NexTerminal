@@ -15,6 +15,7 @@ export interface ServerConfig {
   authType: AuthType;
   keyPath?: string;
   isHidden: boolean;
+  logSession?: boolean;
 }
 
 export interface TunnelProfile {
@@ -38,6 +39,7 @@ export interface SerialProfile {
   stopBits: SerialStopBits;
   parity: SerialParity;
   rtscts: boolean;
+  logSession?: boolean;
 }
 
 export interface ActiveSession {

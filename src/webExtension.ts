@@ -19,20 +19,6 @@ class StaticTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   }
 }
 
-class StaticTunnelMonitorProvider implements vscode.WebviewViewProvider {
-  public resolveWebviewView(webviewView: vscode.WebviewView): void {
-    webviewView.webview.html = `<!DOCTYPE html>
-<html lang="en">
-<body style="font-family: Segoe UI, sans-serif; padding: 12px;">
-  <h3 style="margin: 0 0 8px 0;">Nexus Tunnel Monitor</h3>
-  <p style="margin: 0; color: #586e85;">
-    Tunnel and serial runtime features require the desktop extension host.
-  </p>
-</body>
-</html>`;
-  }
-}
-
 const unsupportedCommands = [
   "nexus.refresh",
   "nexus.server.add",
@@ -62,11 +48,6 @@ export function activate(context: vscode.ExtensionContext): void {
     treeDataProvider: new StaticTreeProvider("Nexus tunnels require desktop VS Code"),
     showCollapseAll: false
   });
-  const tunnelMonitorRegistration = vscode.window.registerWebviewViewProvider(
-    "nexusTunnelMonitor",
-    new StaticTunnelMonitorProvider()
-  );
-
   const commandRegistrations = unsupportedCommands.map((commandId) =>
     vscode.commands.registerCommand(commandId, () => {
       void vscode.window.showWarningMessage(
@@ -75,7 +56,7 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  context.subscriptions.push(commandCenterView, tunnelsView, tunnelMonitorRegistration, ...commandRegistrations);
+  context.subscriptions.push(commandCenterView, tunnelsView, ...commandRegistrations);
 }
 
 export function deactivate(): void {}

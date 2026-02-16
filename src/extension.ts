@@ -14,7 +14,6 @@ import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
 import { TunnelManager } from "./services/tunnel/tunnelManager";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { NexusTreeProvider } from "./ui/nexusTreeProvider";
-import { TunnelMonitorViewProvider } from "./ui/tunnelMonitorView";
 import { TunnelTreeProvider } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
@@ -39,12 +38,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const terminalsByServer: ServerTerminalMap = new Map();
   const serialTerminals: SerialTerminalMap = new Map();
 
+  const customLogDir = vscode.workspace.getConfiguration("nexus.logging").get<string>("sessionLogDirectory", "");
+  const sessionLogDir = customLogDir || path.join(context.globalStorageUri.fsPath, "session-logs");
+
   const ctx: CommandContext = {
     core,
     tunnelManager,
     serialSidecar,
     sshFactory,
     loggerFactory,
+    sessionLogDir,
     terminalsByServer,
     serialTerminals
   };
@@ -77,12 +80,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
-  const tunnelMonitorProvider = new TunnelMonitorViewProvider();
-  const tunnelMonitorRegistration = vscode.window.registerWebviewViewProvider(
-    TunnelMonitorViewProvider.viewType,
-    tunnelMonitorProvider
-  );
-
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
     treeDataProvider: nexusTreeProvider,
     dragAndDropController: nexusTreeProvider,
@@ -102,7 +99,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const snapshot = core.getSnapshot();
     nexusTreeProvider.setSnapshot(snapshot);
     tunnelTreeProvider.setSnapshot(snapshot);
-    tunnelMonitorProvider.setSnapshot(snapshot);
     statusBarItem.text = `$(terminal) Nexus: ${snapshot.activeSessions.length} sessions, ${snapshot.activeTunnels.length} tunnels`;
   };
   syncViews();
@@ -163,7 +159,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     commandCenterView,
     tunnelView,
-    tunnelMonitorRegistration,
     statusBarItem,
     refreshCommand,
     configChangeListener,

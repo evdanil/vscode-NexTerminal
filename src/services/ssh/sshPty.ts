@@ -3,6 +3,7 @@ import type { Duplex } from "node:stream";
 import * as vscode from "vscode";
 import type { ServerConfig } from "../../models/config";
 import type { SessionLogger } from "../../logging/terminalLogger";
+import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { SshConnection } from "./contracts";
 import type { SilentAuthSshFactory } from "./silentAuth";
 
@@ -24,7 +25,8 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly serverConfig: ServerConfig,
     private readonly sshFactory: SilentAuthSshFactory,
     private readonly callbacks: SshPtyCallbacks,
-    private readonly logger: SessionLogger
+    private readonly logger: SessionLogger,
+    private readonly transcript?: SessionTranscript
   ) {}
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
@@ -59,6 +61,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.disposed = true;
     this.stream?.destroy();
     this.connection?.dispose();
+    this.transcript?.close();
     this.logger.log("terminal closed");
     this.logger.close();
     this.writeEmitter.dispose();
@@ -78,6 +81,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.stream.on("data", (data: Buffer | string) => {
         const text = typeof data === "string" ? data : data.toString("utf8");
         this.logger.log(`stdout ${JSON.stringify(text)}`);
+        this.transcript?.write(text);
         this.writeEmitter.fire(text);
       });
       this.stream.on("close", () => this.dispose());
