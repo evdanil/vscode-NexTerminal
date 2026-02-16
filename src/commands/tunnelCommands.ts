@@ -389,7 +389,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
 
     vscode.commands.registerCommand("nexus.tunnel.openBrowser", (arg?: unknown) => {
       if (arg instanceof TunnelTreeItem && arg.activeTunnelId) {
-        const url = `http://localhost:${arg.profile.localPort}`;
+        const url = `https://localhost:${arg.profile.localPort}`;
         void vscode.env.openExternal(vscode.Uri.parse(url));
       }
     }),
