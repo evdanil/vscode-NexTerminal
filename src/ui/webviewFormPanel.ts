@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { renderFormHtml } from "./formHtml";
 import type { FormDefinition, FormMessage, FormValues } from "./formTypes";
@@ -22,7 +23,8 @@ export class WebviewFormPanel {
       { enableScripts: true, retainContextWhenHidden: false }
     );
 
-    this.panel.webview.html = renderFormHtml(definition);
+    const nonce = randomBytes(16).toString("base64");
+    this.panel.webview.html = renderFormHtml(definition, nonce);
 
     this.panel.webview.onDidReceiveMessage(async (message: FormMessage) => {
       if (message.type === "submit") {
@@ -82,12 +84,6 @@ export class WebviewFormPanel {
   public addSelectOption(key: string, value: string, label: string): void {
     if (!this.disposed) {
       void this.panel.webview.postMessage({ type: "addSelectOption", key, value, label });
-    }
-  }
-
-  public sendValidationErrors(errors: Record<string, string>): void {
-    if (!this.disposed) {
-      void this.panel.webview.postMessage({ type: "validationError", errors });
     }
   }
 

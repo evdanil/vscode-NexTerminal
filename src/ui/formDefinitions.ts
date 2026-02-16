@@ -1,5 +1,102 @@
 import type { SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
-import type { FormDefinition } from "./formTypes";
+import type { FormDefinition, FormFieldDescriptor, VisibleWhen } from "./formTypes";
+
+function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDescriptor[] {
+  return [
+    { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host, visibleWhen: vw },
+    { type: "number", key: "port", label: "Port", required: true, min: 1, max: 65535, value: seed?.port ?? 22, visibleWhen: vw },
+    { type: "text", key: "username", label: "Username", required: true, placeholder: "root", value: seed?.username, visibleWhen: vw },
+    {
+      type: "select",
+      key: "authType",
+      label: "Authentication",
+      options: [
+        { label: "Password", value: "password" },
+        { label: "Private Key", value: "key" },
+        { label: "SSH Agent", value: "agent" }
+      ],
+      value: seed?.authType ?? "password",
+      visibleWhen: vw
+    },
+    { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, visibleWhen: vw }
+  ];
+}
+
+function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFieldDescriptor[] {
+  return [
+    { type: "text", key: "path", label: "Port Path", required: true, placeholder: "COM3 or /dev/ttyUSB0", value: seed?.path, visibleWhen: vw },
+    {
+      type: "select",
+      key: "baudRate",
+      label: "Baud Rate",
+      options: [
+        { label: "9600", value: "9600" },
+        { label: "19200", value: "19200" },
+        { label: "38400", value: "38400" },
+        { label: "57600", value: "57600" },
+        { label: "115200", value: "115200" },
+        { label: "230400", value: "230400" },
+        { label: "460800", value: "460800" },
+        { label: "921600", value: "921600" }
+      ],
+      value: `${seed?.baudRate ?? 115200}`,
+      visibleWhen: vw
+    },
+    {
+      type: "select",
+      key: "dataBits",
+      label: "Data Bits",
+      options: [
+        { label: "8", value: "8" },
+        { label: "7", value: "7" },
+        { label: "6", value: "6" },
+        { label: "5", value: "5" }
+      ],
+      value: `${seed?.dataBits ?? 8}`,
+      visibleWhen: vw
+    },
+    {
+      type: "select",
+      key: "stopBits",
+      label: "Stop Bits",
+      options: [
+        { label: "1", value: "1" },
+        { label: "2", value: "2" }
+      ],
+      value: `${seed?.stopBits ?? 1}`,
+      visibleWhen: vw
+    },
+    {
+      type: "select",
+      key: "parity",
+      label: "Parity",
+      options: [
+        { label: "None", value: "none" },
+        { label: "Even", value: "even" },
+        { label: "Odd", value: "odd" },
+        { label: "Mark", value: "mark" },
+        { label: "Space", value: "space" }
+      ],
+      value: seed?.parity ?? "none",
+      visibleWhen: vw
+    },
+    { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", value: seed?.rtscts ?? false, visibleWhen: vw }
+  ];
+}
+
+function sharedTrailingFields(seed?: { logSession?: boolean; group?: string }, existingGroups?: string[]): FormFieldDescriptor[] {
+  return [
+    { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.logSession ?? true },
+    {
+      type: "combobox",
+      key: "group",
+      label: "Group",
+      suggestions: existingGroups ?? [],
+      placeholder: "Type a new group or pick existing...",
+      value: seed?.group ?? ""
+    }
+  ];
+}
 
 export function serverFormDefinition(seed?: Partial<ServerConfig>, existingGroups?: string[]): FormDefinition {
   const isEdit = Boolean(seed?.id);
@@ -8,30 +105,8 @@ export function serverFormDefinition(seed?: Partial<ServerConfig>, existingGroup
     title: isEdit ? "Edit Server" : "Add Server",
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
-      { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host },
-      { type: "number", key: "port", label: "Port", required: true, min: 1, max: 65535, value: seed?.port ?? 22 },
-      { type: "text", key: "username", label: "Username", required: true, placeholder: "root", value: seed?.username },
-      {
-        type: "select",
-        key: "authType",
-        label: "Authentication",
-        options: [
-          { label: "Password", value: "password" },
-          { label: "Private Key", value: "key" },
-          { label: "SSH Agent", value: "agent" }
-        ],
-        value: seed?.authType ?? "password"
-      },
-      { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath },
-      { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.logSession ?? true },
-      {
-        type: "combobox",
-        key: "group",
-        label: "Group",
-        suggestions: existingGroups ?? [],
-        placeholder: "Type a new group or pick existing...",
-        value: seed?.group ?? ""
-      }
+      ...sshFields(seed),
+      ...sharedTrailingFields(seed, existingGroups)
     ]
   };
 }
@@ -74,68 +149,8 @@ export function serialFormDefinition(seed?: Partial<SerialProfile>, existingGrou
     title: isEdit ? "Edit Serial Profile" : "Add Serial Profile",
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "Arduino", value: seed?.name },
-      { type: "text", key: "path", label: "Port Path", required: true, placeholder: "COM3 or /dev/ttyUSB0", value: seed?.path },
-      {
-        type: "select",
-        key: "baudRate",
-        label: "Baud Rate",
-        options: [
-          { label: "9600", value: "9600" },
-          { label: "19200", value: "19200" },
-          { label: "38400", value: "38400" },
-          { label: "57600", value: "57600" },
-          { label: "115200", value: "115200" },
-          { label: "230400", value: "230400" },
-          { label: "460800", value: "460800" },
-          { label: "921600", value: "921600" }
-        ],
-        value: `${seed?.baudRate ?? 115200}`
-      },
-      {
-        type: "select",
-        key: "dataBits",
-        label: "Data Bits",
-        options: [
-          { label: "8", value: "8" },
-          { label: "7", value: "7" },
-          { label: "6", value: "6" },
-          { label: "5", value: "5" }
-        ],
-        value: `${seed?.dataBits ?? 8}`
-      },
-      {
-        type: "select",
-        key: "stopBits",
-        label: "Stop Bits",
-        options: [
-          { label: "1", value: "1" },
-          { label: "2", value: "2" }
-        ],
-        value: `${seed?.stopBits ?? 1}`
-      },
-      {
-        type: "select",
-        key: "parity",
-        label: "Parity",
-        options: [
-          { label: "None", value: "none" },
-          { label: "Even", value: "even" },
-          { label: "Odd", value: "odd" },
-          { label: "Mark", value: "mark" },
-          { label: "Space", value: "space" }
-        ],
-        value: seed?.parity ?? "none"
-      },
-      { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", value: seed?.rtscts ?? false },
-      { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.logSession ?? true },
-      {
-        type: "combobox",
-        key: "group",
-        label: "Group",
-        suggestions: existingGroups ?? [],
-        placeholder: "Type a new group or pick existing...",
-        value: seed?.group ?? ""
-      }
+      ...serialFields(seed),
+      ...sharedTrailingFields(seed, existingGroups)
     ]
   };
 }
@@ -163,91 +178,9 @@ export function unifiedProfileFormDefinition(seed?: UnifiedProfileSeed, existing
         value: seed?.profileType ?? "ssh"
       },
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server or Arduino" },
-      // SSH fields
-      { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", visibleWhen: sshVw },
-      { type: "number", key: "port", label: "Port", required: true, min: 1, max: 65535, value: 22, visibleWhen: sshVw },
-      { type: "text", key: "username", label: "Username", required: true, placeholder: "root", visibleWhen: sshVw },
-      {
-        type: "select",
-        key: "authType",
-        label: "Authentication",
-        options: [
-          { label: "Password", value: "password" },
-          { label: "Private Key", value: "key" },
-          { label: "SSH Agent", value: "agent" }
-        ],
-        value: "password",
-        visibleWhen: sshVw
-      },
-      { type: "file", key: "keyPath", label: "Private Key File", visibleWhen: sshVw },
-      // Serial fields
-      { type: "text", key: "path", label: "Port Path", required: true, placeholder: "COM3 or /dev/ttyUSB0", visibleWhen: serialVw },
-      {
-        type: "select",
-        key: "baudRate",
-        label: "Baud Rate",
-        options: [
-          { label: "9600", value: "9600" },
-          { label: "19200", value: "19200" },
-          { label: "38400", value: "38400" },
-          { label: "57600", value: "57600" },
-          { label: "115200", value: "115200" },
-          { label: "230400", value: "230400" },
-          { label: "460800", value: "460800" },
-          { label: "921600", value: "921600" }
-        ],
-        value: "115200",
-        visibleWhen: serialVw
-      },
-      {
-        type: "select",
-        key: "dataBits",
-        label: "Data Bits",
-        options: [
-          { label: "8", value: "8" },
-          { label: "7", value: "7" },
-          { label: "6", value: "6" },
-          { label: "5", value: "5" }
-        ],
-        value: "8",
-        visibleWhen: serialVw
-      },
-      {
-        type: "select",
-        key: "stopBits",
-        label: "Stop Bits",
-        options: [
-          { label: "1", value: "1" },
-          { label: "2", value: "2" }
-        ],
-        value: "1",
-        visibleWhen: serialVw
-      },
-      {
-        type: "select",
-        key: "parity",
-        label: "Parity",
-        options: [
-          { label: "None", value: "none" },
-          { label: "Even", value: "even" },
-          { label: "Odd", value: "odd" },
-          { label: "Mark", value: "mark" },
-          { label: "Space", value: "space" }
-        ],
-        value: "none",
-        visibleWhen: serialVw
-      },
-      { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", visibleWhen: serialVw },
-      // Shared fields (always visible)
-      { type: "checkbox", key: "logSession", label: "Log session transcript", value: true },
-      {
-        type: "combobox",
-        key: "group",
-        label: "Group",
-        suggestions: existingGroups ?? [],
-        placeholder: "Type a new group or pick existing...",
-        value: seed?.group ?? ""
-      }
+      ...sshFields(undefined, sshVw),
+      ...serialFields(undefined, serialVw),
+      ...sharedTrailingFields({ group: seed?.group }, existingGroups)
     ]
   };
 }

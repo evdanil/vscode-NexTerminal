@@ -7,7 +7,6 @@ import type { SerialSidecarManager } from "../services/serial/serialSidecarManag
 import { serialFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import {
-  GroupTreeItem,
   SerialProfileTreeItem,
   SerialSessionTreeItem
 } from "../ui/nexusTreeProvider";
@@ -82,19 +81,6 @@ function toSerialSessionIdFromArg(arg: unknown): string | undefined {
   return undefined;
 }
 
-export function toGroupFromArg(arg: unknown): string | undefined {
-  if (arg instanceof GroupTreeItem) {
-    return arg.groupName;
-  }
-  if (typeof arg === "object" && arg) {
-    const withGroup = arg as { groupName?: string };
-    if (withGroup.groupName) {
-      return withGroup.groupName;
-    }
-  }
-  return undefined;
-}
-
 async function listSerialPorts(
   serialSidecar: SerialSidecarManager
 ): Promise<Array<{ path: string; manufacturer?: string }>> {
@@ -119,20 +105,27 @@ async function listSerialPorts(
   }
 }
 
+const VALID_DATA_BITS = new Set<number>([5, 6, 7, 8]);
+const VALID_STOP_BITS = new Set<number>([1, 2]);
+const VALID_PARITY = new Set<string>(["none", "even", "odd", "mark", "space"]);
+
 export function formValuesToSerial(values: FormValues, existingId?: string): SerialProfile | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const portPath = typeof values.path === "string" ? values.path.trim() : "";
   if (!name || !portPath) {
     return undefined;
   }
+  const dataBits = typeof values.dataBits === "string" ? Number(values.dataBits) : 8;
+  const stopBits = typeof values.stopBits === "string" ? Number(values.stopBits) : 1;
+  const parity = typeof values.parity === "string" ? values.parity : "none";
   return {
     id: existingId ?? randomUUID(),
     name,
     path: portPath,
     baudRate: typeof values.baudRate === "string" ? Number(values.baudRate) : 115200,
-    dataBits: (typeof values.dataBits === "string" ? Number(values.dataBits) : 8) as SerialDataBits,
-    stopBits: (typeof values.stopBits === "string" ? Number(values.stopBits) : 1) as SerialStopBits,
-    parity: (values.parity as SerialParity) ?? "none",
+    dataBits: VALID_DATA_BITS.has(dataBits) ? (dataBits as SerialDataBits) : 8,
+    stopBits: VALID_STOP_BITS.has(stopBits) ? (stopBits as SerialStopBits) : 1,
+    parity: VALID_PARITY.has(parity) ? (parity as SerialParity) : "none",
     rtscts: values.rtscts === true,
     logSession: values.logSession !== false,
     group: typeof values.group === "string" && values.group ? values.group : undefined

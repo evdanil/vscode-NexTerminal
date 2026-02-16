@@ -93,6 +93,11 @@ function collectGroups(ctx: CommandContext): string[] {
   return [...groups].sort((a, b) => a.localeCompare(b));
 }
 
+const VALID_AUTH_TYPES = new Set<string>(["password", "key", "agent"]);
+function isAuthType(value: unknown): value is AuthType {
+  return typeof value === "string" && VALID_AUTH_TYPES.has(value);
+}
+
 export function formValuesToServer(values: FormValues, existingId?: string, preserveIsHidden = false): ServerConfig | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const host = typeof values.host === "string" ? values.host.trim() : "";
@@ -106,7 +111,7 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     host,
     port: typeof values.port === "number" ? values.port : 22,
     username,
-    authType: (values.authType as AuthType) ?? "password",
+    authType: isAuthType(values.authType) ? values.authType : "password",
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
     group: typeof values.group === "string" && values.group ? values.group : undefined,
     isHidden: preserveIsHidden,

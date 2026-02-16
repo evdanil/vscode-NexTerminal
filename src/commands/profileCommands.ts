@@ -46,15 +46,7 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
           if (!value.trim()) {
             return "Group name cannot be empty";
           }
-          const existing = ctx.core.getSnapshot().explicitGroups;
-          const snapshot = ctx.core.getSnapshot();
-          const allGroups = new Set(existing);
-          for (const s of snapshot.servers) {
-            if (s.group) allGroups.add(s.group);
-          }
-          for (const p of snapshot.serialProfiles) {
-            if (p.group) allGroups.add(p.group);
-          }
+          const allGroups = new Set(collectGroups(ctx));
           if (allGroups.has(value.trim())) {
             return "A group with this name already exists";
           }

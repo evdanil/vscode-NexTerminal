@@ -17,7 +17,8 @@ function visibleWhenAttrs(field: FormFieldDescriptor): string {
 }
 
 function renderField(field: FormFieldDescriptor): string {
-  const id = `field-${field.key}`;
+  const key = escapeHtml(field.key);
+  const id = `field-${key}`;
   const req = "required" in field && field.required ? " required" : "";
   const vw = visibleWhenAttrs(field);
 
@@ -25,40 +26,40 @@ function renderField(field: FormFieldDescriptor): string {
     case "text":
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
-  <input type="text" id="${id}" name="${field.key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
-  <div class="field-error" id="error-${field.key}"></div>
+  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
+  <div class="field-error" id="error-${key}"></div>
 </div>`;
 
     case "number":
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
-  <input type="number" id="${id}" name="${field.key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
-  <div class="field-error" id="error-${field.key}"></div>
+  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
+  <div class="field-error" id="error-${key}"></div>
 </div>`;
 
     case "select":
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}</label>
-  <select id="${id}" name="${field.key}" class="create-inline-select">
+  <select id="${id}" name="${key}" class="create-inline-select">
     ${field.options.map((opt) => `<option value="${escapeHtml(opt.value)}"${opt.value === field.value ? " selected" : ""}>${escapeHtml(opt.label)}</option>`).join("\n    ")}
   </select>
-  <div class="field-error" id="error-${field.key}"></div>
+  <div class="field-error" id="error-${key}"></div>
 </div>`;
 
     case "combobox":
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}</label>
-  <input type="text" id="${id}" name="${field.key}" list="list-${field.key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "Type or select...")}" />
-  <datalist id="list-${field.key}">
+  <input type="text" id="${id}" name="${key}" list="list-${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "Type or select...")}" />
+  <datalist id="list-${key}">
     ${field.suggestions.map((s) => `<option value="${escapeHtml(s)}">`).join("\n    ")}
   </datalist>
-  <div class="field-error" id="error-${field.key}"></div>
+  <div class="field-error" id="error-${key}"></div>
 </div>`;
 
     case "checkbox":
       return `<div class="form-group form-group-checkbox"${vw}>
   <label>
-    <input type="checkbox" id="${id}" name="${field.key}"${field.value ? " checked" : ""} />
+    <input type="checkbox" id="${id}" name="${key}"${field.value ? " checked" : ""} />
     ${escapeHtml(field.label)}
   </label>
 </div>`;
@@ -67,23 +68,28 @@ function renderField(field: FormFieldDescriptor): string {
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}</label>
   <div class="file-input-row">
-    <input type="text" id="${id}" name="${field.key}" value="${escapeHtml(field.value ?? "")}" readonly />
-    <button type="button" class="browse-btn" data-key="${field.key}">Browse</button>
+    <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" readonly />
+    <button type="button" class="browse-btn" data-key="${key}">Browse</button>
   </div>
-  <div class="field-error" id="error-${field.key}"></div>
+  <div class="field-error" id="error-${key}"></div>
 </div>`;
   }
 }
 
-export function renderFormHtml(definition: FormDefinition): string {
+export function renderFormHtml(definition: FormDefinition, nonce?: string): string {
   const fieldsHtml = definition.fields.map(renderField).join("\n");
+  const csp = nonce
+    ? `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />`
+    : "";
+  const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <style>
+  ${csp}
+  <style${nonceAttr}>
     body {
       font-family: var(--vscode-font-family);
       font-size: var(--vscode-font-size, 13px);
@@ -210,7 +216,7 @@ export function renderFormHtml(definition: FormDefinition): string {
       <button type="button" class="btn-secondary" id="cancel-btn">Cancel</button>
     </div>
   </form>
-  <script>
+  <script${nonceAttr}>
     (function() {
       const vscode = acquireVsCodeApi();
       const form = document.getElementById("nexus-form");
