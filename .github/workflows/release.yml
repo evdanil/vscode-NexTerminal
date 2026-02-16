@@ -53,16 +53,16 @@ jobs:
 
       - name: Publish to VS Code Marketplace
         if: >-
-          (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_marketplace == 'true')
-          && secrets.VSCE_PAT != ''
+          startsWith(github.ref, 'refs/tags/v')
+          || inputs.publish_marketplace
         run: npx @vscode/vsce publish --no-dependencies --pat "$VSCE_PAT"
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
       - name: Publish to Open VSX Registry
         if: >-
-          (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_marketplace == 'true')
-          && secrets.OVSX_PAT != ''
+          startsWith(github.ref, 'refs/tags/v')
+          || inputs.publish_marketplace
         run: npx ovsx publish *.vsix --pat "$OVSX_PAT"
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
