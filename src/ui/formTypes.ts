@@ -4,7 +4,7 @@ export interface VisibleWhen {
 }
 
 export type FormFieldDescriptor =
-  | { type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; visibleWhen?: VisibleWhen }
+  | { type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean; visibleWhen?: VisibleWhen }
   | { type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; placeholder?: string; value?: number; visibleWhen?: VisibleWhen }
   | { type: "select"; key: string; label: string; options: { label: string; value: string }[]; value?: string; visibleWhen?: VisibleWhen }
   | { type: "combobox"; key: string; label: string; suggestions: string[]; placeholder?: string; value?: string; visibleWhen?: VisibleWhen }
@@ -22,6 +22,7 @@ export type FormMessage =
   | { type: "submit"; values: FormValues }
   | { type: "cancel" }
   | { type: "browse"; key: string }
+  | { type: "scan"; key: string }
   | { type: "createInline"; key: string };
 
 export type ExtensionMessage =

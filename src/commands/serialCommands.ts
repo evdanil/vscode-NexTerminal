@@ -105,6 +105,21 @@ async function listSerialPorts(
   }
 }
 
+export async function scanForPort(ctx: CommandContext): Promise<string | undefined> {
+  const ports = await listSerialPorts(ctx.serialSidecar);
+  if (ports.length === 0) {
+    return undefined;
+  }
+  const pick = await vscode.window.showQuickPick(
+    ports.map((p) => ({
+      label: p.path,
+      description: p.manufacturer ?? ""
+    })),
+    { title: "Select Serial Port" }
+  );
+  return pick?.label;
+}
+
 const VALID_DATA_BITS = new Set<number>([5, 6, 7, 8]);
 const VALID_STOP_BITS = new Set<number>([1, 2]);
 const VALID_PARITY = new Set<string>(["none", "even", "odd", "mark", "space"]);
@@ -146,6 +161,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       const existingGroups = collectGroups(ctx);
       const definition = serialFormDefinition(existing, existingGroups);
       WebviewFormPanel.open("serial-edit", definition, {
+        onScan: () => scanForPort(ctx),
         onSubmit: async (values) => {
           const updated = formValuesToSerial(values, existing.id);
           if (!updated) {

@@ -24,7 +24,7 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDes
 
 function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFieldDescriptor[] {
   return [
-    { type: "text", key: "path", label: "Port Path", required: true, placeholder: "COM3 or /dev/ttyUSB0", value: seed?.path, visibleWhen: vw },
+    { type: "text", key: "path", label: "Port Path", required: true, placeholder: "COM3 or /dev/ttyUSB0", value: seed?.path, scannable: true, visibleWhen: vw },
     {
       type: "select",
       key: "baudRate",

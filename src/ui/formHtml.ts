@@ -24,6 +24,16 @@ function renderField(field: FormFieldDescriptor): string {
 
   switch (field.type) {
     case "text":
+      if (field.scannable) {
+        return `<div class="form-group"${vw}>
+  <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
+  <div class="file-input-row">
+    <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
+    <button type="button" class="browse-btn scan-btn" data-key="${key}">Scan</button>
+  </div>
+  <div class="field-error" id="error-${key}"></div>
+</div>`;
+      }
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
   <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
@@ -292,6 +302,12 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       for (const btn of document.querySelectorAll(".browse-btn")) {
         btn.addEventListener("click", () => {
           vscode.postMessage({ type: "browse", key: btn.dataset.key });
+        });
+      }
+
+      for (const btn of document.querySelectorAll(".scan-btn")) {
+        btn.addEventListener("click", () => {
+          vscode.postMessage({ type: "scan", key: btn.dataset.key });
         });
       }
 

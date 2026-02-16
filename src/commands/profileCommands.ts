@@ -5,7 +5,7 @@ import type { FormValues } from "../ui/formTypes";
 import { GroupTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { formValuesToServer, browseForKey, collectGroups } from "./serverCommands";
-import { formValuesToSerial } from "./serialCommands";
+import { formValuesToSerial, scanForPort } from "./serialCommands";
 import type { CommandContext } from "./types";
 
 export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed): void {
@@ -27,7 +27,8 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         await ctx.core.addOrUpdateServer(server);
       }
     },
-    onBrowse: browseForKey
+    onBrowse: browseForKey,
+    onScan: () => scanForPort(ctx)
   });
 }
 

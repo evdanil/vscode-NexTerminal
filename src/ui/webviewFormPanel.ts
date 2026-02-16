@@ -14,6 +14,7 @@ export class WebviewFormPanel {
     private readonly onSubmit: (values: FormValues) => void,
     private readonly onCancel: () => void,
     private readonly onBrowse?: (key: string) => Promise<string | undefined>,
+    private readonly onScan?: (key: string) => Promise<string | undefined>,
     private readonly onCreateInline?: (key: string) => void
   ) {
     this.panel = vscode.window.createWebviewPanel(
@@ -43,6 +44,12 @@ export class WebviewFormPanel {
           void this.panel.webview.postMessage({ type: "browseResult", key: message.key, path: result });
         }
       }
+      if (message.type === "scan" && this.onScan) {
+        const result = await this.onScan(message.key);
+        if (result && !this.disposed) {
+          void this.panel.webview.postMessage({ type: "browseResult", key: message.key, path: result });
+        }
+      }
       if (message.type === "createInline" && this.onCreateInline) {
         this.onCreateInline(message.key);
       }
@@ -61,6 +68,7 @@ export class WebviewFormPanel {
       onSubmit: (values: FormValues) => void;
       onCancel?: () => void;
       onBrowse?: (key: string) => Promise<string | undefined>;
+      onScan?: (key: string) => Promise<string | undefined>;
       onCreateInline?: (key: string) => void;
     }
   ): WebviewFormPanel {
@@ -75,6 +83,7 @@ export class WebviewFormPanel {
       options.onSubmit,
       options.onCancel ?? (() => {}),
       options.onBrowse,
+      options.onScan,
       options.onCreateInline
     );
     WebviewFormPanel.activePanels.set(formId, instance);
