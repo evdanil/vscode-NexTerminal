@@ -18,6 +18,7 @@ import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
 import { TunnelTreeProvider } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
 import { registerSettingsCommands } from "./commands/settingsCommands";
+import { registerConfigCommands } from "./commands/configCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -165,6 +166,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
   const settingsDisposables = registerSettingsCommands(settingsTreeProvider, () => ctx.sessionLogDir);
+  const configDisposables = registerConfigCommands(core);
 
   context.subscriptions.push(
     commandCenterView,
@@ -177,6 +179,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ...tunnelDisposables,
     ...serialDisposables,
     ...settingsDisposables,
+    ...configDisposables,
     {
       dispose: () => {
         unsubscribeCore();

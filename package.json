@@ -1,7 +1,7 @@
 {
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
-  "description": "Unified SSH and Serial command center for VS Code.",
+  "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar.",
   "version": "0.1.7",
   "publisher": "nexus",
   "license": "MIT",
@@ -61,7 +61,7 @@
       },
       {
         "view": "nexusTunnels",
-        "contents": "No port-forwarding tunnels configured.\n[Add Tunnel](command:nexus.tunnel.add)\nTip: Drag a tunnel onto a server in Connectivity Hub to start it."
+        "contents": "No port-forwarding tunnels configured.\n[Add Tunnel](command:nexus.tunnel.add)\nRight-click a tunnel to start, stop, or edit it."
       }
     ],
     "commands": [
@@ -96,8 +96,10 @@
       { "command": "nexus.group.rename", "title": "Rename Group", "icon": "$(edit)" },
       { "command": "nexus.settings.edit", "title": "Edit Setting", "icon": "$(edit)" },
       { "command": "nexus.settings.reset", "title": "Reset to Default", "icon": "$(discard)" },
-      { "command": "nexus.settings.openJson", "title": "Open Settings JSON", "icon": "$(json)" },
-      { "command": "nexus.settings.openLogDir", "title": "Open Log Directory", "icon": "$(folder-opened)" }
+      { "command": "nexus.settings.openJson", "title": "Open VS Code Settings", "icon": "$(settings-gear)" },
+      { "command": "nexus.settings.openLogDir", "title": "Open Log Directory", "icon": "$(folder-opened)" },
+      { "command": "nexus.config.export", "title": "Nexus: Export Configuration", "icon": "$(cloud-upload)" },
+      { "command": "nexus.config.import", "title": "Nexus: Import Configuration", "icon": "$(cloud-download)" }
     ],
     "menus": {
       "view/title": [
@@ -142,14 +144,24 @@
           "group": "navigation@3"
         },
         {
-          "command": "nexus.settings.openLogDir",
+          "command": "nexus.config.export",
           "when": "view == nexusSettings",
           "group": "navigation@1"
         },
         {
-          "command": "nexus.settings.openJson",
+          "command": "nexus.config.import",
           "when": "view == nexusSettings",
           "group": "navigation@2"
+        },
+        {
+          "command": "nexus.settings.openLogDir",
+          "when": "view == nexusSettings",
+          "group": "navigation@3"
+        },
+        {
+          "command": "nexus.settings.openJson",
+          "when": "view == nexusSettings",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -244,7 +256,9 @@
         {"command":"nexus.settings.edit","when":"false"},
         {"command":"nexus.settings.reset","when":"false"},
         {"command":"nexus.settings.openJson","when":"true"},
-        {"command":"nexus.settings.openLogDir","when":"true"}
+        {"command":"nexus.settings.openLogDir","when":"true"},
+        {"command":"nexus.config.export","when":"true"},
+        {"command":"nexus.config.import","when":"true"}
       ]
     },
     "keybindings": [
