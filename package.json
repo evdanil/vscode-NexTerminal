@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar.",
-  "version": "0.1.7",
+  "version": "2.0.0",
   "publisher": "nexus",
   "license": "MIT",
   "repository": {
@@ -98,6 +98,7 @@
       { "command": "nexus.settings.reset", "title": "Reset to Default", "icon": "$(discard)" },
       { "command": "nexus.settings.openJson", "title": "Open VS Code Settings", "icon": "$(settings-gear)" },
       { "command": "nexus.settings.openLogDir", "title": "Open Log Directory", "icon": "$(folder-opened)" },
+      { "command": "nexus.tunnel.openBrowser", "title": "Open in Browser", "icon": "$(globe)" },
       { "command": "nexus.config.export", "title": "Nexus: Export Configuration", "icon": "$(cloud-upload)" },
       { "command": "nexus.config.import", "title": "Nexus: Import Configuration", "icon": "$(cloud-download)" }
     ],
@@ -206,12 +207,14 @@
         {"command":"nexus.serial.remove","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected)?$/","group":"3_destructive"},
 
         {"command":"nexus.tunnel.start","when":"view == nexusTunnels && viewItem == nexus.tunnel","group":"inline"},
-        {"command":"nexus.tunnel.stop","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"inline@1"},
-        {"command":"nexus.tunnel.restart","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"inline@2"},
+        {"command":"nexus.tunnel.openBrowser","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"inline@1"},
+        {"command":"nexus.tunnel.stop","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"inline@2"},
+        {"command":"nexus.tunnel.restart","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"inline@3"},
 
         {"command":"nexus.tunnel.start","when":"view == nexusTunnels && viewItem == nexus.tunnel","group":"0_connect"},
-        {"command":"nexus.tunnel.stop","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"0_connect@1"},
-        {"command":"nexus.tunnel.restart","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"0_connect@2"},
+        {"command":"nexus.tunnel.openBrowser","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"0_connect@1"},
+        {"command":"nexus.tunnel.stop","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"0_connect@2"},
+        {"command":"nexus.tunnel.restart","when":"view == nexusTunnels && viewItem == nexus.activeTunnel","group":"0_connect@3"},
 
         {"command":"nexus.tunnel.edit","when":"view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/","group":"1_manage@1"},
         {"command":"nexus.tunnel.duplicate","when":"view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/","group":"1_manage@2"},
@@ -257,6 +260,7 @@
         {"command":"nexus.settings.reset","when":"false"},
         {"command":"nexus.settings.openJson","when":"true"},
         {"command":"nexus.settings.openLogDir","when":"true"},
+        {"command":"nexus.tunnel.openBrowser","when":"false"},
         {"command":"nexus.config.export","when":"true"},
         {"command":"nexus.config.import","when":"true"}
       ]

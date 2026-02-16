@@ -387,6 +387,13 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       void vscode.window.showInformationMessage(`Copied: ${info}`);
     }),
 
+    vscode.commands.registerCommand("nexus.tunnel.openBrowser", (arg?: unknown) => {
+      if (arg instanceof TunnelTreeItem && arg.activeTunnelId) {
+        const url = `http://localhost:${arg.profile.localPort}`;
+        void vscode.env.openExternal(vscode.Uri.parse(url));
+      }
+    }),
+
     vscode.commands.registerCommand("nexus.tunnel.duplicate", async (arg?: unknown) => {
       const profile = toTunnelFromArg(ctx.core, arg) ?? (await pickTunnel(ctx.core));
       if (!profile) {
