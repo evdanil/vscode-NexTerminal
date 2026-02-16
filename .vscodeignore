@@ -104,3 +104,6 @@ node_modules/**/deps/**/scripts/**
 node_modules/**/deps/**/patches/**
 
 # serialport: all sub-packages must be included (index.js re-exports everything)
+# Exclude compiled native addon build dirs (CI may compile Linux-only binaries from source)
+# The cross-platform prebuilds/ directory is what we want instead
+node_modules/@serialport/bindings-cpp/build/**

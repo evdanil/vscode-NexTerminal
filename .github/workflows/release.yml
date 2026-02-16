@@ -35,8 +35,19 @@ jobs:
       - name: Build production bundle
         run: npm run build:production
 
+      - name: Remove CI-compiled native addons (keep cross-platform prebuilds)
+        run: rm -rf node_modules/@serialport/bindings-cpp/build
+
       - name: Package VSIX
         run: npx @vscode/vsce package --no-dependencies
+
+      - name: Verify VSIX contents
+        run: |
+          VSIX_FILE=$(ls *.vsix)
+          echo "VSIX: $VSIX_FILE ($(du -h "$VSIX_FILE" | cut -f1))"
+          unzip -l "$VSIX_FILE" | grep -c "serialport" || { echo "ERROR: serialport not found in VSIX"; exit 1; }
+          unzip -l "$VSIX_FILE" | grep "prebuilds.*\.node" || { echo "ERROR: native prebuilds not found in VSIX"; exit 1; }
+          echo "VSIX verification passed"
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
