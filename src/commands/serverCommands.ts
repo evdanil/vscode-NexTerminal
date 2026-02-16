@@ -151,6 +151,9 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
               terminalName,
               startedAt: Date.now()
             });
+            if (terminalRef) {
+              ctx.sessionTerminals.set(sessionId, terminalRef);
+            }
 
             for (const tunnel of ctx.core.getSnapshot().tunnels) {
               if (tunnel.autoStart && tunnel.defaultServerId === server.id) {
@@ -165,6 +168,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
           },
           onSessionClosed: (sessionId) => {
             ctx.core.unregisterSession(sessionId);
+            ctx.sessionTerminals.delete(sessionId);
             if (terminalRef) {
               removeTerminal(server.id, terminalRef, ctx.terminalsByServer);
             }
@@ -182,6 +186,16 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
 }
 
 async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<void> {
+  // If arg is a single session node, disconnect only that session
+  if (arg instanceof SessionTreeItem) {
+    const terminal = ctx.sessionTerminals.get(arg.session.id);
+    if (terminal) {
+      terminal.dispose();
+    }
+    return;
+  }
+
+  // Otherwise disconnect all sessions for the server
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
     return;

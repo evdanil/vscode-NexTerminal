@@ -6,6 +6,7 @@ import type { SilentAuthSshFactory } from "../services/ssh/silentAuth";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
 
 export type ServerTerminalMap = Map<string, Set<vscode.Terminal>>;
+export type SessionTerminalMap = Map<string, vscode.Terminal>;
 export type SerialTerminalMap = Map<string, { terminal: vscode.Terminal; profileId: string }>;
 
 export interface CommandContext {
@@ -16,5 +17,6 @@ export interface CommandContext {
   loggerFactory: TerminalLoggerFactory;
   sessionLogDir: string;
   terminalsByServer: ServerTerminalMap;
+  sessionTerminals: SessionTerminalMap;
   serialTerminals: SerialTerminalMap;
 }

@@ -3,7 +3,7 @@ import * as vscode from "vscode";
 import { registerSerialCommands } from "./commands/serialCommands";
 import { registerServerCommands } from "./commands/serverCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
-import type { CommandContext, SerialTerminalMap, ServerTerminalMap } from "./commands/types";
+import type { CommandContext, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory } from "./logging/terminalLogger";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
@@ -39,6 +39,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const sidecarPath = path.join(__dirname, "services", "serial", "serialSidecarWorker.js");
   const serialSidecar = new SerialSidecarManager(sidecarPath, extensionRoot);
   const terminalsByServer: ServerTerminalMap = new Map();
+  const sessionTerminals: SessionTerminalMap = new Map();
   const serialTerminals: SerialTerminalMap = new Map();
 
   const defaultSessionLogDir = path.join(context.globalStorageUri.fsPath, "session-logs");
@@ -54,6 +55,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return custom || defaultSessionLogDir;
     },
     terminalsByServer,
+    sessionTerminals,
     serialTerminals
   };
 
