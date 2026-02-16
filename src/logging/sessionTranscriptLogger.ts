@@ -41,9 +41,15 @@ export function createSessionTranscript(logDir: string, profileName: string, ena
   if (!enabled) {
     return NOOP_TRANSCRIPT;
   }
-  const safeName = profileName.replace(/[^\w.-]/g, "_");
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const filename = `${safeName}_${timestamp}.log`;
-  const filepath = path.join(logDir, filename);
-  return new FileSessionTranscript(filepath);
+  try {
+    const safeName = profileName.replace(/[^\w.-]/g, "_");
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const filename = `${safeName}_${timestamp}.log`;
+    const filepath = path.join(logDir, filename);
+    return new FileSessionTranscript(filepath);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[Nexus] Failed to create session transcript in ${logDir}: ${message}`);
+    return NOOP_TRANSCRIPT;
+  }
 }

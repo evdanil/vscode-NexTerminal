@@ -14,8 +14,10 @@ import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
 import { TunnelManager } from "./services/tunnel/tunnelManager";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { NexusTreeProvider } from "./ui/nexusTreeProvider";
+import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
 import { TunnelTreeProvider } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
+import { registerSettingsCommands } from "./commands/settingsCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -38,8 +40,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const terminalsByServer: ServerTerminalMap = new Map();
   const serialTerminals: SerialTerminalMap = new Map();
 
-  const customLogDir = vscode.workspace.getConfiguration("nexus.logging").get<string>("sessionLogDirectory", "");
-  const sessionLogDir = customLogDir || path.join(context.globalStorageUri.fsPath, "session-logs");
+  const defaultSessionLogDir = path.join(context.globalStorageUri.fsPath, "session-logs");
 
   const ctx: CommandContext = {
     core,
@@ -47,7 +48,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     serialSidecar,
     sshFactory,
     loggerFactory,
-    sessionLogDir,
+    get sessionLogDir() {
+      const custom = vscode.workspace.getConfiguration("nexus.logging").get<string>("sessionLogDirectory", "");
+      return custom || defaultSessionLogDir;
+    },
     terminalsByServer,
     serialTerminals
   };
@@ -80,6 +84,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
+  const settingsTreeProvider = new SettingsTreeProvider(defaultSessionLogDir);
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
     treeDataProvider: nexusTreeProvider,
     dragAndDropController: nexusTreeProvider,
@@ -89,6 +94,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     treeDataProvider: tunnelTreeProvider,
     dragAndDropController: tunnelTreeProvider,
     showCollapseAll: true
+  });
+
+  const settingsView = vscode.window.createTreeView("nexusSettings", {
+    treeDataProvider: settingsTreeProvider
   });
 
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
@@ -148,23 +157,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const configChangeListener = vscode.workspace.onDidChangeConfiguration((event) => {
     if (event.affectsConfiguration("nexus.logging") || event.affectsConfiguration("nexus.tunnel")) {
-      // Settings take effect on next operation; no runtime update needed for current architecture
+      settingsTreeProvider.refresh();
     }
   });
 
   const serverDisposables = registerServerCommands(ctx);
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
+  const settingsDisposables = registerSettingsCommands(settingsTreeProvider, () => ctx.sessionLogDir);
 
   context.subscriptions.push(
     commandCenterView,
     tunnelView,
+    settingsView,
     statusBarItem,
     refreshCommand,
     configChangeListener,
     ...serverDisposables,
     ...tunnelDisposables,
     ...serialDisposables,
+    ...settingsDisposables,
     {
       dispose: () => {
         unsubscribeCore();
