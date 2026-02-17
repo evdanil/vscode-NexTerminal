@@ -144,6 +144,8 @@ describe("SETTINGS_KEYS", () => {
     expect(keys).toContain("nexus.terminal.keyboardPassthrough");
     expect(keys).toContain("nexus.terminal.passthroughKeys");
     expect(keys).toContain("nexus.terminal.macros");
+    expect(keys).toContain("nexus.terminal.highlighting.enabled");
+    expect(keys).toContain("nexus.terminal.highlighting.rules");
   });
 
   it("includes logging settings", () => {

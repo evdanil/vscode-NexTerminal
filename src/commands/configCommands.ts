@@ -22,7 +22,9 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.terminal", key: "openLocation" },
   { section: "nexus.terminal", key: "keyboardPassthrough" },
   { section: "nexus.terminal", key: "passthroughKeys" },
-  { section: "nexus.terminal", key: "macros" }
+  { section: "nexus.terminal", key: "macros" },
+  { section: "nexus.terminal.highlighting", key: "enabled" },
+  { section: "nexus.terminal.highlighting", key: "rules" }
 ];
 
 function readSettings(): Record<string, unknown> {
