@@ -7,6 +7,10 @@ export function passwordSecretKey(serverId: string): string {
   return `password-${serverId}`;
 }
 
+export function passphraseSecretKey(serverId: string): string {
+  return `passphrase-${serverId}`;
+}
+
 function isAuthError(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;
@@ -61,23 +65,44 @@ export class SilentAuthSshFactory {
   public async connect(server: ServerConfig): Promise<SshConnection> {
     if (server.authType === "key") {
       const handler = this.buildKeyboardInteractiveHandler();
+      const ppKey = passphraseSecretKey(server.id);
+      const savedPassphrase = await this.vault.get(ppKey);
+
+      // Try saved passphrase (or no passphrase on first attempt).
       try {
         return await this.connector.connect(server, {
+          ...(savedPassphrase && { passphrase: savedPassphrase }),
           ...(handler && { onKeyboardInteractive: handler })
         });
       } catch (error) {
         if (!isPassphraseError(error)) {
           throw error;
         }
-        const passphrase = await this.passphrasePrompt(server);
-        if (!passphrase) {
-          throw new Error(`Passphrase entry canceled for ${server.name}`);
+        // Saved passphrase was wrong — clear it.
+        if (savedPassphrase) {
+          await this.vault.delete(ppKey);
         }
-        return this.connector.connect(server, {
-          passphrase,
-          ...(handler && { onKeyboardInteractive: handler })
-        });
       }
+
+      // Prompt user for passphrase.
+      const promptResult = await this.prompt.prompt({
+        ...server,
+        name: `${server.name} (key passphrase)`
+      });
+      if (!promptResult) {
+        throw new Error(`Passphrase entry canceled for ${server.name}`);
+      }
+
+      const connection = await this.connector.connect(server, {
+        passphrase: promptResult.password,
+        ...(handler && { onKeyboardInteractive: handler })
+      });
+      if (promptResult.save) {
+        await this.vault.store(ppKey, promptResult.password);
+      } else {
+        await this.vault.delete(ppKey);
+      }
+      return connection;
     }
 
     if (server.authType !== "password") {
@@ -122,11 +147,4 @@ export class SilentAuthSshFactory {
     return connection;
   }
 
-  private async passphrasePrompt(server: ServerConfig): Promise<string | undefined> {
-    const result = await this.prompt.prompt({
-      ...server,
-      name: `${server.name} (key passphrase)`
-    });
-    return result?.password;
-  }
 }
