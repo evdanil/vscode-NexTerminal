@@ -147,7 +147,7 @@
       "view/title": [
         {
           "command": "nexus.refresh",
-          "when": "view =~ /^nexus/",
+          "when": "view =~ /^nexus/ && view != nexusFileExplorer",
           "group": "navigation"
         },
         {
