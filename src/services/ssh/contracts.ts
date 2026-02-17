@@ -1,4 +1,5 @@
 import type { Duplex } from "node:stream";
+import type { SFTPWrapper } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 
 export interface PasswordPromptResult {
@@ -25,6 +26,7 @@ export interface PtyOptions {
 export interface SshConnection {
   openShell(ptyOptions?: PtyOptions): Promise<Duplex>;
   openDirectTcp(remoteIP: string, remotePort: number): Promise<Duplex>;
+  openSftp(): Promise<SFTPWrapper>;
   onClose(listener: () => void): () => void;
   dispose(): void;
 }

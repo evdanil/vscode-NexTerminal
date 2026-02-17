@@ -42,7 +42,16 @@ const unsupportedCommands = [
   "nexus.group.remove",
   "nexus.group.rename",
   "nexus.group.connect",
-  "nexus.group.disconnect"
+  "nexus.group.disconnect",
+  "nexus.files.browse",
+  "nexus.files.open",
+  "nexus.files.upload",
+  "nexus.files.download",
+  "nexus.files.delete",
+  "nexus.files.rename",
+  "nexus.files.createDir",
+  "nexus.files.refresh",
+  "nexus.files.disconnect"
 ];
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -54,6 +63,10 @@ export function activate(context: vscode.ExtensionContext): void {
     treeDataProvider: new StaticTreeProvider("Nexus tunnels require desktop VS Code"),
     showCollapseAll: false
   });
+  const fileExplorerView = vscode.window.createTreeView("nexusFileExplorer", {
+    treeDataProvider: new StaticTreeProvider("Nexus file explorer requires desktop VS Code"),
+    showCollapseAll: false
+  });
   const commandRegistrations = unsupportedCommands.map((commandId) =>
     vscode.commands.registerCommand(commandId, () => {
       void vscode.window.showWarningMessage(
@@ -62,7 +75,7 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  context.subscriptions.push(commandCenterView, tunnelsView, ...commandRegistrations);
+  context.subscriptions.push(commandCenterView, tunnelsView, fileExplorerView, ...commandRegistrations);
 }
 
 export function deactivate(): void {}

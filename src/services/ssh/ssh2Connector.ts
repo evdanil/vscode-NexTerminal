@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
-import { Client, type ConnectConfig } from "ssh2";
+import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import type { KeyboardInteractiveHandler, PtyOptions, SshConnection, SshConnector } from "./contracts";
 
@@ -40,6 +40,18 @@ class Ssh2Connection implements SshConnection {
           return;
         }
         resolve(stream);
+      });
+    });
+  }
+
+  public async openSftp(): Promise<SFTPWrapper> {
+    return new Promise((resolve, reject) => {
+      this.client.sftp((error: Error | undefined, sftp: SFTPWrapper) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(sftp);
       });
     });
   }

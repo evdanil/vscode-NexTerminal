@@ -2,9 +2,11 @@ import type * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { TerminalLoggerFactory } from "../logging/terminalLogger";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
+import type { SftpService } from "../services/sftp/sftpService";
 import type { SilentAuthSshFactory } from "../services/ssh/silentAuth";
 import type { TerminalHighlighter } from "../services/terminalHighlighter";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
+import type { FileExplorerTreeProvider } from "../ui/fileExplorerTreeProvider";
 
 export type ServerTerminalMap = Map<string, Set<vscode.Terminal>>;
 export type SessionTerminalMap = Map<string, vscode.Terminal>;
@@ -21,4 +23,6 @@ export interface CommandContext {
   sessionTerminals: SessionTerminalMap;
   serialTerminals: SerialTerminalMap;
   highlighter: TerminalHighlighter;
+  sftpService: SftpService;
+  fileExplorerProvider: FileExplorerTreeProvider;
 }

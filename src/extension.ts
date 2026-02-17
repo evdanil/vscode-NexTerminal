@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { registerFileCommands } from "./commands/fileCommands";
 import { registerSerialCommands } from "./commands/serialCommands";
 import { registerServerCommands } from "./commands/serverCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
@@ -7,6 +8,8 @@ import type { CommandContext, SerialTerminalMap, ServerTerminalMap, SessionTermi
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory } from "./logging/terminalLogger";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
+import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFileSystemProvider";
+import { SftpService } from "./services/sftp/sftpService";
 import { SilentAuthSshFactory } from "./services/ssh/silentAuth";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
@@ -14,6 +17,7 @@ import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
 import { TerminalHighlighter } from "./services/terminalHighlighter";
 import { TunnelManager } from "./services/tunnel/tunnelManager";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
+import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
 import { NexusTreeProvider } from "./ui/nexusTreeProvider";
 import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
 import { TunnelTreeProvider } from "./ui/tunnelTreeProvider";
@@ -135,6 +139,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const serialTerminals: SerialTerminalMap = new Map();
 
   const highlighter = new TerminalHighlighter();
+  const sftpService = new SftpService(sshFactory);
+  const fileSystemProvider = new NexusFileSystemProvider(sftpService);
+  const fsRegistration = vscode.workspace.registerFileSystemProvider(NEXTERM_SCHEME, fileSystemProvider, { isCaseSensitive: true });
+  const fileExplorerProvider = new FileExplorerTreeProvider(sftpService);
   const defaultSessionLogDir = path.join(context.globalStorageUri.fsPath, "session-logs");
 
   const ctx: CommandContext = {
@@ -150,7 +158,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     terminalsByServer,
     sessionTerminals,
     serialTerminals,
-    highlighter
+    highlighter,
+    sftpService,
+    fileExplorerProvider
   };
 
   const nexusTreeProvider = new NexusTreeProvider({
@@ -197,6 +207,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     treeDataProvider: settingsTreeProvider
   });
 
+  const fileExplorerView = vscode.window.createTreeView("nexusFileExplorer", {
+    treeDataProvider: fileExplorerProvider,
+    showCollapseAll: true
+  });
+
   const macroTreeProvider = new MacroTreeProvider();
   const macroView = vscode.window.createTreeView("nexusMacros", {
     treeDataProvider: macroTreeProvider
@@ -214,6 +229,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     nexusTreeProvider.setSnapshot(snapshot);
     tunnelTreeProvider.setSnapshot(snapshot);
     statusBarItem.text = `$(terminal) Nexus: ${snapshot.activeSessions.length} sessions, ${snapshot.activeTunnels.length} tunnels`;
+
+    const activeServerId = fileExplorerProvider.getActiveServerId();
+    if (activeServerId && !core.isServerConnected(activeServerId)) {
+      sftpService.disconnect(activeServerId);
+      fileExplorerProvider.clearActiveServer();
+    }
   };
   syncViews();
 
@@ -283,12 +304,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const settingsDisposables = registerSettingsCommands(settingsTreeProvider, () => ctx.sessionLogDir);
   const configDisposables = registerConfigCommands(core);
   const macroDisposables = registerMacroCommands(macroTreeProvider);
+  const fileDisposables = registerFileCommands(ctx);
 
   context.subscriptions.push(
     commandCenterView,
     tunnelView,
     settingsView,
     macroView,
+    fileExplorerView,
+    fsRegistration,
     statusBarItem,
     refreshCommand,
     configChangeListener,
@@ -299,6 +323,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ...settingsDisposables,
     ...configDisposables,
     ...macroDisposables,
+    ...fileDisposables,
     {
       dispose: () => {
         unsubscribeCore();
@@ -308,6 +333,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         serialTerminals.clear();
         serialSidecar.dispose();
+        sftpService.dispose();
         void tunnelManager.stopAll();
       }
     }

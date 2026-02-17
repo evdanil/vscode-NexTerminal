@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar with regex-based terminal highlighting.",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -26,7 +26,8 @@
     "onCommand:nexus.server.connect",
     "onCommand:nexus.serial.add",
     "onCommand:nexus.serial.connect",
-    "onCommand:nexus.profile.add"
+    "onCommand:nexus.profile.add",
+    "onFileSystem:nexterm"
   ],
   "contributes": {
     "viewsContainers": {
@@ -49,6 +50,11 @@
           "name": "Port Forwarding"
         },
         {
+          "id": "nexusFileExplorer",
+          "name": "File Explorer",
+          "visibility": "collapsed"
+        },
+        {
           "id": "nexusMacros",
           "name": "Terminal Macros",
           "visibility": "collapsed"
@@ -68,6 +74,10 @@
       {
         "view": "nexusTunnels",
         "contents": "No port-forwarding tunnels configured.\n[Add Tunnel](command:nexus.tunnel.add)\nRight-click a tunnel to start, stop, or edit it."
+      },
+      {
+        "view": "nexusFileExplorer",
+        "contents": "No server selected.\nRight-click a connected server → \"Browse Files\" to start."
       },
       {
         "view": "nexusMacros",
@@ -122,7 +132,16 @@
       { "command": "nexus.macro.moveUp", "title": "Move Up", "icon": "$(arrow-up)" },
       { "command": "nexus.macro.moveDown", "title": "Move Down", "icon": "$(arrow-down)" },
       { "command": "nexus.macro.assignSlot", "title": "Assign Shortcut", "icon": "$(keyboard)" },
-      { "command": "nexus.macro.runItem", "title": "Run", "icon": "$(play)" }
+      { "command": "nexus.macro.runItem", "title": "Run", "icon": "$(play)" },
+      { "command": "nexus.files.browse", "title": "Nexus: Browse Files", "icon": "$(remote-explorer)" },
+      { "command": "nexus.files.open", "title": "Open File", "icon": "$(go-to-file)" },
+      { "command": "nexus.files.upload", "title": "Upload File", "icon": "$(cloud-upload)" },
+      { "command": "nexus.files.download", "title": "Download", "icon": "$(cloud-download)" },
+      { "command": "nexus.files.delete", "title": "Delete", "icon": "$(trash)" },
+      { "command": "nexus.files.rename", "title": "Rename", "icon": "$(edit)" },
+      { "command": "nexus.files.createDir", "title": "New Directory", "icon": "$(new-folder)" },
+      { "command": "nexus.files.refresh", "title": "Refresh", "icon": "$(refresh)" },
+      { "command": "nexus.files.disconnect", "title": "Disconnect", "icon": "$(debug-disconnect)" }
     ],
     "menus": {
       "view/title": [
@@ -190,6 +209,21 @@
           "command": "nexus.macro.add",
           "when": "view == nexusMacros",
           "group": "navigation@1"
+        },
+        {
+          "command": "nexus.files.refresh",
+          "when": "view == nexusFileExplorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nexus.files.browse",
+          "when": "view == nexusFileExplorer",
+          "group": "navigation@2"
+        },
+        {
+          "command": "nexus.files.disconnect",
+          "when": "view == nexusFileExplorer",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
@@ -205,6 +239,8 @@
         {"command":"nexus.server.edit","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/","group":"1_manage@1"},
         {"command":"nexus.server.rename","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/","group":"1_manage@2"},
         {"command":"nexus.server.duplicate","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/","group":"1_manage@3"},
+
+        {"command":"nexus.files.browse","when":"view == nexusCommandCenter && viewItem == nexus.serverConnected","group":"1_manage@4"},
 
         {"command":"nexus.server.copyInfo","when":"view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/","group":"2_clipboard"},
 
@@ -258,7 +294,14 @@
         {"command":"nexus.macro.moveUp","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@2"},
         {"command":"nexus.macro.moveDown","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@3"},
         {"command":"nexus.macro.assignSlot","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@4"},
-        {"command":"nexus.macro.remove","when":"view == nexusMacros && viewItem == nexus.macro","group":"2_destructive"}
+        {"command":"nexus.macro.remove","when":"view == nexusMacros && viewItem == nexus.macro","group":"2_destructive"},
+
+        {"command":"nexus.files.open","when":"view == nexusFileExplorer && viewItem == nexus.fileExplorer.file","group":"inline"},
+        {"command":"nexus.files.createDir","when":"view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir","group":"1_manage@1"},
+        {"command":"nexus.files.upload","when":"view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir","group":"1_manage@2"},
+        {"command":"nexus.files.rename","when":"view == nexusFileExplorer && viewItem =~ /^nexus\\.fileExplorer\\.(file|dir)$/","group":"1_manage@3"},
+        {"command":"nexus.files.download","when":"view == nexusFileExplorer && viewItem == nexus.fileExplorer.file","group":"1_manage@4"},
+        {"command":"nexus.files.delete","when":"view == nexusFileExplorer && viewItem =~ /^nexus\\.fileExplorer\\.(file|dir)$/","group":"2_destructive"}
       ],
       "commandPalette": [
         {"command":"nexus.refresh","when":"true"},
@@ -308,7 +351,16 @@
         {"command":"nexus.macro.moveUp","when":"false"},
         {"command":"nexus.macro.moveDown","when":"false"},
         {"command":"nexus.macro.assignSlot","when":"false"},
-        {"command":"nexus.macro.runItem","when":"false"}
+        {"command":"nexus.macro.runItem","when":"false"},
+        {"command":"nexus.files.browse","when":"true"},
+        {"command":"nexus.files.open","when":"false"},
+        {"command":"nexus.files.upload","when":"false"},
+        {"command":"nexus.files.download","when":"false"},
+        {"command":"nexus.files.delete","when":"false"},
+        {"command":"nexus.files.rename","when":"false"},
+        {"command":"nexus.files.createDir","when":"false"},
+        {"command":"nexus.files.refresh","when":"true"},
+        {"command":"nexus.files.disconnect","when":"true"}
       ]
     },
     "keybindings": [

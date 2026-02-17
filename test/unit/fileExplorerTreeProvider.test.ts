@@ -1,0 +1,238 @@
+import { describe, expect, it, vi, beforeEach } from "vitest";
+
+vi.mock("vscode", () => {
+  const EventEmitter = vi.fn().mockImplementation(() => {
+    const listeners: Array<(e: unknown) => void> = [];
+    return {
+      event: (listener: (e: unknown) => void) => { listeners.push(listener); },
+      fire: (e: unknown) => { for (const l of listeners) { l(e); } },
+      _listeners: listeners
+    };
+  });
+  return {
+    TreeItem: class {
+      label?: string;
+      id?: string;
+      description?: string;
+      contextValue?: string;
+      command?: unknown;
+      tooltip?: string;
+      iconPath?: unknown;
+      resourceUri?: unknown;
+      collapsibleState?: number;
+      constructor(label: string, collapsibleState?: number) {
+        this.label = label;
+        this.collapsibleState = collapsibleState;
+      }
+    },
+    TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+    ThemeIcon: Object.assign(
+      class { constructor(public id: string) {} },
+      {
+        File: { id: "file" },
+        Folder: { id: "folder" },
+      }
+    ),
+    Uri: {
+      from: vi.fn((components: { scheme: string; authority: string; path: string }) => ({
+        scheme: components.scheme,
+        authority: components.authority,
+        path: components.path,
+      })),
+    },
+    EventEmitter,
+  };
+});
+
+import { FileExplorerTreeProvider, FileExplorerServerItem, FileTreeItem } from "../../src/ui/fileExplorerTreeProvider";
+import type { SftpService, DirectoryEntry } from "../../src/services/sftp/sftpService";
+import type { ServerConfig } from "../../src/models/config";
+
+function createMockSftpService(): SftpService {
+  return {
+    connect: vi.fn(),
+    disconnect: vi.fn(),
+    isConnected: vi.fn(),
+    readDirectory: vi.fn(),
+    stat: vi.fn(),
+    readFile: vi.fn(),
+    writeFile: vi.fn(),
+    delete: vi.fn(),
+    rename: vi.fn(),
+    createDirectory: vi.fn(),
+    realpath: vi.fn(),
+    download: vi.fn(),
+    upload: vi.fn(),
+    invalidateCache: vi.fn(),
+    dispose: vi.fn(),
+  } as any;
+}
+
+const testServer: ServerConfig = {
+  id: "srv-1",
+  name: "Test Server",
+  host: "example.com",
+  port: 22,
+  username: "dev",
+  authType: "password",
+  isHidden: false,
+};
+
+const fileEntry: DirectoryEntry = {
+  name: "file.txt",
+  isDirectory: false,
+  isSymlink: false,
+  size: 1024,
+  modifiedAt: 1700000000,
+  permissions: 0o644,
+};
+
+const dirEntry: DirectoryEntry = {
+  name: "subdir",
+  isDirectory: true,
+  isSymlink: false,
+  size: 4096,
+  modifiedAt: 1700000001,
+  permissions: 0o755,
+};
+
+describe("FileExplorerTreeProvider", () => {
+  let sftp: ReturnType<typeof createMockSftpService>;
+  let provider: FileExplorerTreeProvider;
+
+  beforeEach(() => {
+    sftp = createMockSftpService();
+    provider = new FileExplorerTreeProvider(sftp);
+  });
+
+  it("returns empty children when no active server", async () => {
+    const children = await provider.getChildren();
+    expect(children).toEqual([]);
+  });
+
+  it("returns server header and entries when active server is set", async () => {
+    (sftp.readDirectory as any).mockResolvedValue([fileEntry, dirEntry]);
+
+    provider.setActiveServer(testServer, "/home/dev");
+    const children = await provider.getChildren();
+
+    expect(children).toHaveLength(3); // header + 2 entries
+    expect(children[0]).toBeInstanceOf(FileExplorerServerItem);
+    expect(children[1]).toBeInstanceOf(FileTreeItem);
+    expect(children[2]).toBeInstanceOf(FileTreeItem);
+  });
+
+  it("sorts directories before files", async () => {
+    (sftp.readDirectory as any).mockResolvedValue([fileEntry, dirEntry]);
+
+    provider.setActiveServer(testServer, "/home/dev");
+    const children = await provider.getChildren();
+
+    // Skip server header item
+    const items = children.slice(1) as FileTreeItem[];
+    expect(items[0].entry.isDirectory).toBe(true);
+    expect(items[1].entry.isDirectory).toBe(false);
+  });
+
+  it("sorts alphabetically within same type", async () => {
+    const entries: DirectoryEntry[] = [
+      { ...fileEntry, name: "zebra.txt" },
+      { ...fileEntry, name: "alpha.txt" },
+      { ...dirEntry, name: "bravo" },
+      { ...dirEntry, name: "able" },
+    ];
+    (sftp.readDirectory as any).mockResolvedValue(entries);
+
+    provider.setActiveServer(testServer, "/home/dev");
+    const children = await provider.getChildren();
+    const items = children.slice(1) as FileTreeItem[];
+
+    expect(items[0].entry.name).toBe("able");
+    expect(items[1].entry.name).toBe("bravo");
+    expect(items[2].entry.name).toBe("alpha.txt");
+    expect(items[3].entry.name).toBe("zebra.txt");
+  });
+
+  it("expands directory items into child entries", async () => {
+    const childEntries: DirectoryEntry[] = [
+      { ...fileEntry, name: "nested.txt" },
+    ];
+    (sftp.readDirectory as any).mockResolvedValue(childEntries);
+
+    provider.setActiveServer(testServer, "/home/dev");
+
+    const dirItem = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+    const children = await provider.getChildren(dirItem);
+
+    expect(children).toHaveLength(1);
+    expect((children[0] as FileTreeItem).entry.name).toBe("nested.txt");
+  });
+
+  it("returns empty for non-directory items", async () => {
+    provider.setActiveServer(testServer, "/home/dev");
+
+    const fileItem = new FileTreeItem("srv-1", "/home/dev", fileEntry);
+    const children = await provider.getChildren(fileItem);
+
+    expect(children).toEqual([]);
+  });
+
+  it("clears active server", async () => {
+    provider.setActiveServer(testServer, "/home/dev");
+    provider.clearActiveServer();
+
+    expect(provider.getActiveServerId()).toBeUndefined();
+    const children = await provider.getChildren();
+    expect(children).toEqual([]);
+  });
+
+  it("getActiveServerId returns the active server id", () => {
+    expect(provider.getActiveServerId()).toBeUndefined();
+    provider.setActiveServer(testServer, "/home/dev");
+    expect(provider.getActiveServerId()).toBe("srv-1");
+  });
+
+  it("fires onDidChangeTreeData when setting active server", () => {
+    const listener = vi.fn();
+    provider.onDidChangeTreeData(listener);
+    provider.setActiveServer(testServer, "/home/dev");
+    expect(listener).toHaveBeenCalled();
+  });
+
+  it("fires onDidChangeTreeData on refresh", () => {
+    const listener = vi.fn();
+    provider.onDidChangeTreeData(listener);
+    provider.refresh();
+    expect(listener).toHaveBeenCalled();
+  });
+
+  it("file items have correct contextValue", () => {
+    const fileItem = new FileTreeItem("srv-1", "/home/dev", fileEntry);
+    expect(fileItem.contextValue).toBe("nexus.fileExplorer.file");
+  });
+
+  it("directory items have correct contextValue", () => {
+    const dirItem = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+    expect(dirItem.contextValue).toBe("nexus.fileExplorer.dir");
+  });
+
+  it("file items have a command to open via nexterm:// URI", () => {
+    const item = new FileTreeItem("srv-1", "/home/dev", fileEntry);
+    expect(item.command).toBeDefined();
+    expect(item.command!.command).toBe("vscode.open");
+    expect(item.resourceUri).toBeDefined();
+    expect(item.resourceUri!.scheme).toBe("nexterm");
+    expect(item.resourceUri!.authority).toBe("srv-1");
+    expect(item.resourceUri!.path).toBe("/home/dev/file.txt");
+  });
+
+  it("handles readDirectory errors gracefully", async () => {
+    (sftp.readDirectory as any).mockRejectedValue(new Error("permission denied"));
+
+    provider.setActiveServer(testServer, "/home/dev");
+    const children = await provider.getChildren();
+
+    // Should have server header + empty directory (error caught)
+    expect(children).toHaveLength(1); // just the header
+  });
+});
