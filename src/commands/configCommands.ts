@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
+import { validateServerConfig, validateTunnelProfile, validateSerialProfile } from "../utils/validation";
 
 interface NexusConfigExport {
   version: 1;
@@ -12,12 +13,15 @@ interface NexusConfigExport {
   settings: Record<string, unknown>;
 }
 
-const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
+export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.logging", key: "sessionTranscripts" },
   { section: "nexus.logging", key: "sessionLogDirectory" },
   { section: "nexus.logging", key: "maxFileSizeMb" },
   { section: "nexus.logging", key: "maxRotatedFiles" },
-  { section: "nexus.tunnel", key: "defaultConnectionMode" }
+  { section: "nexus.tunnel", key: "defaultConnectionMode" },
+  { section: "nexus.terminal", key: "openLocation" },
+  { section: "nexus.terminal", key: "keyboardPassthrough" },
+  { section: "nexus.terminal", key: "macros" }
 ];
 
 function readSettings(): Record<string, unknown> {
@@ -45,7 +49,7 @@ async function applySettings(settings: Record<string, unknown>): Promise<void> {
   }
 }
 
-function isValidExport(data: unknown): data is NexusConfigExport {
+export function isValidExport(data: unknown): data is NexusConfigExport {
   if (typeof data !== "object" || data === null) {
     return false;
   }
@@ -150,20 +154,33 @@ export function registerConfigCommands(core: NexusCore): vscode.Disposable[] {
         : new Set<string>();
 
       let imported = 0;
+      let skipped = 0;
       for (const server of data.servers) {
-        if (!existingIds.has(server.id)) {
+        if (existingIds.has(server.id)) {
+          skipped++;
+        } else if (!validateServerConfig(server)) {
+          skipped++;
+        } else {
           await core.addOrUpdateServer(server);
           imported++;
         }
       }
       for (const tunnel of data.tunnels) {
-        if (!existingIds.has(tunnel.id)) {
+        if (existingIds.has(tunnel.id)) {
+          skipped++;
+        } else if (!validateTunnelProfile(tunnel)) {
+          skipped++;
+        } else {
           await core.addOrUpdateTunnel(tunnel);
           imported++;
         }
       }
       for (const profile of data.serialProfiles) {
-        if (!existingIds.has(profile.id)) {
+        if (existingIds.has(profile.id)) {
+          skipped++;
+        } else if (!validateSerialProfile(profile)) {
+          skipped++;
+        } else {
           await core.addOrUpdateSerialProfile(profile);
           imported++;
         }
@@ -181,8 +198,9 @@ export function registerConfigCommands(core: NexusCore): vscode.Disposable[] {
         await applySettings(data.settings);
       }
 
+      const skipNote = skipped > 0 ? ` (${skipped} skipped)` : "";
       void vscode.window.showInformationMessage(
-        `Imported ${imported} profiles${mode.value === "replace" ? " (replaced existing)" : ""}.`
+        `Imported ${imported} profiles${mode.value === "replace" ? " (replaced existing)" : ""}${skipNote}.`
       );
     })
   ];
