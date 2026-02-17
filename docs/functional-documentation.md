@@ -92,7 +92,17 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - Right-click a group to rename or remove it.
 - Groups can be created from the `+` menu or inline while editing a profile.
 
-### 4.9 Configuration Export/Import
+### 4.9 Terminal Macros
+- Define named macros in `nexus.terminal.macros` settings (name + text + optional slot).
+- Macros appear in the **Terminal Macros** sidebar view (`nexusMacros`).
+- Click the play button or the label to send macro text to the active terminal.
+- Press `Alt+S` to open a quick pick of all macros.
+- Press `Alt+1` through `Alt+0` to trigger macros by slot assignment.
+- **Slot assignment:** each macro can have an explicit `slot` (0-9) binding it to a specific `Alt+N` shortcut. Right-click a macro and select **Assign Shortcut** to pick a slot. If no macros have explicit slots, the first 10 macros auto-assign positionally (legacy mode).
+- Conflict resolution: assigning a slot already taken by another macro clears the old assignment.
+- Add, edit, remove, reorder, and assign shortcuts via the context menu.
+
+### 4.10 Configuration Export/Import
 - `Nexus: Export Configuration` saves all server, tunnel, and serial profiles to a JSON file.
 - `Nexus: Import Configuration` restores from a backup with merge or replace options.
 
@@ -102,6 +112,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - `nexusCommandCenter`: servers, serial profiles, and active sessions.
 - `nexusTunnels`: tunnel profiles and active traffic state.
 - `nexusTunnelMonitor`: dedicated traffic/status panel for active tunnels.
+- `nexusMacros`: terminal macros with slot-based keyboard shortcuts.
 - `nexusSettings`: extension settings sidebar panel.
 
 ### 5.2 Commands
@@ -127,6 +138,14 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 
 **Profile:**
 - `nexus.profile.add` (unified add form)
+
+**Macros:**
+- `nexus.macro.add`, `nexus.macro.edit`, `nexus.macro.remove`
+- `nexus.macro.run` (Alt+S quick pick)
+- `nexus.macro.slot` (Alt+1–Alt+0 keybinding dispatch)
+- `nexus.macro.runItem` (tree item click/play button)
+- `nexus.macro.assignSlot` (assign Alt+N shortcut via context menu)
+- `nexus.macro.moveUp`, `nexus.macro.moveDown`
 
 **Config:**
 - `nexus.config.export`, `nexus.config.import`

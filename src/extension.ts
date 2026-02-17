@@ -24,6 +24,18 @@ import { registerProfileCommands } from "./commands/profileCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeProvider } from "./ui/macroTreeProvider";
 
+const ALL_PASSTHROUGH_KEYS = ["b", "e", "g", "j", "k", "n", "o", "p", "r", "w"] as const;
+
+function updatePassthroughContext(): void {
+  const config = vscode.workspace.getConfiguration("nexus.terminal");
+  const masterEnabled = config.get<boolean>("keyboardPassthrough", false);
+  const selectedKeys = config.get<string[]>("passthroughKeys", [...ALL_PASSTHROUGH_KEYS]);
+  const activeSet = masterEnabled ? new Set(selectedKeys.map(k => k.toLowerCase())) : new Set<string>();
+  for (const key of ALL_PASSTHROUGH_KEYS) {
+    void vscode.commands.executeCommand("setContext", `nexus.passthrough.ctrl${key.toUpperCase()}`, activeSet.has(key));
+  }
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const repository = new VscodeConfigRepository(context);
   const core = new NexusCore(repository);
@@ -124,6 +136,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     treeDataProvider: macroTreeProvider
   });
   updateMacroContext();
+  updatePassthroughContext();
 
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   statusBarItem.command = "nexusCommandCenter.focus";
@@ -187,6 +200,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (event.affectsConfiguration("nexus.terminal.macros")) {
       macroTreeProvider.refresh();
       updateMacroContext();
+    }
+    if (event.affectsConfiguration("nexus.terminal.keyboardPassthrough") || event.affectsConfiguration("nexus.terminal.passthroughKeys")) {
+      updatePassthroughContext();
     }
   });
 

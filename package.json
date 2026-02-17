@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar.",
-  "version": "2.2.2",
+  "version": "2.3.0",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -120,7 +120,9 @@
       { "command": "nexus.macro.run", "title": "Nexus: Run Macro", "icon": "$(play)" },
       { "command": "nexus.macro.slot", "title": "Nexus: Run Macro Slot" },
       { "command": "nexus.macro.moveUp", "title": "Move Up", "icon": "$(arrow-up)" },
-      { "command": "nexus.macro.moveDown", "title": "Move Down", "icon": "$(arrow-down)" }
+      { "command": "nexus.macro.moveDown", "title": "Move Down", "icon": "$(arrow-down)" },
+      { "command": "nexus.macro.assignSlot", "title": "Assign Shortcut", "icon": "$(keyboard)" },
+      { "command": "nexus.macro.runItem", "title": "Run", "icon": "$(play)" }
     ],
     "menus": {
       "view/title": [
@@ -251,10 +253,11 @@
         {"command":"nexus.settings.edit","when":"view == nexusSettings && viewItem == nexus.setting","group":"inline"},
         {"command":"nexus.settings.reset","when":"view == nexusSettings && viewItem == nexus.setting","group":"1_manage"},
 
-        {"command":"nexus.macro.slot","when":"view == nexusMacros && viewItem == nexus.macro","group":"inline"},
+        {"command":"nexus.macro.runItem","when":"view == nexusMacros && viewItem == nexus.macro","group":"inline"},
         {"command":"nexus.macro.edit","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@1"},
         {"command":"nexus.macro.moveUp","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@2"},
         {"command":"nexus.macro.moveDown","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@3"},
+        {"command":"nexus.macro.assignSlot","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@4"},
         {"command":"nexus.macro.remove","when":"view == nexusMacros && viewItem == nexus.macro","group":"2_destructive"}
       ],
       "commandPalette": [
@@ -303,7 +306,9 @@
         {"command":"nexus.macro.remove","when":"false"},
         {"command":"nexus.macro.slot","when":"false"},
         {"command":"nexus.macro.moveUp","when":"false"},
-        {"command":"nexus.macro.moveDown","when":"false"}
+        {"command":"nexus.macro.moveDown","when":"false"},
+        {"command":"nexus.macro.assignSlot","when":"false"},
+        {"command":"nexus.macro.runItem","when":"false"}
       ]
     },
     "keybindings": [
@@ -317,61 +322,61 @@
         "command": "workbench.action.terminal.sendSequence",
         "args": { "text": "\u0002" },
         "key": "ctrl+b",
-        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+        "when": "terminalFocus && nexus.passthrough.ctrlB"
       },
       {
         "command": "workbench.action.terminal.sendSequence",
         "args": { "text": "\u0005" },
         "key": "ctrl+e",
-        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+        "when": "terminalFocus && nexus.passthrough.ctrlE"
       },
       {
         "command": "workbench.action.terminal.sendSequence",
         "args": { "text": "\u0007" },
         "key": "ctrl+g",
-        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+        "when": "terminalFocus && nexus.passthrough.ctrlG"
       },
       {
         "command": "workbench.action.terminal.sendSequence",
         "args": { "text": "\u000a" },
         "key": "ctrl+j",
-        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+        "when": "terminalFocus && nexus.passthrough.ctrlJ"
       },
       {
         "command": "workbench.action.terminal.sendSequence",
         "args": { "text": "\u000b" },
         "key": "ctrl+k",
-        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+        "when": "terminalFocus && nexus.passthrough.ctrlK"
       },
       {
         "command": "workbench.action.terminal.sendSequence",
         "args": { "text": "\u000e" },
         "key": "ctrl+n",
-        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+        "when": "terminalFocus && nexus.passthrough.ctrlN"
       },
       {
         "command": "workbench.action.terminal.sendSequence",
         "args": { "text": "\u000f" },
         "key": "ctrl+o",
-        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+        "when": "terminalFocus && nexus.passthrough.ctrlO"
       },
       {
         "command": "workbench.action.terminal.sendSequence",
         "args": { "text": "\u0010" },
         "key": "ctrl+p",
-        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+        "when": "terminalFocus && nexus.passthrough.ctrlP"
       },
       {
         "command": "workbench.action.terminal.sendSequence",
         "args": { "text": "\u0012" },
         "key": "ctrl+r",
-        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+        "when": "terminalFocus && nexus.passthrough.ctrlR"
       },
       {
         "command": "workbench.action.terminal.sendSequence",
         "args": { "text": "\u0017" },
         "key": "ctrl+w",
-        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+        "when": "terminalFocus && nexus.passthrough.ctrlW"
       },
       {
         "command": "nexus.macro.run",
@@ -454,22 +459,40 @@
           "order": 7,
           "markdownDescription": "Pass Ctrl+ key combinations through to the terminal instead of VS Code when the terminal is focused. Enables full use of terminal apps like nano, vim, and htop."
         },
+        "nexus.terminal.passthroughKeys": {
+          "type": "array",
+          "default": ["b", "e", "g", "j", "k", "n", "o", "p", "r", "w"],
+          "order": 8,
+          "items": {
+            "type": "string",
+            "enum": ["b", "e", "g", "j", "k", "n", "o", "p", "r", "w"]
+          },
+          "uniqueItems": true,
+          "markdownDescription": "Which Ctrl+ key combinations to pass through when `#nexus.terminal.keyboardPassthrough#` is enabled. Each entry is a letter (e.g. `b` for Ctrl+B)."
+        },
         "nexus.terminal.macros": {
           "type": "array",
           "default": [],
-          "order": 8,
+          "order": 9,
           "items": {
             "type": "object",
             "required": ["name", "text"],
             "properties": {
               "name": { "type": "string", "description": "Display name for the macro" },
-              "text": { "type": "string", "description": "Text to send (use \\n for Enter)" }
+              "text": { "type": "string", "description": "Text to send (use \\n for Enter)" },
+              "slot": { "type": "integer", "minimum": 0, "maximum": 9, "description": "Keyboard shortcut slot (0-9). Alt+1 = slot 1, ..., Alt+0 = slot 0." }
             }
           },
-          "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or `Alt+1` through `Alt+0` for the first 10 macros."
+          "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or `Alt+1` through `Alt+0` for the first 10 macros. Optionally assign a `slot` (0-9) to bind a macro to a specific `Alt+N` shortcut."
         }
       }
     }
+  },
+  "configurationDefaults": {
+    "terminal.integrated.commandsToSkipShell": [
+      "nexus.macro.run",
+      "nexus.macro.slot"
+    ]
   },
   "scripts": {
     "clean": "rimraf dist coverage",

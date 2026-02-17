@@ -21,6 +21,7 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.tunnel", key: "defaultConnectionMode" },
   { section: "nexus.terminal", key: "openLocation" },
   { section: "nexus.terminal", key: "keyboardPassthrough" },
+  { section: "nexus.terminal", key: "passthroughKeys" },
   { section: "nexus.terminal", key: "macros" }
 ];
 

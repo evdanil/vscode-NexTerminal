@@ -3,25 +3,28 @@ import * as vscode from "vscode";
 export interface TerminalMacro {
   name: string;
   text: string;
+  slot?: number;
 }
 
 export class MacroTreeItem extends vscode.TreeItem {
   public constructor(
     public readonly macro: TerminalMacro,
-    public readonly index: number
+    public readonly index: number,
+    public readonly displaySlot?: number
   ) {
-    const slotLabel = index < 10 ? `[Alt+${(index + 1) % 10}]` : `[${index + 1}]`;
-    super(`${slotLabel} ${macro.name}`, vscode.TreeItemCollapsibleState.None);
+    const prefix = displaySlot !== undefined ? `[Alt+${displaySlot}] ` : "";
+    super(`${prefix}${macro.name}`, vscode.TreeItemCollapsibleState.None);
     this.id = `macro:${index}`;
     const preview = macro.text.replace(/\n/g, "\u21b5");
     this.description = `\u2192 ${preview.length > 40 ? preview.slice(0, 37) + "..." : preview}`;
     this.contextValue = "nexus.macro";
     this.command = {
-      command: "nexus.macro.slot",
+      command: "nexus.macro.runItem",
       title: "Run Macro",
-      arguments: [{ index }]
+      arguments: [this]
     };
-    this.tooltip = `${macro.name}\n${macro.text.replace(/\n/g, "\\n")}`;
+    const slotHint = displaySlot !== undefined ? ` (Alt+${displaySlot})` : "";
+    this.tooltip = `${macro.name}${slotHint}\n${macro.text.replace(/\n/g, "\\n")}`;
     this.iconPath = new vscode.ThemeIcon("terminal");
   }
 }
@@ -42,6 +45,18 @@ export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem>
     const macros = vscode.workspace
       .getConfiguration("nexus.terminal")
       .get<TerminalMacro[]>("macros", []);
-    return macros.map((macro, index) => new MacroTreeItem(macro, index));
+
+    const anyHasSlot = macros.some((m) => m.slot !== undefined);
+
+    return macros.map((macro, index) => {
+      let displaySlot: number | undefined;
+      if (macro.slot !== undefined) {
+        displaySlot = macro.slot;
+      } else if (!anyHasSlot && index < 10) {
+        // Legacy mode: no macros have explicit slots, use positional
+        displaySlot = (index + 1) % 10;
+      }
+      return new MacroTreeItem(macro, index, displaySlot);
+    });
   }
 }

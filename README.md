@@ -12,6 +12,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 - **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized by group. Drag and drop to rearrange or assign tunnels to servers.
 - **Settings Panel** — View and edit extension settings directly in the sidebar.
 - **Session Transcript Logging** — Automatically log clean terminal output (ANSI codes stripped) to files with configurable rotation.
+- **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign each macro an explicit `Alt+N` slot (0-9) via the context menu, or let them auto-assign positionally. Quick pick access via `Alt+S`.
 - **Configuration Export/Import** — Back up and restore all profiles and settings as a single JSON file.
 - **Web Extension Fallback** — Graceful degradation in browser-based VS Code (SSH/serial require desktop runtime).
 
@@ -73,6 +74,7 @@ npm run package:vsix
 | `nexus.logging.sessionLogDirectory` | *(extension storage)* | Custom directory for session logs |
 | `nexus.tunnel.defaultConnectionMode` | `shared` | `shared` or `isolated` SSH mode for tunnels |
 | `nexus.terminal.openLocation` | `panel` | Where to open terminals: `panel` or `editor` tab |
+| `nexus.terminal.macros` | `[]` | Terminal macros with optional `slot` (0-9) for Alt+N shortcuts |
 
 ## Documentation
 

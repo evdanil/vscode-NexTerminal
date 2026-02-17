@@ -142,6 +142,7 @@ describe("SETTINGS_KEYS", () => {
     const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
     expect(keys).toContain("nexus.terminal.openLocation");
     expect(keys).toContain("nexus.terminal.keyboardPassthrough");
+    expect(keys).toContain("nexus.terminal.passthroughKeys");
     expect(keys).toContain("nexus.terminal.macros");
   });
 
