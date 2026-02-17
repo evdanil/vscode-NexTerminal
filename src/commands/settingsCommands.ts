@@ -100,6 +100,18 @@ export function registerSettingsCommands(
           return;
         }
         newValue = pick.value;
+      } else if (key === "enabled" && section === "nexus.terminal.highlighting") {
+        const pick = await vscode.window.showQuickPick(
+          [
+            { label: "On", description: "Highlight patterns in terminal output", value: true },
+            { label: "Off", description: "Disable terminal highlighting", value: false }
+          ],
+          { title: "Terminal Highlighting" }
+        );
+        if (!pick) {
+          return;
+        }
+        newValue = pick.value;
       } else {
         return;
       }
