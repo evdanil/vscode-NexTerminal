@@ -49,6 +49,11 @@
           "name": "Port Forwarding"
         },
         {
+          "id": "nexusMacros",
+          "name": "Terminal Macros",
+          "visibility": "collapsed"
+        },
+        {
           "id": "nexusSettings",
           "name": "Settings",
           "visibility": "collapsed"
@@ -63,6 +68,10 @@
       {
         "view": "nexusTunnels",
         "contents": "No port-forwarding tunnels configured.\n[Add Tunnel](command:nexus.tunnel.add)\nRight-click a tunnel to start, stop, or edit it."
+      },
+      {
+        "view": "nexusMacros",
+        "contents": "No macros defined.\n[Add Macro](command:nexus.macro.add)\nMacros send predefined text to the active terminal."
       }
     ],
     "commands": [
@@ -104,7 +113,14 @@
       { "command": "nexus.group.add", "title": "Nexus: New Group", "icon": "$(new-folder)" },
       { "command": "nexus.group.remove", "title": "Remove Group", "icon": "$(trash)" },
       { "command": "nexus.config.export", "title": "Nexus: Export Configuration", "icon": "$(cloud-upload)" },
-      { "command": "nexus.config.import", "title": "Nexus: Import Configuration", "icon": "$(cloud-download)" }
+      { "command": "nexus.config.import", "title": "Nexus: Import Configuration", "icon": "$(cloud-download)" },
+      { "command": "nexus.macro.add", "title": "Nexus: Add Macro", "icon": "$(add)" },
+      { "command": "nexus.macro.edit", "title": "Edit", "icon": "$(edit)" },
+      { "command": "nexus.macro.remove", "title": "Remove", "icon": "$(trash)" },
+      { "command": "nexus.macro.run", "title": "Nexus: Run Macro", "icon": "$(play)" },
+      { "command": "nexus.macro.slot", "title": "Nexus: Run Macro Slot" },
+      { "command": "nexus.macro.moveUp", "title": "Move Up", "icon": "$(arrow-up)" },
+      { "command": "nexus.macro.moveDown", "title": "Move Down", "icon": "$(arrow-down)" }
     ],
     "menus": {
       "view/title": [
@@ -167,6 +183,11 @@
           "command": "nexus.settings.openJson",
           "when": "view == nexusSettings",
           "group": "navigation@4"
+        },
+        {
+          "command": "nexus.macro.add",
+          "when": "view == nexusMacros",
+          "group": "navigation@1"
         }
       ],
       "view/item/context": [
@@ -228,7 +249,13 @@
         {"command":"nexus.tunnel.remove","when":"view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/","group":"3_destructive"},
 
         {"command":"nexus.settings.edit","when":"view == nexusSettings && viewItem == nexus.setting","group":"inline"},
-        {"command":"nexus.settings.reset","when":"view == nexusSettings && viewItem == nexus.setting","group":"1_manage"}
+        {"command":"nexus.settings.reset","when":"view == nexusSettings && viewItem == nexus.setting","group":"1_manage"},
+
+        {"command":"nexus.macro.slot","when":"view == nexusMacros && viewItem == nexus.macro","group":"inline"},
+        {"command":"nexus.macro.edit","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@1"},
+        {"command":"nexus.macro.moveUp","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@2"},
+        {"command":"nexus.macro.moveDown","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@3"},
+        {"command":"nexus.macro.remove","when":"view == nexusMacros && viewItem == nexus.macro","group":"2_destructive"}
       ],
       "commandPalette": [
         {"command":"nexus.refresh","when":"true"},
@@ -269,7 +296,14 @@
         {"command":"nexus.settings.openLogDir","when":"true"},
         {"command":"nexus.tunnel.openBrowser","when":"false"},
         {"command":"nexus.config.export","when":"true"},
-        {"command":"nexus.config.import","when":"true"}
+        {"command":"nexus.config.import","when":"true"},
+        {"command":"nexus.macro.add","when":"true"},
+        {"command":"nexus.macro.run","when":"true"},
+        {"command":"nexus.macro.edit","when":"false"},
+        {"command":"nexus.macro.remove","when":"false"},
+        {"command":"nexus.macro.slot","when":"false"},
+        {"command":"nexus.macro.moveUp","when":"false"},
+        {"command":"nexus.macro.moveDown","when":"false"}
       ]
     },
     "keybindings": [
@@ -278,7 +312,82 @@
         "key": "ctrl+shift+n",
         "mac": "cmd+shift+n",
         "when": "!terminalFocus"
-      }
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u0002" },
+        "key": "ctrl+b",
+        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u0005" },
+        "key": "ctrl+e",
+        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u0007" },
+        "key": "ctrl+g",
+        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u000a" },
+        "key": "ctrl+j",
+        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u000b" },
+        "key": "ctrl+k",
+        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u000e" },
+        "key": "ctrl+n",
+        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u000f" },
+        "key": "ctrl+o",
+        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u0010" },
+        "key": "ctrl+p",
+        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u0012" },
+        "key": "ctrl+r",
+        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u0017" },
+        "key": "ctrl+w",
+        "when": "terminalFocus && config.nexus.terminal.keyboardPassthrough"
+      },
+      {
+        "command": "nexus.macro.run",
+        "key": "alt+s",
+        "when": "terminalFocus"
+      },
+      { "command": "nexus.macro.slot", "args": { "index": 0 }, "key": "alt+1", "when": "terminalFocus && nexus.hasMacros" },
+      { "command": "nexus.macro.slot", "args": { "index": 1 }, "key": "alt+2", "when": "terminalFocus && nexus.hasMacros" },
+      { "command": "nexus.macro.slot", "args": { "index": 2 }, "key": "alt+3", "when": "terminalFocus && nexus.hasMacros" },
+      { "command": "nexus.macro.slot", "args": { "index": 3 }, "key": "alt+4", "when": "terminalFocus && nexus.hasMacros" },
+      { "command": "nexus.macro.slot", "args": { "index": 4 }, "key": "alt+5", "when": "terminalFocus && nexus.hasMacros" },
+      { "command": "nexus.macro.slot", "args": { "index": 5 }, "key": "alt+6", "when": "terminalFocus && nexus.hasMacros" },
+      { "command": "nexus.macro.slot", "args": { "index": 6 }, "key": "alt+7", "when": "terminalFocus && nexus.hasMacros" },
+      { "command": "nexus.macro.slot", "args": { "index": 7 }, "key": "alt+8", "when": "terminalFocus && nexus.hasMacros" },
+      { "command": "nexus.macro.slot", "args": { "index": 8 }, "key": "alt+9", "when": "terminalFocus && nexus.hasMacros" },
+      { "command": "nexus.macro.slot", "args": { "index": 9 }, "key": "alt+0", "when": "terminalFocus && nexus.hasMacros" }
     ],
     "configuration": {
       "title": "Nexus Terminal",
@@ -338,6 +447,26 @@
             "Open in the terminal panel (default)",
             "Open as an editor tab"
           ]
+        },
+        "nexus.terminal.keyboardPassthrough": {
+          "type": "boolean",
+          "default": false,
+          "order": 7,
+          "markdownDescription": "Pass Ctrl+ key combinations through to the terminal instead of VS Code when the terminal is focused. Enables full use of terminal apps like nano, vim, and htop."
+        },
+        "nexus.terminal.macros": {
+          "type": "array",
+          "default": [],
+          "order": 8,
+          "items": {
+            "type": "object",
+            "required": ["name", "text"],
+            "properties": {
+              "name": { "type": "string", "description": "Display name for the macro" },
+              "text": { "type": "string", "description": "Text to send (use \\n for Enter)" }
+            }
+          },
+          "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or `Alt+1` through `Alt+0` for the first 10 macros."
         }
       }
     }

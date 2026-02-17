@@ -19,8 +19,10 @@ import { TunnelTreeProvider } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
 import { registerSettingsCommands } from "./commands/settingsCommands";
 import { registerConfigCommands } from "./commands/configCommands";
+import { registerMacroCommands, updateMacroContext } from "./commands/macroCommands";
 import { registerProfileCommands } from "./commands/profileCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
+import { MacroTreeProvider } from "./ui/macroTreeProvider";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const repository = new VscodeConfigRepository(context);
@@ -117,6 +119,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     treeDataProvider: settingsTreeProvider
   });
 
+  const macroTreeProvider = new MacroTreeProvider();
+  const macroView = vscode.window.createTreeView("nexusMacros", {
+    treeDataProvider: macroTreeProvider
+  });
+  updateMacroContext();
+
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   statusBarItem.command = "nexusCommandCenter.focus";
   statusBarItem.show();
@@ -173,8 +181,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   const configChangeListener = vscode.workspace.onDidChangeConfiguration((event) => {
-    if (event.affectsConfiguration("nexus.logging") || event.affectsConfiguration("nexus.tunnel")) {
+    if (event.affectsConfiguration("nexus.logging") || event.affectsConfiguration("nexus.tunnel") || event.affectsConfiguration("nexus.terminal")) {
       settingsTreeProvider.refresh();
+    }
+    if (event.affectsConfiguration("nexus.terminal.macros")) {
+      macroTreeProvider.refresh();
+      updateMacroContext();
     }
   });
 
@@ -184,11 +196,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(settingsTreeProvider, () => ctx.sessionLogDir);
   const configDisposables = registerConfigCommands(core);
+  const macroDisposables = registerMacroCommands(macroTreeProvider);
 
   context.subscriptions.push(
     commandCenterView,
     tunnelView,
     settingsView,
+    macroView,
     statusBarItem,
     refreshCommand,
     configChangeListener,
@@ -198,6 +212,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ...profileDisposables,
     ...settingsDisposables,
     ...configDisposables,
+    ...macroDisposables,
     {
       dispose: () => {
         unsubscribeCore();
