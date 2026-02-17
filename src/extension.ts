@@ -24,6 +24,31 @@ import { registerProfileCommands } from "./commands/profileCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeProvider } from "./ui/macroTreeProvider";
 
+const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.slot"];
+
+/** Ensure our macro commands are in terminal.integrated.commandsToSkipShell so Alt+S / Alt+N work even when the user has customised that setting. */
+function ensureCommandsToSkipShell(): void {
+  const config = vscode.workspace.getConfiguration("terminal.integrated");
+  const inspect = config.inspect<string[]>("commandsToSkipShell");
+
+  // Only patch when user already has a custom value (global or workspace).
+  // If they don't, our configurationDefaults in package.json already covers it.
+  const targets: vscode.ConfigurationTarget[] = [];
+  if (inspect?.globalValue !== undefined) { targets.push(vscode.ConfigurationTarget.Global); }
+  if (inspect?.workspaceValue !== undefined) { targets.push(vscode.ConfigurationTarget.Workspace); }
+  if (inspect?.workspaceFolderValue !== undefined) { targets.push(vscode.ConfigurationTarget.WorkspaceFolder); }
+
+  for (const target of targets) {
+    const current = target === vscode.ConfigurationTarget.Global ? inspect!.globalValue!
+      : target === vscode.ConfigurationTarget.Workspace ? inspect!.workspaceValue!
+      : inspect!.workspaceFolderValue!;
+    const missing = MACRO_SKIP_SHELL_COMMANDS.filter((cmd) => !current.includes(cmd));
+    if (missing.length > 0) {
+      void config.update("commandsToSkipShell", [...current, ...missing], target);
+    }
+  }
+}
+
 const ALL_PASSTHROUGH_KEYS = ["b", "e", "g", "j", "k", "n", "o", "p", "r", "w"] as const;
 
 function updatePassthroughContext(): void {
@@ -137,6 +162,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   updateMacroContext();
   updatePassthroughContext();
+  ensureCommandsToSkipShell();
 
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   statusBarItem.command = "nexusCommandCenter.focus";
