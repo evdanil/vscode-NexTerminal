@@ -6,6 +6,19 @@ import { ServerTreeItem } from "../ui/nexusTreeProvider";
 import { FileTreeItem } from "../ui/fileExplorerTreeProvider";
 import type { CommandContext } from "./types";
 
+function validateFilename(value: string): string | undefined {
+  if (!value) {
+    return "Name cannot be empty";
+  }
+  if (value.includes("/") || value.includes("\\") || value.includes("\0")) {
+    return "Name must not contain path separators or null characters";
+  }
+  if (value === "." || value === "..") {
+    return "Name must not be '.' or '..'";
+  }
+  return undefined;
+}
+
 function toServerFromArg(
   ctx: CommandContext,
   arg: unknown
@@ -143,6 +156,7 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       title: "Rename",
       value: arg.entry.name,
       prompt: "Enter new name",
+      validateInput: validateFilename,
     });
     if (!newName || newName === arg.entry.name) {
       return;
@@ -160,6 +174,7 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     const name = await vscode.window.showInputBox({
       title: "New Directory",
       prompt: "Enter directory name",
+      validateInput: validateFilename,
     });
     if (!name) {
       return;

@@ -24,6 +24,9 @@ interface CacheEntry {
 }
 
 const CACHE_TTL_MS = 30_000;
+const MAX_CACHE_ENTRIES = 500;
+const MAX_DELETE_DEPTH = 100;
+const MAX_DELETE_OPS = 10_000;
 
 function toDirectoryEntry(entry: FileEntry): DirectoryEntry {
   const attrs = entry.attrs;
@@ -60,6 +63,7 @@ export class SftpService {
   private readonly sessions = new Map<string, SftpSession>();
   private readonly dirCache = new Map<string, CacheEntry>();
   private readonly unsubscribers = new Map<string, () => void>();
+  private readonly pending = new Map<string, Promise<void>>();
 
   public constructor(private readonly sshFactory: SilentAuthSshFactory) {}
 
@@ -67,13 +71,13 @@ export class SftpService {
     if (this.sessions.has(server.id)) {
       return;
     }
-    const connection = await this.sshFactory.connect(server);
-    const sftp = await connection.openSftp();
-    this.sessions.set(server.id, { connection, sftp });
-    const unsub = connection.onClose(() => {
-      this.cleanupSession(server.id);
-    });
-    this.unsubscribers.set(server.id, unsub);
+    const existing = this.pending.get(server.id);
+    if (existing) {
+      return existing;
+    }
+    const promise = this.doConnect(server).finally(() => this.pending.delete(server.id));
+    this.pending.set(server.id, promise);
+    return promise;
   }
 
   public disconnect(serverId: string): void {
@@ -113,6 +117,7 @@ export class SftpService {
       .map(toDirectoryEntry);
 
     this.dirCache.set(key, { entries: result, fetchedAt: Date.now() });
+    this.evictCacheIfNeeded();
     return result;
   }
 
@@ -130,12 +135,35 @@ export class SftpService {
     return statsToDirectoryEntry(path.posix.basename(remotePath), stats);
   }
 
-  public async readFile(serverId: string, remotePath: string): Promise<Buffer> {
+  public async lstat(serverId: string, remotePath: string): Promise<DirectoryEntry> {
+    const sftp = this.getSftp(serverId);
+    const stats = await new Promise<Stats>((resolve, reject) => {
+      sftp.lstat(remotePath, (error, stats) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stats);
+      });
+    });
+    return statsToDirectoryEntry(path.posix.basename(remotePath), stats);
+  }
+
+  public async readFile(serverId: string, remotePath: string, maxSize?: number): Promise<Buffer> {
     const sftp = this.getSftp(serverId);
     return new Promise<Buffer>((resolve, reject) => {
       const chunks: Buffer[] = [];
+      let totalSize = 0;
       const stream = sftp.createReadStream(remotePath);
-      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      stream.on("data", (chunk: Buffer) => {
+        totalSize += chunk.length;
+        if (maxSize && totalSize > maxSize) {
+          stream.destroy();
+          reject(new Error(`File exceeds maximum size of ${Math.round(maxSize / 1024 / 1024)}MB`));
+          return;
+        }
+        chunks.push(chunk);
+      });
       stream.on("end", () => resolve(Buffer.concat(chunks)));
       stream.on("error", reject);
     });
@@ -157,7 +185,7 @@ export class SftpService {
   public async delete(serverId: string, remotePath: string, isDir: boolean): Promise<void> {
     const sftp = this.getSftp(serverId);
     if (isDir) {
-      await this.deleteRecursive(sftp, serverId, remotePath);
+      await this.deleteRecursive(sftp, serverId, remotePath, 0, { count: 0 });
     } else {
       await new Promise<void>((resolve, reject) => {
         sftp.unlink(remotePath, (error) => {
@@ -259,6 +287,16 @@ export class SftpService {
     }
   }
 
+  private async doConnect(server: ServerConfig): Promise<void> {
+    const connection = await this.sshFactory.connect(server);
+    const sftp = await connection.openSftp();
+    this.sessions.set(server.id, { connection, sftp });
+    const unsub = connection.onClose(() => {
+      this.cleanupSession(server.id);
+    });
+    this.unsubscribers.set(server.id, unsub);
+  }
+
   private getSftp(serverId: string): SFTPWrapper {
     const session = this.sessions.get(serverId);
     if (!session) {
@@ -277,12 +315,34 @@ export class SftpService {
     this.invalidateCache(serverId);
   }
 
-  private async deleteRecursive(sftp: SFTPWrapper, serverId: string, dirPath: string): Promise<void> {
+  private evictCacheIfNeeded(): void {
+    if (this.dirCache.size <= MAX_CACHE_ENTRIES) {
+      return;
+    }
+    const oldest = this.dirCache.keys().next().value;
+    if (oldest) {
+      this.dirCache.delete(oldest);
+    }
+  }
+
+  private async deleteRecursive(
+    sftp: SFTPWrapper,
+    serverId: string,
+    dirPath: string,
+    depth: number,
+    ops: { count: number }
+  ): Promise<void> {
+    if (depth > MAX_DELETE_DEPTH) {
+      throw new Error(`Delete aborted: directory nesting exceeds ${MAX_DELETE_DEPTH} levels`);
+    }
     const entries = await this.readDirectory(serverId, dirPath);
     for (const entry of entries) {
+      if (++ops.count > MAX_DELETE_OPS) {
+        throw new Error(`Delete aborted: more than ${MAX_DELETE_OPS} items`);
+      }
       const fullPath = path.posix.join(dirPath, entry.name);
-      if (entry.isDirectory) {
-        await this.deleteRecursive(sftp, serverId, fullPath);
+      if (entry.isDirectory && !entry.isSymlink) {
+        await this.deleteRecursive(sftp, serverId, fullPath, depth + 1, ops);
       } else {
         await new Promise<void>((resolve, reject) => {
           sftp.unlink(fullPath, (error) => {

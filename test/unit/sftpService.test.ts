@@ -18,6 +18,7 @@ function createMockSftp() {
   return {
     readdir: vi.fn(),
     stat: vi.fn(),
+    lstat: vi.fn(),
     createReadStream: vi.fn(),
     createWriteStream: vi.fn(),
     unlink: vi.fn(),
@@ -198,6 +199,45 @@ describe("SftpService", () => {
 
     // Should have fetched twice because cache was invalidated
     expect(sftp.readdir).toHaveBeenCalledTimes(2);
+  });
+
+  it("lstat returns entry without following symlinks", async () => {
+    await service.connect(testServer);
+
+    sftp.lstat.mockImplementation((_path: string, cb: Function) => {
+      cb(null, { mode: 0o120777, size: 30, mtime: 1700000000 });
+    });
+
+    const entry = await service.lstat("srv-1", "/home/dev/link");
+    expect(entry.name).toBe("link");
+    expect(entry.isSymlink).toBe(true);
+  });
+
+  it("deduplicates concurrent connect calls", async () => {
+    const p1 = service.connect(testServer);
+    const p2 = service.connect(testServer);
+    await Promise.all([p1, p2]);
+
+    expect(factory.connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("readFile enforces streaming max size", async () => {
+    await service.connect(testServer);
+
+    const bigChunk = Buffer.alloc(60 * 1024 * 1024);
+    const mockStream = {
+      on: vi.fn((event: string, handler: Function) => {
+        if (event === "data") {
+          setTimeout(() => handler(bigChunk), 0);
+        }
+        return mockStream;
+      }),
+      destroy: vi.fn(),
+    };
+    sftp.createReadStream.mockReturnValue(mockStream);
+
+    await expect(service.readFile("srv-1", "/big", 50 * 1024 * 1024)).rejects.toThrow(/exceeds maximum size/);
+    expect(mockStream.destroy).toHaveBeenCalled();
   });
 
   it("dispose disconnects all sessions", async () => {

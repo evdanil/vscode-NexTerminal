@@ -73,7 +73,7 @@
       },
       {
         "view": "nexusTunnels",
-        "contents": "No port-forwarding tunnels configured.\n[Add Tunnel](command:nexus.tunnel.add)\nRight-click a tunnel to start, stop, or edit it."
+        "contents": "Use the **+** button above to add a tunnel.\nRight-click a tunnel to start, stop, or edit it."
       },
       {
         "view": "nexusFileExplorer",
@@ -133,7 +133,7 @@
       { "command": "nexus.macro.moveDown", "title": "Move Down", "icon": "$(arrow-down)" },
       { "command": "nexus.macro.assignSlot", "title": "Assign Shortcut", "icon": "$(keyboard)" },
       { "command": "nexus.macro.runItem", "title": "Run", "icon": "$(play)" },
-      { "command": "nexus.files.browse", "title": "Nexus: Browse Files", "icon": "$(remote-explorer)" },
+      { "command": "nexus.files.browse", "title": "Browse Files", "icon": "$(remote-explorer)" },
       { "command": "nexus.files.open", "title": "Open File", "icon": "$(go-to-file)" },
       { "command": "nexus.files.upload", "title": "Upload File", "icon": "$(cloud-upload)" },
       { "command": "nexus.files.download", "title": "Download", "icon": "$(cloud-download)" },

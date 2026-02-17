@@ -22,6 +22,7 @@ vi.mock("vscode", () => {
     FilePermission: { Readonly: 1 },
     FileSystemError: {
       Unavailable: (msg: string) => new Error(msg),
+      NoPermissions: (msg: string) => new Error(msg),
     },
     Disposable: class { constructor(private cb: () => void) {} dispose() { this.cb(); } },
     EventEmitter,
@@ -38,6 +39,7 @@ function createMockSftpService(): SftpService {
     isConnected: vi.fn(),
     readDirectory: vi.fn(),
     stat: vi.fn(),
+    lstat: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn(),
     delete: vi.fn(),
@@ -163,8 +165,8 @@ describe("NexusFileSystemProvider", () => {
     expect(events[0].type).toBe(2);
   });
 
-  it("delete delegates and fires delete event", async () => {
-    (sftp.stat as any).mockResolvedValue(fileEntry);
+  it("delete uses lstat and fires delete event", async () => {
+    (sftp.lstat as any).mockResolvedValue(fileEntry);
     (sftp.delete as any).mockResolvedValue(undefined);
 
     const events: any[] = [];
@@ -173,9 +175,47 @@ describe("NexusFileSystemProvider", () => {
     const uri = buildUri("srv-1", "/home/dev/test.txt");
     await provider.delete(uri, { recursive: false });
 
+    expect(sftp.lstat).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt");
     expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt", false);
     // FileChangeType.Deleted = 3
     expect(events[0].type).toBe(3);
+  });
+
+  it("delete symlinks via unlink, never recurse into targets", async () => {
+    const symlinkDir: DirectoryEntry = { ...dirEntry, isSymlink: true };
+    (sftp.lstat as any).mockResolvedValue(symlinkDir);
+    (sftp.delete as any).mockResolvedValue(undefined);
+
+    const uri = buildUri("srv-1", "/home/dev/link");
+    await provider.delete(uri, { recursive: true });
+
+    // Should delete as file (not directory), even though target is a directory
+    expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/link", false);
+  });
+
+  it("delete rejects non-recursive directory delete", async () => {
+    (sftp.lstat as any).mockResolvedValue(dirEntry);
+
+    const uri = buildUri("srv-1", "/home/dev/subdir");
+    await expect(provider.delete(uri, { recursive: false })).rejects.toThrow(/not empty/i);
+  });
+
+  it("rename rejects cross-server operations", async () => {
+    const oldUri = buildUri("srv-1", "/home/dev/old.txt");
+    const newUri = buildUri("srv-2", "/home/dev/new.txt");
+    await expect(provider.rename(oldUri, newUri)).rejects.toThrow(/across servers/i);
+  });
+
+  it("readFile passes maxSize to sftp service", async () => {
+    (sftp.stat as any).mockResolvedValue(fileEntry);
+    const content = Buffer.from("hello world");
+    (sftp.readFile as any).mockResolvedValue(content);
+
+    const uri = buildUri("srv-1", "/home/dev/test.txt");
+    await provider.readFile(uri);
+
+    // readFile should be called with maxSize = 50MB
+    expect(sftp.readFile).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt", 50 * 1024 * 1024);
   });
 
   it("rename delegates and fires events for old and new URIs", async () => {

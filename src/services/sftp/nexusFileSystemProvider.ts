@@ -57,7 +57,7 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
     if (entry.size > MAX_FILE_SIZE) {
       throw vscode.FileSystemError.Unavailable(`File too large (${Math.round(entry.size / 1024 / 1024)}MB). Maximum is 50MB.`);
     }
-    return this.sftp.readFile(serverId, remotePath);
+    return this.sftp.readFile(serverId, remotePath, MAX_FILE_SIZE);
   }
 
   public async writeFile(uri: vscode.Uri, content: Uint8Array): Promise<void> {
@@ -68,14 +68,25 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
 
   public async delete(uri: vscode.Uri, options: { recursive: boolean }): Promise<void> {
     const { serverId, remotePath } = parseUri(uri);
-    const entry = await this.sftp.stat(serverId, remotePath);
-    await this.sftp.delete(serverId, remotePath, entry.isDirectory);
+    // Use lstat so symlinks are never followed for deletion decisions
+    const entry = await this.sftp.lstat(serverId, remotePath);
+    if (entry.isSymlink) {
+      // Always unlink symlinks directly — never recurse into their targets
+      await this.sftp.delete(serverId, remotePath, false);
+    } else if (entry.isDirectory && !options.recursive) {
+      throw vscode.FileSystemError.NoPermissions("Directory is not empty (use recursive delete)");
+    } else {
+      await this.sftp.delete(serverId, remotePath, entry.isDirectory);
+    }
     this.onDidChangeFileEmitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
   }
 
   public async rename(oldUri: vscode.Uri, newUri: vscode.Uri): Promise<void> {
     const oldParsed = parseUri(oldUri);
     const newParsed = parseUri(newUri);
+    if (oldParsed.serverId !== newParsed.serverId) {
+      throw vscode.FileSystemError.NoPermissions("Cannot rename across servers");
+    }
     await this.sftp.rename(oldParsed.serverId, oldParsed.remotePath, newParsed.remotePath);
     this.onDidChangeFileEmitter.fire([
       { type: vscode.FileChangeType.Deleted, uri: oldUri },
