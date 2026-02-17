@@ -484,6 +484,50 @@
             }
           },
           "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or `Alt+1` through `Alt+0` for the first 10 macros. Optionally assign a `slot` (0-9) to bind a macro to a specific `Alt+N` shortcut."
+        },
+        "nexus.terminal.highlighting.enabled": {
+          "type": "boolean",
+          "default": true,
+          "order": 10,
+          "markdownDescription": "Enable regex-based pattern highlighting in SSH and serial terminal output. Matches are coloured inline using ANSI SGR codes while respecting existing remote colours."
+        },
+        "nexus.terminal.highlighting.rules": {
+          "type": "array",
+          "order": 11,
+          "default": [
+            { "pattern": "\\bCRITICAL\\b|\\bFATAL\\b|\\bPANIC\\b|\\bEMERG(?:ENCY)?\\b", "color": "brightRed", "flags": "gi", "bold": true },
+            { "pattern": "\\bERR(?:OR)?\\b", "color": "red", "flags": "gi", "bold": true },
+            { "pattern": "\\bFAIL(?:ED|URE)?\\b|\\bABORT(?:ED)?\\b", "color": "red", "flags": "gi", "bold": true },
+            { "pattern": "\\bWARN(?:ING)?\\b", "color": "yellow", "flags": "gi", "bold": true },
+            { "pattern": "\\bNOTICE\\b", "color": "cyan", "flags": "gi" },
+            { "pattern": "\\bINFO\\b", "color": "cyan", "flags": "gi" },
+            { "pattern": "\\bDEBUG\\b|\\bTRACE\\b", "color": "brightBlack", "flags": "gi" },
+            { "pattern": "\\bOK\\b|\\bPASS(?:ED)?\\b|\\bSUCCESS(?:FUL)?\\b|\\bDONE\\b", "color": "green", "flags": "gi", "bold": true },
+            { "pattern": "\\bDENIED\\b|\\bREJECT(?:ED)?\\b|\\bREFUSED\\b|\\bFORBIDDEN\\b|\\bBLOCKED\\b", "color": "red", "flags": "gi" },
+            { "pattern": "\\bTIMEOUT\\b|\\bTIMED OUT\\b|\\bUNREACHABLE\\b|\\bNO ROUTE\\b", "color": "red", "flags": "gi" },
+            { "pattern": "\\bDOWN\\b|\\bINACTIVE\\b|\\bDISABLED\\b|\\bOFFLINE\\b|\\bDEAD\\b", "color": "red", "flags": "gi" },
+            { "pattern": "\\bUP\\b|\\bACTIVE\\b|\\bENABLED\\b|\\bRUNNING\\b|\\bESTABLISHED\\b|\\bCONNECTED\\b|\\bONLINE\\b|\\bALIVE\\b|\\bREACHABLE\\b", "color": "green", "flags": "gi" },
+            { "pattern": "\\bPENDING\\b|\\bWAITING\\b|\\bLISTENING\\b", "color": "yellow", "flags": "gi" },
+            { "pattern": "\\bDEPRECATED\\b|\\bOBSOLETE\\b", "color": "yellow", "flags": "gi", "underline": true },
+            { "pattern": "(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}", "color": "magenta", "flags": "g" },
+            { "pattern": "\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}(?:/\\d{1,2})?\\b", "color": "magenta", "flags": "g" },
+            { "pattern": "[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}|(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}", "color": "magenta", "flags": "g" },
+            { "pattern": "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", "color": "brightBlue", "flags": "g" },
+            { "pattern": "https?://\\S+", "color": "blue", "flags": "gi", "underline": true },
+            { "pattern": "\\b(?:errors|dropped|overruns|collisions|discards|retransmits|failures|loss):", "color": "red", "flags": "gi" }
+          ],
+          "items": {
+            "type": "object",
+            "required": ["pattern", "color"],
+            "properties": {
+              "pattern": { "type": "string", "description": "Regular expression pattern to match in terminal output." },
+              "color": { "type": "string", "description": "Named colour (red, green, brightCyan, …) or raw SGR code number (e.g. \"31\")." },
+              "flags": { "type": "string", "default": "gi", "description": "Regex flags. Default: \"gi\" (global, case-insensitive)." },
+              "bold": { "type": "boolean", "default": false, "description": "Apply bold style to matched text." },
+              "underline": { "type": "boolean", "default": false, "description": "Apply underline style to matched text." }
+            }
+          },
+          "markdownDescription": "Highlighting rules applied to SSH and serial terminal output. Each rule specifies a regex `pattern`, a `color` (named or SGR code), optional `flags`, and optional `bold`/`underline` styles. Text already coloured by the remote program is never re-highlighted."
         }
       }
     }

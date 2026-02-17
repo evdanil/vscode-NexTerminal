@@ -6,6 +6,7 @@ import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { SshConnection } from "./contracts";
 import type { SilentAuthSshFactory } from "./silentAuth";
+import type { TerminalHighlighter } from "../terminalHighlighter";
 
 export interface SshPtyCallbacks {
   onSessionOpened(sessionId: string): void;
@@ -26,7 +27,8 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly sshFactory: SilentAuthSshFactory,
     private readonly callbacks: SshPtyCallbacks,
     private readonly logger: SessionLogger,
-    private readonly transcript?: SessionTranscript
+    private readonly transcript?: SessionTranscript,
+    private readonly highlighter?: TerminalHighlighter
   ) {}
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
@@ -86,7 +88,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
         const text = typeof data === "string" ? data : data.toString("utf8");
         this.logger.log(`stdout ${JSON.stringify(text)}`);
         this.transcript?.write(text);
-        this.writeEmitter.fire(text);
+        this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(text) : text);
       });
       this.stream.on("close", () => this.dispose());
       this.stream.on("error", (error: Error) => {

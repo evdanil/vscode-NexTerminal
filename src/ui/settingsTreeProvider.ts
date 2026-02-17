@@ -54,6 +54,13 @@ const SETTINGS: SettingDescriptor[] = [
     label: "Terminal Open Location",
     icon: "layout",
     format: (v) => (v === "editor" ? "Editor Tab" : "Panel")
+  },
+  {
+    key: "enabled",
+    section: "nexus.terminal.highlighting",
+    label: "Terminal Highlighting",
+    icon: "symbol-color",
+    format: (v) => (v === false ? "Off" : "On")
   }
 ];
 

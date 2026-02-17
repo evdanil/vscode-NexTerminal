@@ -235,7 +235,8 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
             }
           },
           ctx.loggerFactory.create("terminal", `serial-${profile.id}`),
-          createSessionTranscript(ctx.sessionLogDir, profile.name, profile.logSession !== false)
+          createSessionTranscript(ctx.sessionLogDir, profile.name, profile.logSession !== false),
+          ctx.highlighter
         );
 
         const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";

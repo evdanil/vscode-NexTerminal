@@ -11,6 +11,7 @@ import { SilentAuthSshFactory } from "./services/ssh/silentAuth";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
 import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
+import { TerminalHighlighter } from "./services/terminalHighlighter";
 import { TunnelManager } from "./services/tunnel/tunnelManager";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { NexusTreeProvider } from "./ui/nexusTreeProvider";
@@ -133,6 +134,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const sessionTerminals: SessionTerminalMap = new Map();
   const serialTerminals: SerialTerminalMap = new Map();
 
+  const highlighter = new TerminalHighlighter();
   const defaultSessionLogDir = path.join(context.globalStorageUri.fsPath, "session-logs");
 
   const ctx: CommandContext = {
@@ -147,7 +149,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
     terminalsByServer,
     sessionTerminals,
-    serialTerminals
+    serialTerminals,
+    highlighter
   };
 
   const nexusTreeProvider = new NexusTreeProvider({
@@ -267,6 +270,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     if (event.affectsConfiguration("nexus.terminal.keyboardPassthrough") || event.affectsConfiguration("nexus.terminal.passthroughKeys")) {
       updatePassthroughContext();
+    }
+    if (event.affectsConfiguration("nexus.terminal.highlighting")) {
+      highlighter.reload();
     }
   });
 
