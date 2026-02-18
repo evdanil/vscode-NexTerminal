@@ -50,15 +50,11 @@ const NORMAL_SWATCHES: SwatchDef[][] = [
 
 function renderSwatch(
   swatch: SwatchDef,
-  scheme: ColorScheme | undefined,
   large: boolean
 ): string {
-  const color = scheme
-    ? escapeHtml((scheme as unknown as Record<string, string>)[swatch.key] ?? "transparent")
-    : "transparent";
   const sizeClass = large ? " swatch-large" : "";
   return `<div class="swatch-cell${sizeClass}">
-  <div class="color-swatch${sizeClass}" data-color-key="${escapeHtml(swatch.key)}" style="background-color: ${color};"></div>
+  <div class="color-swatch${sizeClass}" data-color-key="${escapeHtml(swatch.key)}"></div>
   <span class="swatch-label">${escapeHtml(swatch.label)}</span>
 </div>`;
 }
@@ -103,15 +99,12 @@ export function renderTerminalAppearanceHtml(
   const fontWeight = fontConfig?.weight ?? "normal";
 
   const specialSwatchesHtml = SPECIAL_SWATCHES.map((s) =>
-    renderSwatch(s, activeScheme, true)
+    renderSwatch(s, true)
   ).join("\n        ");
 
   const normalSwatchesHtml = NORMAL_SWATCHES.map((row) =>
-    row.map((s) => renderSwatch(s, activeScheme, false)).join("\n        ")
+    row.map((s) => renderSwatch(s, false)).join("\n        ")
   ).join("\n        ");
-
-  const previewDisplay = activeScheme ? "grid" : "none";
-  const placeholderDisplay = activeScheme ? "none" : "block";
 
   const weightOptions = [
     { value: "normal", label: "Normal" },
@@ -441,11 +434,11 @@ export function renderTerminalAppearanceHtml(
     </div>
   </div>
 
-  <div id="preview-placeholder" class="preview-placeholder" style="display: ${placeholderDisplay};">
+  <div id="preview-placeholder" class="preview-placeholder">
     Select a scheme to preview colors
   </div>
 
-  <div id="preview-grid" style="display: ${previewDisplay};">
+  <div id="preview-grid">
     <div class="special-grid">
       ${specialSwatchesHtml}
     </div>
@@ -649,6 +642,10 @@ export function renderTerminalAppearanceHtml(
       function escapeHtml(str) {
         return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
       }
+
+      // Apply initial preview from server-rendered data (inline styles blocked by CSP)
+      var initialScheme = ${activeScheme ? JSON.stringify(activeScheme) : "null"};
+      updatePreview(initialScheme);
     })();
   </script>
 </body>

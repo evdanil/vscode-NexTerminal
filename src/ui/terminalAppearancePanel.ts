@@ -39,12 +39,22 @@ export class TerminalAppearancePanel {
 
   private render(): void {
     const nonce = randomBytes(16).toString("base64");
+    const fontConfig = this.service.getFontConfig() ?? this.readVsCodeFontConfig();
     this.panel.webview.html = renderTerminalAppearanceHtml(
       this.service.getAllSchemes(),
       this.service.getActiveSchemeId(),
-      this.service.getFontConfig(),
+      fontConfig,
       nonce
     );
+  }
+
+  private readVsCodeFontConfig(): TerminalFontConfig {
+    const termConfig = vscode.workspace.getConfiguration("terminal.integrated");
+    return {
+      family: termConfig.get<string>("fontFamily", ""),
+      size: termConfig.get<number>("fontSize", 14),
+      weight: termConfig.get<string>("fontWeight", "normal"),
+    };
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
