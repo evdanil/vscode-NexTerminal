@@ -84,26 +84,48 @@ export class SettingTreeItem extends vscode.TreeItem {
   }
 }
 
-export class SettingsTreeProvider implements vscode.TreeDataProvider<SettingTreeItem> {
-  private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<SettingTreeItem | undefined>();
+export class AppearanceTreeItem extends vscode.TreeItem {
+  public constructor(description: string) {
+    super("Terminal Appearance", vscode.TreeItemCollapsibleState.None);
+    this.id = "setting:nexus.terminal.appearance";
+    this.description = description;
+    this.iconPath = new vscode.ThemeIcon("paintcan");
+    this.contextValue = "nexus.appearance";
+    this.command = {
+      command: "nexus.terminal.appearance",
+      title: "Terminal Appearance"
+    };
+    this.tooltip = `Terminal Appearance: ${description}\nClick to customize colors and fonts`;
+  }
+}
+
+export class SettingsTreeProvider implements vscode.TreeDataProvider<SettingTreeItem | AppearanceTreeItem> {
+  private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<SettingTreeItem | AppearanceTreeItem | undefined>();
   public readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
 
-  public constructor(private readonly defaultLogDir: string) {}
+  public constructor(
+    private readonly defaultLogDir: string,
+    private readonly getAppearanceDescription: () => string = () => "Default"
+  ) {}
 
   public refresh(): void {
     this.onDidChangeTreeDataEmitter.fire(undefined);
   }
 
-  public getTreeItem(element: SettingTreeItem): vscode.TreeItem {
+  public getTreeItem(element: SettingTreeItem | AppearanceTreeItem): vscode.TreeItem {
     return element;
   }
 
-  public getChildren(): SettingTreeItem[] {
+  public getChildren(): (SettingTreeItem | AppearanceTreeItem)[] {
     const context: SettingsContext = { defaultLogDir: this.defaultLogDir };
-    return SETTINGS.map((desc) => {
+    const items: (SettingTreeItem | AppearanceTreeItem)[] = [
+      new AppearanceTreeItem(this.getAppearanceDescription())
+    ];
+    for (const desc of SETTINGS) {
       const config = vscode.workspace.getConfiguration(desc.section);
       const value = config.get(desc.key);
-      return new SettingTreeItem(desc, value, context);
-    });
+      items.push(new SettingTreeItem(desc, value, context));
+    }
+    return items;
   }
 }

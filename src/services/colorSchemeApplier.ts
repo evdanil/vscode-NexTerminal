@@ -1,6 +1,6 @@
-import type { ColorScheme } from "../models/colorScheme";
+import type { ColorScheme, ColorKey } from "../models/colorScheme";
 
-const SCHEME_TO_VSCODE_MAP: Record<string, string> = {
+const SCHEME_TO_VSCODE_MAP: Record<ColorKey, string> = {
   background: "terminal.background",
   foreground: "terminal.foreground",
   cursor: "terminalCursor.foreground",
@@ -28,7 +28,7 @@ const TERMINAL_KEY_PREFIXES = ["terminal.", "terminalCursor."];
 export function buildTerminalColorKeys(scheme: ColorScheme): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [schemeProp, vscodeKey] of Object.entries(SCHEME_TO_VSCODE_MAP)) {
-    result[vscodeKey] = (scheme as Record<string, string>)[schemeProp];
+    result[vscodeKey] = scheme[schemeProp as ColorKey];
   }
   return result;
 }

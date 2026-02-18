@@ -7,6 +7,12 @@ export function registerSettingsCommands(
 ): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.settings.edit", async (arg?: unknown) => {
+      // If it's an AppearanceTreeItem, open the appearance panel instead
+      if (arg instanceof Object && "contextValue" in arg && (arg as { contextValue: string }).contextValue === "nexus.appearance") {
+        void vscode.commands.executeCommand("nexus.terminal.appearance");
+        return;
+      }
+
       const item = arg instanceof Object && "descriptor" in arg ? (arg as SettingTreeItem) : undefined;
       if (!item) {
         return;

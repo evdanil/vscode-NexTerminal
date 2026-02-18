@@ -141,7 +141,8 @@
       { "command": "nexus.files.rename", "title": "Rename", "icon": "$(edit)" },
       { "command": "nexus.files.createDir", "title": "New Directory", "icon": "$(new-folder)" },
       { "command": "nexus.files.refresh", "title": "Refresh", "icon": "$(refresh)" },
-      { "command": "nexus.files.disconnect", "title": "Disconnect", "icon": "$(debug-disconnect)" }
+      { "command": "nexus.files.disconnect", "title": "Disconnect", "icon": "$(debug-disconnect)" },
+      { "command": "nexus.terminal.appearance", "title": "Nexus: Terminal Appearance", "icon": "$(paintcan)" }
     ],
     "menus": {
       "view/title": [

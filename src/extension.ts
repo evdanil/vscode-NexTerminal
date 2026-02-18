@@ -28,6 +28,9 @@ import { registerMacroCommands, updateMacroContext } from "./commands/macroComma
 import { registerProfileCommands } from "./commands/profileCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeProvider } from "./ui/macroTreeProvider";
+import { VscodeColorSchemeStorage } from "./storage/vscodeColorSchemeStorage";
+import { ColorSchemeService } from "./services/colorSchemeService";
+import { TerminalAppearancePanel } from "./ui/terminalAppearancePanel";
 
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.slot"];
 
@@ -139,6 +142,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const serialTerminals: SerialTerminalMap = new Map();
 
   const highlighter = new TerminalHighlighter();
+  const colorSchemeStorage = new VscodeColorSchemeStorage(context);
+  const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
   const sftpService = new SftpService(sshFactory);
   const fileSystemProvider = new NexusFileSystemProvider(sftpService);
   const fsRegistration = vscode.workspace.registerFileSystemProvider(NEXTERM_SCHEME, fileSystemProvider, { isCaseSensitive: true });
@@ -191,7 +196,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
-  const settingsTreeProvider = new SettingsTreeProvider(defaultSessionLogDir);
+  const settingsTreeProvider = new SettingsTreeProvider(defaultSessionLogDir, () => {
+    const activeId = colorSchemeService.getActiveSchemeId();
+    if (!activeId) return "Default";
+    const scheme = colorSchemeService.getSchemeById(activeId);
+    return scheme?.name ?? "Default";
+  });
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
     treeDataProvider: nexusTreeProvider,
     dragAndDropController: nexusTreeProvider,
@@ -306,6 +316,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const macroDisposables = registerMacroCommands(macroTreeProvider);
   const fileDisposables = registerFileCommands(ctx);
 
+  const appearanceCommand = vscode.commands.registerCommand("nexus.terminal.appearance", () => {
+    TerminalAppearancePanel.open(colorSchemeService);
+  });
+
   context.subscriptions.push(
     commandCenterView,
     tunnelView,
@@ -315,6 +329,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     fsRegistration,
     statusBarItem,
     refreshCommand,
+    appearanceCommand,
     configChangeListener,
     ...serverDisposables,
     ...tunnelDisposables,
