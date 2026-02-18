@@ -34,7 +34,7 @@ describe("renderFormHtml", () => {
       ]
     };
     const html = renderFormHtml(definition);
-    expect(html).toContain("<select");
+    expect(html).toContain("custom-select");
     expect(html).toContain("Option A");
     expect(html).toContain("Option B");
     expect(html).toContain("selected");
@@ -81,7 +81,7 @@ describe("renderFormHtml", () => {
     expect(html).toContain("Cancel");
   });
 
-  it("renders combobox fields with datalist", () => {
+  it("renders combobox fields with custom dropdown", () => {
     const definition: FormDefinition = {
       title: "Test",
       fields: [
@@ -96,10 +96,11 @@ describe("renderFormHtml", () => {
       ]
     };
     const html = renderFormHtml(definition);
-    expect(html).toContain('list="list-group"');
-    expect(html).toContain('<datalist id="list-group">');
-    expect(html).toContain('<option value="Dev">');
-    expect(html).toContain('<option value="Prod">');
+    expect(html).toContain("custom-combobox");
+    expect(html).toContain('autocomplete="off"');
+    expect(html).toContain("custom-select-option");
+    expect(html).toContain("Dev");
+    expect(html).toContain("Prod");
   });
 
   it("includes vscode api script", () => {

@@ -31,6 +31,7 @@ export class TerminalAppearancePanel {
   public static open(service: ColorSchemeService): void {
     if (TerminalAppearancePanel.instance) {
       TerminalAppearancePanel.instance.panel.reveal();
+      TerminalAppearancePanel.instance.render();
       return;
     }
     TerminalAppearancePanel.instance = new TerminalAppearancePanel(service);
