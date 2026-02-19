@@ -1,13 +1,7 @@
 import type { ColorScheme, TerminalFontConfig } from "../models/colorScheme";
-
-function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
+import { escapeHtml } from "./shared/escapeHtml";
+import { baseWebviewCss } from "./shared/webviewStyles";
+import { baseWebviewJs } from "./shared/webviewScripts";
 
 interface SwatchDef {
   key: string;
@@ -133,180 +127,7 @@ export function renderTerminalAppearanceHtml(
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />
   <style nonce="${nonce}">
-    body {
-      font-family: var(--vscode-font-family);
-      font-size: var(--vscode-font-size, 13px);
-      background: var(--vscode-editor-background);
-      color: var(--vscode-editor-foreground);
-      margin: 0;
-      padding: 20px;
-      max-width: 600px;
-    }
-    h3 {
-      font-size: 14px;
-      font-weight: 600;
-      margin: 24px 0 12px 0;
-      padding-bottom: 6px;
-      border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
-    }
-    h3:first-of-type {
-      margin-top: 0;
-    }
-    .form-group {
-      margin-bottom: 14px;
-    }
-    label {
-      display: block;
-      margin-bottom: 4px;
-      font-weight: 500;
-      font-size: 12px;
-      color: var(--vscode-foreground);
-    }
-    input[type="text"],
-    input[type="number"] {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 5px 8px;
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
-      border: 1px solid var(--vscode-input-border, transparent);
-      border-radius: 2px;
-      font-family: inherit;
-      font-size: 13px;
-      outline: none;
-    }
-    input[type="text"]:focus,
-    input[type="number"]:focus {
-      border-color: var(--vscode-focusBorder);
-    }
-    .custom-select {
-      position: relative;
-      width: 100%;
-      box-sizing: border-box;
-    }
-    .custom-select-trigger {
-      display: flex;
-      align-items: center;
-      width: 100%;
-      box-sizing: border-box;
-      padding: 5px 8px;
-      background: var(--vscode-dropdown-background, var(--vscode-input-background));
-      color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
-      border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, transparent));
-      border-radius: 2px;
-      font-family: inherit;
-      font-size: 13px;
-      cursor: pointer;
-      outline: none;
-      user-select: none;
-    }
-    .custom-select-trigger:focus,
-    .custom-select.open .custom-select-trigger {
-      border-color: var(--vscode-focusBorder);
-    }
-    .custom-select-text {
-      flex: 1;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .custom-select-trigger::after {
-      content: "\\25BE";
-      margin-left: 8px;
-      flex-shrink: 0;
-      opacity: 0.7;
-    }
-    .custom-select-dropdown {
-      display: none;
-      position: absolute;
-      top: 100%;
-      left: 0;
-      right: 0;
-      z-index: 1000;
-      max-height: 250px;
-      overflow-y: auto;
-      background: var(--vscode-dropdown-background, var(--vscode-input-background));
-      border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
-      border-top: none;
-      border-radius: 0 0 2px 2px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.16);
-    }
-    .custom-select.open .custom-select-dropdown {
-      display: block;
-    }
-    .custom-select-option {
-      padding: 4px 8px;
-      cursor: pointer;
-      font-size: 13px;
-      color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
-    }
-    .custom-select-option:hover {
-      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
-    }
-    .custom-select-option.selected {
-      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
-      color: var(--vscode-list-activeSelectionForeground, #fff);
-    }
-    .custom-select-group {
-      padding: 6px 8px 2px;
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
-      opacity: 0.7;
-    }
-    .custom-combobox {
-      position: relative;
-    }
-    .custom-combobox.open .custom-select-dropdown {
-      display: block;
-    }
-    .info-banner {
-      padding: 8px 12px;
-      margin-bottom: 16px;
-      font-size: 12px;
-      line-height: 1.4;
-      color: var(--vscode-editorInfo-foreground, var(--vscode-foreground));
-      background: var(--vscode-inputValidation-infoBackground, rgba(0, 120, 212, 0.1));
-      border: 1px solid var(--vscode-inputValidation-infoBorder, rgba(0, 120, 212, 0.4));
-      border-radius: 2px;
-    }
-    .btn-primary {
-      padding: 6px 16px;
-      background: var(--vscode-button-background);
-      color: var(--vscode-button-foreground);
-      border: none;
-      border-radius: 2px;
-      cursor: pointer;
-      font-size: 13px;
-      font-weight: 500;
-    }
-    .btn-primary:hover {
-      background: var(--vscode-button-hoverBackground);
-    }
-    .btn-secondary {
-      padding: 6px 16px;
-      background: var(--vscode-button-secondaryBackground, transparent);
-      color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
-      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
-      border-radius: 2px;
-      cursor: pointer;
-      font-size: 13px;
-    }
-    .btn-secondary:hover {
-      background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground));
-    }
-    .btn-secondary:disabled {
-      opacity: 0.5;
-      cursor: default;
-    }
-    .btn-secondary:disabled:hover {
-      background: var(--vscode-button-secondaryBackground, transparent);
-    }
-    .button-row {
-      display: flex;
-      gap: 8px;
-      margin-top: 14px;
-    }
+    ${baseWebviewCss()}
     .preview-placeholder {
       padding: 20px;
       text-align: center;
@@ -454,106 +275,12 @@ export function renderTerminalAppearanceHtml(
   </div>
 
   <script nonce="${nonce}">
+    ${baseWebviewJs()}
     (function() {
       var vscode = acquireVsCodeApi();
 
-      // Custom select helpers
-      function selectCustomOption(wrapper, value) {
-        var hiddenInput = wrapper.querySelector('input[type="hidden"]');
-        var textEl = wrapper.querySelector('.custom-select-text');
-        var options = wrapper.querySelectorAll('.custom-select-option');
-        for (var i = 0; i < options.length; i++) {
-          options[i].classList.remove('selected');
-          if (options[i].dataset.value === value) {
-            options[i].classList.add('selected');
-            textEl.textContent = options[i].textContent;
-          }
-        }
-        hiddenInput.value = value;
-        wrapper.classList.remove('open');
-        hiddenInput.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-
-      document.addEventListener('click', function(e) {
-        if (!e.target.closest('.custom-select')) {
-          var openSelects = document.querySelectorAll('.custom-select.open');
-          for (var i = 0; i < openSelects.length; i++) {
-            openSelects[i].classList.remove('open');
-          }
-        }
-        if (!e.target.closest('.custom-combobox')) {
-          var openCombos = document.querySelectorAll('.custom-combobox.open');
-          for (var i = 0; i < openCombos.length; i++) {
-            openCombos[i].classList.remove('open');
-          }
-        }
-      });
-
-      var customSelects = document.querySelectorAll('.custom-select');
-      for (var cs = 0; cs < customSelects.length; cs++) {
-        (function(wrapper) {
-          var trigger = wrapper.querySelector('.custom-select-trigger');
-          trigger.addEventListener('click', function(e) {
-            e.stopPropagation();
-            var openSelects = document.querySelectorAll('.custom-select.open');
-            for (var j = 0; j < openSelects.length; j++) {
-              if (openSelects[j] !== wrapper) openSelects[j].classList.remove('open');
-            }
-            wrapper.classList.toggle('open');
-          });
-          trigger.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              wrapper.classList.toggle('open');
-            } else if (e.key === 'Escape') {
-              wrapper.classList.remove('open');
-            }
-          });
-          wrapper.querySelector('.custom-select-dropdown').addEventListener('click', function(e) {
-            var opt = e.target.closest('.custom-select-option');
-            if (!opt) return;
-            selectCustomOption(wrapper, opt.dataset.value);
-          });
-        })(customSelects[cs]);
-      }
-
-      // Custom combobox initialization
-      var combos = document.querySelectorAll('.custom-combobox');
-      for (var ci = 0; ci < combos.length; ci++) {
-        (function(combo) {
-          var input = combo.querySelector('input[type="text"]');
-          var dropdown = combo.querySelector('.custom-select-dropdown');
-          var allOptions = dropdown.querySelectorAll('.custom-select-option');
-
-          function showFiltered(filter) {
-            var count = 0;
-            for (var i = 0; i < allOptions.length; i++) {
-              var match = !filter || allOptions[i].textContent.toLowerCase().indexOf(filter.toLowerCase()) !== -1;
-              allOptions[i].style.display = match ? '' : 'none';
-              if (match) count++;
-            }
-            if (count > 0) { combo.classList.add('open'); } else { combo.classList.remove('open'); }
-          }
-
-          input.addEventListener('focus', function() { showFiltered(input.value); });
-          input.addEventListener('input', function() { showFiltered(input.value); });
-          input.addEventListener('keydown', function(e) {
-            if (e.key === 'Escape') combo.classList.remove('open');
-          });
-
-          for (var oi = 0; oi < allOptions.length; oi++) {
-            (function(opt) {
-              opt.addEventListener('mousedown', function(e) {
-                e.preventDefault();
-                input.value = opt.dataset.value;
-                combo.classList.remove('open');
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-              });
-            })(allOptions[oi]);
-          }
-        })(combos[ci]);
-      }
+      initCustomSelects();
+      initCustomComboboxes();
 
       // Scheme select
       var schemeSelect = document.getElementById("scheme-select");
@@ -637,10 +364,6 @@ export function renderTerminalAppearanceHtml(
           placeholder.style.display = "block";
           grid.style.display = "none";
         }
-      }
-
-      function escapeHtml(str) {
-        return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
       }
 
       // Apply initial preview from server-rendered data (inline styles blocked by CSP)
