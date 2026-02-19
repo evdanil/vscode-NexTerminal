@@ -123,6 +123,7 @@
       { "command": "nexus.group.remove", "title": "Remove Group", "icon": "$(trash)" },
       { "command": "nexus.config.export", "title": "Nexus: Export Configuration", "icon": "$(cloud-upload)" },
       { "command": "nexus.config.import", "title": "Nexus: Import Configuration", "icon": "$(cloud-download)" },
+      { "command": "nexus.macro.editor", "title": "Nexus: Macro Editor", "icon": "$(edit)" },
       { "command": "nexus.macro.add", "title": "Nexus: Add Macro", "icon": "$(add)" },
       { "command": "nexus.macro.edit", "title": "Edit", "icon": "$(edit)" },
       { "command": "nexus.macro.remove", "title": "Remove", "icon": "$(trash)" },
@@ -341,6 +342,7 @@
         {"command":"nexus.tunnel.openBrowser","when":"false"},
         {"command":"nexus.config.export","when":"true"},
         {"command":"nexus.config.import","when":"true"},
+        {"command":"nexus.macro.editor","when":"true"},
         {"command":"nexus.macro.add","when":"true"},
         {"command":"nexus.macro.run","when":"true"},
         {"command":"nexus.macro.edit","when":"false"},
@@ -544,7 +546,8 @@
             "properties": {
               "name": { "type": "string", "description": "Display name for the macro" },
               "text": { "type": "string", "description": "Text to send (use \\n for Enter)" },
-              "slot": { "type": "integer", "minimum": 0, "maximum": 9, "description": "Keyboard shortcut slot (0-9). Alt+1 = slot 1, ..., Alt+0 = slot 0." }
+              "slot": { "type": "integer", "minimum": 0, "maximum": 9, "description": "Keyboard shortcut slot (0-9). Alt+1 = slot 1, ..., Alt+0 = slot 0." },
+              "secret": { "type": "boolean", "default": false, "description": "Hide macro value from sidebar and session logs" }
             }
           },
           "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or `Alt+1` through `Alt+0` for the first 10 macros. Optionally assign a `slot` (0-9) to bind a macro to a specific `Alt+N` shortcut."

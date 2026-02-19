@@ -81,6 +81,30 @@ describe("MacroTreeItem", () => {
     expect(nlItem.description).toBe("\u2192 line1\u21b5line2\u21b5line3");
   });
 
+  it("masks description for secret macros", () => {
+    const macro = { name: "Secret", text: "password123", secret: true };
+    const item = new MacroTreeItem(macro, 0);
+    expect(item.description).toBe("\u2022\u2022\u2022\u2022\u2022");
+  });
+
+  it("shows (secret) in tooltip for secret macros", () => {
+    const macro = { name: "Secret", text: "password123", secret: true };
+    const item = new MacroTreeItem(macro, 0, 3);
+    expect(item.tooltip).toBe("Secret (Alt+3) (secret)");
+  });
+
+  it("uses lock icon for secret macros", () => {
+    const macro = { name: "Secret", text: "password123", secret: true };
+    const item = new MacroTreeItem(macro, 0);
+    expect((item.iconPath as { id: string }).id).toBe("lock");
+  });
+
+  it("uses terminal icon for non-secret macros", () => {
+    const macro = { name: "Normal", text: "echo hi" };
+    const item = new MacroTreeItem(macro, 0);
+    expect((item.iconPath as { id: string }).id).toBe("terminal");
+  });
+
   it("sets contextValue to nexus.macro for all items", () => {
     const item = new MacroTreeItem({ name: "Test", text: "test" }, 0);
     expect(item.contextValue).toBe("nexus.macro");

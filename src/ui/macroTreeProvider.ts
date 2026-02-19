@@ -4,6 +4,7 @@ export interface TerminalMacro {
   name: string;
   text: string;
   slot?: number;
+  secret?: boolean;
 }
 
 export class MacroTreeItem extends vscode.TreeItem {
@@ -15,8 +16,12 @@ export class MacroTreeItem extends vscode.TreeItem {
     const prefix = displaySlot !== undefined ? `[Alt+${displaySlot}] ` : "";
     super(`${prefix}${macro.name}`, vscode.TreeItemCollapsibleState.None);
     this.id = `macro:${index}`;
-    const preview = macro.text.replace(/\n/g, "\u21b5");
-    this.description = `\u2192 ${preview.length > 40 ? preview.slice(0, 37) + "..." : preview}`;
+    if (macro.secret) {
+      this.description = "\u2022\u2022\u2022\u2022\u2022";
+    } else {
+      const preview = macro.text.replace(/\n/g, "\u21b5");
+      this.description = `\u2192 ${preview.length > 40 ? preview.slice(0, 37) + "..." : preview}`;
+    }
     this.contextValue = "nexus.macro";
     this.command = {
       command: "nexus.macro.runItem",
@@ -24,8 +29,12 @@ export class MacroTreeItem extends vscode.TreeItem {
       arguments: [this]
     };
     const slotHint = displaySlot !== undefined ? ` (Alt+${displaySlot})` : "";
-    this.tooltip = `${macro.name}${slotHint}\n${macro.text.replace(/\n/g, "\\n")}`;
-    this.iconPath = new vscode.ThemeIcon("terminal");
+    if (macro.secret) {
+      this.tooltip = `${macro.name}${slotHint} (secret)`;
+    } else {
+      this.tooltip = `${macro.name}${slotHint}\n${macro.text.replace(/\n/g, "\\n")}`;
+    }
+    this.iconPath = new vscode.ThemeIcon(macro.secret ? "lock" : "terminal");
   }
 }
 

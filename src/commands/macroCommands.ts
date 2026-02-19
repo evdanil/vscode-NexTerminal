@@ -1,10 +1,12 @@
 import * as vscode from "vscode";
 import type { MacroTreeItem, MacroTreeProvider } from "../ui/macroTreeProvider";
+import { MacroEditorPanel } from "../ui/macroEditorPanel";
 
 interface TerminalMacro {
   name: string;
   text: string;
   slot?: number;
+  secret?: boolean;
 }
 
 function getMacros(): TerminalMacro[] {
@@ -96,94 +98,21 @@ export function updateMacroContext(): void {
 
 export function registerMacroCommands(treeProvider: MacroTreeProvider): vscode.Disposable[] {
   return [
-    vscode.commands.registerCommand("nexus.macro.add", async () => {
-      const name = await vscode.window.showInputBox({
-        title: "Macro Name",
-        prompt: "Display name for the macro",
-        validateInput: (v) => (v.trim() ? null : "Name cannot be empty")
-      });
-      if (!name) {
-        return;
-      }
-      const text = await vscode.window.showInputBox({
-        title: "Macro Text",
-        prompt: "Text to send (use \\n for Enter)",
-        validateInput: (v) => (v ? null : "Text cannot be empty")
-      });
-      if (text === undefined) {
-        return;
-      }
-      const macros = getMacros();
-      const newMacro: TerminalMacro = { name: name.trim(), text: text.replace(/\\n/g, "\n") };
-
-      const slotResult = await promptForSlot(macros);
-      if (slotResult !== undefined && slotResult !== null) {
-        // Clear any conflict before pushing
-        for (const m of macros) {
-          if (m.slot === slotResult) {
-            delete m.slot;
-          }
-        }
-        newMacro.slot = slotResult;
-      }
-
-      macros.push(newMacro);
-      await saveMacros(macros);
+    vscode.commands.registerCommand("nexus.macro.add", () => {
+      MacroEditorPanel.openNew();
     }),
 
-    vscode.commands.registerCommand("nexus.macro.edit", async (arg?: unknown) => {
+    vscode.commands.registerCommand("nexus.macro.editor", () => {
+      MacroEditorPanel.open();
+    }),
+
+    vscode.commands.registerCommand("nexus.macro.edit", (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
-      let index: number;
       if (item) {
-        index = item.index;
+        MacroEditorPanel.open(item.index);
       } else {
-        const macros = getMacros();
-        if (macros.length === 0) {
-          void vscode.window.showInformationMessage("No macros defined.");
-          return;
-        }
-        const pick = await vscode.window.showQuickPick(
-          macros.map((m, i) => ({ label: m.name, description: m.text.replace(/\n/g, "\\n"), index: i })),
-          { title: "Select Macro to Edit" }
-        );
-        if (!pick) {
-          return;
-        }
-        index = pick.index;
+        MacroEditorPanel.open();
       }
-      const macros = getMacros();
-      const macro = macros[index];
-      if (!macro) {
-        return;
-      }
-      const name = await vscode.window.showInputBox({
-        title: "Macro Name",
-        prompt: "Display name for the macro",
-        value: macro.name,
-        validateInput: (v) => (v.trim() ? null : "Name cannot be empty")
-      });
-      if (!name) {
-        return;
-      }
-      const text = await vscode.window.showInputBox({
-        title: "Macro Text",
-        prompt: "Text to send (use \\n for Enter)",
-        value: macro.text.replace(/\n/g, "\\n"),
-        validateInput: (v) => (v ? null : "Text cannot be empty")
-      });
-      if (text === undefined) {
-        return;
-      }
-      const currentSlot = macro.slot;
-      const slotResult = await promptForSlot(macros, index, currentSlot);
-      if (slotResult === undefined) {
-        // Cancelled — preserve existing slot
-        macros[index] = { name: name.trim(), text: text.replace(/\\n/g, "\n"), ...(currentSlot !== undefined ? { slot: currentSlot } : {}) };
-      } else {
-        macros[index] = { name: name.trim(), text: text.replace(/\\n/g, "\n") };
-        assignSlot(macros, index, slotResult);
-      }
-      await saveMacros(macros);
     }),
 
     vscode.commands.registerCommand("nexus.macro.remove", async (arg?: unknown) => {
