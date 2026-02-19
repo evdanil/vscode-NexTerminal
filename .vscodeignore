@@ -19,6 +19,7 @@ package-lock.json
 **/.idea/**
 .github/**
 .claude/**
+.worktrees/**
 CLAUDE.md
 
 # Node modules — only serialport (native) is needed at runtime; everything else is bundled
