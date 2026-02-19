@@ -127,7 +127,7 @@ export function registerMacroCommands(treeProvider: MacroTreeProvider): vscode.D
           return;
         }
         const pick = await vscode.window.showQuickPick(
-          macros.map((m, i) => ({ label: m.name, description: m.text.replace(/\n/g, "\\n"), index: i })),
+          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), index: i })),
           { title: "Select Macro to Remove" }
         );
         if (!pick) {
@@ -177,7 +177,7 @@ export function registerMacroCommands(treeProvider: MacroTreeProvider): vscode.D
           }
           return {
             label: `${prefix}${m.name}`,
-            description: m.text.replace(/\n/g, "\\n"),
+            description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"),
             index: i
           };
         }),
@@ -234,7 +234,7 @@ export function registerMacroCommands(treeProvider: MacroTreeProvider): vscode.D
           return;
         }
         const pick = await vscode.window.showQuickPick(
-          macros.map((m, i) => ({ label: m.name, description: m.text.replace(/\n/g, "\\n"), index: i })),
+          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), index: i })),
           { title: "Select Macro" }
         );
         if (!pick) {
