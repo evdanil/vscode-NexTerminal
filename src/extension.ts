@@ -206,12 +206,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
-  const settingsTreeProvider = new SettingsTreeProvider(defaultSessionLogDir, () => {
-    const activeId = colorSchemeService.getActiveSchemeId();
-    if (!activeId) return "Default";
-    const scheme = colorSchemeService.getSchemeById(activeId);
-    return scheme?.name ?? "Default";
-  });
+  const settingsTreeProvider = new SettingsTreeProvider();
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
     treeDataProvider: nexusTreeProvider,
     dragAndDropController: nexusTreeProvider,
@@ -321,9 +316,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   const configChangeListener = vscode.workspace.onDidChangeConfiguration((event) => {
-    if (event.affectsConfiguration("nexus.logging") || event.affectsConfiguration("nexus.tunnel") || event.affectsConfiguration("nexus.terminal")) {
-      settingsTreeProvider.refresh();
-    }
     if (event.affectsConfiguration("nexus.terminal.macros")) {
       macroTreeProvider.refresh();
       updateMacroContext();
@@ -340,7 +332,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
   const profileDisposables = registerProfileCommands(ctx);
-  const settingsDisposables = registerSettingsCommands(settingsTreeProvider, () => ctx.sessionLogDir);
+  const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const configDisposables = registerConfigCommands(core);
   const macroDisposables = registerMacroCommands(macroTreeProvider);
   const fileDisposables = registerFileCommands(ctx);

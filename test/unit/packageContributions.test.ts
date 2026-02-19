@@ -41,6 +41,11 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.group.remove");
   });
 
+  it("contributes settings.openPanel command", () => {
+    const commands = packageJson.contributes.commands.map((item) => item.command);
+    expect(commands).toContain("nexus.settings.openPanel");
+  });
+
   it("has a single add button in the command center title bar", () => {
     const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
     const commandCenterNavItems = titleMenuItems.filter(

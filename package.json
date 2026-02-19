@@ -114,8 +114,7 @@
       { "command": "nexus.group.connect", "title": "Connect All", "icon": "$(plug)" },
       { "command": "nexus.group.disconnect", "title": "Disconnect All", "icon": "$(debug-disconnect)" },
       { "command": "nexus.group.rename", "title": "Rename Group", "icon": "$(edit)" },
-      { "command": "nexus.settings.edit", "title": "Edit Setting", "icon": "$(edit)" },
-      { "command": "nexus.settings.reset", "title": "Reset to Default", "icon": "$(discard)" },
+      { "command": "nexus.settings.openPanel", "title": "Nexus: Open Settings", "icon": "$(settings-gear)" },
       { "command": "nexus.settings.openJson", "title": "Open VS Code Settings", "icon": "$(settings-gear)" },
       { "command": "nexus.settings.openLogDir", "title": "Open Log Directory", "icon": "$(folder-opened)" },
       { "command": "nexus.tunnel.openBrowser", "title": "Open in Browser", "icon": "$(globe)" },
@@ -287,8 +286,7 @@
 
         {"command":"nexus.tunnel.remove","when":"view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/","group":"3_destructive"},
 
-        {"command":"nexus.settings.edit","when":"view == nexusSettings && viewItem == nexus.setting","group":"inline"},
-        {"command":"nexus.settings.reset","when":"view == nexusSettings && viewItem == nexus.setting","group":"1_manage"},
+        {"command":"nexus.settings.openPanel","when":"view == nexusSettings && viewItem == nexus.settingsCategory","group":"inline"},
 
         {"command":"nexus.macro.runItem","when":"view == nexusMacros && viewItem == nexus.macro","group":"inline"},
         {"command":"nexus.macro.edit","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@1"},
@@ -337,8 +335,7 @@
         {"command":"nexus.group.connect","when":"false"},
         {"command":"nexus.group.disconnect","when":"false"},
         {"command":"nexus.group.rename","when":"false"},
-        {"command":"nexus.settings.edit","when":"false"},
-        {"command":"nexus.settings.reset","when":"false"},
+        {"command":"nexus.settings.openPanel","when":"true"},
         {"command":"nexus.settings.openJson","when":"true"},
         {"command":"nexus.settings.openLogDir","when":"true"},
         {"command":"nexus.tunnel.openBrowser","when":"false"},
