@@ -7,7 +7,8 @@ const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
   dependencies: Record<string, string>;
   contributes: {
     commands: Array<{ command: string; title: string }>;
-    menus: Record<string, Array<{ command: string; when?: string }>>;
+    menus: Record<string, Array<{ command: string; when?: string; group?: string }>>;
+    configuration?: { properties?: Record<string, any> };
   };
 };
 
@@ -39,6 +40,24 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.profile.add");
     expect(commands).toContain("nexus.group.add");
     expect(commands).toContain("nexus.group.remove");
+  });
+
+  it("contributes settings.openPanel command", () => {
+    const commands = packageJson.contributes.commands.map((item) => item.command);
+    expect(commands).toContain("nexus.settings.openPanel");
+  });
+
+  it("contributes macro.editor command", () => {
+    const commands = packageJson.contributes.commands.map((item) => item.command);
+    expect(commands).toContain("nexus.macro.editor");
+  });
+
+  it("includes secret property in macro schema", () => {
+    const cfg = packageJson.contributes.configuration;
+    const macroSchema = cfg?.properties?.["nexus.terminal.macros"];
+    expect(macroSchema).toBeDefined();
+    expect(macroSchema?.items?.properties?.secret).toBeDefined();
+    expect(macroSchema?.items?.properties?.secret?.type).toBe("boolean");
   });
 
   it("has a single add button in the command center title bar", () => {

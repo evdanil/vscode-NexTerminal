@@ -114,8 +114,7 @@
       { "command": "nexus.group.connect", "title": "Connect All", "icon": "$(plug)" },
       { "command": "nexus.group.disconnect", "title": "Disconnect All", "icon": "$(debug-disconnect)" },
       { "command": "nexus.group.rename", "title": "Rename Group", "icon": "$(edit)" },
-      { "command": "nexus.settings.edit", "title": "Edit Setting", "icon": "$(edit)" },
-      { "command": "nexus.settings.reset", "title": "Reset to Default", "icon": "$(discard)" },
+      { "command": "nexus.settings.openPanel", "title": "Nexus: Open Settings", "icon": "$(settings-gear)" },
       { "command": "nexus.settings.openJson", "title": "Open VS Code Settings", "icon": "$(settings-gear)" },
       { "command": "nexus.settings.openLogDir", "title": "Open Log Directory", "icon": "$(folder-opened)" },
       { "command": "nexus.tunnel.openBrowser", "title": "Open in Browser", "icon": "$(globe)" },
@@ -124,6 +123,7 @@
       { "command": "nexus.group.remove", "title": "Remove Group", "icon": "$(trash)" },
       { "command": "nexus.config.export", "title": "Nexus: Export Configuration", "icon": "$(cloud-upload)" },
       { "command": "nexus.config.import", "title": "Nexus: Import Configuration", "icon": "$(cloud-download)" },
+      { "command": "nexus.macro.editor", "title": "Nexus: Macro Editor", "icon": "$(edit)" },
       { "command": "nexus.macro.add", "title": "Nexus: Add Macro", "icon": "$(add)" },
       { "command": "nexus.macro.edit", "title": "Edit", "icon": "$(edit)" },
       { "command": "nexus.macro.remove", "title": "Remove", "icon": "$(trash)" },
@@ -287,8 +287,7 @@
 
         {"command":"nexus.tunnel.remove","when":"view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/","group":"3_destructive"},
 
-        {"command":"nexus.settings.edit","when":"view == nexusSettings && viewItem == nexus.setting","group":"inline"},
-        {"command":"nexus.settings.reset","when":"view == nexusSettings && viewItem == nexus.setting","group":"1_manage"},
+        {"command":"nexus.settings.openPanel","when":"view == nexusSettings && viewItem == nexus.settingsCategory","group":"inline"},
 
         {"command":"nexus.macro.runItem","when":"view == nexusMacros && viewItem == nexus.macro","group":"inline"},
         {"command":"nexus.macro.edit","when":"view == nexusMacros && viewItem == nexus.macro","group":"1_manage@1"},
@@ -337,13 +336,13 @@
         {"command":"nexus.group.connect","when":"false"},
         {"command":"nexus.group.disconnect","when":"false"},
         {"command":"nexus.group.rename","when":"false"},
-        {"command":"nexus.settings.edit","when":"false"},
-        {"command":"nexus.settings.reset","when":"false"},
+        {"command":"nexus.settings.openPanel","when":"true"},
         {"command":"nexus.settings.openJson","when":"true"},
         {"command":"nexus.settings.openLogDir","when":"true"},
         {"command":"nexus.tunnel.openBrowser","when":"false"},
         {"command":"nexus.config.export","when":"true"},
         {"command":"nexus.config.import","when":"true"},
+        {"command":"nexus.macro.editor","when":"true"},
         {"command":"nexus.macro.add","when":"true"},
         {"command":"nexus.macro.run","when":"true"},
         {"command":"nexus.macro.edit","when":"false"},
@@ -547,7 +546,8 @@
             "properties": {
               "name": { "type": "string", "description": "Display name for the macro" },
               "text": { "type": "string", "description": "Text to send (use \\n for Enter)" },
-              "slot": { "type": "integer", "minimum": 0, "maximum": 9, "description": "Keyboard shortcut slot (0-9). Alt+1 = slot 1, ..., Alt+0 = slot 0." }
+              "slot": { "type": "integer", "minimum": 0, "maximum": 9, "description": "Keyboard shortcut slot (0-9). Alt+1 = slot 1, ..., Alt+0 = slot 0." },
+              "secret": { "type": "boolean", "default": false, "description": "Hide macro value from sidebar and session logs" }
             }
           },
           "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or `Alt+1` through `Alt+0` for the first 10 macros. Optionally assign a `slot` (0-9) to bind a macro to a specific `Alt+N` shortcut."

@@ -1,14 +1,6 @@
 import type { SessionSnapshot } from "../core/contracts";
 import { formatBytes } from "../utils/helpers";
-
-function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
+import { escapeHtml } from "./shared/escapeHtml";
 
 export function renderTunnelMonitorHtml(snapshot: SessionSnapshot): string {
   const tunnelRows = snapshot.activeTunnels
