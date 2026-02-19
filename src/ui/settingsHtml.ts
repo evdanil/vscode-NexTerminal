@@ -190,7 +190,10 @@ export function renderSettingsHtml(values: SettingValues, nonce: string): string
       background: var(--vscode-badge-background, rgba(128,128,128,0.2));
       color: var(--vscode-badge-foreground, var(--vscode-foreground));
       vertical-align: middle;
-      cursor: default;
+      cursor: pointer;
+    }
+    .setting-badge:hover {
+      opacity: 0.85;
     }
     .number-with-unit {
       display: flex;
@@ -351,6 +354,14 @@ export function renderSettingsHtml(values: SettingValues, nonce: string): string
       document.getElementById("reset-all-btn").addEventListener("click", function() {
         vscode.postMessage({ type: "resetAll" });
       });
+
+      // "Requires reload" badge click
+      var badges = document.querySelectorAll('.setting-badge');
+      for (var ri = 0; ri < badges.length; ri++) {
+        badges[ri].addEventListener('click', function() {
+          vscode.postMessage({ type: "reloadWindow" });
+        });
+      }
 
       // Visibility handling for settings-level visibleWhen
       function updateVisibility() {

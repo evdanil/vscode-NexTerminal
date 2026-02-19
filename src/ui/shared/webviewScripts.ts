@@ -25,6 +25,8 @@ export function baseWebviewJs(): string {
       }
       hiddenInput.value = value;
       wrapper.classList.remove('open');
+      var triggerEl = wrapper.querySelector('.custom-select-trigger');
+      if (triggerEl) triggerEl.focus();
       hiddenInput.dispatchEvent(new Event('change', { bubbles: true }));
       hiddenInput.dispatchEvent(new Event('input', { bubbles: true }));
     }
@@ -63,9 +65,29 @@ export function baseWebviewJs(): string {
               wrapper.classList.toggle('open');
             } else if (e.key === 'Escape') {
               wrapper.classList.remove('open');
+            } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+              e.preventDefault();
+              if (!wrapper.classList.contains('open')) {
+                wrapper.classList.add('open');
+                return;
+              }
+              var opts = wrapper.querySelectorAll('.custom-select-option');
+              var current = wrapper.querySelector('.custom-select-option.selected');
+              var idx = -1;
+              for (var ai = 0; ai < opts.length; ai++) {
+                if (opts[ai] === current) { idx = ai; break; }
+              }
+              if (e.key === 'ArrowDown') { idx = Math.min(idx + 1, opts.length - 1); }
+              else { idx = Math.max(idx - 1, 0); }
+              if (onOptionClick) {
+                onOptionClick(wrapper, opts[idx]);
+              } else {
+                selectCustomOption(wrapper, opts[idx].dataset.value);
+              }
             }
           });
-          wrapper.querySelector('.custom-select-dropdown').addEventListener('click', function(e) {
+          var dropdown = wrapper.querySelector('.custom-select-dropdown');
+          dropdown.addEventListener('click', function(e) {
             var opt = e.target.closest('.custom-select-option');
             if (!opt) return;
             if (onOptionClick) {

@@ -139,6 +139,16 @@ export class SettingsPanel {
           revealSetting: { key: "nexus.terminal.highlighting.rules" }
         });
         break;
+      case "reloadWindow": {
+        const action = await vscode.window.showInformationMessage(
+          "This setting requires a window reload to take effect.",
+          "Reload Window"
+        );
+        if (action === "Reload Window") {
+          void vscode.commands.executeCommand("workbench.action.reloadWindow");
+        }
+        break;
+      }
     }
   }
 }
