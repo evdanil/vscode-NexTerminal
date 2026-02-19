@@ -1,7 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { SftpService } from "../../src/services/sftp/sftpService";
-import type { SshConnection } from "../../src/services/ssh/contracts";
-import type { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
+import type { SshConnection, SshFactory } from "../../src/services/ssh/contracts";
 import type { ServerConfig } from "../../src/models/config";
 
 const testServer: ServerConfig = {
@@ -42,16 +41,16 @@ function createMockConnection(sftp: ReturnType<typeof createMockSftp>): SshConne
   };
 }
 
-function createMockFactory(connection: SshConnection): SilentAuthSshFactory {
+function createMockFactory(connection: SshConnection): SshFactory {
   return {
     connect: vi.fn(async () => connection),
-  } as any;
+  };
 }
 
 describe("SftpService", () => {
   let sftp: ReturnType<typeof createMockSftp>;
   let connection: SshConnection;
-  let factory: SilentAuthSshFactory;
+  let factory: SshFactory;
   let service: SftpService;
 
   beforeEach(() => {

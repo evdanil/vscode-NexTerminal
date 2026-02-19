@@ -43,3 +43,12 @@ export interface SshConnector {
     auth: { password?: string; passphrase?: string; onKeyboardInteractive?: KeyboardInteractiveHandler }
   ): Promise<SshConnection>;
 }
+
+export interface SshFactory {
+  connect(server: ServerConfig): Promise<SshConnection>;
+}
+
+export interface SshPoolControl {
+  disconnect(serverId: string): void;
+  dispose(): void;
+}

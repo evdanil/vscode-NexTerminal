@@ -11,6 +11,7 @@ import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
 import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFileSystemProvider";
 import { SftpService } from "./services/sftp/sftpService";
 import { SilentAuthSshFactory } from "./services/ssh/silentAuth";
+import { SshConnectionPool } from "./services/ssh/sshConnectionPool";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
 import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
@@ -133,7 +134,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         })
       )
   );
-  const tunnelManager = new TunnelManager(sshFactory);
+  const multiplexingConfig = vscode.workspace.getConfiguration("nexus.ssh.multiplexing");
+  const pool = new SshConnectionPool(sshFactory, {
+    enabled: multiplexingConfig.get<boolean>("enabled", true),
+    idleTimeoutMs: Math.min(
+      multiplexingConfig.get<number>("idleTimeout", 300) * 1000,
+      3_600_000
+    )
+  });
+  const tunnelManager = new TunnelManager(pool, sshFactory);
   const extensionRoot = path.resolve(__dirname, "..");
   const sidecarPath = path.join(__dirname, "services", "serial", "serialSidecarWorker.js");
   const serialSidecar = new SerialSidecarManager(sidecarPath, extensionRoot);
@@ -144,7 +153,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const highlighter = new TerminalHighlighter();
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
   const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
-  const sftpService = new SftpService(sshFactory);
+  const sftpService = new SftpService(pool);
   const fileSystemProvider = new NexusFileSystemProvider(sftpService);
   const fsRegistration = vscode.workspace.registerFileSystemProvider(NEXTERM_SCHEME, fileSystemProvider, { isCaseSensitive: true });
   const fileExplorerProvider = new FileExplorerTreeProvider(sftpService);
@@ -154,7 +163,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     core,
     tunnelManager,
     serialSidecar,
-    sshFactory,
+    sshFactory: pool,
+    sshPool: pool,
     loggerFactory,
     get sessionLogDir() {
       const custom = vscode.workspace.getConfiguration("nexus.logging").get<string>("sessionLogDirectory", "");
@@ -179,7 +189,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!connectionMode) {
         return;
       }
-      await startTunnel(core, tunnelManager, sshFactory, profile, server, connectionMode);
+      await startTunnel(core, tunnelManager, pool, profile, server, connectionMode);
     },
     async onItemGroupChanged(itemType, itemId, newGroup) {
       if (itemType === "server") {
@@ -248,7 +258,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   syncViews();
 
-  const unsubscribeCore = core.onDidChange(() => syncViews());
+  let previousServers = new Map<string, import("./models/config").ServerConfig>(
+    core.getSnapshot().servers.map(s => [s.id, s])
+  );
+
+  const unsubscribeCore = core.onDidChange((snapshot) => {
+    syncViews();
+    for (const server of snapshot.servers) {
+      const prev = previousServers.get(server.id);
+      if (prev && (
+        prev.host !== server.host ||
+        prev.port !== server.port ||
+        prev.username !== server.username ||
+        prev.authType !== server.authType ||
+        prev.keyPath !== server.keyPath
+      )) {
+        pool.disconnect(server.id);
+      }
+    }
+    previousServers = new Map(snapshot.servers.map(s => [s.id, s]));
+  });
   const unsubscribeTunnel = tunnelManager.onDidChange((event) => {
     if (event.type === "started") {
       core.registerTunnel(event.tunnel);
@@ -350,6 +379,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         serialSidecar.dispose();
         sftpService.dispose();
         void tunnelManager.stopAll();
+        pool.dispose();
       }
     }
   );

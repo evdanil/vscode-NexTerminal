@@ -4,8 +4,7 @@ import * as vscode from "vscode";
 import type { ServerConfig } from "../../models/config";
 import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
-import type { SshConnection } from "./contracts";
-import type { SilentAuthSshFactory } from "./silentAuth";
+import type { SshConnection, SshFactory } from "./contracts";
 import type { TerminalHighlighter } from "../terminalHighlighter";
 
 export interface SshPtyCallbacks {
@@ -24,7 +23,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
 
   public constructor(
     private readonly serverConfig: ServerConfig,
-    private readonly sshFactory: SilentAuthSshFactory,
+    private readonly sshFactory: SshFactory,
     private readonly callbacks: SshPtyCallbacks,
     private readonly logger: SessionLogger,
     private readonly transcript?: SessionTranscript,

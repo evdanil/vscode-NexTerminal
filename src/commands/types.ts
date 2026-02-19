@@ -3,7 +3,7 @@ import type { NexusCore } from "../core/nexusCore";
 import type { TerminalLoggerFactory } from "../logging/terminalLogger";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
 import type { SftpService } from "../services/sftp/sftpService";
-import type { SilentAuthSshFactory } from "../services/ssh/silentAuth";
+import type { SshFactory, SshPoolControl } from "../services/ssh/contracts";
 import type { TerminalHighlighter } from "../services/terminalHighlighter";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
 import type { FileExplorerTreeProvider } from "../ui/fileExplorerTreeProvider";
@@ -16,7 +16,8 @@ export interface CommandContext {
   core: NexusCore;
   tunnelManager: TunnelManager;
   serialSidecar: SerialSidecarManager;
-  sshFactory: SilentAuthSshFactory;
+  sshFactory: SshFactory;
+  sshPool: SshPoolControl;
   loggerFactory: TerminalLoggerFactory;
   sessionLogDir: string;
   terminalsByServer: ServerTerminalMap;

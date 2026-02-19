@@ -7,7 +7,7 @@ import type {
   TunnelConnectionMode,
   TunnelProfile
 } from "../models/config";
-import type { SilentAuthSshFactory } from "../services/ssh/silentAuth";
+import type { SshFactory } from "../services/ssh/contracts";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
 import { serverFormDefinition, tunnelFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
@@ -91,7 +91,7 @@ export async function resolveServerForTunnel(
 export async function startTunnel(
   core: NexusCore,
   tunnelManager: TunnelManager,
-  sshFactory: SilentAuthSshFactory,
+  sshFactory: SshFactory,
   profile: TunnelProfile,
   server: ServerConfig,
   connectionMode: ResolvedTunnelConnectionMode

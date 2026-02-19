@@ -492,6 +492,20 @@
             "All clients share a single SSH connection (recommended — works with 2FA, lower resource usage)"
           ]
         },
+        "nexus.ssh.multiplexing.enabled": {
+          "type": "boolean",
+          "default": true,
+          "order": 5.1,
+          "markdownDescription": "Share a single SSH connection per server across terminals, tunnels (shared mode), and SFTP. Reduces overhead and avoids multiple auth prompts. Requires window reload to take effect."
+        },
+        "nexus.ssh.multiplexing.idleTimeout": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "maximum": 3600,
+          "order": 5.2,
+          "markdownDescription": "Seconds to keep an idle multiplexed connection alive after all channels close (`0` = keep alive until window closes, max `3600`). Requires window reload."
+        },
         "nexus.terminal.openLocation": {
           "type": "string",
           "enum": [

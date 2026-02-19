@@ -1,5 +1,5 @@
 import type { ServerConfig } from "../../models/config";
-import type { KeyboardInteractiveHandler, PasswordPrompt, SecretVault, SshConnection, SshConnector } from "./contracts";
+import type { KeyboardInteractiveHandler, PasswordPrompt, SecretVault, SshConnection, SshConnector, SshFactory } from "./contracts";
 
 export type InputPromptFn = (message: string, password: boolean) => Promise<string | undefined>;
 
@@ -31,7 +31,7 @@ function isPassphraseError(error: unknown): boolean {
   return message.includes("encrypted") || message.includes("passphrase") || message.includes("bad decrypt");
 }
 
-export class SilentAuthSshFactory {
+export class SilentAuthSshFactory implements SshFactory {
   public constructor(
     private readonly connector: SshConnector,
     private readonly vault: SecretVault,

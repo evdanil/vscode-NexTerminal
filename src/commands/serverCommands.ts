@@ -223,6 +223,7 @@ async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<voi
   }
   const activeTunnels = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === server.id);
   await Promise.all(activeTunnels.map((t) => ctx.tunnelManager.stop(t.id)));
+  ctx.sshPool.disconnect(server.id);
 }
 
 export function registerServerCommands(ctx: CommandContext): vscode.Disposable[] {

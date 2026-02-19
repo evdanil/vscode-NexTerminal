@@ -2,8 +2,8 @@ import * as net from "node:net";
 import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
-import type { SshConnection } from "../../src/services/ssh/contracts";
-import { TunnelManager, type TunnelEvent, type TunnelSshFactory } from "../../src/services/tunnel/tunnelManager";
+import type { SshConnection, SshFactory } from "../../src/services/ssh/contracts";
+import { TunnelManager, type TunnelEvent } from "../../src/services/tunnel/tunnelManager";
 
 async function getFreePort(): Promise<number> {
   const server = net.createServer();
@@ -69,7 +69,7 @@ class DirectTcpSshConnection implements SshConnection {
   }
 }
 
-class DirectTcpSshFactory implements TunnelSshFactory {
+class DirectTcpSshFactory implements SshFactory {
   public connectCount = 0;
 
   public async connect(_server: ServerConfig): Promise<SshConnection> {
@@ -132,7 +132,7 @@ describe("TunnelManager integration", () => {
     };
 
     const sshFactory = new DirectTcpSshFactory();
-    manager = new TunnelManager(sshFactory);
+    manager = new TunnelManager(sshFactory, sshFactory);
     const events: TunnelEvent[] = [];
     manager.onDidChange((event) => events.push(event));
 
@@ -177,7 +177,7 @@ describe("TunnelManager integration", () => {
     };
 
     const sshFactory = new DirectTcpSshFactory();
-    manager = new TunnelManager(sshFactory);
+    manager = new TunnelManager(sshFactory, sshFactory);
     const activeTunnel = await manager.start(profile, server, { connectionMode: "shared" });
 
     const first = await exchangeMessage(localPort, "alpha");

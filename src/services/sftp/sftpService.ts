@@ -1,8 +1,7 @@
 import * as path from "node:path";
 import type { SFTPWrapper, FileEntry, Stats } from "ssh2";
 import type { ServerConfig } from "../../models/config";
-import type { SshConnection } from "../ssh/contracts";
-import type { SilentAuthSshFactory } from "../ssh/silentAuth";
+import type { SshConnection, SshFactory } from "../ssh/contracts";
 
 export interface DirectoryEntry {
   name: string;
@@ -65,7 +64,7 @@ export class SftpService {
   private readonly unsubscribers = new Map<string, () => void>();
   private readonly pending = new Map<string, Promise<void>>();
 
-  public constructor(private readonly sshFactory: SilentAuthSshFactory) {}
+  public constructor(private readonly sshFactory: SshFactory) {}
 
   public async connect(server: ServerConfig): Promise<void> {
     if (this.sessions.has(server.id)) {

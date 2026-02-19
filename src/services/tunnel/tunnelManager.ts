@@ -1,11 +1,9 @@
 import * as net from "node:net";
 import { randomUUID } from "node:crypto";
 import type { ActiveTunnel, ResolvedTunnelConnectionMode, ServerConfig, TunnelProfile } from "../../models/config";
-import type { SshConnection } from "../ssh/contracts";
+import type { SshConnection, SshFactory } from "../ssh/contracts";
 
-export interface TunnelSshFactory {
-  connect(server: ServerConfig): Promise<SshConnection>;
-}
+export type TunnelSshFactory = SshFactory;
 
 export type TunnelEvent =
   | { type: "started"; tunnel: ActiveTunnel }
@@ -48,7 +46,10 @@ export class TunnelManager {
   private readonly activeByProfile = new Map<string, string>();
   private trafficTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  public constructor(private readonly sshFactory: TunnelSshFactory) {}
+  public constructor(
+    private readonly sharedFactory: SshFactory,
+    private readonly isolatedFactory: SshFactory
+  ) {}
 
   public onDidChange(listener: TunnelListener): () => void {
     this.listeners.add(listener);
@@ -179,7 +180,7 @@ export class TunnelManager {
         sshConnection = await this.getOrCreateSharedConnection(runtime, activeTunnelId);
         shouldDisposeConnection = false;
       } else {
-        sshConnection = await this.sshFactory.connect(runtime.serverConfig);
+        sshConnection = await this.isolatedFactory.connect(runtime.serverConfig);
         runtime.sshConnections.add(sshConnection);
       }
       const remoteStream = await sshConnection.openDirectTcp(runtime.profile.remoteIP, runtime.profile.remotePort);
@@ -242,7 +243,7 @@ export class TunnelManager {
     if (runtime.sharedConnection) {
       return runtime.sharedConnection;
     }
-    const sharedConnection = await this.sshFactory.connect(runtime.serverConfig);
+    const sharedConnection = await this.sharedFactory.connect(runtime.serverConfig);
     runtime.sharedConnection = sharedConnection;
     runtime.sshConnections.add(sharedConnection);
     sharedConnection.onClose(() => {
