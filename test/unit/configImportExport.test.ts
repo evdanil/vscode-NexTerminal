@@ -160,6 +160,12 @@ describe("SETTINGS_KEYS", () => {
     const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
     expect(keys).toContain("nexus.tunnel.defaultConnectionMode");
   });
+
+  it("includes SSH multiplexing settings", () => {
+    const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
+    expect(keys).toContain("nexus.ssh.multiplexing.enabled");
+    expect(keys).toContain("nexus.ssh.multiplexing.idleTimeout");
+  });
 });
 
 describe("config import command", () => {

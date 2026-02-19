@@ -2,18 +2,19 @@
 
 Unified SSH, Serial, and Port Forwarding hub for VS Code.
 
-Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with session logging, drag-and-drop organization, and configuration import/export.
+Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with SSH connection multiplexing, a settings panel, macro editor, session logging, drag-and-drop organization, and configuration import/export.
 
 ## Features
 
 - **SSH Terminal Sessions** — Connect to remote servers with password, key, or SSH agent authentication. Supports two-factor authentication (keyboard-interactive) — passwords auto-fill while verification codes are prompted separately. Credentials are cached securely via VS Code SecretStorage with silent re-auth.
 - **Serial Terminal Sessions** — Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, parity, and stop bits. Runs in an isolated sidecar process for crash safety.
 - **Port Forwarding (TCP Tunnels)** — Forward local ports to remote hosts through SSH. Shared mode (default) uses a single SSH connection for all clients; isolated mode creates a separate connection per client.
+- **SSH Connection Multiplexing** — Share SSH connections across terminals, tunnels, and SFTP for the same server. Reduces connection overhead with automatic ref-counting and configurable idle timeout.
 - **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized by group. Drag and drop to rearrange or assign tunnels to servers.
-- **Settings Panel** — View and edit extension settings directly in the sidebar.
+- **Settings Panel** — View and edit extension settings in a dedicated webview panel. Declarative metadata drives the UI with auto-save, search, and grouped categories.
 - **Session Transcript Logging** — Automatically log clean terminal output (ANSI codes stripped) to files with configurable rotation.
 - **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH and serial terminal output. Detects errors, warnings, IP addresses, UUIDs, URLs and more with inline ANSI colouring while respecting existing remote colours.
-- **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign each macro an explicit `Alt+N` slot (0-9) via the context menu, or let them auto-assign positionally. Quick pick access via `Alt+S`.
+- **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign each macro an explicit `Alt+N` slot (0-9) via the context menu, or let them auto-assign positionally. Macros without an assigned slot can still be invoked via `Alt+S`, which opens a quick-pick list of all macros. Includes a Macro Editor webview panel with multiline editing, secret macro support, and drag-and-drop slot assignment.
 - **Configuration Export/Import** — Back up and restore all profiles and settings as a single JSON file.
 - **Web Extension Fallback** — Graceful degradation in browser-based VS Code (SSH/serial require desktop runtime).
 
@@ -76,6 +77,9 @@ npm run package:vsix
 | `nexus.tunnel.defaultConnectionMode` | `shared` | `shared` or `isolated` SSH mode for tunnels |
 | `nexus.terminal.openLocation` | `panel` | Where to open terminals: `panel` or `editor` tab |
 | `nexus.terminal.macros` | `[]` | Terminal macros with optional `slot` (0-9) for Alt+N shortcuts |
+| `nexus.ssh.multiplexing.enabled` | `true` | Share SSH connections across terminals, tunnels, and SFTP |
+| `nexus.ssh.multiplexing.idleTimeout` | `300` | Seconds to keep idle multiplexed connection alive |
+| `nexus.terminal.highlighting.enabled` | `true` | Enable regex-based terminal highlighting |
 
 ## Documentation
 

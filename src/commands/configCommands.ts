@@ -24,7 +24,9 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.terminal", key: "passthroughKeys" },
   { section: "nexus.terminal", key: "macros" },
   { section: "nexus.terminal.highlighting", key: "enabled" },
-  { section: "nexus.terminal.highlighting", key: "rules" }
+  { section: "nexus.terminal.highlighting", key: "rules" },
+  { section: "nexus.ssh.multiplexing", key: "enabled" },
+  { section: "nexus.ssh.multiplexing", key: "idleTimeout" }
 ];
 
 function readSettings(): Record<string, unknown> {

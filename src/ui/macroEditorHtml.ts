@@ -133,6 +133,7 @@ export function renderMacroEditorHtml(
         ${slotOptionsHtml}
       </div>
     </div>
+    <div class="hint">Macros without a shortcut can still be run via <strong>Alt+S</strong> (quick pick).</div>
   </div>
 
   <div class="bottom-actions">
