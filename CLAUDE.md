@@ -75,6 +75,10 @@ Passwords stored separately via VS Code `SecretStorage` with key pattern `passwo
 ### Web extension (`webExtension.ts`)
 Graceful degradation — registers stub commands showing "not available in browser" warnings. Intentional MVP gap.
 
+## Development Workflow
+
+- Feature development uses git worktrees in the `.worktrees/` directory for isolation from the main working tree
+
 ## Testing Patterns
 
 - Unit tests mock VS Code API and use `InMemoryConfigRepository`

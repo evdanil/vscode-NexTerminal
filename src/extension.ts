@@ -120,9 +120,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     maxFileSizeBytes: maxFileSizeMb * 1024 * 1024,
     maxRotatedFiles
   });
+  const secretVault = new VscodeSecretVault(context);
   const sshFactory = new SilentAuthSshFactory(
     new Ssh2Connector(),
-    new VscodeSecretVault(context),
+    secretVault,
     new VscodePasswordPrompt(),
     (message, isPassword) =>
       Promise.resolve(
@@ -333,7 +334,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const serialDisposables = registerSerialCommands(ctx);
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
-  const configDisposables = registerConfigCommands(core);
+  const configDisposables = registerConfigCommands(core, secretVault);
   const macroDisposables = registerMacroCommands(macroTreeProvider);
   const fileDisposables = registerFileCommands(ctx);
 

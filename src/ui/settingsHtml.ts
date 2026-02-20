@@ -154,10 +154,28 @@ export function renderSettingsHtml(values: SettingValues, nonce: string): string
     <a href="#" id="open-highlighting-json">Edit highlighting rules in settings.json</a>
   </div>`;
 
+  // Import / Export section
+  sectionsHtml += `
+  <h3 id="section-importexport">Import / Export</h3>
+  <div class="setting-desc">Create an encrypted backup or export a sanitized copy to share.</div>
+  <div class="button-row">
+    <button type="button" class="btn-primary" id="backup-btn">Backup\u2026</button>
+    <button type="button" class="btn-secondary" id="share-btn">Export for Sharing\u2026</button>
+    <button type="button" class="btn-secondary" id="import-btn">Import\u2026</button>
+  </div>`;
+
   // Reset button
   sectionsHtml += `
   <div class="button-row" style="margin-top: 24px; justify-content: flex-end;">
     <button type="button" class="btn-secondary" id="reset-all-btn">Reset All to Defaults</button>
+  </div>`;
+
+  // Danger Zone
+  sectionsHtml += `
+  <h3 id="section-dangerzone">Danger Zone</h3>
+  <div class="setting-desc">Permanently delete all your data. This cannot be undone.</div>
+  <div class="button-row">
+    <button type="button" class="btn-danger" id="complete-reset-btn">Delete All Data\u2026</button>
   </div>`;
 
   return `<!DOCTYPE html>
@@ -232,6 +250,19 @@ export function renderSettingsHtml(values: SettingValues, nonce: string): string
     }
     .form-group[data-visible-when-setting] { display: none; }
     .form-group[data-visible-when-setting].field-visible { display: block; }
+    .btn-danger {
+      padding: 6px 16px;
+      background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
+      color: var(--vscode-errorForeground, #f48771);
+      border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground, #f48771));
+      border-radius: 2px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .btn-danger:hover {
+      opacity: 0.9;
+    }
   </style>
 </head>
 <body>
@@ -353,6 +384,18 @@ export function renderSettingsHtml(values: SettingValues, nonce: string): string
       });
       document.getElementById("reset-all-btn").addEventListener("click", function() {
         vscode.postMessage({ type: "resetAll" });
+      });
+      document.getElementById("backup-btn").addEventListener("click", function() {
+        vscode.postMessage({ type: "backup" });
+      });
+      document.getElementById("share-btn").addEventListener("click", function() {
+        vscode.postMessage({ type: "share" });
+      });
+      document.getElementById("import-btn").addEventListener("click", function() {
+        vscode.postMessage({ type: "importConfig" });
+      });
+      document.getElementById("complete-reset-btn").addEventListener("click", function() {
+        vscode.postMessage({ type: "completeReset" });
       });
 
       // "Requires reload" badge click

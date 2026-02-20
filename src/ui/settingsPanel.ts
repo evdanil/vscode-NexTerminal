@@ -149,6 +149,20 @@ export class SettingsPanel {
         }
         break;
       }
+      case "backup":
+        await vscode.commands.executeCommand("nexus.config.export.backup");
+        break;
+      case "share":
+        await vscode.commands.executeCommand("nexus.config.export");
+        break;
+      case "importConfig":
+        await vscode.commands.executeCommand("nexus.config.import");
+        this.render();
+        break;
+      case "completeReset":
+        await vscode.commands.executeCommand("nexus.config.completeReset");
+        this.render();
+        break;
     }
   }
 }

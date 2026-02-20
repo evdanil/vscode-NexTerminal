@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar with connection multiplexing, a settings panel, macro editor, and regex-based terminal highlighting.",
-  "version": "2.6.1",
+  "version": "2.7.0",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -267,13 +267,21 @@
       },
       {
         "command": "nexus.config.export",
-        "title": "Nexus: Export Configuration",
-        "icon": "$(cloud-upload)"
+        "title": "Nexus: Export for Sharing",
+        "icon": "$(share)"
+      },
+      {
+        "command": "nexus.config.export.backup",
+        "title": "Nexus: Encrypted Backup"
       },
       {
         "command": "nexus.config.import",
         "title": "Nexus: Import Configuration",
         "icon": "$(cloud-download)"
+      },
+      {
+        "command": "nexus.config.completeReset",
+        "title": "Nexus: Delete All Data"
       },
       {
         "command": "nexus.macro.editor",
@@ -885,7 +893,15 @@
           "when": "true"
         },
         {
+          "command": "nexus.config.export.backup",
+          "when": "true"
+        },
+        {
           "command": "nexus.config.import",
+          "when": "true"
+        },
+        {
+          "command": "nexus.config.completeReset",
           "when": "true"
         },
         {
