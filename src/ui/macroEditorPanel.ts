@@ -1,6 +1,11 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
-import { isValidBinding } from "../macroBindings";
+import {
+  isValidBinding,
+  bindingToDisplayLabel,
+  CRITICAL_CTRL_SHIFT_KEYS,
+  SPECIAL_BINDING_WARNINGS
+} from "../macroBindings";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
 import type { TerminalMacro } from "./macroTreeProvider";
 
@@ -117,6 +122,28 @@ export class MacroEditorPanel {
         if (bindingRaw) {
           const normalized = bindingRaw.toLowerCase();
           if (isValidBinding(normalized)) {
+            // Warn about critical Ctrl+Shift keys
+            if (normalized.startsWith("ctrl+shift+")) {
+              const key = normalized.slice(11);
+              if (CRITICAL_CTRL_SHIFT_KEYS.has(key)) {
+                const proceed = await vscode.window.showWarningMessage(
+                  `${bindingToDisplayLabel(normalized)} is a common VS Code shortcut. Using it for a macro will override the default behavior in the terminal.`,
+                  "Use Anyway",
+                  "Cancel"
+                );
+                if (proceed !== "Use Anyway") break;
+              }
+            }
+            // Warn about alt+s override
+            const specialWarning = SPECIAL_BINDING_WARNINGS[normalized];
+            if (specialWarning) {
+              const proceed = await vscode.window.showWarningMessage(
+                specialWarning,
+                "Use Anyway",
+                "Cancel"
+              );
+              if (proceed !== "Use Anyway") break;
+            }
             // Clear conflicting binding
             for (const m of macros) {
               if (m.keybinding?.toLowerCase() === normalized) {
