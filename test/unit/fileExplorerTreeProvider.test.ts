@@ -40,11 +40,18 @@ vi.mock("vscode", () => {
         path: components.path,
       })),
     },
+    DataTransferItem: class {
+      constructor(public value: string) {}
+      asString() { return Promise.resolve(this.value); }
+    },
+    window: {
+      showErrorMessage: vi.fn(),
+    },
     EventEmitter,
   };
 });
 
-import { FileExplorerTreeProvider, FileExplorerServerItem, FileTreeItem } from "../../src/ui/fileExplorerTreeProvider";
+import { FileExplorerTreeProvider, FileExplorerServerItem, FileTreeItem, ParentDirItem } from "../../src/ui/fileExplorerTreeProvider";
 import type { SftpService, DirectoryEntry } from "../../src/services/sftp/sftpService";
 import type { ServerConfig } from "../../src/models/config";
 
@@ -116,9 +123,25 @@ describe("FileExplorerTreeProvider", () => {
     provider.setActiveServer(testServer, "/home/dev");
     const children = await provider.getChildren();
 
-    expect(children).toHaveLength(3); // header + 2 entries
+    expect(children).toHaveLength(5); // header + parentDir + "." + 2 entries
+    expect(children[0]).toBeInstanceOf(FileExplorerServerItem);
+    expect(children[1]).toBeInstanceOf(ParentDirItem);
+    expect(children[2]).toBeInstanceOf(FileTreeItem);
+    expect((children[2] as FileTreeItem).label).toBe(".");
+    expect(children[3]).toBeInstanceOf(FileTreeItem);
+    expect(children[4]).toBeInstanceOf(FileTreeItem);
+  });
+
+  it("omits ParentDirItem when root is /", async () => {
+    (sftp.readDirectory as any).mockResolvedValue([fileEntry]);
+
+    provider.setActiveServer(testServer, "/");
+    const children = await provider.getChildren();
+
+    expect(children).toHaveLength(3); // header + "." + 1 entry, no parentDir
     expect(children[0]).toBeInstanceOf(FileExplorerServerItem);
     expect(children[1]).toBeInstanceOf(FileTreeItem);
+    expect((children[1] as FileTreeItem).label).toBe(".");
     expect(children[2]).toBeInstanceOf(FileTreeItem);
   });
 
@@ -128,8 +151,8 @@ describe("FileExplorerTreeProvider", () => {
     provider.setActiveServer(testServer, "/home/dev");
     const children = await provider.getChildren();
 
-    // Skip server header item
-    const items = children.slice(1) as FileTreeItem[];
+    // Skip server header + parentDir + "." items
+    const items = children.filter((c) => c instanceof FileTreeItem && c.label !== ".") as FileTreeItem[];
     expect(items[0].entry.isDirectory).toBe(true);
     expect(items[1].entry.isDirectory).toBe(false);
   });
@@ -145,7 +168,7 @@ describe("FileExplorerTreeProvider", () => {
 
     provider.setActiveServer(testServer, "/home/dev");
     const children = await provider.getChildren();
-    const items = children.slice(1) as FileTreeItem[];
+    const items = children.filter((c) => c instanceof FileTreeItem && c.label !== ".") as FileTreeItem[];
 
     expect(items[0].entry.name).toBe("able");
     expect(items[1].entry.name).toBe("bravo");
@@ -232,7 +255,222 @@ describe("FileExplorerTreeProvider", () => {
     provider.setActiveServer(testServer, "/home/dev");
     const children = await provider.getChildren();
 
-    // Should have server header + empty directory (error caught)
-    expect(children).toHaveLength(1); // just the header
+    // Should have server header + parentDir + "." + empty directory (error caught)
+    expect(children).toHaveLength(3); // header + parentDir + "."
+  });
+
+  it("setRootPath changes the root directory", async () => {
+    (sftp.readDirectory as any).mockResolvedValue([fileEntry]);
+
+    provider.setActiveServer(testServer, "/home/dev");
+    provider.setRootPath("/etc");
+    expect(provider.getRootPath()).toBe("/etc");
+
+    const children = await provider.getChildren();
+    const parentItem = children.find((c) => c instanceof ParentDirItem) as ParentDirItem;
+    expect(parentItem).toBeDefined();
+    expect(parentItem.parentPath).toBe("/");
+  });
+
+  it("getHomeDir returns the original home directory", () => {
+    provider.setActiveServer(testServer, "/home/dev");
+    expect(provider.getHomeDir()).toBe("/home/dev");
+    provider.setRootPath("/etc");
+    expect(provider.getHomeDir()).toBe("/home/dev");
+  });
+
+  describe('"." current directory item', () => {
+    it('has contextValue nexus.fileExplorer.dir and label "."', async () => {
+      (sftp.readDirectory as any).mockResolvedValue([]);
+
+      provider.setActiveServer(testServer, "/home/dev");
+      const children = await provider.getChildren();
+      const dotItem = children.find(
+        (c) => c instanceof FileTreeItem && c.label === "."
+      ) as FileTreeItem;
+
+      expect(dotItem).toBeDefined();
+      expect(dotItem.contextValue).toBe("nexus.fileExplorer.dir");
+      expect(dotItem.label).toBe(".");
+      expect(dotItem.tooltip).toBe("/home/dev");
+      expect(dotItem.description).toBe("/home/dev");
+      expect(dotItem.collapsibleState).toBe(0); // None
+    });
+
+    it('resolves correctly at root "/"', async () => {
+      (sftp.readDirectory as any).mockResolvedValue([]);
+
+      provider.setActiveServer(testServer, "/");
+      const children = await provider.getChildren();
+      const dotItem = children.find(
+        (c) => c instanceof FileTreeItem && c.label === "."
+      ) as FileTreeItem;
+
+      expect(dotItem).toBeDefined();
+      expect(dotItem.tooltip).toBe("/");
+      // path.posix.join("/", "") === "/" — so commands resolve to "/"
+      const path = await import("node:path");
+      expect(path.posix.join(dotItem.remotePath, dotItem.entry.name)).toBe("/");
+    });
+  });
+
+  describe("drag and drop", () => {
+    it("handleDrag serializes FileTreeItem data correctly", async () => {
+      const item = new FileTreeItem("srv-1", "/home/dev", fileEntry);
+      const dataTransfer = new Map<string, { value: string }>();
+      const mockTransfer = {
+        set: (mime: string, transferItem: { value: string }) => {
+          dataTransfer.set(mime, transferItem);
+        },
+      };
+
+      await provider.handleDrag([item], mockTransfer as any);
+
+      const entry = dataTransfer.get("application/vnd.nexus.fileItem");
+      expect(entry).toBeDefined();
+      const parsed = JSON.parse(entry!.value);
+      expect(parsed).toEqual([
+        { serverId: "srv-1", remotePath: "/home/dev", name: "file.txt", isDirectory: false },
+      ]);
+    });
+
+    it('handleDrag skips "." items', async () => {
+      (sftp.readDirectory as any).mockResolvedValue([]);
+      provider.setActiveServer(testServer, "/home/dev");
+      const children = await provider.getChildren();
+      const dotItem = children.find(
+        (c) => c instanceof FileTreeItem && c.label === "."
+      )!;
+
+      const dataTransfer = new Map<string, unknown>();
+      const mockTransfer = {
+        set: (mime: string, transferItem: unknown) => {
+          dataTransfer.set(mime, transferItem);
+        },
+      };
+
+      await provider.handleDrag([dotItem], mockTransfer as any);
+      expect(dataTransfer.size).toBe(0);
+    });
+
+    it("handleDrop calls sftp.rename with correct paths", async () => {
+      (sftp.rename as any).mockResolvedValue(undefined);
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const payload = JSON.stringify([
+        { serverId: "srv-1", remotePath: "/home/dev", name: "file.txt", isDirectory: false },
+      ]);
+      const { DataTransferItem } = await import("vscode");
+      const transferItem = new DataTransferItem(payload);
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      expect(sftp.rename).toHaveBeenCalledWith(
+        "srv-1",
+        "/home/dev/file.txt",
+        "/home/dev/subdir/file.txt"
+      );
+    });
+
+    it("handleDrop skips move when source === target", async () => {
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const payload = JSON.stringify([
+        { serverId: "srv-1", remotePath: "/home/dev/subdir", name: "file.txt", isDirectory: false },
+      ]);
+      const { DataTransferItem } = await import("vscode");
+      const transferItem = new DataTransferItem(payload);
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      expect(sftp.rename).not.toHaveBeenCalled();
+    });
+
+    it("handleDrop skips moving a directory into itself", async () => {
+      provider.setActiveServer(testServer, "/home/dev");
+
+      // Target is the same directory being dragged
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const payload = JSON.stringify([
+        { serverId: "srv-1", remotePath: "/home/dev", name: "subdir", isDirectory: true },
+      ]);
+      const { DataTransferItem } = await import("vscode");
+      const transferItem = new DataTransferItem(payload);
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      expect(sftp.rename).not.toHaveBeenCalled();
+    });
+
+    it("handleDrop uses parent directory when dropped on a file", async () => {
+      (sftp.rename as any).mockResolvedValue(undefined);
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const targetFile = new FileTreeItem("srv-1", "/home/dev/subdir", fileEntry);
+      const payload = JSON.stringify([
+        { serverId: "srv-1", remotePath: "/home/dev", name: "other.txt", isDirectory: false },
+      ]);
+      const { DataTransferItem } = await import("vscode");
+      const transferItem = new DataTransferItem(payload);
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetFile, mockTransfer as any);
+
+      expect(sftp.rename).toHaveBeenCalledWith(
+        "srv-1",
+        "/home/dev/other.txt",
+        "/home/dev/subdir/other.txt"
+      );
+    });
+
+    it("handleDrop uses currentRootPath when dropped on undefined", async () => {
+      (sftp.rename as any).mockResolvedValue(undefined);
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const payload = JSON.stringify([
+        { serverId: "srv-1", remotePath: "/home/dev/subdir", name: "file.txt", isDirectory: false },
+      ]);
+      const { DataTransferItem } = await import("vscode");
+      const transferItem = new DataTransferItem(payload);
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(undefined, mockTransfer as any);
+
+      expect(sftp.rename).toHaveBeenCalledWith(
+        "srv-1",
+        "/home/dev/subdir/file.txt",
+        "/home/dev/file.txt"
+      );
+    });
   });
 });

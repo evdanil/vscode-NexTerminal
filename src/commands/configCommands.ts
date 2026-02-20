@@ -39,7 +39,10 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.terminal.highlighting", key: "enabled" },
   { section: "nexus.terminal.highlighting", key: "rules" },
   { section: "nexus.ssh.multiplexing", key: "enabled" },
-  { section: "nexus.ssh.multiplexing", key: "idleTimeout" }
+  { section: "nexus.ssh.multiplexing", key: "idleTimeout" },
+  { section: "nexus.sftp", key: "cacheTtlSeconds" },
+  { section: "nexus.sftp", key: "maxCacheEntries" },
+  { section: "nexus.sftp", key: "autoRefreshInterval" }
 ];
 
 function readSettings(): Record<string, unknown> {

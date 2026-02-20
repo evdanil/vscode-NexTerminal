@@ -22,8 +22,8 @@ interface CacheEntry {
   fetchedAt: number;
 }
 
-const CACHE_TTL_MS = 30_000;
-const MAX_CACHE_ENTRIES = 500;
+const DEFAULT_CACHE_TTL_MS = 10_000;
+const DEFAULT_MAX_CACHE_ENTRIES = 500;
 const MAX_DELETE_DEPTH = 100;
 const MAX_DELETE_OPS = 10_000;
 
@@ -58,13 +58,28 @@ function cacheKey(serverId: string, remotePath: string): string {
   return `${serverId}:${remotePath}`;
 }
 
+export interface SftpCacheConfig {
+  cacheTtlMs: number;
+  maxCacheEntries: number;
+}
+
 export class SftpService {
   private readonly sessions = new Map<string, SftpSession>();
   private readonly dirCache = new Map<string, CacheEntry>();
   private readonly unsubscribers = new Map<string, () => void>();
   private readonly pending = new Map<string, Promise<void>>();
+  private cacheTtlMs: number;
+  private maxCacheEntries: number;
 
-  public constructor(private readonly sshFactory: SshFactory) {}
+  public constructor(private readonly sshFactory: SshFactory, cacheConfig?: SftpCacheConfig) {
+    this.cacheTtlMs = cacheConfig?.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    this.maxCacheEntries = cacheConfig?.maxCacheEntries ?? DEFAULT_MAX_CACHE_ENTRIES;
+  }
+
+  public updateCacheConfig(config: SftpCacheConfig): void {
+    this.cacheTtlMs = config.cacheTtlMs;
+    this.maxCacheEntries = config.maxCacheEntries;
+  }
 
   public async connect(server: ServerConfig): Promise<void> {
     if (this.sessions.has(server.id)) {
@@ -96,7 +111,7 @@ export class SftpService {
   public async readDirectory(serverId: string, remotePath: string): Promise<DirectoryEntry[]> {
     const key = cacheKey(serverId, remotePath);
     const cached = this.dirCache.get(key);
-    if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
+    if (cached && this.cacheTtlMs > 0 && Date.now() - cached.fetchedAt < this.cacheTtlMs) {
       return cached.entries;
     }
 
@@ -315,7 +330,7 @@ export class SftpService {
   }
 
   private evictCacheIfNeeded(): void {
-    if (this.dirCache.size <= MAX_CACHE_ENTRIES) {
+    if (this.dirCache.size <= this.maxCacheEntries) {
       return;
     }
     const oldest = this.dirCache.keys().next().value;

@@ -3,7 +3,7 @@ export interface SettingMeta {
   section: string;
   label: string;
   type: "boolean" | "number" | "string" | "enum" | "directory" | "multi-checkbox";
-  category: "logging" | "ssh" | "tunnels" | "terminal" | "highlighting";
+  category: "logging" | "ssh" | "tunnels" | "terminal" | "sftp" | "highlighting";
   description?: string;
   badge?: string;
   enumOptions?: Array<{ label: string; value: string; description?: string }>;
@@ -125,6 +125,39 @@ export const SETTINGS_META: SettingMeta[] = [
     ],
     visibleWhen: { setting: "nexus.terminal.keyboardPassthrough", value: true }
   },
+  // --- SFTP ---
+  {
+    key: "cacheTtlSeconds",
+    section: "nexus.sftp",
+    label: "Cache TTL",
+    type: "number",
+    category: "sftp",
+    description: "How long directory listings are cached before being re-fetched from the server.",
+    min: 0,
+    max: 300,
+    unit: "seconds"
+  },
+  {
+    key: "maxCacheEntries",
+    section: "nexus.sftp",
+    label: "Max Cache Entries",
+    type: "number",
+    category: "sftp",
+    description: "Maximum number of directory listings kept in the SFTP cache.",
+    min: 10,
+    max: 5000
+  },
+  {
+    key: "autoRefreshInterval",
+    section: "nexus.sftp",
+    label: "Auto-Refresh Interval",
+    type: "number",
+    category: "sftp",
+    description: "Auto-refresh interval for the File Explorer (in seconds). Set to 0 to disable. Only polls when the view is visible.",
+    min: 0,
+    max: 60,
+    unit: "seconds"
+  },
   // --- Highlighting ---
   {
     key: "enabled",
@@ -136,12 +169,13 @@ export const SETTINGS_META: SettingMeta[] = [
   }
 ];
 
-export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "highlighting"] as const;
+export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "sftp", "highlighting"] as const;
 
 export const CATEGORY_LABELS: Record<string, string> = {
   logging: "Logging",
   ssh: "SSH",
   tunnels: "Tunnels",
   terminal: "Terminal",
+  sftp: "SFTP / File Explorer",
   highlighting: "Highlighting"
 };

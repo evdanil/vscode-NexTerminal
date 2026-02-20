@@ -190,6 +190,13 @@ describe("SETTINGS_KEYS", () => {
     expect(keys).toContain("nexus.ssh.multiplexing.enabled");
     expect(keys).toContain("nexus.ssh.multiplexing.idleTimeout");
   });
+
+  it("includes SFTP settings", () => {
+    const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
+    expect(keys).toContain("nexus.sftp.cacheTtlSeconds");
+    expect(keys).toContain("nexus.sftp.maxCacheEntries");
+    expect(keys).toContain("nexus.sftp.autoRefreshInterval");
+  });
 });
 
 describe("config import command (legacy)", () => {

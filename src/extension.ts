@@ -160,7 +160,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const highlighter = new TerminalHighlighter();
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
   const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
-  const sftpService = new SftpService(pool);
+  const sftpConfig = vscode.workspace.getConfiguration("nexus.sftp");
+  const sftpService = new SftpService(pool, {
+    cacheTtlMs: sftpConfig.get<number>("cacheTtlSeconds", 10) * 1000,
+    maxCacheEntries: sftpConfig.get<number>("maxCacheEntries", 500),
+  });
   const fileSystemProvider = new NexusFileSystemProvider(sftpService);
   const fsRegistration = vscode.workspace.registerFileSystemProvider(NEXTERM_SCHEME, fileSystemProvider, { isCaseSensitive: true });
   const fileExplorerProvider = new FileExplorerTreeProvider(sftpService);
@@ -232,7 +236,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const fileExplorerView = vscode.window.createTreeView("nexusFileExplorer", {
     treeDataProvider: fileExplorerProvider,
-    showCollapseAll: true
+    dragAndDropController: fileExplorerProvider,
+    showCollapseAll: true,
+    canSelectMany: true
   });
 
   const macroTreeProvider = new MacroTreeProvider();
@@ -242,6 +248,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   updateMacroContext();
   updatePassthroughContext();
   ensureMacroKeybindingsWork();
+
+  const autoRefreshInterval = vscode.workspace.getConfiguration("nexus.sftp").get<number>("autoRefreshInterval", 10);
+  fileExplorerProvider.setAutoRefreshInterval(autoRefreshInterval);
+  fileExplorerView.onDidChangeVisibility((e) => {
+    fileExplorerProvider.setViewVisibility(e.visible);
+    if (e.visible) {
+      fileExplorerProvider.refresh();
+    }
+  });
 
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   statusBarItem.command = "nexusCommandCenter.focus";
@@ -351,6 +366,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (event.affectsConfiguration("nexus.terminal.highlighting")) {
       highlighter.reload();
     }
+    if (event.affectsConfiguration("nexus.sftp.cacheTtlSeconds") || event.affectsConfiguration("nexus.sftp.maxCacheEntries")) {
+      const cfg = vscode.workspace.getConfiguration("nexus.sftp");
+      sftpService.updateCacheConfig({
+        cacheTtlMs: cfg.get<number>("cacheTtlSeconds", 10) * 1000,
+        maxCacheEntries: cfg.get<number>("maxCacheEntries", 500),
+      });
+    }
+    if (event.affectsConfiguration("nexus.sftp.autoRefreshInterval")) {
+      const interval = vscode.workspace.getConfiguration("nexus.sftp").get<number>("autoRefreshInterval", 10);
+      fileExplorerProvider.setAutoRefreshInterval(interval);
+    }
   });
 
   const serverDisposables = registerServerCommands(ctx);
@@ -395,6 +421,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         serialTerminals.clear();
         serialSidecar.dispose();
+        fileExplorerProvider.dispose();
         sftpService.dispose();
         void tunnelManager.stopAll();
         registrySync.dispose();

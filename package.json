@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar with connection multiplexing, a settings panel, macro editor, and regex-based terminal highlighting.",
-  "version": "2.7.1",
+  "version": "2.7.2",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -368,6 +368,26 @@
         "icon": "$(new-folder)"
       },
       {
+        "command": "nexus.files.createFile",
+        "title": "New File",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "nexus.files.goToPath",
+        "title": "Go to Path",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "nexus.files.goHome",
+        "title": "Go Home",
+        "icon": "$(home)"
+      },
+      {
+        "command": "nexus.files.copyPath",
+        "title": "Copy Remote Path",
+        "icon": "$(clippy)"
+      },
+      {
         "command": "nexus.files.refresh",
         "title": "Refresh",
         "icon": "$(refresh)"
@@ -451,19 +471,29 @@
           "group": "navigation@1"
         },
         {
-          "command": "nexus.files.refresh",
+          "command": "nexus.files.goHome",
           "when": "view == nexusFileExplorer",
           "group": "navigation@1"
         },
         {
-          "command": "nexus.files.browse",
+          "command": "nexus.files.goToPath",
           "when": "view == nexusFileExplorer",
           "group": "navigation@2"
         },
         {
-          "command": "nexus.files.disconnect",
+          "command": "nexus.files.refresh",
           "when": "view == nexusFileExplorer",
           "group": "navigation@3"
+        },
+        {
+          "command": "nexus.files.browse",
+          "when": "view == nexusFileExplorer",
+          "group": "navigation@4"
+        },
+        {
+          "command": "nexus.files.disconnect",
+          "when": "view == nexusFileExplorer",
+          "group": "navigation@5"
         }
       ],
       "view/item/context": [
@@ -733,24 +763,34 @@
           "group": "1_manage@1"
         },
         {
-          "command": "nexus.files.upload",
+          "command": "nexus.files.createFile",
           "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir",
           "group": "1_manage@2"
         },
         {
+          "command": "nexus.files.upload",
+          "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir",
+          "group": "1_manage@3"
+        },
+        {
           "command": "nexus.files.rename",
           "when": "view == nexusFileExplorer && viewItem =~ /^nexus\\.fileExplorer\\.(file|dir)$/",
-          "group": "1_manage@3"
+          "group": "1_manage@4"
         },
         {
           "command": "nexus.files.download",
           "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.file",
-          "group": "1_manage@4"
+          "group": "1_manage@5"
+        },
+        {
+          "command": "nexus.files.copyPath",
+          "when": "view == nexusFileExplorer && viewItem =~ /^nexus\\.fileExplorer\\.(file|dir)$/",
+          "group": "2_clipboard"
         },
         {
           "command": "nexus.files.delete",
           "when": "view == nexusFileExplorer && viewItem =~ /^nexus\\.fileExplorer\\.(file|dir)$/",
-          "group": "2_destructive"
+          "group": "3_destructive"
         }
       ],
       "commandPalette": [
@@ -980,6 +1020,22 @@
         },
         {
           "command": "nexus.files.createDir",
+          "when": "false"
+        },
+        {
+          "command": "nexus.files.createFile",
+          "when": "false"
+        },
+        {
+          "command": "nexus.files.goToPath",
+          "when": "true"
+        },
+        {
+          "command": "nexus.files.goHome",
+          "when": "true"
+        },
+        {
+          "command": "nexus.files.copyPath",
           "when": "false"
         },
         {
@@ -1462,6 +1518,30 @@
             }
           },
           "markdownDescription": "Highlighting rules applied to SSH and serial terminal output. Each rule specifies a regex `pattern`, a `color` (named or SGR code), optional `flags`, and optional `bold`/`underline` styles. Text already coloured by the remote program is never re-highlighted."
+        },
+        "nexus.sftp.cacheTtlSeconds": {
+          "type": "number",
+          "default": 10,
+          "minimum": 0,
+          "maximum": 300,
+          "order": 20,
+          "markdownDescription": "How long SFTP directory listings are cached (in seconds). Set to `0` to disable caching entirely (every tree expansion fetches fresh data)."
+        },
+        "nexus.sftp.maxCacheEntries": {
+          "type": "number",
+          "default": 500,
+          "minimum": 50,
+          "maximum": 5000,
+          "order": 21,
+          "markdownDescription": "Maximum number of directory listings kept in the SFTP cache. Oldest entries are evicted when this limit is exceeded."
+        },
+        "nexus.sftp.autoRefreshInterval": {
+          "type": "number",
+          "default": 10,
+          "minimum": 0,
+          "maximum": 60,
+          "order": 22,
+          "markdownDescription": "Auto-refresh interval for the SFTP File Explorer (in seconds). Set to `0` to disable. Only polls when the view is visible and a server is connected."
         }
       }
     }
