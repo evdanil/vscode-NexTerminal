@@ -51,7 +51,8 @@ const unsupportedCommands = [
   "nexus.files.rename",
   "nexus.files.createDir",
   "nexus.files.refresh",
-  "nexus.files.disconnect"
+  "nexus.files.disconnect",
+  "nexus.macro.runBinding"
 ];
 
 export function activate(context: vscode.ExtensionContext): void {

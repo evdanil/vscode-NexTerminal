@@ -6,11 +6,13 @@ import type { SecretVault } from "../services/ssh/contracts";
 import { passwordSecretKey, passphraseSecretKey } from "../services/ssh/silentAuth";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile } from "../utils/validation";
+import { isValidBinding } from "../macroBindings";
 
 interface MacroEntry {
   name?: string;
   text?: string;
   secret?: boolean;
+  keybinding?: string;
   [key: string]: unknown;
 }
 
@@ -68,6 +70,16 @@ function stripSecretMacroText(settings: Record<string, unknown>): Record<string,
 }
 
 async function applySettings(settings: Record<string, unknown>): Promise<void> {
+  // Sanitize imported macro keybinding values
+  const macros = settings["nexus.terminal.macros"];
+  if (Array.isArray(macros)) {
+    for (const m of macros as MacroEntry[]) {
+      if (m.keybinding && (typeof m.keybinding !== "string" || !isValidBinding(m.keybinding))) {
+        delete m.keybinding;
+      }
+    }
+  }
+
   for (const [fullKey, value] of Object.entries(settings)) {
     const lastDot = fullKey.lastIndexOf(".");
     if (lastDot < 0) {

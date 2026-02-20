@@ -1,13 +1,15 @@
 import * as vscode from "vscode";
-import type { MacroTreeItem, MacroTreeProvider } from "../ui/macroTreeProvider";
+import type { MacroTreeItem, MacroTreeProvider, TerminalMacro } from "../ui/macroTreeProvider";
 import { MacroEditorPanel } from "../ui/macroEditorPanel";
-
-interface TerminalMacro {
-  name: string;
-  text: string;
-  slot?: number;
-  secret?: boolean;
-}
+import {
+  ALL_BINDINGS,
+  bindingToContextKey,
+  bindingToDisplayLabel,
+  isValidBinding,
+  slotToBinding,
+  CRITICAL_CTRL_SHIFT_KEYS,
+  SPECIAL_BINDING_WARNINGS
+} from "../macroBindings";
 
 function getMacros(): TerminalMacro[] {
   return vscode.workspace.getConfiguration("nexus.terminal").get<TerminalMacro[]>("macros", []);
@@ -23,77 +25,126 @@ function sendMacroText(text: string): void {
   void vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text });
 }
 
-/** Convert keybinding index (0-9) to the keyboard digit: index 0 → 1, ..., 8 → 9, 9 → 0 */
-function indexToSlot(index: number): number {
-  return (index + 1) % 10;
-}
-
-function slotLabel(slot: number): string {
-  return `Alt+${slot}`;
-}
-
-function assignSlot(macros: TerminalMacro[], targetIndex: number, slot: number | null): void {
-  if (slot !== null) {
-    // Clear slot from any conflicting macro
-    for (const m of macros) {
-      if (m.slot === slot) {
-        delete m.slot;
-      }
-    }
-    macros[targetIndex].slot = slot;
-  } else {
-    delete macros[targetIndex].slot;
+function updateBindingContextKeys(): void {
+  const macros = getMacros();
+  const assignedBindings = new Set(
+    macros.map((m) => m.keybinding?.toLowerCase()).filter((b): b is string => b !== undefined)
+  );
+  for (const binding of ALL_BINDINGS) {
+    void vscode.commands.executeCommand("setContext", bindingToContextKey(binding), assignedBindings.has(binding));
   }
-}
-
-async function promptForSlot(
-  macros: TerminalMacro[],
-  excludeIndex?: number,
-  currentSlot?: number
-): Promise<number | null | undefined> {
-  // Returns: number = chosen slot, null = "None" selected, undefined = cancelled
-  const items: (vscode.QuickPickItem & { slot: number | null })[] = [];
-
-  items.push({
-    label: "None",
-    description: "No keyboard shortcut",
-    slot: null,
-    picked: currentSlot === undefined
-  });
-
-  for (let s = 1; s <= 9; s++) {
-    const owner = macros.findIndex((m, i) => m.slot === s && i !== excludeIndex);
-    const taken = owner >= 0 ? ` (currently: ${macros[owner].name})` : "";
-    items.push({
-      label: slotLabel(s),
-      description: taken,
-      slot: s,
-      picked: currentSlot === s
-    });
-  }
-  // Alt+0 = slot 0
-  {
-    const owner = macros.findIndex((m, i) => m.slot === 0 && i !== excludeIndex);
-    const taken = owner >= 0 ? ` (currently: ${macros[owner].name})` : "";
-    items.push({
-      label: slotLabel(0),
-      description: taken,
-      slot: 0,
-      picked: currentSlot === 0
-    });
-  }
-
-  const pick = await vscode.window.showQuickPick(items, {
-    title: "Assign Keyboard Shortcut",
-    placeHolder: "Select a slot for this macro"
-  });
-
-  return pick === undefined ? undefined : pick.slot;
 }
 
 export function updateMacroContext(): void {
   const macros = getMacros();
   void vscode.commands.executeCommand("setContext", "nexus.hasMacros", macros.length > 0);
+  updateBindingContextKeys();
+}
+
+/** Migrate old slot-based macros to keybinding-based. */
+export async function migrateMacroSlots(): Promise<void> {
+  const macros = getMacros();
+  let changed = false;
+  for (const macro of macros) {
+    if (macro.slot !== undefined && !macro.keybinding) {
+      macro.keybinding = slotToBinding(macro.slot);
+      delete macro.slot;
+      changed = true;
+    }
+  }
+  if (changed) {
+    await saveMacros(macros);
+  }
+}
+
+function assignBinding(macros: TerminalMacro[], targetIndex: number, binding: string | null): void {
+  if (binding !== null) {
+    const normalized = binding.toLowerCase();
+    // Clear conflicting binding
+    for (const m of macros) {
+      if (m.keybinding?.toLowerCase() === normalized) {
+        delete m.keybinding;
+      }
+    }
+    macros[targetIndex].keybinding = normalized;
+    // Clear legacy slot if present
+    delete macros[targetIndex].slot;
+  } else {
+    delete macros[targetIndex].keybinding;
+  }
+}
+
+async function promptForBinding(
+  macros: TerminalMacro[],
+  excludeIndex?: number,
+  currentBinding?: string
+): Promise<string | null | undefined> {
+  // Returns: string = chosen binding, null = "None" selected, undefined = cancelled
+  const result = await vscode.window.showInputBox({
+    title: "Assign Keyboard Shortcut",
+    prompt: "Enter a key combination (e.g., alt+m, alt+shift+5, ctrl+shift+a) or leave empty for none",
+    value: currentBinding ?? "",
+    placeHolder: "alt+m",
+    validateInput(value) {
+      if (!value.trim()) {
+        return undefined; // Allow empty = none
+      }
+      const normalized = value.trim().toLowerCase();
+      if (!isValidBinding(normalized)) {
+        return "Invalid binding. Use alt+KEY, alt+shift+KEY, or ctrl+shift+KEY where KEY is A-Z or 0-9.";
+      }
+      // Check for conflict — warn but allow proceeding
+      const owner = macros.findIndex(
+        (m, i) => i !== excludeIndex && m.keybinding?.toLowerCase() === normalized
+      );
+      if (owner >= 0) {
+        return {
+          message: `Already used by "${macros[owner].name}". It will be reassigned if you proceed.`,
+          severity: vscode.InputBoxValidationSeverity.Warning
+        };
+      }
+      return undefined;
+    }
+  });
+
+  if (result === undefined) {
+    return undefined; // Cancelled
+  }
+  if (!result.trim()) {
+    return null; // Empty = none
+  }
+
+  const normalized = result.trim().toLowerCase();
+
+  // Show critical key warning
+  if (normalized.startsWith("ctrl+shift+")) {
+    const key = normalized.slice(11);
+    if (CRITICAL_CTRL_SHIFT_KEYS.has(key)) {
+      const proceed = await vscode.window.showWarningMessage(
+        `${bindingToDisplayLabel(normalized)} is a common VS Code shortcut. Using it for a macro will override the default behavior in the terminal.`,
+        "Use Anyway",
+        "Cancel"
+      );
+      if (proceed !== "Use Anyway") {
+        return undefined;
+      }
+    }
+  }
+
+  // Show alt+s override warning
+  const warning = SPECIAL_BINDING_WARNINGS[normalized];
+  if (warning) {
+    const proceed = await vscode.window.showWarningMessage(
+      warning,
+      "Use Anyway",
+      "Cancel"
+    );
+    if (proceed !== "Use Anyway") {
+      return undefined;
+    }
+  }
+
+  return normalized;
 }
 
 export function registerMacroCommands(treeProvider: MacroTreeProvider): vscode.Disposable[] {
@@ -165,15 +216,17 @@ export function registerMacroCommands(treeProvider: MacroTreeProvider): vscode.D
         return;
       }
 
-      const anyHasSlot = macros.some((m) => m.slot !== undefined);
+      const anyHasBindingOrSlot = macros.some((m) => m.keybinding !== undefined || m.slot !== undefined);
 
       const pick = await vscode.window.showQuickPick(
         macros.map((m, i) => {
           let prefix = "";
-          if (m.slot !== undefined) {
-            prefix = `[${slotLabel(m.slot)}] `;
-          } else if (!anyHasSlot && i < 10) {
-            prefix = `[${slotLabel(indexToSlot(i))}] `;
+          if (m.keybinding) {
+            prefix = `[${bindingToDisplayLabel(m.keybinding)}] `;
+          } else if (m.slot !== undefined) {
+            prefix = `[Alt+${m.slot}] `;
+          } else if (!anyHasBindingOrSlot && i < 10) {
+            prefix = `[Alt+${(i + 1) % 10}] `;
           }
           return {
             label: `${prefix}${m.name}`,
@@ -189,6 +242,19 @@ export function registerMacroCommands(treeProvider: MacroTreeProvider): vscode.D
       sendMacroText(macros[pick.index].text);
     }),
 
+    vscode.commands.registerCommand("nexus.macro.runBinding", (arg?: unknown) => {
+      const args = arg as { binding?: string } | undefined;
+      const binding = args?.binding?.toLowerCase();
+      if (!binding) {
+        return;
+      }
+      const macros = getMacros();
+      const macro = macros.find((m) => m.keybinding?.toLowerCase() === binding);
+      if (macro) {
+        sendMacroText(macro.text);
+      }
+    }),
+
     vscode.commands.registerCommand("nexus.macro.slot", (arg?: unknown) => {
       const args = arg as { index?: number } | undefined;
       const index = args?.index;
@@ -196,18 +262,26 @@ export function registerMacroCommands(treeProvider: MacroTreeProvider): vscode.D
         return;
       }
       const macros = getMacros();
-      const targetSlot = indexToSlot(index);
+      const targetSlot = (index + 1) % 10;
+      const targetBinding = `alt+${targetSlot}`;
 
-      // Find macro with explicit slot matching targetSlot
+      // First try new keybinding system
+      const bindingMacro = macros.find((m) => m.keybinding?.toLowerCase() === targetBinding);
+      if (bindingMacro) {
+        sendMacroText(bindingMacro.text);
+        return;
+      }
+
+      // Then try legacy slot
       const slotMacro = macros.find((m) => m.slot === targetSlot);
       if (slotMacro) {
         sendMacroText(slotMacro.text);
         return;
       }
 
-      // Legacy mode: no macros have any slot property → fall back to positional
-      const anyHasSlot = macros.some((m) => m.slot !== undefined);
-      if (!anyHasSlot) {
+      // Legacy mode: no macros have any keybinding or slot → fall back to positional
+      const anyHasBindingOrSlot = macros.some((m) => m.keybinding !== undefined || m.slot !== undefined);
+      if (!anyHasBindingOrSlot) {
         const macro = macros[index];
         if (macro) {
           sendMacroText(macro.text);
@@ -247,11 +321,11 @@ export function registerMacroCommands(treeProvider: MacroTreeProvider): vscode.D
       if (!macro) {
         return;
       }
-      const slotResult = await promptForSlot(macros, index, macro.slot);
-      if (slotResult === undefined) {
+      const bindingResult = await promptForBinding(macros, index, macro.keybinding);
+      if (bindingResult === undefined) {
         return; // Cancelled
       }
-      assignSlot(macros, index, slotResult);
+      assignBinding(macros, index, bindingResult);
       await saveMacros(macros);
     }),
 

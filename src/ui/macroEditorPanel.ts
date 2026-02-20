@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
+import { isValidBinding } from "../macroBindings";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
 import type { TerminalMacro } from "./macroTreeProvider";
 
@@ -76,7 +77,8 @@ export class MacroEditorPanel {
         if (value === "__new__") {
           this.selectedIndex = null;
         } else {
-          this.selectedIndex = parseInt(value, 10);
+          const parsed = parseInt(value, 10);
+          this.selectedIndex = Number.isNaN(parsed) ? null : parsed;
         }
         this.render();
         break;
@@ -92,7 +94,8 @@ export class MacroEditorPanel {
           if (target === "__new__") {
             this.selectedIndex = null;
           } else {
-            this.selectedIndex = parseInt(target, 10);
+            const parsed = parseInt(target, 10);
+            this.selectedIndex = Number.isNaN(parsed) ? null : parsed;
           }
           this.render();
         }
@@ -101,21 +104,27 @@ export class MacroEditorPanel {
       case "save": {
         const name = (msg.name as string).trim();
         const text = msg.text as string;
+        if (!name || !text) {
+          return;
+        }
         const secret = msg.secret as boolean;
-        const slotRaw = msg.slot as number | null;
+        const bindingRaw = msg.keybinding as string | null;
         const index = msg.index as number | null;
         const macros = getMacros();
 
         const macro: TerminalMacro = { name, text };
         if (secret) macro.secret = true;
-        if (slotRaw !== null) {
-          // Clear conflicting slot
-          for (const m of macros) {
-            if (m.slot === slotRaw) {
-              delete m.slot;
+        if (bindingRaw) {
+          const normalized = bindingRaw.toLowerCase();
+          if (isValidBinding(normalized)) {
+            // Clear conflicting binding
+            for (const m of macros) {
+              if (m.keybinding?.toLowerCase() === normalized) {
+                delete m.keybinding;
+              }
             }
+            macro.keybinding = normalized;
           }
-          macro.slot = slotRaw;
         }
 
         if (index !== null && index < macros.length) {

@@ -81,33 +81,34 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("checked");
   });
 
-  it("renders slot selector with all 10 slots", () => {
+  it("renders binding input field", () => {
     const html = render([], null);
-    expect(html).toContain("slot-selector");
-    expect(html).toContain("None");
-    for (let s = 0; s <= 9; s++) {
-      expect(html).toContain(`Alt+${s}`);
-    }
+    expect(html).toContain("macro-binding");
+    expect(html).toContain('placeholder="e.g., alt+m, alt+shift+5, ctrl+shift+a"');
   });
 
-  it("shows current slot owner in dropdown", () => {
+  it("shows current binding value when macro has keybinding", () => {
     const macros: TerminalMacro[] = [
-      { name: "Alpha", text: "a", slot: 3 },
-      { name: "Beta", text: "b" }
-    ];
-    const html = render(macros, 1);
-    expect(html).toContain("Alpha");
-    expect(html).toContain("Alt+3");
-  });
-
-  it("selects current macro slot in dropdown", () => {
-    const macros: TerminalMacro[] = [
-      { name: "Quick", text: "q", slot: 5 }
+      { name: "Quick", text: "q", keybinding: "alt+m" }
     ];
     const html = render(macros, 0);
-    expect(html).toContain("Alt+5");
-    // The slot trigger should show the assigned slot
-    expect(html).toMatch(/custom-select-text[^<]*>Alt\+5/);
+    expect(html).toContain('value="alt+m"');
+  });
+
+  it("shows empty binding input when macro has no keybinding", () => {
+    const macros: TerminalMacro[] = [
+      { name: "Quick", text: "q" }
+    ];
+    const html = render(macros, 0);
+    // The binding input should have empty value
+    expect(html).toMatch(/id="macro-binding"[^>]*value=""/);
+  });
+
+  it("includes binding validation hint", () => {
+    const html = render([], null);
+    expect(html).toContain("Alt+S");
+    expect(html).toContain("Alt+Shift");
+    expect(html).toContain("Ctrl+Shift");
   });
 
   it("renders dirty state indicator", () => {
@@ -127,11 +128,18 @@ describe("renderMacroEditorHtml", () => {
     const html = render([], null);
     expect(html).toContain("error-name");
     expect(html).toContain("error-text");
+    expect(html).toContain("error-binding");
   });
 
   it("renders textarea with hint about newlines", () => {
     const html = render([], null);
     expect(html).toContain("editor-textarea");
     expect(html).toContain("newline");
+  });
+
+  it("includes client-side binding validation script", () => {
+    const html = render([], null);
+    expect(html).toContain("isValidBinding");
+    expect(html).toContain("VALID_PATTERN");
   });
 });

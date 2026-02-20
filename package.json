@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar with connection multiplexing, a settings panel, macro editor, and regex-based terminal highlighting.",
-  "version": "2.7.2",
+  "version": "2.7.3",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -311,6 +311,10 @@
       {
         "command": "nexus.macro.slot",
         "title": "Nexus: Run Macro Slot"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "title": "Nexus: Run Macro Binding"
       },
       {
         "command": "nexus.macro.moveUp",
@@ -979,6 +983,10 @@
           "when": "false"
         },
         {
+          "command": "nexus.macro.runBinding",
+          "when": "false"
+        },
+        {
           "command": "nexus.macro.moveUp",
           "when": "false"
         },
@@ -1141,84 +1149,868 @@
         "when": "terminalFocus"
       },
       {
-        "command": "nexus.macro.slot",
+        "command": "nexus.macro.runBinding",
         "args": {
-          "index": 0
+          "binding": "alt+a"
         },
-        "key": "alt+1",
-        "when": "terminalFocus && nexus.hasMacros"
+        "key": "alt+a",
+        "when": "terminalFocus && nexus.macro.alt.a"
       },
       {
-        "command": "nexus.macro.slot",
+        "command": "nexus.macro.runBinding",
         "args": {
-          "index": 1
+          "binding": "alt+b"
         },
-        "key": "alt+2",
-        "when": "terminalFocus && nexus.hasMacros"
+        "key": "alt+b",
+        "when": "terminalFocus && nexus.macro.alt.b"
       },
       {
-        "command": "nexus.macro.slot",
+        "command": "nexus.macro.runBinding",
         "args": {
-          "index": 2
+          "binding": "alt+c"
         },
-        "key": "alt+3",
-        "when": "terminalFocus && nexus.hasMacros"
+        "key": "alt+c",
+        "when": "terminalFocus && nexus.macro.alt.c"
       },
       {
-        "command": "nexus.macro.slot",
+        "command": "nexus.macro.runBinding",
         "args": {
-          "index": 3
+          "binding": "alt+d"
         },
-        "key": "alt+4",
-        "when": "terminalFocus && nexus.hasMacros"
+        "key": "alt+d",
+        "when": "terminalFocus && nexus.macro.alt.d"
       },
       {
-        "command": "nexus.macro.slot",
+        "command": "nexus.macro.runBinding",
         "args": {
-          "index": 4
+          "binding": "alt+e"
         },
-        "key": "alt+5",
-        "when": "terminalFocus && nexus.hasMacros"
+        "key": "alt+e",
+        "when": "terminalFocus && nexus.macro.alt.e"
       },
       {
-        "command": "nexus.macro.slot",
+        "command": "nexus.macro.runBinding",
         "args": {
-          "index": 5
+          "binding": "alt+f"
         },
-        "key": "alt+6",
-        "when": "terminalFocus && nexus.hasMacros"
+        "key": "alt+f",
+        "when": "terminalFocus && nexus.macro.alt.f"
       },
       {
-        "command": "nexus.macro.slot",
+        "command": "nexus.macro.runBinding",
         "args": {
-          "index": 6
+          "binding": "alt+g"
         },
-        "key": "alt+7",
-        "when": "terminalFocus && nexus.hasMacros"
+        "key": "alt+g",
+        "when": "terminalFocus && nexus.macro.alt.g"
       },
       {
-        "command": "nexus.macro.slot",
+        "command": "nexus.macro.runBinding",
         "args": {
-          "index": 7
+          "binding": "alt+h"
         },
-        "key": "alt+8",
-        "when": "terminalFocus && nexus.hasMacros"
+        "key": "alt+h",
+        "when": "terminalFocus && nexus.macro.alt.h"
       },
       {
-        "command": "nexus.macro.slot",
+        "command": "nexus.macro.runBinding",
         "args": {
-          "index": 8
+          "binding": "alt+i"
         },
-        "key": "alt+9",
-        "when": "terminalFocus && nexus.hasMacros"
+        "key": "alt+i",
+        "when": "terminalFocus && nexus.macro.alt.i"
       },
       {
-        "command": "nexus.macro.slot",
+        "command": "nexus.macro.runBinding",
         "args": {
-          "index": 9
+          "binding": "alt+j"
+        },
+        "key": "alt+j",
+        "when": "terminalFocus && nexus.macro.alt.j"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+k"
+        },
+        "key": "alt+k",
+        "when": "terminalFocus && nexus.macro.alt.k"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+l"
+        },
+        "key": "alt+l",
+        "when": "terminalFocus && nexus.macro.alt.l"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+m"
+        },
+        "key": "alt+m",
+        "when": "terminalFocus && nexus.macro.alt.m"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+n"
+        },
+        "key": "alt+n",
+        "when": "terminalFocus && nexus.macro.alt.n"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+o"
+        },
+        "key": "alt+o",
+        "when": "terminalFocus && nexus.macro.alt.o"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+p"
+        },
+        "key": "alt+p",
+        "when": "terminalFocus && nexus.macro.alt.p"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+q"
+        },
+        "key": "alt+q",
+        "when": "terminalFocus && nexus.macro.alt.q"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+r"
+        },
+        "key": "alt+r",
+        "when": "terminalFocus && nexus.macro.alt.r"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+s"
+        },
+        "key": "alt+s",
+        "when": "terminalFocus && nexus.macro.alt.s"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+t"
+        },
+        "key": "alt+t",
+        "when": "terminalFocus && nexus.macro.alt.t"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+u"
+        },
+        "key": "alt+u",
+        "when": "terminalFocus && nexus.macro.alt.u"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+v"
+        },
+        "key": "alt+v",
+        "when": "terminalFocus && nexus.macro.alt.v"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+w"
+        },
+        "key": "alt+w",
+        "when": "terminalFocus && nexus.macro.alt.w"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+x"
+        },
+        "key": "alt+x",
+        "when": "terminalFocus && nexus.macro.alt.x"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+y"
+        },
+        "key": "alt+y",
+        "when": "terminalFocus && nexus.macro.alt.y"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+z"
+        },
+        "key": "alt+z",
+        "when": "terminalFocus && nexus.macro.alt.z"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+0"
         },
         "key": "alt+0",
-        "when": "terminalFocus && nexus.hasMacros"
+        "when": "terminalFocus && nexus.macro.alt.0"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+1"
+        },
+        "key": "alt+1",
+        "when": "terminalFocus && nexus.macro.alt.1"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+2"
+        },
+        "key": "alt+2",
+        "when": "terminalFocus && nexus.macro.alt.2"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+3"
+        },
+        "key": "alt+3",
+        "when": "terminalFocus && nexus.macro.alt.3"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+4"
+        },
+        "key": "alt+4",
+        "when": "terminalFocus && nexus.macro.alt.4"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+5"
+        },
+        "key": "alt+5",
+        "when": "terminalFocus && nexus.macro.alt.5"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+6"
+        },
+        "key": "alt+6",
+        "when": "terminalFocus && nexus.macro.alt.6"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+7"
+        },
+        "key": "alt+7",
+        "when": "terminalFocus && nexus.macro.alt.7"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+8"
+        },
+        "key": "alt+8",
+        "when": "terminalFocus && nexus.macro.alt.8"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+9"
+        },
+        "key": "alt+9",
+        "when": "terminalFocus && nexus.macro.alt.9"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+a"
+        },
+        "key": "shift+alt+a",
+        "when": "terminalFocus && nexus.macro.altShift.a"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+b"
+        },
+        "key": "shift+alt+b",
+        "when": "terminalFocus && nexus.macro.altShift.b"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+c"
+        },
+        "key": "shift+alt+c",
+        "when": "terminalFocus && nexus.macro.altShift.c"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+d"
+        },
+        "key": "shift+alt+d",
+        "when": "terminalFocus && nexus.macro.altShift.d"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+e"
+        },
+        "key": "shift+alt+e",
+        "when": "terminalFocus && nexus.macro.altShift.e"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+f"
+        },
+        "key": "shift+alt+f",
+        "when": "terminalFocus && nexus.macro.altShift.f"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+g"
+        },
+        "key": "shift+alt+g",
+        "when": "terminalFocus && nexus.macro.altShift.g"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+h"
+        },
+        "key": "shift+alt+h",
+        "when": "terminalFocus && nexus.macro.altShift.h"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+i"
+        },
+        "key": "shift+alt+i",
+        "when": "terminalFocus && nexus.macro.altShift.i"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+j"
+        },
+        "key": "shift+alt+j",
+        "when": "terminalFocus && nexus.macro.altShift.j"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+k"
+        },
+        "key": "shift+alt+k",
+        "when": "terminalFocus && nexus.macro.altShift.k"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+l"
+        },
+        "key": "shift+alt+l",
+        "when": "terminalFocus && nexus.macro.altShift.l"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+m"
+        },
+        "key": "shift+alt+m",
+        "when": "terminalFocus && nexus.macro.altShift.m"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+n"
+        },
+        "key": "shift+alt+n",
+        "when": "terminalFocus && nexus.macro.altShift.n"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+o"
+        },
+        "key": "shift+alt+o",
+        "when": "terminalFocus && nexus.macro.altShift.o"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+p"
+        },
+        "key": "shift+alt+p",
+        "when": "terminalFocus && nexus.macro.altShift.p"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+q"
+        },
+        "key": "shift+alt+q",
+        "when": "terminalFocus && nexus.macro.altShift.q"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+r"
+        },
+        "key": "shift+alt+r",
+        "when": "terminalFocus && nexus.macro.altShift.r"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+s"
+        },
+        "key": "shift+alt+s",
+        "when": "terminalFocus && nexus.macro.altShift.s"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+t"
+        },
+        "key": "shift+alt+t",
+        "when": "terminalFocus && nexus.macro.altShift.t"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+u"
+        },
+        "key": "shift+alt+u",
+        "when": "terminalFocus && nexus.macro.altShift.u"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+v"
+        },
+        "key": "shift+alt+v",
+        "when": "terminalFocus && nexus.macro.altShift.v"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+w"
+        },
+        "key": "shift+alt+w",
+        "when": "terminalFocus && nexus.macro.altShift.w"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+x"
+        },
+        "key": "shift+alt+x",
+        "when": "terminalFocus && nexus.macro.altShift.x"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+y"
+        },
+        "key": "shift+alt+y",
+        "when": "terminalFocus && nexus.macro.altShift.y"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+z"
+        },
+        "key": "shift+alt+z",
+        "when": "terminalFocus && nexus.macro.altShift.z"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+0"
+        },
+        "key": "shift+alt+0",
+        "when": "terminalFocus && nexus.macro.altShift.0"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+1"
+        },
+        "key": "shift+alt+1",
+        "when": "terminalFocus && nexus.macro.altShift.1"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+2"
+        },
+        "key": "shift+alt+2",
+        "when": "terminalFocus && nexus.macro.altShift.2"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+3"
+        },
+        "key": "shift+alt+3",
+        "when": "terminalFocus && nexus.macro.altShift.3"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+4"
+        },
+        "key": "shift+alt+4",
+        "when": "terminalFocus && nexus.macro.altShift.4"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+5"
+        },
+        "key": "shift+alt+5",
+        "when": "terminalFocus && nexus.macro.altShift.5"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+6"
+        },
+        "key": "shift+alt+6",
+        "when": "terminalFocus && nexus.macro.altShift.6"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+7"
+        },
+        "key": "shift+alt+7",
+        "when": "terminalFocus && nexus.macro.altShift.7"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+8"
+        },
+        "key": "shift+alt+8",
+        "when": "terminalFocus && nexus.macro.altShift.8"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+9"
+        },
+        "key": "shift+alt+9",
+        "when": "terminalFocus && nexus.macro.altShift.9"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+a"
+        },
+        "key": "ctrl+shift+a",
+        "when": "terminalFocus && nexus.macro.ctrlShift.a"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+b"
+        },
+        "key": "ctrl+shift+b",
+        "when": "terminalFocus && nexus.macro.ctrlShift.b"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+c"
+        },
+        "key": "ctrl+shift+c",
+        "when": "terminalFocus && nexus.macro.ctrlShift.c"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+d"
+        },
+        "key": "ctrl+shift+d",
+        "when": "terminalFocus && nexus.macro.ctrlShift.d"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+e"
+        },
+        "key": "ctrl+shift+e",
+        "when": "terminalFocus && nexus.macro.ctrlShift.e"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+f"
+        },
+        "key": "ctrl+shift+f",
+        "when": "terminalFocus && nexus.macro.ctrlShift.f"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+g"
+        },
+        "key": "ctrl+shift+g",
+        "when": "terminalFocus && nexus.macro.ctrlShift.g"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+h"
+        },
+        "key": "ctrl+shift+h",
+        "when": "terminalFocus && nexus.macro.ctrlShift.h"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+i"
+        },
+        "key": "ctrl+shift+i",
+        "when": "terminalFocus && nexus.macro.ctrlShift.i"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+j"
+        },
+        "key": "ctrl+shift+j",
+        "when": "terminalFocus && nexus.macro.ctrlShift.j"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+k"
+        },
+        "key": "ctrl+shift+k",
+        "when": "terminalFocus && nexus.macro.ctrlShift.k"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+l"
+        },
+        "key": "ctrl+shift+l",
+        "when": "terminalFocus && nexus.macro.ctrlShift.l"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+m"
+        },
+        "key": "ctrl+shift+m",
+        "when": "terminalFocus && nexus.macro.ctrlShift.m"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+n"
+        },
+        "key": "ctrl+shift+n",
+        "when": "terminalFocus && nexus.macro.ctrlShift.n"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+o"
+        },
+        "key": "ctrl+shift+o",
+        "when": "terminalFocus && nexus.macro.ctrlShift.o"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+p"
+        },
+        "key": "ctrl+shift+p",
+        "when": "terminalFocus && nexus.macro.ctrlShift.p"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+q"
+        },
+        "key": "ctrl+shift+q",
+        "when": "terminalFocus && nexus.macro.ctrlShift.q"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+r"
+        },
+        "key": "ctrl+shift+r",
+        "when": "terminalFocus && nexus.macro.ctrlShift.r"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+s"
+        },
+        "key": "ctrl+shift+s",
+        "when": "terminalFocus && nexus.macro.ctrlShift.s"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+t"
+        },
+        "key": "ctrl+shift+t",
+        "when": "terminalFocus && nexus.macro.ctrlShift.t"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+u"
+        },
+        "key": "ctrl+shift+u",
+        "when": "terminalFocus && nexus.macro.ctrlShift.u"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+v"
+        },
+        "key": "ctrl+shift+v",
+        "when": "terminalFocus && nexus.macro.ctrlShift.v"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+w"
+        },
+        "key": "ctrl+shift+w",
+        "when": "terminalFocus && nexus.macro.ctrlShift.w"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+x"
+        },
+        "key": "ctrl+shift+x",
+        "when": "terminalFocus && nexus.macro.ctrlShift.x"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+y"
+        },
+        "key": "ctrl+shift+y",
+        "when": "terminalFocus && nexus.macro.ctrlShift.y"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+z"
+        },
+        "key": "ctrl+shift+z",
+        "when": "terminalFocus && nexus.macro.ctrlShift.z"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+0"
+        },
+        "key": "ctrl+shift+0",
+        "when": "terminalFocus && nexus.macro.ctrlShift.0"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+1"
+        },
+        "key": "ctrl+shift+1",
+        "when": "terminalFocus && nexus.macro.ctrlShift.1"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+2"
+        },
+        "key": "ctrl+shift+2",
+        "when": "terminalFocus && nexus.macro.ctrlShift.2"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+3"
+        },
+        "key": "ctrl+shift+3",
+        "when": "terminalFocus && nexus.macro.ctrlShift.3"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+4"
+        },
+        "key": "ctrl+shift+4",
+        "when": "terminalFocus && nexus.macro.ctrlShift.4"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+5"
+        },
+        "key": "ctrl+shift+5",
+        "when": "terminalFocus && nexus.macro.ctrlShift.5"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+6"
+        },
+        "key": "ctrl+shift+6",
+        "when": "terminalFocus && nexus.macro.ctrlShift.6"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+7"
+        },
+        "key": "ctrl+shift+7",
+        "when": "terminalFocus && nexus.macro.ctrlShift.7"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+8"
+        },
+        "key": "ctrl+shift+8",
+        "when": "terminalFocus && nexus.macro.ctrlShift.8"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+9"
+        },
+        "key": "ctrl+shift+9",
+        "when": "terminalFocus && nexus.macro.ctrlShift.9"
       }
     ],
     "configuration": {
@@ -1352,11 +2144,16 @@
                 "type": "string",
                 "description": "Text to send (use \\n for Enter)"
               },
+              "keybinding": {
+                "type": "string",
+                "description": "Keyboard shortcut binding (e.g., \"alt+m\", \"alt+shift+5\", \"ctrl+shift+a\")."
+              },
               "slot": {
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 9,
-                "description": "Keyboard shortcut slot (0-9). Alt+1 = slot 1, ..., Alt+0 = slot 0."
+                "description": "Deprecated. Use keybinding instead. Legacy slot (0-9) auto-migrates to keybinding on first load.",
+                "deprecationMessage": "Use keybinding instead. Slots are auto-migrated to keybinding on first load."
               },
               "secret": {
                 "type": "boolean",
@@ -1365,7 +2162,7 @@
               }
             }
           },
-          "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or `Alt+1` through `Alt+0` for the first 10 macros. Optionally assign a `slot` (0-9) to bind a macro to a specific `Alt+N` shortcut."
+          "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or assign a `keybinding` (e.g., `alt+m`, `alt+shift+5`, `ctrl+shift+a`) to trigger directly. Supports Alt, Alt+Shift, and Ctrl+Shift modifier groups with A-Z and 0-9 keys."
         },
         "nexus.terminal.highlighting.enabled": {
           "type": "boolean",
@@ -1549,7 +2346,8 @@
   "configurationDefaults": {
     "terminal.integrated.commandsToSkipShell": [
       "nexus.macro.run",
-      "nexus.macro.slot"
+      "nexus.macro.slot",
+      "nexus.macro.runBinding"
     ],
     "terminal.integrated.sendKeybindingsToShell": false,
     "window.enableMenuBarMnemonics": false
@@ -1563,7 +2361,8 @@
     "test": "vitest run --coverage",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
-    "package:vsix": "npm run build:production && vsce package"
+    "package:vsix": "npm run build:production && vsce package",
+    "generate:keybindings": "node scripts/generateKeybindings.mjs"
   },
   "dependencies": {
     "serialport": "^13.0.0",

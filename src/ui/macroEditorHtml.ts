@@ -3,10 +3,6 @@ import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
 import type { TerminalMacro } from "./macroTreeProvider";
 
-function slotLabel(slot: number): string {
-  return `Alt+${slot}`;
-}
-
 export function renderMacroEditorHtml(
   macros: TerminalMacro[],
   selectedIndex: number | null,
@@ -27,20 +23,7 @@ export function renderMacroEditorHtml(
   const triggerLabel = macro ? macro.name : (macros.length > 0 ? "Select a macro\u2026" : "+ New Macro");
   const hiddenValue = selectedIndex !== null ? String(selectedIndex) : "__new__";
 
-  // Build slot selector options
-  const currentSlot = macro?.slot;
-  let slotOptionsHtml = `<div class="custom-select-option${currentSlot === undefined ? " selected" : ""}" data-value="none">None</div>`;
-  for (let s = 1; s <= 9; s++) {
-    const owner = macros.findIndex((m, i) => m.slot === s && i !== selectedIndex);
-    const taken = owner >= 0 ? ` (${escapeHtml(macros[owner].name)})` : "";
-    slotOptionsHtml += `\n        <div class="custom-select-option${currentSlot === s ? " selected" : ""}" data-value="${s}">${escapeHtml(slotLabel(s))}${taken}</div>`;
-  }
-  {
-    const owner = macros.findIndex((m, i) => m.slot === 0 && i !== selectedIndex);
-    const taken = owner >= 0 ? ` (${escapeHtml(macros[owner].name)})` : "";
-    slotOptionsHtml += `\n        <div class="custom-select-option${currentSlot === 0 ? " selected" : ""}" data-value="0">${escapeHtml(slotLabel(0))}${taken}</div>`;
-  }
-  const slotTriggerLabel = currentSlot !== undefined ? slotLabel(currentSlot) : "None";
+  const bindingValue = macro?.keybinding ?? "";
 
   const nameValue = macro?.name ?? "";
   const textValue = macro?.text?.replace(/\n/g, "\n") ?? "";
@@ -123,17 +106,10 @@ export function renderMacroEditorHtml(
   </div>
 
   <div class="form-group">
-    <label>Keyboard Shortcut</label>
-    <div class="custom-select" id="slot-selector">
-      <input type="hidden" id="slot-value" value="${currentSlot !== undefined ? String(currentSlot) : "none"}" />
-      <div class="custom-select-trigger" tabindex="0">
-        <span class="custom-select-text">${escapeHtml(slotTriggerLabel)}</span>
-      </div>
-      <div class="custom-select-dropdown">
-        ${slotOptionsHtml}
-      </div>
-    </div>
-    <div class="hint">Macros without a shortcut can still be run via <strong>Alt+S</strong> (quick pick).</div>
+    <label for="macro-binding">Keyboard Shortcut</label>
+    <input type="text" id="macro-binding" value="${escapeHtml(bindingValue)}" placeholder="e.g., alt+m, alt+shift+5, ctrl+shift+a" />
+    <div class="field-error" id="error-binding"></div>
+    <div class="hint">Macros without a shortcut can still be run via <strong>Alt+S</strong> (quick pick). Supported: Alt, Alt+Shift, Ctrl+Shift with A-Z or 0-9.</div>
   </div>
 
   <div class="bottom-actions">
@@ -149,6 +125,12 @@ export function renderMacroEditorHtml(
       var vscode = acquireVsCodeApi();
       var dirty = false;
       var currentIndex = ${selectedIndex !== null ? selectedIndex : "null"};
+
+      var VALID_PATTERN = /^(alt\\+[a-z0-9]|alt\\+shift\\+[a-z0-9]|ctrl\\+shift\\+[a-z0-9])$/;
+
+      function isValidBinding(value) {
+        return VALID_PATTERN.test(value.trim().toLowerCase());
+      }
 
       function markDirty() {
         if (!dirty) {
@@ -166,6 +148,16 @@ export function renderMacroEditorHtml(
       document.getElementById("macro-name").addEventListener("input", markDirty);
       document.getElementById("macro-text").addEventListener("input", markDirty);
       document.getElementById("macro-secret").addEventListener("change", markDirty);
+      document.getElementById("macro-binding").addEventListener("input", function() {
+        markDirty();
+        var val = this.value.trim();
+        var errorEl = document.getElementById("error-binding");
+        if (val && !isValidBinding(val)) {
+          errorEl.textContent = "Invalid. Use alt+KEY, alt+shift+KEY, or ctrl+shift+KEY (A-Z, 0-9).";
+        } else {
+          errorEl.textContent = "";
+        }
+      });
 
       // Macro selector — confirm discard if dirty
       initCustomSelects(function(wrapper, opt) {
@@ -179,9 +171,6 @@ export function renderMacroEditorHtml(
           wrapper.classList.remove("open");
           return;
         }
-        // Slot selector — default behavior
-        selectCustomOption(wrapper, opt.dataset.value);
-        markDirty();
       });
 
       // Save
@@ -189,8 +178,7 @@ export function renderMacroEditorHtml(
         var name = document.getElementById("macro-name").value.trim();
         var text = document.getElementById("macro-text").value;
         var secret = document.getElementById("macro-secret").checked;
-        var slotVal = document.getElementById("slot-value").value;
-        var slot = slotVal === "none" ? null : parseInt(slotVal, 10);
+        var bindingVal = document.getElementById("macro-binding").value.trim().toLowerCase();
 
         // Validate
         var valid = true;
@@ -206,6 +194,12 @@ export function renderMacroEditorHtml(
         } else {
           document.getElementById("error-text").textContent = "";
         }
+        if (bindingVal && !isValidBinding(bindingVal)) {
+          document.getElementById("error-binding").textContent = "Invalid binding format.";
+          valid = false;
+        } else {
+          document.getElementById("error-binding").textContent = "";
+        }
         if (!valid) return;
 
         vscode.postMessage({
@@ -214,7 +208,7 @@ export function renderMacroEditorHtml(
           name: name,
           text: text,
           secret: secret,
-          slot: slot
+          keybinding: bindingVal || null
         });
       });
 

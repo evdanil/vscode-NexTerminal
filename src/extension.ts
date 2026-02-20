@@ -27,7 +27,7 @@ import { TunnelTreeProvider } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
 import { registerSettingsCommands } from "./commands/settingsCommands";
 import { registerConfigCommands } from "./commands/configCommands";
-import { registerMacroCommands, updateMacroContext } from "./commands/macroCommands";
+import { registerMacroCommands, updateMacroContext, migrateMacroSlots } from "./commands/macroCommands";
 import { registerProfileCommands } from "./commands/profileCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeProvider } from "./ui/macroTreeProvider";
@@ -35,7 +35,7 @@ import { VscodeColorSchemeStorage } from "./storage/vscodeColorSchemeStorage";
 import { ColorSchemeService } from "./services/colorSchemeService";
 import { TerminalAppearancePanel } from "./ui/terminalAppearancePanel";
 
-const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.slot"];
+const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.slot", "nexus.macro.runBinding"];
 
 /**
  * Ensure VS Code settings allow Alt+S / Alt+N macro keybindings to reach the extension.
@@ -245,6 +245,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const macroView = vscode.window.createTreeView("nexusMacros", {
     treeDataProvider: macroTreeProvider
   });
+  await migrateMacroSlots();
   updateMacroContext();
   updatePassthroughContext();
   ensureMacroKeybindingsWork();

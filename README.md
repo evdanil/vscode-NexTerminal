@@ -14,7 +14,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 - **Settings Panel** — View and edit extension settings in a dedicated webview panel. Declarative metadata drives the UI with auto-save, search, and grouped categories.
 - **Session Transcript Logging** — Automatically log clean terminal output (ANSI codes stripped) to files with configurable rotation.
 - **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH and serial terminal output. Detects errors, warnings, IP addresses, UUIDs, URLs and more with inline ANSI colouring while respecting existing remote colours.
-- **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign each macro an explicit `Alt+N` slot (0-9) via the context menu, or let them auto-assign positionally. Macros without an assigned slot can still be invoked via `Alt+S`, which opens a quick-pick list of all macros. Includes a Macro Editor webview panel with multiline editing, secret macro support, and drag-and-drop slot assignment.
+- **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign any macro a custom keybinding from 108 supported combinations across three modifier groups: `Alt`, `Alt+Shift`, and `Ctrl+Shift` with A-Z or 0-9 keys (e.g., `Alt+M`, `Alt+Shift+5`, `Ctrl+Shift+A`). Unassigned keybindings fall through to normal VS Code behavior. Macros without a keybinding can still be invoked via `Alt+S`, which opens a quick-pick list of all macros. Includes a Macro Editor webview panel with multiline editing, secret macro support, and inline keybinding assignment. Legacy `slot` (0-9) assignments are auto-migrated to the new keybinding system on first load.
 - **Configuration Export/Import** — Back up and restore all profiles and settings as a single JSON file.
 - **Web Extension Fallback** — Graceful degradation in browser-based VS Code (SSH/serial require desktop runtime).
 
@@ -76,7 +76,7 @@ npm run package:vsix
 | `nexus.logging.sessionLogDirectory` | *(extension storage)* | Custom directory for session logs |
 | `nexus.tunnel.defaultConnectionMode` | `shared` | `shared` or `isolated` SSH mode for tunnels |
 | `nexus.terminal.openLocation` | `panel` | Where to open terminals: `panel` or `editor` tab |
-| `nexus.terminal.macros` | `[]` | Terminal macros with optional `slot` (0-9) for Alt+N shortcuts |
+| `nexus.terminal.macros` | `[]` | Terminal macros with optional `keybinding` (e.g., `alt+m`, `alt+shift+5`, `ctrl+shift+a`) |
 | `nexus.ssh.multiplexing.enabled` | `true` | Share SSH connections across terminals, tunnels, and SFTP |
 | `nexus.ssh.multiplexing.idleTimeout` | `300` | Seconds to keep idle multiplexed connection alive |
 | `nexus.terminal.highlighting.enabled` | `true` | Enable regex-based terminal highlighting |

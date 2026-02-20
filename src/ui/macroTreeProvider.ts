@@ -1,8 +1,11 @@
 import * as vscode from "vscode";
+import { bindingToDisplayLabel } from "../macroBindings";
 
 export interface TerminalMacro {
   name: string;
   text: string;
+  keybinding?: string;
+  /** @deprecated Use keybinding instead. Auto-migrated on first load. */
   slot?: number;
   secret?: boolean;
 }
@@ -11,9 +14,9 @@ export class MacroTreeItem extends vscode.TreeItem {
   public constructor(
     public readonly macro: TerminalMacro,
     public readonly index: number,
-    public readonly displaySlot?: number
+    public readonly displayBinding?: string
   ) {
-    const prefix = displaySlot !== undefined ? `[Alt+${displaySlot}] ` : "";
+    const prefix = displayBinding ? `[${bindingToDisplayLabel(displayBinding)}] ` : "";
     super(`${prefix}${macro.name}`, vscode.TreeItemCollapsibleState.None);
     this.id = `macro:${index}`;
     if (macro.secret) {
@@ -28,11 +31,11 @@ export class MacroTreeItem extends vscode.TreeItem {
       title: "Run Macro",
       arguments: [this]
     };
-    const slotHint = displaySlot !== undefined ? ` (Alt+${displaySlot})` : "";
+    const bindingHint = displayBinding ? ` (${bindingToDisplayLabel(displayBinding)})` : "";
     if (macro.secret) {
-      this.tooltip = `${macro.name}${slotHint} (secret)`;
+      this.tooltip = `${macro.name}${bindingHint} (secret)`;
     } else {
-      this.tooltip = `${macro.name}${slotHint}\n${macro.text.replace(/\n/g, "\\n")}`;
+      this.tooltip = `${macro.name}${bindingHint}\n${macro.text.replace(/\n/g, "\\n")}`;
     }
     this.iconPath = new vscode.ThemeIcon(macro.secret ? "lock" : "terminal");
   }
@@ -55,17 +58,19 @@ export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem>
       .getConfiguration("nexus.terminal")
       .get<TerminalMacro[]>("macros", []);
 
-    const anyHasSlot = macros.some((m) => m.slot !== undefined);
+    const anyHasBindingOrSlot = macros.some((m) => m.keybinding !== undefined || m.slot !== undefined);
 
     return macros.map((macro, index) => {
-      let displaySlot: number | undefined;
-      if (macro.slot !== undefined) {
-        displaySlot = macro.slot;
-      } else if (!anyHasSlot && index < 10) {
-        // Legacy mode: no macros have explicit slots, use positional
-        displaySlot = (index + 1) % 10;
+      let displayBinding: string | undefined;
+      if (macro.keybinding) {
+        displayBinding = macro.keybinding;
+      } else if (macro.slot !== undefined) {
+        displayBinding = `alt+${macro.slot}`;
+      } else if (!anyHasBindingOrSlot && index < 10) {
+        // Legacy positional mode: no macros have explicit keybinding or slot
+        displayBinding = `alt+${(index + 1) % 10}`;
       }
-      return new MacroTreeItem(macro, index, displaySlot);
+      return new MacroTreeItem(macro, index, displayBinding);
     });
   }
 }

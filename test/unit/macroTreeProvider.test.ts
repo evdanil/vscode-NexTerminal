@@ -37,31 +37,31 @@ import { MacroTreeProvider, MacroTreeItem } from "../../src/ui/macroTreeProvider
 import * as vscode from "vscode";
 
 describe("MacroTreeItem", () => {
-  it("shows [Alt+N] label when displaySlot is provided", () => {
+  it("shows binding label when displayBinding is provided", () => {
     const macro = { name: "Hello", text: "echo hello" };
-    const item = new MacroTreeItem(macro, 0, 1);
+    const item = new MacroTreeItem(macro, 0, "alt+1");
     expect(item.label).toBe("[Alt+1] Hello");
 
-    const item9 = new MacroTreeItem(macro, 8, 9);
-    expect(item9.label).toBe("[Alt+9] Hello");
+    const item2 = new MacroTreeItem(macro, 1, "alt+shift+m");
+    expect(item2.label).toBe("[Alt+Shift+M] Hello");
 
-    const item0 = new MacroTreeItem(macro, 9, 0);
-    expect(item0.label).toBe("[Alt+0] Hello");
+    const item3 = new MacroTreeItem(macro, 2, "ctrl+shift+5");
+    expect(item3.label).toBe("[Ctrl+Shift+5] Hello");
   });
 
-  it("shows plain name when displaySlot is undefined", () => {
+  it("shows plain name when displayBinding is undefined", () => {
     const macro = { name: "Hello", text: "echo hello" };
     const item = new MacroTreeItem(macro, 5);
     expect(item.label).toBe("Hello");
   });
 
-  it("includes slot hint in tooltip when displaySlot is provided", () => {
+  it("includes binding hint in tooltip when displayBinding is provided", () => {
     const macro = { name: "Test", text: "echo test" };
-    const item = new MacroTreeItem(macro, 0, 3);
+    const item = new MacroTreeItem(macro, 0, "alt+3");
     expect(item.tooltip).toBe("Test (Alt+3)\necho test");
   });
 
-  it("no slot hint in tooltip when displaySlot is undefined", () => {
+  it("no binding hint in tooltip when displayBinding is undefined", () => {
     const macro = { name: "Test", text: "echo test" };
     const item = new MacroTreeItem(macro, 0);
     expect(item.tooltip).toBe("Test\necho test");
@@ -89,7 +89,7 @@ describe("MacroTreeItem", () => {
 
   it("shows (secret) in tooltip for secret macros", () => {
     const macro = { name: "Secret", text: "password123", secret: true };
-    const item = new MacroTreeItem(macro, 0, 3);
+    const item = new MacroTreeItem(macro, 0, "alt+3");
     expect(item.tooltip).toBe("Secret (Alt+3) (secret)");
   });
 
@@ -111,7 +111,7 @@ describe("MacroTreeItem", () => {
   });
 
   it("wires click command to nexus.macro.runItem", () => {
-    const item = new MacroTreeItem({ name: "Test", text: "test" }, 5, 6);
+    const item = new MacroTreeItem({ name: "Test", text: "test" }, 5, "alt+6");
     expect(item.command).toEqual({
       command: "nexus.macro.runItem",
       title: "Run Macro",
@@ -137,9 +137,9 @@ describe("MacroTreeProvider", () => {
     expect(children).toHaveLength(0);
   });
 
-  it("legacy mode: positional Alt+N labels when no macros have slot", () => {
+  it("displays keybinding when macro has keybinding property", () => {
     const macros = [
-      { name: "Hello", text: "echo hello" },
+      { name: "Hello", text: "echo hello", keybinding: "alt+m" },
       { name: "World", text: "echo world" }
     ];
     vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
@@ -148,12 +148,11 @@ describe("MacroTreeProvider", () => {
 
     const children = provider.getChildren();
     expect(children).toHaveLength(2);
-    expect(children[0]).toBeInstanceOf(MacroTreeItem);
-    expect(children[0].label).toBe("[Alt+1] Hello");
-    expect(children[1].label).toBe("[Alt+2] World");
+    expect(children[0].label).toBe("[Alt+M] Hello");
+    expect(children[1].label).toBe("World");
   });
 
-  it("explicit mode: only macros with slot show Alt+N labels", () => {
+  it("displays legacy slot as alt+N binding", () => {
     const macros = [
       { name: "Hello", text: "echo hello", slot: 5 },
       { name: "World", text: "echo world" }
@@ -168,10 +167,25 @@ describe("MacroTreeProvider", () => {
     expect(children[1].label).toBe("World");
   });
 
-  it("mixed: once any macro has a slot, unassigned ones show no prefix", () => {
+  it("legacy positional mode when no macros have keybinding or slot", () => {
+    const macros = [
+      { name: "Hello", text: "echo hello" },
+      { name: "World", text: "echo world" }
+    ];
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: vi.fn().mockReturnValue(macros)
+    } as unknown as vscode.WorkspaceConfiguration);
+
+    const children = provider.getChildren();
+    expect(children).toHaveLength(2);
+    expect(children[0].label).toBe("[Alt+1] Hello");
+    expect(children[1].label).toBe("[Alt+2] World");
+  });
+
+  it("mixed: once any macro has a keybinding, unassigned ones show no prefix", () => {
     const macros = [
       { name: "A", text: "a" },
-      { name: "B", text: "b", slot: 3 },
+      { name: "B", text: "b", keybinding: "alt+shift+3" },
       { name: "C", text: "c" }
     ];
     vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
@@ -180,7 +194,7 @@ describe("MacroTreeProvider", () => {
 
     const children = provider.getChildren();
     expect(children[0].label).toBe("A");
-    expect(children[1].label).toBe("[Alt+3] B");
+    expect(children[1].label).toBe("[Alt+Shift+3] B");
     expect(children[2].label).toBe("C");
   });
 
