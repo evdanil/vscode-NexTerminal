@@ -6,6 +6,7 @@ import type { SftpService } from "../services/sftp/sftpService";
 import type { SshFactory, SshPoolControl } from "../services/ssh/contracts";
 import type { TerminalHighlighter } from "../services/terminalHighlighter";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
+import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
 import type { FileExplorerTreeProvider } from "../ui/fileExplorerTreeProvider";
 
 export type ServerTerminalMap = Map<string, Set<vscode.Terminal>>;
@@ -26,4 +27,5 @@ export interface CommandContext {
   highlighter: TerminalHighlighter;
   sftpService: SftpService;
   fileExplorerProvider: FileExplorerTreeProvider;
+  registrySync?: TunnelRegistrySync;
 }

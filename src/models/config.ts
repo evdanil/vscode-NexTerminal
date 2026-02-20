@@ -56,15 +56,22 @@ export interface ActiveSerialSession {
   startedAt: number;
 }
 
-export interface ActiveTunnel {
-  id: string;
+export interface TunnelRouteInfo {
   profileId: string;
   serverId: string;
   localPort: number;
   remoteIP: string;
   remotePort: number;
+  connectionMode: ResolvedTunnelConnectionMode;
   startedAt: number;
+}
+
+export interface ActiveTunnel extends TunnelRouteInfo {
+  id: string;
   bytesIn: number;
   bytesOut: number;
-  connectionMode: ResolvedTunnelConnectionMode;
+}
+
+export interface TunnelRegistryEntry extends TunnelRouteInfo {
+  ownerSessionId: string;
 }

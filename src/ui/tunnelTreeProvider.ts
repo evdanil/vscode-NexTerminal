@@ -10,18 +10,35 @@ export class TunnelTreeItem extends vscode.TreeItem {
     public readonly profile: TunnelProfile,
     public readonly activeTunnelId?: string,
     public readonly bytesIn?: number,
-    public readonly bytesOut?: number
+    public readonly bytesOut?: number,
+    public readonly isRemote?: boolean,
+    remoteServerName?: string
   ) {
     super(profile.name, vscode.TreeItemCollapsibleState.None);
     this.id = `tunnel:${profile.id}`;
-    this.contextValue = activeTunnelId ? "nexus.activeTunnel" : "nexus.tunnel";
-    this.iconPath = new vscode.ThemeIcon(
-      activeTunnelId ? "circle-filled" : "circle-outline",
-      new vscode.ThemeColor(activeTunnelId ? "testing.iconPassed" : "descriptionForeground")
-    );
-    this.description = activeTunnelId
-      ? `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort} | in ${formatBytes(bytesIn ?? 0)} out ${formatBytes(bytesOut ?? 0)}`
-      : `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort}`;
+    if (activeTunnelId) {
+      this.contextValue = "nexus.activeTunnel";
+      this.iconPath = new vscode.ThemeIcon(
+        "circle-filled",
+        new vscode.ThemeColor("testing.iconPassed")
+      );
+      this.description = `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort} | in ${formatBytes(bytesIn ?? 0)} out ${formatBytes(bytesOut ?? 0)}`;
+    } else if (isRemote) {
+      this.contextValue = "nexus.remoteTunnel";
+      this.iconPath = new vscode.ThemeIcon(
+        "circle-filled",
+        new vscode.ThemeColor("charts.blue")
+      );
+      const via = remoteServerName ? ` via ${remoteServerName}` : "";
+      this.description = `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort}${via} (other window)`;
+    } else {
+      this.contextValue = "nexus.tunnel";
+      this.iconPath = new vscode.ThemeIcon(
+        "circle-outline",
+        new vscode.ThemeColor("descriptionForeground")
+      );
+      this.description = `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort}`;
+    }
     this.tooltip = this.description;
   }
 }
@@ -37,6 +54,7 @@ export class TunnelTreeProvider
     activeSessions: [],
     activeSerialSessions: [],
     activeTunnels: [],
+    remoteTunnels: [],
     explicitGroups: []
   };
 
@@ -79,6 +97,14 @@ export class TunnelTreeProvider
 
   private toTunnelItem(profile: TunnelProfile): TunnelTreeItem {
     const active = this.snapshot.activeTunnels.find((item) => item.profileId === profile.id);
-    return new TunnelTreeItem(profile, active?.id, active?.bytesIn, active?.bytesOut);
+    if (active) {
+      return new TunnelTreeItem(profile, active.id, active.bytesIn, active.bytesOut);
+    }
+    const remote = this.snapshot.remoteTunnels.find((item) => item.profileId === profile.id);
+    if (remote) {
+      const server = this.snapshot.servers.find((s) => s.id === remote.serverId);
+      return new TunnelTreeItem(profile, undefined, undefined, undefined, true, server?.name);
+    }
+    return new TunnelTreeItem(profile);
   }
 }

@@ -169,7 +169,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
                   if (!mode) {
                     return;
                   }
-                  return startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, tunnel, server, mode);
+                  return startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, tunnel, server, mode, ctx.registrySync);
                 });
               }
             }

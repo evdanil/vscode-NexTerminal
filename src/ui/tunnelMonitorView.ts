@@ -11,6 +11,7 @@ export class TunnelMonitorViewProvider implements vscode.WebviewViewProvider {
     activeSessions: [],
     activeSerialSessions: [],
     activeTunnels: [],
+    remoteTunnels: [],
     explicitGroups: []
   };
   private view?: vscode.WebviewView;

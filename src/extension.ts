@@ -18,6 +18,8 @@ import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
 import { TerminalHighlighter } from "./services/terminalHighlighter";
 import { TunnelManager } from "./services/tunnel/tunnelManager";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
+import { VscodeTunnelRegistryStore } from "./storage/vscodeTunnelRegistryStore";
+import { TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
 import { NexusTreeProvider } from "./ui/nexusTreeProvider";
 import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
@@ -147,6 +149,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const extensionRoot = path.resolve(__dirname, "..");
   const sidecarPath = path.join(__dirname, "services", "serial", "serialSidecarWorker.js");
   const serialSidecar = new SerialSidecarManager(sidecarPath, extensionRoot);
+  const registryStore = new VscodeTunnelRegistryStore(context);
+  const registrySync = new TunnelRegistrySync(registryStore, core, vscode.env.sessionId);
+  await registrySync.initialize();
+
   const terminalsByServer: ServerTerminalMap = new Map();
   const sessionTerminals: SessionTerminalMap = new Map();
   const serialTerminals: SerialTerminalMap = new Map();
@@ -176,7 +182,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     serialTerminals,
     highlighter,
     sftpService,
-    fileExplorerProvider
+    fileExplorerProvider,
+    registrySync
   };
 
   const nexusTreeProvider = new NexusTreeProvider({
@@ -190,7 +197,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!connectionMode) {
         return;
       }
-      await startTunnel(core, tunnelManager, pool, profile, server, connectionMode);
+      await startTunnel(core, tunnelManager, pool, profile, server, connectionMode, registrySync);
     },
     async onItemGroupChanged(itemType, itemId, newGroup) {
       if (itemType === "server") {
@@ -244,7 +251,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const snapshot = core.getSnapshot();
     nexusTreeProvider.setSnapshot(snapshot);
     tunnelTreeProvider.setSnapshot(snapshot);
-    statusBarItem.text = `$(terminal) Nexus: ${snapshot.activeSessions.length} sessions, ${snapshot.activeTunnels.length} tunnels`;
+    const totalTunnels = snapshot.activeTunnels.length + snapshot.remoteTunnels.length;
+    statusBarItem.text = `$(terminal) Nexus: ${snapshot.activeSessions.length} sessions, ${totalTunnels} tunnels`;
+    if (snapshot.remoteTunnels.length > 0) {
+      statusBarItem.tooltip = `${snapshot.activeTunnels.length} local, ${snapshot.remoteTunnels.length} in other window`;
+    } else {
+      statusBarItem.tooltip = undefined;
+    }
 
     const activeServerId = fileExplorerProvider.getActiveServerId();
     if (activeServerId && !core.isServerConnected(activeServerId)) {
@@ -277,6 +290,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const unsubscribeTunnel = tunnelManager.onDidChange((event) => {
     if (event.type === "started") {
       core.registerTunnel(event.tunnel);
+      void registrySync.registerTunnel(event.tunnel);
       const logger = loggerFactory.create("tunnel", event.tunnel.id);
       logger.log(
         `started profile=${event.tunnel.profileId} local=${event.tunnel.localPort} remote=${event.tunnel.remoteIP}:${event.tunnel.remotePort}`
@@ -289,7 +303,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return;
     }
     if (event.type === "stopped") {
+      const stoppingTunnel = core.getSnapshot().activeTunnels.find((t) => t.id === event.tunnelId);
       core.unregisterTunnel(event.tunnelId);
+      if (stoppingTunnel) {
+        void registrySync.unregisterTunnel(stoppingTunnel.profileId);
+      }
       return;
     }
     if (event.type === "error") {
@@ -314,6 +332,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const refreshCommand = vscode.commands.registerCommand("nexus.refresh", async () => {
     await core.initialize();
     syncViews();
+  });
+
+  const windowFocusListener = vscode.window.onDidChangeWindowState((state) => {
+    if (state.focused) {
+      void registrySync.syncNow();
+    }
   });
 
   const configChangeListener = vscode.workspace.onDidChangeConfiguration((event) => {
@@ -352,6 +376,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     statusBarItem,
     refreshCommand,
     appearanceCommand,
+    windowFocusListener,
     configChangeListener,
     ...serverDisposables,
     ...tunnelDisposables,
@@ -372,6 +397,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         serialSidecar.dispose();
         sftpService.dispose();
         void tunnelManager.stopAll();
+        registrySync.dispose();
+        void registrySync.cleanupOwnEntries();
         pool.dispose();
       }
     }

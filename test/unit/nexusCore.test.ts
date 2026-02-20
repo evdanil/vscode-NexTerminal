@@ -182,6 +182,36 @@ describe("NexusCore", () => {
     expect(core.getSnapshot().explicitGroups).toHaveLength(1);
   });
 
+  it("manages remote tunnels via setRemoteTunnels", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    expect(core.getSnapshot().remoteTunnels).toHaveLength(0);
+
+    const entries = [
+      {
+        profileId: "t1",
+        serverId: "s1",
+        localPort: 8080,
+        remoteIP: "10.0.0.5",
+        remotePort: 3306,
+        connectionMode: "shared" as const,
+        startedAt: Date.now(),
+        ownerSessionId: "other-window"
+      }
+    ];
+    core.setRemoteTunnels(entries);
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.remoteTunnels).toHaveLength(1);
+    expect(snapshot.remoteTunnels[0].profileId).toBe("t1");
+    expect(snapshot.remoteTunnels[0].ownerSessionId).toBe("other-window");
+
+    core.setRemoteTunnels([]);
+    expect(core.getSnapshot().remoteTunnels).toHaveLength(0);
+  });
+
   it("persists serial profile CRUD and tracks serial sessions", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

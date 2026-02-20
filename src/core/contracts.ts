@@ -4,7 +4,8 @@ import type {
   ActiveTunnel,
   SerialProfile,
   ServerConfig,
-  TunnelProfile
+  TunnelProfile,
+  TunnelRegistryEntry
 } from "../models/config";
 
 export interface ConfigRepository {
@@ -25,5 +26,11 @@ export interface SessionSnapshot {
   activeSessions: ActiveSession[];
   activeSerialSessions: ActiveSerialSession[];
   activeTunnels: ActiveTunnel[];
+  remoteTunnels: TunnelRegistryEntry[];
   explicitGroups: string[];
+}
+
+export interface TunnelRegistryStore {
+  getEntries(): Promise<TunnelRegistryEntry[]>;
+  saveEntries(entries: TunnelRegistryEntry[]): Promise<void>;
 }

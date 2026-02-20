@@ -81,6 +81,7 @@ export class NexusTreeProvider
     activeSessions: [],
     activeSerialSessions: [],
     activeTunnels: [],
+    remoteTunnels: [],
     explicitGroups: []
   };
 

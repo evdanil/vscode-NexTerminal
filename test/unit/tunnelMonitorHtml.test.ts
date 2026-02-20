@@ -9,7 +9,8 @@ describe("renderTunnelMonitorHtml", () => {
       serialProfiles: [],
       activeSessions: [],
       activeSerialSessions: [],
-      activeTunnels: []
+      activeTunnels: [],
+      remoteTunnels: []
     });
 
     expect(html).toContain("Active tunnels: 0");
@@ -55,7 +56,8 @@ describe("renderTunnelMonitorHtml", () => {
           bytesOut: 2048,
           connectionMode: "isolated"
         }
-      ]
+      ],
+      remoteTunnels: []
     });
 
     expect(html).toContain("Active tunnels: 1");

@@ -9,6 +9,7 @@ import type {
 } from "../models/config";
 import type { SshFactory } from "../services/ssh/contracts";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
+import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
 import { serverFormDefinition, tunnelFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { TunnelTreeItem } from "../ui/tunnelTreeProvider";
@@ -94,11 +95,27 @@ export async function startTunnel(
   sshFactory: SshFactory,
   profile: TunnelProfile,
   server: ServerConfig,
-  connectionMode: ResolvedTunnelConnectionMode
+  connectionMode: ResolvedTunnelConnectionMode,
+  registrySync?: TunnelRegistrySync
 ): Promise<void> {
   if (core.getSnapshot().activeTunnels.some((tunnel) => tunnel.profileId === profile.id)) {
     void vscode.window.showInformationMessage(`Tunnel "${profile.name}" is already running.`);
     return;
+  }
+
+  if (registrySync) {
+    await registrySync.syncNow();
+    const remoteOwner = await registrySync.checkRemoteOwnership(profile.id, profile.localPort);
+    if (remoteOwner) {
+      const action = await vscode.window.showWarningMessage(
+        `Tunnel "${profile.name}" is already active in another VS Code window (localhost:${profile.localPort}). The forwarded port is accessible from this window too.`,
+        "Open in Browser"
+      );
+      if (action === "Open in Browser") {
+        void vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${profile.localPort}`));
+      }
+      return;
+    }
   }
 
   const authenticated = await vscode.window.withProgress(
@@ -191,7 +208,7 @@ async function startTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<v
   if (!connectionMode) {
     return;
   }
-  await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, connectionMode);
+  await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, connectionMode, ctx.registrySync);
 }
 
 async function stopTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<void> {
@@ -314,7 +331,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
           if (!mode) {
             return;
           }
-          await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, updated, server, mode);
+          await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, updated, server, mode, ctx.registrySync);
         },
         onCreateInline: (key) => {
           if (key === "defaultServerId") {
@@ -341,8 +358,12 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       if (!profile) {
         return;
       }
+      const isRemote = ctx.core.getSnapshot().remoteTunnels.some((r) => r.profileId === profile.id);
+      const confirmMsg = isRemote
+        ? `Tunnel "${profile.name}" is running in another window. Removing the profile won't stop the running tunnel. Remove anyway?`
+        : `Remove tunnel "${profile.name}"?`;
       const confirm = await vscode.window.showWarningMessage(
-        `Remove tunnel "${profile.name}"?`,
+        confirmMsg,
         { modal: true },
         "Remove"
       );
@@ -374,7 +395,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       if (!mode) {
         return;
       }
-      await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, mode);
+      await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, mode, ctx.registrySync);
     }),
 
     vscode.commands.registerCommand("nexus.tunnel.copyInfo", async (arg?: unknown) => {
@@ -388,8 +409,8 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
     }),
 
     vscode.commands.registerCommand("nexus.tunnel.openBrowser", (arg?: unknown) => {
-      if (arg instanceof TunnelTreeItem && arg.activeTunnelId) {
-        const url = `https://localhost:${arg.profile.localPort}`;
+      if (arg instanceof TunnelTreeItem && (arg.activeTunnelId || arg.isRemote)) {
+        const url = `http://localhost:${arg.profile.localPort}`;
         void vscode.env.openExternal(vscode.Uri.parse(url));
       }
     }),

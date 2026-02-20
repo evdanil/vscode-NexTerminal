@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar with connection multiplexing, a settings panel, macro editor, and regex-based terminal highlighting.",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -628,6 +628,11 @@
           "group": "inline@1"
         },
         {
+          "command": "nexus.tunnel.openBrowser",
+          "when": "view == nexusTunnels && viewItem == nexus.remoteTunnel",
+          "group": "inline"
+        },
+        {
           "command": "nexus.tunnel.stop",
           "when": "view == nexusTunnels && viewItem == nexus.activeTunnel",
           "group": "inline@2"
@@ -648,6 +653,11 @@
           "group": "0_connect@1"
         },
         {
+          "command": "nexus.tunnel.openBrowser",
+          "when": "view == nexusTunnels && viewItem == nexus.remoteTunnel",
+          "group": "0_connect@1"
+        },
+        {
           "command": "nexus.tunnel.stop",
           "when": "view == nexusTunnels && viewItem == nexus.activeTunnel",
           "group": "0_connect@2"
@@ -659,22 +669,22 @@
         },
         {
           "command": "nexus.tunnel.edit",
-          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/",
+          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel|remoteTunnel)$/",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.tunnel.duplicate",
-          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/",
+          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel|remoteTunnel)$/",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.tunnel.copyInfo",
-          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/",
+          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel|remoteTunnel)$/",
           "group": "2_clipboard"
         },
         {
           "command": "nexus.tunnel.remove",
-          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel)$/",
+          "when": "view == nexusTunnels && viewItem =~ /^nexus\\.(tunnel|activeTunnel|remoteTunnel)$/",
           "group": "3_destructive"
         },
         {

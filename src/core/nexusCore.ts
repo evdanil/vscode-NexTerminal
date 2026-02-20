@@ -4,7 +4,8 @@ import type {
   ActiveTunnel,
   SerialProfile,
   ServerConfig,
-  TunnelProfile
+  TunnelProfile,
+  TunnelRegistryEntry
 } from "../models/config";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 
@@ -18,6 +19,7 @@ export class NexusCore {
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly activeSerialSessions = new Map<string, ActiveSerialSession>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
+  private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
 
   public constructor(private readonly repository: ConfigRepository) {}
@@ -56,6 +58,7 @@ export class NexusCore {
       activeSessions: [...this.activeSessions.values()],
       activeSerialSessions: [...this.activeSerialSessions.values()],
       activeTunnels: [...this.activeTunnels.values()],
+      remoteTunnels: [...this.remoteTunnels],
       explicitGroups: [...this.explicitGroups]
     };
   }
@@ -183,6 +186,11 @@ export class NexusCore {
 
   public unregisterTunnel(activeTunnelId: string): void {
     this.activeTunnels.delete(activeTunnelId);
+    this.emitChanged();
+  }
+
+  public setRemoteTunnels(entries: TunnelRegistryEntry[]): void {
+    this.remoteTunnels = entries;
     this.emitChanged();
   }
 
