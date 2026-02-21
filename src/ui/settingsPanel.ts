@@ -1,19 +1,21 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { renderSettingsHtml } from "./settingsHtml";
-import { SETTINGS_META } from "./settingsMetadata";
+import { SETTINGS_META, CATEGORY_LABELS } from "./settingsMetadata";
 
 export class SettingsPanel {
   private static instance: SettingsPanel | undefined;
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
   private pendingScrollTo: string | undefined;
+  private currentCategory: string | undefined;
   private readonly configListener: vscode.Disposable;
 
-  private constructor() {
+  private constructor(category?: string) {
+    this.currentCategory = category;
     this.panel = vscode.window.createWebviewPanel(
       "nexus.settings",
-      "Nexus Settings",
+      this.buildTitle(category),
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true }
     );
@@ -36,26 +38,47 @@ export class SettingsPanel {
     });
   }
 
-  public static open(scrollToCategory?: string): void {
+  private buildTitle(category?: string): string {
+    if (!category) return "Nexus Settings";
+    const label = CATEGORY_LABELS[category];
+    return label ? `Nexus: ${label} Settings` : "Nexus Settings";
+  }
+
+  public static open(category?: string): void {
     if (SettingsPanel.instance) {
-      SettingsPanel.instance.panel.reveal();
-      if (scrollToCategory) {
-        SettingsPanel.instance.scrollTo(scrollToCategory);
+      const inst = SettingsPanel.instance;
+      inst.panel.reveal();
+      if (category && category !== inst.currentCategory) {
+        inst.switchCategory(category);
+      } else if (!category && inst.currentCategory) {
+        inst.switchCategory(undefined);
+      } else if (category && category === inst.currentCategory) {
+        // Already showing this category, just reveal
+      } else if (!category) {
+        if (inst.pendingScrollTo) {
+          inst.scrollTo(inst.pendingScrollTo);
+        }
       }
       return;
     }
-    const inst = new SettingsPanel();
+    const inst = new SettingsPanel(category);
     SettingsPanel.instance = inst;
-    if (scrollToCategory) {
-      inst.pendingScrollTo = scrollToCategory;
+    if (!category && inst.pendingScrollTo) {
+      // Will be handled in render()
     }
+  }
+
+  private switchCategory(category: string | undefined): void {
+    this.currentCategory = category;
+    this.panel.title = this.buildTitle(category);
+    this.render();
   }
 
   private render(): void {
     const nonce = randomBytes(16).toString("base64");
     const values = this.readAllValues();
-    this.panel.webview.html = renderSettingsHtml(values, nonce);
-    if (this.pendingScrollTo) {
+    this.panel.webview.html = renderSettingsHtml(values, nonce, this.currentCategory);
+    if (this.pendingScrollTo && !this.currentCategory) {
       const cat = this.pendingScrollTo;
       this.pendingScrollTo = undefined;
       // Delay to allow webview to load
@@ -121,6 +144,24 @@ export class SettingsPanel {
         );
         if (confirm === "Reset") {
           for (const meta of SETTINGS_META) {
+            const config = vscode.workspace.getConfiguration(meta.section);
+            await config.update(meta.key, undefined, vscode.ConfigurationTarget.Global);
+          }
+          this.render();
+        }
+        break;
+      }
+      case "resetCategory": {
+        const category = msg.category as string;
+        const categoryLabel = CATEGORY_LABELS[category] ?? category;
+        const confirm = await vscode.window.showWarningMessage(
+          `Reset all ${categoryLabel} settings to their defaults?`,
+          { modal: true },
+          "Reset"
+        );
+        if (confirm === "Reset") {
+          const categoryMetas = SETTINGS_META.filter((m) => m.category === category);
+          for (const meta of categoryMetas) {
             const config = vscode.workspace.getConfiguration(meta.section);
             await config.update(meta.key, undefined, vscode.ConfigurationTarget.Global);
           }

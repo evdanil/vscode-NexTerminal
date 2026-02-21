@@ -12,7 +12,7 @@ export function baseWebviewCss(): string {
       color: var(--vscode-editor-foreground);
       margin: 0;
       padding: 20px;
-      max-width: 600px;
+      max-width: 700px;
     }
     h2 {
       font-size: 16px;
@@ -30,7 +30,7 @@ export function baseWebviewCss(): string {
       margin-top: 0;
     }
     .form-group {
-      margin-bottom: 14px;
+      margin-bottom: 18px;
     }
     .form-group-checkbox {
       margin-top: 8px;

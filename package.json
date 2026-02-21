@@ -246,6 +246,11 @@
         "icon": "$(folder-opened)"
       },
       {
+        "command": "nexus.settings.resetAll",
+        "title": "Nexus: Reset All Settings to Defaults",
+        "icon": "$(discard)"
+      },
+      {
         "command": "nexus.tunnel.openBrowser",
         "title": "Open in Browser",
         "icon": "$(globe)"

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { renderSettingsHtml } from "../../src/ui/settingsHtml";
 import { SETTINGS_META, CATEGORY_ORDER, CATEGORY_LABELS } from "../../src/ui/settingsMetadata";
 
-function renderWithDefaults(): string {
+function buildDefaultValues(): Record<string, unknown> {
   const values: Record<string, unknown> = {};
   for (const meta of SETTINGS_META) {
     const fullKey = `${meta.section}.${meta.key}`;
@@ -15,7 +15,11 @@ function renderWithDefaults(): string {
       case "multi-checkbox": values[fullKey] = meta.checkboxOptions?.map((o) => o.value) ?? []; break;
     }
   }
-  return renderSettingsHtml(values, "test-nonce-123");
+  return values;
+}
+
+function renderWithDefaults(): string {
+  return renderSettingsHtml(buildDefaultValues(), "test-nonce-123");
 }
 
 describe("renderSettingsHtml", () => {
@@ -107,5 +111,85 @@ describe("renderSettingsHtml", () => {
   it("includes save indicator elements", () => {
     const html = renderWithDefaults();
     expect(html).toContain("save-indicator");
+  });
+
+  describe("categoryFilter", () => {
+    it("renders only target category settings when filter is set", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "logging");
+      // Should contain logging settings
+      expect(html).toContain("Session Transcripts");
+      expect(html).toContain("Max Log File Size");
+      // Should NOT contain other category settings
+      expect(html).not.toContain("Connection Multiplexing");
+      expect(html).not.toContain("Open Location");
+      expect(html).not.toContain("Cache TTL");
+    });
+
+    it("omits category headings in focused mode", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "logging");
+      expect(html).not.toContain('id="section-logging"');
+      expect(html).not.toContain("<h3");
+    });
+
+    it("omits cross-link button elements in focused mode", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "ssh");
+      expect(html).not.toContain('id="open-appearance-btn"');
+      expect(html).not.toContain('id="open-macros-btn"');
+    });
+
+    it("omits import/export button elements in focused mode", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "ssh");
+      expect(html).not.toContain('id="backup-btn"');
+      expect(html).not.toContain('id="share-btn"');
+      expect(html).not.toContain('id="import-btn"');
+    });
+
+    it("omits danger zone elements in focused mode", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "ssh");
+      expect(html).not.toContain('id="complete-reset-btn"');
+      expect(html).not.toContain("Danger Zone");
+    });
+
+    it("includes per-category reset button in focused mode", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "logging");
+      expect(html).toContain("reset-category-btn");
+      expect(html).toContain('data-category="logging"');
+    });
+
+    it("wraps settings in .settings-card in focused mode", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "logging");
+      expect(html).toContain("settings-card");
+    });
+
+    it("includes highlighting JSON link for highlighting category", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "highlighting");
+      expect(html).toContain("open-highlighting-json");
+    });
+
+    it("omits highlighting JSON link element for non-highlighting category", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "ssh");
+      expect(html).not.toContain('id="open-highlighting-json"');
+    });
+
+    it("renders everything when filter is undefined (backward compat)", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", undefined);
+      // Should contain all sections
+      for (const cat of CATEGORY_ORDER) {
+        expect(html).toContain(`id="section-${cat}"`);
+      }
+      expect(html).toContain("open-appearance-btn");
+      expect(html).toContain("backup-btn");
+      expect(html).toContain("complete-reset-btn");
+    });
   });
 });

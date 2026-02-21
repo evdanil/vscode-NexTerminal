@@ -119,7 +119,7 @@ function renderSetting(meta: SettingMeta, values: SettingValues): string {
   }
 }
 
-export function renderSettingsHtml(values: SettingValues, nonce: string): string {
+export function renderSettingsHtml(values: SettingValues, nonce: string, categoryFilter?: string): string {
   const grouped = new Map<string, SettingMeta[]>();
   for (const meta of SETTINGS_META) {
     let list = grouped.get(meta.category);
@@ -131,31 +131,56 @@ export function renderSettingsHtml(values: SettingValues, nonce: string): string
   }
 
   let sectionsHtml = "";
-  for (const cat of CATEGORY_ORDER) {
-    const metas = grouped.get(cat);
-    if (!metas || metas.length === 0) continue;
-    const label = CATEGORY_LABELS[cat] ?? cat;
-    sectionsHtml += `\n  <h3 id="section-${escapeHtml(cat)}">${escapeHtml(label)}</h3>\n`;
-    for (const meta of metas) {
-      sectionsHtml += `  ${renderSetting(meta, values)}\n`;
-    }
-  }
 
-  // Cross-link buttons after Terminal section
-  sectionsHtml += `
+  if (categoryFilter) {
+    // Focused mode: render only the target category
+    const metas = grouped.get(categoryFilter);
+    if (metas && metas.length > 0) {
+      for (const meta of metas) {
+        sectionsHtml += `  <div class="settings-card">${renderSetting(meta, values)}</div>\n`;
+      }
+    }
+
+    // Show highlighting JSON link for highlighting category
+    if (categoryFilter === "highlighting") {
+      sectionsHtml += `
+  <div class="setting-desc" style="margin-top: 8px;">
+    <a href="#" id="open-highlighting-json">Edit highlighting rules in settings.json</a>
+  </div>`;
+    }
+
+    // Per-category reset button
+    sectionsHtml += `
+  <div class="button-row" style="margin-top: 24px; justify-content: flex-end;">
+    <button type="button" class="btn-secondary" id="reset-category-btn" data-category="${escapeHtml(categoryFilter)}">Reset to Defaults</button>
+  </div>`;
+  } else {
+    // Full mode: render everything as before
+    for (const cat of CATEGORY_ORDER) {
+      const metas = grouped.get(cat);
+      if (!metas || metas.length === 0) continue;
+      const label = CATEGORY_LABELS[cat] ?? cat;
+      sectionsHtml += `\n  <h3 id="section-${escapeHtml(cat)}">${escapeHtml(label)}</h3>\n`;
+      for (const meta of metas) {
+        sectionsHtml += `  ${renderSetting(meta, values)}\n`;
+      }
+    }
+
+    // Cross-link buttons after Terminal section
+    sectionsHtml += `
   <div class="button-row">
     <button type="button" class="btn-secondary" id="open-appearance-btn">Terminal Appearance\u2026</button>
     <button type="button" class="btn-secondary" id="open-macros-btn">Edit Macros\u2026</button>
   </div>`;
 
-  // After Highlighting section
-  sectionsHtml += `
+    // After Highlighting section
+    sectionsHtml += `
   <div class="setting-desc" style="margin-top: 8px;">
     <a href="#" id="open-highlighting-json">Edit highlighting rules in settings.json</a>
   </div>`;
 
-  // Import / Export section
-  sectionsHtml += `
+    // Import / Export section
+    sectionsHtml += `
   <h3 id="section-importexport">Import / Export</h3>
   <div class="setting-desc">Create an encrypted backup or export a sanitized copy to share.</div>
   <div class="button-row">
@@ -164,19 +189,20 @@ export function renderSettingsHtml(values: SettingValues, nonce: string): string
     <button type="button" class="btn-secondary" id="import-btn">Import\u2026</button>
   </div>`;
 
-  // Reset button
-  sectionsHtml += `
+    // Reset button
+    sectionsHtml += `
   <div class="button-row" style="margin-top: 24px; justify-content: flex-end;">
     <button type="button" class="btn-secondary" id="reset-all-btn">Reset All to Defaults</button>
   </div>`;
 
-  // Danger Zone
-  sectionsHtml += `
+    // Danger Zone
+    sectionsHtml += `
   <h3 id="section-dangerzone">Danger Zone</h3>
   <div class="setting-desc">Permanently delete all your data. This cannot be undone.</div>
   <div class="button-row">
     <button type="button" class="btn-danger" id="complete-reset-btn">Delete All Data\u2026</button>
   </div>`;
+  }
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -262,6 +288,12 @@ export function renderSettingsHtml(values: SettingValues, nonce: string): string
     }
     .btn-danger:hover {
       opacity: 0.9;
+    }
+    .settings-card {
+      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+      border-radius: 4px;
+      padding: 14px 16px;
+      margin-bottom: 16px;
     }
   </style>
 </head>
@@ -371,30 +403,38 @@ export function renderSettingsHtml(values: SettingValues, nonce: string): string
         })(multiGroups[mi]);
       }
 
-      // Cross-link buttons
-      document.getElementById("open-appearance-btn").addEventListener("click", function() {
+      // Optional button handlers (may not exist in focused mode)
+      function bindClick(id, handler) {
+        var el = document.getElementById(id);
+        if (el) el.addEventListener("click", handler);
+      }
+      bindClick("open-appearance-btn", function() {
         vscode.postMessage({ type: "openAppearance" });
       });
-      document.getElementById("open-macros-btn").addEventListener("click", function() {
+      bindClick("open-macros-btn", function() {
         vscode.postMessage({ type: "openMacroEditor" });
       });
-      document.getElementById("open-highlighting-json").addEventListener("click", function(e) {
+      bindClick("open-highlighting-json", function(e) {
         e.preventDefault();
         vscode.postMessage({ type: "openHighlightingJson" });
       });
-      document.getElementById("reset-all-btn").addEventListener("click", function() {
+      bindClick("reset-all-btn", function() {
         vscode.postMessage({ type: "resetAll" });
       });
-      document.getElementById("backup-btn").addEventListener("click", function() {
+      bindClick("reset-category-btn", function() {
+        var cat = document.getElementById("reset-category-btn");
+        vscode.postMessage({ type: "resetCategory", category: cat ? cat.dataset.category : "" });
+      });
+      bindClick("backup-btn", function() {
         vscode.postMessage({ type: "backup" });
       });
-      document.getElementById("share-btn").addEventListener("click", function() {
+      bindClick("share-btn", function() {
         vscode.postMessage({ type: "share" });
       });
-      document.getElementById("import-btn").addEventListener("click", function() {
+      bindClick("import-btn", function() {
         vscode.postMessage({ type: "importConfig" });
       });
-      document.getElementById("complete-reset-btn").addEventListener("click", function() {
+      bindClick("complete-reset-btn", function() {
         vscode.postMessage({ type: "completeReset" });
       });
 

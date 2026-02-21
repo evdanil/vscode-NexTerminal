@@ -187,3 +187,37 @@ export const CATEGORY_LABELS: Record<string, string> = {
   sftp: "SFTP / File Explorer",
   highlighting: "Highlighting"
 };
+
+export const CATEGORY_ICONS: Record<string, string> = {
+  logging: "output",
+  ssh: "remote",
+  tunnels: "plug",
+  terminal: "terminal",
+  sftp: "folder-opened",
+  highlighting: "symbol-color"
+};
+
+export function formatSettingValueForTree(meta: SettingMeta, rawValue: unknown): string {
+  switch (meta.type) {
+    case "boolean":
+      return rawValue ? "ON" : "OFF";
+    case "number": {
+      const num = typeof rawValue === "number" ? rawValue : (meta.min ?? 0);
+      return meta.unit ? `${num} ${meta.unit}` : String(num);
+    }
+    case "directory":
+      return typeof rawValue === "string" && rawValue.length > 0 ? rawValue : "(default)";
+    case "string":
+      return typeof rawValue === "string" && rawValue.length > 0 ? rawValue : "(default)";
+    case "enum": {
+      const val = typeof rawValue === "string" ? rawValue : (meta.enumOptions?.[0]?.value ?? "");
+      const opt = meta.enumOptions?.find((o) => o.value === val);
+      return opt?.label ?? val;
+    }
+    case "multi-checkbox": {
+      const arr = Array.isArray(rawValue) ? rawValue : [];
+      const total = meta.checkboxOptions?.length ?? 0;
+      return `${arr.length} of ${total}`;
+    }
+  }
+}

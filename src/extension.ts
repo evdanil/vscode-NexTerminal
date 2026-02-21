@@ -397,6 +397,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     commandCenterView,
     tunnelView,
     settingsView,
+    settingsTreeProvider,
     macroView,
     fileExplorerView,
     fsRegistration,

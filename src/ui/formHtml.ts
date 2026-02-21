@@ -122,7 +122,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
   ${csp}
   <style${nonceAttr}>
     ${baseWebviewCss()}
-    body { max-width: 520px; }
+    body { max-width: 700px; }
   </style>
 </head>
 <body>
