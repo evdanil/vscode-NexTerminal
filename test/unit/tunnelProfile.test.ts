@@ -43,4 +43,57 @@ describe("isTunnelRouteChanged", () => {
       })
     ).toBe(true);
   });
+
+  it("returns true when tunnelType changes", () => {
+    expect(
+      isTunnelRouteChanged(baseProfile, {
+        ...baseProfile,
+        tunnelType: "reverse"
+      })
+    ).toBe(true);
+  });
+
+  it("returns true when remoteBindAddress changes", () => {
+    const reverseProfile: TunnelProfile = {
+      ...baseProfile,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1"
+    };
+    expect(
+      isTunnelRouteChanged(reverseProfile, {
+        ...reverseProfile,
+        remoteBindAddress: "0.0.0.0"
+      })
+    ).toBe(true);
+  });
+
+  it("returns true when localTargetIP changes", () => {
+    const reverseProfile: TunnelProfile = {
+      ...baseProfile,
+      tunnelType: "reverse",
+      localTargetIP: "127.0.0.1"
+    };
+    expect(
+      isTunnelRouteChanged(reverseProfile, {
+        ...reverseProfile,
+        localTargetIP: "192.168.1.100"
+      })
+    ).toBe(true);
+  });
+
+  it("returns false when non-route fields change on reverse profile", () => {
+    const reverseProfile: TunnelProfile = {
+      ...baseProfile,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1",
+      localTargetIP: "127.0.0.1"
+    };
+    expect(
+      isTunnelRouteChanged(reverseProfile, {
+        ...reverseProfile,
+        name: "Renamed",
+        autoStart: true
+      })
+    ).toBe(false);
+  });
 });

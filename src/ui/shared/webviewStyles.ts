@@ -204,6 +204,12 @@ export function baseWebviewCss(): string {
       opacity: 1;
       background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground));
     }
+    .field-hint {
+      color: var(--vscode-descriptionForeground);
+      font-size: 11px;
+      margin-top: 3px;
+      line-height: 1.4;
+    }
     .field-error {
       color: var(--vscode-errorForeground);
       font-size: 11px;

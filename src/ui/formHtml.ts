@@ -3,6 +3,13 @@ import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
 
+function renderHint(field: FormFieldDescriptor): string {
+  if (!("hint" in field) || !field.hint) {
+    return "";
+  }
+  return `\n  <div class="field-hint">${escapeHtml(field.hint)}</div>`;
+}
+
 function visibleWhenAttrs(field: FormFieldDescriptor): string {
   if (!field.visibleWhen) {
     return "";
@@ -30,14 +37,14 @@ function renderField(field: FormFieldDescriptor): string {
       }
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
-  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
+  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
 
     case "number":
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
-  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
+  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
 

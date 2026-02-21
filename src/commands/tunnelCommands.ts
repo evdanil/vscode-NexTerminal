@@ -5,14 +5,16 @@ import type {
   ResolvedTunnelConnectionMode,
   ServerConfig,
   TunnelConnectionMode,
-  TunnelProfile
+  TunnelProfile,
+  TunnelType
 } from "../models/config";
+import { resolveTunnelType } from "../models/config";
 import type { SshFactory } from "../services/ssh/contracts";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
 import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
 import { serverFormDefinition, tunnelFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
-import { TunnelTreeItem } from "../ui/tunnelTreeProvider";
+import { TunnelTreeItem, formatTunnelRoute } from "../ui/tunnelTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { isTunnelRouteChanged } from "../utils/tunnelProfile";
 import { browseForKey, collectGroups, formValuesToServer } from "./serverCommands";
@@ -29,6 +31,10 @@ export async function resolveTunnelConnectionMode(
   profile: TunnelProfile,
   interactive: boolean
 ): Promise<ResolvedTunnelConnectionMode | undefined> {
+  // Reverse tunnels always require a shared connection
+  if (resolveTunnelType(profile) === "reverse") {
+    return "shared";
+  }
   const profileMode: TunnelConnectionMode = profile.connectionMode ?? getDefaultTunnelConnectionMode();
   if (profileMode !== "ask") {
     return profileMode;
@@ -171,7 +177,7 @@ async function pickTunnel(core: NexusCore): Promise<TunnelProfile | undefined> {
   const pick = await vscode.window.showQuickPick(
     tunnels.map((profile) => ({
       label: profile.name,
-      description: `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort}`,
+      description: formatTunnelRoute(profile),
       profile
     })),
     { title: "Select Tunnel Profile" }
@@ -222,11 +228,14 @@ async function stopTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<vo
     return;
   }
   const pick = await vscode.window.showQuickPick(
-    active.map((item) => ({
-      label: ctx.core.getTunnel(item.profileId)?.name ?? item.profileId,
-      description: `${item.localPort} -> ${item.remoteIP}:${item.remotePort}`,
-      active: item
-    })),
+    active.map((item) => {
+      const prof = ctx.core.getTunnel(item.profileId);
+      return {
+        label: prof?.name ?? item.profileId,
+        description: prof ? formatTunnelRoute(prof) : `${item.localPort} -> ${item.remoteIP}:${item.remotePort}`,
+        active: item
+      };
+    }),
     { title: "Stop active tunnel" }
   );
   if (!pick) {
@@ -240,16 +249,53 @@ function formValuesToTunnel(values: FormValues, existingId?: string, existingCon
   if (!name) {
     return undefined;
   }
+  const tunnelType = (typeof values.tunnelType === "string" ? values.tunnelType : "local") as TunnelType;
   const serverId = typeof values.defaultServerId === "string" && values.defaultServerId ? values.defaultServerId : undefined;
+
+  let localPort: number;
+  let remoteIP: string;
+  let remotePort: number;
+  let remoteBindAddress: string | undefined;
+  let localTargetIP: string | undefined;
+
+  switch (tunnelType) {
+    case "reverse":
+      localPort = typeof values.localPort_reverse === "number" ? values.localPort_reverse : 0;
+      remotePort = typeof values.remotePort_reverse === "number" ? values.remotePort_reverse : 0;
+      remoteBindAddress = typeof values.remoteBindAddress === "string" ? values.remoteBindAddress.trim() : "127.0.0.1";
+      localTargetIP = typeof values.localTargetIP === "string" ? values.localTargetIP.trim() : "127.0.0.1";
+      remoteIP = remoteBindAddress;
+      break;
+    case "dynamic":
+      localPort = typeof values.localPort_dynamic === "number" ? values.localPort_dynamic : 1080;
+      remoteIP = "0.0.0.0";
+      remotePort = 0;
+      break;
+    default:
+      localPort = typeof values.localPort === "number" ? values.localPort : 0;
+      remoteIP = typeof values.remoteIP === "string" ? values.remoteIP.trim() : "127.0.0.1";
+      remotePort = typeof values.remotePort === "number" ? values.remotePort : 0;
+      break;
+  }
+
+  // Force shared mode for reverse tunnels
+  const connectionMode = tunnelType === "reverse" ? "shared" : existingConnectionMode;
+
+  const notes = typeof values.notes === "string" ? values.notes.trim() : undefined;
+
   return {
     id: existingId ?? randomUUID(),
     name,
-    localPort: typeof values.localPort === "number" ? values.localPort : 0,
-    remoteIP: typeof values.remoteIP === "string" ? values.remoteIP.trim() : "127.0.0.1",
-    remotePort: typeof values.remotePort === "number" ? values.remotePort : 0,
+    localPort,
+    remoteIP,
+    remotePort,
     defaultServerId: serverId,
     autoStart: values.autoStart === true,
-    connectionMode: existingConnectionMode
+    connectionMode,
+    tunnelType: tunnelType === "local" ? undefined : tunnelType,
+    remoteBindAddress,
+    localTargetIP,
+    notes: notes || undefined
   };
 }
 
@@ -403,13 +449,18 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       if (!profile) {
         return;
       }
-      const info = `localhost:${profile.localPort} → ${profile.remoteIP}:${profile.remotePort}`;
+      const info = formatTunnelRoute(profile);
       await vscode.env.clipboard.writeText(info);
       void vscode.window.showInformationMessage(`Copied: ${info}`);
     }),
 
     vscode.commands.registerCommand("nexus.tunnel.openBrowser", (arg?: unknown) => {
       if (arg instanceof TunnelTreeItem && (arg.activeTunnelId || arg.isRemote)) {
+        // Reverse tunnels have no local listener to open
+        if (resolveTunnelType(arg.profile) === "reverse") {
+          void vscode.window.showInformationMessage("Reverse tunnels listen on the remote side, not locally.");
+          return;
+        }
         const url = `http://localhost:${arg.profile.localPort}`;
         void vscode.env.openExternal(vscode.Uri.parse(url));
       }

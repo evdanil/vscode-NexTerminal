@@ -85,6 +85,14 @@ export const SETTINGS_META: SettingMeta[] = [
       { label: "Isolated", value: "isolated", description: "Each TCP client gets its own SSH connection" }
     ]
   },
+  {
+    key: "defaultBindAddress",
+    section: "nexus.tunnel",
+    label: "Default Bind Address",
+    type: "string",
+    category: "tunnels",
+    description: "Default bind address for reverse tunnels. Use 127.0.0.1 for local-only or 0.0.0.0 for all interfaces (requires GatewayPorts on server)."
+  },
   // --- Terminal ---
   {
     key: "openLocation",

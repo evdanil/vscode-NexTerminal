@@ -1,9 +1,25 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
 import type { TunnelProfile } from "../models/config";
+import { resolveTunnelType } from "../models/config";
 import { formatBytes } from "../utils/helpers";
 
 const TUNNEL_DRAG_MIME = "application/vnd.nexus.tunnelProfile";
+
+export function formatTunnelRoute(profile: TunnelProfile): string {
+  const type = resolveTunnelType(profile);
+  switch (type) {
+    case "reverse": {
+      const bindAddr = profile.remoteBindAddress ?? "127.0.0.1";
+      const targetIP = profile.localTargetIP ?? "127.0.0.1";
+      return `R ${profile.remotePort} <- ${targetIP}:${profile.localPort}`;
+    }
+    case "dynamic":
+      return `D :${profile.localPort} SOCKS5`;
+    default:
+      return `L ${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort}`;
+  }
+}
 
 export class TunnelTreeItem extends vscode.TreeItem {
   public constructor(
@@ -16,13 +32,14 @@ export class TunnelTreeItem extends vscode.TreeItem {
   ) {
     super(profile.name, vscode.TreeItemCollapsibleState.None);
     this.id = `tunnel:${profile.id}`;
+    const routeDesc = formatTunnelRoute(profile);
     if (activeTunnelId) {
       this.contextValue = "nexus.activeTunnel";
       this.iconPath = new vscode.ThemeIcon(
         "circle-filled",
         new vscode.ThemeColor("testing.iconPassed")
       );
-      this.description = `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort} | in ${formatBytes(bytesIn ?? 0)} out ${formatBytes(bytesOut ?? 0)}`;
+      this.description = `${routeDesc} | in ${formatBytes(bytesIn ?? 0)} out ${formatBytes(bytesOut ?? 0)}`;
     } else if (isRemote) {
       this.contextValue = "nexus.remoteTunnel";
       this.iconPath = new vscode.ThemeIcon(
@@ -30,16 +47,16 @@ export class TunnelTreeItem extends vscode.TreeItem {
         new vscode.ThemeColor("charts.blue")
       );
       const via = remoteServerName ? ` via ${remoteServerName}` : "";
-      this.description = `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort}${via} (other window)`;
+      this.description = `${routeDesc}${via} (other window)`;
     } else {
       this.contextValue = "nexus.tunnel";
       this.iconPath = new vscode.ThemeIcon(
         "circle-outline",
         new vscode.ThemeColor("descriptionForeground")
       );
-      this.description = `${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort}`;
+      this.description = routeDesc;
     }
-    this.tooltip = this.description;
+    this.tooltip = profile.notes ? `${this.description}\n${profile.notes}` : this.description;
   }
 }
 

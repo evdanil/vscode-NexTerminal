@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar with connection multiplexing, a settings panel, macro editor, and regex-based terminal highlighting.",
-  "version": "2.7.4",
+  "version": "2.7.5",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -2057,6 +2057,12 @@
             "Each TCP client gets its own SSH connection (use only when connection isolation is critical)",
             "All clients share a single SSH connection (recommended — works with 2FA, lower resource usage)"
           ]
+        },
+        "nexus.tunnel.defaultBindAddress": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "order": 5.05,
+          "markdownDescription": "Default bind address for reverse tunnels. Use `127.0.0.1` for local-only or `0.0.0.0` for all interfaces (requires `GatewayPorts` on the SSH server)."
         },
         "nexus.ssh.multiplexing.enabled": {
           "type": "boolean",

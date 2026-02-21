@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
 import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
 import type { ServerConfig } from "../../models/config";
-import type { KeyboardInteractiveHandler, PtyOptions, SshConnection, SshConnector } from "./contracts";
+import type { KeyboardInteractiveHandler, PtyOptions, SshConnection, SshConnector, TcpConnectionInfo } from "./contracts";
 
 class Ssh2Connection implements SshConnection {
   private readonly closeListeners = new Set<() => void>();
@@ -54,6 +54,50 @@ class Ssh2Connection implements SshConnection {
         resolve(sftp);
       });
     });
+  }
+
+  public async requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
+    return new Promise((resolve, reject) => {
+      this.client.forwardIn(bindAddr, bindPort, (error: Error | undefined, port: number) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(port);
+      });
+    });
+  }
+
+  public async cancelForwardIn(bindAddr: string, bindPort: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.client.unforwardIn(bindAddr, bindPort, (error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  public onTcpConnection(
+    handler: (info: TcpConnectionInfo, accept: () => Duplex, reject: () => void) => void
+  ): () => void {
+    const listener = (
+      details: { destIP: string; destPort: number; srcIP: string; srcPort: number },
+      accept: () => Duplex,
+      reject: () => void
+    ): void => {
+      handler(
+        { destIP: details.destIP, destPort: details.destPort, srcIP: details.srcIP, srcPort: details.srcPort },
+        accept,
+        reject
+      );
+    };
+    this.client.on("tcp connection", listener);
+    return () => {
+      this.client.removeListener("tcp connection", listener);
+    };
   }
 
   public onClose(listener: () => void): () => void {

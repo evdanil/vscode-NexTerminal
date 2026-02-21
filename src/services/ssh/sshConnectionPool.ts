@@ -1,7 +1,7 @@
 import type { Duplex } from "node:stream";
 import type { SFTPWrapper } from "ssh2";
 import type { ServerConfig } from "../../models/config";
-import type { PtyOptions, SshConnection, SshFactory, SshPoolControl } from "./contracts";
+import type { PtyOptions, SshConnection, SshFactory, SshPoolControl, TcpConnectionInfo } from "./contracts";
 
 export interface PoolOptions {
   enabled: boolean;
@@ -45,6 +45,23 @@ class PooledSshConnection implements SshConnection {
   public openSftp(): Promise<SFTPWrapper> {
     this.assertNotDisposed();
     return this.inner.openSftp();
+  }
+
+  public requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
+    this.assertNotDisposed();
+    return this.inner.requestForwardIn(bindAddr, bindPort);
+  }
+
+  public cancelForwardIn(bindAddr: string, bindPort: number): Promise<void> {
+    this.assertNotDisposed();
+    return this.inner.cancelForwardIn(bindAddr, bindPort);
+  }
+
+  public onTcpConnection(
+    handler: (info: TcpConnectionInfo, accept: () => Duplex, reject: () => void) => void
+  ): () => void {
+    this.assertNotDisposed();
+    return this.inner.onTcpConnection(handler);
   }
 
   public onClose(listener: () => void): () => void {

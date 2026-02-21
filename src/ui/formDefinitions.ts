@@ -1,4 +1,5 @@
-import type { SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
+import type { SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
+import { resolveTunnelType } from "../models/config";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhen } from "./formTypes";
 
 function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDescriptor[] {
@@ -117,19 +118,45 @@ export interface TunnelFormOptions {
 
 export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: TunnelFormOptions): FormDefinition {
   const isEdit = Boolean(seed?.id);
+  const tunnelType: TunnelType = seed ? resolveTunnelType(seed as TunnelProfile) : "local";
   const serverOptions = [
     { label: "(Assign later)", value: "" },
     ...(options?.servers ?? []).map((s) => ({ label: s.name, value: s.id })),
     { label: "Create new server...", value: "__create__server" }
   ];
 
+  const localVw = { field: "tunnelType", value: "local" };
+  const reverseVw = { field: "tunnelType", value: "reverse" };
+  const dynamicVw = { field: "tunnelType", value: "dynamic" };
+  const localOrDynamicVw = { field: "tunnelType", value: "local" };
+
   return {
     title: isEdit ? "Edit Tunnel" : "Add Tunnel",
     fields: [
+      {
+        type: "select",
+        key: "tunnelType",
+        label: "Tunnel Type",
+        options: [
+          { label: "Local Forward (-L)", value: "local" },
+          { label: "Reverse Forward (-R)", value: "reverse" },
+          { label: "Dynamic SOCKS5 (-D)", value: "dynamic" }
+        ],
+        value: tunnelType
+      },
       { type: "text", key: "name", label: "Name", required: true, placeholder: "Database tunnel", value: seed?.name },
-      { type: "number", key: "localPort", label: "Local Port", required: true, min: 1, max: 65535, placeholder: "5432", value: seed?.localPort },
-      { type: "text", key: "remoteIP", label: "Remote IP", required: true, placeholder: "127.0.0.1", value: seed?.remoteIP ?? "127.0.0.1" },
-      { type: "number", key: "remotePort", label: "Remote Port", required: true, min: 1, max: 65535, placeholder: "5432", value: seed?.remotePort },
+      // Local forwarding fields
+      { type: "number", key: "localPort", label: "Local Port", required: true, min: 1, max: 65535, placeholder: "5432", value: seed?.localPort, visibleWhen: localVw },
+      { type: "text", key: "remoteIP", label: "Remote Host", required: true, placeholder: "127.0.0.1", value: seed?.remoteIP ?? "127.0.0.1", visibleWhen: localVw },
+      { type: "number", key: "remotePort", label: "Remote Port", required: true, min: 1, max: 65535, placeholder: "5432", value: seed?.remotePort, visibleWhen: localVw },
+      // Reverse forwarding fields
+      { type: "text", key: "remoteBindAddress", label: "Remote Bind Address", required: true, placeholder: "127.0.0.1", value: seed?.remoteBindAddress ?? "127.0.0.1", hint: "Non-loopback addresses require GatewayPorts clientspecified in sshd_config", visibleWhen: reverseVw },
+      { type: "number", key: "remotePort_reverse", label: "Remote Bind Port", required: true, min: 1, max: 65535, placeholder: "8080", value: seed?.remotePort, visibleWhen: reverseVw },
+      { type: "text", key: "localTargetIP", label: "Local Target Host", required: true, placeholder: "127.0.0.1", value: seed?.localTargetIP ?? "127.0.0.1", visibleWhen: reverseVw },
+      { type: "number", key: "localPort_reverse", label: "Local Target Port", required: true, min: 1, max: 65535, placeholder: "3000", value: seed?.localPort, visibleWhen: reverseVw },
+      // Dynamic SOCKS5 fields
+      { type: "number", key: "localPort_dynamic", label: "Local Port", required: true, min: 1, max: 65535, placeholder: "1080", value: seed?.localPort ?? 1080, visibleWhen: dynamicVw },
+      // Always visible
       {
         type: "select",
         key: "defaultServerId",
@@ -137,7 +164,8 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
         options: serverOptions,
         value: seed?.defaultServerId ?? ""
       },
-      { type: "checkbox", key: "autoStart", label: "Auto-start when server connects", value: seed?.autoStart ?? false }
+      { type: "checkbox", key: "autoStart", label: "Auto-start when server connects", value: seed?.autoStart ?? false },
+      { type: "text", key: "notes", label: "Notes", placeholder: "Optional description or notes", value: seed?.notes ?? "" }
     ]
   };
 }

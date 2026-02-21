@@ -1,6 +1,7 @@
 export type AuthType = "password" | "key" | "agent";
 export type TunnelConnectionMode = "isolated" | "shared" | "ask";
 export type ResolvedTunnelConnectionMode = Exclude<TunnelConnectionMode, "ask">;
+export type TunnelType = "local" | "reverse" | "dynamic";
 export type SerialParity = "none" | "even" | "odd" | "mark" | "space";
 export type SerialDataBits = 5 | 6 | 7 | 8;
 export type SerialStopBits = 1 | 2;
@@ -27,6 +28,10 @@ export interface TunnelProfile {
   defaultServerId?: string;
   autoStart: boolean;
   connectionMode?: TunnelConnectionMode;
+  tunnelType?: TunnelType;
+  remoteBindAddress?: string;
+  localTargetIP?: string;
+  notes?: string;
 }
 
 export interface SerialProfile {
@@ -63,6 +68,9 @@ export interface TunnelRouteInfo {
   remoteIP: string;
   remotePort: number;
   connectionMode: ResolvedTunnelConnectionMode;
+  tunnelType: TunnelType;
+  remoteBindAddress?: string;
+  localTargetIP?: string;
   startedAt: number;
 }
 
@@ -74,4 +82,8 @@ export interface ActiveTunnel extends TunnelRouteInfo {
 
 export interface TunnelRegistryEntry extends TunnelRouteInfo {
   ownerSessionId: string;
+}
+
+export function resolveTunnelType(profile: TunnelProfile): TunnelType {
+  return profile.tunnelType ?? "local";
 }

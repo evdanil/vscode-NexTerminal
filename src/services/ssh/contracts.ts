@@ -23,10 +23,20 @@ export interface PtyOptions {
   cols?: number;
 }
 
+export interface TcpConnectionInfo {
+  destIP: string;
+  destPort: number;
+  srcIP: string;
+  srcPort: number;
+}
+
 export interface SshConnection {
   openShell(ptyOptions?: PtyOptions): Promise<Duplex>;
   openDirectTcp(remoteIP: string, remotePort: number): Promise<Duplex>;
   openSftp(): Promise<SFTPWrapper>;
+  requestForwardIn(bindAddr: string, bindPort: number): Promise<number>;
+  cancelForwardIn(bindAddr: string, bindPort: number): Promise<void>;
+  onTcpConnection(handler: (info: TcpConnectionInfo, accept: () => Duplex, reject: () => void) => void): () => void;
   onClose(listener: () => void): () => void;
   dispose(): void;
 }

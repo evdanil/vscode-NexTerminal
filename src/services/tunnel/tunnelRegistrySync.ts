@@ -59,6 +59,9 @@ export class TunnelRegistrySync {
       remoteIP: tunnel.remoteIP,
       remotePort: tunnel.remotePort,
       connectionMode: tunnel.connectionMode,
+      tunnelType: tunnel.tunnelType,
+      remoteBindAddress: tunnel.remoteBindAddress,
+      localTargetIP: tunnel.localTargetIP,
       startedAt: tunnel.startedAt,
       ownerSessionId: this.sessionId
     };
@@ -86,6 +89,10 @@ export class TunnelRegistrySync {
     );
     if (!remote) {
       return undefined;
+    }
+    // Reverse tunnels have no local listener to probe — trust the registry
+    if (remote.tunnelType === "reverse") {
+      return remote;
     }
     const alive = await this.probePort(remote.localPort);
     return alive ? remote : undefined;
@@ -136,6 +143,9 @@ export class TunnelRegistrySync {
           remoteIP: tunnel.remoteIP,
           remotePort: tunnel.remotePort,
           connectionMode: tunnel.connectionMode,
+          tunnelType: tunnel.tunnelType,
+          remoteBindAddress: tunnel.remoteBindAddress,
+          localTargetIP: tunnel.localTargetIP,
           startedAt: tunnel.startedAt,
           ownerSessionId: this.sessionId
         });
@@ -148,9 +158,12 @@ export class TunnelRegistrySync {
     const entries = await this.store.getEntries();
     const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId);
 
-    // Probe all remote entries concurrently
+    // Probe all remote entries concurrently (reverse tunnels have no local listener to probe)
     const probeResults = await Promise.all(
-      remote.map(async (e) => ({ entry: e, alive: await this.probePort(e.localPort) }))
+      remote.map(async (e) => ({
+        entry: e,
+        alive: e.tunnelType === "reverse" ? true : await this.probePort(e.localPort)
+      }))
     );
     const staleProfileIds = new Set(
       probeResults.filter((r) => !r.alive).map((r) => `${r.entry.ownerSessionId}:${r.entry.profileId}`)

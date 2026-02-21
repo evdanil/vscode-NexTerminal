@@ -23,7 +23,7 @@ import { TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
 import { NexusTreeProvider } from "./ui/nexusTreeProvider";
 import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
-import { TunnelTreeProvider } from "./ui/tunnelTreeProvider";
+import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
 import { registerSettingsCommands } from "./commands/settingsCommands";
 import { registerConfigCommands } from "./commands/configCommands";
@@ -332,7 +332,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ? core.getSnapshot().activeTunnels.find((item) => item.id === event.tunnelId)
         : undefined;
       const profile = active ? core.getTunnel(active.profileId) : undefined;
-      const route = active ? `${active.localPort} -> ${active.remoteIP}:${active.remotePort}` : undefined;
+      const route = profile ? formatTunnelRoute(profile) : (active ? `${active.localPort} -> ${active.remoteIP}:${active.remotePort}` : undefined);
       if (message.includes("Channel open failure: Connection refused")) {
         void vscode.window.showErrorMessage(
           `Nexus tunnel error: Remote endpoint refused ${route ?? "requested route"}. Verify target host/port service is listening and reachable from SSH server.`

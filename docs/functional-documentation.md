@@ -58,14 +58,19 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 5. Output/input logs are written under extension global storage logs.
 
 ### 4.5 Tunnel Patch Bay
-1. Create tunnel profile with `Nexus: Add Tunnel`.
+1. Create tunnel profile with `Nexus: Add Tunnel`. Choose tunnel type from the dropdown:
+   - **Local Forward (-L)**: local TCP listener forwards to a remote target through SSH.
+   - **Reverse Forward (-R)**: the remote SSH server listens and forwards incoming connections back to a local target.
+   - **Dynamic SOCKS5 (-D)**: local SOCKS5 proxy routes connections through SSH to arbitrary destinations.
 2. Assign a default server, or leave unassigned to choose at start time.
 3. Start a tunnel from **Port Forwarding** (right-click > Start), or drag it onto a server in **Command Center**.
 4. In shared mode (default), the SSH connection is established eagerly at tunnel start — 2FA happens once upfront.
 5. Active tunnels show traffic counters (bytes in/out).
-6. **Tunnel Monitor** panel shows live route, server, counters, and start time.
-7. Connection mode can be profile-based: `isolated`, `shared`, or `ask every start`.
+6. **Tunnel Monitor** panel shows live route, type, server, counters, and start time.
+7. Connection mode can be profile-based: `isolated`, `shared`, or `ask every start`. Reverse tunnels always use shared mode.
 8. Right-click tunnel item to start/stop/restart/edit/remove/duplicate/copy info/open in browser.
+9. Tree view indicates tunnel type with prefix: `R` for reverse, `D` for dynamic SOCKS5.
+10. Cross-window tunnel visibility: all three tunnel types are registered in globalState and visible across VS Code windows.
 
 ### 4.6 Serial Sidecar
 1. Create a serial profile with `Nexus: Add Serial Profile` (name + group + line settings).
@@ -164,7 +169,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - `test/unit/nexusCore.test.ts`: repository load, CRUD, session/tunnel lifecycle updates.
 
 ### 6.2 Integration Tests
-- `test/integration/tunnelManager.integration.test.ts`: local echo-server forwarding through real TCP sockets and traffic event verification.
+- `test/integration/tunnelManager.integration.test.ts`: local/reverse/dynamic tunnel forwarding through real TCP sockets, SOCKS5 handshake, and traffic event verification.
 - `test/integration/serialSidecarManager.integration.test.ts`: sidecar request/response and notification flow with a mock worker process.
 
 Run:

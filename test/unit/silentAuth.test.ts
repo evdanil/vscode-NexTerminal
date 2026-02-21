@@ -16,6 +16,10 @@ const baseServer: ServerConfig = {
 const fakeConnection: SshConnection = {
   openShell: vi.fn(),
   openDirectTcp: vi.fn(),
+  openSftp: vi.fn(),
+  requestForwardIn: vi.fn(),
+  cancelForwardIn: vi.fn(),
+  onTcpConnection: vi.fn().mockReturnValue(() => {}),
   onClose: vi.fn().mockReturnValue(() => {}),
   dispose: vi.fn()
 };

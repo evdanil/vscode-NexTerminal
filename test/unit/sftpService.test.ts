@@ -36,6 +36,9 @@ function createMockConnection(sftp: ReturnType<typeof createMockSftp>): SshConne
     openShell: vi.fn(),
     openDirectTcp: vi.fn(),
     openSftp: vi.fn(async () => sftp as any),
+    requestForwardIn: vi.fn(),
+    cancelForwardIn: vi.fn(),
+    onTcpConnection: vi.fn().mockReturnValue(() => {}),
     onClose: vi.fn().mockReturnValue(() => {}),
     dispose: vi.fn(),
   };

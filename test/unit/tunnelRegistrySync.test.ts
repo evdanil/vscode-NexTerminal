@@ -14,6 +14,7 @@ function makeTunnel(overrides: Partial<ActiveTunnel> = {}): ActiveTunnel {
     remoteIP: "10.0.0.5",
     remotePort: 3306,
     connectionMode: "shared",
+    tunnelType: "local",
     startedAt: Date.now(),
     bytesIn: 0,
     bytesOut: 0,
@@ -29,6 +30,7 @@ function makeEntry(overrides: Partial<TunnelRegistryEntry> = {}): TunnelRegistry
     remoteIP: "10.0.0.5",
     remotePort: 3306,
     connectionMode: "shared",
+    tunnelType: "local",
     startedAt: Date.now(),
     ownerSessionId: "other-session",
     ...overrides

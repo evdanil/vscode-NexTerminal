@@ -1,6 +1,28 @@
 import type { SessionSnapshot } from "../core/contracts";
+import type { TunnelType } from "../models/config";
 import { formatBytes } from "../utils/helpers";
 import { escapeHtml } from "./shared/escapeHtml";
+
+function formatMonitorRoute(tunnelType: TunnelType, localPort: number, remoteIP: string, remotePort: number, remoteBindAddress?: string, localTargetIP?: string): string {
+  switch (tunnelType) {
+    case "reverse": {
+      const targetIP = localTargetIP ?? "127.0.0.1";
+      return `R ${remotePort} <- ${targetIP}:${localPort}`;
+    }
+    case "dynamic":
+      return `D :${localPort} SOCKS5`;
+    default:
+      return `L ${localPort} -> ${remoteIP}:${remotePort}`;
+  }
+}
+
+function tunnelTypeLabel(tunnelType: TunnelType): string {
+  switch (tunnelType) {
+    case "reverse": return "Reverse (-R)";
+    case "dynamic": return "Dynamic (-D)";
+    default: return "Local (-L)";
+  }
+}
 
 export function renderTunnelMonitorHtml(snapshot: SessionSnapshot): string {
   const tunnelRows = snapshot.activeTunnels
@@ -10,10 +32,12 @@ export function renderTunnelMonitorHtml(snapshot: SessionSnapshot): string {
       const name = profile?.name ?? active.profileId;
       const serverName = server?.name ?? active.serverId;
       const startedAt = new Date(active.startedAt).toLocaleTimeString();
+      const route = formatMonitorRoute(active.tunnelType, active.localPort, active.remoteIP, active.remotePort, active.remoteBindAddress, active.localTargetIP);
       return `<tr>
   <td>${escapeHtml(name)}</td>
   <td>${escapeHtml(serverName)}</td>
-  <td>${escapeHtml(`${active.localPort} -> ${active.remoteIP}:${active.remotePort}`)}</td>
+  <td>${escapeHtml(tunnelTypeLabel(active.tunnelType))}</td>
+  <td>${escapeHtml(route)}</td>
   <td>${escapeHtml(active.connectionMode)}</td>
   <td>${escapeHtml(formatBytes(active.bytesIn))}</td>
   <td>${escapeHtml(formatBytes(active.bytesOut))}</td>
@@ -29,6 +53,7 @@ export function renderTunnelMonitorHtml(snapshot: SessionSnapshot): string {
     <tr>
       <th scope="col">Tunnel</th>
       <th scope="col">Server</th>
+      <th scope="col">Type</th>
       <th scope="col">Route</th>
       <th scope="col">Mode</th>
       <th scope="col">Inbound</th>
