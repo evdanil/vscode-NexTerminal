@@ -623,6 +623,120 @@ describe("share import", () => {
   });
 });
 
+describe("import from MobaXterm command", () => {
+  let core: NexusCore;
+  let vault: MockVault;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+  });
+
+  it("imports SSH sessions and creates groups", async () => {
+    const ini = `[Bookmarks_1]
+SubRep=Production
+ImgNum=42
+WebServer=#109#0%web.example.com%22%deploy%%-1%
+DBServer=#109#0%db.example.com%5432%admin%%-1%
+`;
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/mobafile.ini", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(ini, "utf8"));
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    const cmd = registeredCommands.get("nexus.config.import.mobaxterm")!;
+    await cmd();
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(2);
+    expect(snapshot.servers[0].host).toBe("web.example.com");
+    expect(snapshot.servers[0].port).toBe(22);
+    expect(snapshot.servers[0].username).toBe("deploy");
+    expect(snapshot.servers[0].authType).toBe("password");
+    expect(snapshot.servers[0].group).toBe("Production");
+    expect(snapshot.servers[1].host).toBe("db.example.com");
+    expect(snapshot.servers[1].port).toBe(5432);
+    // Each server gets a fresh UUID
+    expect(snapshot.servers[0].id).not.toBe(snapshot.servers[1].id);
+    expect(snapshot.explicitGroups).toContain("Production");
+  });
+
+  it("shows warning when no SSH sessions found", async () => {
+    const ini = `[Bookmarks]
+SubRep=
+ImgNum=42
+RDP=#91#3%rdp.example.com%3389%user%%-1%
+`;
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/mobafile.ini", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(ini, "utf8"));
+
+    const cmd = registeredCommands.get("nexus.config.import.mobaxterm")!;
+    await cmd();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("No SSH sessions found (1 non-SSH skipped).");
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("does nothing when user cancels file picker", async () => {
+    mockShowOpenDialog.mockResolvedValue(undefined);
+
+    const cmd = registeredCommands.get("nexus.config.import.mobaxterm")!;
+    await cmd();
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("does nothing when user cancels confirmation", async () => {
+    const ini = `[Bookmarks]
+SubRep=
+ImgNum=42
+Server=#109#0%host.test%22%user%%-1%
+`;
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/mobafile.ini", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(ini, "utf8"));
+    mockShowInformationMessage.mockResolvedValueOnce(undefined); // cancelled
+
+    const cmd = registeredCommands.get("nexus.config.import.mobaxterm")!;
+    await cmd();
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+});
+
+describe("import from SecureCRT command", () => {
+  let core: NexusCore;
+  let vault: MockVault;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+  });
+
+  it("is registered as a command", () => {
+    expect(registeredCommands.has("nexus.config.import.securecrt")).toBe(true);
+  });
+
+  it("does nothing when user cancels folder picker", async () => {
+    mockShowOpenDialog.mockResolvedValue(undefined);
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+});
+
 describe("sanitizeForSharing", () => {
   it("generates fresh IDs and sanitizes user fields", () => {
     const servers = [makeServer({ username: "alice", keyPath: "/home/alice/.ssh/id_rsa" })];

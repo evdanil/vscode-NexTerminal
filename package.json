@@ -303,6 +303,16 @@
         "icon": "$(cloud-download)"
       },
       {
+        "command": "nexus.config.import.mobaxterm",
+        "title": "Import from MobaXterm",
+        "category": "Nexus"
+      },
+      {
+        "command": "nexus.config.import.securecrt",
+        "title": "Import from SecureCRT",
+        "category": "Nexus"
+      },
+      {
         "command": "nexus.config.completeReset",
         "title": "Delete All Data",
         "category": "Nexus"
@@ -991,6 +1001,14 @@
         },
         {
           "command": "nexus.config.import",
+          "when": "true"
+        },
+        {
+          "command": "nexus.config.import.mobaxterm",
+          "when": "true"
+        },
+        {
+          "command": "nexus.config.import.securecrt",
           "when": "true"
         },
         {

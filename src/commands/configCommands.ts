@@ -5,6 +5,9 @@ import type { ServerConfig, TunnelProfile, SerialProfile } from "../models/confi
 import type { SecretVault } from "../services/ssh/contracts";
 import { passwordSecretKey, passphraseSecretKey } from "../services/ssh/silentAuth";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
+import { normalizeFolderPath } from "../utils/folderPaths";
+import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
+import { parseSecureCrtDirectory, type SecureCrtFileEntry } from "../utils/securecrtParser";
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 
@@ -611,10 +614,132 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     void vscode.window.showInformationMessage("All Nexus data has been deleted.");
   }
 
+  async function importMobaxterm(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectMany: false,
+      filters: { "MobaXterm INI Files": ["ini"] },
+      title: "Import from MobaXterm"
+    });
+    if (!uris || uris.length === 0) return;
+
+    const raw = await vscode.workspace.fs.readFile(uris[0]);
+    const text = Buffer.from(raw).toString("utf8");
+    const result = parseMobaxtermSessions(text);
+
+    if (result.sessions.length === 0) {
+      const note = result.skippedCount > 0
+        ? `No SSH sessions found (${result.skippedCount} non-SSH skipped).`
+        : "No SSH sessions found in the selected file.";
+      void vscode.window.showWarningMessage(note);
+      return;
+    }
+
+    const folderNote = result.folders.length > 0 ? ` in ${result.folders.length} folder(s)` : "";
+    const skipNote = result.skippedCount > 0 ? ` (${result.skippedCount} non-SSH skipped)` : "";
+    const confirm = await vscode.window.showInformationMessage(
+      `Found ${result.sessions.length} SSH session(s)${folderNote}${skipNote}. Import?`,
+      { modal: true },
+      "Import"
+    );
+    if (confirm !== "Import") return;
+
+    for (const folder of result.folders) {
+      await core.addGroup(folder);
+    }
+    for (const session of result.sessions) {
+      await core.addOrUpdateServer({
+        id: randomUUID(),
+        name: session.name,
+        host: session.host,
+        port: session.port,
+        username: session.username,
+        authType: "password",
+        isHidden: false,
+        group: session.folder || undefined
+      });
+    }
+
+    void vscode.window.showInformationMessage(
+      `Imported ${result.sessions.length} SSH session(s) from MobaXterm.`
+    );
+  }
+
+  async function importSecureCrt(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: false,
+      canSelectFolders: true,
+      canSelectMany: false,
+      title: "Select SecureCRT Sessions Folder"
+    });
+    if (!uris || uris.length === 0) return;
+
+    const rootUri = uris[0];
+    const files: SecureCrtFileEntry[] = [];
+
+    async function walkDirectory(uri: vscode.Uri, folder: string): Promise<void> {
+      const entries = await vscode.workspace.fs.readDirectory(uri);
+      for (const [name, type] of entries) {
+        const childUri = vscode.Uri.joinPath(uri, name);
+        if (type === vscode.FileType.Directory) {
+          const childFolder = folder ? `${folder}/${name}` : name;
+          await walkDirectory(childUri, childFolder);
+        } else if (type === vscode.FileType.File && name.endsWith(".ini")) {
+          const raw = await vscode.workspace.fs.readFile(childUri);
+          const content = Buffer.from(raw).toString("utf8");
+          const sessionName = name.replace(/\.ini$/, "");
+          files.push({ name: sessionName, folder, content });
+        }
+      }
+    }
+
+    await walkDirectory(rootUri, "");
+    const result = parseSecureCrtDirectory(files);
+
+    if (result.sessions.length === 0) {
+      const note = result.skippedCount > 0
+        ? `No SSH sessions found (${result.skippedCount} non-SSH skipped).`
+        : "No SSH sessions found in the selected folder.";
+      void vscode.window.showWarningMessage(note);
+      return;
+    }
+
+    const folderNote = result.folders.length > 0 ? ` in ${result.folders.length} folder(s)` : "";
+    const skipNote = result.skippedCount > 0 ? ` (${result.skippedCount} non-SSH skipped)` : "";
+    const confirm = await vscode.window.showInformationMessage(
+      `Found ${result.sessions.length} SSH session(s)${folderNote}${skipNote}. Import?`,
+      { modal: true },
+      "Import"
+    );
+    if (confirm !== "Import") return;
+
+    for (const folder of result.folders) {
+      await core.addGroup(folder);
+    }
+    for (const session of result.sessions) {
+      await core.addOrUpdateServer({
+        id: randomUUID(),
+        name: session.name,
+        host: session.host,
+        port: session.port,
+        username: session.username,
+        authType: "password",
+        isHidden: false,
+        group: session.folder || undefined
+      });
+    }
+
+    void vscode.window.showInformationMessage(
+      `Imported ${result.sessions.length} SSH session(s) from SecureCRT.`
+    );
+  }
+
   return [
     vscode.commands.registerCommand("nexus.config.export", exportShare),
     vscode.commands.registerCommand("nexus.config.export.backup", exportBackup),
     vscode.commands.registerCommand("nexus.config.import", importConfig),
+    vscode.commands.registerCommand("nexus.config.import.mobaxterm", importMobaxterm),
+    vscode.commands.registerCommand("nexus.config.import.securecrt", importSecureCrt),
     vscode.commands.registerCommand("nexus.config.completeReset", completeReset)
   ];
 }

@@ -142,3 +142,4 @@ vite.config.ts.timestamp-*
 
 # Git worktrees
 .worktrees/
+tmp/

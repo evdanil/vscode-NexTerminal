@@ -63,6 +63,15 @@ You can also drag a tunnel profile onto a server in the Connectivity Hub to star
 - Run `Nexus: Export Configuration` to save all profiles and settings to a JSON file
 - Run `Nexus: Import Configuration` to restore from a backup (merge or replace)
 
+#### Import from MobaXterm or SecureCRT
+
+Power users migrating from other SSH clients can import their connection profiles directly:
+
+- **MobaXterm**: Run `Nexus: Import from MobaXterm` and select your MobaXterm `.ini` configuration file. SSH sessions are imported with their folder organization preserved.
+- **SecureCRT**: Run `Nexus: Import from SecureCRT` and select your SecureCRT `Sessions/` directory. SSH sessions are imported with their directory hierarchy as folder groups.
+
+Both importers extract hostname, port, and username from each SSH session. Non-SSH sessions (RDP, Telnet, etc.) are skipped. Imported servers default to password authentication.
+
 ## Development
 
 ```bash

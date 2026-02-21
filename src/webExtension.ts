@@ -61,6 +61,8 @@ const unsupportedCommands = [
   "nexus.config.export",
   "nexus.config.export.backup",
   "nexus.config.import",
+  "nexus.config.import.mobaxterm",
+  "nexus.config.import.securecrt",
   "nexus.config.completeReset",
   "nexus.macro.editor",
   "nexus.macro.add",
