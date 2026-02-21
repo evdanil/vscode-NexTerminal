@@ -35,6 +35,8 @@ node_modules/cpu-features/**
 node_modules/nan/**
 node_modules/buildcheck/**
 node_modules/esbuild/**
+node_modules/@rollup/**
+node_modules/rollup/**
 
 # Strip non-essential files from remaining node_modules
 node_modules/**/test/**
