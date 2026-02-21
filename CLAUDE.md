@@ -75,6 +75,12 @@ Passwords stored separately via VS Code `SecretStorage` with key pattern `passwo
 ### Web extension (`webExtension.ts`)
 Graceful degradation — registers stub commands showing "not available in browser" warnings. Intentional MVP gap.
 
+## Versioning & Releases
+
+- Every commit that will be tagged and deployed **must** bump the patch version in `package.json` (e.g. 2.7.5 → 2.7.6). The VS Code Marketplace rejects re-publishing the same version.
+- Never move or re-use an existing version tag. If a fix lands after tagging, bump the patch and create a new tag.
+- Tags follow `v{major}.{minor}.{patch}` format (e.g. `v2.7.6`).
+
 ## Development Workflow
 
 - Feature development uses git worktrees in the `.worktrees/` directory for isolation from the main working tree
