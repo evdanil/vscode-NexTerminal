@@ -20,6 +20,13 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 
 ## Getting Started
 
+### Install from VS Code Marketplace
+
+1. Open VS Code and go to the Extensions view (`Ctrl+Shift+X`)
+2. Search for **NexTerminal**
+3. Click **Install**
+4. Open the **Nexus** sidebar (activity bar icon)
+
 ### Install from VSIX
 
 1. Download the `.vsix` from [GitHub Releases](https://github.com/evdanil/vscode-NexTerminal/releases)

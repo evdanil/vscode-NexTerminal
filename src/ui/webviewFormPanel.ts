@@ -21,7 +21,7 @@ export class WebviewFormPanel {
       `nexus.form.${formId}`,
       definition.title,
       vscode.ViewColumn.Active,
-      { enableScripts: true, retainContextWhenHidden: false }
+      { enableScripts: true, retainContextWhenHidden: true }
     );
 
     const nonce = randomBytes(16).toString("base64");

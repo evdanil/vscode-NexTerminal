@@ -165,4 +165,91 @@ describe("TunnelRegistrySync", () => {
     expect(entries).toHaveLength(1);
     expect(entries[0].ownerSessionId).toBe("my-session");
   });
+
+  it("registerTunnel sets lastSeen timestamp", async () => {
+    await sync.initialize();
+    const tunnel = makeTunnel();
+    await sync.registerTunnel(tunnel);
+
+    const entries = await store.getEntries();
+    expect(entries[0].lastSeen).toBeDefined();
+    expect(typeof entries[0].lastSeen).toBe("number");
+  });
+
+  it("syncFast refreshes lastSeen on own active entries", async () => {
+    await sync.initialize();
+    const tunnel = makeTunnel();
+    await sync.registerTunnel(tunnel);
+    core.registerTunnel(tunnel);
+
+    const entriesBefore = await store.getEntries();
+    const initialLastSeen = entriesBefore[0].lastSeen!;
+
+    // Advance time and sync
+    vi.advanceTimersByTime(5_000);
+    await sync.syncNow();
+
+    const entriesAfter = await store.getEntries();
+    expect(entriesAfter[0].lastSeen).toBeGreaterThan(initialLastSeen);
+  });
+
+  it("checkRemoteOwnership detects stale reverse tunnel entries", async () => {
+    // Create a reverse tunnel entry with an old lastSeen
+    const staleTime = Date.now() - 200_000; // well past the threshold
+    await store.saveEntries([
+      makeEntry({ tunnelType: "reverse", lastSeen: staleTime })
+    ]);
+    await sync.initialize();
+
+    const result = await sync.checkRemoteOwnership("t1", 8080);
+    expect(result).toBeUndefined();
+  });
+
+  it("checkRemoteOwnership trusts fresh reverse tunnel entries", async () => {
+    await store.saveEntries([
+      makeEntry({ tunnelType: "reverse", lastSeen: Date.now() })
+    ]);
+    await sync.initialize();
+
+    const result = await sync.checkRemoteOwnership("t1", 8080);
+    expect(result).toBeDefined();
+  });
+
+  it("syncWithProbe evicts stale reverse tunnel entries", async () => {
+    const staleTime = Date.now() - 200_000;
+    await store.saveEntries([
+      makeEntry({ tunnelType: "reverse", lastSeen: staleTime })
+    ]);
+    await sync.initialize();
+
+    // syncWithProbe runs during initialize — stale reverse entry should be cleaned
+    const entries = await store.getEntries();
+    expect(entries).toHaveLength(0);
+    expect(core.getSnapshot().remoteTunnels).toHaveLength(0);
+  });
+
+  it("syncWithProbe keeps fresh reverse tunnel entries", async () => {
+    await store.saveEntries([
+      makeEntry({ tunnelType: "reverse", lastSeen: Date.now() })
+    ]);
+    probePort.mockResolvedValue(true);
+    await sync.initialize();
+
+    const entries = await store.getEntries();
+    expect(entries).toHaveLength(1);
+    expect(core.getSnapshot().remoteTunnels).toHaveLength(1);
+  });
+
+  it("reverse entries without lastSeen use startedAt for staleness", async () => {
+    // Simulate a pre-heartbeat entry (no lastSeen) with old startedAt
+    const oldStart = Date.now() - 200_000;
+    await store.saveEntries([
+      makeEntry({ tunnelType: "reverse", startedAt: oldStart })
+    ]);
+    await sync.initialize();
+
+    // Should be evicted since startedAt is too old
+    const entries = await store.getEntries();
+    expect(entries).toHaveLength(0);
+  });
 });

@@ -82,6 +82,7 @@ export interface ActiveTunnel extends TunnelRouteInfo {
 
 export interface TunnelRegistryEntry extends TunnelRouteInfo {
   ownerSessionId: string;
+  lastSeen?: number;
 }
 
 export function resolveTunnelType(profile: TunnelProfile): TunnelType {

@@ -6,6 +6,8 @@ import type { ActiveTunnel, TunnelRegistryEntry } from "../../models/config";
 const POLL_INTERVAL_MS = 3_000;
 const PROBE_TIMEOUT_MS = 200;
 const SLOW_REPROBE_INTERVAL_MS = 60_000;
+/** Entries not refreshed within this window are considered stale. */
+const STALE_THRESHOLD_MS = 30_000;
 
 export type ProbePortFn = (port: number) => Promise<boolean>;
 
@@ -63,7 +65,8 @@ export class TunnelRegistrySync {
       remoteBindAddress: tunnel.remoteBindAddress,
       localTargetIP: tunnel.localTargetIP,
       startedAt: tunnel.startedAt,
-      ownerSessionId: this.sessionId
+      ownerSessionId: this.sessionId,
+      lastSeen: Date.now()
     };
     entries.push(entry);
     await this.store.saveEntries(entries);
@@ -90,9 +93,10 @@ export class TunnelRegistrySync {
     if (!remote) {
       return undefined;
     }
-    // Reverse tunnels have no local listener to probe — trust the registry
+    // Reverse tunnels have no local listener to probe — use heartbeat staleness check
     if (remote.tunnelType === "reverse") {
-      return remote;
+      const lastSeen = remote.lastSeen ?? remote.startedAt;
+      return Date.now() - lastSeen < STALE_THRESHOLD_MS ? remote : undefined;
     }
     const alive = await this.probePort(remote.localPort);
     return alive ? remote : undefined;
@@ -128,9 +132,21 @@ export class TunnelRegistrySync {
       this.core.setRemoteTunnels(remote);
     }
 
-    // Self-heal: re-register own active tunnels if missing from registry
+    // Heartbeat: refresh lastSeen on own entries + self-heal missing entries
+    const now = Date.now();
     const activeTunnels = this.core.getSnapshot().activeTunnels;
     const ownEntries = entries.filter((e) => e.ownerSessionId === this.sessionId);
+    let changed = false;
+
+    // Update lastSeen on existing own entries
+    for (const entry of ownEntries) {
+      if (activeTunnels.some((t) => t.profileId === entry.profileId)) {
+        entry.lastSeen = now;
+        changed = true;
+      }
+    }
+
+    // Self-heal: re-register own active tunnels if missing from registry
     const missingOwn = activeTunnels.filter(
       (t) => !ownEntries.some((e) => e.profileId === t.profileId)
     );
@@ -147,9 +163,14 @@ export class TunnelRegistrySync {
           remoteBindAddress: tunnel.remoteBindAddress,
           localTargetIP: tunnel.localTargetIP,
           startedAt: tunnel.startedAt,
-          ownerSessionId: this.sessionId
+          ownerSessionId: this.sessionId,
+          lastSeen: now
         });
       }
+      changed = true;
+    }
+
+    if (changed) {
       await this.store.saveEntries(entries);
     }
   }
@@ -157,13 +178,19 @@ export class TunnelRegistrySync {
   private async syncWithProbe(): Promise<void> {
     const entries = await this.store.getEntries();
     const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId);
+    const now = Date.now();
 
-    // Probe all remote entries concurrently (reverse tunnels have no local listener to probe)
+    // Probe all remote entries concurrently.
+    // Reverse tunnels have no local listener to probe — use lastSeen heartbeat instead.
+    // Entries without lastSeen (pre-heartbeat) are given a grace period from startedAt.
     const probeResults = await Promise.all(
-      remote.map(async (e) => ({
-        entry: e,
-        alive: e.tunnelType === "reverse" ? true : await this.probePort(e.localPort)
-      }))
+      remote.map(async (e) => {
+        if (e.tunnelType === "reverse") {
+          const lastSeen = e.lastSeen ?? e.startedAt;
+          return { entry: e, alive: now - lastSeen < STALE_THRESHOLD_MS };
+        }
+        return { entry: e, alive: await this.probePort(e.localPort) };
+      })
     );
     const staleProfileIds = new Set(
       probeResults.filter((r) => !r.alive).map((r) => `${r.entry.ownerSessionId}:${r.entry.profileId}`)
