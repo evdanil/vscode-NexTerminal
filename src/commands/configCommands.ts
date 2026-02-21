@@ -34,6 +34,7 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.logging", key: "maxFileSizeMb" },
   { section: "nexus.logging", key: "maxRotatedFiles" },
   { section: "nexus.tunnel", key: "defaultConnectionMode" },
+  { section: "nexus.tunnel", key: "defaultBindAddress" },
   { section: "nexus.terminal", key: "openLocation" },
   { section: "nexus.terminal", key: "keyboardPassthrough" },
   { section: "nexus.terminal", key: "passthroughKeys" },
@@ -46,6 +47,8 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.sftp", key: "maxCacheEntries" },
   { section: "nexus.sftp", key: "autoRefreshInterval" }
 ];
+
+const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`));
 
 function readSettings(): Record<string, unknown> {
   const result: Record<string, unknown> = {};
@@ -70,17 +73,29 @@ function stripSecretMacroText(settings: Record<string, unknown>): Record<string,
 }
 
 async function applySettings(settings: Record<string, unknown>): Promise<void> {
-  // Sanitize imported macro keybinding values
-  const macros = settings["nexus.terminal.macros"];
-  if (Array.isArray(macros)) {
-    for (const m of macros as MacroEntry[]) {
-      if (m.keybinding && (typeof m.keybinding !== "string" || !isValidBinding(m.keybinding))) {
-        delete m.keybinding;
-      }
+  const allowedSettings: Record<string, unknown> = {};
+  for (const [fullKey, value] of Object.entries(settings)) {
+    if (SETTINGS_KEY_SET.has(fullKey)) {
+      allowedSettings[fullKey] = value;
     }
   }
 
-  for (const [fullKey, value] of Object.entries(settings)) {
+  // Sanitize imported macro keybinding values
+  const macros = allowedSettings["nexus.terminal.macros"];
+  if (Array.isArray(macros)) {
+    allowedSettings["nexus.terminal.macros"] = (macros as MacroEntry[]).map((macro) => {
+      if (!macro || typeof macro !== "object") {
+        return macro;
+      }
+      const safeMacro = { ...macro };
+      if (safeMacro.keybinding && (typeof safeMacro.keybinding !== "string" || !isValidBinding(safeMacro.keybinding))) {
+        delete safeMacro.keybinding;
+      }
+      return safeMacro;
+    });
+  }
+
+  for (const [fullKey, value] of Object.entries(allowedSettings)) {
     const lastDot = fullKey.lastIndexOf(".");
     if (lastDot < 0) {
       continue;

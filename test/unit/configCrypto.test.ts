@@ -41,4 +41,22 @@ describe("configCrypto", () => {
     const payload = encrypt(plaintext, "password123");
     expect(decrypt(payload, "password123")).toBe(plaintext);
   });
+
+  it("rejects unsupported algorithm metadata", () => {
+    const payload = encrypt("hello", "password");
+    expect(() => decrypt({ ...payload, kdf: "scrypt" as any }, "password")).toThrow("Unsupported key derivation function");
+    expect(() => decrypt({ ...payload, cipher: "aes-256-cbc" as any }, "password")).toThrow("Unsupported cipher");
+  });
+
+  it("rejects invalid iteration counts", () => {
+    const payload = encrypt("hello", "password");
+    expect(() => decrypt({ ...payload, iterations: 1 }, "password")).toThrow("Invalid PBKDF2 iteration count");
+    expect(() => decrypt({ ...payload, iterations: 2_000_000 }, "password")).toThrow("Invalid PBKDF2 iteration count");
+  });
+
+  it("rejects malformed payload fields", () => {
+    const payload = encrypt("hello", "password");
+    expect(() => decrypt({ ...payload, iv: "not/base64!!" }, "password")).toThrow("iv is not valid base64");
+    expect(() => decrypt({ ...payload, tag: "AAAA" }, "password")).toThrow("tag has unexpected length");
+  });
 });

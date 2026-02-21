@@ -1,8 +1,15 @@
 import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
-import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import { Client, type ConnectConfig, type SFTPWrapper, type VerifyCallback } from "ssh2";
 import type { ServerConfig } from "../../models/config";
-import type { KeyboardInteractiveHandler, PtyOptions, SshConnection, SshConnector, TcpConnectionInfo } from "./contracts";
+import type {
+  HostKeyVerifier,
+  KeyboardInteractiveHandler,
+  PtyOptions,
+  SshConnection,
+  SshConnector,
+  TcpConnectionInfo
+} from "./contracts";
 
 class Ssh2Connection implements SshConnection {
   private readonly closeListeners = new Set<() => void>();
@@ -148,11 +155,22 @@ async function toConnectConfig(server: ServerConfig, password?: string, passphra
 }
 
 export class Ssh2Connector implements SshConnector {
+  public constructor(private readonly hostKeyVerifier?: HostKeyVerifier) {}
+
   public async connect(
     server: ServerConfig,
     auth: { password?: string; passphrase?: string; onKeyboardInteractive?: KeyboardInteractiveHandler }
   ): Promise<SshConnection> {
     const config = await toConnectConfig(server, auth.password, auth.passphrase);
+    if (this.hostKeyVerifier) {
+      config.hostVerifier = (hostKey: Buffer | string, verify: VerifyCallback): void => {
+        const rawHostKey = Buffer.isBuffer(hostKey) ? hostKey : Buffer.from(hostKey, "hex");
+        void this.hostKeyVerifier!.verify(server, rawHostKey).then(
+          (allowed) => verify(allowed),
+          () => verify(false)
+        );
+      };
+    }
     const client = new Client();
     return new Promise((resolve, reject) => {
       let settled = false;

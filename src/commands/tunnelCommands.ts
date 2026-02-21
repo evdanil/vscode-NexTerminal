@@ -27,6 +27,15 @@ export function getDefaultTunnelConnectionMode(): ResolvedTunnelConnectionMode {
   return configured === "isolated" ? "isolated" : "shared";
 }
 
+function getDefaultReverseBindAddress(): string {
+  const configured = vscode.workspace.getConfiguration("nexus.tunnel").get<string>("defaultBindAddress", "127.0.0.1");
+  return configured.trim() || "127.0.0.1";
+}
+
+function getDefaultSessionTranscriptsEnabled(): boolean {
+  return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
+}
+
 export async function resolveTunnelConnectionMode(
   profile: TunnelProfile,
   interactive: boolean
@@ -124,33 +133,35 @@ export async function startTunnel(
     }
   }
 
-  const authenticated = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: `Starting tunnel "${profile.name}"`,
-      cancellable: false
-    },
-    async () => {
-      try {
-        const connection = await sshFactory.connect(server);
-        connection.dispose();
-        return true;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "unknown SSH error";
-        if (message.toLowerCase().includes("password entry canceled")) {
-          void vscode.window.showInformationMessage(`Tunnel "${profile.name}" start canceled.`);
+  if (connectionMode === "shared") {
+    const authenticated = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Starting tunnel "${profile.name}"`,
+        cancellable: false
+      },
+      async () => {
+        try {
+          const connection = await sshFactory.connect(server);
+          connection.dispose();
+          return true;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "unknown SSH error";
+          if (message.toLowerCase().includes("password entry canceled")) {
+            void vscode.window.showInformationMessage(`Tunnel "${profile.name}" start canceled.`);
+            return false;
+          }
+          void vscode.window.showErrorMessage(
+            `Failed to authenticate tunnel "${profile.name}" on "${server.name}": ${message}`
+          );
           return false;
         }
-        void vscode.window.showErrorMessage(
-          `Failed to authenticate tunnel "${profile.name}" on "${server.name}": ${message}`
-        );
-        return false;
       }
-    }
-  );
+    );
 
-  if (!authenticated) {
-    return;
+    if (!authenticated) {
+      return;
+    }
   }
 
   await tunnelManager.start(profile, server, { connectionMode });
@@ -303,7 +314,10 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
   return [
     vscode.commands.registerCommand("nexus.tunnel.add", () => {
       const servers = ctx.core.getSnapshot().servers.filter((s) => !s.isHidden);
-      const definition = tunnelFormDefinition(undefined, { servers });
+      const definition = tunnelFormDefinition(undefined, {
+        servers,
+        defaultBindAddress: getDefaultReverseBindAddress()
+      });
       const panel = WebviewFormPanel.open("tunnel-add", definition, {
         onSubmit: async (values) => {
           const profile = formValuesToTunnel(values);
@@ -315,7 +329,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
         onCreateInline: (key) => {
           if (key === "defaultServerId") {
             const existingGroups = collectGroups(ctx);
-            const serverDef = serverFormDefinition(undefined, existingGroups);
+            const serverDef = serverFormDefinition(undefined, existingGroups, getDefaultSessionTranscriptsEnabled());
             WebviewFormPanel.open("tunnel-add-server", serverDef, {
               onSubmit: async (serverValues) => {
                 const server = formValuesToServer(serverValues);
@@ -338,7 +352,10 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const servers = ctx.core.getSnapshot().servers.filter((s) => !s.isHidden);
-      const definition = tunnelFormDefinition(existing, { servers });
+      const definition = tunnelFormDefinition(existing, {
+        servers,
+        defaultBindAddress: getDefaultReverseBindAddress()
+      });
       const panel = WebviewFormPanel.open("tunnel-edit", definition, {
         onSubmit: async (values) => {
           const updated = formValuesToTunnel(values, existing.id, existing.connectionMode);
@@ -382,7 +399,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
         onCreateInline: (key) => {
           if (key === "defaultServerId") {
             const existingGroups = collectGroups(ctx);
-            const serverDef = serverFormDefinition(undefined, existingGroups);
+            const serverDef = serverFormDefinition(undefined, existingGroups, getDefaultSessionTranscriptsEnabled());
             WebviewFormPanel.open("tunnel-edit-server", serverDef, {
               onSubmit: async (serverValues) => {
                 const server = formValuesToServer(serverValues);

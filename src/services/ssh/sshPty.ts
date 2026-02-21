@@ -46,7 +46,6 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.dispose();
       return;
     }
-    this.logger.log(`stdin ${JSON.stringify(data)}`);
     this.stream?.write(data);
   }
 
@@ -73,29 +72,45 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
 
   private async start(dimensions?: vscode.TerminalDimensions): Promise<void> {
     try {
-      this.connection = await this.sshFactory.connect(this.serverConfig);
-      this.stream = await this.connection.openShell({
+      const connection = await this.sshFactory.connect(this.serverConfig);
+      if (this.disposed) {
+        connection.dispose();
+        return;
+      }
+      this.connection = connection;
+
+      const stream = await connection.openShell({
         term: "xterm-256color",
         rows: dimensions?.rows,
         cols: dimensions?.columns
       });
+      if (this.disposed) {
+        stream.destroy();
+        connection.dispose();
+        return;
+      }
+      this.stream = stream;
+
       this.callbacks.onSessionOpened(this.sessionId);
       this.logger.log(`connected to ${this.serverConfig.name}`);
 
-      this.connection.onClose(() => this.dispose());
-      this.stream.on("data", (data: Buffer | string) => {
+      connection.onClose(() => this.dispose());
+      stream.on("data", (data: Buffer | string) => {
         const text = typeof data === "string" ? data : data.toString("utf8");
         this.logger.log(`stdout ${JSON.stringify(text)}`);
         this.transcript?.write(text);
         this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(text) : text);
       });
-      this.stream.on("close", () => this.dispose());
-      this.stream.on("error", (error: Error) => {
+      stream.on("close", () => this.dispose());
+      stream.on("error", (error: Error) => {
         this.logger.log(`error ${error.message}`);
         this.writeEmitter.fire(`\r\n[Nexus SSH Error] ${error.message}\r\n`);
         this.dispose();
       });
     } catch (error) {
+      if (this.disposed) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "unknown SSH error";
       this.logger.log(`connect failed ${message}`);
       this.connectFailed = true;

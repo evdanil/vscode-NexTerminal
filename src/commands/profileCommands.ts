@@ -11,7 +11,8 @@ import { normalizeFolderPath, folderDisplayName, isDescendantOrSelf, MAX_FOLDER_
 
 export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed): void {
   const existingGroups = collectGroups(ctx);
-  const definition = unifiedProfileFormDefinition(seed, existingGroups);
+  const defaultLogSession = vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
+  const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession);
   WebviewFormPanel.open("profile-add", definition, {
     onSubmit: async (values: FormValues) => {
       if (values.profileType === "serial") {

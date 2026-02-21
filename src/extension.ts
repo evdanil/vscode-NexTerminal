@@ -13,6 +13,7 @@ import { SftpService } from "./services/sftp/sftpService";
 import { SilentAuthSshFactory } from "./services/ssh/silentAuth";
 import { SshConnectionPool } from "./services/ssh/sshConnectionPool";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
+import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
 import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
 import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
 import { TerminalHighlighter } from "./services/terminalHighlighter";
@@ -136,8 +137,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     maxRotatedFiles
   });
   const secretVault = new VscodeSecretVault(context);
+  const hostKeyVerifier = new VscodeHostKeyVerifier(context.globalState);
   const sshFactory = new SilentAuthSshFactory(
-    new Ssh2Connector(),
+    new Ssh2Connector(hostKeyVerifier),
     secretVault,
     new VscodePasswordPrompt(),
     (message, isPassword) =>

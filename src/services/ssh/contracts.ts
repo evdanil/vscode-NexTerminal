@@ -11,6 +11,10 @@ export interface PasswordPrompt {
   prompt(server: ServerConfig): Promise<PasswordPromptResult | undefined>;
 }
 
+export interface HostKeyVerifier {
+  verify(server: ServerConfig, hostKey: Buffer): Promise<boolean>;
+}
+
 export interface SecretVault {
   get(key: string): Promise<string | undefined>;
   store(key: string, value: string): Promise<void>;

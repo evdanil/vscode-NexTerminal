@@ -124,6 +124,10 @@ const VALID_DATA_BITS = new Set<number>([5, 6, 7, 8]);
 const VALID_STOP_BITS = new Set<number>([1, 2]);
 const VALID_PARITY = new Set<string>(["none", "even", "odd", "mark", "space"]);
 
+function getDefaultSessionTranscriptsEnabled(): boolean {
+  return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
+}
+
 export function formValuesToSerial(values: FormValues, existingId?: string): SerialProfile | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const portPath = typeof values.path === "string" ? values.path.trim() : "";
@@ -142,7 +146,7 @@ export function formValuesToSerial(values: FormValues, existingId?: string): Ser
     stopBits: VALID_STOP_BITS.has(stopBits) ? (stopBits as SerialStopBits) : 1,
     parity: VALID_PARITY.has(parity) ? (parity as SerialParity) : "none",
     rtscts: values.rtscts === true,
-    logSession: values.logSession !== false,
+    logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
     group: typeof values.group === "string" && values.group ? values.group : undefined
   };
 }
@@ -159,7 +163,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const existingGroups = collectGroups(ctx);
-      const definition = serialFormDefinition(existing, existingGroups);
+      const definition = serialFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled());
       WebviewFormPanel.open("serial-edit", definition, {
         onScan: () => scanForPort(ctx),
         onSubmit: async (values) => {
@@ -235,7 +239,11 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
             }
           },
           ctx.loggerFactory.create("terminal", `serial-${profile.id}`),
-          createSessionTranscript(ctx.sessionLogDir, profile.name, profile.logSession !== false),
+          createSessionTranscript(
+            ctx.sessionLogDir,
+            profile.name,
+            profile.logSession ?? getDefaultSessionTranscriptsEnabled()
+          ),
           ctx.highlighter
         );
 

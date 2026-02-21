@@ -2221,7 +2221,7 @@
               "secret": {
                 "type": "boolean",
                 "default": false,
-                "description": "Hide macro value from sidebar and session logs"
+                "description": "Hide macro value in sidebar/pickers. Note: if the remote side echoes input, it can still appear in terminal output and transcripts."
               }
             }
           },

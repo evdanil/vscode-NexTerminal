@@ -303,7 +303,13 @@ export class SftpService {
 
   private async doConnect(server: ServerConfig): Promise<void> {
     const connection = await this.sshFactory.connect(server);
-    const sftp = await connection.openSftp();
+    let sftp: SFTPWrapper;
+    try {
+      sftp = await connection.openSftp();
+    } catch (error) {
+      connection.dispose();
+      throw error;
+    }
     this.sessions.set(server.id, { connection, sftp });
     const unsub = connection.onClose(() => {
       this.cleanupSession(server.id);

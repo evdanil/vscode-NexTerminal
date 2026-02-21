@@ -101,7 +101,7 @@ export function renderMacroEditorHtml(
   <div class="form-group form-group-checkbox">
     <label>
       <input type="checkbox" id="macro-secret"${isSecret ? " checked" : ""} />
-      Secret (hide from sidebar and logs)
+      Secret (hide value in sidebar and pickers; remote echo may still appear in terminal output)
     </label>
   </div>
 

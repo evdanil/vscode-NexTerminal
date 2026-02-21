@@ -183,6 +183,7 @@ describe("SETTINGS_KEYS", () => {
   it("includes tunnel settings", () => {
     const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
     expect(keys).toContain("nexus.tunnel.defaultConnectionMode");
+    expect(keys).toContain("nexus.tunnel.defaultBindAddress");
   });
 
   it("includes SSH multiplexing settings", () => {
@@ -316,6 +317,26 @@ describe("config import command (legacy)", () => {
     const snapshot = core.getSnapshot();
     expect(snapshot.explicitGroups).toContain("Production");
     expect(snapshot.explicitGroups).toContain("Staging");
+  });
+
+  it("ignores unknown imported settings keys", async () => {
+    const exportData = makeExportData({
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      settings: {
+        "nexus.logging.maxFileSizeMb": 12,
+        "nexus.tunnel.defaultBindAddress": "0.0.0.0",
+        "nexus.logging.unexpectedKey": true,
+        "badkey": "value"
+      }
+    });
+    await runImport(exportData);
+
+    expect(configStore.get("nexus.logging.maxFileSizeMb")).toBe(12);
+    expect(configStore.get("nexus.tunnel.defaultBindAddress")).toBe("0.0.0.0");
+    expect(configStore.has("nexus.logging.unexpectedKey")).toBe(false);
+    expect(configStore.has("badkey")).toBe(false);
   });
 
   it("generates IDs for items with missing IDs", async () => {

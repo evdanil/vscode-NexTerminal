@@ -71,6 +71,17 @@ describe("SftpService", () => {
     expect(service.isConnected("srv-1")).toBe(true);
   });
 
+  it("disposes SSH connection if SFTP channel creation fails", async () => {
+    const failingConnection = createMockConnection(sftp);
+    (failingConnection.openSftp as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("open sftp failed"));
+    const failingFactory = createMockFactory(failingConnection);
+    const failingService = new SftpService(failingFactory);
+
+    await expect(failingService.connect(testServer)).rejects.toThrow("open sftp failed");
+    expect(failingConnection.dispose).toHaveBeenCalled();
+    expect(failingService.isConnected("srv-1")).toBe(false);
+  });
+
   it("does not reconnect if already connected", async () => {
     await service.connect(testServer);
     await service.connect(testServer);

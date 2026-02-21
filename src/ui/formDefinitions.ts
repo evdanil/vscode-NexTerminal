@@ -85,9 +85,13 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
   ];
 }
 
-function sharedTrailingFields(seed?: { logSession?: boolean; group?: string }, existingGroups?: string[]): FormFieldDescriptor[] {
+function sharedTrailingFields(
+  seed?: { logSession?: boolean; group?: string },
+  existingGroups?: string[],
+  defaultLogSession = true
+): FormFieldDescriptor[] {
   return [
-    { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.logSession ?? true },
+    { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.logSession ?? defaultLogSession },
     {
       type: "combobox",
       key: "group",
@@ -99,7 +103,11 @@ function sharedTrailingFields(seed?: { logSession?: boolean; group?: string }, e
   ];
 }
 
-export function serverFormDefinition(seed?: Partial<ServerConfig>, existingGroups?: string[]): FormDefinition {
+export function serverFormDefinition(
+  seed?: Partial<ServerConfig>,
+  existingGroups?: string[],
+  defaultLogSession = true
+): FormDefinition {
   const isEdit = Boolean(seed?.id);
 
   return {
@@ -107,18 +115,20 @@ export function serverFormDefinition(seed?: Partial<ServerConfig>, existingGroup
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
       ...sshFields(seed),
-      ...sharedTrailingFields(seed, existingGroups)
+      ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ]
   };
 }
 
 export interface TunnelFormOptions {
   servers?: Array<{ id: string; name: string; host: string; username: string }>;
+  defaultBindAddress?: string;
 }
 
 export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: TunnelFormOptions): FormDefinition {
   const isEdit = Boolean(seed?.id);
   const tunnelType: TunnelType = seed ? resolveTunnelType(seed as TunnelProfile) : "local";
+  const defaultBindAddress = options?.defaultBindAddress?.trim() || "127.0.0.1";
   const serverOptions = [
     { label: "(Assign later)", value: "" },
     ...(options?.servers ?? []).map((s) => ({ label: s.name, value: s.id })),
@@ -150,7 +160,7 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
       { type: "text", key: "remoteIP", label: "Remote Host", required: true, placeholder: "127.0.0.1", value: seed?.remoteIP ?? "127.0.0.1", visibleWhen: localVw },
       { type: "number", key: "remotePort", label: "Remote Port", required: true, min: 1, max: 65535, placeholder: "5432", value: seed?.remotePort, visibleWhen: localVw },
       // Reverse forwarding fields
-      { type: "text", key: "remoteBindAddress", label: "Remote Bind Address", required: true, placeholder: "127.0.0.1", value: seed?.remoteBindAddress ?? "127.0.0.1", hint: "Non-loopback addresses require GatewayPorts clientspecified in sshd_config", visibleWhen: reverseVw },
+      { type: "text", key: "remoteBindAddress", label: "Remote Bind Address", required: true, placeholder: "127.0.0.1", value: seed?.remoteBindAddress ?? defaultBindAddress, hint: "Non-loopback addresses require GatewayPorts clientspecified in sshd_config", visibleWhen: reverseVw },
       { type: "number", key: "remotePort_reverse", label: "Remote Bind Port", required: true, min: 1, max: 65535, placeholder: "8080", value: seed?.remotePort, visibleWhen: reverseVw },
       { type: "text", key: "localTargetIP", label: "Local Target Host", required: true, placeholder: "127.0.0.1", value: seed?.localTargetIP ?? "127.0.0.1", visibleWhen: reverseVw },
       { type: "number", key: "localPort_reverse", label: "Local Target Port", required: true, min: 1, max: 65535, placeholder: "3000", value: seed?.localPort, visibleWhen: reverseVw },
@@ -170,7 +180,11 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
   };
 }
 
-export function serialFormDefinition(seed?: Partial<SerialProfile>, existingGroups?: string[]): FormDefinition {
+export function serialFormDefinition(
+  seed?: Partial<SerialProfile>,
+  existingGroups?: string[],
+  defaultLogSession = true
+): FormDefinition {
   const isEdit = Boolean(seed?.id);
 
   return {
@@ -178,7 +192,7 @@ export function serialFormDefinition(seed?: Partial<SerialProfile>, existingGrou
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "Arduino", value: seed?.name },
       ...serialFields(seed),
-      ...sharedTrailingFields(seed, existingGroups)
+      ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ]
   };
 }
@@ -188,7 +202,11 @@ export interface UnifiedProfileSeed {
   group?: string;
 }
 
-export function unifiedProfileFormDefinition(seed?: UnifiedProfileSeed, existingGroups?: string[]): FormDefinition {
+export function unifiedProfileFormDefinition(
+  seed?: UnifiedProfileSeed,
+  existingGroups?: string[],
+  defaultLogSession = true
+): FormDefinition {
   const sshVw = { field: "profileType", value: "ssh" };
   const serialVw = { field: "profileType", value: "serial" };
 
@@ -208,7 +226,7 @@ export function unifiedProfileFormDefinition(seed?: UnifiedProfileSeed, existing
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server or Arduino" },
       ...sshFields(undefined, sshVw),
       ...serialFields(undefined, serialVw),
-      ...sharedTrailingFields({ group: seed?.group }, existingGroups)
+      ...sharedTrailingFields({ group: seed?.group }, existingGroups, defaultLogSession)
     ]
   };
 }

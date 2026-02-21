@@ -57,7 +57,6 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     if (!this.sidecarSessionId) {
       return;
     }
-    this.logger.log(`serial stdin ${JSON.stringify(data)}`);
     void this.transport.writePort(this.sidecarSessionId, Buffer.from(data, "utf8")).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : "unknown serial write error";
       this.writeEmitter.fire(`\r\n[Nexus Serial Error] ${message}\r\n`);

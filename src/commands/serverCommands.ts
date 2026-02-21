@@ -108,6 +108,10 @@ function isAuthType(value: unknown): value is AuthType {
   return typeof value === "string" && VALID_AUTH_TYPES.has(value);
 }
 
+function getDefaultSessionTranscriptsEnabled(): boolean {
+  return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
+}
+
 export function formValuesToServer(values: FormValues, existingId?: string, preserveIsHidden = false): ServerConfig | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const host = typeof values.host === "string" ? values.host.trim() : "";
@@ -125,7 +129,7 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
     group: typeof values.group === "string" && values.group ? values.group : undefined,
     isHidden: preserveIsHidden,
-    logSession: values.logSession !== false
+    logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled()
   };
 }
 
@@ -193,7 +197,11 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
           }
         },
         ctx.loggerFactory.create("terminal", server.id),
-        createSessionTranscript(ctx.sessionLogDir, server.name, server.logSession !== false),
+        createSessionTranscript(
+          ctx.sessionLogDir,
+          server.name,
+          server.logSession ?? getDefaultSessionTranscriptsEnabled()
+        ),
         ctx.highlighter
       );
       const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
@@ -248,7 +256,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const existingGroups = collectGroups(ctx);
-      const definition = serverFormDefinition(existing, existingGroups);
+      const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled());
       WebviewFormPanel.open("server-edit", definition, {
         onSubmit: async (values) => {
           const updated = formValuesToServer(values, existing.id, existing.isHidden);

@@ -11,9 +11,56 @@ export interface EncryptedPayload {
 }
 
 const ITERATIONS = 210_000;
+const MIN_ITERATIONS = 100_000;
+const MAX_ITERATIONS = 1_000_000;
 const KEY_LENGTH = 32;
 const SALT_LENGTH = 16;
 const IV_LENGTH = 12;
+const TAG_LENGTH = 16;
+
+function decodeBase64(field: string, value: unknown): Buffer {
+  if (typeof value !== "string") {
+    throw new Error(`Invalid encrypted payload: ${field} must be base64 string`);
+  }
+  if (value.length > 0 && (!/^[A-Za-z0-9+/]+={0,2}$/u.test(value) || value.length % 4 !== 0)) {
+    throw new Error(`Invalid encrypted payload: ${field} is not valid base64`);
+  }
+  return Buffer.from(value, "base64");
+}
+
+function validatePayload(payload: EncryptedPayload): {
+  salt: Buffer;
+  iv: Buffer;
+  tag: Buffer;
+  ciphertext: Buffer;
+} {
+  if (payload.kdf !== "pbkdf2-sha512") {
+    throw new Error("Unsupported key derivation function");
+  }
+  if (payload.cipher !== "aes-256-gcm") {
+    throw new Error("Unsupported cipher");
+  }
+  if (!Number.isInteger(payload.iterations) || payload.iterations < MIN_ITERATIONS || payload.iterations > MAX_ITERATIONS) {
+    throw new Error("Invalid PBKDF2 iteration count");
+  }
+
+  const salt = decodeBase64("salt", payload.salt);
+  const iv = decodeBase64("iv", payload.iv);
+  const tag = decodeBase64("tag", payload.tag);
+  const ciphertext = decodeBase64("ciphertext", payload.ciphertext);
+
+  if (salt.length !== SALT_LENGTH) {
+    throw new Error("Invalid encrypted payload: salt has unexpected length");
+  }
+  if (iv.length !== IV_LENGTH) {
+    throw new Error("Invalid encrypted payload: iv has unexpected length");
+  }
+  if (tag.length !== TAG_LENGTH) {
+    throw new Error("Invalid encrypted payload: tag has unexpected length");
+  }
+
+  return { salt, iv, tag, ciphertext };
+}
 
 export function encrypt(plaintext: string, password: string): EncryptedPayload {
   const salt = randomBytes(SALT_LENGTH);
@@ -34,10 +81,7 @@ export function encrypt(plaintext: string, password: string): EncryptedPayload {
 }
 
 export function decrypt(payload: EncryptedPayload, password: string): string {
-  const salt = Buffer.from(payload.salt, "base64");
-  const iv = Buffer.from(payload.iv, "base64");
-  const tag = Buffer.from(payload.tag, "base64");
-  const ciphertext = Buffer.from(payload.ciphertext, "base64");
+  const { salt, iv, tag, ciphertext } = validatePayload(payload);
   const key = pbkdf2Sync(password, salt, payload.iterations, KEY_LENGTH, "sha512");
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(tag);
