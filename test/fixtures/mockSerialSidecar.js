@@ -36,6 +36,10 @@ rl.on("line", (line) => {
     notify("portData", { sessionId, data });
     return;
   }
+  if (request.method === "sendBreak") {
+    respond(request.id, { ok: true });
+    return;
+  }
   if (request.method === "closePort") {
     respond(request.id, { ok: true });
     notify("portError", { sessionId: request.params.sessionId, message: "closed" });

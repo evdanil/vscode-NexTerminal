@@ -336,6 +336,24 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       await ctx.core.addOrUpdateSerialProfile(copy);
     }),
 
+    vscode.commands.registerCommand("nexus.serial.sendBreak", async () => {
+      const activeTerminal = vscode.window.activeTerminal;
+      if (!activeTerminal) {
+        return;
+      }
+      for (const [sessionId, entry] of ctx.serialTerminals.entries()) {
+        if (entry.terminal === activeTerminal) {
+          try {
+            await ctx.serialSidecar.sendBreak(sessionId);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "unknown serial break error";
+            void vscode.window.showErrorMessage(`Failed to send break: ${message}`);
+          }
+          return;
+        }
+      }
+    }),
+
     vscode.commands.registerCommand("nexus.serial.listPorts", async () => {
       try {
         const ports = await listSerialPorts(ctx.serialSidecar);

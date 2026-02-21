@@ -49,6 +49,7 @@ describe("SerialSidecarManager integration", () => {
     expect(sessionId).toBe("session-1");
 
     await manager.writePort(sessionId, Buffer.from("hello", "utf8"));
+    await manager.sendBreak(sessionId);
     await manager.closePort(sessionId);
 
     const readyData = await waitFor(() => dataEvents.find((item) => item.payload === "ready"));

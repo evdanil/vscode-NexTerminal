@@ -61,6 +61,10 @@ export class SerialSidecarManager {
     await this.request("writePort", { sessionId, data: data.toString("base64") });
   }
 
+  public async sendBreak(sessionId: string, duration?: number): Promise<void> {
+    await this.request("sendBreak", { sessionId, duration });
+  }
+
   public async closePort(sessionId: string): Promise<void> {
     await this.request("closePort", { sessionId });
   }

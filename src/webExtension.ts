@@ -37,6 +37,7 @@ const unsupportedCommands = [
   "nexus.serial.listPorts",
   "nexus.serial.connect",
   "nexus.serial.disconnect",
+  "nexus.serial.sendBreak",
   "nexus.profile.add",
   "nexus.group.add",
   "nexus.group.remove",

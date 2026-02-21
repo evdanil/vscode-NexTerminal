@@ -5,6 +5,7 @@ import type { OpenPortParams, RpcNotification, RpcRequest, RpcResponse, SerialPo
 type PortRecord = {
   write(data: Buffer, callback: (error?: Error | null) => void): void;
   close(callback: (error?: Error | null) => void): void;
+  set(options: Record<string, boolean>, callback: (error?: Error | null) => void): void;
   on(event: "data", listener: (data: Buffer) => void): void;
   on(event: "error", listener: (error: Error) => void): void;
 };
@@ -127,6 +128,26 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
     const data = Buffer.from(params.data, "base64");
     await new Promise<void>((resolve, reject) => {
       port.write(data, (error) => (error ? reject(error) : resolve()));
+    });
+    return response(request.id, { ok: true });
+  }
+
+  if (request.method === "sendBreak") {
+    const params = request.params as { sessionId?: string; duration?: number };
+    if (!params.sessionId) {
+      return response(request.id, undefined, "invalid sendBreak parameters");
+    }
+    const port = ports.get(params.sessionId);
+    if (!port) {
+      return response(request.id, undefined, "unknown serial session");
+    }
+    const duration = Math.min(Math.max(params.duration ?? 250, 0), 5000);
+    await new Promise<void>((resolve, reject) => {
+      port.set({ brk: true }, (error) => (error ? reject(error) : resolve()));
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, duration));
+    await new Promise<void>((resolve, reject) => {
+      port.set({ brk: false }, (error) => (error ? reject(error) : resolve()));
     });
     return response(request.id, { ok: true });
   }

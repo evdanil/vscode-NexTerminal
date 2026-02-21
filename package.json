@@ -221,6 +221,12 @@
         "icon": "$(edit)"
       },
       {
+        "command": "nexus.serial.sendBreak",
+        "title": "Send Break",
+        "category": "Nexus",
+        "icon": "$(zap)"
+      },
+      {
         "command": "nexus.group.connect",
         "title": "Connect All",
         "icon": "$(plug)"
@@ -932,6 +938,10 @@
           "when": "true"
         },
         {
+          "command": "nexus.serial.sendBreak",
+          "when": "true"
+        },
+        {
           "command": "nexus.profile.add",
           "when": "true"
         },
@@ -1171,6 +1181,24 @@
         },
         "key": "ctrl+w",
         "when": "terminalFocus && nexus.passthrough.ctrlW"
+      },
+      {
+        "command": "workbench.action.terminal.sendSequence",
+        "args": {
+          "text": "\u0011"
+        },
+        "key": "ctrl+q",
+        "when": "terminalFocus"
+      },
+      {
+        "command": "nexus.serial.sendBreak",
+        "key": "ctrl+pausebreak",
+        "when": "terminalFocus"
+      },
+      {
+        "command": "nexus.serial.sendBreak",
+        "key": "ctrl+scrolllock",
+        "when": "terminalFocus"
       },
       {
         "command": "nexus.macro.run",
