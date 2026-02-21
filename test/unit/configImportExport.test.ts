@@ -11,6 +11,7 @@ const mockShowOpenDialog = vi.fn();
 const mockShowInputBox = vi.fn();
 const mockWriteFile = vi.fn();
 const mockReadFile = vi.fn();
+const mockReadDirectory = vi.fn();
 const mockWithProgress = vi.fn();
 const mockConfigUpdate = vi.fn();
 const configStore = new Map<string, unknown>();
@@ -38,7 +39,8 @@ vi.mock("vscode", () => ({
   workspace: {
     fs: {
       writeFile: (...args: unknown[]) => mockWriteFile(...args),
-      readFile: (...args: unknown[]) => mockReadFile(...args)
+      readFile: (...args: unknown[]) => mockReadFile(...args),
+      readDirectory: (...args: unknown[]) => mockReadDirectory(...args)
     },
     getConfiguration: vi.fn((section: string) => ({
       get: (key: string) => configStore.get(`${section}.${key}`),
@@ -53,8 +55,13 @@ vi.mock("vscode", () => ({
     }))
   },
   Uri: {
-    file: (path: string) => ({ fsPath: path, scheme: "file" })
+    file: (path: string) => ({ fsPath: path, scheme: "file" }),
+    joinPath: (base: { fsPath: string; scheme: string }, ...parts: string[]) => ({
+      fsPath: [base.fsPath, ...parts].join("/").replace(/\/+/g, "/"),
+      scheme: base.scheme
+    })
   },
+  FileType: { File: 1, Directory: 2 },
   ConfigurationTarget: { Global: 1 },
   ProgressLocation: { Notification: 15 }
 }));
@@ -725,6 +732,95 @@ describe("import from SecureCRT command", () => {
 
   it("is registered as a command", () => {
     expect(registeredCommands.has("nexus.config.import.securecrt")).toBe(true);
+  });
+
+  it("imports SSH sessions recursively, supports mixed-case .ini extension, and creates groups", async () => {
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/Sessions", scheme: "file" }]);
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    mockReadDirectory.mockImplementation(async (uri: { fsPath: string }) => {
+      switch (uri.fsPath) {
+        case "/fake/Sessions":
+          return [
+            ["Prod", 2], // Directory
+            ["RootSession.INI", 1], // File
+            ["Telnet.ini", 1], // File (non-SSH)
+            ["notes.txt", 1] // File (ignored by extension)
+          ];
+        case "/fake/Sessions/Prod":
+          return [
+            ["App.ini", 1], // File
+            ["Nested", 2] // Directory
+          ];
+        case "/fake/Sessions/Prod/Nested":
+          return [
+            ["Db.iNi", 1] // File
+          ];
+        default:
+          return [];
+      }
+    });
+
+    mockReadFile.mockImplementation(async (uri: { fsPath: string }) => {
+      const byPath: Record<string, string> = {
+        "/fake/Sessions/RootSession.INI": `S:"Protocol Name"=SSH2\nS:"Hostname"=root.example.com\nD:"[SSH2] Port"=00000016`,
+        "/fake/Sessions/Telnet.ini": `S:"Protocol Name"=Telnet\nS:"Hostname"=telnet.example.com`,
+        "/fake/Sessions/Prod/App.ini": `S:"Protocol Name"=SSH2\nS:"Hostname"=app.example.com\nD:"[SSH2] Port"=000008AE\nS:"Username"=deploy`,
+        "/fake/Sessions/Prod/Nested/Db.iNi": `S:"Protocol Name"=SSH2\nS:"Hostname"=db.example.com\nD:"[SSH2] Port"=00011170\nS:"Username"=`
+      };
+      return Buffer.from(byPath[uri.fsPath] ?? "", "utf8");
+    });
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(3);
+
+    const root = snapshot.servers.find((s) => s.name === "RootSession");
+    expect(root).toBeDefined();
+    expect(root?.username).toBe("user");
+    expect(root?.port).toBe(22);
+    expect(root?.group).toBeUndefined();
+
+    const app = snapshot.servers.find((s) => s.name === "App");
+    expect(app).toBeDefined();
+    expect(app?.username).toBe("deploy");
+    expect(app?.port).toBe(2222);
+    expect(app?.group).toBe("Prod");
+
+    const db = snapshot.servers.find((s) => s.name === "Db");
+    expect(db).toBeDefined();
+    expect(db?.username).toBe("user");
+    expect(db?.port).toBe(22); // out-of-range value normalized
+    expect(db?.group).toBe("Prod/Nested");
+
+    expect(snapshot.explicitGroups).toContain("Prod");
+    expect(snapshot.explicitGroups).toContain("Prod/Nested");
+  });
+
+  it("shows warning when folder has no SSH sessions", async () => {
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/Sessions", scheme: "file" }]);
+    mockReadDirectory.mockResolvedValue([["Telnet.ini", 1]]);
+    mockReadFile.mockResolvedValue(Buffer.from(`S:"Protocol Name"=Telnet\nS:"Hostname"=legacy.example.com`, "utf8"));
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("No SSH sessions found (1 non-SSH skipped).");
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("does nothing when user cancels confirmation", async () => {
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/Sessions", scheme: "file" }]);
+    mockReadDirectory.mockResolvedValue([["Srv.ini", 1]]);
+    mockReadFile.mockResolvedValue(Buffer.from(`S:"Protocol Name"=SSH2\nS:"Hostname"=srv.example.com`, "utf8"));
+    mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
   });
 
   it("does nothing when user cancels folder picker", async () => {

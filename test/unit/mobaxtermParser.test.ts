@@ -133,7 +133,7 @@ NoPort=#109#0%host.example.com%%user%%-1%
     expect(result.sessions[0].port).toBe(22);
   });
 
-  it("keeps empty username", () => {
+  it("defaults missing username to user", () => {
     const text = `[Bookmarks]
 SubRep=
 ImgNum=42
@@ -141,7 +141,18 @@ NoUser=#109#0%host.example.com%22%%%-1%
 `;
     const result = parseMobaxtermSessions(text);
     expect(result.sessions).toHaveLength(1);
-    expect(result.sessions[0].username).toBe("");
+    expect(result.sessions[0].username).toBe("user");
+  });
+
+  it("defaults to port 22 when parsed port is out of range", () => {
+    const text = `[Bookmarks]
+SubRep=
+ImgNum=42
+HugePort=#109#0%host.example.com%70000%user%%-1%
+`;
+    const result = parseMobaxtermSessions(text);
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0].port).toBe(22);
   });
 
   it("truncates folder deeper than max depth", () => {

@@ -5,7 +5,6 @@ import type { ServerConfig, TunnelProfile, SerialProfile } from "../models/confi
 import type { SecretVault } from "../services/ssh/contracts";
 import { passwordSecretKey, passphraseSecretKey } from "../services/ssh/silentAuth";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
-import { normalizeFolderPath } from "../utils/folderPaths";
 import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
 import { parseSecureCrtDirectory, type SecureCrtFileEntry } from "../utils/securecrtParser";
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile } from "../utils/validation";
@@ -684,10 +683,10 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         if (type === vscode.FileType.Directory) {
           const childFolder = folder ? `${folder}/${name}` : name;
           await walkDirectory(childUri, childFolder);
-        } else if (type === vscode.FileType.File && name.endsWith(".ini")) {
+        } else if (type === vscode.FileType.File && name.toLowerCase().endsWith(".ini")) {
           const raw = await vscode.workspace.fs.readFile(childUri);
           const content = Buffer.from(raw).toString("utf8");
-          const sessionName = name.replace(/\.ini$/, "");
+          const sessionName = name.replace(/\.ini$/i, "");
           files.push({ name: sessionName, folder, content });
         }
       }

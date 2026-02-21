@@ -19,6 +19,10 @@ interface IniSection {
   entries: Map<string, string>;
 }
 
+function normalizePort(rawPort: number): number {
+  return Number.isFinite(rawPort) && rawPort >= 1 && rawPort <= 65_535 ? rawPort : 22;
+}
+
 /** Generic INI parser. Handles BOM, CRLF, `[section]` headers and `key=value` entries. */
 export function parseIniSections(text: string): IniSection[] {
   // Strip BOM
@@ -103,8 +107,8 @@ export function parseMobaxtermSessions(text: string): ImportParseResult {
       }
 
       const rawPort = parseInt(fields[1] ?? "", 10);
-      const port = Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 22;
-      const username = (fields[2] ?? "").trim();
+      const port = normalizePort(rawPort);
+      const username = (fields[2] ?? "").trim() || "user";
 
       if (folder) {
         folderSet.add(folder);

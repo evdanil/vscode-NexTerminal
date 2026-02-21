@@ -96,23 +96,32 @@ S:"Username"=user
     expect(result!.port).toBe(22);
   });
 
-  it("keeps empty username", () => {
+  it("defaults empty username to user", () => {
     const content = `S:"Protocol Name"=SSH2
 S:"Hostname"=host.test
 D:"[SSH2] Port"=00000016
 S:"Username"=
 `;
     const result = parseSecureCrtSessionFile(content, "Test", "");
-    expect(result!.username).toBe("");
+    expect(result!.username).toBe("user");
   });
 
-  it("keeps empty username when field is absent", () => {
+  it("defaults username to user when field is absent", () => {
     const content = `S:"Protocol Name"=SSH2
 S:"Hostname"=host.test
 D:"[SSH2] Port"=00000016
 `;
     const result = parseSecureCrtSessionFile(content, "Test", "");
-    expect(result!.username).toBe("");
+    expect(result!.username).toBe("user");
+  });
+
+  it("defaults to port 22 when parsed port is out of range", () => {
+    const content = `S:"Protocol Name"=SSH2
+S:"Hostname"=host.test
+D:"[SSH2] Port"=00011170
+`;
+    const result = parseSecureCrtSessionFile(content, "Test", "");
+    expect(result!.port).toBe(22);
   });
 
   it("normalizes folder path", () => {

@@ -9,6 +9,13 @@ export interface SecureCrtFileEntry {
   content: string;
 }
 
+function normalizePort(rawPort: number | undefined): number {
+  if (rawPort === undefined) {
+    return 22;
+  }
+  return Number.isFinite(rawPort) && rawPort >= 1 && rawPort <= 65_535 ? rawPort : 22;
+}
+
 /**
  * Parse a single SecureCRT `.ini` session file.
  *
@@ -54,8 +61,8 @@ export function parseSecureCrtSessionFile(
     return undefined;
   }
 
-  const port = dwords.get("[SSH2] Port") ?? 22;
-  const username = (fields.get("Username") ?? "").trim();
+  const port = normalizePort(dwords.get("[SSH2] Port"));
+  const username = (fields.get("Username") ?? "").trim() || "user";
   const normalizedFolder = folder ? (normalizeFolderPath(folder) ?? "") : "";
 
   return { name, host, port, username, folder: normalizedFolder };
