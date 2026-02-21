@@ -354,6 +354,16 @@ describe("SshConnectionPool", () => {
     expect(f.connect).toHaveBeenCalledTimes(1); // reused
   });
 
+  it("server with multiplexing: true overrides global disabled and still uses pool", async () => {
+    const muxServer: ServerConfig = { ...testServer, multiplexing: true };
+    const f = createMockFactory();
+    const p = new SshConnectionPool(f, { enabled: false, idleTimeoutMs: 5000 });
+
+    await p.connect(muxServer);
+    await p.connect(muxServer);
+    expect(f.connect).toHaveBeenCalledTimes(1); // reused
+  });
+
   // --- Multiplexing fallback ---
 
   it("falls back to standalone connection when openShell fails on reused pooled connection", async () => {
@@ -362,7 +372,7 @@ describe("SshConnectionPool", () => {
     pooledConn.openShell = vi.fn(async () => {
       shellCallCount++;
       if (shellCallCount > 1) {
-        throw new Error("Channel open failure");
+        throw new Error("Channel open failure: Administratively prohibited");
       }
       return {} as any;
     });
@@ -405,7 +415,7 @@ describe("SshConnectionPool", () => {
     pooledConn.openShell = vi.fn(async () => {
       pooledShellCalls++;
       if (pooledShellCalls > 1) {
-        throw new Error("Channel open failure");
+        throw new Error("Channel open failure: Administratively prohibited");
       }
       return {} as any;
     });
@@ -435,6 +445,28 @@ describe("SshConnectionPool", () => {
     // Dispose last lease — now pooled connection is orphaned and should be disposed
     lease1.dispose();
     expect(pooledConn.dispose).toHaveBeenCalled();
+  });
+
+  it("does not fall back on connection-refused channel errors from reused pooled connection", async () => {
+    const pooledConn = createMockConnection();
+    let directTcpCalls = 0;
+    pooledConn.openDirectTcp = vi.fn(async () => {
+      directTcpCalls++;
+      if (directTcpCalls > 1) {
+        throw new Error("Channel open failure: Connection refused");
+      }
+      return {} as any;
+    });
+    const standaloneConn = createMockConnection();
+    const f = createMockFactory([pooledConn, standaloneConn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const lease1 = await p.connect(testServer);
+    await lease1.openDirectTcp("127.0.0.1", 8080);
+
+    const lease2 = await p.connect(testServer);
+    await expect(lease2.openDirectTcp("127.0.0.1", 8080)).rejects.toThrow("Connection refused");
+    expect(f.connect).toHaveBeenCalledTimes(1); // no fallback connection created
   });
 
   it("idle timeout 0 means keep alive until explicit disconnect", async () => {

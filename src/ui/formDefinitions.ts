@@ -20,7 +20,7 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDes
       visibleWhen: vw
     },
     { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, visibleWhen: vw },
-    { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, visibleWhen: vw }
+    { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, hint: "Overrides the global multiplexing setting for this server", visibleWhen: vw }
   ];
 }
 

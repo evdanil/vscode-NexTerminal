@@ -22,6 +22,63 @@ interface PoolEntry {
 }
 
 const MAX_IDLE_TIMEOUT_MS = 3_600_000;
+const SSH_OPEN_ADMINISTRATIVELY_PROHIBITED = 1;
+const SSH_OPEN_CONNECT_FAILED = 2;
+const SSH_OPEN_UNKNOWN_CHANNEL_TYPE = 3;
+const SSH_OPEN_RESOURCE_SHORTAGE = 4;
+
+const FALLBACK_ALLOW_HINTS = [
+  "administratively prohibited",
+  "resource shortage",
+  "too many sessions",
+  "maxsessions",
+  "channel limit",
+  "no more sessions"
+] as const;
+
+const FALLBACK_DENY_HINTS = [
+  "connection refused",
+  "connect failed",
+  "unknown channel type"
+] as const;
+
+function hasAnyNeedle(text: string, needles: readonly string[]): boolean {
+  return needles.some((needle) => text.includes(needle));
+}
+
+function shouldFallbackForChannelLimit(error: unknown): boolean {
+  const reason = typeof error === "object" && error !== null
+    ? (error as { reason?: unknown }).reason
+    : undefined;
+
+  if (typeof reason === "number") {
+    if (reason === SSH_OPEN_ADMINISTRATIVELY_PROHIBITED || reason === SSH_OPEN_RESOURCE_SHORTAGE) {
+      return true;
+    }
+    if (reason === SSH_OPEN_CONNECT_FAILED || reason === SSH_OPEN_UNKNOWN_CHANNEL_TYPE) {
+      return false;
+    }
+  }
+
+  if (typeof reason === "string") {
+    const normalizedReason = reason.toLowerCase();
+    if (hasAnyNeedle(normalizedReason, FALLBACK_DENY_HINTS)) {
+      return false;
+    }
+    if (hasAnyNeedle(normalizedReason, FALLBACK_ALLOW_HINTS)) {
+      return true;
+    }
+  }
+
+  const message = (error instanceof Error ? error.message : typeof error === "string" ? error : "").toLowerCase();
+  if (!message) {
+    return false;
+  }
+  if (hasAnyNeedle(message, FALLBACK_DENY_HINTS)) {
+    return false;
+  }
+  return hasAnyNeedle(message, FALLBACK_ALLOW_HINTS);
+}
 
 class PooledSshConnection implements SshConnection {
   private disposed = false;
@@ -44,9 +101,11 @@ class PooledSshConnection implements SshConnection {
     try {
       return await this.active.openShell(ptyOptions);
     } catch (err) {
-      const fb = await this.tryFallback();
-      if (fb) {
-        return fb.openShell(ptyOptions);
+      if (this.shouldAttemptFallback(err)) {
+        const fb = await this.tryFallback();
+        if (fb) {
+          return fb.openShell(ptyOptions);
+        }
       }
       throw err;
     }
@@ -57,9 +116,11 @@ class PooledSshConnection implements SshConnection {
     try {
       return await this.active.openDirectTcp(remoteIP, remotePort);
     } catch (err) {
-      const fb = await this.tryFallback();
-      if (fb) {
-        return fb.openDirectTcp(remoteIP, remotePort);
+      if (this.shouldAttemptFallback(err)) {
+        const fb = await this.tryFallback();
+        if (fb) {
+          return fb.openDirectTcp(remoteIP, remotePort);
+        }
       }
       throw err;
     }
@@ -70,9 +131,11 @@ class PooledSshConnection implements SshConnection {
     try {
       return await this.active.openSftp();
     } catch (err) {
-      const fb = await this.tryFallback();
-      if (fb) {
-        return fb.openSftp();
+      if (this.shouldAttemptFallback(err)) {
+        const fb = await this.tryFallback();
+        if (fb) {
+          return fb.openSftp();
+        }
       }
       throw err;
     }
@@ -121,6 +184,10 @@ class PooledSshConnection implements SshConnection {
   }
 
   private fallbackPromise?: Promise<SshConnection | undefined>;
+
+  private shouldAttemptFallback(error: unknown): boolean {
+    return Boolean(this.createFallback) && !this.fallbackUsed && shouldFallbackForChannelLimit(error);
+  }
 
   private tryFallback(): Promise<SshConnection | undefined> {
     if (this.fallbackUsed) {
@@ -178,7 +245,8 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
     if (this.disposed) {
       throw new Error("Connection pool is disposed");
     }
-    if (!this.options.enabled || server.multiplexing === false) {
+    const multiplexingEnabled = server.multiplexing ?? this.options.enabled;
+    if (!multiplexingEnabled) {
       return this.innerFactory.connect(server);
     }
 
