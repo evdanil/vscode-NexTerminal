@@ -100,13 +100,26 @@ function ensureMacroKeybindingsWork(): void {
 
 const ALL_PASSTHROUGH_KEYS = ["b", "e", "g", "j", "k", "n", "o", "p", "r", "w"] as const;
 
+/** Track which passthrough context keys are currently set to true, so we only update the delta. */
+const activePassthroughKeys = new Set<string>();
+
 function updatePassthroughContext(): void {
   const config = vscode.workspace.getConfiguration("nexus.terminal");
   const masterEnabled = config.get<boolean>("keyboardPassthrough", false);
   const selectedKeys = config.get<string[]>("passthroughKeys", [...ALL_PASSTHROUGH_KEYS]);
   const activeSet = masterEnabled ? new Set(selectedKeys.map(k => k.toLowerCase())) : new Set<string>();
+
   for (const key of ALL_PASSTHROUGH_KEYS) {
-    void vscode.commands.executeCommand("setContext", `nexus.passthrough.ctrl${key.toUpperCase()}`, activeSet.has(key));
+    const contextKey = `nexus.passthrough.ctrl${key.toUpperCase()}`;
+    const shouldBeActive = activeSet.has(key);
+    const isActive = activePassthroughKeys.has(contextKey);
+    if (shouldBeActive && !isActive) {
+      activePassthroughKeys.add(contextKey);
+      void vscode.commands.executeCommand("setContext", contextKey, true);
+    } else if (!shouldBeActive && isActive) {
+      activePassthroughKeys.delete(contextKey);
+      void vscode.commands.executeCommand("setContext", contextKey, false);
+    }
   }
 }
 
