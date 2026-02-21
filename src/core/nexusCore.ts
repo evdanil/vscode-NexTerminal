@@ -48,7 +48,6 @@ export class NexusCore {
     for (const group of groups) {
       this.explicitGroups.add(group);
     }
-    await this.migrateLegacySlashGroups();
     this.emitChanged();
   }
 
@@ -351,42 +350,6 @@ export class NexusCore {
       this.repository.saveGroups([...this.explicitGroups])
     ]);
     this.emitChanged();
-  }
-
-  private async migrateLegacySlashGroups(): Promise<void> {
-    let changed = false;
-    for (const server of this.servers.values()) {
-      if (server.group && server.group.includes("/")) {
-        server.group = server.group.replace(/\//g, "-");
-        changed = true;
-      }
-    }
-    for (const profile of this.serialProfiles.values()) {
-      if (profile.group && profile.group.includes("/")) {
-        profile.group = profile.group.replace(/\//g, "-");
-        changed = true;
-      }
-    }
-    const groupsToMigrate: string[] = [];
-    for (const g of this.explicitGroups) {
-      if (g.includes("/")) {
-        groupsToMigrate.push(g);
-      }
-    }
-    if (groupsToMigrate.length > 0) {
-      for (const g of groupsToMigrate) {
-        this.explicitGroups.delete(g);
-        this.explicitGroups.add(g.replace(/\//g, "-"));
-      }
-      changed = true;
-    }
-    if (changed) {
-      await Promise.all([
-        this.repository.saveServers([...this.servers.values()]),
-        this.repository.saveSerialProfiles([...this.serialProfiles.values()]),
-        this.repository.saveGroups([...this.explicitGroups])
-      ]);
-    }
   }
 
   private emitChanged(): void {

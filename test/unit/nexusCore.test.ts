@@ -407,7 +407,7 @@ describe("NexusCore", () => {
     expect(snapshot.explicitGroups).not.toContain("RootFolder");
   });
 
-  it("migrates legacy slash groups on initialize", async () => {
+  it("preserves slash-containing groups as nested folders on initialize", async () => {
     const repository = new InMemoryConfigRepository(
       [{
         id: "s1", name: "S1", host: "h", port: 22, username: "u",
@@ -424,10 +424,9 @@ describe("NexusCore", () => {
     await core.initialize();
 
     const snapshot = core.getSnapshot();
-    expect(snapshot.servers[0].group).toBe("US-East");
-    expect(snapshot.serialProfiles[0].group).toBe("Lab-Main");
-    expect(snapshot.explicitGroups).toContain("Legacy-Group");
-    expect(snapshot.explicitGroups).not.toContain("Legacy/Group");
+    expect(snapshot.servers[0].group).toBe("US/East");
+    expect(snapshot.serialProfiles[0].group).toBe("Lab/Main");
+    expect(snapshot.explicitGroups).toContain("Legacy/Group");
   });
 
   it("getItemsInFolder returns direct items when not recursive", async () => {
