@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar with connection multiplexing, a settings panel, macro editor, and regex-based terminal highlighting.",
-  "version": "2.7.5",
+  "version": "2.7.6",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -87,12 +87,14 @@
     "commands": [
       {
         "command": "nexus.refresh",
-        "title": "Nexus: Refresh",
+        "title": "Refresh",
+        "category": "Nexus",
         "icon": "$(refresh)"
       },
       {
         "command": "nexus.server.add",
-        "title": "Nexus: Add Server",
+        "title": "Add Server",
+        "category": "Nexus",
         "icon": "$(add)"
       },
       {
@@ -132,7 +134,8 @@
       },
       {
         "command": "nexus.tunnel.add",
-        "title": "Nexus: Add Tunnel",
+        "title": "Add Tunnel",
+        "category": "Nexus",
         "icon": "$(add)"
       },
       {
@@ -172,7 +175,8 @@
       },
       {
         "command": "nexus.serial.add",
-        "title": "Nexus: Add Serial Profile",
+        "title": "Add Serial Profile",
+        "category": "Nexus",
         "icon": "$(add)"
       },
       {
@@ -187,7 +191,8 @@
       },
       {
         "command": "nexus.serial.listPorts",
-        "title": "Nexus: Scan Serial Ports",
+        "title": "Scan Serial Ports",
+        "category": "Nexus",
         "icon": "$(search)"
       },
       {
@@ -232,7 +237,8 @@
       },
       {
         "command": "nexus.settings.openPanel",
-        "title": "Nexus: Open Settings",
+        "title": "Open Settings",
+        "category": "Nexus",
         "icon": "$(settings-gear)"
       },
       {
@@ -247,7 +253,8 @@
       },
       {
         "command": "nexus.settings.resetAll",
-        "title": "Nexus: Reset All Settings to Defaults",
+        "title": "Reset All Settings to Defaults",
+        "category": "Nexus",
         "icon": "$(discard)"
       },
       {
@@ -257,12 +264,14 @@
       },
       {
         "command": "nexus.profile.add",
-        "title": "Nexus: Add Profile",
+        "title": "Add Profile",
+        "category": "Nexus",
         "icon": "$(add)"
       },
       {
         "command": "nexus.group.add",
-        "title": "Nexus: New Folder",
+        "title": "New Folder",
+        "category": "Nexus",
         "icon": "$(new-folder)"
       },
       {
@@ -272,30 +281,36 @@
       },
       {
         "command": "nexus.config.export",
-        "title": "Nexus: Export for Sharing",
+        "title": "Export for Sharing",
+        "category": "Nexus",
         "icon": "$(share)"
       },
       {
         "command": "nexus.config.export.backup",
-        "title": "Nexus: Encrypted Backup"
+        "title": "Encrypted Backup",
+        "category": "Nexus"
       },
       {
         "command": "nexus.config.import",
-        "title": "Nexus: Import Configuration",
+        "title": "Import Configuration",
+        "category": "Nexus",
         "icon": "$(cloud-download)"
       },
       {
         "command": "nexus.config.completeReset",
-        "title": "Nexus: Delete All Data"
+        "title": "Delete All Data",
+        "category": "Nexus"
       },
       {
         "command": "nexus.macro.editor",
-        "title": "Nexus: Macro Editor",
+        "title": "Macro Editor",
+        "category": "Nexus",
         "icon": "$(edit)"
       },
       {
         "command": "nexus.macro.add",
-        "title": "Nexus: Add Macro",
+        "title": "Add Macro",
+        "category": "Nexus",
         "icon": "$(add)"
       },
       {
@@ -310,16 +325,19 @@
       },
       {
         "command": "nexus.macro.run",
-        "title": "Nexus: Run Macro",
+        "title": "Run Macro",
+        "category": "Nexus",
         "icon": "$(play)"
       },
       {
         "command": "nexus.macro.slot",
-        "title": "Nexus: Run Macro Slot"
+        "title": "Run Macro Slot",
+        "category": "Nexus"
       },
       {
         "command": "nexus.macro.runBinding",
-        "title": "Nexus: Run Macro Binding"
+        "title": "Run Macro Binding",
+        "category": "Nexus"
       },
       {
         "command": "nexus.macro.moveUp",
@@ -408,7 +426,8 @@
       },
       {
         "command": "nexus.terminal.appearance",
-        "title": "Nexus: Terminal Appearance",
+        "title": "Terminal Appearance",
+        "category": "Nexus",
         "icon": "$(paintcan)"
       }
     ],

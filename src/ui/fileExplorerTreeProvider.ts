@@ -171,6 +171,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
         permissions: 0,
       });
       dotItem.label = ".";
+      dotItem.contextValue = "nexus.fileExplorer.currentDir";
       dotItem.collapsibleState = vscode.TreeItemCollapsibleState.None;
       dotItem.tooltip = this.currentRootPath;
       dotItem.description = this.currentRootPath;

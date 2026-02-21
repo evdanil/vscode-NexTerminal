@@ -280,7 +280,7 @@ describe("FileExplorerTreeProvider", () => {
   });
 
   describe('"." current directory item', () => {
-    it('has contextValue nexus.fileExplorer.dir and label "."', async () => {
+    it('has contextValue nexus.fileExplorer.currentDir and label "."', async () => {
       (sftp.readDirectory as any).mockResolvedValue([]);
 
       provider.setActiveServer(testServer, "/home/dev");
@@ -290,7 +290,7 @@ describe("FileExplorerTreeProvider", () => {
       ) as FileTreeItem;
 
       expect(dotItem).toBeDefined();
-      expect(dotItem.contextValue).toBe("nexus.fileExplorer.dir");
+      expect(dotItem.contextValue).toBe("nexus.fileExplorer.currentDir");
       expect(dotItem.label).toBe(".");
       expect(dotItem.tooltip).toBe("/home/dev");
       expect(dotItem.description).toBe("/home/dev");
