@@ -91,9 +91,9 @@ function sharedTrailingFields(seed?: { logSession?: boolean; group?: string }, e
     {
       type: "combobox",
       key: "group",
-      label: "Group",
+      label: "Folder",
       suggestions: existingGroups ?? [],
-      placeholder: "Type a new group or pick existing...",
+      placeholder: "Type a folder path or pick existing...",
       value: seed?.group ?? ""
     }
   ];

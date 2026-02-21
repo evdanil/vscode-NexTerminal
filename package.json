@@ -227,7 +227,7 @@
       },
       {
         "command": "nexus.group.rename",
-        "title": "Rename Group",
+        "title": "Rename Folder",
         "icon": "$(edit)"
       },
       {
@@ -262,12 +262,12 @@
       },
       {
         "command": "nexus.group.add",
-        "title": "Nexus: New Group",
+        "title": "Nexus: New Folder",
         "icon": "$(new-folder)"
       },
       {
         "command": "nexus.group.remove",
-        "title": "Remove Group",
+        "title": "Remove Folder",
         "icon": "$(trash)"
       },
       {
@@ -573,37 +573,42 @@
         },
         {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
           "group": "inline@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
           "group": "inline@2"
         },
         {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.group.rename",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.profile.add",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
           "group": "1_manage@2"
         },
         {
+          "command": "nexus.group.add",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "group": "1_manage@3"
+        },
+        {
           "command": "nexus.group.remove",
-          "when": "view == nexusCommandCenter && viewItem == nexus.group",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
           "group": "3_destructive"
         },
         {

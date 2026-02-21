@@ -8,6 +8,7 @@ import type {
   TunnelRegistryEntry
 } from "../models/config";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
+import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
 type NexusListener = (snapshot: SessionSnapshot) => void;
 
@@ -47,6 +48,7 @@ export class NexusCore {
     for (const group of groups) {
       this.explicitGroups.add(group);
     }
+    await this.migrateLegacySlashGroups();
     this.emitChanged();
   }
 
@@ -194,8 +196,14 @@ export class NexusCore {
     this.emitChanged();
   }
 
-  public async addGroup(name: string): Promise<void> {
-    this.explicitGroups.add(name);
+  public async addGroup(path: string): Promise<void> {
+    const normalized = normalizeFolderPath(path);
+    if (!normalized) {
+      return;
+    }
+    for (const ancestor of getAncestorPaths(normalized)) {
+      this.explicitGroups.add(ancestor);
+    }
     await this.repository.saveGroups([...this.explicitGroups]);
     this.emitChanged();
   }
@@ -212,6 +220,172 @@ export class NexusCore {
       this.explicitGroups.add(newName);
       await this.repository.saveGroups([...this.explicitGroups]);
       this.emitChanged();
+    }
+  }
+
+  public async moveFolder(oldPath: string, newParentPath: string | undefined): Promise<void> {
+    const leaf = folderDisplayName(oldPath);
+    const newPath = newParentPath ? newParentPath + "/" + leaf : leaf;
+    const normalized = normalizeFolderPath(newPath);
+    if (!normalized) {
+      return;
+    }
+    if (newParentPath && isDescendantOrSelf(newParentPath, oldPath)) {
+      return;
+    }
+    await this._renameFolderPath(oldPath, normalized);
+  }
+
+  public async renameFolder(oldPath: string, newName: string): Promise<void> {
+    const parent = parentPath(oldPath);
+    const newPath = parent ? parent + "/" + newName : newName;
+    const normalized = normalizeFolderPath(newPath);
+    if (!normalized) {
+      return;
+    }
+    await this._renameFolderPath(oldPath, normalized);
+  }
+
+  public async removeFolderCascade(path: string, deleteContents: boolean): Promise<void> {
+    const parent = parentPath(path);
+    if (deleteContents) {
+      for (const [id, server] of this.servers.entries()) {
+        if (server.group && isDescendantOrSelf(server.group, path)) {
+          this.servers.delete(id);
+          for (const [sessionId, session] of this.activeSessions.entries()) {
+            if (session.serverId === id) {
+              this.activeSessions.delete(sessionId);
+            }
+          }
+        }
+      }
+      for (const [id, profile] of this.serialProfiles.entries()) {
+        if (profile.group && isDescendantOrSelf(profile.group, path)) {
+          this.serialProfiles.delete(id);
+          for (const [sessionId, session] of this.activeSerialSessions.entries()) {
+            if (session.profileId === id) {
+              this.activeSerialSessions.delete(sessionId);
+            }
+          }
+        }
+      }
+    } else {
+      for (const server of this.servers.values()) {
+        if (server.group && isDescendantOrSelf(server.group, path)) {
+          server.group = parent;
+        }
+      }
+      for (const profile of this.serialProfiles.values()) {
+        if (profile.group && isDescendantOrSelf(profile.group, path)) {
+          profile.group = parent;
+        }
+      }
+    }
+    for (const g of this.explicitGroups) {
+      if (isDescendantOrSelf(g, path)) {
+        this.explicitGroups.delete(g);
+      }
+    }
+    await Promise.all([
+      this.repository.saveServers([...this.servers.values()]),
+      this.repository.saveSerialProfiles([...this.serialProfiles.values()]),
+      this.repository.saveGroups([...this.explicitGroups])
+    ]);
+    this.emitChanged();
+  }
+
+  public getItemsInFolder(path: string, recursive: boolean): { servers: ServerConfig[]; serialProfiles: SerialProfile[] } {
+    const servers: ServerConfig[] = [];
+    const profiles: SerialProfile[] = [];
+    for (const server of this.servers.values()) {
+      if (!server.group) {
+        continue;
+      }
+      if (recursive ? isDescendantOrSelf(server.group, path) : server.group === path) {
+        servers.push(server);
+      }
+    }
+    for (const profile of this.serialProfiles.values()) {
+      if (!profile.group) {
+        continue;
+      }
+      if (recursive ? isDescendantOrSelf(profile.group, path) : profile.group === path) {
+        profiles.push(profile);
+      }
+    }
+    return { servers, serialProfiles: profiles };
+  }
+
+  private async _renameFolderPath(oldPath: string, newPath: string): Promise<void> {
+    // Remap all explicitGroups entries
+    const toAdd: string[] = [];
+    for (const g of this.explicitGroups) {
+      if (isDescendantOrSelf(g, oldPath)) {
+        this.explicitGroups.delete(g);
+        toAdd.push(newPath + g.slice(oldPath.length));
+      }
+    }
+    for (const g of toAdd) {
+      this.explicitGroups.add(g);
+    }
+    // Ensure ancestors of newPath exist
+    for (const ancestor of getAncestorPaths(newPath)) {
+      this.explicitGroups.add(ancestor);
+    }
+
+    // Remap all item groups
+    for (const server of this.servers.values()) {
+      if (server.group && isDescendantOrSelf(server.group, oldPath)) {
+        server.group = newPath + server.group.slice(oldPath.length);
+      }
+    }
+    for (const profile of this.serialProfiles.values()) {
+      if (profile.group && isDescendantOrSelf(profile.group, oldPath)) {
+        profile.group = newPath + profile.group.slice(oldPath.length);
+      }
+    }
+
+    await Promise.all([
+      this.repository.saveServers([...this.servers.values()]),
+      this.repository.saveSerialProfiles([...this.serialProfiles.values()]),
+      this.repository.saveGroups([...this.explicitGroups])
+    ]);
+    this.emitChanged();
+  }
+
+  private async migrateLegacySlashGroups(): Promise<void> {
+    let changed = false;
+    for (const server of this.servers.values()) {
+      if (server.group && server.group.includes("/")) {
+        server.group = server.group.replace(/\//g, "-");
+        changed = true;
+      }
+    }
+    for (const profile of this.serialProfiles.values()) {
+      if (profile.group && profile.group.includes("/")) {
+        profile.group = profile.group.replace(/\//g, "-");
+        changed = true;
+      }
+    }
+    const groupsToMigrate: string[] = [];
+    for (const g of this.explicitGroups) {
+      if (g.includes("/")) {
+        groupsToMigrate.push(g);
+      }
+    }
+    if (groupsToMigrate.length > 0) {
+      for (const g of groupsToMigrate) {
+        this.explicitGroups.delete(g);
+        this.explicitGroups.add(g.replace(/\//g, "-"));
+      }
+      changed = true;
+    }
+    if (changed) {
+      await Promise.all([
+        this.repository.saveServers([...this.servers.values()]),
+        this.repository.saveSerialProfiles([...this.serialProfiles.values()]),
+        this.repository.saveGroups([...this.explicitGroups])
+      ]);
     }
   }
 

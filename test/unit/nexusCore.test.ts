@@ -245,4 +245,210 @@ describe("NexusCore", () => {
     await core.removeSerialProfile("sp1");
     expect(core.getSnapshot().serialProfiles).toHaveLength(0);
   });
+
+  it("addGroup registers ancestor paths for nested folders", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("A/B/C");
+    const groups = core.getSnapshot().explicitGroups;
+    expect(groups).toContain("A");
+    expect(groups).toContain("A/B");
+    expect(groups).toContain("A/B/C");
+    expect(groups).toHaveLength(3);
+  });
+
+  it("addGroup rejects invalid paths", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("../evil");
+    expect(core.getSnapshot().explicitGroups).toHaveLength(0);
+
+    await core.addGroup("");
+    expect(core.getSnapshot().explicitGroups).toHaveLength(0);
+  });
+
+  it("moveFolder moves a folder and all descendant items", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("Prod/US");
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "Prod/US"
+    });
+    await core.addOrUpdateSerialProfile({
+      id: "sp1", name: "SP1", path: "COM1", baudRate: 9600,
+      dataBits: 8, stopBits: 1, parity: "none", rtscts: false, group: "Prod"
+    });
+
+    await core.moveFolder("Prod", "Staging");
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers[0].group).toBe("Staging/Prod/US");
+    expect(snapshot.serialProfiles[0].group).toBe("Staging/Prod");
+    expect(snapshot.explicitGroups).toContain("Staging/Prod/US");
+    expect(snapshot.explicitGroups).toContain("Staging/Prod");
+    expect(snapshot.explicitGroups).toContain("Staging");
+    expect(snapshot.explicitGroups).not.toContain("Prod");
+  });
+
+  it("moveFolder to root removes parent prefix", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("Parent/Child");
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "Parent/Child"
+    });
+
+    await core.moveFolder("Parent/Child", undefined);
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers[0].group).toBe("Child");
+    expect(snapshot.explicitGroups).toContain("Child");
+    expect(snapshot.explicitGroups).not.toContain("Parent/Child");
+  });
+
+  it("moveFolder rejects cycle (moving into own descendant)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("A/B/C");
+    await core.moveFolder("A", "A/B");
+    // Should be unchanged — the move was rejected
+    expect(core.getSnapshot().explicitGroups).toContain("A");
+    expect(core.getSnapshot().explicitGroups).toContain("A/B");
+  });
+
+  it("renameFolder renames a folder and updates descendants", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("Dev/Frontend");
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "Dev/Frontend"
+    });
+
+    await core.renameFolder("Dev", "Development");
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers[0].group).toBe("Development/Frontend");
+    expect(snapshot.explicitGroups).toContain("Development");
+    expect(snapshot.explicitGroups).toContain("Development/Frontend");
+    expect(snapshot.explicitGroups).not.toContain("Dev");
+  });
+
+  it("removeFolderCascade with deleteContents removes items", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("ToDelete/Sub");
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "ToDelete"
+    });
+    await core.addOrUpdateServer({
+      id: "s2", name: "S2", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "ToDelete/Sub"
+    });
+    await core.addOrUpdateServer({
+      id: "s3", name: "S3", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "Safe"
+    });
+
+    await core.removeFolderCascade("ToDelete", true);
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0].id).toBe("s3");
+    expect(snapshot.explicitGroups).not.toContain("ToDelete");
+    expect(snapshot.explicitGroups).not.toContain("ToDelete/Sub");
+  });
+
+  it("removeFolderCascade without deleteContents moves items to parent", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("Parent/ToRemove");
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "Parent/ToRemove"
+    });
+
+    await core.removeFolderCascade("Parent/ToRemove", false);
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers[0].group).toBe("Parent");
+    expect(snapshot.explicitGroups).not.toContain("Parent/ToRemove");
+    expect(snapshot.explicitGroups).toContain("Parent");
+  });
+
+  it("removeFolderCascade root folder moves items to ungrouped", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("RootFolder");
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "RootFolder"
+    });
+
+    await core.removeFolderCascade("RootFolder", false);
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers[0].group).toBeUndefined();
+    expect(snapshot.explicitGroups).not.toContain("RootFolder");
+  });
+
+  it("migrates legacy slash groups on initialize", async () => {
+    const repository = new InMemoryConfigRepository(
+      [{
+        id: "s1", name: "S1", host: "h", port: 22, username: "u",
+        authType: "password", isHidden: false, group: "US/East"
+      }],
+      [],
+      [{
+        id: "sp1", name: "SP1", path: "COM1", baudRate: 9600,
+        dataBits: 8, stopBits: 1, parity: "none", rtscts: false, group: "Lab/Main"
+      }],
+      ["Legacy/Group"]
+    );
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers[0].group).toBe("US-East");
+    expect(snapshot.serialProfiles[0].group).toBe("Lab-Main");
+    expect(snapshot.explicitGroups).toContain("Legacy-Group");
+    expect(snapshot.explicitGroups).not.toContain("Legacy/Group");
+  });
+
+  it("getItemsInFolder returns direct items when not recursive", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "A"
+    });
+    await core.addOrUpdateServer({
+      id: "s2", name: "S2", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "A/B"
+    });
+
+    const direct = core.getItemsInFolder("A", false);
+    expect(direct.servers).toHaveLength(1);
+    expect(direct.servers[0].id).toBe("s1");
+
+    const recursive = core.getItemsInFolder("A", true);
+    expect(recursive.servers).toHaveLength(2);
+  });
 });

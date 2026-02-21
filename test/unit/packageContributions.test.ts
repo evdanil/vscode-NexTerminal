@@ -60,6 +60,14 @@ describe("package contributions", () => {
     expect(macroSchema?.items?.properties?.secret?.type).toBe("boolean");
   });
 
+  it("uses nexus.folder contextValue in folder menu when clauses", () => {
+    const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+    const folderMenuItems = menuItems.filter((item) => item.when?.includes("nexus.folder"));
+    expect(folderMenuItems.length).toBeGreaterThan(0);
+    const groupMenuItems = menuItems.filter((item) => item.when?.includes("nexus.group"));
+    expect(groupMenuItems).toHaveLength(0);
+  });
+
   it("has a single add button in the command center title bar", () => {
     const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
     const commandCenterNavItems = titleMenuItems.filter(

@@ -10,7 +10,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 - **Serial Terminal Sessions** — Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, parity, and stop bits. Runs in an isolated sidecar process for crash safety.
 - **Port Forwarding (TCP Tunnels)** — Three tunnel modes: **Local (-L)** forwards local ports to remote hosts, **Reverse (-R)** forwards remote ports back to local targets, and **Dynamic (-D)** provides a local SOCKS5 proxy through SSH. Shared mode (default) uses a single SSH connection for all clients; isolated mode creates a separate connection per client.
 - **SSH Connection Multiplexing** — Share SSH connections across terminals, tunnels, and SFTP for the same server. Reduces connection overhead with automatic ref-counting and configurable idle timeout.
-- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized by group. Drag and drop to rearrange or assign tunnels to servers.
+- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized into folders with nesting support. Drag and drop to rearrange or assign tunnels to servers.
 - **Settings Panel** — View and edit extension settings in a dedicated webview panel. Declarative metadata drives the UI with auto-save, search, and grouped categories.
 - **Session Transcript Logging** — Automatically log clean terminal output (ANSI codes stripped) to files with configurable rotation.
 - **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH and serial terminal output. Detects errors, warnings, IP addresses, UUIDs, URLs and more with inline ANSI colouring while respecting existing remote colours.

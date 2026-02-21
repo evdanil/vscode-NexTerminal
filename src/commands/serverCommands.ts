@@ -6,10 +6,14 @@ import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { serverFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
-import { GroupTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
+import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { resolveTunnelConnectionMode, startTunnel } from "./tunnelCommands";
 import type { CommandContext, ServerTerminalMap } from "./types";
+import { getAncestorPaths, isDescendantOrSelf, folderDisplayName } from "../utils/folderPaths";
+
+/** @deprecated Use FolderTreeItem */
+const GroupTreeItem = FolderTreeItem;
 
 async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -78,16 +82,22 @@ function collectGroups(ctx: CommandContext): string[] {
   const snapshot = ctx.core.getSnapshot();
   const groups = new Set<string>();
   for (const group of snapshot.explicitGroups) {
-    groups.add(group);
+    for (const ancestor of getAncestorPaths(group)) {
+      groups.add(ancestor);
+    }
   }
   for (const server of snapshot.servers) {
     if (server.group) {
-      groups.add(server.group);
+      for (const ancestor of getAncestorPaths(server.group)) {
+        groups.add(ancestor);
+      }
     }
   }
   for (const profile of snapshot.serialProfiles) {
     if (profile.group) {
-      groups.add(profile.group);
+      for (const ancestor of getAncestorPaths(profile.group)) {
+        groups.add(ancestor);
+      }
     }
   }
   return [...groups].sort((a, b) => a.localeCompare(b));
@@ -313,53 +323,53 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
     }),
 
     vscode.commands.registerCommand("nexus.group.rename", async (arg?: unknown) => {
-      if (!(arg instanceof GroupTreeItem)) {
+      if (!(arg instanceof FolderTreeItem)) {
         return;
       }
-      const oldName = arg.groupName;
+      const oldPath = arg.folderPath;
+      const currentName = folderDisplayName(oldPath);
       const newName = await vscode.window.showInputBox({
-        title: "Rename Group",
-        value: oldName,
-        prompt: "Enter new group name",
-        validateInput: (value) => (value.trim() ? null : "Group name cannot be empty")
+        title: "Rename Folder",
+        value: currentName,
+        prompt: "Enter new folder name",
+        validateInput: (value) => {
+          const trimmed = value.trim();
+          if (!trimmed) {
+            return "Folder name cannot be empty";
+          }
+          if (trimmed.includes("/")) {
+            return "Folder name cannot contain '/'";
+          }
+          return null;
+        }
       });
-      if (!newName || newName.trim() === oldName) {
+      if (!newName || newName.trim() === currentName) {
         return;
       }
-      const trimmedName = newName.trim();
-      const snapshot = ctx.core.getSnapshot();
-      for (const server of snapshot.servers) {
-        if (server.group === oldName) {
-          await ctx.core.addOrUpdateServer({ ...server, group: trimmedName });
-        }
-      }
-      for (const profile of snapshot.serialProfiles) {
-        if (profile.group === oldName) {
-          await ctx.core.addOrUpdateSerialProfile({ ...profile, group: trimmedName });
-        }
-      }
-      await ctx.core.renameExplicitGroup(oldName, trimmedName);
+      await ctx.core.renameFolder(oldPath, newName.trim());
     }),
 
     vscode.commands.registerCommand("nexus.group.connect", async (arg?: unknown) => {
-      if (!(arg instanceof GroupTreeItem)) {
+      if (!(arg instanceof FolderTreeItem)) {
         return;
       }
+      const folderPath = arg.folderPath;
       const servers = ctx.core
         .getSnapshot()
-        .servers.filter((s) => s.group === arg.groupName && !s.isHidden);
+        .servers.filter((s) => s.group && isDescendantOrSelf(s.group, folderPath) && !s.isHidden);
       for (const server of servers) {
         void connectServer(ctx, server.id);
       }
     }),
 
     vscode.commands.registerCommand("nexus.group.disconnect", async (arg?: unknown) => {
-      if (!(arg instanceof GroupTreeItem)) {
+      if (!(arg instanceof FolderTreeItem)) {
         return;
       }
+      const folderPath = arg.folderPath;
       const servers = ctx.core
         .getSnapshot()
-        .servers.filter((s) => s.group === arg.groupName && !s.isHidden);
+        .servers.filter((s) => s.group && isDescendantOrSelf(s.group, folderPath) && !s.isHidden);
       for (const server of servers) {
         await disconnectServer(ctx, server.id);
       }

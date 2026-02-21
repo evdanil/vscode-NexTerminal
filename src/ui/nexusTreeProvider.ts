@@ -1,19 +1,26 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
 import type { ActiveSerialSession, ActiveSession, SerialProfile, ServerConfig } from "../models/config";
+import { getAncestorPaths, folderDisplayName, isDescendantOrSelf } from "../utils/folderPaths";
 import { toParityCode } from "../utils/helpers";
 
 const TUNNEL_DRAG_MIME = "application/vnd.nexus.tunnelProfile";
 const ITEM_DRAG_MIME = "application/vnd.nexus.item";
 
-export class GroupTreeItem extends vscode.TreeItem {
-  public constructor(public readonly groupName: string) {
-    super(groupName, vscode.TreeItemCollapsibleState.Expanded);
-    this.contextValue = "nexus.group";
-    this.id = `group:${groupName}`;
+export class FolderTreeItem extends vscode.TreeItem {
+  public constructor(public readonly folderPath: string, displayName: string) {
+    super(displayName, vscode.TreeItemCollapsibleState.Expanded);
+    this.contextValue = "nexus.folder";
+    this.id = `folder:${folderPath}`;
+    this.tooltip = folderPath;
     this.iconPath = new vscode.ThemeIcon("folder");
   }
 }
+
+/** @deprecated Use FolderTreeItem instead */
+export const GroupTreeItem = FolderTreeItem;
+/** @deprecated Use FolderTreeItem instead */
+export type GroupTreeItem = FolderTreeItem;
 
 export class ServerTreeItem extends vscode.TreeItem {
   public constructor(public readonly server: ServerConfig, connected: boolean) {
@@ -63,11 +70,12 @@ export class SerialSessionTreeItem extends vscode.TreeItem {
   }
 }
 
-type NexusTreeItem = GroupTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem;
+type NexusTreeItem = FolderTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem;
 
 export interface NexusTreeCallbacks {
   onTunnelDropped(serverId: string, tunnelProfileId: string): Promise<void>;
   onItemGroupChanged(itemType: "server" | "serial", itemId: string, newGroup: string | undefined): Promise<void>;
+  onFolderMoved(oldPath: string, newParentPath: string | undefined): Promise<void>;
 }
 
 export class NexusTreeProvider
@@ -110,18 +118,10 @@ export class NexusTreeProvider
 
   public getChildren(element?: NexusTreeItem): vscode.ProviderResult<NexusTreeItem[]> {
     if (!element) {
-      return this.getRootItems();
+      return this.getFolderChildren(undefined);
     }
-    if (element instanceof GroupTreeItem) {
-      const servers = this.snapshot.servers
-        .filter((server) => server.group === element.groupName && !server.isHidden)
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .map((server) => this.toServerItem(server));
-      const serialProfiles = this.snapshot.serialProfiles
-        .filter((profile) => profile.group === element.groupName)
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .map((profile) => this.toSerialProfileItem(profile));
-      return [...servers, ...serialProfiles];
+    if (element instanceof FolderTreeItem) {
+      return this.getFolderChildren(element.folderPath);
     }
     if (element instanceof ServerTreeItem) {
       return this.snapshot.activeSessions
@@ -145,6 +145,8 @@ export class NexusTreeProvider
       dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "server", id: item.server.id })));
     } else if (item instanceof SerialProfileTreeItem) {
       dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "serial", id: item.profile.id })));
+    } else if (item instanceof FolderTreeItem) {
+      dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "folder", id: item.folderPath })));
     }
   }
 
@@ -159,7 +161,7 @@ export class NexusTreeProvider
       }
     }
 
-    // Handle item (server/serial) drop onto group or root (ungroup)
+    // Handle item (server/serial/folder) drop onto folder or root
     const itemTransfer = dataTransfer.get(ITEM_DRAG_MIME);
     if (!itemTransfer) {
       return;
@@ -171,57 +173,94 @@ export class NexusTreeProvider
     } catch {
       return;
     }
-    if (parsed.type !== "server" && parsed.type !== "serial") {
-      return;
-    }
 
-    let newGroup: string | undefined;
-    if (target instanceof GroupTreeItem) {
-      newGroup = target.groupName;
+    // Determine target folder path
+    let targetPath: string | undefined;
+    if (target instanceof FolderTreeItem) {
+      targetPath = target.folderPath;
     } else if (target === undefined) {
-      // Dropped on root — remove from group
-      newGroup = undefined;
+      targetPath = undefined;
     } else {
-      // Dropped on something else (server, session, etc.) — ignore
       return;
     }
 
-    await this.callbacks.onItemGroupChanged(parsed.type as "server" | "serial", parsed.id, newGroup);
+    if (parsed.type === "folder") {
+      // Reject dropping a folder into itself or a descendant
+      if (targetPath && isDescendantOrSelf(targetPath, parsed.id)) {
+        return;
+      }
+      await this.callbacks.onFolderMoved(parsed.id, targetPath);
+      return;
+    }
+
+    if (parsed.type === "server" || parsed.type === "serial") {
+      await this.callbacks.onItemGroupChanged(parsed.type as "server" | "serial", parsed.id, targetPath);
+    }
   }
 
-  private getRootItems(): NexusTreeItem[] {
-    const groupNames = new Set<string>();
-    const ungroupedServers: ServerConfig[] = [];
-    const ungroupedSerialProfiles: SerialProfile[] = [];
-    for (const group of this.snapshot.explicitGroups) {
-      groupNames.add(group);
+  private getFolderChildren(parentPath: string | undefined): NexusTreeItem[] {
+    // Collect all folder paths from explicitGroups + item groups, synthesizing ancestors
+    const allPaths = new Set<string>();
+    for (const g of this.snapshot.explicitGroups) {
+      for (const ancestor of getAncestorPaths(g)) {
+        allPaths.add(ancestor);
+      }
     }
     for (const server of this.snapshot.servers) {
-      if (server.isHidden) {
-        continue;
-      }
       if (server.group) {
-        groupNames.add(server.group);
-      } else {
-        ungroupedServers.push(server);
+        for (const ancestor of getAncestorPaths(server.group)) {
+          allPaths.add(ancestor);
+        }
       }
     }
     for (const profile of this.snapshot.serialProfiles) {
       if (profile.group) {
-        groupNames.add(profile.group);
-      } else {
-        ungroupedSerialProfiles.push(profile);
+        for (const ancestor of getAncestorPaths(profile.group)) {
+          allPaths.add(ancestor);
+        }
       }
     }
 
-    const groupItems = [...groupNames].sort((a, b) => a.localeCompare(b)).map((group) => new GroupTreeItem(group));
-    const serverItems = ungroupedServers
+    // Find direct child folders at this level
+    const childFolderNames = new Set<string>();
+    const prefix = parentPath ? parentPath + "/" : "";
+    const depth = parentPath ? parentPath.split("/").length + 1 : 1;
+    for (const p of allPaths) {
+      const segments = p.split("/");
+      if (segments.length === depth && p.startsWith(prefix)) {
+        childFolderNames.add(p);
+      }
+    }
+
+    // Find direct child items (group matches parentPath exactly, or no group for root)
+    const directServers = this.snapshot.servers
+      .filter((server) => {
+        if (server.isHidden) {
+          return false;
+        }
+        if (parentPath === undefined) {
+          return !server.group;
+        }
+        return server.group === parentPath;
+      })
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((server) => this.toServerItem(server));
-    const serialItems = ungroupedSerialProfiles
+
+    const directSerialProfiles = this.snapshot.serialProfiles
+      .filter((profile) => {
+        if (parentPath === undefined) {
+          return !profile.group;
+        }
+        return profile.group === parentPath;
+      })
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((profile) => this.toSerialProfileItem(profile));
-    return [...groupItems, ...serverItems, ...serialItems];
+
+    const folderItems = [...childFolderNames]
+      .sort((a, b) => a.localeCompare(b))
+      .map((p) => new FolderTreeItem(p, folderDisplayName(p)));
+
+    return [...folderItems, ...directServers, ...directSerialProfiles];
   }
 
   private toServerItem(server: ServerConfig): ServerTreeItem {

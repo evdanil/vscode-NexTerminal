@@ -215,6 +215,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           await core.addOrUpdateSerialProfile({ ...profile, group: newGroup });
         }
       }
+    },
+    async onFolderMoved(oldPath, newParentPath) {
+      await core.moveFolder(oldPath, newParentPath);
     }
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
