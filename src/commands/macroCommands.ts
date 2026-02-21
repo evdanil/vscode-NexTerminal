@@ -2,7 +2,6 @@ import * as vscode from "vscode";
 import type { MacroTreeItem, MacroTreeProvider, TerminalMacro } from "../ui/macroTreeProvider";
 import { MacroEditorPanel } from "../ui/macroEditorPanel";
 import {
-  ALL_BINDINGS,
   bindingToContextKey,
   bindingToDisplayLabel,
   isValidBinding,
@@ -25,19 +24,38 @@ function sendMacroText(text: string): void {
   void vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text });
 }
 
+/** Track which context keys are currently set to true, so we only update the delta. */
+const activeContextKeys = new Set<string>();
+
 function updateBindingContextKeys(): void {
   const macros = getMacros();
   const assignedBindings = new Set(
     macros.map((m) => m.keybinding?.toLowerCase()).filter((b): b is string => b !== undefined)
   );
-  for (const binding of ALL_BINDINGS) {
-    void vscode.commands.executeCommand("setContext", bindingToContextKey(binding), assignedBindings.has(binding));
+
+  // Set true for newly assigned bindings
+  for (const binding of assignedBindings) {
+    const key = bindingToContextKey(binding);
+    if (!activeContextKeys.has(key)) {
+      activeContextKeys.add(key);
+      void vscode.commands.executeCommand("setContext", key, true);
+    }
+  }
+
+  // Set false for previously active bindings that are no longer assigned
+  const newActiveKeys = new Set(
+    [...assignedBindings].map((b) => bindingToContextKey(b))
+  );
+  for (const key of activeContextKeys) {
+    if (!newActiveKeys.has(key)) {
+      activeContextKeys.delete(key);
+      void vscode.commands.executeCommand("setContext", key, false);
+    }
   }
 }
 
 export function updateMacroContext(): void {
-  const macros = getMacros();
-  void vscode.commands.executeCommand("setContext", "nexus.hasMacros", macros.length > 0);
+  void vscode.commands.executeCommand("setContext", "nexus.hasMacros", getMacros().length > 0);
   updateBindingContextKeys();
 }
 
