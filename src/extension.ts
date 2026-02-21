@@ -314,7 +314,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         prev.port !== server.port ||
         prev.username !== server.username ||
         prev.authType !== server.authType ||
-        prev.keyPath !== server.keyPath
+        prev.keyPath !== server.keyPath ||
+        prev.multiplexing !== server.multiplexing
       )) {
         pool.disconnect(server.id);
       }

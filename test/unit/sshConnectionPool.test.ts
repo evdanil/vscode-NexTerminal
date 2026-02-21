@@ -214,9 +214,9 @@ describe("SshConnectionPool", () => {
     const lease = await pool.connect(testServer);
     lease.dispose();
 
-    expect(() => lease.openShell()).toThrow("disposed");
-    expect(() => lease.openDirectTcp("127.0.0.1", 80)).toThrow("disposed");
-    expect(() => lease.openSftp()).toThrow("disposed");
+    await expect(lease.openShell()).rejects.toThrow("disposed");
+    await expect(lease.openDirectTcp("127.0.0.1", 80)).rejects.toThrow("disposed");
+    await expect(lease.openSftp()).rejects.toThrow("disposed");
     expect(() => lease.onClose(() => {})).toThrow("disposed");
   });
 
@@ -316,6 +316,125 @@ describe("SshConnectionPool", () => {
 
     p.disconnect(testServer.id);
     expect(events).toContainEqual({ type: "disconnected", serverId: "srv-1" });
+  });
+
+  // --- Per-server multiplexing toggle ---
+
+  it("server with multiplexing: false bypasses pool even when globally enabled", async () => {
+    const noMuxServer: ServerConfig = { ...testServer, multiplexing: false };
+    const conn1 = createMockConnection();
+    const conn2 = createMockConnection();
+    const f = createMockFactory([conn1, conn2]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const lease1 = await p.connect(noMuxServer);
+    const lease2 = await p.connect(noMuxServer);
+    // Each connect should call factory directly (no pooling)
+    expect(f.connect).toHaveBeenCalledTimes(2);
+    // Connections should be distinct raw connections, not pooled wrappers
+    expect(lease1).not.toBe(lease2);
+  });
+
+  it("server with multiplexing: undefined follows global setting (pooled)", async () => {
+    const f = createMockFactory();
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    await p.connect(testServer); // testServer has no multiplexing field
+    await p.connect(testServer);
+    expect(f.connect).toHaveBeenCalledTimes(1); // reused
+  });
+
+  it("server with multiplexing: true uses pool when globally enabled", async () => {
+    const muxServer: ServerConfig = { ...testServer, multiplexing: true };
+    const f = createMockFactory();
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    await p.connect(muxServer);
+    await p.connect(muxServer);
+    expect(f.connect).toHaveBeenCalledTimes(1); // reused
+  });
+
+  // --- Multiplexing fallback ---
+
+  it("falls back to standalone connection when openShell fails on reused pooled connection", async () => {
+    const pooledConn = createMockConnection();
+    let shellCallCount = 0;
+    pooledConn.openShell = vi.fn(async () => {
+      shellCallCount++;
+      if (shellCallCount > 1) {
+        throw new Error("Channel open failure");
+      }
+      return {} as any;
+    });
+    const standaloneConn = createMockConnection();
+    standaloneConn.openShell = vi.fn(async () => ({ standalone: true }) as any);
+
+    const f = createMockFactory([pooledConn, standaloneConn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    // First lease — openShell succeeds on pooled connection
+    const lease1 = await p.connect(testServer);
+    await lease1.openShell();
+
+    // Second lease — openShell should fail on pooled, fallback to standalone
+    const lease2 = await p.connect(testServer);
+    const stream = await lease2.openShell();
+    expect(stream).toEqual({ standalone: true });
+    // Factory called twice: pooled + standalone fallback
+    expect(f.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("fallback is not offered on fresh (non-reused) connection", async () => {
+    const conn = createMockConnection();
+    conn.openShell = vi.fn(async () => {
+      throw new Error("Channel open failure");
+    });
+    const f = createMockFactory([conn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    // First and only lease — no fallback, error propagates directly
+    const lease = await p.connect(testServer);
+    await expect(lease.openShell()).rejects.toThrow("Channel open failure");
+    // Factory called only once (no fallback attempt)
+    expect(f.connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("fallback properly cleans up: standalone disposed on lease dispose, pooled survives for other leases", async () => {
+    const pooledConn = createMockConnection();
+    let pooledShellCalls = 0;
+    pooledConn.openShell = vi.fn(async () => {
+      pooledShellCalls++;
+      if (pooledShellCalls > 1) {
+        throw new Error("Channel open failure");
+      }
+      return {} as any;
+    });
+    const standaloneConn = createMockConnection();
+    standaloneConn.openShell = vi.fn(async () => ({}) as any);
+
+    const f = createMockFactory([pooledConn, standaloneConn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    // First lease opens shell successfully on pooled connection
+    const lease1 = await p.connect(testServer);
+    await lease1.openShell();
+
+    // Second lease triggers fallback — soft-removes pool entry
+    const lease2 = await p.connect(testServer);
+    await lease2.openShell();
+
+    // Pooled connection should NOT be disposed yet (lease1 still holds it)
+    expect(pooledConn.dispose).not.toHaveBeenCalled();
+
+    // Dispose fallback lease — standalone connection should be disposed
+    lease2.dispose();
+    expect(standaloneConn.dispose).toHaveBeenCalled();
+    // Pooled still alive because lease1 holds it
+    expect(pooledConn.dispose).not.toHaveBeenCalled();
+
+    // Dispose last lease — now pooled connection is orphaned and should be disposed
+    lease1.dispose();
+    expect(pooledConn.dispose).toHaveBeenCalled();
   });
 
   it("idle timeout 0 means keep alive until explicit disconnect", async () => {

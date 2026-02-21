@@ -129,7 +129,8 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
     group: typeof values.group === "string" && values.group ? values.group : undefined,
     isHidden: preserveIsHidden,
-    logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled()
+    logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
+    multiplexing: typeof values.multiplexing === "boolean" ? values.multiplexing : undefined
   };
 }
 

@@ -17,6 +17,7 @@ export interface ServerConfig {
   keyPath?: string;
   isHidden: boolean;
   logSession?: boolean;
+  multiplexing?: boolean;  // undefined = follow global, false = always standalone
 }
 
 export interface TunnelProfile {

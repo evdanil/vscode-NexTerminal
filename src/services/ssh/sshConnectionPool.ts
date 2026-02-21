@@ -26,47 +26,78 @@ const MAX_IDLE_TIMEOUT_MS = 3_600_000;
 class PooledSshConnection implements SshConnection {
   private disposed = false;
   private readonly closeUnsubscribes: Array<() => void> = [];
+  private fallbackConnection?: SshConnection;
+  private fallbackUsed = false;
 
   public constructor(
     private readonly inner: SshConnection,
-    private readonly onRelease: () => void
+    private onRelease: () => void,
+    private readonly createFallback?: () => Promise<SshConnection>
   ) {}
 
-  public openShell(ptyOptions?: PtyOptions): Promise<Duplex> {
-    this.assertNotDisposed();
-    return this.inner.openShell(ptyOptions);
+  private get active(): SshConnection {
+    return this.fallbackUsed && this.fallbackConnection ? this.fallbackConnection : this.inner;
   }
 
-  public openDirectTcp(remoteIP: string, remotePort: number): Promise<Duplex> {
+  public async openShell(ptyOptions?: PtyOptions): Promise<Duplex> {
     this.assertNotDisposed();
-    return this.inner.openDirectTcp(remoteIP, remotePort);
+    try {
+      return await this.active.openShell(ptyOptions);
+    } catch (err) {
+      const fb = await this.tryFallback();
+      if (fb) {
+        return fb.openShell(ptyOptions);
+      }
+      throw err;
+    }
   }
 
-  public openSftp(): Promise<SFTPWrapper> {
+  public async openDirectTcp(remoteIP: string, remotePort: number): Promise<Duplex> {
     this.assertNotDisposed();
-    return this.inner.openSftp();
+    try {
+      return await this.active.openDirectTcp(remoteIP, remotePort);
+    } catch (err) {
+      const fb = await this.tryFallback();
+      if (fb) {
+        return fb.openDirectTcp(remoteIP, remotePort);
+      }
+      throw err;
+    }
+  }
+
+  public async openSftp(): Promise<SFTPWrapper> {
+    this.assertNotDisposed();
+    try {
+      return await this.active.openSftp();
+    } catch (err) {
+      const fb = await this.tryFallback();
+      if (fb) {
+        return fb.openSftp();
+      }
+      throw err;
+    }
   }
 
   public requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
     this.assertNotDisposed();
-    return this.inner.requestForwardIn(bindAddr, bindPort);
+    return this.active.requestForwardIn(bindAddr, bindPort);
   }
 
   public cancelForwardIn(bindAddr: string, bindPort: number): Promise<void> {
     this.assertNotDisposed();
-    return this.inner.cancelForwardIn(bindAddr, bindPort);
+    return this.active.cancelForwardIn(bindAddr, bindPort);
   }
 
   public onTcpConnection(
     handler: (info: TcpConnectionInfo, accept: () => Duplex, reject: () => void) => void
   ): () => void {
     this.assertNotDisposed();
-    return this.inner.onTcpConnection(handler);
+    return this.active.onTcpConnection(handler);
   }
 
   public onClose(listener: () => void): () => void {
     this.assertNotDisposed();
-    const unsub = this.inner.onClose(listener);
+    const unsub = this.active.onClose(listener);
     this.closeUnsubscribes.push(unsub);
     return () => {
       const idx = this.closeUnsubscribes.indexOf(unsub);
@@ -87,6 +118,37 @@ class PooledSshConnection implements SshConnection {
     }
     this.closeUnsubscribes.length = 0;
     this.onRelease();
+  }
+
+  private fallbackPromise?: Promise<SshConnection | undefined>;
+
+  private tryFallback(): Promise<SshConnection | undefined> {
+    if (this.fallbackUsed) {
+      return Promise.resolve(this.fallbackConnection);
+    }
+    if (!this.createFallback) {
+      return Promise.resolve(undefined);
+    }
+    // Cache the promise so concurrent callers share a single fallback attempt
+    if (!this.fallbackPromise) {
+      this.fallbackPromise = this.executeFallback();
+    }
+    return this.fallbackPromise;
+  }
+
+  private async executeFallback(): Promise<SshConnection | undefined> {
+    try {
+      this.fallbackConnection = await this.createFallback!();
+      this.fallbackUsed = true;
+      // Release the pooled reference — we no longer use it
+      this.onRelease();
+      // Future dispose should clean up the standalone connection
+      this.onRelease = () => this.fallbackConnection?.dispose();
+      return this.fallbackConnection;
+    } catch {
+      this.fallbackUsed = true; // prevent retries
+      return undefined;
+    }
   }
 
   private assertNotDisposed(): void {
@@ -116,7 +178,7 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
     if (this.disposed) {
       throw new Error("Connection pool is disposed");
     }
-    if (!this.options.enabled) {
+    if (!this.options.enabled || server.multiplexing === false) {
       return this.innerFactory.connect(server);
     }
 
@@ -124,12 +186,37 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
     this.cancelIdleTimer(entry);
     entry.refCount++;
 
+    // Offer fallback when this is a reused connection (refCount > 1).
+    // If a channel open fails on a multiplexed connection (e.g. Cisco devices
+    // that reject additional channels), automatically create a standalone
+    // connection so the caller doesn't see the failure.
+    // Offer fallback: soft-remove the pool entry (mark unhealthy, remove from
+    // map) but do NOT dispose the underlying connection — other leases may
+    // still hold active streams. The last lease to release will dispose it.
+    const createFallback = entry.refCount > 1
+      ? async (): Promise<SshConnection> => {
+          if (this.entries.get(server.id) === entry) {
+            entry.healthy = false;
+            this.cancelIdleTimer(entry);
+            this.entries.delete(server.id);
+            this.emit({ type: "disconnected", serverId: server.id });
+          }
+          return this.innerFactory.connect(server);
+        }
+      : undefined;
+
     return new PooledSshConnection(entry.connection, () => {
       entry.refCount--;
       if (entry.refCount === 0) {
-        this.startIdleTimer(server.id, entry);
+        if (this.entries.get(server.id) === entry) {
+          this.startIdleTimer(server.id, entry);
+        } else {
+          // Orphaned: entry was soft-removed from pool, dispose now
+          entry.closeUnsubscribe();
+          entry.connection.dispose();
+        }
       }
-    });
+    }, createFallback);
   }
 
   public disconnect(serverId: string): void {
