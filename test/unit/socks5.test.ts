@@ -1,6 +1,6 @@
 import * as net from "node:net";
 import { describe, expect, it, afterEach } from "vitest";
-import { handleSocks5Handshake, sendSocks5Success, sendSocks5Failure, SOCKS5_CONSTANTS } from "../../src/services/tunnel/socks5";
+import { handleSocks5Handshake, sendSocks5Success, sendSocks5Failure, Socks5HandshakeAbortedError, SOCKS5_CONSTANTS } from "../../src/services/tunnel/socks5";
 
 const { SOCKS5_VERSION, AUTH_NO_AUTH, AUTH_NO_ACCEPTABLE, CMD_CONNECT, ATYP_IPV4, ATYP_DOMAIN, ATYP_IPV6 } = SOCKS5_CONSTANTS;
 
@@ -185,7 +185,7 @@ describe("SOCKS5 handleSocks5Handshake", () => {
     await expect(handshakePromise).rejects.toThrow("Unsupported address type");
   });
 
-  it("rejects when socket closes during handshake", async () => {
+  it("rejects with Socks5HandshakeAbortedError when socket closes during handshake", async () => {
     const pair = await createSocketPair();
     cleanup = pair.cleanup;
 
@@ -194,7 +194,7 @@ describe("SOCKS5 handleSocks5Handshake", () => {
     // Close client immediately
     pair.client.destroy();
 
-    await expect(handshakePromise).rejects.toThrow();
+    await expect(handshakePromise).rejects.toThrow(Socks5HandshakeAbortedError);
   });
 });
 

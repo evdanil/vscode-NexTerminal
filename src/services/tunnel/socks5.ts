@@ -14,6 +14,13 @@ const REP_ATYP_NOT_SUPPORTED = 0x08;
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 
+export class Socks5HandshakeAbortedError extends Error {
+  constructor() {
+    super("Socket closed during SOCKS5 handshake");
+    this.name = "Socks5HandshakeAbortedError";
+  }
+}
+
 export interface Socks5Target {
   destAddr: string;
   destPort: number;
@@ -56,7 +63,7 @@ function readBytes(socket: Socket, count: number, timeoutMs: number): Promise<Bu
 
     const onClose = (): void => {
       cleanup();
-      reject(new Error("Socket closed during SOCKS5 handshake"));
+      reject(new Socks5HandshakeAbortedError());
     };
 
     timer = setTimeout(() => {

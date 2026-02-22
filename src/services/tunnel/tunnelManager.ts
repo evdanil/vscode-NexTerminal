@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { ActiveTunnel, ResolvedTunnelConnectionMode, ServerConfig, TunnelProfile, TunnelType } from "../../models/config";
 import { resolveTunnelType } from "../../models/config";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
-import { handleSocks5Handshake, sendSocks5Failure, sendSocks5Success } from "./socks5";
+import { handleSocks5Handshake, sendSocks5Failure, sendSocks5Success, Socks5HandshakeAbortedError } from "./socks5";
 
 export type TunnelSshFactory = SshFactory;
 
@@ -493,6 +493,11 @@ export class TunnelManager {
       socket.pipe(remoteStream);
       remoteStream.pipe(socket);
     } catch (error) {
+      if (error instanceof Socks5HandshakeAbortedError) {
+        runtime.sockets.delete(socket);
+        socket.destroy();
+        return;
+      }
       runtime.sockets.delete(socket);
       if (sshConnection && shouldDisposeConnection) {
         runtime.sshConnections.delete(sshConnection);

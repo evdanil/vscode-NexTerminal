@@ -339,4 +339,42 @@ describe("TunnelManager integration", () => {
     await manager.stop(activeTunnel.id);
     expect(events.some((e) => e.type === "stopped")).toBe(true);
   });
+
+  it("does not emit error when a raw TCP probe connects to a dynamic SOCKS5 tunnel", async () => {
+    const localPort = await getFreePort();
+
+    const profile: TunnelProfile = {
+      id: "tunnel-probe",
+      name: "SOCKS5 Probe Test",
+      localPort,
+      remoteIP: "0.0.0.0",
+      remotePort: 0,
+      autoStart: false,
+      tunnelType: "dynamic"
+    };
+
+    const sshFactory = new DirectTcpSshFactory();
+    manager = new TunnelManager(sshFactory, sshFactory);
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+
+    await manager.start(profile, testServer);
+
+    // Simulate a raw TCP probe (connect + immediate close, no SOCKS5 data)
+    await new Promise<void>((resolve, reject) => {
+      const probe = net.createConnection({ host: "127.0.0.1", port: localPort }, () => {
+        probe.destroy();
+      });
+      probe.on("close", () => resolve());
+      probe.on("error", reject);
+    });
+
+    // Give the handler time to process the closed socket
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const errorEvents = events.filter((e) => e.type === "error");
+    expect(errorEvents).toHaveLength(0);
+
+    await manager.stopAll();
+  });
 });
