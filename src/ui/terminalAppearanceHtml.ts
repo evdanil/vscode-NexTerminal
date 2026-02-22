@@ -174,7 +174,6 @@ export function renderTerminalAppearanceHtml(
       background: var(--vscode-input-background);
       border: 1px solid var(--vscode-input-border, transparent);
       border-radius: 2px;
-      font-size: 14px;
     }
   </style>
 </head>
@@ -308,6 +307,26 @@ export function renderTerminalAppearanceHtml(
         var weight = document.getElementById("font-weight").value;
         vscode.postMessage({ type: "applyFont", family: family, size: size, weight: weight });
       });
+
+      function updateFontPreview() {
+        var preview = document.getElementById("font-preview");
+        var family = document.getElementById("font-family").value;
+        var size = document.getElementById("font-size").value;
+        var weight = document.getElementById("font-weight").value;
+        if (family) {
+          preview.style.fontFamily = family;
+        } else {
+          preview.style.fontFamily = "";
+        }
+        preview.style.fontSize = (parseInt(size, 10) || 14) + "px";
+        preview.style.fontWeight = weight || "normal";
+      }
+
+      document.getElementById("font-family").addEventListener("input", updateFontPreview);
+      document.getElementById("font-size").addEventListener("input", updateFontPreview);
+      document.getElementById("font-weight").addEventListener("change", updateFontPreview);
+
+      updateFontPreview();
 
       window.addEventListener("message", function(event) {
         var msg = event.data;
