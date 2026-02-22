@@ -267,5 +267,24 @@ export function baseWebviewCss(): string {
       display: flex;
       gap: 8px;
       margin-top: 14px;
-    }`;
+    }
+    body:has(.form-illustration) {
+      max-width: 1000px;
+    }
+    .form-illustration {
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+    }
+    .form-illustration svg {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+    .form-illustration .illustration-dark,
+    .form-illustration .illustration-light { display: none; }
+    body.vscode-dark .form-illustration .illustration-dark,
+    body.vscode-high-contrast .form-illustration .illustration-dark { display: block; }
+    body.vscode-light .form-illustration .illustration-light,
+    body.vscode-high-contrast-light .form-illustration .illustration-light { display: block; }`;
 }

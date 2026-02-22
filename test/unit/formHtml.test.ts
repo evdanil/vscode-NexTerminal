@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderFormHtml } from "../../src/ui/formHtml";
 import type { FormDefinition } from "../../src/ui/formTypes";
+import { tunnelFormDefinition } from "../../src/ui/formDefinitions";
 
 describe("renderFormHtml", () => {
   it("renders text fields with labels", () => {
@@ -155,6 +156,58 @@ describe("renderFormHtml", () => {
     const html = renderFormHtml(definition);
     expect(html).toContain(".form-group[data-visible-when-field] { display: none; }");
     expect(html).toContain(".form-group[data-visible-when-field].field-visible { display: block; }");
+  });
+
+  it("renders html fields with form-illustration class", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        { type: "html", content: "<svg><circle r=\"5\"/></svg>" }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain("form-illustration");
+    expect(html).toContain("<svg><circle r=\"5\"/></svg>");
+  });
+
+  it("renders html fields with visibleWhen data attributes", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        { type: "html", content: "<svg/>", visibleWhen: { field: "mode", value: "a" } }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain('data-visible-when-field="mode"');
+    expect(html).toContain('data-visible-when-value="a"');
+    expect(html).toContain("form-illustration");
+  });
+
+  it("renders html fields correctly when CSP nonce is present", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        { type: "html", content: "<svg><circle r=\"5\"/></svg>" }
+      ]
+    };
+    const html = renderFormHtml(definition, "test-nonce-123");
+    expect(html).toContain("form-illustration");
+    expect(html).toContain("<svg><circle r=\"5\"/></svg>");
+    expect(html).toContain('nonce="test-nonce-123"');
+    expect(html).toContain("Content-Security-Policy");
+  });
+
+  it("renders tunnel form with SVG illustrations using inline attributes (no style blocks)", () => {
+    const definition = tunnelFormDefinition();
+    const html = renderFormHtml(definition);
+    // All three illustration types are wired via visibleWhen
+    expect(html).toContain('data-visible-when-value="local"');
+    expect(html).toContain('data-visible-when-value="reverse"');
+    expect(html).toContain('data-visible-when-value="dynamic"');
+    expect(html).toContain("form-illustration");
+    // SVGs use inline presentation attributes, not <style> blocks
+    // (style blocks would be blocked by CSP and cause class name collisions)
+    expect(html).not.toMatch(/<svg[^>]*>[\s\S]*?<style[\s\S]*?<\/style>[\s\S]*?<\/svg>/);
   });
 
   it("includes updateVisibility JS function", () => {

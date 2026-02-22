@@ -18,6 +18,10 @@ function visibleWhenAttrs(field: FormFieldDescriptor): string {
 }
 
 function renderField(field: FormFieldDescriptor): string {
+  if (field.type === "html") {
+    const vw = visibleWhenAttrs(field);
+    return `<div class="form-group form-illustration"${vw}>${field.content}</div>`;
+  }
   const key = escapeHtml(field.key);
   const id = `field-${key}`;
   const req = "required" in field && field.required ? " required" : "";

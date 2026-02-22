@@ -1,6 +1,7 @@
 import type { SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
 import { resolveTunnelType } from "../models/config";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhen } from "./formTypes";
+import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
 
 function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDescriptor[] {
   return [
@@ -139,7 +140,6 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
   const localVw = { field: "tunnelType", value: "local" };
   const reverseVw = { field: "tunnelType", value: "reverse" };
   const dynamicVw = { field: "tunnelType", value: "dynamic" };
-  const localOrDynamicVw = { field: "tunnelType", value: "local" };
 
   return {
     title: isEdit ? "Edit Tunnel" : "Add Tunnel",
@@ -155,6 +155,9 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
         ],
         value: tunnelType
       },
+      { type: "html", content: tunnelIllustrationSvgs.local, visibleWhen: localVw },
+      { type: "html", content: tunnelIllustrationSvgs.reverse, visibleWhen: reverseVw },
+      { type: "html", content: tunnelIllustrationSvgs.dynamic, visibleWhen: dynamicVw },
       { type: "text", key: "name", label: "Name", required: true, placeholder: "Database tunnel", value: seed?.name },
       // Local forwarding fields
       { type: "number", key: "localPort", label: "Local Port", required: true, min: 1, max: 65535, placeholder: "5432", value: seed?.localPort, visibleWhen: localVw },
