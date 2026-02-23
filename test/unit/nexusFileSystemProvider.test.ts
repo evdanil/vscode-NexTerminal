@@ -15,7 +15,24 @@ vi.mock("vscode", () => {
         scheme: components.scheme,
         authority: components.authority,
         path: components.path,
+        fsPath: components.path,
       })),
+      file: vi.fn((filePath: string) => ({
+        scheme: "file",
+        authority: "",
+        path: filePath,
+        fsPath: filePath,
+      })),
+      joinPath: vi.fn((base: { scheme: string; authority: string; path: string; fsPath: string }, ...segments: string[]) => {
+        const basePath = base.path.endsWith("/") ? base.path.slice(0, -1) : base.path;
+        const joinedPath = `${basePath}/${segments.join("/")}`.replace(/\/+/g, "/");
+        return {
+          scheme: base.scheme,
+          authority: base.authority,
+          path: joinedPath,
+          fsPath: joinedPath,
+        };
+      }),
     },
     FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
     FileChangeType: { Changed: 2, Created: 1, Deleted: 3 },
@@ -23,6 +40,14 @@ vi.mock("vscode", () => {
     FileSystemError: {
       Unavailable: (msg: string) => new Error(msg),
       NoPermissions: (msg: string) => new Error(msg),
+      FileExists: (msg: string) => new Error(msg),
+    },
+    workspace: {
+      fs: {
+        stat: vi.fn(),
+        createDirectory: vi.fn(),
+        delete: vi.fn(),
+      },
     },
     Disposable: class { constructor(private cb: () => void) {} dispose() { this.cb(); } },
     EventEmitter,
@@ -48,6 +73,7 @@ function createMockSftpService(): SftpService {
     realpath: vi.fn(),
     download: vi.fn(),
     upload: vi.fn(),
+    copyRemote: vi.fn(),
     invalidateCache: vi.fn(),
     dispose: vi.fn(),
   } as any;
@@ -75,9 +101,13 @@ describe("NexusFileSystemProvider", () => {
   let sftp: ReturnType<typeof createMockSftpService>;
   let provider: NexusFileSystemProvider;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     sftp = createMockSftpService();
     provider = new NexusFileSystemProvider(sftp);
+    const vscode = await import("vscode");
+    (vscode.workspace.fs.stat as any).mockReset();
+    (vscode.workspace.fs.createDirectory as any).mockReset();
+    (vscode.workspace.fs.delete as any).mockReset();
   });
 
   it("buildUri creates correct nexterm:// URI", () => {
@@ -245,6 +275,71 @@ describe("NexusFileSystemProvider", () => {
 
     expect(sftp.createDirectory).toHaveBeenCalledWith("srv-1", "/home/dev/newdir");
     expect(events[0].type).toBe(1); // Created
+  });
+
+  it("copy delegates nexterm->nexterm to copyRemote", async () => {
+    (sftp.lstat as any).mockResolvedValue(fileEntry);
+    (sftp.stat as any).mockRejectedValue(new Error("missing"));
+    (sftp.copyRemote as any).mockResolvedValue(undefined);
+
+    const events: any[] = [];
+    provider.onDidChangeFile((e) => events.push(...e));
+
+    const source = buildUri("srv-1", "/home/dev/a.txt");
+    const destination = buildUri("srv-1", "/home/dev/b.txt");
+    await provider.copy(source, destination, { overwrite: false });
+
+    expect(sftp.copyRemote).toHaveBeenCalledWith("srv-1", "/home/dev/a.txt", "/home/dev/b.txt", false);
+    expect(events[0].type).toBe(1); // Created
+  });
+
+  it("copy supports nexterm->file file copy", async () => {
+    const vscode = await import("vscode");
+    (sftp.lstat as any).mockResolvedValue(fileEntry);
+    (vscode.workspace.fs.stat as any).mockRejectedValue(new Error("missing"));
+    (vscode.workspace.fs.createDirectory as any).mockResolvedValue(undefined);
+    (sftp.download as any).mockResolvedValue(undefined);
+
+    const source = buildUri("srv-1", "/home/dev/a.txt");
+    const destination = vscode.Uri.file("/tmp/out.txt");
+    await provider.copy(source, destination, { overwrite: false });
+
+    expect(vscode.workspace.fs.createDirectory).toHaveBeenCalledWith(expect.objectContaining({ fsPath: "/tmp" }));
+    expect(sftp.download).toHaveBeenCalledWith("srv-1", "/home/dev/a.txt", "/tmp/out.txt");
+  });
+
+  it("copy supports nexterm->file recursive directory copy", async () => {
+    const vscode = await import("vscode");
+    (sftp.lstat as any).mockResolvedValue(dirEntry);
+    (vscode.workspace.fs.stat as any).mockRejectedValue(new Error("missing"));
+    (vscode.workspace.fs.createDirectory as any).mockResolvedValue(undefined);
+    (sftp.readDirectory as any).mockImplementation(async (_serverId: string, remotePath: string) => {
+      if (remotePath === "/home/dev/subdir") {
+        return [{ ...fileEntry, name: "nested.txt" }];
+      }
+      return [];
+    });
+    (sftp.download as any).mockResolvedValue(undefined);
+
+    const source = buildUri("srv-1", "/home/dev/subdir");
+    const destination = vscode.Uri.file("/tmp/outdir");
+    await provider.copy(source, destination, { overwrite: false });
+
+    expect(vscode.workspace.fs.createDirectory).toHaveBeenCalledWith(expect.objectContaining({ fsPath: "/tmp/outdir" }));
+    expect(sftp.download).toHaveBeenCalledWith("srv-1", "/home/dev/subdir/nested.txt", "/tmp/outdir/nested.txt");
+  });
+
+  it("copy rejects nexterm->nexterm across servers", async () => {
+    const source = buildUri("srv-1", "/home/dev/a.txt");
+    const destination = buildUri("srv-2", "/home/dev/b.txt");
+    await expect(provider.copy(source, destination, { overwrite: false })).rejects.toThrow(/across servers/i);
+  });
+
+  it("copy rejects unsupported destination schemes", async () => {
+    const vscode = await import("vscode");
+    const source = buildUri("srv-1", "/home/dev/a.txt");
+    const destination = vscode.Uri.from({ scheme: "http", authority: "example.com", path: "/x" });
+    await expect(provider.copy(source, destination, { overwrite: false })).rejects.toThrow(/unsupported destination scheme/i);
   });
 
   it("watch returns a no-op disposable", () => {

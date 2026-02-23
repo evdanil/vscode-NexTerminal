@@ -33,21 +33,62 @@ vi.mock("vscode", () => {
         Folder: { id: "folder" },
       }
     ),
+    FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
     Uri: {
       from: vi.fn((components: { scheme: string; authority: string; path: string }) => ({
         scheme: components.scheme,
         authority: components.authority,
         path: components.path,
+        fsPath: components.path,
         toString: () => `${components.scheme}://${components.authority}${components.path}`,
+      })),
+      parse: vi.fn((value: string) => {
+        const parsed = new URL(value);
+        return {
+          scheme: parsed.protocol.replace(":", ""),
+          authority: parsed.host,
+          path: parsed.pathname,
+          fsPath: parsed.pathname,
+          toString: () => value,
+        };
+      }),
+      joinPath: vi.fn((base: { scheme: string; authority: string; path: string; fsPath: string }, ...segments: string[]) => {
+        const basePath = base.path.endsWith("/") ? base.path.slice(0, -1) : base.path;
+        const joinedPath = `${basePath}/${segments.join("/")}`.replace(/\/+/g, "/");
+        return {
+          scheme: base.scheme,
+          authority: base.authority,
+          path: joinedPath,
+          fsPath: joinedPath,
+          toString: () => `${base.scheme}://${base.authority}${joinedPath}`,
+        };
+      }),
+      file: vi.fn((filePath: string) => ({
+        scheme: "file",
+        authority: "",
+        path: filePath,
+        fsPath: filePath,
+        toString: () => `file://${filePath}`,
       })),
     },
     DataTransferItem: class {
-      constructor(public value: string) {}
+      constructor(public value: string, private file?: { uri?: unknown }) {}
       asString() { return Promise.resolve(this.value); }
+      asFile() { return this.file; }
     },
     window: {
       showErrorMessage: vi.fn(),
       showQuickPick: vi.fn(),
+      showWarningMessage: vi.fn(),
+      showInformationMessage: vi.fn(),
+      withProgress: vi.fn(async (_opts, task) => task({ report: vi.fn() })),
+    },
+    ProgressLocation: { Notification: 15 },
+    workspace: {
+      fs: {
+        stat: vi.fn(),
+        readDirectory: vi.fn(),
+      },
     },
     EventEmitter,
   };
@@ -117,6 +158,12 @@ describe("FileExplorerTreeProvider", () => {
     const vscode = await import("vscode");
     (vscode.window.showQuickPick as any).mockReset();
     (vscode.window.showErrorMessage as any).mockReset();
+    (vscode.window.showWarningMessage as any).mockReset();
+    (vscode.window.showInformationMessage as any).mockReset();
+    (vscode.window.withProgress as any).mockReset();
+    (vscode.window.withProgress as any).mockImplementation(async (_opts: unknown, task: any) => task({ report: vi.fn() }));
+    (vscode.workspace.fs.stat as any).mockReset();
+    (vscode.workspace.fs.readDirectory as any).mockReset();
   });
 
   it("returns empty children when no active server", async () => {
@@ -256,6 +303,19 @@ describe("FileExplorerTreeProvider", () => {
     expect(item.resourceUri!.path).toBe("/home/dev/file.txt");
   });
 
+  it("directory items expose nexterm:// resourceUri", () => {
+    const item = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+    expect(item.resourceUri).toBeDefined();
+    expect(item.resourceUri!.scheme).toBe("nexterm");
+    expect(item.resourceUri!.path).toBe("/home/dev/subdir");
+    expect(item.command).toBeUndefined();
+  });
+
+  it("declares external and internal drop mime types", () => {
+    expect(provider.dragMimeTypes).toEqual(["application/vnd.nexus.fileitem", "text/uri-list"]);
+    expect(provider.dropMimeTypes).toEqual(["application/vnd.nexus.fileitem", "text/uri-list", "files"]);
+  });
+
   it("handles readDirectory errors gracefully", async () => {
     (sftp.readDirectory as any).mockRejectedValue(new Error("permission denied"));
 
@@ -333,7 +393,7 @@ describe("FileExplorerTreeProvider", () => {
 
       await provider.handleDrag([item], mockTransfer as any);
 
-      const entry = dataTransfer.get("application/vnd.nexus.fileItem");
+      const entry = dataTransfer.get("application/vnd.nexus.fileitem");
       expect(entry).toBeDefined();
       const parsed = JSON.parse(entry!.value);
       expect(parsed).toEqual([
@@ -374,7 +434,7 @@ describe("FileExplorerTreeProvider", () => {
       const transferItem = new DataTransferItem(payload);
       const mockTransfer = {
         get: (mime: string) => {
-          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          if (mime === "application/vnd.nexus.fileitem") { return transferItem; }
           return undefined;
         },
       };
@@ -403,7 +463,7 @@ describe("FileExplorerTreeProvider", () => {
       const transferItem = new DataTransferItem(payload);
       const mockTransfer = {
         get: (mime: string) => {
-          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          if (mime === "application/vnd.nexus.fileitem") { return transferItem; }
           return undefined;
         },
       };
@@ -432,7 +492,7 @@ describe("FileExplorerTreeProvider", () => {
       const transferItem = new DataTransferItem(payload);
       const mockTransfer = {
         get: (mime: string) => {
-          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          if (mime === "application/vnd.nexus.fileitem") { return transferItem; }
           return undefined;
         },
       };
@@ -454,7 +514,7 @@ describe("FileExplorerTreeProvider", () => {
       const transferItem = new DataTransferItem(payload);
       const mockTransfer = {
         get: (mime: string) => {
-          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          if (mime === "application/vnd.nexus.fileitem") { return transferItem; }
           return undefined;
         },
       };
@@ -479,7 +539,7 @@ describe("FileExplorerTreeProvider", () => {
       const transferItem = new DataTransferItem(payload);
       const mockTransfer = {
         get: (mime: string) => {
-          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          if (mime === "application/vnd.nexus.fileitem") { return transferItem; }
           return undefined;
         },
       };
@@ -505,7 +565,7 @@ describe("FileExplorerTreeProvider", () => {
       const transferItem = new DataTransferItem(payload);
       const mockTransfer = {
         get: (mime: string) => {
-          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          if (mime === "application/vnd.nexus.fileitem") { return transferItem; }
           return undefined;
         },
       };
@@ -532,7 +592,7 @@ describe("FileExplorerTreeProvider", () => {
       const transferItem = new DataTransferItem(payload);
       const mockTransfer = {
         get: (mime: string) => {
-          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          if (mime === "application/vnd.nexus.fileitem") { return transferItem; }
           return undefined;
         },
       };
@@ -557,7 +617,7 @@ describe("FileExplorerTreeProvider", () => {
       const transferItem = new DataTransferItem(payload);
       const mockTransfer = {
         get: (mime: string) => {
-          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          if (mime === "application/vnd.nexus.fileitem") { return transferItem; }
           return undefined;
         },
       };
@@ -568,6 +628,118 @@ describe("FileExplorerTreeProvider", () => {
       expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
       expect(sftp.rename).not.toHaveBeenCalled();
       expect(sftp.copyRemote).not.toHaveBeenCalled();
+    });
+
+    it("handleDrop uploads local file from text/uri-list", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.File });
+      (sftp.stat as any).mockRejectedValue(new Error("missing"));
+      (sftp.upload as any).mockResolvedValue(undefined);
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem("file:///tmp/local.txt");
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "text/uri-list") { return uriListItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      expect(sftp.upload).toHaveBeenCalledWith(
+        "srv-1",
+        "/tmp/local.txt",
+        "/home/dev/subdir/local.txt"
+      );
+    });
+
+    it("handleDrop uploads dropped local directory recursively", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.Directory });
+      (vscode.workspace.fs.readDirectory as any).mockResolvedValue([
+        ["nested.txt", vscode.FileType.File],
+      ]);
+      (sftp.stat as any).mockRejectedValue(new Error("missing"));
+      (sftp.createDirectory as any).mockResolvedValue(undefined);
+      (sftp.upload as any).mockResolvedValue(undefined);
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem("file:///tmp/mydir");
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "text/uri-list") { return uriListItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      expect(sftp.createDirectory).toHaveBeenCalledWith("srv-1", "/home/dev/subdir/mydir");
+      expect(sftp.upload).toHaveBeenCalledWith(
+        "srv-1",
+        "/tmp/mydir/nested.txt",
+        "/home/dev/subdir/mydir/nested.txt"
+      );
+    });
+
+    it("handleDrop supports skip-all conflict decision", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.Directory });
+      (vscode.workspace.fs.readDirectory as any).mockResolvedValue([
+        ["one.txt", vscode.FileType.File],
+        ["two.txt", vscode.FileType.File],
+      ]);
+      (sftp.createDirectory as any).mockResolvedValue(undefined);
+      (sftp.stat as any).mockImplementation(async (_serverId: string, remotePath: string) => {
+        if (remotePath.endsWith("/mydir")) {
+          throw new Error("missing");
+        }
+        return { ...fileEntry, name: "existing.txt", isDirectory: false };
+      });
+      (vscode.window.showWarningMessage as any).mockResolvedValue("Skip All");
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem("file:///tmp/mydir");
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "text/uri-list") { return uriListItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      const conflictPrompts = (vscode.window.showWarningMessage as any).mock.calls
+        .filter((args: unknown[]) => typeof args[0] === "string" && args[0].includes("already exists"));
+      expect(conflictPrompts).toHaveLength(1);
+      expect(sftp.upload).not.toHaveBeenCalled();
+    });
+
+    it("handleDrop ignores unsupported uri schemes from external sources", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem("nexterm://srv-1/home/dev/file.txt");
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "text/uri-list") { return uriListItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      expect(sftp.upload).not.toHaveBeenCalled();
+      expect(vscode.window.showWarningMessage).toHaveBeenCalled();
     });
 
     it("handleDrag sets text/uri-list with nexterm:// URIs", async () => {

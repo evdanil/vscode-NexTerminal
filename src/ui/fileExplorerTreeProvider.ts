@@ -5,11 +5,20 @@ import type { DirectoryEntry } from "../services/sftp/sftpService";
 import type { SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
 
-const FILE_DRAG_MIME = "application/vnd.nexus.fileItem";
+const FILE_DRAG_MIME = "application/vnd.nexus.fileitem";
+const URI_LIST_MIME = "text/uri-list";
+const FILES_MIME = "files";
 const MOVE_COPY_OPTIONS = [
   { label: "Move", value: "move" as const },
   { label: "Copy", value: "copy" as const }
 ];
+const CONFLICT_OPTIONS = {
+  overwrite: "Overwrite",
+  skip: "Skip",
+  overwriteAll: "Overwrite All",
+  skipAll: "Skip All",
+  cancel: "Cancel"
+} as const;
 
 interface DraggedFilePayloadItem {
   serverId: string;
@@ -21,6 +30,17 @@ interface DraggedFilePayloadItem {
 interface ValidDraggedItem extends DraggedFilePayloadItem {
   oldPath: string;
   newPath: string;
+}
+
+type UploadConflictMode = "ask" | "overwrite" | "skip" | "cancel";
+type UploadDecision = "overwrite" | "skip" | "cancel";
+
+interface UploadSummary {
+  uploaded: number;
+  skipped: number;
+  conflicts: number;
+  unsupported: number;
+  canceled: boolean;
 }
 
 function isSafeEntryName(name: string): boolean {
@@ -75,6 +95,22 @@ function parseDraggedPayload(raw: string): DraggedFilePayloadItem[] {
   return items;
 }
 
+function parseUriList(raw: string): vscode.Uri[] {
+  const uris: vscode.Uri[] = [];
+  const lines = raw.split(/\r?\n/).map((line) => line.trim());
+  for (const line of lines) {
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+    try {
+      uris.push(vscode.Uri.parse(line, true));
+    } catch {
+      // Ignore malformed URI entries from foreign drag sources.
+    }
+  }
+  return uris;
+}
+
 export class FileExplorerServerItem extends vscode.TreeItem {
   public constructor(server: ServerConfig) {
     super(`${server.name} (${server.username}@${server.host})`, vscode.TreeItemCollapsibleState.None);
@@ -111,6 +147,8 @@ export class FileTreeItem extends vscode.TreeItem {
     );
 
     const fullPath = path.posix.join(remotePath, entry.name);
+    const uri = buildUri(serverId, fullPath);
+    this.resourceUri = uri;
 
     if (entry.isDirectory) {
       this.contextValue = "nexus.fileExplorer.dir";
@@ -118,8 +156,6 @@ export class FileTreeItem extends vscode.TreeItem {
     } else {
       this.contextValue = "nexus.fileExplorer.file";
       this.iconPath = vscode.ThemeIcon.File;
-      const uri = buildUri(serverId, fullPath);
-      this.resourceUri = uri;
       this.command = {
         command: "vscode.open",
         title: "Open File",
@@ -142,8 +178,8 @@ function formatSize(bytes: number): string {
 export type FileExplorerItem = FileExplorerServerItem | ParentDirItem | FileTreeItem;
 
 export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExplorerItem>, vscode.TreeDragAndDropController<FileExplorerItem> {
-  public readonly dragMimeTypes = [FILE_DRAG_MIME, "text/uri-list"];
-  public readonly dropMimeTypes = [FILE_DRAG_MIME];
+  public readonly dragMimeTypes = [FILE_DRAG_MIME, URI_LIST_MIME];
+  public readonly dropMimeTypes = [FILE_DRAG_MIME, URI_LIST_MIME, FILES_MIME];
 
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<FileExplorerItem | undefined>();
   public readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
@@ -284,7 +320,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       return buildUri(item.serverId, fullPath).toString();
     });
     dataTransfer.set(
-      "text/uri-list",
+      URI_LIST_MIME,
       new vscode.DataTransferItem(uris.join("\r\n"))
     );
   }
@@ -296,26 +332,43 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     if (!this.activeServerId || !this.currentRootPath) {
       return;
     }
-    const transferItem = dataTransfer.get(FILE_DRAG_MIME);
-    if (!transferItem) {
+
+    const targetDirNormalized = this.resolveTargetDirectory(target);
+    if (!targetDirNormalized) {
       return;
     }
 
-    // Determine target directory
+    const internalTransferItem = dataTransfer.get(FILE_DRAG_MIME);
+    if (internalTransferItem) {
+      await this.handleInternalDrop(internalTransferItem, targetDirNormalized);
+      return;
+    }
+
+    await this.handleExternalDrop(dataTransfer, targetDirNormalized);
+  }
+
+  public dispose(): void {
+    this.stopPolling();
+  }
+
+  private resolveTargetDirectory(target: FileExplorerItem | undefined): string | undefined {
     let targetDir: string;
     if (target instanceof FileTreeItem) {
-      if (target.entry.isDirectory) {
-        targetDir = path.posix.join(target.remotePath, target.entry.name);
-      } else {
-        targetDir = target.remotePath;
-      }
+      targetDir = target.entry.isDirectory
+        ? path.posix.join(target.remotePath, target.entry.name)
+        : target.remotePath;
     } else if (target instanceof ParentDirItem) {
       targetDir = target.parentPath;
-    } else {
+    } else if (this.currentRootPath) {
       targetDir = this.currentRootPath;
+    } else {
+      return undefined;
     }
-    const targetDirNormalized = normalizeRemoteDir(targetDir);
-    if (!targetDirNormalized) {
+    return normalizeRemoteDir(targetDir);
+  }
+
+  private async handleInternalDrop(transferItem: vscode.DataTransferItem, targetDirNormalized: string): Promise<void> {
+    if (!this.activeServerId) {
       return;
     }
 
@@ -385,8 +438,313 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     this.onDidChangeTreeDataEmitter.fire(undefined);
   }
 
-  public dispose(): void {
-    this.stopPolling();
+  private async handleExternalDrop(dataTransfer: vscode.DataTransfer, targetDirNormalized: string): Promise<void> {
+    if (!this.activeServerId) {
+      return;
+    }
+
+    const { localUris, unsupportedCount } = await this.collectDroppedLocalUris(dataTransfer);
+    if (localUris.length === 0 && unsupportedCount === 0) {
+      return;
+    }
+
+    const summary: UploadSummary = {
+      uploaded: 0,
+      skipped: unsupportedCount,
+      conflicts: 0,
+      unsupported: unsupportedCount,
+      canceled: false
+    };
+    const conflictState: { mode: UploadConflictMode } = { mode: "ask" };
+    const serverId = this.activeServerId;
+
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: "Uploading dropped items..." },
+      async (progress) => {
+        for (const uri of localUris) {
+          if (summary.canceled) {
+            break;
+          }
+          const rootName = path.basename(uri.fsPath);
+          if (!isSafeEntryName(rootName)) {
+            summary.skipped += 1;
+            continue;
+          }
+          const remoteDest = path.posix.join(targetDirNormalized, rootName);
+          await this.uploadLocalUri(serverId, uri, remoteDest, progress, conflictState, summary);
+        }
+      }
+    );
+
+    if (summary.uploaded > 0) {
+      this.sftp.invalidateCache(serverId, targetDirNormalized);
+      this.onDidChangeTreeDataEmitter.fire(undefined);
+    }
+
+    const detail = `uploaded ${summary.uploaded}, skipped ${summary.skipped}, conflicts ${summary.conflicts}`;
+    if (summary.canceled) {
+      void vscode.window.showWarningMessage(`Upload canceled (${detail}).`);
+      return;
+    }
+    if (summary.skipped > 0 || summary.conflicts > 0) {
+      const extra = summary.unsupported > 0 ? `, unsupported ${summary.unsupported}` : "";
+      void vscode.window.showWarningMessage(`Upload completed with skips (${detail}${extra}).`);
+      return;
+    }
+    if (summary.uploaded > 0) {
+      void vscode.window.showInformationMessage(`Upload completed (${detail}).`);
+    }
+  }
+
+  private async collectDroppedLocalUris(dataTransfer: vscode.DataTransfer): Promise<{ localUris: vscode.Uri[]; unsupportedCount: number }> {
+    const allUris: vscode.Uri[] = [];
+
+    const uriListItem = dataTransfer.get(URI_LIST_MIME);
+    if (uriListItem) {
+      try {
+        allUris.push(...parseUriList(await uriListItem.asString()));
+      } catch {
+        // Ignore malformed uri-list payloads from external sources.
+      }
+    }
+
+    allUris.push(...this.collectFileUrisFromDataTransfer(dataTransfer));
+
+    const uniqueLocalUris = new Map<string, vscode.Uri>();
+    let unsupportedCount = 0;
+    for (const uri of allUris) {
+      if (uri.scheme !== "file") {
+        unsupportedCount += 1;
+        continue;
+      }
+      const key = process.platform === "win32"
+        ? path.normalize(uri.fsPath).toLowerCase()
+        : path.normalize(uri.fsPath);
+      if (!uniqueLocalUris.has(key)) {
+        uniqueLocalUris.set(key, uri);
+      }
+    }
+
+    return { localUris: [...uniqueLocalUris.values()], unsupportedCount };
+  }
+
+  private collectFileUrisFromDataTransfer(dataTransfer: vscode.DataTransfer): vscode.Uri[] {
+    const uris: vscode.Uri[] = [];
+    const seenItems = new Set<vscode.DataTransferItem>();
+    const addFromItem = (item: vscode.DataTransferItem | undefined): void => {
+      if (!item || seenItems.has(item)) {
+        return;
+      }
+      seenItems.add(item);
+      const file = item.asFile();
+      if (file?.uri) {
+        uris.push(file.uri);
+      }
+    };
+
+    addFromItem(dataTransfer.get(FILES_MIME));
+    const iterable = dataTransfer as unknown as Iterable<[string, vscode.DataTransferItem]>;
+    if (typeof (iterable as { [Symbol.iterator]?: unknown })[Symbol.iterator] === "function") {
+      for (const [, item] of iterable) {
+        addFromItem(item);
+      }
+    }
+
+    return uris;
+  }
+
+  private async uploadLocalUri(
+    serverId: string,
+    localUri: vscode.Uri,
+    remoteDest: string,
+    progress: vscode.Progress<{ message?: string; increment?: number }>,
+    conflictState: { mode: UploadConflictMode },
+    summary: UploadSummary
+  ): Promise<void> {
+    let localStat: vscode.FileStat;
+    try {
+      localStat = await vscode.workspace.fs.stat(localUri);
+    } catch {
+      summary.skipped += 1;
+      return;
+    }
+
+    if ((localStat.type & vscode.FileType.SymbolicLink) !== 0) {
+      summary.skipped += 1;
+      return;
+    }
+
+    if ((localStat.type & vscode.FileType.Directory) !== 0) {
+      await this.uploadLocalDirectory(serverId, localUri, remoteDest, progress, conflictState, summary);
+      return;
+    }
+
+    await this.uploadLocalFile(serverId, localUri, remoteDest, progress, conflictState, summary);
+  }
+
+  private async uploadLocalDirectory(
+    serverId: string,
+    localUri: vscode.Uri,
+    remoteDir: string,
+    progress: vscode.Progress<{ message?: string; increment?: number }>,
+    conflictState: { mode: UploadConflictMode },
+    summary: UploadSummary
+  ): Promise<void> {
+    if (summary.canceled) {
+      return;
+    }
+
+    const canContinue = await this.ensureRemoteDirectory(serverId, remoteDir, summary);
+    if (!canContinue) {
+      return;
+    }
+
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(localUri);
+    } catch {
+      summary.skipped += 1;
+      return;
+    }
+
+    for (const [name, fileType] of entries) {
+      if (summary.canceled) {
+        return;
+      }
+      if (!isSafeEntryName(name)) {
+        summary.skipped += 1;
+        continue;
+      }
+      if ((fileType & vscode.FileType.SymbolicLink) !== 0) {
+        summary.skipped += 1;
+        continue;
+      }
+
+      const childLocal = vscode.Uri.joinPath(localUri, name);
+      const childRemote = path.posix.join(remoteDir, name);
+      if ((fileType & vscode.FileType.Directory) !== 0) {
+        await this.uploadLocalDirectory(serverId, childLocal, childRemote, progress, conflictState, summary);
+      } else if ((fileType & vscode.FileType.File) !== 0) {
+        await this.uploadLocalFile(serverId, childLocal, childRemote, progress, conflictState, summary);
+      }
+    }
+  }
+
+  private async uploadLocalFile(
+    serverId: string,
+    localUri: vscode.Uri,
+    remotePath: string,
+    progress: vscode.Progress<{ message?: string; increment?: number }>,
+    conflictState: { mode: UploadConflictMode },
+    summary: UploadSummary
+  ): Promise<void> {
+    if (summary.canceled) {
+      return;
+    }
+
+    const decision = await this.resolveUploadDecision(serverId, remotePath, conflictState, summary);
+    if (decision === "cancel") {
+      summary.canceled = true;
+      return;
+    }
+    if (decision === "skip") {
+      summary.skipped += 1;
+      return;
+    }
+
+    progress.report({ message: path.basename(localUri.fsPath) });
+    try {
+      await this.sftp.upload(serverId, localUri.fsPath, remotePath);
+      summary.uploaded += 1;
+    } catch (err: unknown) {
+      summary.skipped += 1;
+      const message = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Failed to upload "${path.basename(localUri.fsPath)}": ${message}`);
+    }
+  }
+
+  private async ensureRemoteDirectory(serverId: string, remoteDir: string, summary: UploadSummary): Promise<boolean> {
+    const existing = await this.tryRemoteStat(serverId, remoteDir);
+    if (existing) {
+      if (existing.isDirectory) {
+        return true;
+      }
+      summary.conflicts += 1;
+      summary.skipped += 1;
+      void vscode.window.showWarningMessage(`Skipping "${remoteDir}" because destination exists as a file.`);
+      return false;
+    }
+
+    try {
+      await this.sftp.createDirectory(serverId, remoteDir);
+      return true;
+    } catch (err: unknown) {
+      summary.skipped += 1;
+      const message = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Failed to create remote directory "${remoteDir}": ${message}`);
+      return false;
+    }
+  }
+
+  private async resolveUploadDecision(
+    serverId: string,
+    remotePath: string,
+    conflictState: { mode: UploadConflictMode },
+    summary: UploadSummary
+  ): Promise<UploadDecision> {
+    const existing = await this.tryRemoteStat(serverId, remotePath);
+    if (!existing) {
+      return "overwrite";
+    }
+
+    summary.conflicts += 1;
+    if (existing.isDirectory) {
+      void vscode.window.showWarningMessage(`Skipping "${remotePath}" because destination is a directory.`);
+      return "skip";
+    }
+
+    if (conflictState.mode === "overwrite") {
+      return "overwrite";
+    }
+    if (conflictState.mode === "skip") {
+      return "skip";
+    }
+    if (conflictState.mode === "cancel") {
+      return "cancel";
+    }
+
+    const choice = await vscode.window.showWarningMessage(
+      `Remote file "${remotePath}" already exists. Choose an action.`,
+      CONFLICT_OPTIONS.overwrite,
+      CONFLICT_OPTIONS.skip,
+      CONFLICT_OPTIONS.overwriteAll,
+      CONFLICT_OPTIONS.skipAll,
+      CONFLICT_OPTIONS.cancel
+    );
+
+    switch (choice) {
+      case CONFLICT_OPTIONS.overwrite:
+        return "overwrite";
+      case CONFLICT_OPTIONS.skip:
+        return "skip";
+      case CONFLICT_OPTIONS.overwriteAll:
+        conflictState.mode = "overwrite";
+        return "overwrite";
+      case CONFLICT_OPTIONS.skipAll:
+        conflictState.mode = "skip";
+        return "skip";
+      default:
+        conflictState.mode = "cancel";
+        return "cancel";
+    }
+  }
+
+  private async tryRemoteStat(serverId: string, remotePath: string): Promise<DirectoryEntry | undefined> {
+    try {
+      return await this.sftp.stat(serverId, remotePath);
+    } catch {
+      return undefined;
+    }
   }
 
   private updatePolling(): void {
