@@ -204,6 +204,14 @@ describe("renderFormHtml", () => {
     expect(html).toContain("Auto-stop when server disconnects");
   });
 
+  it("renders tunnel form with browserUrl field and hint", () => {
+    const definition = tunnelFormDefinition();
+    const html = renderFormHtml(definition);
+    expect(html).toContain('id="field-browserUrl"');
+    expect(html).toContain("Browser URL");
+    expect(html).toContain("URL opened by the globe icon");
+  });
+
   it("renders tunnel form with SVG illustrations using inline attributes (no style blocks)", () => {
     const definition = tunnelFormDefinition();
     const html = renderFormHtml(definition);

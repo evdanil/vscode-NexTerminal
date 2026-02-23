@@ -34,6 +34,7 @@ export interface TunnelProfile {
   remoteBindAddress?: string;
   localTargetIP?: string;
   notes?: string;
+  browserUrl?: string;
 }
 
 export interface SerialProfile {

@@ -16,7 +16,7 @@ import { serverFormDefinition, tunnelFormDefinition } from "../ui/formDefinition
 import type { FormValues } from "../ui/formTypes";
 import { TunnelTreeItem, formatTunnelRoute } from "../ui/tunnelTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
-import { isTunnelRouteChanged } from "../utils/tunnelProfile";
+import { isTunnelRouteChanged, resolveBrowserUrl } from "../utils/tunnelProfile";
 import { browseForKey, collectGroups, formValuesToServer } from "./serverCommands";
 import type { CommandContext } from "./types";
 
@@ -127,7 +127,7 @@ export async function startTunnel(
         "Open in Browser"
       );
       if (action === "Open in Browser") {
-        void vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${profile.localPort}`));
+        void vscode.env.openExternal(vscode.Uri.parse(resolveBrowserUrl(profile)));
       }
       return;
     }
@@ -293,6 +293,7 @@ function formValuesToTunnel(values: FormValues, existingId?: string, existingCon
   const connectionMode = tunnelType === "reverse" ? "shared" : existingConnectionMode;
 
   const notes = typeof values.notes === "string" ? values.notes.trim() : undefined;
+  const browserUrl = typeof values.browserUrl === "string" && values.browserUrl.trim() ? values.browserUrl.trim() : undefined;
 
   return {
     id: existingId ?? randomUUID(),
@@ -307,7 +308,8 @@ function formValuesToTunnel(values: FormValues, existingId?: string, existingCon
     tunnelType: tunnelType === "local" ? undefined : tunnelType,
     remoteBindAddress,
     localTargetIP,
-    notes: notes || undefined
+    notes: notes || undefined,
+    browserUrl
   };
 }
 
@@ -479,7 +481,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
           void vscode.window.showInformationMessage("Reverse tunnels listen on the remote side, not locally.");
           return;
         }
-        const url = `http://localhost:${arg.profile.localPort}`;
+        const url = resolveBrowserUrl(arg.profile);
         void vscode.env.openExternal(vscode.Uri.parse(url));
       }
     }),

@@ -278,6 +278,19 @@ describe("config import command (legacy)", () => {
     );
   });
 
+  it("imports old-format tunnels without browserUrl or notes", async () => {
+    const legacyTunnel = { id: "t-old", name: "Legacy", localPort: 8080, remoteIP: "127.0.0.1", remotePort: 80, autoStart: false };
+    const exportData = makeExportData({ tunnels: [legacyTunnel] });
+    await runImport(exportData);
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.tunnels).toHaveLength(1);
+    expect(snapshot.tunnels[0].id).toBe("t-old");
+    expect(snapshot.tunnels[0].name).toBe("Legacy");
+    expect(snapshot.tunnels[0].browserUrl).toBeUndefined();
+    expect(snapshot.tunnels[0].notes).toBeUndefined();
+  });
+
   it("skips invalid items and reports skip count", async () => {
     const exportData = makeExportData({
       servers: [
@@ -945,7 +958,7 @@ describe("share export round-trip", () => {
     const sourceCore = new NexusCore(sourceRepo);
     await sourceCore.initialize();
     await sourceCore.addOrUpdateServer(makeServer());
-    await sourceCore.addOrUpdateTunnel(makeTunnel({ defaultServerId: "s1" }));
+    await sourceCore.addOrUpdateTunnel(makeTunnel({ defaultServerId: "s1", browserUrl: "https://myapp.local:{localPort}/admin", notes: "test note" }));
     await sourceCore.addOrUpdateSerialProfile(makeSerialProfile());
     await sourceCore.addGroup("Production");
 
@@ -983,6 +996,9 @@ describe("share export round-trip", () => {
 
     // Tunnel defaultServerId should point to the imported server
     expect(snapshot.tunnels[0].defaultServerId).toBe(snapshot.servers[0].id);
+    // Optional fields should survive the round-trip
+    expect(snapshot.tunnels[0].browserUrl).toBe("https://myapp.local:{localPort}/admin");
+    expect(snapshot.tunnels[0].notes).toBe("test note");
   });
 });
 
