@@ -58,13 +58,15 @@ import { NexusFileSystemProvider, buildUri, NEXTERM_SCHEME } from "../../src/ser
 import type { SftpService, DirectoryEntry } from "../../src/services/sftp/sftpService";
 
 function createMockSftpService(): SftpService {
-  return {
+  const service: any = {
     connect: vi.fn(),
     disconnect: vi.fn(),
     isConnected: vi.fn(),
     readDirectory: vi.fn(),
     stat: vi.fn(),
     lstat: vi.fn(),
+    tryStat: vi.fn(),
+    tryLstat: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn(),
     delete: vi.fn(),
@@ -76,7 +78,22 @@ function createMockSftpService(): SftpService {
     copyRemote: vi.fn(),
     invalidateCache: vi.fn(),
     dispose: vi.fn(),
-  } as any;
+  };
+  service.tryStat.mockImplementation(async (...args: any[]) => {
+    try {
+      return await service.stat(...args);
+    } catch {
+      return undefined;
+    }
+  });
+  service.tryLstat.mockImplementation(async (...args: any[]) => {
+    try {
+      return await service.lstat(...args);
+    } catch {
+      return undefined;
+    }
+  });
+  return service as SftpService;
 }
 
 const fileEntry: DirectoryEntry = {
@@ -278,8 +295,12 @@ describe("NexusFileSystemProvider", () => {
   });
 
   it("copy delegates nexterm->nexterm to copyRemote", async () => {
-    (sftp.lstat as any).mockResolvedValue(fileEntry);
-    (sftp.stat as any).mockRejectedValue(new Error("missing"));
+    (sftp.lstat as any).mockImplementation(async (_serverId: string, remotePath: string) => {
+      if (remotePath === "/home/dev/a.txt") {
+        return fileEntry;
+      }
+      throw new Error("missing");
+    });
     (sftp.copyRemote as any).mockResolvedValue(undefined);
 
     const events: any[] = [];
@@ -327,6 +348,18 @@ describe("NexusFileSystemProvider", () => {
 
     expect(vscode.workspace.fs.createDirectory).toHaveBeenCalledWith(expect.objectContaining({ fsPath: "/tmp/outdir" }));
     expect(sftp.download).toHaveBeenCalledWith("srv-1", "/home/dev/subdir/nested.txt", "/tmp/outdir/nested.txt");
+  });
+
+  it("copy enforces max depth for nexterm->file recursive directory copy", async () => {
+    const vscode = await import("vscode");
+    (sftp.lstat as any).mockResolvedValue(dirEntry);
+    (vscode.workspace.fs.stat as any).mockRejectedValue(new Error("missing"));
+    (vscode.workspace.fs.createDirectory as any).mockResolvedValue(undefined);
+    (sftp.readDirectory as any).mockResolvedValue([{ ...dirEntry, name: "nested" }]);
+
+    const source = buildUri("srv-1", "/home/dev/subdir");
+    const destination = vscode.Uri.file("/tmp/outdir");
+    await expect(provider.copy(source, destination, { overwrite: false })).rejects.toThrow(/exceeds 100 levels/i);
   });
 
   it("copy rejects nexterm->nexterm across servers", async () => {

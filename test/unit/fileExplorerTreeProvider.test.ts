@@ -99,12 +99,15 @@ import type { SftpService, DirectoryEntry } from "../../src/services/sftp/sftpSe
 import type { ServerConfig } from "../../src/models/config";
 
 function createMockSftpService(): SftpService {
-  return {
+  const service: any = {
     connect: vi.fn(),
     disconnect: vi.fn(),
     isConnected: vi.fn(),
     readDirectory: vi.fn(),
     stat: vi.fn(),
+    lstat: vi.fn(),
+    tryStat: vi.fn(),
+    tryLstat: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn(),
     delete: vi.fn(),
@@ -117,7 +120,22 @@ function createMockSftpService(): SftpService {
     copyRemote: vi.fn(),
     invalidateCache: vi.fn(),
     dispose: vi.fn(),
-  } as any;
+  };
+  service.tryStat.mockImplementation(async (...args: any[]) => {
+    try {
+      return await service.stat(...args);
+    } catch {
+      return undefined;
+    }
+  });
+  service.tryLstat.mockImplementation(async (...args: any[]) => {
+    try {
+      return await service.lstat(...args);
+    } catch {
+      return undefined;
+    }
+  });
+  return service as SftpService;
 }
 
 const testServer: ServerConfig = {
@@ -685,6 +703,34 @@ describe("FileExplorerTreeProvider", () => {
         "/tmp/mydir/nested.txt",
         "/home/dev/subdir/mydir/nested.txt"
       );
+    });
+
+    it("handleDrop enforces max upload depth for local directories", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.Directory });
+      (vscode.workspace.fs.readDirectory as any).mockResolvedValue([
+        ["nested", vscode.FileType.Directory],
+      ]);
+      (sftp.stat as any).mockRejectedValue(new Error("missing"));
+      (sftp.createDirectory as any).mockResolvedValue(undefined);
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem("file:///tmp/deep");
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "text/uri-list") { return uriListItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("directory nesting exceeds 100 levels")
+      );
+      expect(sftp.upload).not.toHaveBeenCalled();
     });
 
     it("handleDrop supports skip-all conflict decision", async () => {

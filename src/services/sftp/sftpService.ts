@@ -163,6 +163,14 @@ export class SftpService {
     return statsToDirectoryEntry(path.posix.basename(remotePath), stats);
   }
 
+  public async tryStat(serverId: string, remotePath: string): Promise<DirectoryEntry | undefined> {
+    try {
+      return await this.stat(serverId, remotePath);
+    } catch {
+      return undefined;
+    }
+  }
+
   public async lstat(serverId: string, remotePath: string): Promise<DirectoryEntry> {
     const sftp = this.getSftp(serverId);
     const stats = await new Promise<Stats>((resolve, reject) => {
@@ -175,6 +183,14 @@ export class SftpService {
       });
     });
     return statsToDirectoryEntry(path.posix.basename(remotePath), stats);
+  }
+
+  public async tryLstat(serverId: string, remotePath: string): Promise<DirectoryEntry | undefined> {
+    try {
+      return await this.lstat(serverId, remotePath);
+    } catch {
+      return undefined;
+    }
   }
 
   public async readFile(serverId: string, remotePath: string, maxSize?: number): Promise<Buffer> {

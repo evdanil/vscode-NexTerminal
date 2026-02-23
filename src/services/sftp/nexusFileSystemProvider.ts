@@ -5,6 +5,7 @@ import type { SftpService, DirectoryEntry } from "./sftpService";
 export const NEXTERM_SCHEME = "nexterm";
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+const MAX_COPY_DEPTH = 100;
 
 export function buildUri(serverId: string, remotePath: string): vscode.Uri {
   return vscode.Uri.from({ scheme: NEXTERM_SCHEME, authority: serverId, path: remotePath });
@@ -108,7 +109,7 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
       }
 
       const sourceEntry = await this.sftp.lstat(sourceParsed.serverId, sourceParsed.remotePath);
-      const destinationEntry = await this.tryRemoteStat(destinationParsed.serverId, destinationParsed.remotePath);
+      const destinationEntry = await this.sftp.tryLstat(destinationParsed.serverId, destinationParsed.remotePath);
       if (destinationEntry) {
         if (!options.overwrite) {
           throw vscode.FileSystemError.FileExists(`Destination already exists: ${destination.path}`);
@@ -158,34 +159,12 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     if (sourceEntry.isDirectory) {
-      const destinationStat = await this.tryLocalStat(destination);
-      if (destinationStat) {
-        if (!overwrite) {
-          throw vscode.FileSystemError.FileExists(`Destination already exists: ${destination.fsPath}`);
-        }
-        if ((destinationStat.type & vscode.FileType.Directory) === 0) {
-          await vscode.workspace.fs.delete(destination, { recursive: true, useTrash: false });
-          await vscode.workspace.fs.createDirectory(destination);
-        }
-      } else {
-        await vscode.workspace.fs.createDirectory(destination);
-      }
-
-      await this.copyRemoteDirectoryToLocal(serverId, remotePath, destination, overwrite);
+      await this.ensureLocalDirectoryDestination(destination, overwrite);
+      await this.copyRemoteDirectoryToLocal(serverId, remotePath, destination, overwrite, 0);
       return;
     }
 
-    await this.ensureLocalParentDirectory(destination);
-    const destinationStat = await this.tryLocalStat(destination);
-    if (destinationStat) {
-      if (!overwrite) {
-        throw vscode.FileSystemError.FileExists(`Destination already exists: ${destination.fsPath}`);
-      }
-      if ((destinationStat.type & vscode.FileType.Directory) !== 0) {
-        await vscode.workspace.fs.delete(destination, { recursive: true, useTrash: false });
-      }
-    }
-
+    await this.ensureLocalFileDestination(destination, overwrite);
     await this.sftp.download(serverId, remotePath, destination.fsPath);
   }
 
@@ -193,8 +172,15 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
     serverId: string,
     remoteDir: string,
     localDir: vscode.Uri,
-    overwrite: boolean
+    overwrite: boolean,
+    depth: number
   ): Promise<void> {
+    if (depth > MAX_COPY_DEPTH) {
+      throw vscode.FileSystemError.NoPermissions(
+        `Copy aborted: directory nesting exceeds ${MAX_COPY_DEPTH} levels`
+      );
+    }
+
     const entries = await this.sftp.readDirectory(serverId, remoteDir);
     for (const entry of entries) {
       if (entry.isSymlink) {
@@ -203,46 +189,49 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
 
       const remoteChild = path.posix.join(remoteDir, entry.name);
       const localChild = vscode.Uri.joinPath(localDir, entry.name);
-      const localChildStat = await this.tryLocalStat(localChild);
-
       if (entry.isDirectory) {
-        if (localChildStat) {
-          if ((localChildStat.type & vscode.FileType.Directory) === 0) {
-            if (!overwrite) {
-              throw vscode.FileSystemError.FileExists(`Destination already exists: ${localChild.fsPath}`);
-            }
-            await vscode.workspace.fs.delete(localChild, { recursive: true, useTrash: false });
-            await vscode.workspace.fs.createDirectory(localChild);
-          }
-        } else {
-          await vscode.workspace.fs.createDirectory(localChild);
-        }
-        await this.copyRemoteDirectoryToLocal(serverId, remoteChild, localChild, overwrite);
+        await this.ensureLocalDirectoryDestination(localChild, overwrite);
+        await this.copyRemoteDirectoryToLocal(serverId, remoteChild, localChild, overwrite, depth + 1);
       } else {
-        if (localChildStat) {
-          if (!overwrite) {
-            throw vscode.FileSystemError.FileExists(`Destination already exists: ${localChild.fsPath}`);
-          }
-          if ((localChildStat.type & vscode.FileType.Directory) !== 0) {
-            await vscode.workspace.fs.delete(localChild, { recursive: true, useTrash: false });
-          }
-        }
+        await this.ensureLocalFileDestination(localChild, overwrite);
         await this.sftp.download(serverId, remoteChild, localChild.fsPath);
       }
+    }
+  }
+
+  private async ensureLocalDirectoryDestination(destination: vscode.Uri, overwrite: boolean): Promise<void> {
+    const destinationStat = await this.tryLocalStat(destination);
+    if (!destinationStat) {
+      await vscode.workspace.fs.createDirectory(destination);
+      return;
+    }
+    if ((destinationStat.type & vscode.FileType.Directory) !== 0) {
+      return;
+    }
+    if (!overwrite) {
+      throw vscode.FileSystemError.FileExists(`Destination already exists: ${destination.fsPath}`);
+    }
+    await vscode.workspace.fs.delete(destination, { recursive: true, useTrash: false });
+    await vscode.workspace.fs.createDirectory(destination);
+  }
+
+  private async ensureLocalFileDestination(destination: vscode.Uri, overwrite: boolean): Promise<void> {
+    await this.ensureLocalParentDirectory(destination);
+    const destinationStat = await this.tryLocalStat(destination);
+    if (!destinationStat) {
+      return;
+    }
+    if (!overwrite) {
+      throw vscode.FileSystemError.FileExists(`Destination already exists: ${destination.fsPath}`);
+    }
+    if ((destinationStat.type & vscode.FileType.Directory) !== 0) {
+      await vscode.workspace.fs.delete(destination, { recursive: true, useTrash: false });
     }
   }
 
   private async ensureLocalParentDirectory(uri: vscode.Uri): Promise<void> {
     const parent = vscode.Uri.file(path.dirname(uri.fsPath));
     await vscode.workspace.fs.createDirectory(parent);
-  }
-
-  private async tryRemoteStat(serverId: string, remotePath: string): Promise<DirectoryEntry | undefined> {
-    try {
-      return await this.sftp.stat(serverId, remotePath);
-    } catch {
-      return undefined;
-    }
   }
 
   private async tryLocalStat(uri: vscode.Uri): Promise<vscode.FileStat | undefined> {
