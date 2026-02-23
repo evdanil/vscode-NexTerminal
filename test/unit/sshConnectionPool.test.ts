@@ -30,6 +30,7 @@ function createMockConnection(): SshConnection & { closeListeners: Set<() => voi
     openShell: vi.fn(async () => ({} as any)),
     openDirectTcp: vi.fn(async () => ({} as any)),
     openSftp: vi.fn(async () => ({} as any)),
+    exec: vi.fn(async () => ({} as any)),
     requestForwardIn: vi.fn(async () => 0),
     cancelForwardIn: vi.fn(async () => {}),
     onTcpConnection: vi.fn(() => () => {}),

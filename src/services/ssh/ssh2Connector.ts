@@ -63,6 +63,18 @@ class Ssh2Connection implements SshConnection {
     });
   }
 
+  public async exec(command: string): Promise<Duplex> {
+    return new Promise((resolve, reject) => {
+      this.client.exec(command, (error: Error | undefined, stream: Duplex) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stream);
+      });
+    });
+  }
+
   public async requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
     return new Promise((resolve, reject) => {
       this.client.forwardIn(bindAddr, bindPort, (error: Error | undefined, port: number) => {

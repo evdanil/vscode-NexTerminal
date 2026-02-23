@@ -141,6 +141,21 @@ class PooledSshConnection implements SshConnection {
     }
   }
 
+  public async exec(command: string): Promise<Duplex> {
+    this.assertNotDisposed();
+    try {
+      return await this.active.exec(command);
+    } catch (err) {
+      if (this.shouldAttemptFallback(err)) {
+        const fb = await this.tryFallback();
+        if (fb) {
+          return fb.exec(command);
+        }
+      }
+      throw err;
+    }
+  }
+
   public requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
     this.assertNotDisposed();
     return this.active.requestForwardIn(bindAddr, bindPort);

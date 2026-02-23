@@ -74,7 +74,7 @@ function formatSize(bytes: number): string {
 export type FileExplorerItem = FileExplorerServerItem | ParentDirItem | FileTreeItem;
 
 export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExplorerItem>, vscode.TreeDragAndDropController<FileExplorerItem> {
-  public readonly dragMimeTypes = [FILE_DRAG_MIME];
+  public readonly dragMimeTypes = [FILE_DRAG_MIME, "text/uri-list"];
   public readonly dropMimeTypes = [FILE_DRAG_MIME];
 
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<FileExplorerItem | undefined>();
@@ -210,6 +210,15 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       FILE_DRAG_MIME,
       new vscode.DataTransferItem(JSON.stringify(payload))
     );
+
+    const uris = items.map((item) => {
+      const fullPath = path.posix.join(item.remotePath, item.entry.name);
+      return buildUri(item.serverId, fullPath).toString();
+    });
+    dataTransfer.set(
+      "text/uri-list",
+      new vscode.DataTransferItem(uris.join("\r\n"))
+    );
   }
 
   public async handleDrop(
@@ -245,24 +254,48 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       return;
     }
 
-    for (const item of items) {
+    // Filter valid items: same server, different path, no dir-into-self
+    const validItems = items.filter((item) => {
       if (item.serverId !== this.activeServerId) {
-        continue;
+        return false;
       }
       const oldPath = path.posix.join(item.remotePath, item.name);
       const newPath = path.posix.join(targetDir, item.name);
       if (oldPath === newPath) {
-        continue;
+        return false;
       }
       if (item.isDirectory && (newPath + "/").startsWith(oldPath + "/")) {
-        continue;
+        return false;
       }
+      return true;
+    });
+
+    if (validItems.length === 0) {
+      return;
+    }
+
+    const choice = await vscode.window.showQuickPick(
+      [{ label: "Move" }, { label: "Copy" }],
+      { placeHolder: "Move or copy the selected items?" }
+    );
+    if (!choice) {
+      return;
+    }
+
+    for (const item of validItems) {
+      const oldPath = path.posix.join(item.remotePath, item.name);
+      const newPath = path.posix.join(targetDir, item.name);
       try {
-        await this.sftp.rename(this.activeServerId, oldPath, newPath);
-        this.sftp.invalidateCache(this.activeServerId, item.remotePath);
+        if (choice.label === "Move") {
+          await this.sftp.rename(this.activeServerId, oldPath, newPath);
+          this.sftp.invalidateCache(this.activeServerId, item.remotePath);
+        } else {
+          await this.sftp.copyRemote(this.activeServerId, oldPath, newPath, item.isDirectory);
+        }
       } catch (err: unknown) {
+        const verb = choice.label === "Move" ? "move" : "copy";
         const message = err instanceof Error ? err.message : String(err);
-        void vscode.window.showErrorMessage(`Failed to move ${item.name}: ${message}`);
+        void vscode.window.showErrorMessage(`Failed to ${verb} ${item.name}: ${message}`);
       }
     }
 

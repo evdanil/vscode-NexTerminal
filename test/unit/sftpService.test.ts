@@ -36,6 +36,7 @@ function createMockConnection(sftp: ReturnType<typeof createMockSftp>): SshConne
     openShell: vi.fn(),
     openDirectTcp: vi.fn(),
     openSftp: vi.fn(async () => sftp as any),
+    exec: vi.fn(),
     requestForwardIn: vi.fn(),
     cancelForwardIn: vi.fn(),
     onTcpConnection: vi.fn().mockReturnValue(() => {}),
@@ -260,5 +261,107 @@ describe("SftpService", () => {
     expect(sftp.end).toHaveBeenCalled();
     expect(connection.dispose).toHaveBeenCalled();
     expect(service.isConnected("srv-1")).toBe(false);
+  });
+
+  describe("execCommand", () => {
+    const tick = () => new Promise((r) => process.nextTick(r));
+
+    it("runs command and collects stdout/stderr/exitCode", async () => {
+      const { PassThrough } = await import("node:stream");
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const stream = Object.assign(stdout, { stderr }) as any;
+
+      (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
+      await service.connect(testServer);
+
+      const resultPromise = service.execCommand("srv-1", "echo hello");
+      await tick();
+
+      stdout.write("hello\n");
+      stderr.write("warn\n");
+      stdout.emit("close", 0);
+
+      const result = await resultPromise;
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("hello\n");
+      expect(result.stderr).toBe("warn\n");
+    });
+
+    it("throws when no session exists", async () => {
+      await expect(service.execCommand("srv-1", "ls")).rejects.toThrow("No SFTP session");
+    });
+  });
+
+  describe("copyRemote", () => {
+    const tick = () => new Promise((r) => process.nextTick(r));
+
+    it("calls cp -p for files", async () => {
+      const { PassThrough } = await import("node:stream");
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const stream = Object.assign(stdout, { stderr }) as any;
+
+      (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
+      await service.connect(testServer);
+
+      const promise = service.copyRemote("srv-1", "/home/a.txt", "/home/b.txt", false);
+      await tick();
+      stdout.emit("close", 0);
+      await promise;
+
+      expect(connection.exec).toHaveBeenCalledWith("cp -p '/home/a.txt' '/home/b.txt'");
+    });
+
+    it("calls cp -rp for directories", async () => {
+      const { PassThrough } = await import("node:stream");
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const stream = Object.assign(stdout, { stderr }) as any;
+
+      (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
+      await service.connect(testServer);
+
+      const promise = service.copyRemote("srv-1", "/home/mydir", "/home/copy", true);
+      await tick();
+      stdout.emit("close", 0);
+      await promise;
+
+      expect(connection.exec).toHaveBeenCalledWith("cp -rp '/home/mydir' '/home/copy'");
+    });
+
+    it("throws on non-zero exit code with stderr message", async () => {
+      const { PassThrough } = await import("node:stream");
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const stream = Object.assign(stdout, { stderr }) as any;
+
+      (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
+      await service.connect(testServer);
+
+      const promise = service.copyRemote("srv-1", "/a", "/b", false);
+      await tick();
+      stderr.write("cp: cannot stat '/a': No such file or directory\n");
+      stdout.emit("close", 1);
+
+      await expect(promise).rejects.toThrow("No such file or directory");
+    });
+
+    it("shell-escapes paths with single quotes", async () => {
+      const { PassThrough } = await import("node:stream");
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const stream = Object.assign(stdout, { stderr }) as any;
+
+      (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
+      await service.connect(testServer);
+
+      const promise = service.copyRemote("srv-1", "/home/it's a file", "/home/dest", false);
+      await tick();
+      stdout.emit("close", 0);
+      await promise;
+
+      expect(connection.exec).toHaveBeenCalledWith("cp -p '/home/it'\\''s a file' '/home/dest'");
+    });
   });
 });

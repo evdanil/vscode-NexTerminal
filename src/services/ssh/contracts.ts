@@ -38,6 +38,7 @@ export interface SshConnection {
   openShell(ptyOptions?: PtyOptions): Promise<Duplex>;
   openDirectTcp(remoteIP: string, remotePort: number): Promise<Duplex>;
   openSftp(): Promise<SFTPWrapper>;
+  exec(command: string): Promise<Duplex>;
   requestForwardIn(bindAddr: string, bindPort: number): Promise<number>;
   cancelForwardIn(bindAddr: string, bindPort: number): Promise<void>;
   onTcpConnection(handler: (info: TcpConnectionInfo, accept: () => Duplex, reject: () => void) => void): () => void;

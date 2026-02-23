@@ -38,6 +38,7 @@ vi.mock("vscode", () => {
         scheme: components.scheme,
         authority: components.authority,
         path: components.path,
+        toString: () => `${components.scheme}://${components.authority}${components.path}`,
       })),
     },
     DataTransferItem: class {
@@ -46,6 +47,7 @@ vi.mock("vscode", () => {
     },
     window: {
       showErrorMessage: vi.fn(),
+      showQuickPick: vi.fn(),
     },
     EventEmitter,
   };
@@ -70,6 +72,8 @@ function createMockSftpService(): SftpService {
     realpath: vi.fn(),
     download: vi.fn(),
     upload: vi.fn(),
+    execCommand: vi.fn(),
+    copyRemote: vi.fn(),
     invalidateCache: vi.fn(),
     dispose: vi.fn(),
   } as any;
@@ -107,9 +111,12 @@ describe("FileExplorerTreeProvider", () => {
   let sftp: ReturnType<typeof createMockSftpService>;
   let provider: FileExplorerTreeProvider;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     sftp = createMockSftpService();
     provider = new FileExplorerTreeProvider(sftp);
+    const vscode = await import("vscode");
+    (vscode.window.showQuickPick as any).mockReset();
+    (vscode.window.showErrorMessage as any).mockReset();
   });
 
   it("returns empty children when no active server", async () => {
@@ -353,7 +360,9 @@ describe("FileExplorerTreeProvider", () => {
       expect(dataTransfer.size).toBe(0);
     });
 
-    it("handleDrop calls sftp.rename with correct paths", async () => {
+    it("handleDrop shows QuickPick; Move calls sftp.rename", async () => {
+      const vscode = await import("vscode");
+      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Move" });
       (sftp.rename as any).mockResolvedValue(undefined);
       provider.setActiveServer(testServer, "/home/dev");
 
@@ -372,11 +381,66 @@ describe("FileExplorerTreeProvider", () => {
 
       await provider.handleDrop(targetDir, mockTransfer as any);
 
+      expect(vscode.window.showQuickPick).toHaveBeenCalled();
       expect(sftp.rename).toHaveBeenCalledWith(
         "srv-1",
         "/home/dev/file.txt",
         "/home/dev/subdir/file.txt"
       );
+    });
+
+    it("handleDrop shows QuickPick; Copy calls sftp.copyRemote", async () => {
+      const vscode = await import("vscode");
+      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Copy" });
+      (sftp.copyRemote as any).mockResolvedValue(undefined);
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const payload = JSON.stringify([
+        { serverId: "srv-1", remotePath: "/home/dev", name: "file.txt", isDirectory: false },
+      ]);
+      const { DataTransferItem } = await import("vscode");
+      const transferItem = new DataTransferItem(payload);
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      expect(vscode.window.showQuickPick).toHaveBeenCalled();
+      expect(sftp.copyRemote).toHaveBeenCalledWith(
+        "srv-1",
+        "/home/dev/file.txt",
+        "/home/dev/subdir/file.txt",
+        false
+      );
+    });
+
+    it("handleDrop does nothing when user cancels QuickPick", async () => {
+      const vscode = await import("vscode");
+      (vscode.window.showQuickPick as any).mockResolvedValue(undefined);
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const payload = JSON.stringify([
+        { serverId: "srv-1", remotePath: "/home/dev", name: "file.txt", isDirectory: false },
+      ]);
+      const { DataTransferItem } = await import("vscode");
+      const transferItem = new DataTransferItem(payload);
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      expect(sftp.rename).not.toHaveBeenCalled();
+      expect(sftp.copyRemote).not.toHaveBeenCalled();
     });
 
     it("handleDrop skips move when source === target", async () => {
@@ -397,6 +461,9 @@ describe("FileExplorerTreeProvider", () => {
 
       await provider.handleDrop(targetDir, mockTransfer as any);
 
+      // No valid items, so QuickPick should not be shown
+      const vscode = await import("vscode");
+      expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
       expect(sftp.rename).not.toHaveBeenCalled();
     });
 
@@ -419,10 +486,14 @@ describe("FileExplorerTreeProvider", () => {
 
       await provider.handleDrop(targetDir, mockTransfer as any);
 
+      const vscode = await import("vscode");
+      expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
       expect(sftp.rename).not.toHaveBeenCalled();
     });
 
     it("handleDrop uses parent directory when dropped on a file", async () => {
+      const vscode = await import("vscode");
+      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Move" });
       (sftp.rename as any).mockResolvedValue(undefined);
       provider.setActiveServer(testServer, "/home/dev");
 
@@ -449,6 +520,8 @@ describe("FileExplorerTreeProvider", () => {
     });
 
     it("handleDrop uses currentRootPath when dropped on undefined", async () => {
+      const vscode = await import("vscode");
+      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Move" });
       (sftp.rename as any).mockResolvedValue(undefined);
       provider.setActiveServer(testServer, "/home/dev");
 
@@ -471,6 +544,23 @@ describe("FileExplorerTreeProvider", () => {
         "/home/dev/subdir/file.txt",
         "/home/dev/file.txt"
       );
+    });
+
+    it("handleDrag sets text/uri-list with nexterm:// URIs", async () => {
+      const item = new FileTreeItem("srv-1", "/home/dev", fileEntry);
+      const dataTransfer = new Map<string, { value: string }>();
+      const mockTransfer = {
+        set: (mime: string, transferItem: { value: string }) => {
+          dataTransfer.set(mime, transferItem);
+        },
+      };
+
+      await provider.handleDrag([item], mockTransfer as any);
+
+      const uriList = dataTransfer.get("text/uri-list");
+      expect(uriList).toBeDefined();
+      expect(uriList!.value).toContain("nexterm");
+      expect(uriList!.value).toContain("/home/dev/file.txt");
     });
   });
 });

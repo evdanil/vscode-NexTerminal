@@ -59,6 +59,10 @@ class DirectTcpSshConnection implements SshConnection {
     throw new Error("Not implemented");
   }
 
+  public async exec(_command: string): Promise<Duplex> {
+    throw new Error("Not implemented");
+  }
+
   public async requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
     this.forwardedPorts.set(`${bindAddr}:${bindPort}`, { bindAddr, bindPort });
     return bindPort;

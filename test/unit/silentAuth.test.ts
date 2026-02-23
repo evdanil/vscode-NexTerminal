@@ -17,6 +17,7 @@ const fakeConnection: SshConnection = {
   openShell: vi.fn(),
   openDirectTcp: vi.fn(),
   openSftp: vi.fn(),
+  exec: vi.fn(),
   requestForwardIn: vi.fn(),
   cancelForwardIn: vi.fn(),
   onTcpConnection: vi.fn().mockReturnValue(() => {}),

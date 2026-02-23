@@ -54,6 +54,10 @@ function parentDir(remotePath: string): string {
   return path.posix.dirname(remotePath);
 }
 
+function shellEscape(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
 function cacheKey(serverId: string, remotePath: string): string {
   return `${serverId}:${remotePath}`;
 }
@@ -254,6 +258,39 @@ export class SftpService {
         resolve(absPath);
       });
     });
+  }
+
+  public async execCommand(serverId: string, command: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    const session = this.sessions.get(serverId);
+    if (!session) {
+      throw new Error(`No SFTP session for server ${serverId}`);
+    }
+    const stream = await session.connection.exec(command);
+    return new Promise((resolve, reject) => {
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+      stream.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
+      const stderrStream = (stream as unknown as { stderr?: NodeJS.ReadableStream }).stderr;
+      stderrStream?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+      stream.on("error", reject);
+      stream.on("close", (code: number | null) => {
+        resolve({
+          exitCode: code ?? 0,
+          stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
+          stderr: Buffer.concat(stderrChunks).toString("utf-8"),
+        });
+      });
+    });
+  }
+
+  public async copyRemote(serverId: string, srcPath: string, destPath: string, isDirectory: boolean): Promise<void> {
+    const flag = isDirectory ? "-rp" : "-p";
+    const command = `cp ${flag} ${shellEscape(srcPath)} ${shellEscape(destPath)}`;
+    const result = await this.execCommand(serverId, command);
+    if (result.exitCode !== 0) {
+      throw new Error(result.stderr || `cp exited with code ${result.exitCode}`);
+    }
+    this.invalidateCache(serverId, parentDir(destPath));
   }
 
   public async download(serverId: string, remotePath: string, localPath: string): Promise<void> {
