@@ -310,7 +310,7 @@ describe("SftpService", () => {
       stdout.emit("close", 0);
       await promise;
 
-      expect(connection.exec).toHaveBeenCalledWith("cp -p '/home/a.txt' '/home/b.txt'");
+      expect(connection.exec).toHaveBeenCalledWith("cp -p -- '/home/a.txt' '/home/b.txt'");
     });
 
     it("calls cp -rp for directories", async () => {
@@ -327,7 +327,7 @@ describe("SftpService", () => {
       stdout.emit("close", 0);
       await promise;
 
-      expect(connection.exec).toHaveBeenCalledWith("cp -rp '/home/mydir' '/home/copy'");
+      expect(connection.exec).toHaveBeenCalledWith("cp -R -p -- '/home/mydir' '/home/copy'");
     });
 
     it("throws on non-zero exit code with stderr message", async () => {
@@ -361,7 +361,34 @@ describe("SftpService", () => {
       stdout.emit("close", 0);
       await promise;
 
-      expect(connection.exec).toHaveBeenCalledWith("cp -p '/home/it'\\''s a file' '/home/dest'");
+      expect(connection.exec).toHaveBeenCalledWith("cp -p -- '/home/it'\\''s a file' '/home/dest'");
+    });
+
+    it("rejects control characters in source and destination paths", async () => {
+      await service.connect(testServer);
+
+      await expect(service.copyRemote("srv-1", "/home/a\nbad", "/home/b", false)).rejects.toThrow(
+        "Invalid remote source path"
+      );
+      await expect(service.copyRemote("srv-1", "/home/a", "/home/\rb", false)).rejects.toThrow(
+        "Invalid remote destination path"
+      );
+    });
+
+    it("treats signal-terminated commands as errors", async () => {
+      const { PassThrough } = await import("node:stream");
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const stream = Object.assign(stdout, { stderr }) as any;
+
+      (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
+      await service.connect(testServer);
+
+      const promise = service.copyRemote("srv-1", "/a", "/b", false);
+      await tick();
+      stdout.emit("close", null, "TERM");
+
+      await expect(promise).rejects.toThrow("terminated by signal TERM");
     });
   });
 });

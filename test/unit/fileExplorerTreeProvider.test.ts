@@ -362,7 +362,7 @@ describe("FileExplorerTreeProvider", () => {
 
     it("handleDrop shows QuickPick; Move calls sftp.rename", async () => {
       const vscode = await import("vscode");
-      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Move" });
+      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Move", value: "move" });
       (sftp.rename as any).mockResolvedValue(undefined);
       provider.setActiveServer(testServer, "/home/dev");
 
@@ -391,7 +391,7 @@ describe("FileExplorerTreeProvider", () => {
 
     it("handleDrop shows QuickPick; Copy calls sftp.copyRemote", async () => {
       const vscode = await import("vscode");
-      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Copy" });
+      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Copy", value: "copy" });
       (sftp.copyRemote as any).mockResolvedValue(undefined);
       provider.setActiveServer(testServer, "/home/dev");
 
@@ -493,7 +493,7 @@ describe("FileExplorerTreeProvider", () => {
 
     it("handleDrop uses parent directory when dropped on a file", async () => {
       const vscode = await import("vscode");
-      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Move" });
+      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Move", value: "move" });
       (sftp.rename as any).mockResolvedValue(undefined);
       provider.setActiveServer(testServer, "/home/dev");
 
@@ -521,7 +521,7 @@ describe("FileExplorerTreeProvider", () => {
 
     it("handleDrop uses currentRootPath when dropped on undefined", async () => {
       const vscode = await import("vscode");
-      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Move" });
+      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Move", value: "move" });
       (sftp.rename as any).mockResolvedValue(undefined);
       provider.setActiveServer(testServer, "/home/dev");
 
@@ -544,6 +544,30 @@ describe("FileExplorerTreeProvider", () => {
         "/home/dev/subdir/file.txt",
         "/home/dev/file.txt"
       );
+    });
+
+    it("handleDrop rejects forged payload names with path separators", async () => {
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const payload = JSON.stringify([
+        { serverId: "srv-1", remotePath: "/home/dev", name: "/etc/passwd", isDirectory: false },
+      ]);
+      const { DataTransferItem } = await import("vscode");
+      const transferItem = new DataTransferItem(payload);
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "application/vnd.nexus.fileItem") { return transferItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      const vscode = await import("vscode");
+      expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+      expect(sftp.rename).not.toHaveBeenCalled();
+      expect(sftp.copyRemote).not.toHaveBeenCalled();
     });
 
     it("handleDrag sets text/uri-list with nexterm:// URIs", async () => {

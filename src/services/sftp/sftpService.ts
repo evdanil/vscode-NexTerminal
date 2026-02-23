@@ -58,6 +58,16 @@ function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
+function toBufferChunk(chunk: Buffer | string): Buffer {
+  return Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+}
+
+function assertValidExecPath(remotePath: string, label: "source" | "destination"): void {
+  if (!remotePath || remotePath.includes("\0") || remotePath.includes("\r") || remotePath.includes("\n")) {
+    throw new Error(`Invalid remote ${label} path`);
+  }
+}
+
 function cacheKey(serverId: string, remotePath: string): string {
   return `${serverId}:${remotePath}`;
 }
@@ -269,26 +279,51 @@ export class SftpService {
     return new Promise((resolve, reject) => {
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
-      stream.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
-      const stderrStream = (stream as unknown as { stderr?: NodeJS.ReadableStream }).stderr;
-      stderrStream?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
-      stream.on("error", reject);
-      stream.on("close", (code: number | null) => {
+      let settled = false;
+
+      const onStdoutData = (chunk: Buffer | string): void => {
+        stdoutChunks.push(toBufferChunk(chunk));
+      };
+      const onStderrData = (chunk: Buffer | string): void => {
+        stderrChunks.push(toBufferChunk(chunk));
+      };
+      const onError = (error: Error): void => {
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      };
+      const onClose = (code: number | null, signal: string): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        const stderrText = Buffer.concat(stderrChunks).toString("utf-8");
+        const signalNote = code === null ? `terminated by signal ${signal || "unknown"}` : "";
         resolve({
-          exitCode: code ?? 0,
+          exitCode: code ?? -1,
           stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
-          stderr: Buffer.concat(stderrChunks).toString("utf-8"),
+          stderr: signalNote ? (stderrText ? `${stderrText}\n${signalNote}` : signalNote) : stderrText,
         });
-      });
+      };
+
+      stream.on("data", onStdoutData);
+      const stderrStream = (stream as unknown as { stderr?: NodeJS.ReadableStream }).stderr;
+      stderrStream?.on("data", onStderrData);
+      stream.on("error", onError);
+      stream.on("close", onClose);
     });
   }
 
   public async copyRemote(serverId: string, srcPath: string, destPath: string, isDirectory: boolean): Promise<void> {
-    const flag = isDirectory ? "-rp" : "-p";
-    const command = `cp ${flag} ${shellEscape(srcPath)} ${shellEscape(destPath)}`;
+    assertValidExecPath(srcPath, "source");
+    assertValidExecPath(destPath, "destination");
+
+    const flag = isDirectory ? "-R -p" : "-p";
+    const command = `cp ${flag} -- ${shellEscape(srcPath)} ${shellEscape(destPath)}`;
     const result = await this.execCommand(serverId, command);
     if (result.exitCode !== 0) {
-      throw new Error(result.stderr || `cp exited with code ${result.exitCode}`);
+      throw new Error(result.stderr.trim() || `cp exited with code ${result.exitCode}`);
     }
     this.invalidateCache(serverId, parentDir(destPath));
   }

@@ -6,6 +6,74 @@ import type { SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
 
 const FILE_DRAG_MIME = "application/vnd.nexus.fileItem";
+const MOVE_COPY_OPTIONS = [
+  { label: "Move", value: "move" as const },
+  { label: "Copy", value: "copy" as const }
+];
+
+interface DraggedFilePayloadItem {
+  serverId: string;
+  remotePath: string;
+  name: string;
+  isDirectory: boolean;
+}
+
+interface ValidDraggedItem extends DraggedFilePayloadItem {
+  oldPath: string;
+  newPath: string;
+}
+
+function isSafeEntryName(name: string): boolean {
+  return (
+    name.length > 0 &&
+    !name.includes("/") &&
+    !name.includes("\\") &&
+    !name.includes("\0") &&
+    name !== "." &&
+    name !== ".."
+  );
+}
+
+function normalizeRemoteDir(remotePath: string): string | undefined {
+  if (!remotePath || remotePath.includes("\0")) {
+    return undefined;
+  }
+  const normalized = path.posix.normalize(remotePath);
+  if (!normalized.startsWith("/")) {
+    return undefined;
+  }
+  return normalized;
+}
+
+function parseDraggedPayload(raw: string): DraggedFilePayloadItem[] {
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    return [];
+  }
+
+  const items: DraggedFilePayloadItem[] = [];
+  for (const item of parsed) {
+    if (typeof item !== "object" || item === null) {
+      continue;
+    }
+    const candidate = item as Partial<DraggedFilePayloadItem>;
+    if (
+      typeof candidate.serverId !== "string" ||
+      typeof candidate.remotePath !== "string" ||
+      typeof candidate.name !== "string" ||
+      typeof candidate.isDirectory !== "boolean"
+    ) {
+      continue;
+    }
+    items.push({
+      serverId: candidate.serverId,
+      remotePath: candidate.remotePath,
+      name: candidate.name,
+      isDirectory: candidate.isDirectory
+    });
+  }
+  return items;
+}
 
 export class FileExplorerServerItem extends vscode.TreeItem {
   public constructor(server: ServerConfig) {
@@ -246,28 +314,43 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     } else {
       targetDir = this.currentRootPath;
     }
+    const targetDirNormalized = normalizeRemoteDir(targetDir);
+    if (!targetDirNormalized) {
+      return;
+    }
 
-    let items: Array<{ serverId: string; remotePath: string; name: string; isDirectory: boolean }>;
+    let items: DraggedFilePayloadItem[];
     try {
-      items = JSON.parse(await transferItem.asString());
+      items = parseDraggedPayload(await transferItem.asString());
     } catch {
       return;
     }
 
-    // Filter valid items: same server, different path, no dir-into-self
-    const validItems = items.filter((item) => {
+    // Filter valid items: same server, sane names, no path traversal, no self-moves.
+    const validItems: ValidDraggedItem[] = items.flatMap((item) => {
       if (item.serverId !== this.activeServerId) {
-        return false;
+        return [];
       }
-      const oldPath = path.posix.join(item.remotePath, item.name);
-      const newPath = path.posix.join(targetDir, item.name);
+      if (!isSafeEntryName(item.name)) {
+        return [];
+      }
+      const sourceDirNormalized = normalizeRemoteDir(item.remotePath);
+      if (!sourceDirNormalized) {
+        return [];
+      }
+      const oldPath = path.posix.normalize(path.posix.join(sourceDirNormalized, item.name));
+      const sourcePrefix = sourceDirNormalized === "/" ? "/" : `${sourceDirNormalized}/`;
+      if (!oldPath.startsWith(sourcePrefix)) {
+        return [];
+      }
+      const newPath = path.posix.normalize(path.posix.join(targetDirNormalized, item.name));
       if (oldPath === newPath) {
-        return false;
+        return [];
       }
       if (item.isDirectory && (newPath + "/").startsWith(oldPath + "/")) {
-        return false;
+        return [];
       }
-      return true;
+      return [{ ...item, oldPath, newPath }];
     });
 
     if (validItems.length === 0) {
@@ -275,31 +358,30 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     }
 
     const choice = await vscode.window.showQuickPick(
-      [{ label: "Move" }, { label: "Copy" }],
+      MOVE_COPY_OPTIONS,
       { placeHolder: "Move or copy the selected items?" }
     );
     if (!choice) {
       return;
     }
+    const operation = choice.value;
 
     for (const item of validItems) {
-      const oldPath = path.posix.join(item.remotePath, item.name);
-      const newPath = path.posix.join(targetDir, item.name);
       try {
-        if (choice.label === "Move") {
-          await this.sftp.rename(this.activeServerId, oldPath, newPath);
+        if (operation === "move") {
+          await this.sftp.rename(this.activeServerId, item.oldPath, item.newPath);
           this.sftp.invalidateCache(this.activeServerId, item.remotePath);
         } else {
-          await this.sftp.copyRemote(this.activeServerId, oldPath, newPath, item.isDirectory);
+          await this.sftp.copyRemote(this.activeServerId, item.oldPath, item.newPath, item.isDirectory);
         }
       } catch (err: unknown) {
-        const verb = choice.label === "Move" ? "move" : "copy";
+        const verb = operation === "move" ? "move" : "copy";
         const message = err instanceof Error ? err.message : String(err);
         void vscode.window.showErrorMessage(`Failed to ${verb} ${item.name}: ${message}`);
       }
     }
 
-    this.sftp.invalidateCache(this.activeServerId, targetDir);
+    this.sftp.invalidateCache(this.activeServerId, targetDirNormalized);
     this.onDidChangeTreeDataEmitter.fire(undefined);
   }
 
