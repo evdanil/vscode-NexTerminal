@@ -122,7 +122,7 @@ async function toConnectConfig(server: ServerConfig, password?: string, passphra
     host: server.host,
     port: server.port,
     username: server.username,
-    readyTimeout: 15_000,
+    readyTimeout: 60_000,
     keepaliveInterval: 10_000,
     keepaliveCountMax: 3,
     tryKeyboard: true
