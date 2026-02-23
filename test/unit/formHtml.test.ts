@@ -197,6 +197,13 @@ describe("renderFormHtml", () => {
     expect(html).toContain("Content-Security-Policy");
   });
 
+  it("renders tunnel form with autoStop checkbox", () => {
+    const definition = tunnelFormDefinition();
+    const html = renderFormHtml(definition);
+    expect(html).toContain("autoStop");
+    expect(html).toContain("Auto-stop when server disconnects");
+  });
+
   it("renders tunnel form with SVG illustrations using inline attributes (no style blocks)", () => {
     const definition = tunnelFormDefinition();
     const html = renderFormHtml(definition);

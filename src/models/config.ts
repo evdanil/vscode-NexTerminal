@@ -28,6 +28,7 @@ export interface TunnelProfile {
   remotePort: number;
   defaultServerId?: string;
   autoStart: boolean;
+  autoStop?: boolean;
   connectionMode?: TunnelConnectionMode;
   tunnelType?: TunnelType;
   remoteBindAddress?: string;

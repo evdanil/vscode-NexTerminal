@@ -302,6 +302,7 @@ function formValuesToTunnel(values: FormValues, existingId?: string, existingCon
     remotePort,
     defaultServerId: serverId,
     autoStart: values.autoStart === true,
+    autoStop: values.autoStop === true,
     connectionMode,
     tunnelType: tunnelType === "local" ? undefined : tunnelType,
     remoteBindAddress,

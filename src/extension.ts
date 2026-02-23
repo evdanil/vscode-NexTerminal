@@ -209,14 +209,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     async onTunnelDropped(serverId, tunnelProfileId) {
       const profile = core.getTunnel(tunnelProfileId);
       const server = core.getServer(serverId);
-      if (!profile || !server) {
+      if (!profile) {
+        vscode.window.showWarningMessage("Cannot start tunnel: tunnel profile not found.");
+        return;
+      }
+      if (!server) {
+        vscode.window.showWarningMessage("Cannot start tunnel: server not found.");
         return;
       }
       const connectionMode = await resolveTunnelConnectionMode(profile, true);
       if (!connectionMode) {
-        return;
+        return; // User canceled — intentional
       }
-      await startTunnel(core, tunnelManager, pool, profile, server, connectionMode, registrySync);
+      try {
+        await startTunnel(core, tunnelManager, pool, profile, server, connectionMode, registrySync);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        vscode.window.showErrorMessage(`Failed to start tunnel "${profile.name}": ${message}`);
+      }
     },
     async onItemGroupChanged(itemType, itemId, newGroup) {
       if (itemType === "server") {

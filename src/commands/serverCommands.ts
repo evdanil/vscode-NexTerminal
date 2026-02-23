@@ -148,6 +148,22 @@ async function browseForKey(): Promise<string | undefined> {
   return uris?.[0]?.fsPath;
 }
 
+async function stopAutoStopTunnels(ctx: CommandContext, serverId: string): Promise<void> {
+  const snapshot = ctx.core.getSnapshot();
+  const tunnelsToStop = snapshot.activeTunnels.filter((t) => {
+    if (t.serverId !== serverId) {
+      return false;
+    }
+    const profile = ctx.core.getTunnel(t.profileId);
+    return profile?.autoStop !== false; // undefined or true → stop
+  });
+  await Promise.all(tunnelsToStop.map((t) => ctx.tunnelManager.stop(t.id)));
+}
+
+function hasActiveTunnelsForServer(ctx: CommandContext, serverId: string): boolean {
+  return ctx.core.getSnapshot().activeTunnels.some((tunnel) => tunnel.serverId === serverId);
+}
+
 async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
@@ -195,6 +211,9 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
             if (terminalRef) {
               removeTerminal(server.id, terminalRef, ctx.terminalsByServer);
             }
+            if (!ctx.core.isServerConnected(server.id)) {
+              stopAutoStopTunnels(ctx, server.id).catch(() => {});
+            }
           }
         },
         ctx.loggerFactory.create("terminal", server.id),
@@ -240,9 +259,10 @@ async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<voi
     }
     ctx.terminalsByServer.delete(server.id);
   }
-  const activeTunnels = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === server.id);
-  await Promise.all(activeTunnels.map((t) => ctx.tunnelManager.stop(t.id)));
-  ctx.sshPool.disconnect(server.id);
+  await stopAutoStopTunnels(ctx, server.id);
+  if (!hasActiveTunnelsForServer(ctx, server.id)) {
+    ctx.sshPool.disconnect(server.id);
+  }
 }
 
 export function registerServerCommands(ctx: CommandContext): vscode.Disposable[] {
@@ -289,6 +309,10 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       await disconnectServer(ctx, server.id);
+      // Stop ALL tunnels when server profile is deleted, regardless of autoStop
+      const remaining = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === server.id);
+      await Promise.all(remaining.map((t) => ctx.tunnelManager.stop(t.id)));
+      ctx.sshPool.disconnect(server.id);
       await ctx.core.removeServer(server.id);
     }),
 

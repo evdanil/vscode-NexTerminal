@@ -81,6 +81,10 @@ describe("isTunnelRouteChanged", () => {
     ).toBe(true);
   });
 
+  it("returns false when autoStop changes", () => {
+    expect(isTunnelRouteChanged(baseProfile, { ...baseProfile, autoStop: true })).toBe(false);
+  });
+
   it("returns false when non-route fields change on reverse profile", () => {
     const reverseProfile: TunnelProfile = {
       ...baseProfile,

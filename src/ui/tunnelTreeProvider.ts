@@ -3,8 +3,7 @@ import type { SessionSnapshot } from "../core/contracts";
 import type { TunnelProfile } from "../models/config";
 import { resolveTunnelType } from "../models/config";
 import { formatBytes } from "../utils/helpers";
-
-const TUNNEL_DRAG_MIME = "application/vnd.nexus.tunnelProfile";
+import { TUNNEL_DRAG_MIME } from "./dndMimeTypes";
 
 export function formatTunnelRoute(profile: TunnelProfile): string {
   const type = resolveTunnelType(profile);
@@ -75,7 +74,7 @@ export class TunnelTreeProvider
     explicitGroups: []
   };
 
-  public readonly dragMimeTypes = [TUNNEL_DRAG_MIME];
+  public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, "text/plain"];
   public readonly dropMimeTypes: string[] = [];
 
   public readonly onDidChangeTreeData: vscode.Event<TunnelTreeItem | undefined> =
@@ -105,7 +104,9 @@ export class TunnelTreeProvider
     if (source.length === 0) {
       return;
     }
-    dataTransfer.set(TUNNEL_DRAG_MIME, new vscode.DataTransferItem(source[0].profile.id));
+    const payload = JSON.stringify({ type: "tunnelProfile", id: source[0].profile.id });
+    dataTransfer.set(TUNNEL_DRAG_MIME, new vscode.DataTransferItem(payload));
+    dataTransfer.set("text/plain", new vscode.DataTransferItem(payload));
   }
 
   public async handleDrop(): Promise<void> {

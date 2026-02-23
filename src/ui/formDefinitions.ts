@@ -179,6 +179,7 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
         value: seed?.defaultServerId ?? ""
       },
       { type: "checkbox", key: "autoStart", label: "Auto-start when server connects", value: seed?.autoStart ?? false },
+      { type: "checkbox", key: "autoStop", label: "Auto-stop when server disconnects", value: seed?.autoStop ?? true },
       { type: "text", key: "notes", label: "Notes", placeholder: "Optional description or notes", value: seed?.notes ?? "" }
     ]
   };

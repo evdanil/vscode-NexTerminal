@@ -3,9 +3,7 @@ import type { SessionSnapshot } from "../core/contracts";
 import type { ActiveSerialSession, ActiveSession, SerialProfile, ServerConfig } from "../models/config";
 import { getAncestorPaths, folderDisplayName, isDescendantOrSelf } from "../utils/folderPaths";
 import { toParityCode } from "../utils/helpers";
-
-const TUNNEL_DRAG_MIME = "application/vnd.nexus.tunnelProfile";
-const ITEM_DRAG_MIME = "application/vnd.nexus.item";
+import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
 
 export class FolderTreeItem extends vscode.TreeItem {
   public constructor(public readonly folderPath: string, displayName: string) {
@@ -94,7 +92,7 @@ export class NexusTreeProvider
   };
 
   public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME];
-  public readonly dropMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME];
+  public readonly dropMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME, "text/plain"];
 
   public constructor(
     private readonly callbacks: NexusTreeCallbacks
@@ -153,9 +151,8 @@ export class NexusTreeProvider
   public async handleDrop(target: NexusTreeItem | undefined, dataTransfer: vscode.DataTransfer): Promise<void> {
     // Handle tunnel drop onto server
     if (target instanceof ServerTreeItem) {
-      const tunnelTransfer = dataTransfer.get(TUNNEL_DRAG_MIME);
-      if (tunnelTransfer) {
-        const tunnelProfileId = await tunnelTransfer.asString();
+      const tunnelProfileId = await this.extractTunnelProfileId(dataTransfer);
+      if (tunnelProfileId) {
         await this.callbacks.onTunnelDropped(target.server.id, tunnelProfileId);
         return;
       }
@@ -196,6 +193,39 @@ export class NexusTreeProvider
     if (parsed.type === "server" || parsed.type === "serial") {
       await this.callbacks.onItemGroupChanged(parsed.type as "server" | "serial", parsed.id, targetPath);
     }
+  }
+
+  private async extractTunnelProfileId(dataTransfer: vscode.DataTransfer): Promise<string | undefined> {
+    // Try each MIME type that might carry the tunnel profile ID.
+    // Custom MIME data can arrive empty in cross-view transfers, so
+    // we try text/plain as a reliable fallback.
+    for (const mime of [TUNNEL_DRAG_MIME, "text/plain"]) {
+      const item = dataTransfer.get(mime);
+      if (!item) {
+        continue;
+      }
+      const raw = await item.asString();
+      if (!raw) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed?.type === "tunnelProfile" && typeof parsed.id === "string" && this.hasTunnelProfileId(parsed.id)) {
+          return parsed.id;
+        }
+      } catch {
+        // Non-JSON payloads may come from older/other transfer producers.
+        const rawId = raw.trim();
+        if (rawId && this.hasTunnelProfileId(rawId)) {
+          return rawId;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private hasTunnelProfileId(id: string): boolean {
+    return this.snapshot.tunnels.some((tunnel) => tunnel.id === id);
   }
 
   private getFolderChildren(parentPath: string | undefined): NexusTreeItem[] {
