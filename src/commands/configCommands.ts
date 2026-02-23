@@ -6,7 +6,12 @@ import type { SecretVault } from "../services/ssh/contracts";
 import { passwordSecretKey, passphraseSecretKey } from "../services/ssh/silentAuth";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
-import { parseSecureCrtDirectory, type SecureCrtFileEntry } from "../utils/securecrtParser";
+import {
+  parseSecureCrtDirectory,
+  parseSecureCrtXmlExport,
+  type ImportParseResult,
+  type SecureCrtFileEntry
+} from "../utils/securecrtParser";
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 
@@ -665,40 +670,82 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
   }
 
   async function importSecureCrt(): Promise<void> {
+    const sourcePick = await vscode.window.showQuickPick(
+      [
+        { label: "SecureCRT XML Export File (.xml)", value: "xml" as const },
+        { label: "SecureCRT Sessions Folder", value: "folder" as const }
+      ],
+      { title: "SecureCRT Import Source" }
+    );
+    if (!sourcePick) return;
+
     const uris = await vscode.window.showOpenDialog({
-      canSelectFiles: false,
-      canSelectFolders: true,
+      canSelectFiles: sourcePick.value === "xml",
+      canSelectFolders: sourcePick.value === "folder",
       canSelectMany: false,
-      title: "Select SecureCRT Sessions Folder"
+      filters: sourcePick.value === "xml" ? { "SecureCRT XML Files": ["xml"] } : undefined,
+      title: sourcePick.value === "xml" ? "Select SecureCRT XML Export File" : "Select SecureCRT Sessions Folder"
     });
     if (!uris || uris.length === 0) return;
 
-    const rootUri = uris[0];
-    const files: SecureCrtFileEntry[] = [];
+    const inputUri = uris[0];
+    const stat = await vscode.workspace.fs.stat(inputUri);
 
-    async function walkDirectory(uri: vscode.Uri, folder: string): Promise<void> {
-      const entries = await vscode.workspace.fs.readDirectory(uri);
-      for (const [name, type] of entries) {
-        const childUri = vscode.Uri.joinPath(uri, name);
-        if (type === vscode.FileType.Directory) {
-          const childFolder = folder ? `${folder}/${name}` : name;
-          await walkDirectory(childUri, childFolder);
-        } else if (type === vscode.FileType.File && name.toLowerCase().endsWith(".ini")) {
-          const raw = await vscode.workspace.fs.readFile(childUri);
-          const content = Buffer.from(raw).toString("utf8");
-          const sessionName = name.replace(/\.ini$/i, "");
-          files.push({ name: sessionName, folder, content });
+    let result: ImportParseResult;
+    const unsupportedMsg = "Unsupported SecureCRT input. Select a SecureCRT XML export file or Sessions folder.";
+
+    if (sourcePick.value === "folder") {
+      const isDirectory = (stat.type & vscode.FileType.Directory) === vscode.FileType.Directory;
+      if (!isDirectory) {
+        void vscode.window.showErrorMessage(unsupportedMsg);
+        return;
+      }
+
+      const files: SecureCrtFileEntry[] = [];
+
+      async function walkDirectory(uri: vscode.Uri, folder: string): Promise<void> {
+        const entries = await vscode.workspace.fs.readDirectory(uri);
+        for (const [name, type] of entries) {
+          const childUri = vscode.Uri.joinPath(uri, name);
+          if (type === vscode.FileType.Directory) {
+            const childFolder = folder ? `${folder}/${name}` : name;
+            await walkDirectory(childUri, childFolder);
+          } else if (type === vscode.FileType.File && name.toLowerCase().endsWith(".ini")) {
+            const raw = await vscode.workspace.fs.readFile(childUri);
+            const content = Buffer.from(raw).toString("utf8");
+            const sessionName = name.replace(/\.ini$/i, "");
+            files.push({ name: sessionName, folder, content });
+          }
         }
       }
-    }
 
-    await walkDirectory(rootUri, "");
-    const result = parseSecureCrtDirectory(files);
+      await walkDirectory(inputUri, "");
+      result = parseSecureCrtDirectory(files);
+    } else {
+      const isFile = (stat.type & vscode.FileType.File) === vscode.FileType.File;
+      if (!isFile || !inputUri.fsPath.toLowerCase().endsWith(".xml")) {
+        void vscode.window.showErrorMessage(unsupportedMsg);
+        return;
+      }
+      const raw = await vscode.workspace.fs.readFile(inputUri);
+      if (raw.byteLength > 10 * 1024 * 1024) {
+        void vscode.window.showErrorMessage("SecureCRT XML file exceeds the 10 MB size limit.");
+        return;
+      }
+      const text = Buffer.from(raw).toString("utf8");
+      try {
+        result = parseSecureCrtXmlExport(text);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "unknown parse error";
+        void vscode.window.showErrorMessage(`Failed to parse SecureCRT XML: ${message}`);
+        return;
+      }
+    }
 
     if (result.sessions.length === 0) {
       const note = result.skippedCount > 0
         ? `No SSH sessions found (${result.skippedCount} non-SSH skipped).`
-        : "No SSH sessions found in the selected folder.";
+        : `No SSH sessions found in the selected ${sourcePick.value === "xml" ? "file" : "folder"}.`;
       void vscode.window.showWarningMessage(note);
       return;
     }

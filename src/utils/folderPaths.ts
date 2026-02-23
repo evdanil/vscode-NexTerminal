@@ -11,7 +11,7 @@ export function normalizeFolderPath(path: string): string | undefined {
     return undefined;
   }
   for (const seg of segments) {
-    if (seg === ".." || seg === ".") {
+    if (seg === ".." || seg === "." || seg.includes("\\")) {
       return undefined;
     }
   }

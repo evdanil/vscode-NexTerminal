@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   parseSecureCrtSessionFile,
-  parseSecureCrtDirectory
+  parseSecureCrtDirectory,
+  parseSecureCrtXmlExport
 } from "../../src/utils/securecrtParser";
 
 describe("parseSecureCrtSessionFile", () => {
@@ -245,5 +246,172 @@ describe("parseSecureCrtDirectory", () => {
     ];
     const result = parseSecureCrtDirectory(files);
     expect(result.folders).toEqual(["Alpha", "Zulu"]);
+  });
+});
+
+describe("parseSecureCrtXmlExport", () => {
+  it("parses nested SSH sessions and collects folders", () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="SSH">
+      <key name="Prod">
+        <key name="App">
+          <dword name="Is Session">1</dword>
+          <string name="Protocol Name">SSH2</string>
+          <string name="Hostname">app.example.com</string>
+          <dword name="[SSH2] Port">2222</dword>
+          <string name="Username">deploy</string>
+        </key>
+      </key>
+      <key name="Core">
+        <key name="Db">
+          <dword name="Is Session">1</dword>
+          <string name="Protocol Name">SSH2</string>
+          <string name="Hostname">db.example.com</string>
+          <dword name="[SSH2] Port">22</dword>
+        </key>
+      </key>
+    </key>
+  </key>
+</VanDyke>`;
+    const result = parseSecureCrtXmlExport(xml);
+    expect(result.sessions).toHaveLength(2);
+    expect(result.sessions).toEqual(
+      expect.arrayContaining([
+        {
+          name: "App",
+          host: "app.example.com",
+          port: 2222,
+          username: "deploy",
+          folder: "SSH/Prod"
+        },
+        {
+          name: "Db",
+          host: "db.example.com",
+          port: 22,
+          username: "user",
+          folder: "SSH/Core"
+        }
+      ])
+    );
+    expect(result.folders).toEqual(["SSH/Core", "SSH/Prod"]);
+    expect(result.skippedCount).toBe(0);
+  });
+
+  it("skips non-SSH sessions and SSH sessions without hostname", () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="RDP">
+      <key name="Desktop">
+        <dword name="Is Session">1</dword>
+        <string name="Protocol Name">RDP</string>
+        <string name="Hostname">rdp.example.com</string>
+      </key>
+    </key>
+    <key name="Default">
+      <dword name="Is Session">1</dword>
+      <string name="Protocol Name">SSH2</string>
+    </key>
+    <key name="SSH">
+      <key name="Good">
+        <dword name="Is Session">1</dword>
+        <string name="Protocol Name">SSH2</string>
+        <string name="Hostname">good.example.com</string>
+      </key>
+    </key>
+  </key>
+</VanDyke>`;
+    const result = parseSecureCrtXmlExport(xml);
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0].name).toBe("Good");
+    expect(result.skippedCount).toBe(2);
+  });
+
+  it("uses port fallback and username fallback", () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="SSH">
+      <key name="BadPort">
+        <dword name="Is Session">1</dword>
+        <string name="Protocol Name">SSH2</string>
+        <string name="Hostname">bad.example.com</string>
+        <dword name="[SSH2] Port">70000</dword>
+        <string name="Username"/>
+      </key>
+      <key name="NoPort">
+        <dword name="Is Session">1</dword>
+        <string name="Protocol Name">SSH2</string>
+        <string name="Hostname">nop.example.com</string>
+      </key>
+    </key>
+  </key>
+</VanDyke>`;
+    const result = parseSecureCrtXmlExport(xml);
+    const bad = result.sessions.find((session) => session.name === "BadPort");
+    const noPort = result.sessions.find((session) => session.name === "NoPort");
+    expect(bad?.port).toBe(22);
+    expect(bad?.username).toBe("user");
+    expect(noPort?.port).toBe(22);
+    expect(noPort?.username).toBe("user");
+  });
+
+  it("truncates XML folder depth to first three segments", () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="SSH">
+      <key name="Switches">
+        <key name="Draglines">
+          <key name="CCTV">
+            <key name="DL01">
+              <dword name="Is Session">1</dword>
+              <string name="Protocol Name">SSH2</string>
+              <string name="Hostname">deep.example.com</string>
+            </key>
+          </key>
+        </key>
+      </key>
+    </key>
+  </key>
+</VanDyke>`;
+    const result = parseSecureCrtXmlExport(xml);
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0].folder).toBe("SSH/Switches/Draglines");
+    expect(result.folders).toEqual(["SSH/Switches/Draglines"]);
+  });
+
+  it("returns empty result when Sessions key is missing", () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Security"/>
+</VanDyke>`;
+    const result = parseSecureCrtXmlExport(xml);
+    expect(result.sessions).toHaveLength(0);
+    expect(result.skippedCount).toBe(0);
+    expect(result.folders).toHaveLength(0);
+  });
+
+  it("throws on malformed XML", () => {
+    expect(() => parseSecureCrtXmlExport("<VanDyke><key name=\"Sessions\">")).toThrow("Invalid XML format");
+  });
+
+  it("ignores entity definitions when processEntities is disabled", () => {
+    const xml = `<?xml version="1.0"?>
+<!DOCTYPE foo [<!ENTITY xxe "injected">]>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="Server">
+      <dword name="Is Session">1</dword>
+      <string name="Protocol Name">SSH2</string>
+      <string name="Hostname">safe.example.com</string>
+    </key>
+  </key>
+</VanDyke>`;
+    const result = parseSecureCrtXmlExport(xml);
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0].host).toBe("safe.example.com");
   });
 });

@@ -68,7 +68,7 @@ You can also drag a tunnel profile onto a server in the Connectivity Hub to star
 Power users migrating from other SSH clients can import their connection profiles directly:
 
 - **MobaXterm**: Run `Nexus: Import from MobaXterm` and select your MobaXterm `.ini` configuration file. SSH sessions are imported with their folder organization preserved.
-- **SecureCRT**: Run `Nexus: Import from SecureCRT` and select your SecureCRT `Sessions/` directory. SSH sessions are imported with their directory hierarchy as folder groups.
+- **SecureCRT**: Run `Nexus: Import from SecureCRT` and select either your SecureCRT XML export file (for example `SecureCRTSessions.xml`) or your `Sessions/` directory. SSH sessions are imported with their hierarchy as folder groups.
 
 Both importers extract hostname, port, and username from each SSH session. Non-SSH sessions (RDP, Telnet, etc.) are skipped. Imported servers default to password authentication.
 

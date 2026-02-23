@@ -12,6 +12,7 @@ const mockShowInputBox = vi.fn();
 const mockWriteFile = vi.fn();
 const mockReadFile = vi.fn();
 const mockReadDirectory = vi.fn();
+const mockStat = vi.fn();
 const mockWithProgress = vi.fn();
 const mockConfigUpdate = vi.fn();
 const configStore = new Map<string, unknown>();
@@ -40,7 +41,8 @@ vi.mock("vscode", () => ({
     fs: {
       writeFile: (...args: unknown[]) => mockWriteFile(...args),
       readFile: (...args: unknown[]) => mockReadFile(...args),
-      readDirectory: (...args: unknown[]) => mockReadDirectory(...args)
+      readDirectory: (...args: unknown[]) => mockReadDirectory(...args),
+      stat: (...args: unknown[]) => mockStat(...args)
     },
     getConfiguration: vi.fn((section: string) => ({
       get: (key: string) => configStore.get(`${section}.${key}`),
@@ -741,6 +743,7 @@ describe("import from SecureCRT command", () => {
     core = new NexusCore(repo);
     await core.initialize();
     registerConfigCommands(core, vault);
+    mockShowQuickPick.mockResolvedValue({ label: "SecureCRT Sessions Folder", value: "folder" });
   });
 
   it("is registered as a command", () => {
@@ -749,6 +752,7 @@ describe("import from SecureCRT command", () => {
 
   it("imports SSH sessions recursively, supports mixed-case .ini extension, and creates groups", async () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/Sessions", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 2 });
     mockShowInformationMessage.mockResolvedValueOnce("Import");
 
     mockReadDirectory.mockImplementation(async (uri: { fsPath: string }) => {
@@ -814,6 +818,7 @@ describe("import from SecureCRT command", () => {
 
   it("shows warning when folder has no SSH sessions", async () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/Sessions", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 2 });
     mockReadDirectory.mockResolvedValue([["Telnet.ini", 1]]);
     mockReadFile.mockResolvedValue(Buffer.from(`S:"Protocol Name"=Telnet\nS:"Hostname"=legacy.example.com`, "utf8"));
 
@@ -826,6 +831,7 @@ describe("import from SecureCRT command", () => {
 
   it("does nothing when user cancels confirmation", async () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/Sessions", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 2 });
     mockReadDirectory.mockResolvedValue([["Srv.ini", 1]]);
     mockReadFile.mockResolvedValue(Buffer.from(`S:"Protocol Name"=SSH2\nS:"Hostname"=srv.example.com`, "utf8"));
     mockShowInformationMessage.mockResolvedValueOnce(undefined);
@@ -843,6 +849,131 @@ describe("import from SecureCRT command", () => {
     await cmd();
 
     expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("imports SSH sessions from SecureCRT XML file and truncates deep folders", async () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="SSH">
+      <key name="Production">
+        <key name="App">
+          <dword name="Is Session">1</dword>
+          <string name="Protocol Name">SSH2</string>
+          <string name="Hostname">app.example.com</string>
+          <dword name="[SSH2] Port">2222</dword>
+          <string name="Username">deploy</string>
+        </key>
+      </key>
+      <key name="A">
+        <key name="B">
+          <key name="C">
+            <key name="D">
+              <dword name="Is Session">1</dword>
+              <string name="Protocol Name">SSH2</string>
+              <string name="Hostname">deep.example.com</string>
+              <dword name="[SSH2] Port">22</dword>
+            </key>
+          </key>
+        </key>
+      </key>
+    </key>
+    <key name="RDP">
+      <key name="Desk">
+        <dword name="Is Session">1</dword>
+        <string name="Protocol Name">RDP</string>
+        <string name="Hostname">rdp.example.com</string>
+      </key>
+    </key>
+  </key>
+</VanDyke>`;
+
+    mockShowQuickPick.mockResolvedValue({ label: "SecureCRT XML Export File (.xml)", value: "xml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/SecureCRTSessions.xml", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1 });
+    mockReadFile.mockResolvedValue(Buffer.from(xml, "utf8"));
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(2);
+
+    const app = snapshot.servers.find((s) => s.name === "App");
+    expect(app?.host).toBe("app.example.com");
+    expect(app?.port).toBe(2222);
+    expect(app?.username).toBe("deploy");
+    expect(app?.group).toBe("SSH/Production");
+
+    const deep = snapshot.servers.find((s) => s.name === "D");
+    expect(deep?.host).toBe("deep.example.com");
+    expect(deep?.group).toBe("SSH/A/B");
+
+    expect(snapshot.explicitGroups).toContain("SSH/Production");
+    expect(snapshot.explicitGroups).toContain("SSH/A/B");
+  });
+
+  it("shows parsing error for malformed XML files", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "SecureCRT XML Export File (.xml)", value: "xml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/SecureCRTSessions.xml", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1 });
+    mockReadFile.mockResolvedValue(Buffer.from("<VanDyke><key name=\"Sessions\">", "utf8"));
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Failed to parse SecureCRT XML"));
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("shows warning when XML file has no SSH sessions", async () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="RDP">
+      <key name="Desk">
+        <dword name="Is Session">1</dword>
+        <string name="Protocol Name">RDP</string>
+        <string name="Hostname">rdp.example.com</string>
+      </key>
+    </key>
+  </key>
+</VanDyke>`;
+    mockShowQuickPick.mockResolvedValue({ label: "SecureCRT XML Export File (.xml)", value: "xml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/SecureCRTSessions.xml", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1 });
+    mockReadFile.mockResolvedValue(Buffer.from(xml, "utf8"));
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("No SSH sessions found (1 non-SSH skipped).");
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("shows error for unsupported file extension", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "SecureCRT XML Export File (.xml)", value: "xml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/not-securecrt.txt", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1 });
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      "Unsupported SecureCRT input. Select a SecureCRT XML export file or Sessions folder."
+    );
+    expect(mockReadFile).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when user cancels source picker", async () => {
+    mockShowQuickPick.mockResolvedValue(undefined);
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
+    expect(mockShowOpenDialog).not.toHaveBeenCalled();
   });
 });
 

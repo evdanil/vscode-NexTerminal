@@ -41,6 +41,11 @@ describe("normalizeFolderPath", () => {
     expect(normalizeFolderPath("A/./B")).toBeUndefined();
   });
 
+  it("rejects segments containing backslashes", () => {
+    expect(normalizeFolderPath("..\\..\\etc")).toBeUndefined();
+    expect(normalizeFolderPath("A/B\\C")).toBeUndefined();
+  });
+
   it("rejects paths deeper than MAX_FOLDER_DEPTH", () => {
     const deep = Array.from({ length: MAX_FOLDER_DEPTH + 1 }, (_, i) => `level${i}`).join("/");
     expect(normalizeFolderPath(deep)).toBeUndefined();
