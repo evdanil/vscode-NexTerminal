@@ -828,7 +828,7 @@
         },
         {
           "command": "nexus.files.download",
-          "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.file",
+          "when": "view == nexusFileExplorer && viewItem =~ /^nexus\\.fileExplorer\\.(file|dir)$/",
           "group": "1_manage@5"
         },
         {

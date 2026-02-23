@@ -58,6 +58,131 @@ function resolveSelectedItems(arg: unknown, allSelected: unknown): FileTreeItem[
   return [];
 }
 
+type DownloadConflictMode = "ask" | "overwrite" | "skip" | "cancel";
+
+interface DownloadSummary {
+  downloaded: number;
+  skipped: number;
+  conflicts: number;
+  failed: number;
+  canceled: boolean;
+}
+
+interface DownloadItem {
+  item: FileTreeItem;
+  remotePath: string;
+}
+
+const DOWNLOAD_CONFLICT_OPTIONS = {
+  overwrite: "Overwrite",
+  skip: "Skip",
+  overwriteAll: "Overwrite All",
+  skipAll: "Skip All",
+  cancel: "Cancel"
+} as const;
+
+function isFileExistsError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return /already exists|file exists/i.test(error.message);
+}
+
+function dedupeDownloadItems(items: FileTreeItem[]): DownloadItem[] {
+  const normalized = items
+    .filter((item) => item.label !== ".")
+    .map((item) => ({ item, remotePath: path.posix.join(item.remotePath, item.entry.name) }))
+    .sort((a, b) => a.remotePath.length - b.remotePath.length);
+
+  const result: DownloadItem[] = [];
+  for (const candidate of normalized) {
+    if (result.some((existing) => candidate.remotePath === existing.remotePath || candidate.remotePath.startsWith(`${existing.remotePath}/`))) {
+      continue;
+    }
+    result.push(candidate);
+  }
+  return result;
+}
+
+async function resolveDownloadConflict(
+  targetLabel: string,
+  conflictState: { mode: DownloadConflictMode },
+  summary: DownloadSummary
+): Promise<"overwrite" | "skip" | "cancel"> {
+  summary.conflicts += 1;
+
+  if (conflictState.mode === "overwrite") {
+    return "overwrite";
+  }
+  if (conflictState.mode === "skip") {
+    return "skip";
+  }
+  if (conflictState.mode === "cancel") {
+    return "cancel";
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    `Local target "${targetLabel}" already exists. Choose an action.`,
+    DOWNLOAD_CONFLICT_OPTIONS.overwrite,
+    DOWNLOAD_CONFLICT_OPTIONS.skip,
+    DOWNLOAD_CONFLICT_OPTIONS.overwriteAll,
+    DOWNLOAD_CONFLICT_OPTIONS.skipAll,
+    DOWNLOAD_CONFLICT_OPTIONS.cancel
+  );
+
+  switch (choice) {
+    case DOWNLOAD_CONFLICT_OPTIONS.overwrite:
+      return "overwrite";
+    case DOWNLOAD_CONFLICT_OPTIONS.skip:
+      return "skip";
+    case DOWNLOAD_CONFLICT_OPTIONS.overwriteAll:
+      conflictState.mode = "overwrite";
+      return "overwrite";
+    case DOWNLOAD_CONFLICT_OPTIONS.skipAll:
+      conflictState.mode = "skip";
+      return "skip";
+    default:
+      conflictState.mode = "cancel";
+      return "cancel";
+  }
+}
+
+async function copyRemoteToLocalWithConflict(
+  sourceUri: vscode.Uri,
+  destinationUri: vscode.Uri,
+  conflictState: { mode: DownloadConflictMode },
+  summary: DownloadSummary
+): Promise<void> {
+  let overwrite = conflictState.mode === "overwrite";
+
+  while (true) {
+    try {
+      await vscode.workspace.fs.copy(sourceUri, destinationUri, { overwrite });
+      summary.downloaded += 1;
+      return;
+    } catch (error) {
+      if (!isFileExistsError(error)) {
+        summary.failed += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(`Failed to download "${path.basename(destinationUri.fsPath)}": ${message}`);
+        return;
+      }
+
+      const decision = await resolveDownloadConflict(destinationUri.fsPath, conflictState, summary);
+      if (decision === "cancel") {
+        summary.canceled = true;
+        return;
+      }
+      if (decision === "skip") {
+        summary.skipped += 1;
+        return;
+      }
+
+      overwrite = true;
+    }
+  }
+}
+
 export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
   const browse = vscode.commands.registerCommand("nexus.files.browse", async (arg?: unknown) => {
     let server = toServerFromArg(ctx, arg);
@@ -140,13 +265,13 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
   });
 
   const download = vscode.commands.registerCommand("nexus.files.download", async (arg?: unknown, allSelected?: unknown) => {
-    const items = resolveSelectedItems(arg, allSelected).filter((i) => !i.entry.isDirectory);
+    const items = dedupeDownloadItems(resolveSelectedItems(arg, allSelected));
     if (items.length === 0) {
       return;
     }
 
-    if (items.length === 1) {
-      const item = items[0];
+    if (items.length === 1 && !items[0].item.entry.isDirectory) {
+      const item = items[0].item;
       const dest = await vscode.window.showSaveDialog({
         title: "Save file as",
         defaultUri: vscode.Uri.file(item.entry.name),
@@ -154,11 +279,13 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       if (!dest) {
         return;
       }
+
       const remoteFile = path.posix.join(item.remotePath, item.entry.name);
+      const sourceUri = buildUri(item.serverId, remoteFile);
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: `Downloading ${item.entry.name}...` },
         async () => {
-          await ctx.sftpService.download(item.serverId, remoteFile, dest.fsPath);
+          await vscode.workspace.fs.copy(sourceUri, dest, { overwrite: true });
         }
       );
       vscode.window.showInformationMessage(`Downloaded ${item.entry.name}`);
@@ -174,19 +301,43 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     if (!folder || folder.length === 0) {
       return;
     }
-    const destDir = folder[0].fsPath;
+
+    const destRoot = folder[0];
+    const conflictState: { mode: DownloadConflictMode } = { mode: "ask" };
+    const summary: DownloadSummary = {
+      downloaded: 0,
+      skipped: 0,
+      conflicts: 0,
+      failed: 0,
+      canceled: false
+    };
+
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "Downloading files...", cancellable: false },
       async (progress) => {
-        for (const item of items) {
+        for (const { item, remotePath } of items) {
+          if (summary.canceled) {
+            break;
+          }
           progress.report({ message: item.entry.name });
-          const remoteFile = path.posix.join(item.remotePath, item.entry.name);
-          const localDest = path.join(destDir, item.entry.name);
-          await ctx.sftpService.download(item.serverId, remoteFile, localDest);
+
+          const sourceUri = buildUri(item.serverId, remotePath);
+          const destinationUri = vscode.Uri.joinPath(destRoot, item.entry.name);
+          await copyRemoteToLocalWithConflict(sourceUri, destinationUri, conflictState, summary);
         }
       }
     );
-    vscode.window.showInformationMessage(`Downloaded ${items.length} files`);
+
+    const detail = `downloaded ${summary.downloaded}, skipped ${summary.skipped}, conflicts ${summary.conflicts}, failed ${summary.failed}`;
+    if (summary.canceled) {
+      vscode.window.showWarningMessage(`Download canceled (${detail}).`);
+      return;
+    }
+    if (summary.skipped > 0 || summary.conflicts > 0 || summary.failed > 0) {
+      vscode.window.showWarningMessage(`Download completed with issues (${detail}).`);
+      return;
+    }
+    vscode.window.showInformationMessage(`Downloaded ${summary.downloaded} item${summary.downloaded === 1 ? "" : "s"}.`);
   });
 
   const deleteCmd = vscode.commands.registerCommand("nexus.files.delete", async (arg?: unknown, allSelected?: unknown) => {
