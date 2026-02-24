@@ -196,6 +196,10 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
 
             for (const tunnel of ctx.core.getSnapshot().tunnels) {
               if (tunnel.autoStart && tunnel.defaultServerId === server.id) {
+                // Silently skip tunnels that are already running
+                if (ctx.core.getSnapshot().activeTunnels.some((t) => t.profileId === tunnel.id)) {
+                  continue;
+                }
                 void resolveTunnelConnectionMode(tunnel, false).then((mode) => {
                   if (!mode) {
                     return;
