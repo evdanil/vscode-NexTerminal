@@ -263,10 +263,10 @@ describe("SftpService", () => {
     expect(service.isConnected("srv-1")).toBe(false);
   });
 
-  describe("execCommand", () => {
+  describe("execCommand (private, tested via copyRemote)", () => {
     const tick = () => new Promise((r) => process.nextTick(r));
 
-    it("runs command and collects stdout/stderr/exitCode", async () => {
+    it("collects stdout/stderr/exitCode through copyRemote", async () => {
       const { PassThrough } = await import("node:stream");
       const stdout = new PassThrough();
       const stderr = new PassThrough();
@@ -275,21 +275,32 @@ describe("SftpService", () => {
       (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
       await service.connect(testServer);
 
-      const resultPromise = service.execCommand("srv-1", "echo hello");
+      const resultPromise = service.copyRemote("srv-1", "/a", "/b", false);
       await tick();
 
-      stdout.write("hello\n");
-      stderr.write("warn\n");
-      stdout.emit("close", 0);
+      stderr.write("cp: error\n");
+      stdout.emit("close", 1);
 
-      const result = await resultPromise;
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toBe("hello\n");
-      expect(result.stderr).toBe("warn\n");
+      await expect(resultPromise).rejects.toThrow("cp: error");
     });
 
     it("throws when no session exists", async () => {
-      await expect(service.execCommand("srv-1", "ls")).rejects.toThrow("No SFTP session");
+      await expect(service.copyRemote("srv-1", "/a", "/b", false)).rejects.toThrow("No SFTP session");
+    });
+
+    it("times out when command hangs", async () => {
+      const { PassThrough } = await import("node:stream");
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const stream = Object.assign(stdout, { stderr, destroy: vi.fn() }) as any;
+
+      (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
+      await service.connect(testServer);
+
+      // Use a very short timeout via the private method
+      const resultPromise = (service as any).execCommand("srv-1", "sleep 999", 50);
+      await expect(resultPromise).rejects.toThrow("Command timed out after 50ms");
+      expect(stream.destroy).toHaveBeenCalled();
     });
   });
 

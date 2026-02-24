@@ -4,6 +4,7 @@ import type { ServerConfig } from "../models/config";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
 import { ServerTreeItem } from "../ui/nexusTreeProvider";
 import { FileTreeItem } from "../ui/fileExplorerTreeProvider";
+import { type ConflictMode, type ConflictDecision, resolveConflict } from "../ui/conflictResolution";
 import type { CommandContext } from "./types";
 
 function validateFilename(value: string): string | undefined {
@@ -58,8 +59,6 @@ function resolveSelectedItems(arg: unknown, allSelected: unknown): FileTreeItem[
   return [];
 }
 
-type DownloadConflictMode = "ask" | "overwrite" | "skip" | "cancel";
-
 interface DownloadSummary {
   downloaded: number;
   skipped: number;
@@ -73,14 +72,6 @@ interface DownloadItem {
   remotePath: string;
 }
 
-const DOWNLOAD_CONFLICT_OPTIONS = {
-  overwrite: "Overwrite",
-  skip: "Skip",
-  overwriteAll: "Overwrite All",
-  skipAll: "Skip All",
-  cancel: "Cancel"
-} as const;
-
 function isFileExistsError(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;
@@ -92,7 +83,7 @@ function dedupeDownloadItems(items: FileTreeItem[]): DownloadItem[] {
   const normalized = items
     .filter((item) => item.label !== ".")
     .map((item) => ({ item, remotePath: path.posix.join(item.remotePath, item.entry.name) }))
-    .sort((a, b) => a.remotePath.length - b.remotePath.length);
+    .sort((a, b) => a.remotePath.localeCompare(b.remotePath));
 
   const result: DownloadItem[] = [];
   for (const candidate of normalized) {
@@ -106,51 +97,17 @@ function dedupeDownloadItems(items: FileTreeItem[]): DownloadItem[] {
 
 async function resolveDownloadConflict(
   targetLabel: string,
-  conflictState: { mode: DownloadConflictMode },
+  conflictState: { mode: ConflictMode },
   summary: DownloadSummary
-): Promise<"overwrite" | "skip" | "cancel"> {
+): Promise<ConflictDecision> {
   summary.conflicts += 1;
-
-  if (conflictState.mode === "overwrite") {
-    return "overwrite";
-  }
-  if (conflictState.mode === "skip") {
-    return "skip";
-  }
-  if (conflictState.mode === "cancel") {
-    return "cancel";
-  }
-
-  const choice = await vscode.window.showWarningMessage(
-    `Local target "${targetLabel}" already exists. Choose an action.`,
-    DOWNLOAD_CONFLICT_OPTIONS.overwrite,
-    DOWNLOAD_CONFLICT_OPTIONS.skip,
-    DOWNLOAD_CONFLICT_OPTIONS.overwriteAll,
-    DOWNLOAD_CONFLICT_OPTIONS.skipAll,
-    DOWNLOAD_CONFLICT_OPTIONS.cancel
-  );
-
-  switch (choice) {
-    case DOWNLOAD_CONFLICT_OPTIONS.overwrite:
-      return "overwrite";
-    case DOWNLOAD_CONFLICT_OPTIONS.skip:
-      return "skip";
-    case DOWNLOAD_CONFLICT_OPTIONS.overwriteAll:
-      conflictState.mode = "overwrite";
-      return "overwrite";
-    case DOWNLOAD_CONFLICT_OPTIONS.skipAll:
-      conflictState.mode = "skip";
-      return "skip";
-    default:
-      conflictState.mode = "cancel";
-      return "cancel";
-  }
+  return resolveConflict(`Local target "${targetLabel}" already exists. Choose an action.`, conflictState);
 }
 
 async function copyRemoteToLocalWithConflict(
   sourceUri: vscode.Uri,
   destinationUri: vscode.Uri,
-  conflictState: { mode: DownloadConflictMode },
+  conflictState: { mode: ConflictMode },
   summary: DownloadSummary
 ): Promise<void> {
   let overwrite = conflictState.mode === "overwrite";
@@ -303,7 +260,7 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     }
 
     const destRoot = folder[0];
-    const conflictState: { mode: DownloadConflictMode } = { mode: "ask" };
+    const conflictState: { mode: ConflictMode } = { mode: "ask" };
     const summary: DownloadSummary = {
       downloaded: 0,
       skipped: 0,

@@ -4,6 +4,8 @@ import type { ServerConfig } from "../models/config";
 import type { DirectoryEntry } from "../services/sftp/sftpService";
 import type { SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
+import { isSafeEntryName } from "../utils/pathSafety";
+import { type ConflictMode, type ConflictDecision, resolveConflict } from "./conflictResolution";
 
 const FILE_DRAG_MIME = "application/vnd.nexus.fileitem";
 const URI_LIST_MIME = "text/uri-list";
@@ -13,13 +15,6 @@ const MOVE_COPY_OPTIONS = [
   { label: "Move", value: "move" as const },
   { label: "Copy", value: "copy" as const }
 ];
-const CONFLICT_OPTIONS = {
-  overwrite: "Overwrite",
-  skip: "Skip",
-  overwriteAll: "Overwrite All",
-  skipAll: "Skip All",
-  cancel: "Cancel"
-} as const;
 
 interface DraggedFilePayloadItem {
   serverId: string;
@@ -33,25 +28,12 @@ interface ValidDraggedItem extends DraggedFilePayloadItem {
   newPath: string;
 }
 
-type UploadConflictMode = "ask" | "overwrite" | "skip" | "cancel";
-type UploadDecision = "overwrite" | "skip" | "cancel";
 
 interface UploadSummary {
   uploaded: number;
   skipped: number;
   conflicts: number;
   canceled: boolean;
-}
-
-function isSafeEntryName(name: string): boolean {
-  return (
-    name.length > 0 &&
-    !name.includes("/") &&
-    !name.includes("\\") &&
-    !name.includes("\0") &&
-    name !== "." &&
-    name !== ".."
-  );
 }
 
 function normalizeRemoteDir(remotePath: string): string | undefined {
@@ -444,7 +426,10 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     }
 
     const { localUris, unsupportedCount } = await this.collectDroppedLocalUris(dataTransfer);
-    if (localUris.length === 0 && unsupportedCount === 0) {
+    if (localUris.length === 0) {
+      if (unsupportedCount > 0) {
+        void vscode.window.showWarningMessage("Only local files can be uploaded. Non-file URIs were ignored.");
+      }
       return;
     }
 
@@ -454,7 +439,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       conflicts: 0,
       canceled: false
     };
-    const conflictState: { mode: UploadConflictMode } = { mode: "ask" };
+    const conflictState: { mode: ConflictMode } = { mode: "ask" };
     const serverId = this.activeServerId;
 
     await vscode.window.withProgress(
@@ -555,7 +540,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     localUri: vscode.Uri,
     remoteDest: string,
     progress: vscode.Progress<{ message?: string; increment?: number }>,
-    conflictState: { mode: UploadConflictMode },
+    conflictState: { mode: ConflictMode },
     summary: UploadSummary
   ): Promise<void> {
     let localStat: vscode.FileStat;
@@ -584,7 +569,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     localUri: vscode.Uri,
     remoteDir: string,
     progress: vscode.Progress<{ message?: string; increment?: number }>,
-    conflictState: { mode: UploadConflictMode },
+    conflictState: { mode: ConflictMode },
     summary: UploadSummary,
     depth: number
   ): Promise<void> {
@@ -638,7 +623,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     localUri: vscode.Uri,
     remotePath: string,
     progress: vscode.Progress<{ message?: string; increment?: number }>,
-    conflictState: { mode: UploadConflictMode },
+    conflictState: { mode: ConflictMode },
     summary: UploadSummary
   ): Promise<void> {
     if (summary.canceled) {
@@ -692,9 +677,9 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   private async resolveUploadDecision(
     serverId: string,
     remotePath: string,
-    conflictState: { mode: UploadConflictMode },
+    conflictState: { mode: ConflictMode },
     summary: UploadSummary
-  ): Promise<UploadDecision> {
+  ): Promise<ConflictDecision> {
     const existing = await this.sftp.tryStat(serverId, remotePath);
     if (!existing) {
       return "overwrite";
@@ -706,40 +691,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       return "skip";
     }
 
-    if (conflictState.mode === "overwrite") {
-      return "overwrite";
-    }
-    if (conflictState.mode === "skip") {
-      return "skip";
-    }
-    if (conflictState.mode === "cancel") {
-      return "cancel";
-    }
-
-    const choice = await vscode.window.showWarningMessage(
-      `Remote file "${remotePath}" already exists. Choose an action.`,
-      CONFLICT_OPTIONS.overwrite,
-      CONFLICT_OPTIONS.skip,
-      CONFLICT_OPTIONS.overwriteAll,
-      CONFLICT_OPTIONS.skipAll,
-      CONFLICT_OPTIONS.cancel
-    );
-
-    switch (choice) {
-      case CONFLICT_OPTIONS.overwrite:
-        return "overwrite";
-      case CONFLICT_OPTIONS.skip:
-        return "skip";
-      case CONFLICT_OPTIONS.overwriteAll:
-        conflictState.mode = "overwrite";
-        return "overwrite";
-      case CONFLICT_OPTIONS.skipAll:
-        conflictState.mode = "skip";
-        return "skip";
-      default:
-        conflictState.mode = "cancel";
-        return "cancel";
-    }
+    return resolveConflict(`Remote file "${remotePath}" already exists. Choose an action.`, conflictState);
   }
 
   private updatePolling(): void {

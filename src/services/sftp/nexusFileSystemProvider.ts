@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { SftpService, DirectoryEntry } from "./sftpService";
+import { isSafeEntryName } from "../../utils/pathSafety";
 
 export const NEXTERM_SCHEME = "nexterm";
 
@@ -184,6 +185,9 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
     const entries = await this.sftp.readDirectory(serverId, remoteDir);
     for (const entry of entries) {
       if (entry.isSymlink) {
+        continue;
+      }
+      if (!isSafeEntryName(entry.name)) {
         continue;
       }
 

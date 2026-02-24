@@ -95,48 +95,9 @@ vi.mock("vscode", () => {
 });
 
 import { FileExplorerTreeProvider, FileExplorerServerItem, FileTreeItem, ParentDirItem } from "../../src/ui/fileExplorerTreeProvider";
-import type { SftpService, DirectoryEntry } from "../../src/services/sftp/sftpService";
+import type { DirectoryEntry } from "../../src/services/sftp/sftpService";
 import type { ServerConfig } from "../../src/models/config";
-
-function createMockSftpService(): SftpService {
-  const service: any = {
-    connect: vi.fn(),
-    disconnect: vi.fn(),
-    isConnected: vi.fn(),
-    readDirectory: vi.fn(),
-    stat: vi.fn(),
-    lstat: vi.fn(),
-    tryStat: vi.fn(),
-    tryLstat: vi.fn(),
-    readFile: vi.fn(),
-    writeFile: vi.fn(),
-    delete: vi.fn(),
-    rename: vi.fn(),
-    createDirectory: vi.fn(),
-    realpath: vi.fn(),
-    download: vi.fn(),
-    upload: vi.fn(),
-    execCommand: vi.fn(),
-    copyRemote: vi.fn(),
-    invalidateCache: vi.fn(),
-    dispose: vi.fn(),
-  };
-  service.tryStat.mockImplementation(async (...args: any[]) => {
-    try {
-      return await service.stat(...args);
-    } catch {
-      return undefined;
-    }
-  });
-  service.tryLstat.mockImplementation(async (...args: any[]) => {
-    try {
-      return await service.lstat(...args);
-    } catch {
-      return undefined;
-    }
-  });
-  return service as SftpService;
-}
+import { createMockSftpService } from "../helpers/mockSftpService";
 
 const testServer: ServerConfig = {
   id: "srv-1",

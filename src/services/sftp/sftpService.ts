@@ -286,16 +286,26 @@ export class SftpService {
     });
   }
 
-  public async execCommand(serverId: string, command: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  private async execCommand(serverId: string, command: string, timeoutMs = 300_000): Promise<{ exitCode: number; stdout: string; stderr: string }> {
     const session = this.sessions.get(serverId);
     if (!session) {
       throw new Error(`No SFTP session for server ${serverId}`);
     }
+    // NOTE: This is SSH channel exec (connection.exec), NOT local child_process.exec.
+    // Shell escaping is handled by shellEscape() + assertValidExecPath() in the caller.
     const stream = await session.connection.exec(command);
     return new Promise((resolve, reject) => {
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
       let settled = false;
+
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          stream.destroy();
+          reject(new Error(`Command timed out after ${timeoutMs}ms`));
+        }
+      }, timeoutMs);
 
       const onStdoutData = (chunk: Buffer | string): void => {
         stdoutChunks.push(toBufferChunk(chunk));
@@ -306,6 +316,7 @@ export class SftpService {
       const onError = (error: Error): void => {
         if (!settled) {
           settled = true;
+          clearTimeout(timer);
           reject(error);
         }
       };
@@ -314,6 +325,7 @@ export class SftpService {
           return;
         }
         settled = true;
+        clearTimeout(timer);
         const stderrText = Buffer.concat(stderrChunks).toString("utf-8");
         const signalNote = code === null ? `terminated by signal ${signal || "unknown"}` : "";
         resolve({
@@ -339,7 +351,9 @@ export class SftpService {
     const command = `cp ${flag} -- ${shellEscape(srcPath)} ${shellEscape(destPath)}`;
     const result = await this.execCommand(serverId, command);
     if (result.exitCode !== 0) {
-      throw new Error(result.stderr.trim() || `cp exited with code ${result.exitCode}`);
+      const stderr = result.stderr.trim();
+      const hint = stderr ? "" : " (ensure the remote system has a POSIX-compatible `cp` command)";
+      throw new Error(stderr || `cp exited with code ${result.exitCode}${hint}`);
     }
     this.invalidateCache(serverId, parentDir(destPath));
   }

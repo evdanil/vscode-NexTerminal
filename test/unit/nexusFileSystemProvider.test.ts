@@ -55,46 +55,8 @@ vi.mock("vscode", () => {
 });
 
 import { NexusFileSystemProvider, buildUri, NEXTERM_SCHEME } from "../../src/services/sftp/nexusFileSystemProvider";
-import type { SftpService, DirectoryEntry } from "../../src/services/sftp/sftpService";
-
-function createMockSftpService(): SftpService {
-  const service: any = {
-    connect: vi.fn(),
-    disconnect: vi.fn(),
-    isConnected: vi.fn(),
-    readDirectory: vi.fn(),
-    stat: vi.fn(),
-    lstat: vi.fn(),
-    tryStat: vi.fn(),
-    tryLstat: vi.fn(),
-    readFile: vi.fn(),
-    writeFile: vi.fn(),
-    delete: vi.fn(),
-    rename: vi.fn(),
-    createDirectory: vi.fn(),
-    realpath: vi.fn(),
-    download: vi.fn(),
-    upload: vi.fn(),
-    copyRemote: vi.fn(),
-    invalidateCache: vi.fn(),
-    dispose: vi.fn(),
-  };
-  service.tryStat.mockImplementation(async (...args: any[]) => {
-    try {
-      return await service.stat(...args);
-    } catch {
-      return undefined;
-    }
-  });
-  service.tryLstat.mockImplementation(async (...args: any[]) => {
-    try {
-      return await service.lstat(...args);
-    } catch {
-      return undefined;
-    }
-  });
-  return service as SftpService;
-}
+import type { DirectoryEntry } from "../../src/services/sftp/sftpService";
+import { createMockSftpService } from "../helpers/mockSftpService";
 
 const fileEntry: DirectoryEntry = {
   name: "test.txt",
@@ -348,6 +310,34 @@ describe("NexusFileSystemProvider", () => {
 
     expect(vscode.workspace.fs.createDirectory).toHaveBeenCalledWith(expect.objectContaining({ fsPath: "/tmp/outdir" }));
     expect(sftp.download).toHaveBeenCalledWith("srv-1", "/home/dev/subdir/nested.txt", "/tmp/outdir/nested.txt");
+  });
+
+  it("copy skips malicious entry names during nexterm->file recursive copy", async () => {
+    const vscode = await import("vscode");
+    (sftp.lstat as any).mockResolvedValue(dirEntry);
+    (vscode.workspace.fs.stat as any).mockRejectedValue(new Error("missing"));
+    (vscode.workspace.fs.createDirectory as any).mockResolvedValue(undefined);
+    (sftp.readDirectory as any).mockImplementation(async (_serverId: string, remotePath: string) => {
+      if (remotePath === "/home/dev/subdir") {
+        return [
+          { ...fileEntry, name: "safe.txt" },
+          { ...fileEntry, name: "../../etc/malicious" },
+          { ...fileEntry, name: "has/slash" },
+          { ...fileEntry, name: ".." },
+          { ...fileEntry, name: "ok.txt" },
+        ];
+      }
+      return [];
+    });
+    (sftp.download as any).mockResolvedValue(undefined);
+
+    const source = buildUri("srv-1", "/home/dev/subdir");
+    const destination = vscode.Uri.file("/tmp/outdir");
+    await provider.copy(source, destination, { overwrite: false });
+
+    expect(sftp.download).toHaveBeenCalledTimes(2);
+    expect(sftp.download).toHaveBeenCalledWith("srv-1", "/home/dev/subdir/safe.txt", "/tmp/outdir/safe.txt");
+    expect(sftp.download).toHaveBeenCalledWith("srv-1", "/home/dev/subdir/ok.txt", "/tmp/outdir/ok.txt");
   });
 
   it("copy enforces max depth for nexterm->file recursive directory copy", async () => {
