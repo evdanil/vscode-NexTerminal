@@ -14,7 +14,7 @@ export interface KeyPairInfo {
 const KEY_PREFIXES = ["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"];
 const KEY_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 const PUBLIC_KEY_PATTERN = /^(?<type>ssh-(?:ed25519|rsa)|ecdsa-sha2-[A-Za-z0-9-]+)\s+(?<base64>[A-Za-z0-9+/=]+)(?:\s+[^\r\n]*)?$/;
-const SSH_KEYGEN_TIMEOUT_MS = 10_000;
+const SSH_KEYGEN_TIMEOUT_MS = 30_000;
 
 export function defaultSshDir(): string {
   return path.join(os.homedir(), ".ssh");
