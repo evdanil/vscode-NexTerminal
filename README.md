@@ -7,6 +7,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 ## Features
 
 - **SSH Terminal Sessions** — Connect to remote servers with password, private key, or SSH agent authentication. Two-factor authentication (keyboard-interactive) is fully supported — passwords auto-fill while verification codes are prompted separately. Credentials are cached securely via VS Code SecretStorage with silent re-auth.
+- **SSH Key Deployment** — Right-click any server and select "Deploy SSH Key" to automate key-based authentication setup. Discovers existing local keys or generates new ed25519 key pairs, deploys the public key to the remote `authorized_keys`, and optionally converts the server profile to key auth. Cross-platform (Windows, macOS, Linux).
 - **Proxy Support** — Route SSH connections through intermediaries when direct access isn't available. Three proxy types are supported per server:
   - **SSH Jump Host** — Select another configured server as a bastion/jump host (ProxyJump equivalent). Supports multi-hop chaining (A → B → C) with full auth reuse.
   - **SOCKS5 Proxy** — Connect through a SOCKS5 proxy server with optional username/password authentication.
@@ -52,6 +53,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 2. Enter host, port, username, and authentication details (password, private key, or SSH agent)
 3. Optionally configure a proxy (SSH jump host, SOCKS5, or HTTP CONNECT) under the Proxy section
 4. Right-click the server and select **Connect** to open a terminal session
+5. To set up key-based auth: right-click the server → **Deploy SSH Key** → select or generate a key → the public key is deployed automatically
 
 ### Connect Through a Proxy
 
