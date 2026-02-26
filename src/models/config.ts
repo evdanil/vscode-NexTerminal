@@ -33,6 +33,7 @@ export interface TunnelProfile {
   tunnelType?: TunnelType;
   remoteBindAddress?: string;
   localTargetIP?: string;
+  localBindAddress?: string;
   notes?: string;
   browserUrl?: string;
 }
@@ -74,6 +75,7 @@ export interface TunnelRouteInfo {
   tunnelType: TunnelType;
   remoteBindAddress?: string;
   localTargetIP?: string;
+  localBindAddress?: string;
   startedAt: number;
 }
 

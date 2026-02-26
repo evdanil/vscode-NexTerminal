@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import * as os from "node:os";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type {
@@ -34,6 +35,22 @@ function getDefaultReverseBindAddress(): string {
 
 function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
+}
+
+function getNetworkInterfaceOptions(): Array<{ label: string; value: string }> {
+  const result: Array<{ label: string; value: string }> = [];
+  const interfaces = os.networkInterfaces();
+  for (const [name, addrs] of Object.entries(interfaces)) {
+    if (!addrs) {
+      continue;
+    }
+    for (const addr of addrs) {
+      if (addr.family === "IPv4" && !addr.internal) {
+        result.push({ label: `${addr.address} (${name})`, value: addr.address });
+      }
+    }
+  }
+  return result;
 }
 
 export async function resolveTunnelConnectionMode(
@@ -268,6 +285,7 @@ function formValuesToTunnel(values: FormValues, existingId?: string, existingCon
   let remotePort: number;
   let remoteBindAddress: string | undefined;
   let localTargetIP: string | undefined;
+  let localBindAddress: string | undefined;
 
   switch (tunnelType) {
     case "reverse":
@@ -277,16 +295,22 @@ function formValuesToTunnel(values: FormValues, existingId?: string, existingCon
       localTargetIP = typeof values.localTargetIP === "string" ? values.localTargetIP.trim() : "127.0.0.1";
       remoteIP = remoteBindAddress;
       break;
-    case "dynamic":
+    case "dynamic": {
       localPort = typeof values.localPort_dynamic === "number" ? values.localPort_dynamic : 1080;
       remoteIP = "0.0.0.0";
       remotePort = 0;
+      const dynamicBind = typeof values.localBindAddress_dynamic === "string" ? values.localBindAddress_dynamic.trim() : undefined;
+      localBindAddress = dynamicBind && dynamicBind !== "127.0.0.1" ? dynamicBind : undefined;
       break;
-    default:
+    }
+    default: {
       localPort = typeof values.localPort === "number" ? values.localPort : 0;
       remoteIP = typeof values.remoteIP === "string" ? values.remoteIP.trim() : "127.0.0.1";
       remotePort = typeof values.remotePort === "number" ? values.remotePort : 0;
+      const localBind = typeof values.localBindAddress === "string" ? values.localBindAddress.trim() : undefined;
+      localBindAddress = localBind && localBind !== "127.0.0.1" ? localBind : undefined;
       break;
+    }
   }
 
   // Force shared mode for reverse tunnels
@@ -308,6 +332,7 @@ function formValuesToTunnel(values: FormValues, existingId?: string, existingCon
     tunnelType: tunnelType === "local" ? undefined : tunnelType,
     remoteBindAddress,
     localTargetIP,
+    localBindAddress,
     notes: notes || undefined,
     browserUrl
   };
@@ -319,7 +344,8 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       const servers = ctx.core.getSnapshot().servers.filter((s) => !s.isHidden);
       const definition = tunnelFormDefinition(undefined, {
         servers,
-        defaultBindAddress: getDefaultReverseBindAddress()
+        defaultBindAddress: getDefaultReverseBindAddress(),
+        networkInterfaces: getNetworkInterfaceOptions()
       });
       const panel = WebviewFormPanel.open("tunnel-add", definition, {
         onSubmit: async (values) => {
@@ -357,7 +383,8 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       const servers = ctx.core.getSnapshot().servers.filter((s) => !s.isHidden);
       const definition = tunnelFormDefinition(existing, {
         servers,
-        defaultBindAddress: getDefaultReverseBindAddress()
+        defaultBindAddress: getDefaultReverseBindAddress(),
+        networkInterfaces: getNetworkInterfaceOptions()
       });
       const panel = WebviewFormPanel.open("tunnel-edit", definition, {
         onSubmit: async (values) => {

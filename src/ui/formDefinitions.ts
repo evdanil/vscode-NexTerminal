@@ -125,12 +125,29 @@ export function serverFormDefinition(
 export interface TunnelFormOptions {
   servers?: Array<{ id: string; name: string; host: string; username: string }>;
   defaultBindAddress?: string;
+  networkInterfaces?: Array<{ label: string; value: string }>;
+}
+
+function localBindAddressOptions(networkInterfaces?: Array<{ label: string; value: string }>): Array<{ label: string; value: string }> {
+  const opts: Array<{ label: string; value: string }> = [
+    { label: "127.0.0.1 (localhost)", value: "127.0.0.1" }
+  ];
+  if (networkInterfaces) {
+    for (const iface of networkInterfaces) {
+      if (iface.value !== "127.0.0.1" && iface.value !== "0.0.0.0") {
+        opts.push(iface);
+      }
+    }
+  }
+  opts.push({ label: "0.0.0.0 (all interfaces)", value: "0.0.0.0" });
+  return opts;
 }
 
 export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: TunnelFormOptions): FormDefinition {
   const isEdit = Boolean(seed?.id);
   const tunnelType: TunnelType = seed ? resolveTunnelType(seed as TunnelProfile) : "local";
   const defaultBindAddress = options?.defaultBindAddress?.trim() || "127.0.0.1";
+  const bindOptions = localBindAddressOptions(options?.networkInterfaces);
   const serverOptions = [
     { label: "(Assign later)", value: "" },
     ...(options?.servers ?? []).map((s) => ({ label: s.name, value: s.id })),
@@ -161,6 +178,7 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
       { type: "text", key: "name", label: "Name", required: true, placeholder: "Database tunnel", value: seed?.name },
       // Local forwarding fields
       { type: "number", key: "localPort", label: "Local Port", required: true, min: 1, max: 65535, placeholder: "5432", value: seed?.localPort, visibleWhen: localVw },
+      { type: "select", key: "localBindAddress", label: "Local Bind Address", options: bindOptions, value: seed?.localBindAddress ?? "127.0.0.1", hint: "Network interface for the local listener", visibleWhen: localVw },
       { type: "text", key: "remoteIP", label: "Remote Host", required: true, placeholder: "127.0.0.1", value: seed?.remoteIP ?? "127.0.0.1", visibleWhen: localVw },
       { type: "number", key: "remotePort", label: "Remote Port", required: true, min: 1, max: 65535, placeholder: "5432", value: seed?.remotePort, visibleWhen: localVw },
       // Reverse forwarding fields
@@ -170,6 +188,7 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
       { type: "number", key: "localPort_reverse", label: "Local Target Port", required: true, min: 1, max: 65535, placeholder: "3000", value: seed?.localPort, visibleWhen: reverseVw },
       // Dynamic SOCKS5 fields
       { type: "number", key: "localPort_dynamic", label: "Local Port", required: true, min: 1, max: 65535, placeholder: "1080", value: seed?.localPort ?? 1080, visibleWhen: dynamicVw },
+      { type: "select", key: "localBindAddress_dynamic", label: "Local Bind Address", options: bindOptions, value: seed?.localBindAddress ?? "127.0.0.1", hint: "Network interface for the local listener", visibleWhen: dynamicVw },
       // Always visible
       {
         type: "select",

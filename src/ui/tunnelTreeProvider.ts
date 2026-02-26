@@ -1,24 +1,11 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
 import type { TunnelProfile } from "../models/config";
-import { resolveTunnelType } from "../models/config";
 import { formatBytes } from "../utils/helpers";
+import { formatTunnelRoute } from "../utils/tunnelProfile";
 import { TUNNEL_DRAG_MIME } from "./dndMimeTypes";
 
-export function formatTunnelRoute(profile: TunnelProfile): string {
-  const type = resolveTunnelType(profile);
-  switch (type) {
-    case "reverse": {
-      const bindAddr = profile.remoteBindAddress ?? "127.0.0.1";
-      const targetIP = profile.localTargetIP ?? "127.0.0.1";
-      return `R ${profile.remotePort} <- ${targetIP}:${profile.localPort}`;
-    }
-    case "dynamic":
-      return `D :${profile.localPort} SOCKS5`;
-    default:
-      return `L ${profile.localPort} -> ${profile.remoteIP}:${profile.remotePort}`;
-  }
-}
+export { formatTunnelRoute };
 
 export class TunnelTreeItem extends vscode.TreeItem {
   public constructor(

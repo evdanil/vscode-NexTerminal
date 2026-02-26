@@ -29,10 +29,10 @@ interface ActiveTunnelRuntime {
   isStopping: boolean;
 }
 
-function listen(server: net.Server, port: number): Promise<void> {
+function listen(server: net.Server, port: number, host: string): Promise<void> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, "127.0.0.1", () => {
+    server.listen(port, host, () => {
       server.off("error", reject);
       resolve();
     });
@@ -93,7 +93,8 @@ export class TunnelManager {
       connectionMode: options?.connectionMode ?? "isolated",
       tunnelType,
       remoteBindAddress: profile.remoteBindAddress,
-      localTargetIP: profile.localTargetIP
+      localTargetIP: profile.localTargetIP,
+      localBindAddress: profile.localBindAddress
     };
 
     switch (tunnelType) {
@@ -174,7 +175,7 @@ export class TunnelManager {
       });
     });
 
-    await listen(listenerServer, profile.localPort);
+    await listen(listenerServer, profile.localPort, profile.localBindAddress ?? "127.0.0.1");
     const runtime: ActiveTunnelRuntime = {
       active: activeTunnel,
       profile,
@@ -405,7 +406,7 @@ export class TunnelManager {
       });
     });
 
-    await listen(listenerServer, profile.localPort);
+    await listen(listenerServer, profile.localPort, profile.localBindAddress ?? "127.0.0.1");
     const runtime: ActiveTunnelRuntime = {
       active: activeTunnel,
       profile,
