@@ -38,6 +38,7 @@ function createMockConnection(): SshConnection & { closeListeners: Set<() => voi
       closeListeners.add(listener);
       return () => closeListeners.delete(listener);
     }),
+    getBanner: vi.fn(() => undefined),
     dispose: vi.fn(() => {
       for (const listener of closeListeners) {
         listener();

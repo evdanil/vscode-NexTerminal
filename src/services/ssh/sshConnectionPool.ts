@@ -186,6 +186,10 @@ class PooledSshConnection implements SshConnection {
     };
   }
 
+  public getBanner(): string | undefined {
+    return this.active.getBanner();
+  }
+
   public dispose(): void {
     if (this.disposed) {
       return;

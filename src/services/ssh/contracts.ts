@@ -43,6 +43,8 @@ export interface SshConnection {
   cancelForwardIn(bindAddr: string, bindPort: number): Promise<void>;
   onTcpConnection(handler: (info: TcpConnectionInfo, accept: () => Duplex, reject: () => void) => void): () => void;
   onClose(listener: () => void): () => void;
+  /** Returns the SSH pre-auth banner (if any) once, then undefined on subsequent calls. */
+  getBanner(): string | undefined;
   dispose(): void;
 }
 

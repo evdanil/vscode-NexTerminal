@@ -13,13 +13,21 @@ import type {
 
 class Ssh2Connection implements SshConnection {
   private readonly closeListeners = new Set<() => void>();
+  private banner?: string;
 
-  public constructor(private readonly client: Client) {
+  public constructor(private readonly client: Client, banner?: string) {
+    this.banner = banner;
     this.client.on("close", () => {
       for (const listener of this.closeListeners) {
         listener();
       }
     });
+  }
+
+  public getBanner(): string | undefined {
+    const b = this.banner;
+    this.banner = undefined;
+    return b;
   }
 
   public async openShell(ptyOptions?: PtyOptions): Promise<Duplex> {
@@ -187,6 +195,10 @@ export class Ssh2Connector implements SshConnector {
     const client = new Client();
     return new Promise((resolve, reject) => {
       let settled = false;
+      let banner: string | undefined;
+      client.on("banner", (message: string) => {
+        banner = message;
+      });
       client.on("keyboard-interactive", (name, instructions, _lang, prompts, finish) => {
         if (auth.onKeyboardInteractive) {
           const mapped = prompts.map((p) => ({
@@ -213,7 +225,7 @@ export class Ssh2Connector implements SshConnector {
       });
       client.on("ready", () => {
         settled = true;
-        resolve(new Ssh2Connection(client));
+        resolve(new Ssh2Connection(client, banner));
       });
       client.on("error", (error: Error) => {
         if (!settled) {

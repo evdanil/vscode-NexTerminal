@@ -104,6 +104,10 @@ class DirectTcpSshConnection implements SshConnection {
     return () => this.closeListeners.delete(listener);
   }
 
+  public getBanner(): string | undefined {
+    return undefined;
+  }
+
   public dispose(): void {
     for (const socket of this.openSockets) {
       socket.destroy();

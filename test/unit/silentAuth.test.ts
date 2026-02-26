@@ -22,6 +22,7 @@ const fakeConnection: SshConnection = {
   cancelForwardIn: vi.fn(),
   onTcpConnection: vi.fn().mockReturnValue(() => {}),
   onClose: vi.fn().mockReturnValue(() => {}),
+  getBanner: vi.fn().mockReturnValue(undefined),
   dispose: vi.fn()
 };
 

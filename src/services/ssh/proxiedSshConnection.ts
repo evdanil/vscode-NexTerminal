@@ -43,6 +43,10 @@ export class ProxiedSshConnection implements SshConnection {
     return this.inner.onClose(listener);
   }
 
+  public getBanner(): string | undefined {
+    return this.inner.getBanner();
+  }
+
   public dispose(): void {
     this.inner.dispose();
     this.proxyCleanup();

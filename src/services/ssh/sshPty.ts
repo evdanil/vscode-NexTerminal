@@ -94,6 +94,12 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.callbacks.onSessionOpened(this.sessionId);
       this.logger.log(`connected to ${this.serverConfig.name}`);
 
+      const banner = connection.getBanner();
+      if (banner) {
+        const normalized = banner.replace(/\r?\n/g, "\r\n");
+        this.writeEmitter.fire(normalized);
+      }
+
       connection.onClose(() => this.dispose());
       stream.on("data", (data: Buffer | string) => {
         const text = typeof data === "string" ? data : data.toString("utf8");

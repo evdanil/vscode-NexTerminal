@@ -27,6 +27,7 @@ function makeFakeConnection(): SshConnection & { disposed: boolean } {
     cancelForwardIn: vi.fn(async () => {}),
     onTcpConnection: vi.fn(() => () => {}),
     onClose: vi.fn(() => () => {}),
+    getBanner: vi.fn(() => undefined),
     dispose: vi.fn(() => { conn.disposed = true; })
   };
   return conn;
