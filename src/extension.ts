@@ -23,6 +23,7 @@ import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { VscodeTunnelRegistryStore } from "./storage/vscodeTunnelRegistryStore";
 import { TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
+import { createCollapsedFolderStatePersistence } from "./ui/collapsedFolderStatePersistence";
 import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
 import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
 import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
@@ -38,6 +39,7 @@ import { ColorSchemeService } from "./services/colorSchemeService";
 import { TerminalAppearancePanel } from "./ui/terminalAppearancePanel";
 
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.slot", "nexus.macro.runBinding"];
+const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
 
 /**
  * Ensure VS Code settings allow Alt+S / Alt+N macro keybindings to reach the extension.
@@ -254,8 +256,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
   const settingsTreeProvider = new SettingsTreeProvider();
-  const savedCollapsed = context.globalState.get<string[]>("nexus.ui.collapsedFolders", []);
+  const savedCollapsed = context.globalState.get<string[]>(COLLAPSED_FOLDERS_KEY, []);
   nexusTreeProvider.loadCollapsedFolders(savedCollapsed);
+  const collapsedFolderStatePersistence = createCollapsedFolderStatePersistence(
+    (paths) => context.globalState.update(COLLAPSED_FOLDERS_KEY, paths),
+    {
+      onError: (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Failed to persist collapsed folder state: ${message}`);
+      }
+    }
+  );
+  const persistCollapsedFolders = (): void => {
+    collapsedFolderStatePersistence.schedule(nexusTreeProvider.getCollapsedFolders());
+  };
+  const handleFolderStateChange = (element: unknown, isCollapsed: boolean): void => {
+    if (!(element instanceof FolderTreeItem)) {
+      return;
+    }
+    if (isCollapsed) {
+      nexusTreeProvider.collapseFolder(element.folderPath);
+    } else {
+      nexusTreeProvider.expandFolder(element.folderPath);
+    }
+    persistCollapsedFolders();
+  };
 
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
     treeDataProvider: nexusTreeProvider,
@@ -263,16 +288,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     showCollapseAll: true
   });
   const collapseListener = commandCenterView.onDidCollapseElement((e) => {
-    if (e.element instanceof FolderTreeItem) {
-      nexusTreeProvider.collapseFolder(e.element.folderPath);
-      context.globalState.update("nexus.ui.collapsedFolders", nexusTreeProvider.getCollapsedFolders());
-    }
+    handleFolderStateChange(e.element, true);
   });
   const expandListener = commandCenterView.onDidExpandElement((e) => {
-    if (e.element instanceof FolderTreeItem) {
-      nexusTreeProvider.expandFolder(e.element.folderPath);
-      context.globalState.update("nexus.ui.collapsedFolders", nexusTreeProvider.getCollapsedFolders());
-    }
+    handleFolderStateChange(e.element, false);
   });
   const tunnelView = vscode.window.createTreeView("nexusTunnels", {
     treeDataProvider: tunnelTreeProvider,
@@ -473,6 +492,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ...configDisposables,
     ...macroDisposables,
     ...fileDisposables,
+    {
+      dispose: () => {
+        void collapsedFolderStatePersistence.flush();
+        collapsedFolderStatePersistence.dispose();
+      }
+    },
     {
       dispose: () => {
         unsubscribeCore();

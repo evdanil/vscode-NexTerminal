@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as vscode from "vscode";
 import { FolderTreeItem, NexusTreeProvider, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
@@ -195,8 +196,7 @@ describe("NexusTreeProvider folder collapse state", () => {
     const children = provider.getChildren(undefined) as FolderTreeItem[];
     const folder = children.find((c) => c instanceof FolderTreeItem);
     expect(folder).toBeDefined();
-    // TreeItemCollapsibleState.Expanded = 2
-    expect(folder!.collapsibleState).toBe(2);
+    expect(folder!.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Expanded);
   });
 
   it("creates FolderTreeItem with Collapsed state after collapseFolder", () => {
@@ -205,10 +205,8 @@ describe("NexusTreeProvider folder collapse state", () => {
     const children = provider.getChildren(undefined) as FolderTreeItem[];
     const prod = children.find((c) => c instanceof FolderTreeItem && c.folderPath === "Production");
     const staging = children.find((c) => c instanceof FolderTreeItem && c.folderPath === "Staging");
-    // TreeItemCollapsibleState.Collapsed = 1
-    expect(prod!.collapsibleState).toBe(1);
-    // Staging should still be expanded
-    expect(staging!.collapsibleState).toBe(2);
+    expect(prod!.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Collapsed);
+    expect(staging!.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Expanded);
   });
 
   it("expandFolder restores Expanded state", () => {
@@ -217,7 +215,7 @@ describe("NexusTreeProvider folder collapse state", () => {
     provider.expandFolder("Production");
     const children = provider.getChildren(undefined) as FolderTreeItem[];
     const prod = children.find((c) => c instanceof FolderTreeItem && c.folderPath === "Production");
-    expect(prod!.collapsibleState).toBe(2);
+    expect(prod!.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Expanded);
   });
 
   it("getCollapsedFolders returns current collapsed paths", () => {
@@ -234,8 +232,8 @@ describe("NexusTreeProvider folder collapse state", () => {
     const children = provider.getChildren(undefined) as FolderTreeItem[];
     const prod = children.find((c) => c instanceof FolderTreeItem && c.folderPath === "Production");
     const staging = children.find((c) => c instanceof FolderTreeItem && c.folderPath === "Staging");
-    expect(prod!.collapsibleState).toBe(1);
-    expect(staging!.collapsibleState).toBe(2);
+    expect(prod!.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Collapsed);
+    expect(staging!.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Expanded);
     expect(provider.getCollapsedFolders()).toEqual(["Production"]);
   });
 

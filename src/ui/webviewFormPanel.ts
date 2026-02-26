@@ -7,6 +7,7 @@ export class WebviewFormPanel {
   private static activePanels = new Map<string, WebviewFormPanel>();
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
+  private submitInFlight = false;
 
   private constructor(
     private readonly formId: string,
@@ -29,8 +30,16 @@ export class WebviewFormPanel {
 
     this.panel.webview.onDidReceiveMessage(async (message: FormMessage) => {
       if (message.type === "submit") {
-        await Promise.resolve(this.onSubmit(message.values));
-        this.dispose();
+        if (this.submitInFlight || this.disposed) {
+          return;
+        }
+        this.submitInFlight = true;
+        try {
+          await Promise.resolve(this.onSubmit(message.values));
+          this.dispose();
+        } finally {
+          this.submitInFlight = false;
+        }
         return;
       }
       if (message.type === "cancel") {
