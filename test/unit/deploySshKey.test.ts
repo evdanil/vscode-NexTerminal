@@ -1,5 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import * as path from "node:path";
+import { PassThrough } from "node:stream";
+import type { SshConnection } from "../../src/services/ssh/contracts";
 
 // Mock fs/promises before importing module under test
 vi.mock("node:fs/promises", () => ({
@@ -15,7 +17,7 @@ vi.mock("node:child_process", () => ({
 
 import { readdir, mkdir } from "node:fs/promises";
 import { execFile as execFileCb } from "node:child_process";
-import { findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
+import { findLocalKeyPairs, generateKeyPair, execRemoteCommand, deployPublicKeyToRemote } from "../../src/services/ssh/deploySshKey";
 
 describe("findLocalKeyPairs", () => {
   beforeEach(() => {
@@ -147,5 +149,85 @@ describe("generateKeyPair", () => {
     await expect(
       generateKeyPair({ sshDir: "/home/user/.ssh", name: "id_ed25519", passphrase: "" })
     ).rejects.toThrow("ssh-keygen not found");
+  });
+});
+
+function mockConnection(responses: Array<{ stdout: string; stderr?: string; exitCode: number }>): SshConnection {
+  let callIdx = 0;
+  return {
+    exec: vi.fn(async () => {
+      const resp = responses[callIdx++] ?? { stdout: "", stderr: "", exitCode: 0 };
+      const stream = new PassThrough() as any;
+      stream.stderr = new PassThrough();
+      process.nextTick(() => {
+        stream.push(resp.stdout);
+        stream.push(null);
+        if (resp.stderr) {
+          stream.stderr.push(resp.stderr);
+        }
+        stream.stderr.push(null);
+        stream.emit("exit", resp.exitCode);
+      });
+      return stream;
+    }),
+    openShell: vi.fn(),
+    openDirectTcp: vi.fn(),
+    openSftp: vi.fn(),
+    requestForwardIn: vi.fn(),
+    cancelForwardIn: vi.fn(),
+    onTcpConnection: vi.fn().mockReturnValue(() => {}),
+    onClose: vi.fn().mockReturnValue(() => {}),
+    getBanner: vi.fn(),
+    dispose: vi.fn(),
+  };
+}
+
+describe("execRemoteCommand", () => {
+  it("collects stdout, stderr, and exit code", async () => {
+    const conn = mockConnection([{ stdout: "hello\n", stderr: "warn\n", exitCode: 0 }]);
+    const result = await execRemoteCommand(conn, "echo hello");
+    expect(result.stdout).toBe("hello\n");
+    expect(result.stderr).toBe("warn\n");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("returns non-zero exit code", async () => {
+    const conn = mockConnection([{ stdout: "", exitCode: 1 }]);
+    const result = await execRemoteCommand(conn, "false");
+    expect(result.exitCode).toBe(1);
+  });
+});
+
+describe("deployPublicKeyToRemote", () => {
+  it("creates .ssh dir and appends key", async () => {
+    const conn = mockConnection([
+      { stdout: "", exitCode: 0 },  // mkdir
+      { stdout: "", exitCode: 1 },  // grep (not found)
+      { stdout: "", exitCode: 0 },  // append
+    ]);
+
+    const result = await deployPublicKeyToRemote(conn, "ssh-ed25519 AAAA comment");
+    expect(result.alreadyDeployed).toBe(false);
+    expect(conn.exec).toHaveBeenCalledTimes(3);
+  });
+
+  it("detects already-deployed key", async () => {
+    const conn = mockConnection([
+      { stdout: "", exitCode: 0 },  // mkdir
+      { stdout: "ssh-ed25519 AAAA comment", exitCode: 0 },  // grep (found)
+    ]);
+
+    const result = await deployPublicKeyToRemote(conn, "ssh-ed25519 AAAA comment");
+    expect(result.alreadyDeployed).toBe(true);
+    expect(conn.exec).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws when mkdir fails", async () => {
+    const conn = mockConnection([
+      { stdout: "", stderr: "permission denied", exitCode: 1 },
+    ]);
+
+    await expect(deployPublicKeyToRemote(conn, "ssh-ed25519 AAAA comment"))
+      .rejects.toThrow();
   });
 });
