@@ -49,6 +49,24 @@ async function pickConnectedServer(ctx: CommandContext): Promise<ServerConfig | 
   return pick?.server;
 }
 
+function resolveTargetDirectory(
+  ctx: CommandContext,
+  arg: unknown
+): { serverId: string; dirPath: string } | undefined {
+  if (arg instanceof FileTreeItem && arg.entry.isDirectory) {
+    return {
+      serverId: arg.serverId,
+      dirPath: path.posix.join(arg.remotePath, arg.entry.name),
+    };
+  }
+  const serverId = ctx.fileExplorerProvider.getActiveServerId();
+  const dirPath = ctx.fileExplorerProvider.getRootPath();
+  if (!serverId || !dirPath) {
+    return undefined;
+  }
+  return { serverId, dirPath };
+}
+
 function resolveSelectedItems(arg: unknown, allSelected: unknown): FileTreeItem[] {
   if (Array.isArray(allSelected) && allSelected.length > 0) {
     return allSelected.filter((item): item is FileTreeItem => item instanceof FileTreeItem);
@@ -174,7 +192,8 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
   });
 
   const createFile = vscode.commands.registerCommand("nexus.files.createFile", async (arg?: unknown) => {
-    if (!(arg instanceof FileTreeItem) || !arg.entry.isDirectory) {
+    const target = resolveTargetDirectory(ctx, arg);
+    if (!target) {
       return;
     }
     const name = await vscode.window.showInputBox({
@@ -185,17 +204,22 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     if (!name) {
       return;
     }
-    const parentPath = path.posix.join(arg.remotePath, arg.entry.name);
-    const newFilePath = path.posix.join(parentPath, name);
-    await ctx.sftpService.writeFile(arg.serverId, newFilePath, Buffer.alloc(0));
-    ctx.sftpService.invalidateCache(arg.serverId, parentPath);
-    ctx.fileExplorerProvider.refresh();
-    const uri = buildUri(arg.serverId, newFilePath);
-    await vscode.commands.executeCommand("vscode.open", uri);
+    try {
+      const newFilePath = path.posix.join(target.dirPath, name);
+      await ctx.sftpService.writeFile(target.serverId, newFilePath, Buffer.alloc(0));
+      ctx.sftpService.invalidateCache(target.serverId, target.dirPath);
+      ctx.fileExplorerProvider.refresh();
+      const uri = buildUri(target.serverId, newFilePath);
+      await vscode.commands.executeCommand("vscode.open", uri);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      vscode.window.showErrorMessage(`Failed to create file "${name}": ${message}`);
+    }
   });
 
   const upload = vscode.commands.registerCommand("nexus.files.upload", async (arg?: unknown) => {
-    if (!(arg instanceof FileTreeItem) || !arg.entry.isDirectory) {
+    const target = resolveTargetDirectory(ctx, arg);
+    if (!target) {
       return;
     }
     const files = await vscode.window.showOpenDialog({
@@ -205,20 +229,24 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     if (!files || files.length === 0) {
       return;
     }
-    const targetDir = path.posix.join(arg.remotePath, arg.entry.name);
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "Uploading files..." },
-      async (progress) => {
-        for (const file of files) {
-          const fileName = path.basename(file.fsPath);
-          progress.report({ message: fileName });
-          const remoteDest = path.posix.join(targetDir, fileName);
-          await ctx.sftpService.upload(arg.serverId, file.fsPath, remoteDest);
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "Uploading files..." },
+        async (progress) => {
+          for (const file of files) {
+            const fileName = path.basename(file.fsPath);
+            progress.report({ message: fileName });
+            const remoteDest = path.posix.join(target.dirPath, fileName);
+            await ctx.sftpService.upload(target.serverId, file.fsPath, remoteDest);
+          }
         }
-      }
-    );
-    ctx.sftpService.invalidateCache(arg.serverId, targetDir);
-    ctx.fileExplorerProvider.refresh();
+      );
+      ctx.sftpService.invalidateCache(target.serverId, target.dirPath);
+      ctx.fileExplorerProvider.refresh();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      vscode.window.showErrorMessage(`Failed to upload: ${message}`);
+    }
   });
 
   const download = vscode.commands.registerCommand("nexus.files.download", async (arg?: unknown, allSelected?: unknown) => {
@@ -372,7 +400,8 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
   });
 
   const createDir = vscode.commands.registerCommand("nexus.files.createDir", async (arg?: unknown) => {
-    if (!(arg instanceof FileTreeItem) || !arg.entry.isDirectory) {
+    const target = resolveTargetDirectory(ctx, arg);
+    if (!target) {
       return;
     }
     const name = await vscode.window.showInputBox({
@@ -383,11 +412,15 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     if (!name) {
       return;
     }
-    const parentPath = path.posix.join(arg.remotePath, arg.entry.name);
-    const newDirPath = path.posix.join(parentPath, name);
-    await ctx.sftpService.createDirectory(arg.serverId, newDirPath);
-    ctx.sftpService.invalidateCache(arg.serverId, parentPath);
-    ctx.fileExplorerProvider.refresh();
+    try {
+      const newDirPath = path.posix.join(target.dirPath, name);
+      await ctx.sftpService.createDirectory(target.serverId, newDirPath);
+      ctx.sftpService.invalidateCache(target.serverId, target.dirPath);
+      ctx.fileExplorerProvider.refresh();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      vscode.window.showErrorMessage(`Failed to create directory "${name}": ${message}`);
+    }
   });
 
   const goToPath = vscode.commands.registerCommand("nexus.files.goToPath", async (arg?: unknown) => {

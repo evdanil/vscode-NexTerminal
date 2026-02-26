@@ -527,29 +527,44 @@
           "group": "navigation@1"
         },
         {
-          "command": "nexus.files.goHome",
+          "command": "nexus.files.createFile",
           "when": "view == nexusFileExplorer",
           "group": "navigation@1"
         },
         {
-          "command": "nexus.files.goToPath",
+          "command": "nexus.files.createDir",
           "when": "view == nexusFileExplorer",
           "group": "navigation@2"
         },
         {
-          "command": "nexus.files.refresh",
+          "command": "nexus.files.upload",
           "when": "view == nexusFileExplorer",
           "group": "navigation@3"
         },
         {
-          "command": "nexus.files.browse",
+          "command": "nexus.files.goHome",
           "when": "view == nexusFileExplorer",
           "group": "navigation@4"
         },
         {
-          "command": "nexus.files.disconnect",
+          "command": "nexus.files.goToPath",
           "when": "view == nexusFileExplorer",
           "group": "navigation@5"
+        },
+        {
+          "command": "nexus.files.refresh",
+          "when": "view == nexusFileExplorer",
+          "group": "navigation@6"
+        },
+        {
+          "command": "nexus.files.browse",
+          "when": "view == nexusFileExplorer",
+          "group": "navigation@7"
+        },
+        {
+          "command": "nexus.files.disconnect",
+          "when": "view == nexusFileExplorer",
+          "group": "navigation@8"
         }
       ],
       "view/item/context": [
