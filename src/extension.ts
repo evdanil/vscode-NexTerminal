@@ -10,7 +10,7 @@ import { TerminalLoggerFactory } from "./logging/terminalLogger";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
 import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFileSystemProvider";
 import { SftpService } from "./services/sftp/sftpService";
-import { SilentAuthSshFactory } from "./services/ssh/silentAuth";
+import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { ProxySshFactory } from "./services/ssh/proxySshFactory";
 import { SshConnectionPool } from "./services/ssh/sshConnectionPool";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
@@ -335,6 +335,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)
       )) {
         pool.disconnect(server.id);
+        // Clear stale proxy password when proxy endpoint changes to prevent
+        // sending one proxy's credentials to a different proxy server.
+        if (JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)) {
+          void secretVault.delete(proxyPasswordSecretKey(server.id));
+        }
       }
     }
     previousServers = new Map(snapshot.servers.map(s => [s.id, s]));

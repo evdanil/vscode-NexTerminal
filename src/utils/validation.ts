@@ -4,6 +4,10 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
+function isValidPort(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
 export function validateProxyConfig(proxy: unknown): proxy is ProxyConfig {
   if (typeof proxy !== "object" || proxy === null) {
     return false;
@@ -13,10 +17,10 @@ export function validateProxyConfig(proxy: unknown): proxy is ProxyConfig {
     return isNonEmptyString(obj.jumpHostId);
   }
   if (obj.type === "socks5") {
-    return isNonEmptyString(obj.host) && typeof obj.port === "number";
+    return isNonEmptyString(obj.host) && isValidPort(obj.port);
   }
   if (obj.type === "http") {
-    return isNonEmptyString(obj.host) && typeof obj.port === "number";
+    return isNonEmptyString(obj.host) && isValidPort(obj.port);
   }
   return false;
 }

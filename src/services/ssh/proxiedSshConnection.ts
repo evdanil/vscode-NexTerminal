@@ -54,9 +54,5 @@ export function jumpHostCleanup(jumpConnection: SshConnection): () => void {
 }
 
 export function socketCleanup(socket: Socket | Duplex): () => void {
-  return () => {
-    if ("destroy" in socket && typeof socket.destroy === "function") {
-      socket.destroy();
-    }
-  };
+  return () => socket.destroy();
 }

@@ -137,8 +137,9 @@ describe("renderFormHtml", () => {
       ]
     };
     const html = renderFormHtml(definition);
-    expect(html).toContain('data-visible-when-field="profileType"');
-    expect(html).toContain('data-visible-when-value="ssh"');
+    expect(html).toContain("data-visible-when=");
+    expect(html).toContain("profileType");
+    expect(html).toContain("ssh");
   });
 
   it("includes CSS for visibleWhen hidden/visible states", () => {
@@ -154,8 +155,8 @@ describe("renderFormHtml", () => {
       ]
     };
     const html = renderFormHtml(definition);
-    expect(html).toContain(".form-group[data-visible-when-field] { display: none; }");
-    expect(html).toContain(".form-group[data-visible-when-field].field-visible { display: block; }");
+    expect(html).toContain(".form-group[data-visible-when] { display: none; }");
+    expect(html).toContain(".form-group[data-visible-when].field-visible { display: block; }");
   });
 
   it("renders html fields with form-illustration class", () => {
@@ -178,8 +179,8 @@ describe("renderFormHtml", () => {
       ]
     };
     const html = renderFormHtml(definition);
-    expect(html).toContain('data-visible-when-field="mode"');
-    expect(html).toContain('data-visible-when-value="a"');
+    expect(html).toContain("data-visible-when=");
+    expect(html).toContain("mode");
     expect(html).toContain("form-illustration");
   });
 
@@ -215,10 +216,10 @@ describe("renderFormHtml", () => {
   it("renders tunnel form with SVG illustrations using inline attributes (no style blocks)", () => {
     const definition = tunnelFormDefinition();
     const html = renderFormHtml(definition);
-    // All three illustration types are wired via visibleWhen
-    expect(html).toContain('data-visible-when-value="local"');
-    expect(html).toContain('data-visible-when-value="reverse"');
-    expect(html).toContain('data-visible-when-value="dynamic"');
+    // All three illustration types are wired via visibleWhen (JSON is HTML-escaped)
+    expect(html).toContain('&quot;value&quot;:&quot;local&quot;');
+    expect(html).toContain('&quot;value&quot;:&quot;reverse&quot;');
+    expect(html).toContain('&quot;value&quot;:&quot;dynamic&quot;');
     expect(html).toContain("form-illustration");
     // SVGs use inline presentation attributes, not <style> blocks
     // (style blocks would be blocked by CSP and cause class name collisions)
@@ -241,7 +242,7 @@ describe("renderFormHtml", () => {
     expect(html).toContain("updateVisibility");
   });
 
-  it("renders compound visibleWhen with comma-separated fields and values", () => {
+  it("renders compound visibleWhen as JSON-encoded data attribute", () => {
     const definition: FormDefinition = {
       title: "Test",
       fields: [
@@ -257,11 +258,13 @@ describe("renderFormHtml", () => {
       ]
     };
     const html = renderFormHtml(definition);
-    expect(html).toContain('data-visible-when-field="profileType,proxyType"');
-    expect(html).toContain('data-visible-when-value="ssh,socks5"');
+    expect(html).toContain("data-visible-when=");
+    expect(html).toContain("profileType");
+    expect(html).toContain("proxyType");
+    expect(html).toContain("socks5");
   });
 
-  it("renders single visibleWhen condition as before (backward compatible)", () => {
+  it("renders single visibleWhen condition as JSON array (backward compatible)", () => {
     const definition: FormDefinition = {
       title: "Test",
       fields: [
@@ -274,11 +277,12 @@ describe("renderFormHtml", () => {
       ]
     };
     const html = renderFormHtml(definition);
-    expect(html).toContain('data-visible-when-field="type"');
-    expect(html).toContain('data-visible-when-value="ssh"');
+    expect(html).toContain("data-visible-when=");
+    expect(html).toContain('&quot;field&quot;:&quot;type&quot;');
+    expect(html).toContain('&quot;value&quot;:&quot;ssh&quot;');
   });
 
-  it("JS updateVisibility splits comma-separated fields for compound conditions", () => {
+  it("JS updateVisibility uses JSON.parse for compound conditions", () => {
     const definition: FormDefinition = {
       title: "Test",
       fields: [
@@ -314,7 +318,6 @@ describe("renderFormHtml", () => {
       ]
     };
     const html = renderFormHtml(definition);
-    // The JS should split on comma to handle multiple fields
-    expect(html).toContain("split(\",\")");
+    expect(html).toContain("JSON.parse");
   });
 });

@@ -1,4 +1,4 @@
-import type { SerialProfile, ServerConfig, TunnelProfile, TunnelType, ProxyConfig } from "../models/config";
+import type { SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
 import { resolveTunnelType } from "../models/config";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
@@ -110,18 +110,13 @@ export interface ServerListEntry {
   name: string;
 }
 
-function resolveProxyType(proxy?: ProxyConfig): string {
-  if (!proxy) return "none";
-  return proxy.type;
-}
-
 function proxyFields(
   seed?: Partial<ServerConfig>,
   servers?: ServerListEntry[],
   vw?: VisibleWhen
 ): FormFieldDescriptor[] {
   const proxy = seed?.proxy;
-  const proxyType = resolveProxyType(proxy);
+  const proxyType = proxy?.type ?? "none";
 
   const sshJumpVw: VisibleWhenCondition = { field: "proxyType", value: "ssh" };
   const socks5Vw: VisibleWhenCondition = { field: "proxyType", value: "socks5" };

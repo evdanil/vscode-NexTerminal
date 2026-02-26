@@ -15,9 +15,7 @@ function visibleWhenAttrs(field: FormFieldDescriptor): string {
     return "";
   }
   const conditions = Array.isArray(field.visibleWhen) ? field.visibleWhen : [field.visibleWhen];
-  const fields = conditions.map((c) => escapeHtml(c.field)).join(",");
-  const values = conditions.map((c) => escapeHtml(c.value)).join(",");
-  return ` data-visible-when-field="${fields}" data-visible-when-value="${values}"`;
+  return ` data-visible-when='${escapeHtml(JSON.stringify(conditions))}'`;
 }
 
 function renderField(field: FormFieldDescriptor): string {
@@ -148,15 +146,14 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       var form = document.getElementById("nexus-form");
 
       function updateVisibility() {
-        var groups = document.querySelectorAll("[data-visible-when-field]");
+        var groups = document.querySelectorAll("[data-visible-when]");
         for (var gi = 0; gi < groups.length; gi++) {
           var group = groups[gi];
-          var fieldList = group.dataset.visibleWhenField.split(",");
-          var valueList = group.dataset.visibleWhenValue.split(",");
+          var conditions = JSON.parse(group.dataset.visibleWhen);
           var visible = true;
-          for (var ci = 0; ci < fieldList.length; ci++) {
-            var control = form.elements[fieldList[ci]];
-            if (!control || control.value !== valueList[ci]) {
+          for (var ci = 0; ci < conditions.length; ci++) {
+            var control = form.elements[conditions[ci].field];
+            if (!control || control.value !== conditions[ci].value) {
               visible = false;
               break;
             }
@@ -175,11 +172,11 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       }
 
       var watchedFields = {};
-      var wfGroups = document.querySelectorAll("[data-visible-when-field]");
+      var wfGroups = document.querySelectorAll("[data-visible-when]");
       for (var wi = 0; wi < wfGroups.length; wi++) {
-        var fieldNames = wfGroups[wi].dataset.visibleWhenField.split(",");
-        for (var fi = 0; fi < fieldNames.length; fi++) {
-          watchedFields[fieldNames[fi]] = true;
+        var wfConditions = JSON.parse(wfGroups[wi].dataset.visibleWhen);
+        for (var fi = 0; fi < wfConditions.length; fi++) {
+          watchedFields[wfConditions[fi].field] = true;
         }
       }
       for (var fieldName in watchedFields) {

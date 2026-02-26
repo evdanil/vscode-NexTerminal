@@ -35,8 +35,8 @@ export function baseWebviewCss(): string {
     .form-group-checkbox {
       margin-top: 8px;
     }
-    .form-group[data-visible-when-field] { display: none; }
-    .form-group[data-visible-when-field].field-visible { display: block; }
+    .form-group[data-visible-when] { display: none; }
+    .form-group[data-visible-when].field-visible { display: block; }
     label {
       display: block;
       margin-bottom: 4px;

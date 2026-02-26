@@ -7,6 +7,8 @@ import { ProxiedSshConnection, jumpHostCleanup, socketCleanup } from "./proxiedS
 import type { SilentAuthSshFactory } from "./silentAuth";
 import { proxyPasswordSecretKey } from "./silentAuth";
 
+const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT headers
+
 export class ProxySshFactory implements SshFactory {
   public constructor(
     private readonly authFactory: SilentAuthSshFactory,
@@ -111,15 +113,16 @@ export class ProxySshFactory implements SshFactory {
       }
     });
 
-    let connection: SshConnection;
-    try {
-      connection = await this.authFactory.connect(target, { sock: socket });
-    } catch (error) {
-      socket.destroy();
-      throw error;
-    }
+    // The socks library schedules setImmediate(() => socket.resume()) after the
+    // SOCKS5 handshake completes. If there's any async gap before ssh2 takes the
+    // socket (e.g., password lookup from SecretStorage), the premature resume causes
+    // the SSH server's banner data to be lost — no data listeners are attached yet,
+    // so flowing data is discarded, leading to "Timed out while waiting for handshake".
+    // Fix: wait for the deferred resume to fire, then re-pause so ssh2 can take over.
+    await new Promise<void>((r) => setImmediate(r));
+    socket.pause();
 
-    return new ProxiedSshConnection(connection, socketCleanup(socket));
+    return this.connectThroughSocket(target, socket);
   }
 
   private async connectViaHttpConnect(
@@ -139,6 +142,13 @@ export class ProxySshFactory implements SshFactory {
       proxyPassword
     );
 
+    return this.connectThroughSocket(target, socket);
+  }
+
+  private async connectThroughSocket(
+    target: ServerConfig,
+    socket: net.Socket
+  ): Promise<SshConnection> {
     let connection: SshConnection;
     try {
       connection = await this.authFactory.connect(target, { sock: socket });
@@ -146,7 +156,6 @@ export class ProxySshFactory implements SshFactory {
       socket.destroy();
       throw error;
     }
-
     return new ProxiedSshConnection(connection, socketCleanup(socket));
   }
 
@@ -160,9 +169,12 @@ export class ProxySshFactory implements SshFactory {
   ): Promise<net.Socket> {
     return new Promise((resolve, reject) => {
       const socket = net.createConnection(proxyPort, proxyHost, () => {
-        let request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
+        // Strip CR/LF to prevent HTTP header injection
+        const safeHost = targetHost.replace(/[\r\n]/g, "");
+        let request = `CONNECT ${safeHost}:${targetPort} HTTP/1.1\r\nHost: ${safeHost}:${targetPort}\r\n`;
         if (username) {
-          const credentials = Buffer.from(`${username}:${password ?? ""}`).toString("base64");
+          const safeUser = username.replace(/[\r\n]/g, "");
+          const credentials = Buffer.from(`${safeUser}:${password ?? ""}`).toString("base64");
           request += `Proxy-Authorization: Basic ${credentials}\r\n`;
         }
         request += "\r\n";
@@ -176,15 +188,28 @@ export class ProxySshFactory implements SshFactory {
       let responseData = "";
       const onData = (chunk: Buffer): void => {
         responseData += chunk.toString();
+
+        if (responseData.length > MAX_HTTP_RESPONSE_SIZE) {
+          socket.destroy();
+          reject(new Error("HTTP CONNECT proxy response too large"));
+          return;
+        }
+
         const headerEnd = responseData.indexOf("\r\n\r\n");
         if (headerEnd === -1) {
           return; // Headers not complete yet
         }
         socket.removeListener("data", onData);
+        socket.setTimeout(0);
 
         const statusLine = responseData.substring(0, responseData.indexOf("\r\n"));
         const statusCode = parseInt(statusLine.split(" ")[1], 10);
         if (statusCode === 200) {
+          // Push back any data that arrived after the HTTP headers (e.g., SSH banner)
+          const trailing = responseData.substring(headerEnd + 4);
+          if (trailing.length > 0) {
+            socket.unshift(Buffer.from(trailing));
+          }
           resolve(socket);
         } else {
           socket.destroy();
