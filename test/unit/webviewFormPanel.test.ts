@@ -9,6 +9,7 @@ const panelDispose = vi.fn(() => {
 });
 const panelReveal = vi.fn();
 const postMessage = vi.fn(async () => true);
+const showErrorMessage = vi.fn();
 
 vi.mock("../../src/ui/formHtml", () => ({
   renderFormHtml: vi.fn(() => "<html></html>")
@@ -16,6 +17,7 @@ vi.mock("../../src/ui/formHtml", () => ({
 
 vi.mock("vscode", () => ({
   window: {
+    showErrorMessage: (...args: unknown[]) => showErrorMessage(...args),
     createWebviewPanel: vi.fn(() => ({
       webview: {
         html: "",
@@ -75,14 +77,11 @@ describe("WebviewFormPanel submit handling", () => {
     WebviewFormPanel.open("panel-retry", { title: "Retry", fields: [] }, { onSubmit });
     expect(messageHandler).toBeDefined();
 
-    await expect(
-      Promise.resolve(messageHandler!({ type: "submit", values: {} }))
-    ).rejects.toThrow("save failed");
+    await Promise.resolve(messageHandler!({ type: "submit", values: {} }));
+    expect(showErrorMessage).toHaveBeenCalledWith("Save failed: save failed");
     expect(panelDispose).not.toHaveBeenCalled();
 
-    await expect(
-      Promise.resolve(messageHandler!({ type: "submit", values: {} }))
-    ).resolves.toBeUndefined();
+    await Promise.resolve(messageHandler!({ type: "submit", values: {} }));
     expect(onSubmit).toHaveBeenCalledTimes(2);
     expect(panelDispose).toHaveBeenCalledTimes(1);
   });
