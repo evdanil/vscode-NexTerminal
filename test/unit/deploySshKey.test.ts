@@ -24,24 +24,16 @@ function makeEnoentError(): NodeJS.ErrnoException {
   return Object.assign(new Error("ENOENT"), { code: "ENOENT" });
 }
 
-function mockSshKeygenProcess(exitCode: number, stdout = "", stderr = ""): {
-  stdinEnd: ReturnType<typeof vi.fn>;
+function mockSshKeygenProcess(exitCode: number, stderr = ""): {
   kill: ReturnType<typeof vi.fn>;
 } {
   const child = new EventEmitter() as any;
-  child.stdout = new PassThrough();
   child.stderr = new PassThrough();
-  const stdinEnd = vi.fn();
-  child.stdin = { end: stdinEnd };
   const kill = vi.fn();
   child.kill = kill;
   vi.mocked(spawn).mockReturnValue(child);
 
   process.nextTick(() => {
-    if (stdout) {
-      child.stdout.push(stdout);
-    }
-    child.stdout.push(null);
     if (stderr) {
       child.stderr.push(stderr);
     }
@@ -49,7 +41,7 @@ function mockSshKeygenProcess(exitCode: number, stdout = "", stderr = ""): {
     child.emit("close", exitCode);
   });
 
-  return { stdinEnd, kill };
+  return { kill };
 }
 
 describe("findLocalKeyPairs", () => {
@@ -116,9 +108,9 @@ describe("generateKeyPair", () => {
     vi.mocked(access).mockRejectedValue(makeEnoentError());
   });
 
-  it("invokes ssh-keygen without passing passphrase via argv", async () => {
+  it("passes passphrase via -N flag", async () => {
     vi.mocked(mkdir).mockResolvedValue(undefined);
-    const proc = mockSshKeygenProcess(0);
+    mockSshKeygenProcess(0);
 
     const result = await generateKeyPair({
       sshDir: "/home/user/.ssh",
@@ -130,17 +122,16 @@ describe("generateKeyPair", () => {
     const resolvedKeyPath = path.join(resolvedSshDir, "id_ed25519");
     expect(spawn).toHaveBeenCalledWith(
       expect.any(String),
-      ["-q", "-t", "ed25519", "-f", resolvedKeyPath, "-C", "nexus-terminal"],
-      { stdio: ["pipe", "pipe", "pipe"] }
+      ["-q", "-t", "ed25519", "-f", resolvedKeyPath, "-N", "my-secret", "-C", "nexus-terminal"],
+      { stdio: ["ignore", "pipe", "pipe"] }
     );
-    expect(proc.stdinEnd).toHaveBeenCalledWith("my-secret\nmy-secret\n", "utf8");
     expect(result.privateKeyPath).toBe(resolvedKeyPath);
     expect(result.publicKeyPath).toBe(`${resolvedKeyPath}.pub`);
   });
 
-  it("calls ssh-keygen with empty passphrase when requested", async () => {
+  it("passes empty -N flag for no passphrase", async () => {
     vi.mocked(mkdir).mockResolvedValue(undefined);
-    const proc = mockSshKeygenProcess(0);
+    mockSshKeygenProcess(0);
 
     await generateKeyPair({
       sshDir: "/home/user/.ssh",
@@ -148,7 +139,11 @@ describe("generateKeyPair", () => {
       passphrase: "",
     });
 
-    expect(proc.stdinEnd).toHaveBeenCalledWith("\n\n", "utf8");
+    expect(spawn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.arrayContaining(["-N", ""]),
+      expect.any(Object),
+    );
   });
 
   it("creates .ssh directory with mode 700 if missing", async () => {
@@ -187,7 +182,7 @@ describe("generateKeyPair", () => {
 
   it("throws on ssh-keygen non-zero exit", async () => {
     vi.mocked(mkdir).mockResolvedValue(undefined);
-    mockSshKeygenProcess(1, "", "permission denied");
+    mockSshKeygenProcess(1, "permission denied");
 
     await expect(
       generateKeyPair({ sshDir: "/home/user/.ssh", name: "id_ed25519", passphrase: "" })

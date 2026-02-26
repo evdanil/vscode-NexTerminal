@@ -86,11 +86,11 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
+// ssh-keygen reads passphrases from /dev/tty, not stdin, so we must use the -N flag.
 async function runSshKeygen(binary: string, keyPath: string, passphrase: string): Promise<void> {
-  const args = ["-q", "-t", "ed25519", "-f", keyPath, "-C", "nexus-terminal"];
+  const args = ["-q", "-t", "ed25519", "-f", keyPath, "-N", passphrase, "-C", "nexus-terminal"];
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(binary, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
+    const child = spawn(binary, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     let settled = false;
     const timeout = setTimeout(() => {
@@ -118,9 +118,6 @@ async function runSshKeygen(binary: string, keyPath: string, passphrase: string)
     child.on("error", (error) => {
       finish(new Error(`Failed to run ssh-keygen: ${error.message}`));
     });
-    child.stdout.on("data", (chunk: Buffer | string) => {
-      stdout += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    });
     child.stderr.on("data", (chunk: Buffer | string) => {
       stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
     });
@@ -129,11 +126,8 @@ async function runSshKeygen(binary: string, keyPath: string, passphrase: string)
         finish();
         return;
       }
-      const message = (stderr || stdout || `exit code ${exitCode ?? "unknown"}`).trim();
-      finish(new Error(`ssh-keygen failed: ${message}`));
+      finish(new Error(`ssh-keygen failed: ${(stderr || `exit code ${exitCode ?? "unknown"}`).trim()}`));
     });
-
-    child.stdin.end(`${passphrase}\n${passphrase}\n`, "utf8");
   });
 }
 
