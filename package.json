@@ -145,6 +145,12 @@
         "icon": "$(edit)"
       },
       {
+        "command": "nexus.server.deployKey",
+        "title": "Deploy SSH Key",
+        "category": "Nexus",
+        "icon": "$(key)"
+      },
+      {
         "command": "nexus.tunnel.add",
         "title": "Add Tunnel",
         "category": "Nexus",
@@ -624,6 +630,11 @@
           "group": "1_manage@4"
         },
         {
+          "command": "nexus.server.deployKey",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "group": "1_manage@5"
+        },
+        {
           "command": "nexus.server.copyInfo",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
           "group": "2_clipboard"
@@ -968,6 +979,10 @@
         },
         {
           "command": "nexus.server.rename",
+          "when": "true"
+        },
+        {
+          "command": "nexus.server.deployKey",
           "when": "true"
         },
         {

@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import * as os from "node:os";
+import * as path from "node:path";
 import * as vscode from "vscode";
 import type { AuthType, ProxyConfig, ServerConfig } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
@@ -9,6 +11,8 @@ import { serverFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../services/ssh/deploySshKey";
+import type { KeyPairInfo } from "../services/ssh/deploySshKey";
 import { resolveTunnelConnectionMode, startTunnel } from "./tunnelCommands";
 import type { CommandContext, ServerTerminalMap } from "./types";
 import { getAncestorPaths, isDescendantOrSelf, folderDisplayName } from "../utils/folderPaths";
@@ -491,6 +495,145 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         .servers.filter((s) => s.group && isDescendantOrSelf(s.group, folderPath) && !s.isHidden);
       for (const server of servers) {
         await disconnectServer(ctx, server.id);
+      }
+    }),
+
+    vscode.commands.registerCommand("nexus.server.deployKey", async (arg?: unknown) => {
+      const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
+      if (!server) return;
+
+      const sshDir = defaultSshDir();
+      const keyPairs = await findLocalKeyPairs(sshDir);
+
+      type KeyPickItem = vscode.QuickPickItem & { keyPair?: KeyPairInfo; generate?: boolean };
+      const items: KeyPickItem[] = keyPairs.map((kp) => ({
+        label: kp.name,
+        description: kp.publicKeyPath,
+        keyPair: kp,
+      }));
+      items.push({ label: "$(add) Generate new ed25519 key", generate: true });
+
+      const pick = await vscode.window.showQuickPick(items, {
+        title: `Deploy SSH Key to ${server.name}`,
+        placeHolder: "Select an existing key or generate a new one",
+      });
+      if (!pick) return;
+
+      let publicKeyPath: string;
+
+      if (pick.generate) {
+        const defaultName = "id_ed25519";
+        let keyName = defaultName;
+        try {
+          await readFile(path.join(sshDir, `${defaultName}.pub`));
+          const custom = await vscode.window.showInputBox({
+            title: "Key Name",
+            prompt: `${defaultName} already exists. Enter a name for the new key`,
+            value: "id_ed25519_nexus",
+            validateInput: (v) => (v.trim() ? null : "Name cannot be empty"),
+          });
+          if (!custom) return;
+          keyName = custom.trim();
+        } catch {
+          // Default name available
+        }
+
+        const passChoice = await vscode.window.showQuickPick(
+          [
+            { label: "No passphrase", description: "Key will not be encrypted", passphrase: "" },
+            {
+              label: "Set passphrase",
+              description: "Encrypt the private key",
+              passphrase: undefined as string | undefined,
+            },
+          ],
+          { title: "Key Passphrase" },
+        );
+        if (!passChoice) return;
+
+        let passphrase = passChoice.passphrase ?? "";
+        if (passChoice.passphrase === undefined) {
+          const pp = await vscode.window.showInputBox({
+            title: "Enter Passphrase",
+            password: true,
+            prompt: "Enter passphrase for the new key",
+          });
+          if (pp === undefined) return;
+          const confirm = await vscode.window.showInputBox({
+            title: "Confirm Passphrase",
+            password: true,
+            prompt: "Re-enter passphrase to confirm",
+          });
+          if (confirm === undefined || confirm !== pp) {
+            void vscode.window.showErrorMessage("Passphrases do not match.");
+            return;
+          }
+          passphrase = pp;
+        }
+
+        try {
+          const result = await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: "Generating SSH key..." },
+            () => generateKeyPair({ sshDir, name: keyName, passphrase }),
+          );
+          publicKeyPath = result.publicKeyPath;
+        } catch (err: any) {
+          void vscode.window.showErrorMessage(`Key generation failed: ${err?.message ?? err}`);
+          return;
+        }
+      } else {
+        publicKeyPath = pick.keyPair!.publicKeyPath;
+      }
+
+      let pubKeyContent: string;
+      try {
+        pubKeyContent = (await readFile(publicKeyPath, "utf-8")).trim();
+      } catch (err: any) {
+        void vscode.window.showErrorMessage(`Cannot read public key: ${err?.message ?? err}`);
+        return;
+      }
+
+      let connection: import("../services/ssh/contracts").SshConnection | undefined;
+      try {
+        const deployResult = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `Deploying key to ${server.name}...`,
+            cancellable: false,
+          },
+          async () => {
+            connection = await ctx.sshFactory.connect(server);
+            return deployPublicKeyToRemote(connection, pubKeyContent);
+          },
+        );
+
+        if (deployResult.alreadyDeployed) {
+          void vscode.window.showInformationMessage("Public key is already deployed on this server.");
+        } else {
+          const switchAction = "Switch to key auth";
+          const response = await vscode.window.showInformationMessage(
+            `SSH key deployed to ${server.name} successfully.`,
+            switchAction,
+          );
+          if (response === switchAction) {
+            const privateKeyPath = publicKeyPath.replace(/\.pub$/, "");
+            await ctx.core.addOrUpdateServer({ ...server, authType: "key", keyPath: privateKeyPath });
+            if (server.authType === "password" && ctx.secretVault) {
+              const removeAction = "Remove stored password";
+              const pwResponse = await vscode.window.showInformationMessage(
+                "Server switched to key authentication.",
+                removeAction,
+              );
+              if (pwResponse === removeAction) {
+                await ctx.secretVault.delete(passwordSecretKey(server.id));
+              }
+            }
+          }
+        }
+      } catch (err: any) {
+        void vscode.window.showErrorMessage(`Deploy failed: ${err?.message ?? err}`);
+      } finally {
+        connection?.dispose();
       }
     })
   ];

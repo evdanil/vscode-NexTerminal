@@ -29,6 +29,7 @@ const unsupportedCommands = [
   "nexus.server.copyInfo",
   "nexus.server.duplicate",
   "nexus.server.rename",
+  "nexus.server.deployKey",
   "nexus.tunnel.add",
   "nexus.tunnel.edit",
   "nexus.tunnel.remove",
