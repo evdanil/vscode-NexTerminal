@@ -1,4 +1,4 @@
-import { readdir, mkdir, readFile } from "node:fs/promises";
+import { readdir, mkdir } from "node:fs/promises";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import * as path from "node:path";
@@ -115,10 +115,18 @@ export async function deployPublicKeyToRemote(
   publicKeyContent: string,
 ): Promise<DeployResult> {
   const trimmedKey = publicKeyContent.trim();
+  if (!trimmedKey) {
+    throw new Error("Public key content is empty");
+  }
 
   // Extract type+base64 for matching (ignore comment)
   const keyParts = trimmedKey.split(/\s+/);
   const matchPattern = keyParts.length >= 2 ? `${keyParts[0]} ${keyParts[1]}` : trimmedKey;
+
+  // Validate match pattern contains only safe characters for shell interpolation
+  if (!/^[A-Za-z0-9+/= @._-]+$/.test(matchPattern)) {
+    throw new Error("Public key contains unexpected characters");
+  }
 
   // Create .ssh dir with correct permissions
   const mkdirResult = await execRemoteCommand(

@@ -7,7 +7,6 @@ import type { SshConnection } from "../../src/services/ssh/contracts";
 vi.mock("node:fs/promises", () => ({
   readdir: vi.fn(),
   mkdir: vi.fn(),
-  readFile: vi.fn(),
 }));
 
 // Mock child_process
@@ -229,5 +228,28 @@ describe("deployPublicKeyToRemote", () => {
 
     await expect(deployPublicKeyToRemote(conn, "ssh-ed25519 AAAA comment"))
       .rejects.toThrow();
+  });
+
+  it("throws when append fails", async () => {
+    const conn = mockConnection([
+      { stdout: "", exitCode: 0 },  // mkdir
+      { stdout: "", exitCode: 1 },  // grep (not found)
+      { stdout: "", stderr: "disk full", exitCode: 1 },  // append
+    ]);
+
+    await expect(deployPublicKeyToRemote(conn, "ssh-ed25519 AAAA comment"))
+      .rejects.toThrow("Failed to deploy key");
+  });
+
+  it("throws on empty public key content", async () => {
+    const conn = mockConnection([]);
+    await expect(deployPublicKeyToRemote(conn, "")).rejects.toThrow("Public key content is empty");
+    await expect(deployPublicKeyToRemote(conn, "   ")).rejects.toThrow("Public key content is empty");
+  });
+
+  it("throws on key with unexpected characters", async () => {
+    const conn = mockConnection([]);
+    await expect(deployPublicKeyToRemote(conn, "ssh-ed25519 AAAA'; rm -rf /"))
+      .rejects.toThrow("unexpected characters");
   });
 });

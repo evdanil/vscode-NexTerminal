@@ -530,7 +530,12 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             title: "Key Name",
             prompt: `${defaultName} already exists. Enter a name for the new key`,
             value: "id_ed25519_nexus",
-            validateInput: (v) => (v.trim() ? null : "Name cannot be empty"),
+            validateInput: (v) => {
+              const trimmed = v.trim();
+              if (!trimmed) return "Name cannot be empty";
+              if (/[/\\]/.test(trimmed)) return "Name cannot contain path separators";
+              return null;
+            },
           });
           if (!custom) return;
           keyName = custom.trim();
