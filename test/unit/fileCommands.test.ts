@@ -145,8 +145,8 @@ describe("fileCommands title bar actions", () => {
   it("upload falls back to active root directory when no tree item is passed", async () => {
     const ctx = createContext();
     mockShowOpenDialog.mockResolvedValue([
-      { fsPath: "C:\\tmp\\a.txt" },
-      { fsPath: "C:\\tmp\\b.txt" }
+      { fsPath: "/tmp/a.txt" },
+      { fsPath: "/tmp/b.txt" }
     ]);
     registerFileCommands(ctx);
 
@@ -154,8 +154,8 @@ describe("fileCommands title bar actions", () => {
     expect(upload).toBeDefined();
     await upload!(undefined);
 
-    expect(ctx.sftpService.upload).toHaveBeenCalledWith("srv-1", "C:\\tmp\\a.txt", "/home/a.txt");
-    expect(ctx.sftpService.upload).toHaveBeenCalledWith("srv-1", "C:\\tmp\\b.txt", "/home/b.txt");
+    expect(ctx.sftpService.upload).toHaveBeenCalledWith("srv-1", "/tmp/a.txt", "/home/a.txt");
+    expect(ctx.sftpService.upload).toHaveBeenCalledWith("srv-1", "/tmp/b.txt", "/home/b.txt");
     expect(ctx.sftpService.invalidateCache).toHaveBeenCalledWith("srv-1", "/home");
     expect(ctx.fileExplorerProvider.refresh).toHaveBeenCalled();
   });
@@ -173,7 +173,7 @@ describe("fileCommands title bar actions", () => {
 
   it("upload surfaces SFTP errors to the user", async () => {
     const ctx = createContext({ uploadReject: new Error("upload blocked") });
-    mockShowOpenDialog.mockResolvedValue([{ fsPath: "C:\\tmp\\a.txt" }]);
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/tmp/a.txt" }]);
     registerFileCommands(ctx);
 
     const upload = registeredCommands.get("nexus.files.upload");
