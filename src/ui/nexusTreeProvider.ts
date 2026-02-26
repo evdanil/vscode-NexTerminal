@@ -6,8 +6,12 @@ import { toParityCode } from "../utils/helpers";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
 
 export class FolderTreeItem extends vscode.TreeItem {
-  public constructor(public readonly folderPath: string, displayName: string) {
-    super(displayName, vscode.TreeItemCollapsibleState.Expanded);
+  public constructor(
+    public readonly folderPath: string,
+    displayName: string,
+    collapsibleState: vscode.TreeItemCollapsibleState = vscode.TreeItemCollapsibleState.Expanded
+  ) {
+    super(displayName, collapsibleState);
     this.contextValue = "nexus.folder";
     this.id = `folder:${folderPath}`;
     this.tooltip = folderPath;
@@ -95,6 +99,7 @@ export class NexusTreeProvider
   implements vscode.TreeDataProvider<NexusTreeItem>, vscode.TreeDragAndDropController<NexusTreeItem>
 {
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<NexusTreeItem | undefined>();
+  private readonly collapsedFolders = new Set<string>();
   private snapshot: SessionSnapshot = {
     servers: [],
     tunnels: [],
@@ -119,6 +124,25 @@ export class NexusTreeProvider
   public setSnapshot(snapshot: SessionSnapshot): void {
     this.snapshot = snapshot;
     this.refresh();
+  }
+
+  public collapseFolder(path: string): void {
+    this.collapsedFolders.add(path);
+  }
+
+  public expandFolder(path: string): void {
+    this.collapsedFolders.delete(path);
+  }
+
+  public getCollapsedFolders(): string[] {
+    return [...this.collapsedFolders];
+  }
+
+  public loadCollapsedFolders(paths: string[]): void {
+    this.collapsedFolders.clear();
+    for (const p of paths) {
+      this.collapsedFolders.add(p);
+    }
   }
 
   public refresh(): void {
@@ -303,7 +327,13 @@ export class NexusTreeProvider
 
     const folderItems = [...childFolderNames]
       .sort((a, b) => a.localeCompare(b))
-      .map((p) => new FolderTreeItem(p, folderDisplayName(p)));
+      .map((p) => new FolderTreeItem(
+        p,
+        folderDisplayName(p),
+        this.collapsedFolders.has(p)
+          ? vscode.TreeItemCollapsibleState.Collapsed
+          : vscode.TreeItemCollapsibleState.Expanded
+      ));
 
     return [...folderItems, ...directServers, ...directSerialProfiles];
   }

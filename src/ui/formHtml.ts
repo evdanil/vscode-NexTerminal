@@ -182,9 +182,11 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           for (var ii = 0; ii < inputs.length; ii++) {
             if (visible) {
               if (inputs[ii].dataset.wasRequired === "true") inputs[ii].required = true;
+              inputs[ii].disabled = false;
             } else {
               inputs[ii].dataset.wasRequired = inputs[ii].required ? "true" : "false";
               inputs[ii].required = false;
+              inputs[ii].disabled = true;
             }
           }
         }

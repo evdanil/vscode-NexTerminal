@@ -332,6 +332,20 @@ describe("renderFormHtml", () => {
     expect(html).toContain("JSON.parse");
   });
 
+  it("updateVisibility disables hidden inputs to prevent constraint validation", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        { type: "text", key: "x", label: "X", visibleWhen: { field: "y", value: "z" } }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    // When hiding, must set disabled = true so min/max constraints don't block submission
+    expect(html).toContain("inputs[ii].disabled = true");
+    // When showing, must re-enable
+    expect(html).toContain("inputs[ii].disabled = false");
+  });
+
   it("guards visibleWhen JSON parsing to avoid script breakage", () => {
     const definition: FormDefinition = {
       title: "Test",

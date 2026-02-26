@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { NexusTreeProvider, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
+import { FolderTreeItem, NexusTreeProvider, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
 
@@ -162,5 +162,87 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
     await provider.handleDrop(target, makeTransfer({ "text/plain": "unknown" }) as any);
 
     expect(onTunnelDropped).not.toHaveBeenCalled();
+  });
+});
+
+describe("NexusTreeProvider folder collapse state", () => {
+  const callbacks = {
+    onTunnelDropped: vi.fn(async () => {}),
+    onItemGroupChanged: vi.fn(async () => {}),
+    onFolderMoved: vi.fn(async () => {})
+  };
+
+  function makeProvider(): NexusTreeProvider {
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      servers: [
+        makeServer({ id: "s1", name: "A", group: "Production" }),
+        makeServer({ id: "s2", name: "B", group: "Staging" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      activeSessions: [],
+      activeSerialSessions: [],
+      activeTunnels: [],
+      remoteTunnels: [],
+      explicitGroups: []
+    });
+    return provider;
+  }
+
+  it("creates FolderTreeItem with Expanded state by default", () => {
+    const provider = makeProvider();
+    const children = provider.getChildren(undefined) as FolderTreeItem[];
+    const folder = children.find((c) => c instanceof FolderTreeItem);
+    expect(folder).toBeDefined();
+    // TreeItemCollapsibleState.Expanded = 2
+    expect(folder!.collapsibleState).toBe(2);
+  });
+
+  it("creates FolderTreeItem with Collapsed state after collapseFolder", () => {
+    const provider = makeProvider();
+    provider.collapseFolder("Production");
+    const children = provider.getChildren(undefined) as FolderTreeItem[];
+    const prod = children.find((c) => c instanceof FolderTreeItem && c.folderPath === "Production");
+    const staging = children.find((c) => c instanceof FolderTreeItem && c.folderPath === "Staging");
+    // TreeItemCollapsibleState.Collapsed = 1
+    expect(prod!.collapsibleState).toBe(1);
+    // Staging should still be expanded
+    expect(staging!.collapsibleState).toBe(2);
+  });
+
+  it("expandFolder restores Expanded state", () => {
+    const provider = makeProvider();
+    provider.collapseFolder("Production");
+    provider.expandFolder("Production");
+    const children = provider.getChildren(undefined) as FolderTreeItem[];
+    const prod = children.find((c) => c instanceof FolderTreeItem && c.folderPath === "Production");
+    expect(prod!.collapsibleState).toBe(2);
+  });
+
+  it("getCollapsedFolders returns current collapsed paths", () => {
+    const provider = makeProvider();
+    expect(provider.getCollapsedFolders()).toEqual([]);
+    provider.collapseFolder("Production");
+    provider.collapseFolder("Staging");
+    expect(provider.getCollapsedFolders().sort()).toEqual(["Production", "Staging"]);
+  });
+
+  it("loadCollapsedFolders restores collapsed state", () => {
+    const provider = makeProvider();
+    provider.loadCollapsedFolders(["Production"]);
+    const children = provider.getChildren(undefined) as FolderTreeItem[];
+    const prod = children.find((c) => c instanceof FolderTreeItem && c.folderPath === "Production");
+    const staging = children.find((c) => c instanceof FolderTreeItem && c.folderPath === "Staging");
+    expect(prod!.collapsibleState).toBe(1);
+    expect(staging!.collapsibleState).toBe(2);
+    expect(provider.getCollapsedFolders()).toEqual(["Production"]);
+  });
+
+  it("loadCollapsedFolders replaces previous state", () => {
+    const provider = makeProvider();
+    provider.collapseFolder("Production");
+    provider.loadCollapsedFolders(["Staging"]);
+    expect(provider.getCollapsedFolders()).toEqual(["Staging"]);
   });
 });

@@ -11,7 +11,7 @@ export class WebviewFormPanel {
   private constructor(
     private readonly formId: string,
     definition: FormDefinition,
-    private readonly onSubmit: (values: FormValues) => void,
+    private readonly onSubmit: (values: FormValues) => void | Promise<void>,
     private readonly onCancel: () => void,
     private readonly onBrowse?: (key: string) => Promise<string | undefined>,
     private readonly onScan?: (key: string) => Promise<string | undefined>,
@@ -29,7 +29,7 @@ export class WebviewFormPanel {
 
     this.panel.webview.onDidReceiveMessage(async (message: FormMessage) => {
       if (message.type === "submit") {
-        this.onSubmit(message.values);
+        await Promise.resolve(this.onSubmit(message.values));
         this.dispose();
         return;
       }
@@ -65,7 +65,7 @@ export class WebviewFormPanel {
     formId: string,
     definition: FormDefinition,
     options: {
-      onSubmit: (values: FormValues) => void;
+      onSubmit: (values: FormValues) => void | Promise<void>;
       onCancel?: () => void;
       onBrowse?: (key: string) => Promise<string | undefined>;
       onScan?: (key: string) => Promise<string | undefined>;

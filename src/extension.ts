@@ -23,7 +23,7 @@ import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { VscodeTunnelRegistryStore } from "./storage/vscodeTunnelRegistryStore";
 import { TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
-import { NexusTreeProvider } from "./ui/nexusTreeProvider";
+import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
 import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
 import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
@@ -254,10 +254,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
   const settingsTreeProvider = new SettingsTreeProvider();
+  const savedCollapsed = context.globalState.get<string[]>("nexus.ui.collapsedFolders", []);
+  nexusTreeProvider.loadCollapsedFolders(savedCollapsed);
+
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
     treeDataProvider: nexusTreeProvider,
     dragAndDropController: nexusTreeProvider,
     showCollapseAll: true
+  });
+  const collapseListener = commandCenterView.onDidCollapseElement((e) => {
+    if (e.element instanceof FolderTreeItem) {
+      nexusTreeProvider.collapseFolder(e.element.folderPath);
+      context.globalState.update("nexus.ui.collapsedFolders", nexusTreeProvider.getCollapsedFolders());
+    }
+  });
+  const expandListener = commandCenterView.onDidExpandElement((e) => {
+    if (e.element instanceof FolderTreeItem) {
+      nexusTreeProvider.expandFolder(e.element.folderPath);
+      context.globalState.update("nexus.ui.collapsedFolders", nexusTreeProvider.getCollapsedFolders());
+    }
   });
   const tunnelView = vscode.window.createTreeView("nexusTunnels", {
     treeDataProvider: tunnelTreeProvider,
@@ -437,6 +452,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(
     commandCenterView,
+    collapseListener,
+    expandListener,
     tunnelView,
     settingsView,
     settingsTreeProvider,
