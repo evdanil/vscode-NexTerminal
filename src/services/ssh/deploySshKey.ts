@@ -13,12 +13,8 @@ export interface KeyPairInfo {
   publicKeyPath: string;
 }
 
+// Ordered by preference: ed25519 first. Iteration order = sort order.
 const KEY_PREFIXES = ["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"];
-
-function keySortOrder(name: string): number {
-  const idx = KEY_PREFIXES.indexOf(name);
-  return idx >= 0 ? idx : KEY_PREFIXES.length;
-}
 
 export function defaultSshDir(): string {
   return path.join(os.homedir(), ".ssh");
@@ -46,6 +42,29 @@ export async function findLocalKeyPairs(sshDir: string): Promise<KeyPairInfo[]> 
     }
   }
 
-  pairs.sort((a, b) => keySortOrder(a.name) - keySortOrder(b.name));
   return pairs;
+}
+
+export interface GenerateKeyPairOptions {
+  sshDir: string;
+  name: string;
+  passphrase: string;
+}
+
+function findSshKeygen(): string {
+  if (process.platform === "win32") {
+    return "C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe";
+  }
+  return "ssh-keygen";
+}
+
+export async function generateKeyPair(options: GenerateKeyPairOptions): Promise<{ publicKeyPath: string }> {
+  await mkdir(options.sshDir, { recursive: true, mode: 0o700 });
+
+  const keyPath = path.join(options.sshDir, options.name);
+  const args = ["-t", "ed25519", "-f", keyPath, "-N", options.passphrase, "-C", "nexus-terminal"];
+
+  await execFile(findSshKeygen(), args);
+
+  return { publicKeyPath: `${keyPath}.pub` };
 }
