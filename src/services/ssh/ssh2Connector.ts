@@ -129,7 +129,7 @@ class Ssh2Connection implements SshConnection {
   }
 }
 
-async function toConnectConfig(server: ServerConfig, password?: string, passphrase?: string): Promise<ConnectConfig> {
+async function toConnectConfig(server: ServerConfig, password?: string, passphrase?: string, sock?: Duplex): Promise<ConnectConfig> {
   const base: ConnectConfig = {
     host: server.host,
     port: server.port,
@@ -137,7 +137,8 @@ async function toConnectConfig(server: ServerConfig, password?: string, passphra
     readyTimeout: 60_000,
     keepaliveInterval: 10_000,
     keepaliveCountMax: 3,
-    tryKeyboard: true
+    tryKeyboard: true,
+    ...(sock && { sock })
   };
 
   if (server.authType === "password") {
@@ -171,9 +172,9 @@ export class Ssh2Connector implements SshConnector {
 
   public async connect(
     server: ServerConfig,
-    auth: { password?: string; passphrase?: string; onKeyboardInteractive?: KeyboardInteractiveHandler }
+    auth: { password?: string; passphrase?: string; sock?: Duplex; onKeyboardInteractive?: KeyboardInteractiveHandler }
   ): Promise<SshConnection> {
-    const config = await toConnectConfig(server, auth.password, auth.passphrase);
+    const config = await toConnectConfig(server, auth.password, auth.passphrase, auth.sock);
     if (this.hostKeyVerifier) {
       config.hostVerifier = (hostKey: Buffer | string, verify: VerifyCallback): void => {
         const rawHostKey = Buffer.isBuffer(hostKey) ? hostKey : Buffer.from(hostKey, "hex");

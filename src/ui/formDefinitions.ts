@@ -1,6 +1,6 @@
-import type { SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
+import type { SerialProfile, ServerConfig, TunnelProfile, TunnelType, ProxyConfig } from "../models/config";
 import { resolveTunnelType } from "../models/config";
-import type { FormDefinition, FormFieldDescriptor, VisibleWhen } from "./formTypes";
+import type { FormDefinition, FormFieldDescriptor, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
 
 function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDescriptor[] {
@@ -105,10 +105,90 @@ function sharedTrailingFields(
   ];
 }
 
+export interface ServerListEntry {
+  id: string;
+  name: string;
+}
+
+function resolveProxyType(proxy?: ProxyConfig): string {
+  if (!proxy) return "none";
+  return proxy.type;
+}
+
+function proxyFields(
+  seed?: Partial<ServerConfig>,
+  servers?: ServerListEntry[],
+  vw?: VisibleWhen
+): FormFieldDescriptor[] {
+  const proxy = seed?.proxy;
+  const proxyType = resolveProxyType(proxy);
+
+  const sshJumpVw: VisibleWhenCondition = { field: "proxyType", value: "ssh" };
+  const socks5Vw: VisibleWhenCondition = { field: "proxyType", value: "socks5" };
+  const httpVw: VisibleWhenCondition = { field: "proxyType", value: "http" };
+
+  // When inside the unified form, compound the proxy visibility with the parent vw
+  const compoundVw = (inner: VisibleWhenCondition): VisibleWhen => {
+    if (!vw) return inner;
+    const conditions = Array.isArray(vw) ? vw : [vw];
+    return [...conditions, inner];
+  };
+
+  // Server options for jump host picker (exclude self to prevent circular ref)
+  const serverOptions = [
+    { label: "(Select jump host)", value: "" },
+    ...(servers ?? [])
+      .filter((s) => s.id !== seed?.id)
+      .map((s) => ({ label: s.name, value: s.id }))
+  ];
+
+  const jumpHostId = proxy?.type === "ssh" ? proxy.jumpHostId : "";
+  const socks5Host = proxy?.type === "socks5" ? proxy.host : "";
+  const socks5Port = proxy?.type === "socks5" ? proxy.port : 1080;
+  const socks5Username = proxy?.type === "socks5" ? (proxy.username ?? "") : "";
+  const httpHost = proxy?.type === "http" ? proxy.host : "";
+  const httpPort = proxy?.type === "http" ? proxy.port : 3128;
+  const httpUsername = proxy?.type === "http" ? (proxy.username ?? "") : "";
+
+  return [
+    {
+      type: "select",
+      key: "proxyType",
+      label: "Proxy",
+      options: [
+        { label: "None (direct connection)", value: "none" },
+        { label: "SSH Jump Host", value: "ssh" },
+        { label: "SOCKS5 Proxy", value: "socks5" },
+        { label: "HTTP CONNECT Proxy", value: "http" }
+      ],
+      value: proxyType,
+      visibleWhen: vw
+    },
+    // SSH Jump Host fields
+    {
+      type: "select",
+      key: "proxyJumpHostId",
+      label: "Jump Host Server",
+      options: serverOptions,
+      value: jumpHostId,
+      visibleWhen: compoundVw(sshJumpVw)
+    },
+    // SOCKS5 fields
+    { type: "text", key: "proxySocks5Host", label: "SOCKS5 Proxy Host", required: true, placeholder: "proxy.example.com", value: socks5Host, visibleWhen: compoundVw(socks5Vw) },
+    { type: "number", key: "proxySocks5Port", label: "SOCKS5 Proxy Port", required: true, min: 1, max: 65535, value: socks5Port, visibleWhen: compoundVw(socks5Vw) },
+    { type: "text", key: "proxySocks5Username", label: "SOCKS5 Username", placeholder: "Optional", value: socks5Username, visibleWhen: compoundVw(socks5Vw) },
+    // HTTP CONNECT fields
+    { type: "text", key: "proxyHttpHost", label: "HTTP Proxy Host", required: true, placeholder: "proxy.example.com", value: httpHost, visibleWhen: compoundVw(httpVw) },
+    { type: "number", key: "proxyHttpPort", label: "HTTP Proxy Port", required: true, min: 1, max: 65535, value: httpPort, visibleWhen: compoundVw(httpVw) },
+    { type: "text", key: "proxyHttpUsername", label: "HTTP Proxy Username", placeholder: "Optional", value: httpUsername, visibleWhen: compoundVw(httpVw) }
+  ];
+}
+
 export function serverFormDefinition(
   seed?: Partial<ServerConfig>,
   existingGroups?: string[],
-  defaultLogSession = true
+  defaultLogSession = true,
+  servers?: ServerListEntry[]
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
 
@@ -117,6 +197,7 @@ export function serverFormDefinition(
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
       ...sshFields(seed),
+      ...proxyFields(seed, servers),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ]
   };
@@ -230,10 +311,11 @@ export interface UnifiedProfileSeed {
 export function unifiedProfileFormDefinition(
   seed?: UnifiedProfileSeed,
   existingGroups?: string[],
-  defaultLogSession = true
+  defaultLogSession = true,
+  servers?: ServerListEntry[]
 ): FormDefinition {
-  const sshVw = { field: "profileType", value: "ssh" };
-  const serialVw = { field: "profileType", value: "serial" };
+  const sshVw: VisibleWhenCondition = { field: "profileType", value: "ssh" };
+  const serialVw: VisibleWhenCondition = { field: "profileType", value: "serial" };
 
   return {
     title: "Add Profile",
@@ -250,6 +332,7 @@ export function unifiedProfileFormDefinition(
       },
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server or Arduino" },
       ...sshFields(undefined, sshVw),
+      ...proxyFields(undefined, servers, sshVw),
       ...serialFields(undefined, serialVw),
       ...sharedTrailingFields({ group: seed?.group }, existingGroups, defaultLogSession)
     ]

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as vscode from "vscode";
-import type { AuthType, ServerConfig } from "../models/config";
+import type { AuthType, ProxyConfig, ServerConfig } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { serverFormDefinition } from "../ui/formDefinitions";
@@ -112,6 +112,39 @@ function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
 }
 
+export function formValuesToProxy(values: FormValues): ProxyConfig | undefined {
+  const proxyType = typeof values.proxyType === "string" ? values.proxyType : "none";
+  if (proxyType === "none") return undefined;
+
+  if (proxyType === "ssh") {
+    const jumpHostId = typeof values.proxyJumpHostId === "string" ? values.proxyJumpHostId : "";
+    if (!jumpHostId) return undefined;
+    return { type: "ssh", jumpHostId };
+  }
+
+  if (proxyType === "socks5") {
+    const host = typeof values.proxySocks5Host === "string" ? values.proxySocks5Host.trim() : "";
+    const port = typeof values.proxySocks5Port === "number" ? values.proxySocks5Port : 1080;
+    if (!host) return undefined;
+    const username = typeof values.proxySocks5Username === "string" && values.proxySocks5Username.trim()
+      ? values.proxySocks5Username.trim()
+      : undefined;
+    return { type: "socks5", host, port, username };
+  }
+
+  if (proxyType === "http") {
+    const host = typeof values.proxyHttpHost === "string" ? values.proxyHttpHost.trim() : "";
+    const port = typeof values.proxyHttpPort === "number" ? values.proxyHttpPort : 3128;
+    if (!host) return undefined;
+    const username = typeof values.proxyHttpUsername === "string" && values.proxyHttpUsername.trim()
+      ? values.proxyHttpUsername.trim()
+      : undefined;
+    return { type: "http", host, port, username };
+  }
+
+  return undefined;
+}
+
 export function formValuesToServer(values: FormValues, existingId?: string, preserveIsHidden = false): ServerConfig | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const host = typeof values.host === "string" ? values.host.trim() : "";
@@ -130,7 +163,8 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     group: typeof values.group === "string" && values.group ? values.group : undefined,
     isHidden: preserveIsHidden,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
-    multiplexing: typeof values.multiplexing === "boolean" ? values.multiplexing : undefined
+    multiplexing: typeof values.multiplexing === "boolean" ? values.multiplexing : undefined,
+    proxy: formValuesToProxy(values)
   };
 }
 
@@ -281,7 +315,8 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const existingGroups = collectGroups(ctx);
-      const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled());
+      const serverList = ctx.core.getSnapshot().servers.map((s) => ({ id: s.id, name: s.name }));
+      const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList);
       WebviewFormPanel.open("server-edit", definition, {
         onSubmit: async (values) => {
           const updated = formValuesToServer(values, existing.id, existing.isHidden);

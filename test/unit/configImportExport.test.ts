@@ -1014,6 +1014,44 @@ describe("sanitizeForSharing", () => {
     const result = sanitizeForSharing(servers, tunnels, [], {});
     expect(result.tunnels[0].defaultServerId).toBeUndefined();
   });
+
+  it("remaps jump host IDs in proxy config", () => {
+    const jumpServer = makeServer({ id: "jump-1", name: "Jump" });
+    const targetServer = makeServer({
+      id: "target-1",
+      name: "Target",
+      proxy: { type: "ssh", jumpHostId: "jump-1" }
+    });
+    const result = sanitizeForSharing([jumpServer, targetServer], [], [], {});
+
+    const newJump = result.servers.find((s) => s.name === "Jump")!;
+    const newTarget = result.servers.find((s) => s.name === "Target")!;
+    expect(newTarget.proxy).toBeDefined();
+    expect(newTarget.proxy!.type).toBe("ssh");
+    if (newTarget.proxy!.type === "ssh") {
+      expect(newTarget.proxy!.jumpHostId).toBe(newJump.id);
+    }
+  });
+
+  it("strips proxy username from SOCKS5 and HTTP configs", () => {
+    const server = makeServer({
+      proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "user1" }
+    });
+    const result = sanitizeForSharing([server], [], [], {});
+    const sanitized = result.servers[0];
+    expect(sanitized.proxy).toBeDefined();
+    if (sanitized.proxy?.type === "socks5") {
+      expect(sanitized.proxy.username).toBeUndefined();
+    }
+  });
+
+  it("clears proxy when jump host is not in export", () => {
+    const server = makeServer({
+      proxy: { type: "ssh", jumpHostId: "nonexistent" }
+    });
+    const result = sanitizeForSharing([server], [], [], {});
+    expect(result.servers[0].proxy).toBeUndefined();
+  });
 });
 
 describe("complete reset", () => {

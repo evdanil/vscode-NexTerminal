@@ -11,6 +11,7 @@ import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
 import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFileSystemProvider";
 import { SftpService } from "./services/sftp/sftpService";
 import { SilentAuthSshFactory } from "./services/ssh/silentAuth";
+import { ProxySshFactory } from "./services/ssh/proxySshFactory";
 import { SshConnectionPool } from "./services/ssh/sshConnectionPool";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
@@ -152,8 +153,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         })
       )
   );
+  const proxiedFactory = new ProxySshFactory(
+    sshFactory,
+    (id) => core.getServer(id),
+    secretVault
+  );
   const multiplexingConfig = vscode.workspace.getConfiguration("nexus.ssh.multiplexing");
-  const pool = new SshConnectionPool(sshFactory, {
+  const pool = new SshConnectionPool(proxiedFactory, {
     enabled: multiplexingConfig.get<boolean>("enabled", true),
     idleTimeoutMs: Math.min(
       multiplexingConfig.get<number>("idleTimeout", 300) * 1000,
@@ -325,7 +331,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         prev.username !== server.username ||
         prev.authType !== server.authType ||
         prev.keyPath !== server.keyPath ||
-        prev.multiplexing !== server.multiplexing
+        prev.multiplexing !== server.multiplexing ||
+        JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)
       )) {
         pool.disconnect(server.id);
       }

@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
-import type { ActiveSerialSession, ActiveSession, SerialProfile, ServerConfig } from "../models/config";
+import type { ActiveSerialSession, ActiveSession, ProxyConfig, SerialProfile, ServerConfig } from "../models/config";
 import { getAncestorPaths, folderDisplayName, isDescendantOrSelf } from "../utils/folderPaths";
 import { toParityCode } from "../utils/helpers";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
@@ -20,11 +20,26 @@ export const GroupTreeItem = FolderTreeItem;
 /** @deprecated Use FolderTreeItem instead */
 export type GroupTreeItem = FolderTreeItem;
 
+function proxyTooltipSuffix(proxy?: ProxyConfig, serverLookup?: (id: string) => ServerConfig | undefined): string {
+  if (!proxy) return "";
+  if (proxy.type === "ssh") {
+    const jumpName = serverLookup?.(proxy.jumpHostId)?.name ?? proxy.jumpHostId;
+    return ` (via jump host "${jumpName}")`;
+  }
+  if (proxy.type === "socks5") return ` (via SOCKS5 ${proxy.host}:${proxy.port})`;
+  if (proxy.type === "http") return ` (via HTTP proxy ${proxy.host}:${proxy.port})`;
+  return "";
+}
+
 export class ServerTreeItem extends vscode.TreeItem {
-  public constructor(public readonly server: ServerConfig, connected: boolean) {
+  public constructor(
+    public readonly server: ServerConfig,
+    connected: boolean,
+    serverLookup?: (id: string) => ServerConfig | undefined
+  ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}:${connected ? "on" : "off"}`;
-    this.tooltip = `${server.username}@${server.host}:${server.port}`;
+    this.tooltip = `${server.username}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}`;
     this.description = `${server.username}@${server.host}`;
     this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
     this.iconPath = new vscode.ThemeIcon(
@@ -295,7 +310,8 @@ export class NexusTreeProvider
 
   private toServerItem(server: ServerConfig): ServerTreeItem {
     const connected = this.snapshot.activeSessions.some((session) => session.serverId === server.id);
-    return new ServerTreeItem(server, connected);
+    const lookup = (id: string): ServerConfig | undefined => this.snapshot.servers.find((s) => s.id === id);
+    return new ServerTreeItem(server, connected, lookup);
   }
 
   private toSerialProfileItem(profile: SerialProfile): SerialProfileTreeItem {

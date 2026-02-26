@@ -5,6 +5,30 @@ export type TunnelType = "local" | "reverse" | "dynamic";
 export type SerialParity = "none" | "even" | "odd" | "mark" | "space";
 export type SerialDataBits = 5 | 6 | 7 | 8;
 export type SerialStopBits = 1 | 2;
+export type ProxyType = "ssh" | "socks5" | "http";
+
+export interface SshJumpProxy {
+  type: "ssh";
+  jumpHostId: string;  // references another ServerConfig.id
+}
+
+export interface Socks5Proxy {
+  type: "socks5";
+  host: string;
+  port: number;
+  username?: string;
+  // password stored in SecretStorage: "proxy-password-{serverId}"
+}
+
+export interface HttpConnectProxy {
+  type: "http";
+  host: string;
+  port: number;
+  username?: string;
+  // password stored in SecretStorage: "proxy-password-{serverId}"
+}
+
+export type ProxyConfig = SshJumpProxy | Socks5Proxy | HttpConnectProxy;
 
 export interface ServerConfig {
   id: string;
@@ -18,6 +42,7 @@ export interface ServerConfig {
   isHidden: boolean;
   logSession?: boolean;
   multiplexing?: boolean;  // undefined = follow global, false = always standalone
+  proxy?: ProxyConfig;
 }
 
 export interface TunnelProfile {

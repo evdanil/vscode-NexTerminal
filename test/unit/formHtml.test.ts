@@ -240,4 +240,81 @@ describe("renderFormHtml", () => {
     const html = renderFormHtml(definition);
     expect(html).toContain("updateVisibility");
   });
+
+  it("renders compound visibleWhen with comma-separated fields and values", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "text",
+          key: "proxyHost",
+          label: "Proxy Host",
+          visibleWhen: [
+            { field: "profileType", value: "ssh" },
+            { field: "proxyType", value: "socks5" }
+          ]
+        }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain('data-visible-when-field="profileType,proxyType"');
+    expect(html).toContain('data-visible-when-value="ssh,socks5"');
+  });
+
+  it("renders single visibleWhen condition as before (backward compatible)", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "text",
+          key: "host",
+          label: "Host",
+          visibleWhen: { field: "type", value: "ssh" }
+        }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain('data-visible-when-field="type"');
+    expect(html).toContain('data-visible-when-value="ssh"');
+  });
+
+  it("JS updateVisibility splits comma-separated fields for compound conditions", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "profileType",
+          label: "Profile",
+          options: [
+            { label: "SSH", value: "ssh" },
+            { label: "Serial", value: "serial" }
+          ],
+          value: "ssh"
+        },
+        {
+          type: "select",
+          key: "proxyType",
+          label: "Proxy",
+          options: [
+            { label: "None", value: "none" },
+            { label: "SOCKS5", value: "socks5" }
+          ],
+          value: "none"
+        },
+        {
+          type: "text",
+          key: "proxyHost",
+          label: "Proxy Host",
+          visibleWhen: [
+            { field: "profileType", value: "ssh" },
+            { field: "proxyType", value: "socks5" }
+          ]
+        }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    // The JS should split on comma to handle multiple fields
+    expect(html).toContain("split(\",\")");
+  });
 });

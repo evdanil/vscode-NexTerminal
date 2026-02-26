@@ -14,7 +14,10 @@ function visibleWhenAttrs(field: FormFieldDescriptor): string {
   if (!field.visibleWhen) {
     return "";
   }
-  return ` data-visible-when-field="${escapeHtml(field.visibleWhen.field)}" data-visible-when-value="${escapeHtml(field.visibleWhen.value)}"`;
+  const conditions = Array.isArray(field.visibleWhen) ? field.visibleWhen : [field.visibleWhen];
+  const fields = conditions.map((c) => escapeHtml(c.field)).join(",");
+  const values = conditions.map((c) => escapeHtml(c.value)).join(",");
+  return ` data-visible-when-field="${fields}" data-visible-when-value="${values}"`;
 }
 
 function renderField(field: FormFieldDescriptor): string {
@@ -148,11 +151,16 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         var groups = document.querySelectorAll("[data-visible-when-field]");
         for (var gi = 0; gi < groups.length; gi++) {
           var group = groups[gi];
-          var watchedField = group.dataset.visibleWhenField;
-          var watchedValue = group.dataset.visibleWhenValue;
-          var control = form.elements[watchedField];
-          if (!control) continue;
-          var visible = control.value === watchedValue;
+          var fieldList = group.dataset.visibleWhenField.split(",");
+          var valueList = group.dataset.visibleWhenValue.split(",");
+          var visible = true;
+          for (var ci = 0; ci < fieldList.length; ci++) {
+            var control = form.elements[fieldList[ci]];
+            if (!control || control.value !== valueList[ci]) {
+              visible = false;
+              break;
+            }
+          }
           group.classList.toggle("field-visible", visible);
           var inputs = group.querySelectorAll("input, select, textarea");
           for (var ii = 0; ii < inputs.length; ii++) {
@@ -169,7 +177,10 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       var watchedFields = {};
       var wfGroups = document.querySelectorAll("[data-visible-when-field]");
       for (var wi = 0; wi < wfGroups.length; wi++) {
-        watchedFields[wfGroups[wi].dataset.visibleWhenField] = true;
+        var fieldNames = wfGroups[wi].dataset.visibleWhenField.split(",");
+        for (var fi = 0; fi < fieldNames.length; fi++) {
+          watchedFields[fieldNames[fi]] = true;
+        }
       }
       for (var fieldName in watchedFields) {
         var ctrl = form.elements[fieldName];

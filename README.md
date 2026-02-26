@@ -2,21 +2,34 @@
 
 Unified SSH, Serial, and Port Forwarding hub for VS Code.
 
-Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with SSH connection multiplexing, a settings panel, macro editor, session logging, drag-and-drop organization, and configuration import/export.
+Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support, SFTP file explorer, connection multiplexing, terminal macros, regex highlighting, color schemes, and configuration import/export.
 
 ## Features
 
-- **SSH Terminal Sessions** — Connect to remote servers with password, key, or SSH agent authentication. Supports two-factor authentication (keyboard-interactive) — passwords auto-fill while verification codes are prompted separately. Credentials are cached securely via VS Code SecretStorage with silent re-auth.
-- **Serial Terminal Sessions** — Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, parity, and stop bits. Runs in an isolated sidecar process for crash safety.
-- **Port Forwarding (TCP Tunnels)** — Three tunnel modes: **Local (-L)** forwards local ports to remote hosts, **Reverse (-R)** forwards remote ports back to local targets, and **Dynamic (-D)** provides a local SOCKS5 proxy through SSH. Shared mode (default) uses a single SSH connection for all clients; isolated mode creates a separate connection per client.
-- **SSH Connection Multiplexing** — Share SSH connections across terminals, tunnels, and SFTP for the same server. Reduces connection overhead with automatic ref-counting and configurable idle timeout. Per-server toggle lets you disable multiplexing for devices that don't support multiple channels (e.g. Cisco). When multiplexing is enabled, automatic fallback to standalone connections handles channel failures transparently.
-- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized into folders with nesting support. Drag and drop to rearrange or assign tunnels to servers.
-- **Settings Panel** — View and edit extension settings in a dedicated webview panel. Declarative metadata drives the UI with auto-save, search, and grouped categories.
-- **Session Transcript Logging** — Automatically log clean terminal output (ANSI codes stripped) to files with configurable rotation.
-- **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH and serial terminal output. Detects errors, warnings, IP addresses, UUIDs, URLs and more with inline ANSI colouring while respecting existing remote colours.
-- **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign any macro a custom keybinding from 108 supported combinations across three modifier groups: `Alt`, `Alt+Shift`, and `Ctrl+Shift` with A-Z or 0-9 keys (e.g., `Alt+M`, `Alt+Shift+5`, `Ctrl+Shift+A`). Unassigned keybindings fall through to normal VS Code behavior. Macros without a keybinding can still be invoked via `Alt+S`, which opens a quick-pick list of all macros. Includes a Macro Editor webview panel with multiline editing, secret macro support, and inline keybinding assignment. Legacy `slot` (0-9) assignments are auto-migrated to the new keybinding system on first load.
-- **Configuration Export/Import** — Back up and restore all profiles and settings as a single JSON file.
-- **Web Extension Fallback** — Graceful degradation in browser-based VS Code (SSH/serial require desktop runtime).
+- **SSH Terminal Sessions** — Connect to remote servers with password, private key, or SSH agent authentication. Two-factor authentication (keyboard-interactive) is fully supported — passwords auto-fill while verification codes are prompted separately. Credentials are cached securely via VS Code SecretStorage with silent re-auth.
+- **Proxy Support** — Route SSH connections through intermediaries when direct access isn't available. Three proxy types are supported per server:
+  - **SSH Jump Host** — Select another configured server as a bastion/jump host (ProxyJump equivalent). Supports multi-hop chaining (A → B → C) with full auth reuse.
+  - **SOCKS5 Proxy** — Connect through a SOCKS5 proxy server with optional username/password authentication.
+  - **HTTP CONNECT Proxy** — Connect through an HTTP proxy using the CONNECT method, common in corporate environments.
+- **SFTP File Explorer** — Browse, download, and manage remote files on connected servers. Drag-and-drop support for moving files between directories.
+- **Serial Terminal Sessions** — Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, parity, stop bits, and RTS/CTS flow control. Supports break signal and XON passthrough. Runs in an isolated sidecar process for crash safety.
+- **Port Forwarding (TCP Tunnels)** — Three tunnel modes:
+  - **Local (-L)** — Forward a local port to a remote host through SSH.
+  - **Reverse (-R)** — Forward a remote port back to a local target.
+  - **Dynamic SOCKS5 (-D)** — Run a local SOCKS5 proxy that routes traffic to any destination through SSH.
+
+  All modes support configurable local bind addresses (localhost, LAN, or all interfaces), auto-start/auto-stop with server connections, live traffic counters, and a browser URL shortcut for quick access.
+- **SSH Connection Multiplexing** — Share SSH connections across terminals, tunnels, and SFTP for the same server. Reduces connection overhead with automatic ref-counting and configurable idle timeout. Per-server toggle lets you disable multiplexing for devices that don't support multiple channels (e.g. Cisco). Automatic fallback to standalone connections handles channel failures transparently.
+- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized into nested folders. Drag and drop to rearrange profiles, move between folders, or assign tunnels to servers.
+- **Terminal Appearance** — Customize terminal font family, size, and weight. Import color schemes from MobaXterm INI files or configure custom themes with live preview.
+- **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH and serial terminal output. 16+ built-in rules detect errors, warnings, IP addresses, UUIDs, URLs and more with inline ANSI colouring while respecting existing remote colours.
+- **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign any macro a custom keybinding from 108 combinations across three modifier groups: `Alt`, `Alt+Shift`, and `Ctrl+Shift` with A-Z or 0-9 keys. Macros without a keybinding are accessible via `Alt+S` quick-pick. Includes a Macro Editor panel with multiline editing, secret macro support, and inline keybinding assignment.
+- **Keyboard Passthrough** — Optionally pass `Ctrl+` key combinations (e.g. `Ctrl+B`, `Ctrl+N`) directly to the terminal for applications like vim, nano, and htop. Configurable per-key with 10 supported combinations.
+- **Session Transcript Logging** — Automatically log clean terminal output (ANSI codes stripped) to files with configurable rotation. Per-profile toggle.
+- **Settings Panel** — View and edit all extension settings in a dedicated webview panel with search, grouped categories, and auto-save.
+- **Configuration Export/Import** — Full encrypted backup with master password protection, or sanitized share export (credentials stripped, IDs remapped). Proxy configurations are preserved across backup and restore.
+- **Import from MobaXterm / SecureCRT** — Migrate SSH session profiles directly from MobaXterm INI files or SecureCRT XML exports and session directories. Folder hierarchy is preserved.
+- **Web Extension Fallback** — Graceful degradation in browser-based VS Code (SSH/serial features require desktop runtime).
 
 ## Getting Started
 
@@ -37,7 +50,15 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 
 1. Click `+` in the Connectivity Hub title bar, or run `Nexus: Add Server` from the command palette
 2. Enter host, port, username, and authentication details (password, private key, or SSH agent)
-3. Right-click the server and select **Connect** to open a terminal session
+3. Optionally configure a proxy (SSH jump host, SOCKS5, or HTTP CONNECT) under the Proxy section
+4. Right-click the server and select **Connect** to open a terminal session
+
+### Connect Through a Proxy
+
+If your target server is behind a firewall or bastion host:
+
+1. **SSH Jump Host** — First add the bastion server as a regular server profile, then edit the target server and set its proxy to "SSH Jump Host", selecting the bastion from the dropdown. Multi-hop chains (A → B → C) work automatically.
+2. **SOCKS5 / HTTP CONNECT** — Edit the target server and set its proxy type, entering the proxy host, port, and optional credentials. Proxy passwords are stored securely in VS Code SecretStorage.
 
 ### Add a Serial Device
 
@@ -58,17 +79,25 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 
 You can also drag a tunnel profile onto a server in the Connectivity Hub to start it immediately.
 
+### Browse Remote Files
+
+1. Connect to an SSH server
+2. Open the **File Explorer** section in the Nexus sidebar
+3. Click the server icon to set it as the active SFTP target
+4. Browse, download, or drag files between remote directories
+
 ### Export / Import Configuration
 
-- Run `Nexus: Export Configuration` to save all profiles and settings to a JSON file
-- Run `Nexus: Import Configuration` to restore from a backup (merge or replace)
+- **Encrypted Backup**: Run `Nexus: Export Backup` to create a master-password-protected backup including all profiles, settings, and saved credentials
+- **Share Export**: Run `Nexus: Export Configuration` to create a sanitized export safe for sharing (credentials stripped, IDs remapped)
+- **Import**: Run `Nexus: Import Configuration` to restore from either format (merge or replace)
 
 #### Import from MobaXterm or SecureCRT
 
 Power users migrating from other SSH clients can import their connection profiles directly:
 
 - **MobaXterm**: Run `Nexus: Import from MobaXterm` and select your MobaXterm `.ini` configuration file. SSH sessions are imported with their folder organization preserved.
-- **SecureCRT**: Run `Nexus: Import from SecureCRT` and select either your SecureCRT XML export file (for example `SecureCRTSessions.xml`) or your `Sessions/` directory. SSH sessions are imported with their hierarchy as folder groups.
+- **SecureCRT**: Run `Nexus: Import from SecureCRT` and select either your SecureCRT XML export file or your `Sessions/` directory. SSH sessions are imported with their hierarchy as folder groups.
 
 Both importers extract hostname, port, and username from each SSH session. Non-SSH sessions (RDP, Telnet, etc.) are skipped. Imported servers default to password authentication.
 
@@ -89,17 +118,22 @@ npm run package:vsix
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `nexus.logging.maxFileSizeMb` | `10` | Max log file size before rotation |
-| `nexus.logging.maxRotatedFiles` | `1` | Number of rotated log files to keep |
 | `nexus.logging.sessionTranscripts` | `true` | Enable session transcript logging |
 | `nexus.logging.sessionLogDirectory` | *(extension storage)* | Custom directory for session logs |
+| `nexus.logging.maxFileSizeMb` | `10` | Max log file size before rotation |
+| `nexus.logging.maxRotatedFiles` | `1` | Number of rotated log files to keep |
+| `nexus.ssh.multiplexing.enabled` | `true` | Share SSH connections across terminals, tunnels, and SFTP |
+| `nexus.ssh.multiplexing.idleTimeout` | `300` | Seconds to keep idle multiplexed connection alive |
 | `nexus.tunnel.defaultConnectionMode` | `shared` | `shared` or `isolated` SSH mode for tunnels |
 | `nexus.tunnel.defaultBindAddress` | `127.0.0.1` | Default bind address for reverse tunnels |
 | `nexus.terminal.openLocation` | `panel` | Where to open terminals: `panel` or `editor` tab |
-| `nexus.terminal.macros` | `[]` | Terminal macros with optional `keybinding` (e.g., `alt+m`, `alt+shift+5`, `ctrl+shift+a`) |
-| `nexus.ssh.multiplexing.enabled` | `true` | Share SSH connections across terminals, tunnels, and SFTP |
-| `nexus.ssh.multiplexing.idleTimeout` | `300` | Seconds to keep idle multiplexed connection alive |
+| `nexus.terminal.keyboardPassthrough` | `false` | Pass Ctrl+ key combinations to the terminal |
+| `nexus.terminal.passthroughKeys` | `[b,e,g,j,k,n,o,p,r,w]` | Which Ctrl+ keys to pass through when enabled |
+| `nexus.terminal.macros` | `[]` | Terminal macros with optional `keybinding` (e.g., `alt+m`, `alt+shift+5`) |
 | `nexus.terminal.highlighting.enabled` | `true` | Enable regex-based terminal highlighting |
+| `nexus.sftp.cacheTtlSeconds` | `10` | SFTP directory listing cache TTL |
+| `nexus.sftp.maxCacheEntries` | `500` | Maximum cached SFTP directory listings |
+| `nexus.sftp.autoRefreshInterval` | `10` | Auto-refresh interval for file explorer (seconds) |
 
 ## Documentation
 

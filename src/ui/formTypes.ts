@@ -1,7 +1,9 @@
-export interface VisibleWhen {
+export interface VisibleWhenCondition {
   field: string;
   value: string;
 }
+
+export type VisibleWhen = VisibleWhenCondition | VisibleWhenCondition[];
 
 export type FormFieldDescriptor =
   | { type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean; hint?: string; visibleWhen?: VisibleWhen }

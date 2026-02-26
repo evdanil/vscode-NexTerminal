@@ -1,7 +1,7 @@
 {
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
-  "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar with connection multiplexing, a settings panel, macro editor, and regex-based terminal highlighting.",
+  "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, terminal macros, regex highlighting, and configuration import/export.",
   "version": "2.7.21",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
@@ -15,6 +15,18 @@
   },
   "categories": [
     "Other"
+  ],
+  "keywords": [
+    "ssh",
+    "terminal",
+    "serial",
+    "port forwarding",
+    "tunnel",
+    "sftp",
+    "proxy",
+    "jump host",
+    "bastion",
+    "remote"
   ],
   "main": "./dist/extension.js",
   "browser": "./dist/webExtension.js",
@@ -2448,6 +2460,7 @@
   "dependencies": {
     "fast-xml-parser": "^5.3.7",
     "serialport": "^13.0.0",
+    "socks": "^2.8.7",
     "ssh2": "^1.17.0"
   },
   "devDependencies": {

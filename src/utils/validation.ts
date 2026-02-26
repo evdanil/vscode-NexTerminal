@@ -1,7 +1,24 @@
-import type { ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
+import type { ServerConfig, TunnelProfile, SerialProfile, ProxyConfig } from "../models/config";
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+export function validateProxyConfig(proxy: unknown): proxy is ProxyConfig {
+  if (typeof proxy !== "object" || proxy === null) {
+    return false;
+  }
+  const obj = proxy as Record<string, unknown>;
+  if (obj.type === "ssh") {
+    return isNonEmptyString(obj.jumpHostId);
+  }
+  if (obj.type === "socks5") {
+    return isNonEmptyString(obj.host) && typeof obj.port === "number";
+  }
+  if (obj.type === "http") {
+    return isNonEmptyString(obj.host) && typeof obj.port === "number";
+  }
+  return false;
 }
 
 export function validateServerConfig(item: unknown): item is ServerConfig {
@@ -9,14 +26,24 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
     return false;
   }
   const obj = item as Record<string, unknown>;
-  return (
-    isNonEmptyString(obj.id) &&
-    isNonEmptyString(obj.name) &&
-    isNonEmptyString(obj.host) &&
-    typeof obj.port === "number" &&
-    isNonEmptyString(obj.username) &&
-    (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
-  );
+  if (
+    !(
+      isNonEmptyString(obj.id) &&
+      isNonEmptyString(obj.name) &&
+      isNonEmptyString(obj.host) &&
+      typeof obj.port === "number" &&
+      isNonEmptyString(obj.username) &&
+      (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
+    )
+  ) {
+    return false;
+  }
+  if (obj.proxy !== undefined && obj.proxy !== null) {
+    if (!validateProxyConfig(obj.proxy)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function validateTunnelProfile(item: unknown): item is TunnelProfile {

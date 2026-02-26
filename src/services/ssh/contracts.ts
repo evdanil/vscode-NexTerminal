@@ -55,7 +55,7 @@ export type KeyboardInteractiveHandler = (
 export interface SshConnector {
   connect(
     server: ServerConfig,
-    auth: { password?: string; passphrase?: string; onKeyboardInteractive?: KeyboardInteractiveHandler }
+    auth: { password?: string; passphrase?: string; sock?: Duplex; onKeyboardInteractive?: KeyboardInteractiveHandler }
   ): Promise<SshConnection>;
 }
 

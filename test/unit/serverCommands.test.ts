@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommandContext } from "../../src/commands/types";
-import { registerServerCommands } from "../../src/commands/serverCommands";
+import { registerServerCommands, formValuesToServer, formValuesToProxy } from "../../src/commands/serverCommands";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
@@ -224,5 +224,91 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).toHaveBeenCalledTimes(1);
     expect(disconnectPool).toHaveBeenCalledWith("srv-1");
     expect(removeServer).toHaveBeenCalledWith("srv-1");
+  });
+});
+
+describe("formValuesToProxy", () => {
+  it("returns undefined for proxyType=none", () => {
+    expect(formValuesToProxy({ proxyType: "none" })).toBeUndefined();
+  });
+
+  it("returns undefined when proxyType is missing", () => {
+    expect(formValuesToProxy({})).toBeUndefined();
+  });
+
+  it("parses SSH jump host proxy", () => {
+    const result = formValuesToProxy({
+      proxyType: "ssh",
+      proxyJumpHostId: "srv-jump-123"
+    });
+    expect(result).toEqual({ type: "ssh", jumpHostId: "srv-jump-123" });
+  });
+
+  it("returns undefined for SSH proxy without jump host", () => {
+    expect(formValuesToProxy({ proxyType: "ssh", proxyJumpHostId: "" })).toBeUndefined();
+  });
+
+  it("parses SOCKS5 proxy", () => {
+    const result = formValuesToProxy({
+      proxyType: "socks5",
+      proxySocks5Host: "proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: "user1"
+    });
+    expect(result).toEqual({ type: "socks5", host: "proxy.example.com", port: 1080, username: "user1" });
+  });
+
+  it("omits SOCKS5 username when empty", () => {
+    const result = formValuesToProxy({
+      proxyType: "socks5",
+      proxySocks5Host: "proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: ""
+    });
+    expect(result).toEqual({ type: "socks5", host: "proxy.example.com", port: 1080 });
+  });
+
+  it("parses HTTP CONNECT proxy", () => {
+    const result = formValuesToProxy({
+      proxyType: "http",
+      proxyHttpHost: "corporate-proxy.com",
+      proxyHttpPort: 3128,
+      proxyHttpUsername: "admin"
+    });
+    expect(result).toEqual({ type: "http", host: "corporate-proxy.com", port: 3128, username: "admin" });
+  });
+
+  it("returns undefined for HTTP proxy without host", () => {
+    expect(formValuesToProxy({ proxyType: "http", proxyHttpHost: "", proxyHttpPort: 3128 })).toBeUndefined();
+  });
+});
+
+describe("formValuesToServer with proxy", () => {
+  it("includes proxy config in server when present", () => {
+    const server = formValuesToServer({
+      name: "Test",
+      host: "example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      proxyType: "socks5",
+      proxySocks5Host: "proxy.local",
+      proxySocks5Port: 1080
+    });
+    expect(server).toBeDefined();
+    expect(server!.proxy).toEqual({ type: "socks5", host: "proxy.local", port: 1080 });
+  });
+
+  it("omits proxy when proxyType is none", () => {
+    const server = formValuesToServer({
+      name: "Test",
+      host: "example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      proxyType: "none"
+    });
+    expect(server).toBeDefined();
+    expect(server!.proxy).toBeUndefined();
   });
 });

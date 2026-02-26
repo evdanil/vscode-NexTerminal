@@ -3,7 +3,7 @@ import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
 import type { SecretVault } from "../services/ssh/contracts";
-import { passwordSecretKey, passphraseSecretKey } from "../services/ssh/silentAuth";
+import { passwordSecretKey, passphraseSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
 import {
@@ -140,6 +140,22 @@ interface SanitizedSnapshot {
   settings: Record<string, unknown>;
 }
 
+function remapProxy(proxy: import("../models/config").ProxyConfig | undefined, idMap: Map<string, string>): import("../models/config").ProxyConfig | undefined {
+  if (!proxy) return undefined;
+  if (proxy.type === "ssh") {
+    const newJumpHostId = idMap.get(proxy.jumpHostId);
+    if (!newJumpHostId) return undefined; // Jump host not in export
+    return { ...proxy, jumpHostId: newJumpHostId };
+  }
+  if (proxy.type === "socks5") {
+    return { type: "socks5", host: proxy.host, port: proxy.port };
+  }
+  if (proxy.type === "http") {
+    return { type: "http", host: proxy.host, port: proxy.port };
+  }
+  return undefined;
+}
+
 export function sanitizeForSharing(
   servers: ServerConfig[],
   tunnels: TunnelProfile[],
@@ -148,10 +164,14 @@ export function sanitizeForSharing(
 ): SanitizedSnapshot {
   const idMap = new Map<string, string>();
 
+  // First pass: assign new IDs
+  for (const s of servers) {
+    idMap.set(s.id, randomUUID());
+  }
+
   const newServers = servers.map((s) => {
-    const newId = randomUUID();
-    idMap.set(s.id, newId);
-    return { ...s, id: newId, username: "user", keyPath: "" };
+    const newId = idMap.get(s.id)!;
+    return { ...s, id: newId, username: "user", keyPath: "", proxy: remapProxy(s.proxy, idMap) };
   });
 
   const newTunnels = tunnels.map((t) => {
@@ -234,14 +254,17 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         const settings = readSettings();
 
         // Collect secrets
-        const secrets: Record<string, unknown> = { passwords: {}, passphrases: {}, secretMacros: [] };
+        const secrets: Record<string, unknown> = { passwords: {}, passphrases: {}, proxyPasswords: {}, secretMacros: [] };
         const passwords = secrets.passwords as Record<string, string>;
         const passphrases = secrets.passphrases as Record<string, string>;
+        const proxyPasswords = secrets.proxyPasswords as Record<string, string>;
         for (const server of snapshot.servers) {
           const pw = await vault.get(passwordSecretKey(server.id));
           if (pw) passwords[server.id] = pw;
           const pp = await vault.get(passphraseSecretKey(server.id));
           if (pp) passphrases[server.id] = pp;
+          const proxyPw = await vault.get(proxyPasswordSecretKey(server.id));
+          if (proxyPw) proxyPasswords[server.id] = proxyPw;
         }
 
         // Collect secret macros
@@ -377,13 +400,26 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     // Generate fresh IDs to prevent duplicates on re-import
     const idMap = new Map<string, string>();
 
-    let imported = 0;
-    let skipped = 0;
+    // First pass: assign new IDs
     for (const server of data.servers) {
       ensureId(server as unknown as Record<string, unknown>);
       const newId = randomUUID();
       idMap.set(server.id, newId);
       server.id = newId;
+    }
+
+    // Second pass: remap jump host references and import
+    let imported = 0;
+    let skipped = 0;
+    for (const server of data.servers) {
+      if (server.proxy?.type === "ssh") {
+        const remapped = idMap.get(server.proxy.jumpHostId);
+        if (remapped) {
+          server.proxy = { ...server.proxy, jumpHostId: remapped };
+        } else {
+          server.proxy = undefined; // Jump host not in export
+        }
+      }
       if (validateServerConfig(server)) {
         await core.addOrUpdateServer(server);
         imported++;
@@ -543,6 +579,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     if (decryptedSecrets) {
       const passwords = decryptedSecrets.passwords as Record<string, string> | undefined;
       const passphrases = decryptedSecrets.passphrases as Record<string, string> | undefined;
+      const proxyPasswords = decryptedSecrets.proxyPasswords as Record<string, string> | undefined;
       if (passwords) {
         for (const [serverId, pw] of Object.entries(passwords)) {
           await vault.store(passwordSecretKey(serverId), pw);
@@ -551,6 +588,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       if (passphrases) {
         for (const [serverId, pp] of Object.entries(passphrases)) {
           await vault.store(passphraseSecretKey(serverId), pp);
+        }
+      }
+      if (proxyPasswords) {
+        for (const [serverId, pw] of Object.entries(proxyPasswords)) {
+          await vault.store(proxyPasswordSecretKey(serverId), pw);
         }
       }
     }
@@ -583,6 +625,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     for (const server of snapshot.servers) {
       await vault.delete(passwordSecretKey(server.id));
       await vault.delete(passphraseSecretKey(server.id));
+      await vault.delete(proxyPasswordSecretKey(server.id));
     }
 
     // Remove all servers
