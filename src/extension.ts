@@ -208,6 +208,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     highlighter,
     sftpService,
     fileExplorerProvider,
+    secretVault,
     registrySync
   };
 

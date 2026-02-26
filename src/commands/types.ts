@@ -3,7 +3,7 @@ import type { NexusCore } from "../core/nexusCore";
 import type { TerminalLoggerFactory } from "../logging/terminalLogger";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
 import type { SftpService } from "../services/sftp/sftpService";
-import type { SshFactory, SshPoolControl } from "../services/ssh/contracts";
+import type { SecretVault, SshFactory, SshPoolControl } from "../services/ssh/contracts";
 import type { TerminalHighlighter } from "../services/terminalHighlighter";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
 import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
@@ -27,5 +27,6 @@ export interface CommandContext {
   highlighter: TerminalHighlighter;
   sftpService: SftpService;
   fileExplorerProvider: FileExplorerTreeProvider;
+  secretVault?: SecretVault;
   registrySync?: TunnelRegistrySync;
 }

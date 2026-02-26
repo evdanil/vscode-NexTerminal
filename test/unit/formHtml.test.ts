@@ -62,6 +62,17 @@ describe("renderFormHtml", () => {
     expect(html).toContain('max="65535"');
   });
 
+  it("renders password fields with password input type", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [{ type: "password", key: "proxyPassword", label: "Proxy Password", placeholder: "Secret" }]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain('type="password"');
+    expect(html).toContain('id="field-proxyPassword"');
+    expect(html).toContain('autocomplete="new-password"');
+  });
+
   it("renders file fields with browse button", () => {
     const definition: FormDefinition = {
       title: "Test",
@@ -319,5 +330,16 @@ describe("renderFormHtml", () => {
     };
     const html = renderFormHtml(definition);
     expect(html).toContain("JSON.parse");
+  });
+
+  it("guards visibleWhen JSON parsing to avoid script breakage", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [{ type: "text", key: "x", label: "X", visibleWhen: { field: "y", value: "z" } }]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain("function parseVisibleWhen");
+    expect(html).toContain("try {");
+    expect(html).toContain("catch (_error)");
   });
 });

@@ -41,6 +41,79 @@ function createVault(seed?: Record<string, string>): SecretVault {
   };
 }
 
+function createMockHttpSocket() {
+  const dataListeners = new Set<(chunk: Buffer) => void>();
+  let errorListener: ((error: Error) => void) | undefined;
+  let timeoutListener: (() => void) | undefined;
+
+  const socket: any = {
+    write: vi.fn(),
+    destroy: vi.fn(),
+    setTimeout: vi.fn((_ms: number, cb?: () => void) => {
+      timeoutListener = cb;
+      return socket;
+    }),
+    once: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+      if (event === "error") {
+        errorListener = handler as (error: Error) => void;
+      }
+      return socket;
+    }),
+    on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+      if (event === "data") {
+        dataListeners.add(handler as (chunk: Buffer) => void);
+      }
+      return socket;
+    }),
+    removeListener: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+      if (event === "data") {
+        dataListeners.delete(handler as (chunk: Buffer) => void);
+      }
+      return socket;
+    }),
+    unshift: vi.fn(),
+    emitData: (raw: string | Buffer) => {
+      const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      for (const listener of [...dataListeners]) {
+        listener(chunk);
+      }
+    },
+    emitError: (error: Error) => {
+      if (errorListener) {
+        const listener = errorListener;
+        errorListener = undefined;
+        listener(error);
+      }
+    },
+    emitTimeout: () => {
+      timeoutListener?.();
+    }
+  };
+
+  return socket;
+}
+
+function mockNetCreateConnectionWithSocket(socket: any): Promise<void> {
+  return import("node:net").then((netMod) => {
+    (netMod.createConnection as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      (_port: number, _host: string, onConnect?: () => void) => {
+        setImmediate(() => onConnect?.());
+        return socket;
+      }
+    );
+  });
+}
+
+async function waitForSocketWrite(socket: { write: { mock: { calls: unknown[][] } } }): Promise<void> {
+  for (let i = 0; i < 20; i++) {
+    if (socket.write.mock.calls.length > 0) {
+      return;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error("Timed out waiting for HTTP CONNECT request write");
+}
+
 describe("ProxiedSshConnection", () => {
   it("delegates all SshConnection methods to inner connection", async () => {
     const inner = makeFakeConnection();
@@ -302,5 +375,70 @@ describe("ProxySshFactory", () => {
     const factory = await createFactory();
     await expect(factory.connect(targetServer)).rejects.toThrow("Connection refused");
     expect(jumpConn.dispose).toHaveBeenCalled();
+  });
+
+  it("sanitizes CRLF in HTTP CONNECT host and proxy username", async () => {
+    const server = makeServer({
+      host: "target.example.com\r\nX-Injected: 1",
+      proxy: {
+        type: "http",
+        host: "proxy.local",
+        port: 3128,
+        username: "attacker\r\nX-Auth: 1"
+      }
+    });
+    vault = createVault({ "proxy-password-srv-target": "pw-1" });
+
+    const socket = createMockHttpSocket();
+    await mockNetCreateConnectionWithSocket(socket);
+
+    const factory = await createFactory();
+    const promise = factory.connect(server);
+    await waitForSocketWrite(socket);
+    socket.emitData("HTTP/1.1 200 Connection Established\r\n\r\n");
+    await promise;
+
+    const request = String(socket.write.mock.calls[0][0]);
+    expect(request).not.toContain("\r\nX-Injected: 1\r\n");
+    const headerMatch = request.match(/Proxy-Authorization: Basic ([^\r\n]+)/);
+    expect(headerMatch).toBeTruthy();
+    const decoded = Buffer.from(headerMatch![1], "base64").toString("utf8");
+    expect(decoded).not.toContain("\r");
+    expect(decoded).not.toContain("\n");
+  });
+
+  it("rejects oversized HTTP CONNECT responses and destroys socket", async () => {
+    const server = makeServer({
+      proxy: { type: "http", host: "proxy.local", port: 3128 }
+    });
+    const socket = createMockHttpSocket();
+    await mockNetCreateConnectionWithSocket(socket);
+
+    const factory = await createFactory();
+    const promise = factory.connect(server);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    socket.emitData("A".repeat(70000));
+
+    await expect(promise).rejects.toThrow("HTTP CONNECT proxy response too large");
+    expect(socket.destroy).toHaveBeenCalled();
+    expect(authFactory.connect).not.toHaveBeenCalled();
+  });
+
+  it("pushes back trailing HTTP CONNECT data so SSH banner is preserved", async () => {
+    const server = makeServer({
+      proxy: { type: "http", host: "proxy.local", port: 3128 }
+    });
+    const socket = createMockHttpSocket();
+    await mockNetCreateConnectionWithSocket(socket);
+
+    const factory = await createFactory();
+    const promise = factory.connect(server);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    socket.emitData("HTTP/1.1 200 OK\r\nProxy-Agent: test\r\n\r\nSSH-2.0-test-banner");
+    await promise;
+
+    expect(socket.unshift).toHaveBeenCalledTimes(1);
+    const pushed = socket.unshift.mock.calls[0][0] as Buffer;
+    expect(pushed.toString()).toBe("SSH-2.0-test-banner");
   });
 });

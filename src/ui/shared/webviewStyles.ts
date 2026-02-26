@@ -53,6 +53,7 @@ export function baseWebviewCss(): string {
     }
     .req { color: var(--vscode-errorForeground); }
     input[type="text"],
+    input[type="password"],
     input[type="number"] {
       width: 100%;
       box-sizing: border-box;
@@ -66,6 +67,7 @@ export function baseWebviewCss(): string {
       outline: none;
     }
     input[type="text"]:focus,
+    input[type="password"]:focus,
     input[type="number"]:focus {
       border-color: var(--vscode-focusBorder);
     }

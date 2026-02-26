@@ -5,7 +5,6 @@ export type TunnelType = "local" | "reverse" | "dynamic";
 export type SerialParity = "none" | "even" | "odd" | "mark" | "space";
 export type SerialDataBits = 5 | 6 | 7 | 8;
 export type SerialStopBits = 1 | 2;
-export type ProxyType = "ssh" | "socks5" | "http";
 
 export interface SshJumpProxy {
   type: "ssh";

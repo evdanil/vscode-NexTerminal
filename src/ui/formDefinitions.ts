@@ -172,10 +172,12 @@ function proxyFields(
     { type: "text", key: "proxySocks5Host", label: "SOCKS5 Proxy Host", required: true, placeholder: "proxy.example.com", value: socks5Host, visibleWhen: compoundVw(socks5Vw) },
     { type: "number", key: "proxySocks5Port", label: "SOCKS5 Proxy Port", required: true, min: 1, max: 65535, value: socks5Port, visibleWhen: compoundVw(socks5Vw) },
     { type: "text", key: "proxySocks5Username", label: "SOCKS5 Username", placeholder: "Optional", value: socks5Username, visibleWhen: compoundVw(socks5Vw) },
+    { type: "password", key: "proxySocks5Password", label: "SOCKS5 Password", placeholder: "Leave blank to keep existing", visibleWhen: compoundVw(socks5Vw) },
     // HTTP CONNECT fields
     { type: "text", key: "proxyHttpHost", label: "HTTP Proxy Host", required: true, placeholder: "proxy.example.com", value: httpHost, visibleWhen: compoundVw(httpVw) },
     { type: "number", key: "proxyHttpPort", label: "HTTP Proxy Port", required: true, min: 1, max: 65535, value: httpPort, visibleWhen: compoundVw(httpVw) },
-    { type: "text", key: "proxyHttpUsername", label: "HTTP Proxy Username", placeholder: "Optional", value: httpUsername, visibleWhen: compoundVw(httpVw) }
+    { type: "text", key: "proxyHttpUsername", label: "HTTP Proxy Username", placeholder: "Optional", value: httpUsername, visibleWhen: compoundVw(httpVw) },
+    { type: "password", key: "proxyHttpPassword", label: "HTTP Proxy Password", placeholder: "Leave blank to keep existing", visibleWhen: compoundVw(httpVw) }
   ];
 }
 

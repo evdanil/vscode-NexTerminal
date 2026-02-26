@@ -46,6 +46,13 @@ function renderField(field: FormFieldDescriptor): string {
   <div class="field-error" id="error-${key}"></div>
 </div>`;
 
+    case "password":
+      return `<div class="form-group"${vw}>
+  <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
+  <input type="password" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}" autocomplete="new-password"${req} />${renderHint(field)}
+  <div class="field-error" id="error-${key}"></div>
+</div>`;
+
     case "number":
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
@@ -145,11 +152,23 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       var vscode = acquireVsCodeApi();
       var form = document.getElementById("nexus-form");
 
+      function parseVisibleWhen(raw) {
+        if (!raw) {
+          return [];
+        }
+        try {
+          var parsed = JSON.parse(raw);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch (_error) {
+          return [];
+        }
+      }
+
       function updateVisibility() {
         var groups = document.querySelectorAll("[data-visible-when]");
         for (var gi = 0; gi < groups.length; gi++) {
           var group = groups[gi];
-          var conditions = JSON.parse(group.dataset.visibleWhen);
+          var conditions = parseVisibleWhen(group.dataset.visibleWhen);
           var visible = true;
           for (var ci = 0; ci < conditions.length; ci++) {
             var control = form.elements[conditions[ci].field];
@@ -174,7 +193,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       var watchedFields = {};
       var wfGroups = document.querySelectorAll("[data-visible-when]");
       for (var wi = 0; wi < wfGroups.length; wi++) {
-        var wfConditions = JSON.parse(wfGroups[wi].dataset.visibleWhen);
+        var wfConditions = parseVisibleWhen(wfGroups[wi].dataset.visibleWhen);
         for (var fi = 0; fi < wfConditions.length; fi++) {
           watchedFields[wfConditions[fi].field] = true;
         }

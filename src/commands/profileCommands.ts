@@ -4,7 +4,7 @@ import { unifiedProfileFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
-import { formValuesToServer, browseForKey, collectGroups } from "./serverCommands";
+import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
 import type { CommandContext } from "./types";
 import { normalizeFolderPath, folderDisplayName, isDescendantOrSelf, MAX_FOLDER_DEPTH } from "../utils/folderPaths";
@@ -28,6 +28,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
           return;
         }
         await ctx.core.addOrUpdateServer(server);
+        await syncProxyPasswordSecret(ctx, server.id, values);
       }
     },
     onBrowse: browseForKey,

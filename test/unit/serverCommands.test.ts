@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommandContext } from "../../src/commands/types";
-import { registerServerCommands, formValuesToServer, formValuesToProxy } from "../../src/commands/serverCommands";
+import { registerServerCommands, formValuesToServer, formValuesToProxy, syncProxyPasswordSecret } from "../../src/commands/serverCommands";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
+import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
@@ -90,6 +91,8 @@ interface Harness {
   disconnectPool: ReturnType<typeof vi.fn>;
   removeServer: ReturnType<typeof vi.fn>;
   terminalDispose: ReturnType<typeof vi.fn>;
+  secretDelete: ReturnType<typeof vi.fn>;
+  secretStore: ReturnType<typeof vi.fn>;
 }
 
 function setupHarness(options: {
@@ -120,6 +123,8 @@ function setupHarness(options: {
   });
   const disconnectPool = vi.fn();
   const removeServer = vi.fn(async () => {});
+  const secretDelete = vi.fn(async () => {});
+  const secretStore = vi.fn(async () => {});
 
   const terminalDispose = vi.fn();
   const terminalsByServer = new Map<string, Set<{ dispose: () => void }>>();
@@ -147,12 +152,17 @@ function setupHarness(options: {
     highlighter: {} as any,
     sftpService: {} as any,
     fileExplorerProvider: {} as any,
+    secretVault: {
+      get: vi.fn(async () => undefined),
+      store: secretStore,
+      delete: secretDelete
+    },
     registrySync: undefined
   };
 
   mockShowWarningMessage.mockResolvedValue(options.confirmRemove === false ? undefined : "Remove");
 
-  return { ctx, stopTunnel, disconnectPool, removeServer, terminalDispose };
+  return { ctx, stopTunnel, disconnectPool, removeServer, terminalDispose, secretDelete, secretStore };
 }
 
 describe("server disconnect with tunnel autoStop", () => {
@@ -204,7 +214,7 @@ describe("server disconnect with tunnel autoStop", () => {
   it("remove command stops all remaining tunnels and disconnects pool", async () => {
     const autoStopProfile = makeTunnel({ id: "tp-stop", autoStop: true });
     const keepProfile = makeTunnel({ id: "tp-keep", autoStop: false });
-    const { ctx, stopTunnel, disconnectPool, removeServer } = setupHarness({
+    const { ctx, stopTunnel, disconnectPool, removeServer, secretDelete } = setupHarness({
       profiles: [autoStopProfile, keepProfile],
       activeTunnels: [
         { id: "at-stop", profileId: "tp-stop", serverId: "srv-1" },
@@ -223,6 +233,9 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(stopTunnel).toHaveBeenCalledWith("at-keep");
     expect(disconnectPool).toHaveBeenCalledTimes(1);
     expect(disconnectPool).toHaveBeenCalledWith("srv-1");
+    expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
   });
 });
@@ -281,6 +294,37 @@ describe("formValuesToProxy", () => {
   it("returns undefined for HTTP proxy without host", () => {
     expect(formValuesToProxy({ proxyType: "http", proxyHttpHost: "", proxyHttpPort: 3128 })).toBeUndefined();
   });
+
+  it("returns undefined for SOCKS5 proxy with invalid port", () => {
+    expect(formValuesToProxy({
+      proxyType: "socks5",
+      proxySocks5Host: "proxy.example.com",
+      proxySocks5Port: 0
+    })).toBeUndefined();
+    expect(formValuesToProxy({
+      proxyType: "socks5",
+      proxySocks5Host: "proxy.example.com",
+      proxySocks5Port: 70000
+    })).toBeUndefined();
+    expect(formValuesToProxy({
+      proxyType: "socks5",
+      proxySocks5Host: "proxy.example.com",
+      proxySocks5Port: 1080.5
+    })).toBeUndefined();
+  });
+
+  it("returns undefined for HTTP proxy with invalid port", () => {
+    expect(formValuesToProxy({
+      proxyType: "http",
+      proxyHttpHost: "proxy.example.com",
+      proxyHttpPort: 0
+    })).toBeUndefined();
+    expect(formValuesToProxy({
+      proxyType: "http",
+      proxyHttpHost: "proxy.example.com",
+      proxyHttpPort: 70000
+    })).toBeUndefined();
+  });
 });
 
 describe("formValuesToServer with proxy", () => {
@@ -310,5 +354,54 @@ describe("formValuesToServer with proxy", () => {
     });
     expect(server).toBeDefined();
     expect(server!.proxy).toBeUndefined();
+  });
+});
+
+describe("syncProxyPasswordSecret", () => {
+  it("stores SOCKS5 proxy password when username is set and password provided", async () => {
+    const { ctx, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
+    await syncProxyPasswordSecret(ctx, "srv-1", {
+      proxyType: "socks5",
+      proxySocks5Username: "user1",
+      proxySocks5Password: "secret-socks5"
+    });
+    expect(secretStore).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"), "secret-socks5");
+  });
+
+  it("stores HTTP proxy password when username is set and password provided", async () => {
+    const { ctx, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
+    await syncProxyPasswordSecret(ctx, "srv-1", {
+      proxyType: "http",
+      proxyHttpUsername: "user1",
+      proxyHttpPassword: "secret-http"
+    });
+    expect(secretStore).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"), "secret-http");
+  });
+
+  it("deletes proxy password when username is removed", async () => {
+    const { ctx, secretDelete } = setupHarness({ profiles: [], activeTunnels: [] });
+    await syncProxyPasswordSecret(ctx, "srv-1", {
+      proxyType: "socks5",
+      proxySocks5Username: "",
+      proxySocks5Password: ""
+    });
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+  });
+
+  it("deletes proxy password when proxy is disabled", async () => {
+    const { ctx, secretDelete } = setupHarness({ profiles: [], activeTunnels: [] });
+    await syncProxyPasswordSecret(ctx, "srv-1", { proxyType: "none" });
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+  });
+
+  it("keeps existing secret when password field is blank", async () => {
+    const { ctx, secretDelete, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
+    await syncProxyPasswordSecret(ctx, "srv-1", {
+      proxyType: "http",
+      proxyHttpUsername: "user1",
+      proxyHttpPassword: ""
+    });
+    expect(secretStore).not.toHaveBeenCalled();
+    expect(secretDelete).not.toHaveBeenCalled();
   });
 });

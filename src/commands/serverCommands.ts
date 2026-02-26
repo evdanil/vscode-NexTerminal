@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import type { AuthType, ProxyConfig, ServerConfig } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SshPty } from "../services/ssh/sshPty";
+import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { serverFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
@@ -112,6 +113,10 @@ function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
 }
 
+function isValidProxyPort(port: number): boolean {
+  return Number.isInteger(port) && port >= 1 && port <= 65535;
+}
+
 export function formValuesToProxy(values: FormValues): ProxyConfig | undefined {
   const proxyType = typeof values.proxyType === "string" ? values.proxyType : "none";
   if (proxyType === "none") return undefined;
@@ -125,7 +130,7 @@ export function formValuesToProxy(values: FormValues): ProxyConfig | undefined {
   if (proxyType === "socks5") {
     const host = typeof values.proxySocks5Host === "string" ? values.proxySocks5Host.trim() : "";
     const port = typeof values.proxySocks5Port === "number" ? values.proxySocks5Port : 1080;
-    if (!host) return undefined;
+    if (!host || !isValidProxyPort(port)) return undefined;
     const username = typeof values.proxySocks5Username === "string" && values.proxySocks5Username.trim()
       ? values.proxySocks5Username.trim()
       : undefined;
@@ -135,7 +140,7 @@ export function formValuesToProxy(values: FormValues): ProxyConfig | undefined {
   if (proxyType === "http") {
     const host = typeof values.proxyHttpHost === "string" ? values.proxyHttpHost.trim() : "";
     const port = typeof values.proxyHttpPort === "number" ? values.proxyHttpPort : 3128;
-    if (!host) return undefined;
+    if (!host || !isValidProxyPort(port)) return undefined;
     const username = typeof values.proxyHttpUsername === "string" && values.proxyHttpUsername.trim()
       ? values.proxyHttpUsername.trim()
       : undefined;
@@ -143,6 +148,42 @@ export function formValuesToProxy(values: FormValues): ProxyConfig | undefined {
   }
 
   return undefined;
+}
+
+export async function syncProxyPasswordSecret(ctx: CommandContext, serverId: string, values: FormValues): Promise<void> {
+  if (!ctx.secretVault) {
+    return;
+  }
+  const secretKey = proxyPasswordSecretKey(serverId);
+  const proxyType = typeof values.proxyType === "string" ? values.proxyType : "none";
+
+  if (proxyType === "socks5") {
+    const username = typeof values.proxySocks5Username === "string" ? values.proxySocks5Username.trim() : "";
+    if (!username) {
+      await ctx.secretVault.delete(secretKey);
+      return;
+    }
+    const password = typeof values.proxySocks5Password === "string" ? values.proxySocks5Password : "";
+    if (password.length > 0) {
+      await ctx.secretVault.store(secretKey, password);
+    }
+    return;
+  }
+
+  if (proxyType === "http") {
+    const username = typeof values.proxyHttpUsername === "string" ? values.proxyHttpUsername.trim() : "";
+    if (!username) {
+      await ctx.secretVault.delete(secretKey);
+      return;
+    }
+    const password = typeof values.proxyHttpPassword === "string" ? values.proxyHttpPassword : "";
+    if (password.length > 0) {
+      await ctx.secretVault.store(secretKey, password);
+    }
+    return;
+  }
+
+  await ctx.secretVault.delete(secretKey);
 }
 
 export function formValuesToServer(values: FormValues, existingId?: string, preserveIsHidden = false): ServerConfig | undefined {
@@ -324,6 +365,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             return;
           }
           await ctx.core.addOrUpdateServer(updated);
+          await syncProxyPasswordSecret(ctx, updated.id, values);
           if (ctx.core.isServerConnected(existing.id)) {
             void vscode.window.showInformationMessage(
               "Server profile updated. Existing sessions keep current connection settings until reconnect."
@@ -348,6 +390,11 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       await disconnectServer(ctx, server.id);
+      if (ctx.secretVault) {
+        await ctx.secretVault.delete(passwordSecretKey(server.id));
+        await ctx.secretVault.delete(passphraseSecretKey(server.id));
+        await ctx.secretVault.delete(proxyPasswordSecretKey(server.id));
+      }
       // Stop ALL tunnels when server profile is deleted, regardless of autoStop
       const remaining = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === server.id);
       await Promise.all(remaining.map((t) => ctx.tunnelManager.stop(t.id)));
