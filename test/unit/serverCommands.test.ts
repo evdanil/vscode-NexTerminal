@@ -1,11 +1,28 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
 import { registerServerCommands, formValuesToServer, formValuesToProxy, syncProxyPasswordSecret } from "../../src/commands/serverCommands";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
+import { readFile } from "node:fs/promises";
+import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
+
+vi.mock("node:fs/promises", () => ({
+  readFile: vi.fn()
+}));
+
+vi.mock("../../src/services/ssh/deploySshKey", () => ({
+  defaultSshDir: vi.fn(() => "/home/user/.ssh"),
+  findLocalKeyPairs: vi.fn(async () => []),
+  generateKeyPair: vi.fn(async () => ({
+    publicKeyPath: "/home/user/.ssh/id_ed25519.pub",
+    privateKeyPath: "/home/user/.ssh/id_ed25519"
+  })),
+  deployPublicKeyToRemote: vi.fn(async () => ({ alreadyDeployed: false }))
+}));
 
 vi.mock("vscode", () => ({
   commands: {
@@ -90,6 +107,7 @@ interface Harness {
   stopTunnel: ReturnType<typeof vi.fn>;
   disconnectPool: ReturnType<typeof vi.fn>;
   removeServer: ReturnType<typeof vi.fn>;
+  addOrUpdateServer: ReturnType<typeof vi.fn>;
   terminalDispose: ReturnType<typeof vi.fn>;
   secretDelete: ReturnType<typeof vi.fn>;
   secretStore: ReturnType<typeof vi.fn>;
@@ -123,6 +141,7 @@ function setupHarness(options: {
   });
   const disconnectPool = vi.fn();
   const removeServer = vi.fn(async () => {});
+  const addOrUpdateServer = vi.fn(async () => {});
   const secretDelete = vi.fn(async () => {});
   const secretStore = vi.fn(async () => {});
 
@@ -135,7 +154,8 @@ function setupHarness(options: {
     getTunnel: vi.fn((id: string) => snapshot.tunnels.find((t) => t.id === id)),
     getSnapshot: vi.fn(() => snapshot),
     isServerConnected: vi.fn(() => false),
-    removeServer
+    removeServer,
+    addOrUpdateServer
   };
 
   const ctx: CommandContext = {
@@ -162,7 +182,7 @@ function setupHarness(options: {
 
   mockShowWarningMessage.mockResolvedValue(options.confirmRemove === false ? undefined : "Remove");
 
-  return { ctx, stopTunnel, disconnectPool, removeServer, terminalDispose, secretDelete, secretStore };
+  return { ctx, stopTunnel, disconnectPool, removeServer, addOrUpdateServer, terminalDispose, secretDelete, secretStore };
 }
 
 describe("server disconnect with tunnel autoStop", () => {
@@ -403,5 +423,103 @@ describe("syncProxyPasswordSecret", () => {
     });
     expect(secretStore).not.toHaveBeenCalled();
     expect(secretDelete).not.toHaveBeenCalled();
+  });
+});
+
+describe("deploy key command", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    vi.mocked(defaultSshDir).mockReturnValue("/home/user/.ssh");
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(async (_options: unknown, task: () => Promise<unknown>) => task());
+  });
+
+  it("deploys selected key and switches server to key auth", async () => {
+    const { ctx, addOrUpdateServer, secretDelete } = setupHarness({ profiles: [], activeTunnels: [] });
+    const connection = { dispose: vi.fn() };
+    (ctx.sshFactory as any).connect = vi.fn(async () => connection);
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      {
+        name: "id_ed25519",
+        publicKeyPath: "/home/user/.ssh/id_ed25519.pub",
+        privateKeyPath: "/home/user/.ssh/id_ed25519"
+      }
+    ]);
+    vi.mocked(vscode.window.showQuickPick as any).mockResolvedValueOnce({
+      label: "id_ed25519",
+      keyPair: {
+        name: "id_ed25519",
+        publicKeyPath: "/home/user/.ssh/id_ed25519.pub",
+        privateKeyPath: "/home/user/.ssh/id_ed25519"
+      }
+    });
+    vi.mocked(readFile).mockResolvedValueOnce("ssh-ed25519 AAAA user@example");
+    vi.mocked(deployPublicKeyToRemote).mockResolvedValueOnce({ alreadyDeployed: false });
+    vi.mocked(vscode.window.showInformationMessage as any)
+      .mockResolvedValueOnce("Switch to key auth")
+      .mockResolvedValueOnce("Remove stored password");
+
+    registerServerCommands(ctx);
+    const deployCmd = registeredCommands.get("nexus.server.deployKey");
+    expect(deployCmd).toBeDefined();
+
+    await deployCmd!("srv-1");
+
+    expect((ctx.sshFactory as any).connect).toHaveBeenCalledWith(expect.objectContaining({ id: "srv-1" }));
+    expect(deployPublicKeyToRemote).toHaveBeenCalledWith(connection, "ssh-ed25519 AAAA user@example");
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "srv-1",
+        authType: "key",
+        keyPath: "/home/user/.ssh/id_ed25519"
+      })
+    );
+    expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
+    expect(connection.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("validates generated key name and uses generated private key path", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [] });
+    const connection = { dispose: vi.fn() };
+    (ctx.sshFactory as any).connect = vi.fn(async () => connection);
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([]);
+    vi.mocked(vscode.window.showQuickPick as any)
+      .mockResolvedValueOnce({ label: "$(add) Generate new ed25519 key", generate: true })
+      .mockResolvedValueOnce({ label: "No passphrase", passphrase: "" });
+    vi.mocked(vscode.window.showInputBox as any).mockImplementationOnce(async (options: any) => {
+      expect(options.validateInput("..")).toContain("cannot");
+      expect(options.validateInput("bad/name")).toContain("only contain");
+      return "id_custom";
+    });
+    vi.mocked(generateKeyPair).mockResolvedValueOnce({
+      publicKeyPath: "/home/user/.ssh/id_custom.pub",
+      privateKeyPath: "/home/user/.ssh/id_custom"
+    });
+    vi.mocked(readFile)
+      .mockResolvedValueOnce("exists")
+      .mockResolvedValueOnce("ssh-ed25519 AAAA id_custom");
+    vi.mocked(deployPublicKeyToRemote).mockResolvedValueOnce({ alreadyDeployed: false });
+    vi.mocked(vscode.window.showInformationMessage as any).mockResolvedValueOnce("Switch to key auth");
+
+    registerServerCommands(ctx);
+    const deployCmd = registeredCommands.get("nexus.server.deployKey");
+    expect(deployCmd).toBeDefined();
+
+    await deployCmd!("srv-1");
+
+    expect(generateKeyPair).toHaveBeenCalledWith({
+      sshDir: "/home/user/.ssh",
+      name: "id_custom",
+      passphrase: ""
+    });
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "srv-1",
+        authType: "key",
+        keyPath: "/home/user/.ssh/id_custom"
+      })
+    );
   });
 });

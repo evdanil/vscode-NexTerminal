@@ -1,22 +1,56 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import * as path from "node:path";
+import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { SshConnection } from "../../src/services/ssh/contracts";
 
 // Mock fs/promises before importing module under test
 vi.mock("node:fs/promises", () => ({
+  access: vi.fn(),
   readdir: vi.fn(),
   mkdir: vi.fn(),
 }));
 
 // Mock child_process
 vi.mock("node:child_process", () => ({
-  execFile: vi.fn(),
+  spawn: vi.fn(),
 }));
 
-import { readdir, mkdir } from "node:fs/promises";
-import { execFile as execFileCb } from "node:child_process";
+import { access, readdir, mkdir } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { findLocalKeyPairs, generateKeyPair, execRemoteCommand, deployPublicKeyToRemote } from "../../src/services/ssh/deploySshKey";
+
+function makeEnoentError(): NodeJS.ErrnoException {
+  return Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+}
+
+function mockSshKeygenProcess(exitCode: number, stdout = "", stderr = ""): {
+  stdinEnd: ReturnType<typeof vi.fn>;
+  kill: ReturnType<typeof vi.fn>;
+} {
+  const child = new EventEmitter() as any;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const stdinEnd = vi.fn();
+  child.stdin = { end: stdinEnd };
+  const kill = vi.fn();
+  child.kill = kill;
+  vi.mocked(spawn).mockReturnValue(child);
+
+  process.nextTick(() => {
+    if (stdout) {
+      child.stdout.push(stdout);
+    }
+    child.stdout.push(null);
+    if (stderr) {
+      child.stderr.push(stderr);
+    }
+    child.stderr.push(null);
+    child.emit("close", exitCode);
+  });
+
+  return { stdinEnd, kill };
+}
 
 describe("findLocalKeyPairs", () => {
   beforeEach(() => {
@@ -79,55 +113,34 @@ describe("findLocalKeyPairs", () => {
 describe("generateKeyPair", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    vi.mocked(access).mockRejectedValue(makeEnoentError());
   });
 
-  it("calls ssh-keygen with correct args for no passphrase", async () => {
+  it("invokes ssh-keygen without passing passphrase via argv", async () => {
     vi.mocked(mkdir).mockResolvedValue(undefined);
-    vi.mocked(execFileCb).mockImplementation((_cmd: any, _args: any, cb: any) => {
-      cb(null, "", "");
-      return {} as any;
-    });
+    const proc = mockSshKeygenProcess(0);
 
     const result = await generateKeyPair({
-      sshDir: "/home/user/.ssh",
-      name: "id_ed25519",
-      passphrase: "",
-    });
-
-    expect(execFileCb).toHaveBeenCalledWith(
-      expect.any(String),
-      ["-t", "ed25519", "-f", path.join("/home/user/.ssh", "id_ed25519"), "-N", "", "-C", "nexus-terminal"],
-      expect.any(Function),
-    );
-    expect(result.publicKeyPath).toBe(path.join("/home/user/.ssh", "id_ed25519.pub"));
-  });
-
-  it("passes passphrase to ssh-keygen", async () => {
-    vi.mocked(mkdir).mockResolvedValue(undefined);
-    vi.mocked(execFileCb).mockImplementation((_cmd: any, _args: any, cb: any) => {
-      cb(null, "", "");
-      return {} as any;
-    });
-
-    await generateKeyPair({
       sshDir: "/home/user/.ssh",
       name: "id_ed25519",
       passphrase: "my-secret",
     });
 
-    expect(execFileCb).toHaveBeenCalledWith(
+    const resolvedSshDir = path.resolve("/home/user/.ssh");
+    const resolvedKeyPath = path.join(resolvedSshDir, "id_ed25519");
+    expect(spawn).toHaveBeenCalledWith(
       expect.any(String),
-      expect.arrayContaining(["-N", "my-secret"]),
-      expect.any(Function),
+      ["-q", "-t", "ed25519", "-f", resolvedKeyPath, "-C", "nexus-terminal"],
+      { stdio: ["pipe", "pipe", "pipe"] }
     );
+    expect(proc.stdinEnd).toHaveBeenCalledWith("my-secret\nmy-secret\n", "utf8");
+    expect(result.privateKeyPath).toBe(resolvedKeyPath);
+    expect(result.publicKeyPath).toBe(`${resolvedKeyPath}.pub`);
   });
 
-  it("creates .ssh directory with mode 700 if missing", async () => {
+  it("calls ssh-keygen with empty passphrase when requested", async () => {
     vi.mocked(mkdir).mockResolvedValue(undefined);
-    vi.mocked(execFileCb).mockImplementation((_cmd: any, _args: any, cb: any) => {
-      cb(null, "", "");
-      return {} as any;
-    });
+    const proc = mockSshKeygenProcess(0);
 
     await generateKeyPair({
       sshDir: "/home/user/.ssh",
@@ -135,19 +148,50 @@ describe("generateKeyPair", () => {
       passphrase: "",
     });
 
-    expect(mkdir).toHaveBeenCalledWith("/home/user/.ssh", { recursive: true, mode: 0o700 });
+    expect(proc.stdinEnd).toHaveBeenCalledWith("\n\n", "utf8");
   });
 
-  it("throws on ssh-keygen failure", async () => {
+  it("creates .ssh directory with mode 700 if missing", async () => {
     vi.mocked(mkdir).mockResolvedValue(undefined);
-    vi.mocked(execFileCb).mockImplementation((_cmd: any, _args: any, cb: any) => {
-      cb(new Error("ssh-keygen not found"), "", "");
-      return {} as any;
+    mockSshKeygenProcess(0);
+
+    await generateKeyPair({
+      sshDir: "/home/user/.ssh",
+      name: "id_ed25519",
+      passphrase: "",
     });
+
+    expect(mkdir).toHaveBeenCalledWith(path.resolve("/home/user/.ssh"), { recursive: true, mode: 0o700 });
+  });
+
+  it("throws when key name is invalid", async () => {
+    await expect(
+      generateKeyPair({ sshDir: "/home/user/.ssh", name: "../bad", passphrase: "" })
+    ).rejects.toThrow("invalid characters");
+  });
+
+  it("throws when passphrase contains newlines", async () => {
+    await expect(
+      generateKeyPair({ sshDir: "/home/user/.ssh", name: "id_ed25519", passphrase: "line1\nline2" })
+    ).rejects.toThrow("Passphrase cannot contain newlines");
+  });
+
+  it("throws when key path already exists", async () => {
+    vi.mocked(mkdir).mockResolvedValue(undefined);
+    vi.mocked(access).mockResolvedValue(undefined);
 
     await expect(
       generateKeyPair({ sshDir: "/home/user/.ssh", name: "id_ed25519", passphrase: "" })
-    ).rejects.toThrow("ssh-keygen not found");
+    ).rejects.toThrow("Key already exists");
+  });
+
+  it("throws on ssh-keygen non-zero exit", async () => {
+    vi.mocked(mkdir).mockResolvedValue(undefined);
+    mockSshKeygenProcess(1, "", "permission denied");
+
+    await expect(
+      generateKeyPair({ sshDir: "/home/user/.ssh", name: "id_ed25519", passphrase: "" })
+    ).rejects.toThrow("ssh-keygen failed");
   });
 });
 
@@ -247,9 +291,15 @@ describe("deployPublicKeyToRemote", () => {
     await expect(deployPublicKeyToRemote(conn, "   ")).rejects.toThrow("Public key content is empty");
   });
 
-  it("throws on key with unexpected characters", async () => {
+  it("rejects multi-line key content to prevent heredoc break-out", async () => {
     const conn = mockConnection([]);
-    await expect(deployPublicKeyToRemote(conn, "ssh-ed25519 AAAA'; rm -rf /"))
-      .rejects.toThrow("unexpected characters");
+    await expect(
+      deployPublicKeyToRemote(conn, "ssh-ed25519 AAAA comment\nNEXUS_KEY_EOF\nrm -rf /")
+    ).rejects.toThrow("single line");
+  });
+
+  it("rejects invalid public key format", async () => {
+    const conn = mockConnection([]);
+    await expect(deployPublicKeyToRemote(conn, "not-a-valid-public-key")).rejects.toThrow("format is invalid");
   });
 });

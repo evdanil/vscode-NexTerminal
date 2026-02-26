@@ -121,6 +121,131 @@ function isValidProxyPort(port: number): boolean {
   return Number.isInteger(port) && port >= 1 && port <= 65535;
 }
 
+const DEPLOY_DEFAULT_KEY_NAME = "id_ed25519";
+const DEPLOY_FALLBACK_KEY_NAME = "id_ed25519_nexus";
+const DEPLOY_KEY_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+function validateDeployKeyNameInput(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "Name cannot be empty";
+  }
+  if (trimmed === "." || trimmed === "..") {
+    return "Name cannot be '.' or '..'";
+  }
+  if (!DEPLOY_KEY_NAME_PATTERN.test(trimmed)) {
+    return "Name can only contain letters, numbers, '.', '_' and '-'";
+  }
+  return null;
+}
+
+interface SelectedDeployKey {
+  publicKeyPath: string;
+  privateKeyPath: string;
+}
+
+async function pickPassphraseForGeneratedKey(): Promise<string | undefined> {
+  const passChoice = await vscode.window.showQuickPick(
+    [
+      { label: "No passphrase", description: "Key will not be encrypted", passphrase: "" },
+      {
+        label: "Set passphrase",
+        description: "Encrypt the private key",
+        passphrase: undefined as string | undefined
+      }
+    ],
+    { title: "Key Passphrase" }
+  );
+  if (!passChoice) {
+    return undefined;
+  }
+  if (passChoice.passphrase !== undefined) {
+    return passChoice.passphrase;
+  }
+  const passphrase = await vscode.window.showInputBox({
+    title: "Enter Passphrase",
+    password: true,
+    prompt: "Enter passphrase for the new key"
+  });
+  if (passphrase === undefined) {
+    return undefined;
+  }
+  const confirm = await vscode.window.showInputBox({
+    title: "Confirm Passphrase",
+    password: true,
+    prompt: "Re-enter passphrase to confirm"
+  });
+  if (confirm === undefined || confirm !== passphrase) {
+    void vscode.window.showErrorMessage("Passphrases do not match.");
+    return undefined;
+  }
+  return passphrase;
+}
+
+async function pickDeployKeyName(sshDir: string): Promise<string | undefined> {
+  let keyName = DEPLOY_DEFAULT_KEY_NAME;
+  try {
+    await readFile(path.join(sshDir, `${DEPLOY_DEFAULT_KEY_NAME}.pub`));
+    const custom = await vscode.window.showInputBox({
+      title: "Key Name",
+      prompt: `${DEPLOY_DEFAULT_KEY_NAME} already exists. Enter a name for the new key`,
+      value: DEPLOY_FALLBACK_KEY_NAME,
+      validateInput: validateDeployKeyNameInput
+    });
+    if (!custom) {
+      return undefined;
+    }
+    keyName = custom.trim();
+  } catch {
+    // Default name available
+  }
+  return keyName;
+}
+
+async function pickKeyForDeployment(sshDir: string): Promise<SelectedDeployKey | undefined> {
+  const keyPairs = await findLocalKeyPairs(sshDir);
+
+  type KeyPickItem = vscode.QuickPickItem & { keyPair?: KeyPairInfo; generate?: boolean };
+  const items: KeyPickItem[] = keyPairs.map((keyPair) => ({
+    label: keyPair.name,
+    description: keyPair.publicKeyPath,
+    keyPair
+  }));
+  items.push({ label: "$(add) Generate new ed25519 key", generate: true });
+
+  const pick = await vscode.window.showQuickPick(items, {
+    title: "Deploy SSH Key",
+    placeHolder: "Select an existing key or generate a new one"
+  });
+  if (!pick) {
+    return undefined;
+  }
+  if (!pick.generate) {
+    if (!pick.keyPair) {
+      return undefined;
+    }
+    return {
+      publicKeyPath: pick.keyPair.publicKeyPath,
+      privateKeyPath: pick.keyPair.privateKeyPath
+    };
+  }
+
+  const keyName = await pickDeployKeyName(sshDir);
+  if (!keyName) {
+    return undefined;
+  }
+  const passphrase = await pickPassphraseForGeneratedKey();
+  if (passphrase === undefined) {
+    return undefined;
+  }
+
+  const generated = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Generating SSH key..." },
+    () => generateKeyPair({ sshDir, name: keyName, passphrase })
+  );
+  return { publicKeyPath: generated.publicKeyPath, privateKeyPath: generated.privateKeyPath };
+}
+
 export function formValuesToProxy(values: FormValues): ProxyConfig | undefined {
   const proxyType = typeof values.proxyType === "string" ? values.proxyType : "none";
   if (proxyType === "none") return undefined;
@@ -500,101 +625,30 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
 
     vscode.commands.registerCommand("nexus.server.deployKey", async (arg?: unknown) => {
       const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
-      if (!server) return;
+      if (!server) {
+        return;
+      }
 
       const sshDir = defaultSshDir();
-      const keyPairs = await findLocalKeyPairs(sshDir);
-
-      type KeyPickItem = vscode.QuickPickItem & { keyPair?: KeyPairInfo; generate?: boolean };
-      const items: KeyPickItem[] = keyPairs.map((kp) => ({
-        label: kp.name,
-        description: kp.publicKeyPath,
-        keyPair: kp,
-      }));
-      items.push({ label: "$(add) Generate new ed25519 key", generate: true });
-
-      const pick = await vscode.window.showQuickPick(items, {
-        title: `Deploy SSH Key to ${server.name}`,
-        placeHolder: "Select an existing key or generate a new one",
-      });
-      if (!pick) return;
-
-      let publicKeyPath: string;
-
-      if (pick.generate) {
-        const defaultName = "id_ed25519";
-        let keyName = defaultName;
-        try {
-          await readFile(path.join(sshDir, `${defaultName}.pub`));
-          const custom = await vscode.window.showInputBox({
-            title: "Key Name",
-            prompt: `${defaultName} already exists. Enter a name for the new key`,
-            value: "id_ed25519_nexus",
-            validateInput: (v) => {
-              const trimmed = v.trim();
-              if (!trimmed) return "Name cannot be empty";
-              if (/[/\\]/.test(trimmed)) return "Name cannot contain path separators";
-              return null;
-            },
-          });
-          if (!custom) return;
-          keyName = custom.trim();
-        } catch {
-          // Default name available
-        }
-
-        const passChoice = await vscode.window.showQuickPick(
-          [
-            { label: "No passphrase", description: "Key will not be encrypted", passphrase: "" },
-            {
-              label: "Set passphrase",
-              description: "Encrypt the private key",
-              passphrase: undefined as string | undefined,
-            },
-          ],
-          { title: "Key Passphrase" },
-        );
-        if (!passChoice) return;
-
-        let passphrase = passChoice.passphrase ?? "";
-        if (passChoice.passphrase === undefined) {
-          const pp = await vscode.window.showInputBox({
-            title: "Enter Passphrase",
-            password: true,
-            prompt: "Enter passphrase for the new key",
-          });
-          if (pp === undefined) return;
-          const confirm = await vscode.window.showInputBox({
-            title: "Confirm Passphrase",
-            password: true,
-            prompt: "Re-enter passphrase to confirm",
-          });
-          if (confirm === undefined || confirm !== pp) {
-            void vscode.window.showErrorMessage("Passphrases do not match.");
-            return;
-          }
-          passphrase = pp;
-        }
-
-        try {
-          const result = await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: "Generating SSH key..." },
-            () => generateKeyPair({ sshDir, name: keyName, passphrase }),
-          );
-          publicKeyPath = result.publicKeyPath;
-        } catch (err: any) {
-          void vscode.window.showErrorMessage(`Key generation failed: ${err?.message ?? err}`);
-          return;
-        }
-      } else {
-        publicKeyPath = pick.keyPair!.publicKeyPath;
+      let selectedKey: SelectedDeployKey | undefined;
+      try {
+        selectedKey = await pickKeyForDeployment(sshDir);
+      } catch (error: any) {
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(`Key selection failed: ${message}`);
+        return;
       }
+      if (!selectedKey) {
+        return;
+      }
+      const { publicKeyPath, privateKeyPath } = selectedKey;
 
       let pubKeyContent: string;
       try {
-        pubKeyContent = (await readFile(publicKeyPath, "utf-8")).trim();
-      } catch (err: any) {
-        void vscode.window.showErrorMessage(`Cannot read public key: ${err?.message ?? err}`);
+        pubKeyContent = await readFile(publicKeyPath, "utf-8");
+      } catch (error: any) {
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(`Cannot read public key: ${message}`);
         return;
       }
 
@@ -621,7 +675,6 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             switchAction,
           );
           if (response === switchAction) {
-            const privateKeyPath = publicKeyPath.replace(/\.pub$/, "");
             await ctx.core.addOrUpdateServer({ ...server, authType: "key", keyPath: privateKeyPath });
             if (server.authType === "password" && ctx.secretVault) {
               const removeAction = "Remove stored password";

@@ -1,20 +1,20 @@
-import { readdir, mkdir } from "node:fs/promises";
-import { execFile as execFileCb } from "node:child_process";
-import { promisify } from "node:util";
+import { access, readdir, mkdir } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import * as path from "node:path";
 import * as os from "node:os";
 import type { SshConnection } from "./contracts";
 
-const execFile = promisify(execFileCb);
-
 export interface KeyPairInfo {
   name: string;
-  privateKeyPath: string;
   publicKeyPath: string;
+  privateKeyPath: string;
 }
 
 // Ordered by preference: ed25519 first. Iteration order = sort order.
 const KEY_PREFIXES = ["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"];
+const KEY_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+const PUBLIC_KEY_PATTERN = /^(?<type>ssh-(?:ed25519|rsa)|ecdsa-sha2-[A-Za-z0-9-]+)\s+(?<base64>[A-Za-z0-9+/=]+)(?:\s+[^\r\n]*)?$/;
+const SSH_KEYGEN_TIMEOUT_MS = 10_000;
 
 export function defaultSshDir(): string {
   return path.join(os.homedir(), ".ssh");
@@ -51,6 +51,11 @@ export interface GenerateKeyPairOptions {
   passphrase: string;
 }
 
+export interface GeneratedKeyPairPaths {
+  publicKeyPath: string;
+  privateKeyPath: string;
+}
+
 function findSshKeygen(): string {
   if (process.platform === "win32") {
     return "C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe";
@@ -58,15 +63,97 @@ function findSshKeygen(): string {
   return "ssh-keygen";
 }
 
-export async function generateKeyPair(options: GenerateKeyPairOptions): Promise<{ publicKeyPath: string }> {
-  await mkdir(options.sshDir, { recursive: true, mode: 0o700 });
+function normalizeKeyName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    throw new Error("Key name cannot be empty");
+  }
+  if (!KEY_NAME_PATTERN.test(trimmed) || trimmed === "." || trimmed === "..") {
+    throw new Error("Key name contains invalid characters");
+  }
+  return trimmed;
+}
 
-  const keyPath = path.join(options.sshDir, options.name);
-  const args = ["-t", "ed25519", "-f", keyPath, "-N", options.passphrase, "-C", "nexus-terminal"];
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
+    return true;
+  } catch (error: any) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
 
-  await execFile(findSshKeygen(), args);
+async function runSshKeygen(binary: string, keyPath: string, passphrase: string): Promise<void> {
+  const args = ["-q", "-t", "ed25519", "-f", keyPath, "-C", "nexus-terminal"];
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(binary, args, { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      child.kill();
+      reject(new Error("ssh-keygen timed out"));
+    }, SSH_KEYGEN_TIMEOUT_MS);
 
-  return { publicKeyPath: `${keyPath}.pub` };
+    const finish = (error?: Error): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    };
+
+    child.on("error", (error) => {
+      finish(new Error(`Failed to run ssh-keygen: ${error.message}`));
+    });
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdout += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    });
+    child.on("close", (exitCode) => {
+      if (exitCode === 0) {
+        finish();
+        return;
+      }
+      const message = (stderr || stdout || `exit code ${exitCode ?? "unknown"}`).trim();
+      finish(new Error(`ssh-keygen failed: ${message}`));
+    });
+
+    child.stdin.end(`${passphrase}\n${passphrase}\n`, "utf8");
+  });
+}
+
+export async function generateKeyPair(options: GenerateKeyPairOptions): Promise<GeneratedKeyPairPaths> {
+  if (/[\r\n]/.test(options.passphrase)) {
+    throw new Error("Passphrase cannot contain newlines");
+  }
+  const sshDir = path.resolve(options.sshDir);
+  const keyName = normalizeKeyName(options.name);
+  await mkdir(sshDir, { recursive: true, mode: 0o700 });
+
+  const keyPath = path.join(sshDir, keyName);
+  const publicKeyPath = `${keyPath}.pub`;
+  if ((await pathExists(keyPath)) || (await pathExists(publicKeyPath))) {
+    throw new Error(`Key already exists: ${keyName}`);
+  }
+
+  await runSshKeygen(findSshKeygen(), keyPath, options.passphrase);
+
+  return { publicKeyPath, privateKeyPath: keyPath };
 }
 
 export interface ExecResult {
@@ -118,10 +205,16 @@ export async function deployPublicKeyToRemote(
   if (!trimmedKey) {
     throw new Error("Public key content is empty");
   }
+  if (/[\r\n]/.test(trimmedKey)) {
+    throw new Error("Public key must be a single line");
+  }
+  const parsed = PUBLIC_KEY_PATTERN.exec(trimmedKey);
+  if (!parsed?.groups?.type || !parsed.groups.base64) {
+    throw new Error("Public key format is invalid");
+  }
 
   // Extract type+base64 for matching (ignore comment)
-  const keyParts = trimmedKey.split(/\s+/);
-  const matchPattern = keyParts.length >= 2 ? `${keyParts[0]} ${keyParts[1]}` : trimmedKey;
+  const matchPattern = `${parsed.groups.type} ${parsed.groups.base64}`;
 
   // Validate match pattern contains only safe characters for shell interpolation
   if (!/^[A-Za-z0-9+/= @._-]+$/.test(matchPattern)) {
