@@ -88,6 +88,11 @@ export class SerialSessionTreeItem extends vscode.TreeItem {
 }
 
 type NexusTreeItem = FolderTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem;
+type DragItemType = "server" | "serial" | "folder";
+interface DragItemPayload {
+  type: DragItemType;
+  id: string;
+}
 
 export interface NexusTreeCallbacks {
   onTunnelDropped(serverId: string, tunnelProfileId: string): Promise<void>;
@@ -178,7 +183,7 @@ export class NexusTreeProvider
     source: readonly NexusTreeItem[],
     dataTransfer: vscode.DataTransfer
   ): Promise<void> {
-    const items: Array<{ type: string; id: string }> = [];
+    const items: DragItemPayload[] = [];
     for (const item of source) {
       if (item instanceof ServerTreeItem) {
         items.push({ type: "server", id: item.server.id });
@@ -209,11 +214,8 @@ export class NexusTreeProvider
       return;
     }
     const raw = await itemTransfer.asString();
-    let parsedItems: Array<{ type: string; id: string }>;
-    try {
-      const parsed = JSON.parse(raw);
-      parsedItems = Array.isArray(parsed) ? parsed : [parsed];
-    } catch {
+    const parsedItems = this.parseDragItems(raw);
+    if (parsedItems.length === 0) {
       return;
     }
 
@@ -227,17 +229,57 @@ export class NexusTreeProvider
       return;
     }
 
+    const knownFolderPaths = this.collectKnownFolderPaths();
+    const knownServerIds = new Set(this.snapshot.servers.map((server) => server.id));
+    const knownSerialIds = new Set(this.snapshot.serialProfiles.map((profile) => profile.id));
+
     for (const item of parsedItems) {
       if (item.type === "folder") {
+        if (!knownFolderPaths.has(item.id)) {
+          continue;
+        }
         // Reject dropping a folder into itself or a descendant
         if (targetPath && isDescendantOrSelf(targetPath, item.id)) {
           continue;
         }
         await this.callbacks.onFolderMoved(item.id, targetPath);
-      } else if (item.type === "server" || item.type === "serial") {
-        await this.callbacks.onItemGroupChanged(item.type as "server" | "serial", item.id, targetPath);
+      } else if (item.type === "server") {
+        if (!knownServerIds.has(item.id)) {
+          continue;
+        }
+        await this.callbacks.onItemGroupChanged(item.type, item.id, targetPath);
+      } else if (item.type === "serial") {
+        if (!knownSerialIds.has(item.id)) {
+          continue;
+        }
+        await this.callbacks.onItemGroupChanged(item.type, item.id, targetPath);
       }
     }
+  }
+
+  private parseDragItems(raw: string): DragItemPayload[] {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    const result: DragItemPayload[] = [];
+    for (const item of items) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const type = (item as { type?: unknown }).type;
+      const id = (item as { id?: unknown }).id;
+      if ((type === "server" || type === "serial" || type === "folder") && typeof id === "string") {
+        const normalizedId = id.trim();
+        if (normalizedId.length > 0) {
+          result.push({ type, id: normalizedId });
+        }
+      }
+    }
+    return result;
   }
 
   private async extractTunnelProfileId(dataTransfer: vscode.DataTransfer): Promise<string | undefined> {
@@ -273,28 +315,35 @@ export class NexusTreeProvider
     return this.snapshot.tunnels.some((tunnel) => tunnel.id === id);
   }
 
-  private getFolderChildren(parentPath: string | undefined): NexusTreeItem[] {
-    // Collect all folder paths from explicitGroups + item groups, synthesizing ancestors
-    const allPaths = new Set<string>();
-    for (const g of this.snapshot.explicitGroups) {
-      for (const ancestor of getAncestorPaths(g)) {
-        allPaths.add(ancestor);
+  private collectKnownFolderPaths(): Set<string> {
+    const paths = new Set<string>();
+    for (const group of this.snapshot.explicitGroups) {
+      for (const ancestor of getAncestorPaths(group)) {
+        paths.add(ancestor);
       }
     }
     for (const server of this.snapshot.servers) {
-      if (server.group) {
-        for (const ancestor of getAncestorPaths(server.group)) {
-          allPaths.add(ancestor);
-        }
+      if (!server.group) {
+        continue;
+      }
+      for (const ancestor of getAncestorPaths(server.group)) {
+        paths.add(ancestor);
       }
     }
     for (const profile of this.snapshot.serialProfiles) {
-      if (profile.group) {
-        for (const ancestor of getAncestorPaths(profile.group)) {
-          allPaths.add(ancestor);
-        }
+      if (!profile.group) {
+        continue;
+      }
+      for (const ancestor of getAncestorPaths(profile.group)) {
+        paths.add(ancestor);
       }
     }
+    return paths;
+  }
+
+  private getFolderChildren(parentPath: string | undefined): NexusTreeItem[] {
+    // Collect all folder paths from explicitGroups + item groups, synthesizing ancestors
+    const allPaths = this.collectKnownFolderPaths();
 
     // Find direct child folders at this level
     const childFolderNames = new Set<string>();

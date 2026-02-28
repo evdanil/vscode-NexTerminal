@@ -303,6 +303,24 @@ describe("authProfileCommands", () => {
     expect(mockShowQuickPick).not.toHaveBeenCalled();
   });
 
+  it("applyToServer falls back to arg when allSelected has no command center items", async () => {
+    const profile = makeAuthProfile({ id: "ap1", username: "deploy", authType: "password" });
+    const server = makeServer({ id: "s1" });
+    const { ctx, core } = await setupContext({
+      servers: [server],
+      authProfiles: [profile],
+      withVault: false
+    });
+    registerAuthProfileCommands(ctx);
+
+    mockShowQuickPick.mockResolvedValue({ profile });
+
+    const cmd = registeredCommands.get("nexus.authProfile.applyToServer");
+    await cmd!(new ServerTreeItem(server), [{ bogus: true }]);
+
+    expect(core.getServer("s1")?.username).toBe("deploy");
+  });
+
   it("applyToServer multi-select canceled by user does not apply", async () => {
     const profile = makeAuthProfile({ id: "ap1", username: "deploy", authType: "key", keyPath: "/keys/id" });
     const s1 = makeServer({ id: "s1", name: "Server 1" });

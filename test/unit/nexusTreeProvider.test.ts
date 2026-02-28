@@ -315,4 +315,69 @@ describe("NexusTreeProvider multi-item drag", () => {
     expect(onItemGroupChanged).toHaveBeenCalledWith("server", "srv-1", "Production");
     expect(onItemGroupChanged).toHaveBeenCalledWith("server", "srv-2", "Production");
   });
+
+  it("handleDrop supports legacy single-item object payload", async () => {
+    const onItemGroupChanged = vi.fn(async () => {});
+    const callbacks = {
+      onTunnelDropped: vi.fn(async () => {}),
+      onItemGroupChanged,
+      onFolderMoved: vi.fn(async () => {})
+    };
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      servers: [makeServer({ id: "srv-1" })],
+      tunnels: [],
+      serialProfiles: [],
+      activeSessions: [],
+      activeSerialSessions: [],
+      activeTunnels: [],
+      remoteTunnels: [],
+      explicitGroups: [],
+      authProfiles: []
+    });
+
+    const target = new FolderTreeItem("Production");
+    const payload = JSON.stringify({ type: "server", id: "srv-1" });
+    await provider.handleDrop(target, makeTransfer({ [ITEM_DRAG_MIME]: payload }) as any);
+
+    expect(onItemGroupChanged).toHaveBeenCalledTimes(1);
+    expect(onItemGroupChanged).toHaveBeenCalledWith("server", "srv-1", "Production");
+  });
+
+  it("handleDrop ignores malformed and unknown payload entries", async () => {
+    const onItemGroupChanged = vi.fn(async () => {});
+    const onFolderMoved = vi.fn(async () => {});
+    const callbacks = {
+      onTunnelDropped: vi.fn(async () => {}),
+      onItemGroupChanged,
+      onFolderMoved
+    };
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      servers: [makeServer({ id: "srv-1" })],
+      tunnels: [],
+      serialProfiles: [],
+      activeSessions: [],
+      activeSerialSessions: [],
+      activeTunnels: [],
+      remoteTunnels: [],
+      explicitGroups: ["Production"],
+      authProfiles: []
+    });
+
+    const payload = JSON.stringify([
+      null,
+      { type: "server", id: "" },
+      { type: "server", id: "missing" },
+      { type: "folder", id: "Unknown" },
+      { type: "server", id: "srv-1" },
+      { type: "folder", id: "Production" }
+    ]);
+    await provider.handleDrop(undefined, makeTransfer({ [ITEM_DRAG_MIME]: payload }) as any);
+
+    expect(onItemGroupChanged).toHaveBeenCalledTimes(1);
+    expect(onItemGroupChanged).toHaveBeenCalledWith("server", "srv-1", undefined);
+    expect(onFolderMoved).toHaveBeenCalledTimes(1);
+    expect(onFolderMoved).toHaveBeenCalledWith("Production", undefined);
+  });
 });

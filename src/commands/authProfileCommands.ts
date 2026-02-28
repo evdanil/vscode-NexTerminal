@@ -10,10 +10,13 @@ type CommandCenterItem = FolderTreeItem | ServerTreeItem;
 
 function resolveCommandCenterItems(arg: unknown, allSelected: unknown): CommandCenterItem[] {
   if (Array.isArray(allSelected) && allSelected.length > 0) {
-    return allSelected.filter(
+    const selectedItems = allSelected.filter(
       (item): item is CommandCenterItem =>
         item instanceof FolderTreeItem || item instanceof ServerTreeItem
     );
+    if (selectedItems.length > 0) {
+      return selectedItems;
+    }
   }
   if (arg instanceof FolderTreeItem || arg instanceof ServerTreeItem) {
     return [arg];
