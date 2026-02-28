@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 
@@ -150,6 +150,40 @@ describe("NexusCore", () => {
 
     core.unregisterTunnel("active-1");
     expect(core.getSnapshot().activeTunnels).toHaveLength(0);
+  });
+
+  it("does not emit change when tunnel traffic counters are unchanged", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addOrUpdateTunnel({
+      id: "t1",
+      name: "Redis",
+      localPort: 6379,
+      remoteIP: "127.0.0.1",
+      remotePort: 6379,
+      autoStart: false
+    });
+
+    core.registerTunnel({
+      id: "active-1",
+      profileId: "t1",
+      serverId: "s1",
+      localPort: 6379,
+      remoteIP: "127.0.0.1",
+      remotePort: 6379,
+      startedAt: Date.now(),
+      bytesIn: 128,
+      bytesOut: 256,
+      connectionMode: "isolated"
+    });
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    core.updateTunnelTraffic("active-1", 128, 256);
+    expect(listener).not.toHaveBeenCalled();
   });
 
   it("manages explicit groups", async () => {

@@ -162,7 +162,7 @@ export class SettingsTreeProvider
       items.push(new SettingsCategoryItem(cat));
     }
 
-    // 2 link items
+    // 3 link items
     items.push(
       new SettingsLinkItem("Terminal Appearance", "nexus.terminal.appearance", "paintcan", "Customize terminal colors and fonts")
     );

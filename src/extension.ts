@@ -28,6 +28,7 @@ import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
 import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
 import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
+import { createCoalescedInvoker } from "./utils/coalescedInvoker";
 import { registerSettingsCommands } from "./commands/settingsCommands";
 import { registerConfigCommands } from "./commands/configCommands";
 import { registerMacroCommands, updateMacroContext, migrateMacroSlots } from "./commands/macroCommands";
@@ -355,15 +356,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       fileExplorerProvider.clearActiveServer();
     }
   };
-  let syncTimer: ReturnType<typeof setTimeout> | undefined;
+  const viewSync = createCoalescedInvoker(syncViewsImmediate, 150);
   const syncViews = (): void => {
-    if (syncTimer !== undefined) {
-      return;
-    }
-    syncTimer = setTimeout(() => {
-      syncTimer = undefined;
-      syncViewsImmediate();
-    }, 150);
+    viewSync.schedule();
   };
   syncViewsImmediate();
 
@@ -438,7 +433,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const refreshCommand = vscode.commands.registerCommand("nexus.refresh", async () => {
     await core.initialize();
-    syncViewsImmediate();
+    viewSync.flush();
   });
 
   const windowFocusListener = vscode.window.onDidChangeWindowState((state) => {
@@ -529,6 +524,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void tunnelManager.stopAll();
         registrySync.dispose();
         void registrySync.cleanupOwnEntries();
+        viewSync.dispose();
         pool.dispose();
       }
     }
