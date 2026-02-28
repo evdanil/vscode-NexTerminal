@@ -84,10 +84,10 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 9 root items", () => {
+    it("returns 10 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(9);
+      expect(roots).toHaveLength(10);
     });
 
     it("has 6 category items first", () => {
@@ -99,13 +99,14 @@ describe("SettingsTreeProvider", () => {
         .toEqual(["logging", "ssh", "tunnels", "terminal", "sftp", "highlighting"]);
     });
 
-    it("has 2 link items for Appearance and Macros", () => {
+    it("has 3 link items for Appearance, Macros, and Auth Profiles", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const links = roots.filter((r) => r instanceof SettingsLinkItem);
-      expect(links).toHaveLength(2);
+      expect(links).toHaveLength(3);
       expect(links[0].label).toBe("Terminal Appearance");
       expect(links[1].label).toBe("Macros");
+      expect(links[2].label).toBe("Auth Profiles");
     });
 
     it("has 1 Data Management group", () => {

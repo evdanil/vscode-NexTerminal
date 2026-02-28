@@ -697,12 +697,12 @@
           "group": "1_manage@1"
         },
         {
-          "command": "nexus.profile.add",
+          "command": "nexus.group.add",
           "when": "view == nexusCommandCenter && viewItem == nexus.folder",
           "group": "1_manage@2"
         },
         {
-          "command": "nexus.group.add",
+          "command": "nexus.profile.add",
           "when": "view == nexusCommandCenter && viewItem == nexus.folder",
           "group": "1_manage@3"
         },

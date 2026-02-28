@@ -169,6 +169,9 @@ export class SettingsTreeProvider
     items.push(
       new SettingsLinkItem("Macros", "nexus.macro.editor", "record-keys", "Open the macro editor")
     );
+    items.push(
+      new SettingsLinkItem("Auth Profiles", "nexus.authProfile.manage", "key", "Create and manage reusable credential templates")
+    );
 
     // 1 data management group
     items.push(new DataManagementGroupItem());
