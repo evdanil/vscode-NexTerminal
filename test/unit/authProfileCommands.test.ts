@@ -6,14 +6,15 @@ import { authProfilePasswordSecretKey, passwordSecretKey } from "../../src/servi
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { registerAuthProfileCommands } from "../../src/commands/authProfileCommands";
 import { FolderTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
-import { WebviewFormPanel } from "../../src/ui/webviewFormPanel";
+import { AuthProfileEditorPanel } from "../../src/ui/authProfileEditorPanel";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
 const mockShowWarningMessage = vi.fn();
 const mockShowInformationMessage = vi.fn();
 const mockWithProgress = vi.fn();
-const openPanel = vi.fn();
+const mockOpen = vi.fn();
+const mockOpenNew = vi.fn();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -57,14 +58,11 @@ vi.mock("vscode", () => ({
   ProgressLocation: { Notification: 15 }
 }));
 
-vi.mock("../../src/ui/webviewFormPanel", () => ({
-  WebviewFormPanel: {
-    open: (...args: unknown[]) => openPanel(...args)
+vi.mock("../../src/ui/authProfileEditorPanel", () => ({
+  AuthProfileEditorPanel: {
+    open: (...args: unknown[]) => mockOpen(...args),
+    openNew: (...args: unknown[]) => mockOpenNew(...args)
   }
-}));
-
-vi.mock("../../src/commands/serverCommands", () => ({
-  browseForKey: vi.fn(async () => undefined)
 }));
 
 function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
@@ -157,6 +155,28 @@ describe("authProfileCommands", () => {
     mockWithProgress.mockImplementation(async (_opts: unknown, task: () => Promise<void>) => task());
   });
 
+  it("add command opens editor in new mode", async () => {
+    const { ctx } = await setupContext();
+    registerAuthProfileCommands(ctx);
+
+    const cmd = registeredCommands.get("nexus.authProfile.add");
+    expect(cmd).toBeDefined();
+    cmd!();
+
+    expect(mockOpenNew).toHaveBeenCalledWith(ctx.core, ctx.secretVault);
+  });
+
+  it("manage command opens editor", async () => {
+    const { ctx } = await setupContext();
+    registerAuthProfileCommands(ctx);
+
+    const cmd = registeredCommands.get("nexus.authProfile.manage");
+    expect(cmd).toBeDefined();
+    cmd!();
+
+    expect(mockOpen).toHaveBeenCalledWith(ctx.core, ctx.secretVault);
+  });
+
   it("applies auth profile to folder even when secretVault is unavailable", async () => {
     const { ctx, core } = await setupContext({
       withVault: false,
@@ -176,52 +196,6 @@ describe("authProfileCommands", () => {
     expect(core.getServer("s1")?.authType).toBe("key");
     expect(core.getServer("s1")?.keyPath).toBe("/keys/id_ed25519");
     expect(core.getServer("s2")?.username).toBe("stay");
-  });
-
-  it("manage edit deletes stored profile secret when switching to non-password auth", async () => {
-    const profile = makeAuthProfile({ id: "ap1", authType: "password" });
-    const { ctx, core, vault } = await setupContext({
-      authProfiles: [profile],
-      withVault: true,
-      initialSecrets: { [authProfilePasswordSecretKey("ap1")]: "old-secret" }
-    });
-    registerAuthProfileCommands(ctx);
-
-    mockShowQuickPick.mockResolvedValue({ action: "edit", profile });
-    const manage = registeredCommands.get("nexus.authProfile.manage");
-    expect(manage).toBeDefined();
-    await manage!();
-
-    expect(openPanel).toHaveBeenCalled();
-    const options = openPanel.mock.calls[0][2];
-    await options.onSubmit({
-      name: "Prod Auth",
-      username: "root",
-      authType: "key",
-      keyPath: "/keys/id_ed25519"
-    });
-
-    expect(vault?.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
-    expect(core.getAuthProfile("ap1")?.authType).toBe("key");
-  });
-
-  it("manage delete removes auth profile secret from vault", async () => {
-    const profile = makeAuthProfile({ id: "ap1" });
-    const { ctx, core, vault } = await setupContext({
-      authProfiles: [profile],
-      withVault: true
-    });
-    registerAuthProfileCommands(ctx);
-
-    mockShowQuickPick.mockResolvedValue({ action: "delete", profile });
-    mockShowWarningMessage.mockResolvedValue("Delete");
-
-    const manage = registeredCommands.get("nexus.authProfile.manage");
-    expect(manage).toBeDefined();
-    await manage!();
-
-    expect(vault?.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
-    expect(core.getAuthProfile("ap1")).toBeUndefined();
   });
 
   it("applyToServer copies profile password into server password secret", async () => {

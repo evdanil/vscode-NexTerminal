@@ -1,34 +1,10 @@
-import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import type { AuthProfile, AuthType } from "../models/config";
-import { authProfileFormDefinition } from "../ui/formDefinitions";
-import type { FormValues } from "../ui/formTypes";
+import type { AuthProfile } from "../models/config";
 import { FolderTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
-import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import { AuthProfileEditorPanel } from "../ui/authProfileEditorPanel";
 import { authProfilePasswordSecretKey, passwordSecretKey } from "../services/ssh/silentAuth";
 import { isDescendantOrSelf } from "../utils/folderPaths";
-import { browseForKey } from "./serverCommands";
 import type { CommandContext } from "./types";
-
-const VALID_AUTH_TYPES = new Set<string>(["password", "key", "agent"]);
-function isAuthType(value: unknown): value is AuthType {
-  return typeof value === "string" && VALID_AUTH_TYPES.has(value);
-}
-
-function formValuesToAuthProfile(values: FormValues, existingId?: string): AuthProfile | undefined {
-  const name = typeof values.name === "string" ? values.name.trim() : "";
-  const username = typeof values.username === "string" ? values.username.trim() : "";
-  if (!name || !username) {
-    return undefined;
-  }
-  return {
-    id: existingId ?? randomUUID(),
-    name,
-    username,
-    authType: isAuthType(values.authType) ? values.authType : "password",
-    keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined
-  };
-}
 
 async function pickAuthProfile(ctx: CommandContext): Promise<AuthProfile | undefined> {
   const profiles = ctx.core.getSnapshot().authProfiles;
@@ -77,99 +53,11 @@ async function applyAuthProfileToServers(
 export function registerAuthProfileCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.authProfile.add", () => {
-      const definition = authProfileFormDefinition();
-      WebviewFormPanel.open("authProfile-add", definition, {
-        onSubmit: async (values) => {
-          const profile = formValuesToAuthProfile(values);
-          if (!profile) {
-            return;
-          }
-          await ctx.core.addOrUpdateAuthProfile(profile);
-          const password = typeof values.password === "string" ? values.password : "";
-          if (ctx.secretVault) {
-            const key = authProfilePasswordSecretKey(profile.id);
-            if (profile.authType === "password" && password) {
-              await ctx.secretVault.store(key, password);
-            } else {
-              await ctx.secretVault.delete(key);
-            }
-          }
-          void vscode.window.showInformationMessage(`Auth profile "${profile.name}" created.`);
-        },
-        onBrowse: browseForKey
-      });
+      AuthProfileEditorPanel.openNew(ctx.core, ctx.secretVault);
     }),
 
-    vscode.commands.registerCommand("nexus.authProfile.manage", async () => {
-      const profiles = ctx.core.getSnapshot().authProfiles;
-      if (profiles.length === 0) {
-        const create = await vscode.window.showInformationMessage(
-          "No auth profiles configured.",
-          "Create One"
-        );
-        if (create === "Create One") {
-          void vscode.commands.executeCommand("nexus.authProfile.add");
-        }
-        return;
-      }
-
-      type ProfilePickItem = vscode.QuickPickItem & { profile: AuthProfile; action?: "edit" | "delete" };
-      const items: ProfilePickItem[] = [];
-      for (const p of profiles) {
-        items.push(
-          { label: `$(edit) Edit: ${p.name}`, description: `${p.authType} — ${p.username}`, profile: p, action: "edit" },
-          { label: `$(trash) Delete: ${p.name}`, description: `${p.authType} — ${p.username}`, profile: p, action: "delete" }
-        );
-      }
-
-      const pick = await vscode.window.showQuickPick(items, { title: "Manage Auth Profiles" });
-      if (!pick) {
-        return;
-      }
-
-      if (pick.action === "delete") {
-        const confirm = await vscode.window.showWarningMessage(
-          `Delete auth profile "${pick.profile.name}"?`,
-          { modal: true },
-          "Delete"
-        );
-        if (confirm !== "Delete") {
-          return;
-        }
-        if (ctx.secretVault) {
-          await ctx.secretVault.delete(authProfilePasswordSecretKey(pick.profile.id));
-        }
-        await ctx.core.removeAuthProfile(pick.profile.id);
-        void vscode.window.showInformationMessage(`Auth profile "${pick.profile.name}" deleted.`);
-        return;
-      }
-
-      // Edit
-      const existing = pick.profile;
-      const definition = authProfileFormDefinition(existing);
-      WebviewFormPanel.open("authProfile-edit", definition, {
-        onSubmit: async (values) => {
-          const updated = formValuesToAuthProfile(values, existing.id);
-          if (!updated) {
-            return;
-          }
-          await ctx.core.addOrUpdateAuthProfile(updated);
-          const password = typeof values.password === "string" ? values.password : "";
-          if (ctx.secretVault) {
-            const key = authProfilePasswordSecretKey(updated.id);
-            if (updated.authType !== "password") {
-              await ctx.secretVault.delete(key);
-            } else if (password) {
-              await ctx.secretVault.store(key, password);
-            } else if (existing.authType !== "password") {
-              // Don't retain stale password when switching from key/agent to password with no new secret.
-              await ctx.secretVault.delete(key);
-            }
-          }
-          void vscode.window.showInformationMessage(`Auth profile "${updated.name}" updated.`);
-        },
-        onBrowse: browseForKey
-      });
+    vscode.commands.registerCommand("nexus.authProfile.manage", () => {
+      AuthProfileEditorPanel.open(ctx.core, ctx.secretVault);
     }),
 
     vscode.commands.registerCommand("nexus.authProfile.applyToFolder", async (arg?: unknown) => {

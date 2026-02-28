@@ -8,6 +8,7 @@ import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { serverFormDefinition } from "../ui/formDefinitions";
+import { AuthProfileEditorPanel } from "../ui/authProfileEditorPanel";
 import { authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
@@ -507,7 +508,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const snapshot = ctx.core.getSnapshot();
       const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
       const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
-      WebviewFormPanel.open("server-edit", definition, {
+      const panel = WebviewFormPanel.open("server-edit", definition, {
         onSubmit: async (values) => {
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
@@ -533,6 +534,20 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           }
         },
         onBrowse: browseForKey,
+        onCreateInline: (key) => {
+          if (key === "authProfileId") {
+            AuthProfileEditorPanel.openNew(ctx.core, ctx.secretVault);
+            const knownIds = new Set(snapshot.authProfiles.map((p) => p.id));
+            const unsub = ctx.core.onDidChange(() => {
+              const newProfiles = ctx.core.getSnapshot().authProfiles;
+              const added = newProfiles.find((p) => !knownIds.has(p.id));
+              if (added) {
+                panel.addSelectOption("authProfileId", added.id, `${added.name} — ${added.authType} — ${added.username}`);
+                unsub();
+              }
+            });
+          }
+        },
         onAutofill: async (_key, value) => {
           const profile = ctx.core.getAuthProfile(value);
           if (!profile) {
