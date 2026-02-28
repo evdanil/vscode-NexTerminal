@@ -291,7 +291,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
     treeDataProvider: nexusTreeProvider,
     dragAndDropController: nexusTreeProvider,
-    showCollapseAll: true
+    showCollapseAll: true,
+    canSelectMany: true
   });
   const collapseListener = commandCenterView.onDidCollapseElement((e) => {
     handleFolderStateChange(e.element, true);

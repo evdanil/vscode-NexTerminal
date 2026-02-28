@@ -1,10 +1,49 @@
 import * as vscode from "vscode";
-import type { AuthProfile } from "../models/config";
+import type { AuthProfile, ServerConfig } from "../models/config";
 import { FolderTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { AuthProfileEditorPanel } from "../ui/authProfileEditorPanel";
 import { authProfilePasswordSecretKey, passwordSecretKey } from "../services/ssh/silentAuth";
 import { isDescendantOrSelf } from "../utils/folderPaths";
 import type { CommandContext } from "./types";
+
+type CommandCenterItem = FolderTreeItem | ServerTreeItem;
+
+function resolveCommandCenterItems(arg: unknown, allSelected: unknown): CommandCenterItem[] {
+  if (Array.isArray(allSelected) && allSelected.length > 0) {
+    return allSelected.filter(
+      (item): item is CommandCenterItem =>
+        item instanceof FolderTreeItem || item instanceof ServerTreeItem
+    );
+  }
+  if (arg instanceof FolderTreeItem || arg instanceof ServerTreeItem) {
+    return [arg];
+  }
+  return [];
+}
+
+function collectServersFromSelection(
+  items: CommandCenterItem[],
+  allServers: ServerConfig[]
+): ServerConfig[] {
+  const seen = new Set<string>();
+  const result: ServerConfig[] = [];
+  for (const item of items) {
+    if (item instanceof ServerTreeItem) {
+      if (!seen.has(item.server.id)) {
+        seen.add(item.server.id);
+        result.push(item.server);
+      }
+    } else if (item instanceof FolderTreeItem) {
+      for (const s of allServers) {
+        if (s.group && isDescendantOrSelf(s.group, item.folderPath) && !seen.has(s.id)) {
+          seen.add(s.id);
+          result.push(s);
+        }
+      }
+    }
+  }
+  return result;
+}
 
 async function pickAuthProfile(ctx: CommandContext): Promise<AuthProfile | undefined> {
   const profiles = ctx.core.getSnapshot().authProfiles;
@@ -23,6 +62,15 @@ async function pickAuthProfile(ctx: CommandContext): Promise<AuthProfile | undef
   return pick?.profile;
 }
 
+async function confirmApply(profile: AuthProfile, count: number): Promise<boolean> {
+  const confirm = await vscode.window.showWarningMessage(
+    `Apply "${profile.name}" to ${count} server(s)?\nThis overwrites their authentication settings.`,
+    { modal: true },
+    "Apply"
+  );
+  return confirm === "Apply";
+}
+
 async function applyAuthProfileToServers(
   ctx: CommandContext,
   profile: AuthProfile,
@@ -32,8 +80,9 @@ async function applyAuthProfileToServers(
     ? await ctx.secretVault.get(authProfilePasswordSecretKey(profile.id))
     : undefined;
   for (const server of servers) {
+    const current = ctx.core.getServer(server.id) ?? server;
     const updated = {
-      ...server,
+      ...current,
       username: profile.username,
       authType: profile.authType,
       keyPath: profile.keyPath
@@ -60,28 +109,21 @@ export function registerAuthProfileCommands(ctx: CommandContext): vscode.Disposa
       AuthProfileEditorPanel.open(ctx.core, ctx.secretVault);
     }),
 
-    vscode.commands.registerCommand("nexus.authProfile.applyToFolder", async (arg?: unknown) => {
-      if (!(arg instanceof FolderTreeItem)) {
+    vscode.commands.registerCommand("nexus.authProfile.applyToFolder", async (arg?: unknown, allSelected?: unknown) => {
+      const items = resolveCommandCenterItems(arg, allSelected);
+      if (items.length === 0) {
         return;
       }
-      const folderPath = arg.folderPath;
+      const servers = collectServersFromSelection(items, ctx.core.getSnapshot().servers);
+      if (servers.length === 0) {
+        void vscode.window.showInformationMessage("No servers found in selection.");
+        return;
+      }
       const profile = await pickAuthProfile(ctx);
       if (!profile) {
         return;
       }
-      const servers = ctx.core.getSnapshot().servers.filter(
-        (s) => s.group && isDescendantOrSelf(s.group, folderPath)
-      );
-      if (servers.length === 0) {
-        void vscode.window.showInformationMessage("No servers in this folder.");
-        return;
-      }
-      const confirm = await vscode.window.showWarningMessage(
-        `Apply "${profile.name}" to ${servers.length} server(s) in "${folderPath}"?\nThis overwrites their authentication settings.`,
-        { modal: true },
-        "Apply"
-      );
-      if (confirm !== "Apply") {
+      if (!await confirmApply(profile, servers.length)) {
         return;
       }
       await vscode.window.withProgress(
@@ -91,20 +133,31 @@ export function registerAuthProfileCommands(ctx: CommandContext): vscode.Disposa
       void vscode.window.showInformationMessage(`Applied auth profile "${profile.name}" to ${servers.length} server(s).`);
     }),
 
-    vscode.commands.registerCommand("nexus.authProfile.applyToServer", async (arg?: unknown) => {
-      let server: import("../models/config").ServerConfig | undefined;
-      if (arg instanceof ServerTreeItem) {
-        server = arg.server;
+    vscode.commands.registerCommand("nexus.authProfile.applyToServer", async (arg?: unknown, allSelected?: unknown) => {
+      const items = resolveCommandCenterItems(arg, allSelected);
+      if (items.length === 0) {
+        return;
       }
-      if (!server) {
+      const servers = collectServersFromSelection(items, ctx.core.getSnapshot().servers);
+      if (servers.length === 0) {
         return;
       }
       const profile = await pickAuthProfile(ctx);
       if (!profile) {
         return;
       }
-      await applyAuthProfileToServers(ctx, profile, [server]);
-      void vscode.window.showInformationMessage(`Applied auth profile "${profile.name}" to "${server.name}".`);
+      if (servers.length > 1 && !await confirmApply(profile, servers.length)) {
+        return;
+      }
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Applying auth profile "${profile.name}"...` },
+        () => applyAuthProfileToServers(ctx, profile, servers)
+      );
+      if (servers.length === 1) {
+        void vscode.window.showInformationMessage(`Applied auth profile "${profile.name}" to "${servers[0].name}".`);
+      } else {
+        void vscode.window.showInformationMessage(`Applied auth profile "${profile.name}" to ${servers.length} server(s).`);
+      }
     })
   ];
 }

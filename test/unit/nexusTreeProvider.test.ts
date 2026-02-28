@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
 import { FolderTreeItem, NexusTreeProvider, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
-import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
+import { ITEM_DRAG_MIME, TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
 
 vi.mock("vscode", () => ({
@@ -246,5 +246,73 @@ describe("NexusTreeProvider folder collapse state", () => {
     provider.collapseFolder("Production");
     provider.loadCollapsedFolders(["Staging"]);
     expect(provider.getCollapsedFolders()).toEqual(["Staging"]);
+  });
+});
+
+describe("NexusTreeProvider multi-item drag", () => {
+  it("handleDrag serializes multiple items into an array", async () => {
+    const callbacks = {
+      onTunnelDropped: vi.fn(async () => {}),
+      onItemGroupChanged: vi.fn(async () => {}),
+      onFolderMoved: vi.fn(async () => {})
+    };
+    const provider = new NexusTreeProvider(callbacks);
+
+    const server = makeServer({ id: "srv-1" });
+    const items = [
+      new ServerTreeItem(server, false),
+      new FolderTreeItem("Production")
+    ];
+
+    const stored: Record<string, vscode.DataTransferItem> = {};
+    const dataTransfer = {
+      set: (mime: string, item: vscode.DataTransferItem) => {
+        stored[mime] = item;
+      }
+    };
+
+    await provider.handleDrag(items, dataTransfer as any);
+
+    const raw = await stored[ITEM_DRAG_MIME].asString();
+    const payload = JSON.parse(raw);
+    expect(Array.isArray(payload)).toBe(true);
+    expect(payload).toHaveLength(2);
+    expect(payload[0]).toEqual({ type: "server", id: "srv-1" });
+    expect(payload[1]).toEqual({ type: "folder", id: "Production" });
+  });
+
+  it("handleDrop processes multi-item array payload", async () => {
+    const onItemGroupChanged = vi.fn(async () => {});
+    const callbacks = {
+      onTunnelDropped: vi.fn(async () => {}),
+      onItemGroupChanged,
+      onFolderMoved: vi.fn(async () => {})
+    };
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      servers: [
+        makeServer({ id: "srv-1" }),
+        makeServer({ id: "srv-2", name: "Server 2" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      activeSessions: [],
+      activeSerialSessions: [],
+      activeTunnels: [],
+      remoteTunnels: [],
+      explicitGroups: [],
+      authProfiles: []
+    });
+
+    const target = new FolderTreeItem("Production");
+    const payload = JSON.stringify([
+      { type: "server", id: "srv-1" },
+      { type: "server", id: "srv-2" }
+    ]);
+    await provider.handleDrop(target, makeTransfer({ [ITEM_DRAG_MIME]: payload }) as any);
+
+    expect(onItemGroupChanged).toHaveBeenCalledTimes(2);
+    expect(onItemGroupChanged).toHaveBeenCalledWith("server", "srv-1", "Production");
+    expect(onItemGroupChanged).toHaveBeenCalledWith("server", "srv-2", "Production");
   });
 });

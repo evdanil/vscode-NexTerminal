@@ -198,6 +198,150 @@ describe("authProfileCommands", () => {
     expect(core.getServer("s2")?.username).toBe("stay");
   });
 
+  it("applyToServer with multi-select applies to all selected servers", async () => {
+    const profile = makeAuthProfile({ id: "ap1", username: "deploy", authType: "key", keyPath: "/keys/id" });
+    const s1 = makeServer({ id: "s1", name: "Server 1" });
+    const s2 = makeServer({ id: "s2", name: "Server 2" });
+    const { ctx, core } = await setupContext({
+      servers: [s1, s2],
+      authProfiles: [profile],
+      withVault: false
+    });
+    registerAuthProfileCommands(ctx);
+
+    mockShowQuickPick.mockResolvedValue({ profile });
+    mockShowWarningMessage.mockResolvedValue("Apply");
+
+    const cmd = registeredCommands.get("nexus.authProfile.applyToServer");
+    await cmd!(new ServerTreeItem(s1), [new ServerTreeItem(s1), new ServerTreeItem(s2)]);
+
+    expect(core.getServer("s1")?.username).toBe("deploy");
+    expect(core.getServer("s2")?.username).toBe("deploy");
+    expect(mockShowWarningMessage).toHaveBeenCalled();
+  });
+
+  it("applyToFolder with mixed selection (folder + standalone server)", async () => {
+    const profile = makeAuthProfile({ id: "ap1", username: "deploy", authType: "key", keyPath: "/keys/id" });
+    const s1 = makeServer({ id: "s1", name: "In Folder", group: "Prod" });
+    const s2 = makeServer({ id: "s2", name: "Standalone" });
+    const { ctx, core } = await setupContext({
+      servers: [s1, s2],
+      authProfiles: [profile],
+      withVault: false
+    });
+    registerAuthProfileCommands(ctx);
+
+    mockShowQuickPick.mockResolvedValue({ profile });
+    mockShowWarningMessage.mockResolvedValue("Apply");
+
+    const cmd = registeredCommands.get("nexus.authProfile.applyToFolder");
+    await cmd!(
+      new FolderTreeItem("Prod"),
+      [new FolderTreeItem("Prod"), new ServerTreeItem(s2)]
+    );
+
+    expect(core.getServer("s1")?.username).toBe("deploy");
+    expect(core.getServer("s2")?.username).toBe("deploy");
+  });
+
+  it("deduplicates server selected both directly and via folder", async () => {
+    const profile = makeAuthProfile({ id: "ap1", username: "deploy", authType: "key", keyPath: "/keys/id" });
+    const s1 = makeServer({ id: "s1", name: "Server 1", group: "Prod" });
+    const { ctx, core } = await setupContext({
+      servers: [s1],
+      authProfiles: [profile],
+      withVault: false
+    });
+    registerAuthProfileCommands(ctx);
+
+    mockShowQuickPick.mockResolvedValue({ profile });
+    mockShowWarningMessage.mockResolvedValue("Apply");
+
+    const cmd = registeredCommands.get("nexus.authProfile.applyToFolder");
+    await cmd!(
+      new FolderTreeItem("Prod"),
+      [new FolderTreeItem("Prod"), new ServerTreeItem(s1)]
+    );
+
+    // Should apply once, message says 1 server
+    expect(core.getServer("s1")?.username).toBe("deploy");
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("1 server(s)"),
+      expect.anything(),
+      "Apply"
+    );
+  });
+
+  it("applyToServer single-click backward compat (no confirmation)", async () => {
+    const profile = makeAuthProfile({ id: "ap1", username: "deploy", authType: "password" });
+    const server = makeServer({ id: "s1" });
+    const { ctx, core } = await setupContext({
+      servers: [server],
+      authProfiles: [profile],
+      withVault: false
+    });
+    registerAuthProfileCommands(ctx);
+
+    mockShowQuickPick.mockResolvedValue({ profile });
+
+    const cmd = registeredCommands.get("nexus.authProfile.applyToServer");
+    await cmd!(new ServerTreeItem(server));
+
+    expect(core.getServer("s1")?.username).toBe("deploy");
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("applyToServer with empty selection is a no-op", async () => {
+    const { ctx } = await setupContext({
+      authProfiles: [makeAuthProfile()]
+    });
+    registerAuthProfileCommands(ctx);
+
+    const cmd = registeredCommands.get("nexus.authProfile.applyToServer");
+    await cmd!();
+
+    expect(mockShowQuickPick).not.toHaveBeenCalled();
+  });
+
+  it("applyToServer multi-select canceled by user does not apply", async () => {
+    const profile = makeAuthProfile({ id: "ap1", username: "deploy", authType: "key", keyPath: "/keys/id" });
+    const s1 = makeServer({ id: "s1", name: "Server 1" });
+    const s2 = makeServer({ id: "s2", name: "Server 2" });
+    const { ctx, core } = await setupContext({
+      servers: [s1, s2],
+      authProfiles: [profile],
+      withVault: false
+    });
+    registerAuthProfileCommands(ctx);
+
+    mockShowQuickPick.mockResolvedValue({ profile });
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    const cmd = registeredCommands.get("nexus.authProfile.applyToServer");
+    await cmd!(new ServerTreeItem(s1), [new ServerTreeItem(s1), new ServerTreeItem(s2)]);
+
+    expect(core.getServer("s1")?.username).toBe("old-user");
+    expect(core.getServer("s2")?.username).toBe("old-user");
+  });
+
+  it("applyToServer returns early when profile picker is canceled", async () => {
+    const s1 = makeServer({ id: "s1" });
+    const { ctx, core } = await setupContext({
+      servers: [s1],
+      authProfiles: [makeAuthProfile()],
+      withVault: false
+    });
+    registerAuthProfileCommands(ctx);
+
+    mockShowQuickPick.mockResolvedValue(undefined);
+
+    const cmd = registeredCommands.get("nexus.authProfile.applyToServer");
+    await cmd!(new ServerTreeItem(s1));
+
+    expect(core.getServer("s1")?.username).toBe("old-user");
+    expect(mockWithProgress).not.toHaveBeenCalled();
+  });
+
   it("applyToServer copies profile password into server password secret", async () => {
     const profile = makeAuthProfile({ id: "ap1", username: "deploy", authType: "password" });
     const server = makeServer({ id: "s1", username: "old" });

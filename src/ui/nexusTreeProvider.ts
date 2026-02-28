@@ -178,13 +178,18 @@ export class NexusTreeProvider
     source: readonly NexusTreeItem[],
     dataTransfer: vscode.DataTransfer
   ): Promise<void> {
-    const item = source[0];
-    if (item instanceof ServerTreeItem) {
-      dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "server", id: item.server.id })));
-    } else if (item instanceof SerialProfileTreeItem) {
-      dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "serial", id: item.profile.id })));
-    } else if (item instanceof FolderTreeItem) {
-      dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "folder", id: item.folderPath })));
+    const items: Array<{ type: string; id: string }> = [];
+    for (const item of source) {
+      if (item instanceof ServerTreeItem) {
+        items.push({ type: "server", id: item.server.id });
+      } else if (item instanceof SerialProfileTreeItem) {
+        items.push({ type: "serial", id: item.profile.id });
+      } else if (item instanceof FolderTreeItem) {
+        items.push({ type: "folder", id: item.folderPath });
+      }
+    }
+    if (items.length > 0) {
+      dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify(items)));
     }
   }
 
@@ -204,9 +209,10 @@ export class NexusTreeProvider
       return;
     }
     const raw = await itemTransfer.asString();
-    let parsed: { type: string; id: string };
+    let parsedItems: Array<{ type: string; id: string }>;
     try {
-      parsed = JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      parsedItems = Array.isArray(parsed) ? parsed : [parsed];
     } catch {
       return;
     }
@@ -221,17 +227,16 @@ export class NexusTreeProvider
       return;
     }
 
-    if (parsed.type === "folder") {
-      // Reject dropping a folder into itself or a descendant
-      if (targetPath && isDescendantOrSelf(targetPath, parsed.id)) {
-        return;
+    for (const item of parsedItems) {
+      if (item.type === "folder") {
+        // Reject dropping a folder into itself or a descendant
+        if (targetPath && isDescendantOrSelf(targetPath, item.id)) {
+          continue;
+        }
+        await this.callbacks.onFolderMoved(item.id, targetPath);
+      } else if (item.type === "server" || item.type === "serial") {
+        await this.callbacks.onItemGroupChanged(item.type as "server" | "serial", item.id, targetPath);
       }
-      await this.callbacks.onFolderMoved(parsed.id, targetPath);
-      return;
-    }
-
-    if (parsed.type === "server" || parsed.type === "serial") {
-      await this.callbacks.onItemGroupChanged(parsed.type as "server" | "serial", parsed.id, targetPath);
     }
   }
 
