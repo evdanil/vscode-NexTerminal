@@ -16,6 +16,10 @@ export function proxyPasswordSecretKey(serverId: string): string {
   return `proxy-password-${serverId}`;
 }
 
+export function authProfilePasswordSecretKey(profileId: string): string {
+  return `auth-profile-password-${profileId}`;
+}
+
 function isAuthError(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;

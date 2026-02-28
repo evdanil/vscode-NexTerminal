@@ -114,6 +114,15 @@ export interface TunnelRegistryEntry extends TunnelRouteInfo {
   lastSeen?: number;
 }
 
+export interface AuthProfile {
+  id: string;       // UUID
+  name: string;     // e.g. "Production Servers"
+  username: string;
+  authType: AuthType;
+  keyPath?: string;  // only for authType === "key"
+  // Password stored in SecretVault under "auth-profile-password-{id}"
+}
+
 export function resolveTunnelType(profile: TunnelProfile): TunnelType {
   return profile.tunnelType ?? "local";
 }

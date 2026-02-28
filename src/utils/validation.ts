@@ -1,4 +1,4 @@
-import type { ServerConfig, TunnelProfile, SerialProfile, ProxyConfig } from "../models/config";
+import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile, ProxyConfig } from "../models/config";
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
@@ -74,5 +74,18 @@ export function validateSerialProfile(item: unknown): item is SerialProfile {
     isNonEmptyString(obj.name) &&
     isNonEmptyString(obj.path) &&
     typeof obj.baudRate === "number"
+  );
+}
+
+export function validateAuthProfile(item: unknown): item is AuthProfile {
+  if (typeof item !== "object" || item === null) {
+    return false;
+  }
+  const obj = item as Record<string, unknown>;
+  return (
+    isNonEmptyString(obj.id) &&
+    isNonEmptyString(obj.name) &&
+    isNonEmptyString(obj.username) &&
+    (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
   );
 }

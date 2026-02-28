@@ -2,6 +2,7 @@ import type {
   ActiveSerialSession,
   ActiveSession,
   ActiveTunnel,
+  AuthProfile,
   SerialProfile,
   ServerConfig,
   TunnelProfile,
@@ -17,6 +18,8 @@ export interface ConfigRepository {
   saveSerialProfiles(profiles: SerialProfile[]): Promise<void>;
   getGroups(): Promise<string[]>;
   saveGroups(groups: string[]): Promise<void>;
+  getAuthProfiles(): Promise<AuthProfile[]>;
+  saveAuthProfiles(profiles: AuthProfile[]): Promise<void>;
 }
 
 export interface SessionSnapshot {
@@ -28,6 +31,7 @@ export interface SessionSnapshot {
   activeTunnels: ActiveTunnel[];
   remoteTunnels: TunnelRegistryEntry[];
   explicitGroups: string[];
+  authProfiles: AuthProfile[];
 }
 
 export interface TunnelRegistryStore {

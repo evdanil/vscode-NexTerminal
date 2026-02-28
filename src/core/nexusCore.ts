@@ -2,11 +2,14 @@ import type {
   ActiveSerialSession,
   ActiveSession,
   ActiveTunnel,
+  AuthProfile,
   SerialProfile,
   ServerConfig,
   TunnelProfile,
   TunnelRegistryEntry
 } from "../models/config";
+import type { SecretVault } from "../services/ssh/contracts";
+import { passwordSecretKey, authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
@@ -22,20 +25,23 @@ export class NexusCore {
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
   private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
+  private readonly authProfiles = new Map<string, AuthProfile>();
 
   public constructor(private readonly repository: ConfigRepository) {}
 
   public async initialize(): Promise<void> {
-    const [servers, tunnels, serialProfiles, groups] = await Promise.all([
+    const [servers, tunnels, serialProfiles, groups, authProfiles] = await Promise.all([
       this.repository.getServers(),
       this.repository.getTunnels(),
       this.repository.getSerialProfiles(),
-      this.repository.getGroups()
+      this.repository.getGroups(),
+      this.repository.getAuthProfiles()
     ]);
     this.servers.clear();
     this.tunnels.clear();
     this.serialProfiles.clear();
     this.explicitGroups.clear();
+    this.authProfiles.clear();
     for (const server of servers) {
       this.servers.set(server.id, server);
     }
@@ -47,6 +53,9 @@ export class NexusCore {
     }
     for (const group of groups) {
       this.explicitGroups.add(group);
+    }
+    for (const profile of authProfiles) {
+      this.authProfiles.set(profile.id, profile);
     }
     this.emitChanged();
   }
@@ -60,7 +69,8 @@ export class NexusCore {
       activeSerialSessions: [...this.activeSerialSessions.values()],
       activeTunnels: [...this.activeTunnels.values()],
       remoteTunnels: [...this.remoteTunnels],
-      explicitGroups: [...this.explicitGroups]
+      explicitGroups: [...this.explicitGroups],
+      authProfiles: [...this.authProfiles.values()]
     };
   }
 
@@ -79,6 +89,54 @@ export class NexusCore {
 
   public getSerialProfile(id: string): SerialProfile | undefined {
     return this.serialProfiles.get(id);
+  }
+
+  public getAuthProfile(id: string): AuthProfile | undefined {
+    return this.authProfiles.get(id);
+  }
+
+  public async addOrUpdateAuthProfile(profile: AuthProfile): Promise<void> {
+    this.authProfiles.set(profile.id, profile);
+    await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
+    this.emitChanged();
+  }
+
+  public async removeAuthProfile(profileId: string): Promise<void> {
+    this.authProfiles.delete(profileId);
+    await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
+    this.emitChanged();
+  }
+
+  public async applyAuthProfileToFolder(
+    profileId: string,
+    folderPath: string,
+    vault: SecretVault,
+    profilePassword: string | undefined
+  ): Promise<number> {
+    const profile = this.authProfiles.get(profileId);
+    if (!profile) {
+      return 0;
+    }
+    let count = 0;
+    for (const server of this.servers.values()) {
+      if (!server.group || !isDescendantOrSelf(server.group, folderPath)) {
+        continue;
+      }
+      server.username = profile.username;
+      server.authType = profile.authType;
+      server.keyPath = profile.keyPath;
+      if (profile.authType === "password" && profilePassword) {
+        await vault.store(passwordSecretKey(server.id), profilePassword);
+      } else {
+        await vault.delete(passwordSecretKey(server.id));
+      }
+      count++;
+    }
+    if (count > 0) {
+      await this.repository.saveServers([...this.servers.values()]);
+      this.emitChanged();
+    }
+    return count;
   }
 
   public isServerConnected(serverId: string): boolean {

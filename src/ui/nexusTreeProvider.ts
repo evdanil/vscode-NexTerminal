@@ -108,7 +108,8 @@ export class NexusTreeProvider
     activeSerialSessions: [],
     activeTunnels: [],
     remoteTunnels: [],
-    explicitGroups: []
+    explicitGroups: [],
+    authProfiles: []
   };
 
   public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME];

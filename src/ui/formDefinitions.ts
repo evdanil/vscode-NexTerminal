@@ -1,7 +1,27 @@
-import type { SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
+import type { AuthProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
 import { resolveTunnelType } from "../models/config";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
+
+function authProfileSelectField(authProfiles?: AuthProfile[], vw?: VisibleWhen): FormFieldDescriptor | undefined {
+  if (!authProfiles || authProfiles.length === 0) {
+    return undefined;
+  }
+  const options = [
+    { label: "(None)", value: "" },
+    ...authProfiles.map((p) => ({ label: `${p.name} — ${p.authType} — ${p.username}`, value: p.id }))
+  ];
+  return {
+    type: "select",
+    key: "authProfileId",
+    label: "Auth Profile",
+    options,
+    value: "",
+    hint: "Auto-fill credentials from a saved auth profile",
+    autofill: true,
+    visibleWhen: vw
+  };
+}
 
 function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDescriptor[] {
   return [
@@ -185,14 +205,17 @@ export function serverFormDefinition(
   seed?: Partial<ServerConfig>,
   existingGroups?: string[],
   defaultLogSession = true,
-  servers?: ServerListEntry[]
+  servers?: ServerListEntry[],
+  authProfiles?: AuthProfile[]
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
+  const profileField = authProfileSelectField(authProfiles);
 
   return {
     title: isEdit ? "Edit Server" : "Add Server",
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
+      ...(profileField ? [profileField] : []),
       ...sshFields(seed),
       ...proxyFields(seed, servers),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
@@ -283,6 +306,30 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
   };
 }
 
+export function authProfileFormDefinition(seed?: Partial<AuthProfile>): FormDefinition {
+  const isEdit = Boolean(seed?.id);
+  return {
+    title: isEdit ? "Edit Auth Profile" : "New Auth Profile",
+    fields: [
+      { type: "text", key: "name", label: "Name", required: true, placeholder: "Production Servers", value: seed?.name },
+      { type: "text", key: "username", label: "Username", required: true, placeholder: "root", value: seed?.username },
+      {
+        type: "select",
+        key: "authType",
+        label: "Authentication",
+        options: [
+          { label: "Password", value: "password" },
+          { label: "Private Key", value: "key" },
+          { label: "SSH Agent", value: "agent" }
+        ],
+        value: seed?.authType ?? "password"
+      },
+      { type: "password", key: "password", label: "Password", placeholder: isEdit ? "Leave blank to keep existing" : "Enter password", visibleWhen: { field: "authType", value: "password" } },
+      { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, visibleWhen: { field: "authType", value: "key" } }
+    ]
+  };
+}
+
 export function serialFormDefinition(
   seed?: Partial<SerialProfile>,
   existingGroups?: string[],
@@ -309,10 +356,12 @@ export function unifiedProfileFormDefinition(
   seed?: UnifiedProfileSeed,
   existingGroups?: string[],
   defaultLogSession = true,
-  servers?: ServerListEntry[]
+  servers?: ServerListEntry[],
+  authProfiles?: AuthProfile[]
 ): FormDefinition {
   const sshVw: VisibleWhenCondition = { field: "profileType", value: "ssh" };
   const serialVw: VisibleWhenCondition = { field: "profileType", value: "serial" };
+  const profileField = authProfileSelectField(authProfiles, sshVw);
 
   return {
     title: "Add Profile",
@@ -328,6 +377,7 @@ export function unifiedProfileFormDefinition(
         value: seed?.profileType ?? "ssh"
       },
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server or Arduino" },
+      ...(profileField ? [profileField] : []),
       ...sshFields(undefined, sshVw),
       ...proxyFields(undefined, servers, sshVw),
       ...serialFields(undefined, serialVw),

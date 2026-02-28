@@ -1,12 +1,13 @@
 import type { ConfigRepository } from "../core/contracts";
-import type { SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
+import type { AuthProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
 
 export class InMemoryConfigRepository implements ConfigRepository {
   public constructor(
     private servers: ServerConfig[] = [],
     private tunnels: TunnelProfile[] = [],
     private serialProfiles: SerialProfile[] = [],
-    private groups: string[] = []
+    private groups: string[] = [],
+    private authProfiles: AuthProfile[] = []
   ) {}
 
   public async getServers(): Promise<ServerConfig[]> {
@@ -39,5 +40,13 @@ export class InMemoryConfigRepository implements ConfigRepository {
 
   public async saveGroups(groups: string[]): Promise<void> {
     this.groups = [...groups];
+  }
+
+  public async getAuthProfiles(): Promise<AuthProfile[]> {
+    return [...this.authProfiles];
+  }
+
+  public async saveAuthProfiles(profiles: AuthProfile[]): Promise<void> {
+    this.authProfiles = [...profiles];
   }
 }

@@ -32,6 +32,7 @@ import { registerSettingsCommands } from "./commands/settingsCommands";
 import { registerConfigCommands } from "./commands/configCommands";
 import { registerMacroCommands, updateMacroContext, migrateMacroSlots } from "./commands/macroCommands";
 import { registerProfileCommands } from "./commands/profileCommands";
+import { registerAuthProfileCommands } from "./commands/authProfileCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeProvider } from "./ui/macroTreeProvider";
 import { VscodeColorSchemeStorage } from "./storage/vscodeColorSchemeStorage";
@@ -465,6 +466,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const serialDisposables = registerSerialCommands(ctx);
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
+  const authProfileDisposables = registerAuthProfileCommands(ctx);
   const configDisposables = registerConfigCommands(core, secretVault);
   const macroDisposables = registerMacroCommands(macroTreeProvider);
   const fileDisposables = registerFileCommands(ctx);
@@ -493,6 +495,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ...serialDisposables,
     ...profileDisposables,
     ...settingsDisposables,
+    ...authProfileDisposables,
     ...configDisposables,
     ...macroDisposables,
     ...fileDisposables,

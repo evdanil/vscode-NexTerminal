@@ -5,6 +5,7 @@ import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
+import { authProfilePasswordSecretKey, passwordSecretKey } from "../services/ssh/silentAuth";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
 import type { CommandContext } from "./types";
 import { normalizeFolderPath, folderDisplayName, isDescendantOrSelf, MAX_FOLDER_DEPTH } from "../utils/folderPaths";
@@ -12,8 +13,9 @@ import { normalizeFolderPath, folderDisplayName, isDescendantOrSelf, MAX_FOLDER_
 export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed): void {
   const existingGroups = collectGroups(ctx);
   const defaultLogSession = vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
-  const serverList = ctx.core.getSnapshot().servers.map((s) => ({ id: s.id, name: s.name }));
-  const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList);
+  const snapshot = ctx.core.getSnapshot();
+  const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
+  const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles);
   WebviewFormPanel.open("profile-add", definition, {
     onSubmit: async (values: FormValues) => {
       if (values.profileType === "serial") {
@@ -29,10 +31,29 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         }
         await ctx.core.addOrUpdateServer(server);
         await syncProxyPasswordSecret(ctx, server.id, values);
+        // Copy auth profile password to server if profile was selected
+        const authProfileId = typeof values.authProfileId === "string" ? values.authProfileId : "";
+        if (authProfileId && ctx.secretVault) {
+          const profilePw = await ctx.secretVault.get(authProfilePasswordSecretKey(authProfileId));
+          if (profilePw) {
+            await ctx.secretVault.store(passwordSecretKey(server.id), profilePw);
+          }
+        }
       }
     },
     onBrowse: browseForKey,
-    onScan: () => scanForPort(ctx)
+    onScan: () => scanForPort(ctx),
+    onAutofill: async (_key, value) => {
+      const profile = ctx.core.getAuthProfile(value);
+      if (!profile) {
+        return undefined;
+      }
+      return {
+        username: profile.username,
+        authType: profile.authType,
+        ...(profile.keyPath ? { keyPath: profile.keyPath } : {})
+      };
+    }
   });
 }
 

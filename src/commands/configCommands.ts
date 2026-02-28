@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
-import type { ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
+import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
 import type { SecretVault } from "../services/ssh/contracts";
-import { passwordSecretKey, passphraseSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
+import { passwordSecretKey, passphraseSecretKey, proxyPasswordSecretKey, authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
+import { validateAuthProfile } from "../utils/validation";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
 import {
@@ -30,6 +31,7 @@ interface NexusConfigExport {
   servers: ServerConfig[];
   tunnels: TunnelProfile[];
   serialProfiles: SerialProfile[];
+  authProfiles?: AuthProfile[];
   groups?: string[];
   settings: Record<string, unknown>;
   encryptedSecrets?: EncryptedPayload;
@@ -137,6 +139,7 @@ interface SanitizedSnapshot {
   servers: ServerConfig[];
   tunnels: TunnelProfile[];
   serialProfiles: SerialProfile[];
+  authProfiles: AuthProfile[];
   settings: Record<string, unknown>;
 }
 
@@ -160,7 +163,8 @@ export function sanitizeForSharing(
   servers: ServerConfig[],
   tunnels: TunnelProfile[],
   serialProfiles: SerialProfile[],
-  settings: Record<string, unknown>
+  settings: Record<string, unknown>,
+  authProfiles: AuthProfile[] = []
 ): SanitizedSnapshot {
   const idMap = new Map<string, string>();
 
@@ -202,10 +206,17 @@ export function sanitizeForSharing(
     sanitizedSettings["nexus.logging.sessionLogDirectory"] = "";
   }
 
+  const newAuthProfiles = authProfiles.map((p) => ({
+    ...p,
+    id: randomUUID(),
+    keyPath: undefined
+  }));
+
   return {
     servers: newServers,
     tunnels: newTunnels,
     serialProfiles: newSerialProfiles,
+    authProfiles: newAuthProfiles,
     settings: sanitizedSettings
   };
 }
@@ -254,10 +265,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         const settings = readSettings();
 
         // Collect secrets
-        const secrets: Record<string, unknown> = { passwords: {}, passphrases: {}, proxyPasswords: {}, secretMacros: [] };
+        const secrets: Record<string, unknown> = { passwords: {}, passphrases: {}, proxyPasswords: {}, authProfilePasswords: {}, secretMacros: [] };
         const passwords = secrets.passwords as Record<string, string>;
         const passphrases = secrets.passphrases as Record<string, string>;
         const proxyPasswords = secrets.proxyPasswords as Record<string, string>;
+        const authProfilePasswords = secrets.authProfilePasswords as Record<string, string>;
         for (const server of snapshot.servers) {
           const pw = await vault.get(passwordSecretKey(server.id));
           if (pw) passwords[server.id] = pw;
@@ -265,6 +277,10 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
           if (pp) passphrases[server.id] = pp;
           const proxyPw = await vault.get(proxyPasswordSecretKey(server.id));
           if (proxyPw) proxyPasswords[server.id] = proxyPw;
+        }
+        for (const profile of snapshot.authProfiles) {
+          const pw = await vault.get(authProfilePasswordSecretKey(profile.id));
+          if (pw) authProfilePasswords[profile.id] = pw;
         }
 
         // Collect secret macros
@@ -282,6 +298,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
           servers: snapshot.servers,
           tunnels: snapshot.tunnels,
           serialProfiles: snapshot.serialProfiles,
+          authProfiles: snapshot.authProfiles,
           groups: snapshot.explicitGroups,
           settings: stripSecretMacroText(settings),
           encryptedSecrets
@@ -297,7 +314,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         const json = JSON.stringify(exportData, null, 2);
         await vscode.workspace.fs.writeFile(uri, Buffer.from(json, "utf8"));
 
-        const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length;
+        const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + snapshot.authProfiles.length;
         void vscode.window.showInformationMessage(`Backup saved with ${count} profiles to ${uri.fsPath}`);
       }
     );
@@ -311,7 +328,8 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       snapshot.servers,
       snapshot.tunnels,
       snapshot.serialProfiles,
-      settings
+      settings,
+      snapshot.authProfiles
     );
 
     const exportData: NexusConfigExport = {
@@ -321,6 +339,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       servers: sanitized.servers,
       tunnels: sanitized.tunnels,
       serialProfiles: sanitized.serialProfiles,
+      authProfiles: sanitized.authProfiles,
       groups: snapshot.explicitGroups,
       settings: sanitized.settings
     };
@@ -455,6 +474,18 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       }
     }
 
+    for (const profile of data.authProfiles ?? []) {
+      ensureId(profile as unknown as Record<string, unknown>);
+      const newId = randomUUID();
+      profile.id = newId;
+      if (validateAuthProfile(profile)) {
+        await core.addOrUpdateAuthProfile(profile);
+        imported++;
+      } else {
+        skipped++;
+      }
+    }
+
     if (Array.isArray(data.groups)) {
       for (const group of data.groups) {
         if (typeof group === "string" && group) {
@@ -488,6 +519,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       for (const profile of snapshot.serialProfiles) {
         await core.removeSerialProfile(profile.id);
       }
+      for (const profile of snapshot.authProfiles) {
+        if (vault) {
+          await vault.delete(authProfilePasswordSecretKey(profile.id));
+        }
+        await core.removeAuthProfile(profile.id);
+      }
       for (const group of snapshot.explicitGroups) {
         await core.removeExplicitGroup(group);
       }
@@ -497,7 +534,8 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       ? new Set([
           ...snapshot.servers.map((s) => s.id),
           ...snapshot.tunnels.map((t) => t.id),
-          ...snapshot.serialProfiles.map((p) => p.id)
+          ...snapshot.serialProfiles.map((p) => p.id),
+          ...snapshot.authProfiles.map((p) => p.id)
         ])
       : new Set<string>();
 
@@ -533,6 +571,17 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         skipped++;
       } else {
         await core.addOrUpdateSerialProfile(profile);
+        imported++;
+      }
+    }
+    for (const profile of data.authProfiles ?? []) {
+      ensureId(profile as unknown as Record<string, unknown>);
+      if (existingIds.has(profile.id)) {
+        skipped++;
+      } else if (!validateAuthProfile(profile)) {
+        skipped++;
+      } else {
+        await core.addOrUpdateAuthProfile(profile);
         imported++;
       }
     }
@@ -595,6 +644,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
           await vault.store(proxyPasswordSecretKey(serverId), pw);
         }
       }
+      const authProfilePws = decryptedSecrets.authProfilePasswords as Record<string, string> | undefined;
+      if (authProfilePws) {
+        for (const [profileId, pw] of Object.entries(authProfilePws)) {
+          await vault.store(authProfilePasswordSecretKey(profileId), pw);
+        }
+      }
     }
 
     const skipNote = skipped > 0 ? ` (${skipped} skipped)` : "";
@@ -641,6 +696,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     // Remove all serial profiles
     for (const profile of snapshot.serialProfiles) {
       await core.removeSerialProfile(profile.id);
+    }
+
+    // Remove all auth profiles
+    for (const profile of snapshot.authProfiles) {
+      await vault.delete(authProfilePasswordSecretKey(profile.id));
+      await core.removeAuthProfile(profile.id);
     }
 
     // Remove all groups

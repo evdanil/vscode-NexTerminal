@@ -64,12 +64,13 @@ function renderField(field: FormFieldDescriptor): string {
       const selectedOpt = field.options.find((opt) => opt.value === field.value) ?? field.options[0];
       const selectedLabel = selectedOpt?.label ?? "";
       const selectedValue = field.value ?? field.options[0]?.value ?? "";
+      const autofillAttr = field.autofill ? ' data-autofill="true"' : "";
       const optionsHtml = field.options.map((opt) =>
         `<div class="custom-select-option${opt.value === selectedValue ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}</div>`
       ).join("\n      ");
       return `<div class="form-group"${vw}>
   <label>${escapeHtml(field.label)}</label>
-  <div class="custom-select" id="${id}" data-name="${key}">
+  <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}>
     <input type="hidden" name="${key}" value="${escapeHtml(selectedValue)}" />
     <div class="custom-select-trigger" tabindex="0">
       <span class="custom-select-text">${escapeHtml(selectedLabel)}</span>
@@ -267,6 +268,9 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         }
         selectCustomOption(wrapper, value);
         wrapper.dataset.prev = value;
+        if (wrapper.dataset.autofill === 'true' && value) {
+          vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: value });
+        }
       });
       initCustomComboboxes();
 
@@ -293,6 +297,20 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             selectCustomOption(wrapper, msg.value);
             wrapper.dataset.prev = msg.value;
           }
+        }
+        if (msg.type === "fillFields") {
+          var fillValues = msg.values;
+          for (var fk in fillValues) {
+            var el = form.elements[fk];
+            if (el) {
+              el.value = fillValues[fk];
+            }
+            var wrapper = document.getElementById("field-" + fk);
+            if (wrapper && wrapper.classList.contains("custom-select")) {
+              selectCustomOption(wrapper, fillValues[fk]);
+            }
+          }
+          updateVisibility();
         }
         if (msg.type === "validationError") {
           var errEls = document.querySelectorAll(".field-error");

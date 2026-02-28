@@ -89,7 +89,11 @@ const unsupportedCommands = [
   "nexus.files.copyPath",
   "nexus.files.refresh",
   "nexus.files.disconnect",
-  "nexus.terminal.appearance"
+  "nexus.terminal.appearance",
+  "nexus.authProfile.add",
+  "nexus.authProfile.manage",
+  "nexus.authProfile.applyToFolder",
+  "nexus.authProfile.applyToServer"
 ];
 
 export function activate(context: vscode.ExtensionContext): void {

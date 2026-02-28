@@ -107,7 +107,8 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       activeSerialSessions: [],
       activeTunnels: [],
       remoteTunnels: [],
-      explicitGroups: []
+      explicitGroups: [],
+      authProfiles: []
     });
 
     const target = new ServerTreeItem(makeServer(), false);
@@ -132,7 +133,8 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       activeSerialSessions: [],
       activeTunnels: [],
       remoteTunnels: [],
-      explicitGroups: []
+      explicitGroups: [],
+      authProfiles: []
     });
 
     const target = new ServerTreeItem(makeServer(), false);
@@ -156,7 +158,8 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       activeSerialSessions: [],
       activeTunnels: [],
       remoteTunnels: [],
-      explicitGroups: []
+      explicitGroups: [],
+      authProfiles: []
     });
 
     const target = new ServerTreeItem(makeServer(), false);
@@ -186,7 +189,8 @@ describe("NexusTreeProvider folder collapse state", () => {
       activeSerialSessions: [],
       activeTunnels: [],
       remoteTunnels: [],
-      explicitGroups: []
+      explicitGroups: [],
+      authProfiles: []
     });
     return provider;
   }

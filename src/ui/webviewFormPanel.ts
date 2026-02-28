@@ -16,7 +16,8 @@ export class WebviewFormPanel {
     private readonly onCancel: () => void,
     private readonly onBrowse?: (key: string) => Promise<string | undefined>,
     private readonly onScan?: (key: string) => Promise<string | undefined>,
-    private readonly onCreateInline?: (key: string) => void
+    private readonly onCreateInline?: (key: string) => void,
+    private readonly onAutofill?: (key: string, value: string) => Promise<Record<string, string> | undefined>
   ) {
     this.panel = vscode.window.createWebviewPanel(
       `nexus.form.${formId}`,
@@ -65,6 +66,12 @@ export class WebviewFormPanel {
       if (message.type === "createInline" && this.onCreateInline) {
         this.onCreateInline(message.key);
       }
+      if (message.type === "autofill" && this.onAutofill) {
+        const result = await this.onAutofill(message.key, message.value);
+        if (result && !this.disposed) {
+          void this.panel.webview.postMessage({ type: "fillFields", values: result });
+        }
+      }
     });
 
     this.panel.onDidDispose(() => {
@@ -82,6 +89,7 @@ export class WebviewFormPanel {
       onBrowse?: (key: string) => Promise<string | undefined>;
       onScan?: (key: string) => Promise<string | undefined>;
       onCreateInline?: (key: string) => void;
+      onAutofill?: (key: string, value: string) => Promise<Record<string, string> | undefined>;
     }
   ): WebviewFormPanel {
     const existing = WebviewFormPanel.activePanels.get(formId);
@@ -96,7 +104,8 @@ export class WebviewFormPanel {
       options.onCancel ?? (() => {}),
       options.onBrowse,
       options.onScan,
-      options.onCreateInline
+      options.onCreateInline,
+      options.onAutofill
     );
     WebviewFormPanel.activePanels.set(formId, instance);
     return instance;

@@ -1,12 +1,13 @@
 import * as vscode from "vscode";
-import type { SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
+import type { AuthProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
 import type { ConfigRepository } from "../core/contracts";
-import { validateServerConfig, validateTunnelProfile, validateSerialProfile } from "../utils/validation";
+import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateAuthProfile } from "../utils/validation";
 
 const SERVERS_KEY = "nexus.servers";
 const TUNNELS_KEY = "nexus.tunnels";
 const SERIAL_PROFILES_KEY = "nexus.serialProfiles";
 const GROUPS_KEY = "nexus.groups";
+const AUTH_PROFILES_KEY = "nexus.authProfiles";
 
 export class VscodeConfigRepository implements ConfigRepository {
   public constructor(private readonly context: vscode.ExtensionContext) {}
@@ -62,5 +63,20 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async saveGroups(groups: string[]): Promise<void> {
     await this.context.globalState.update(GROUPS_KEY, groups);
+  }
+
+  public async getAuthProfiles(): Promise<AuthProfile[]> {
+    const raw = this.context.globalState.get<AuthProfile[]>(AUTH_PROFILES_KEY, []);
+    return raw.filter((item) => {
+      if (validateAuthProfile(item)) {
+        return true;
+      }
+      console.warn("[Nexus] Skipping invalid auth profile entry:", JSON.stringify(item));
+      return false;
+    });
+  }
+
+  public async saveAuthProfiles(profiles: AuthProfile[]): Promise<void> {
+    await this.context.globalState.update(AUTH_PROFILES_KEY, profiles);
   }
 }

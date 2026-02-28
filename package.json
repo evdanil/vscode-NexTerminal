@@ -151,6 +151,28 @@
         "icon": "$(key)"
       },
       {
+        "command": "nexus.authProfile.add",
+        "title": "New Auth Profile",
+        "category": "Nexus",
+        "icon": "$(key)"
+      },
+      {
+        "command": "nexus.authProfile.manage",
+        "title": "Manage Auth Profiles",
+        "category": "Nexus",
+        "icon": "$(key)"
+      },
+      {
+        "command": "nexus.authProfile.applyToFolder",
+        "title": "Apply Auth Profile",
+        "icon": "$(key)"
+      },
+      {
+        "command": "nexus.authProfile.applyToServer",
+        "title": "Apply Auth Profile",
+        "icon": "$(key)"
+      },
+      {
         "command": "nexus.tunnel.add",
         "title": "Add Tunnel",
         "category": "Nexus",
@@ -635,6 +657,11 @@
           "group": "1_manage@5"
         },
         {
+          "command": "nexus.authProfile.applyToServer",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "group": "1_manage@6"
+        },
+        {
           "command": "nexus.server.copyInfo",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
           "group": "2_clipboard"
@@ -678,6 +705,11 @@
           "command": "nexus.group.add",
           "when": "view == nexusCommandCenter && viewItem == nexus.folder",
           "group": "1_manage@3"
+        },
+        {
+          "command": "nexus.authProfile.applyToFolder",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "group": "1_manage@4"
         },
         {
           "command": "nexus.group.remove",
@@ -984,6 +1016,22 @@
         {
           "command": "nexus.server.deployKey",
           "when": "true"
+        },
+        {
+          "command": "nexus.authProfile.add",
+          "when": "true"
+        },
+        {
+          "command": "nexus.authProfile.manage",
+          "when": "true"
+        },
+        {
+          "command": "nexus.authProfile.applyToFolder",
+          "when": "false"
+        },
+        {
+          "command": "nexus.authProfile.applyToServer",
+          "when": "false"
         },
         {
           "command": "nexus.serial.rename",

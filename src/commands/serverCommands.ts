@@ -8,6 +8,7 @@ import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { serverFormDefinition } from "../ui/formDefinitions";
+import { authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -493,8 +494,9 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const existingGroups = collectGroups(ctx);
-      const serverList = ctx.core.getSnapshot().servers.map((s) => ({ id: s.id, name: s.name }));
-      const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList);
+      const snapshot = ctx.core.getSnapshot();
+      const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
+      const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
       WebviewFormPanel.open("server-edit", definition, {
         onSubmit: async (values) => {
           const updated = formValuesToServer(values, existing.id, existing.isHidden);
@@ -503,13 +505,32 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           }
           await ctx.core.addOrUpdateServer(updated);
           await syncProxyPasswordSecret(ctx, updated.id, values);
+          // Copy auth profile password to server if profile was selected
+          const authProfileId = typeof values.authProfileId === "string" ? values.authProfileId : "";
+          if (authProfileId && ctx.secretVault) {
+            const profilePw = await ctx.secretVault.get(authProfilePasswordSecretKey(authProfileId));
+            if (profilePw) {
+              await ctx.secretVault.store(passwordSecretKey(updated.id), profilePw);
+            }
+          }
           if (ctx.core.isServerConnected(existing.id)) {
             void vscode.window.showInformationMessage(
               "Server profile updated. Existing sessions keep current connection settings until reconnect."
             );
           }
         },
-        onBrowse: browseForKey
+        onBrowse: browseForKey,
+        onAutofill: async (_key, value) => {
+          const profile = ctx.core.getAuthProfile(value);
+          if (!profile) {
+            return undefined;
+          }
+          return {
+            username: profile.username,
+            authType: profile.authType,
+            ...(profile.keyPath ? { keyPath: profile.keyPath } : {})
+          };
+        }
       });
     }),
 

@@ -9,7 +9,7 @@ export type FormFieldDescriptor =
   | { type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean; hint?: string; visibleWhen?: VisibleWhen }
   | { type: "password"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; hint?: string; visibleWhen?: VisibleWhen }
   | { type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; placeholder?: string; value?: number; hint?: string; visibleWhen?: VisibleWhen }
-  | { type: "select"; key: string; label: string; options: { label: string; value: string }[]; value?: string; hint?: string; visibleWhen?: VisibleWhen }
+  | { type: "select"; key: string; label: string; options: { label: string; value: string }[]; value?: string; hint?: string; visibleWhen?: VisibleWhen; autofill?: boolean }
   | { type: "combobox"; key: string; label: string; suggestions: string[]; placeholder?: string; value?: string; hint?: string; visibleWhen?: VisibleWhen }
   | { type: "checkbox"; key: string; label: string; value?: boolean; hint?: string; visibleWhen?: VisibleWhen }
   | { type: "file"; key: string; label: string; value?: string; hint?: string; visibleWhen?: VisibleWhen }
@@ -28,10 +28,12 @@ export type FormMessage =
   | { type: "cancel" }
   | { type: "browse"; key: string }
   | { type: "scan"; key: string }
-  | { type: "createInline"; key: string };
+  | { type: "createInline"; key: string }
+  | { type: "autofill"; key: string; value: string };
 
 export type ExtensionMessage =
   | { type: "init"; definition: FormDefinition; values: FormValues }
   | { type: "browseResult"; key: string; path: string }
   | { type: "validationError"; errors: Record<string, string> }
-  | { type: "addSelectOption"; key: string; value: string; label: string };
+  | { type: "addSelectOption"; key: string; value: string; label: string }
+  | { type: "fillFields"; values: Record<string, string> };
