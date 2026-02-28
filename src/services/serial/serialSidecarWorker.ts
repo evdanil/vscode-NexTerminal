@@ -8,6 +8,7 @@ type PortRecord = {
   set(options: Record<string, boolean>, callback: (error?: Error | null) => void): void;
   on(event: "data", listener: (data: Buffer) => void): void;
   on(event: "error", listener: (error: Error) => void): void;
+  on(event: "close", listener: () => void): void;
 };
 
 type SerialPortCtor = new (options: {
@@ -111,6 +112,15 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
           message: error.message
         }
       });
+    });
+    port.on("close", () => {
+      if (ports.has(sessionId)) {
+        ports.delete(sessionId);
+        writeLine({
+          method: "portError",
+          params: { sessionId, message: "Port closed" }
+        });
+      }
     });
     ports.set(sessionId, port);
     return response(request.id, { sessionId });

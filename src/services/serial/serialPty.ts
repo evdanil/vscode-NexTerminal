@@ -18,15 +18,22 @@ export type SerialPtyOptions = OpenPortParams;
 export interface SerialPtyCallbacks {
   onSessionOpened(sessionId: string): void;
   onSessionClosed(sessionId: string): void;
+  onDisconnected?(sessionId: string): void;
 }
+
+// Must match the sidecar worker's port.on("close") message and serialport
+// native close error text. Changes to either side must stay in sync.
+const DISCONNECT_MESSAGES = ["Port closed", "closed"];
 
 export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   private readonly writeEmitter = new vscode.EventEmitter<string>();
   private readonly closeEmitter = new vscode.EventEmitter<void>();
+  private readonly nameEmitter = new vscode.EventEmitter<string>();
   private sidecarSessionId?: string;
   private dataSubscription?: () => void;
   private errorSubscription?: () => void;
   private disposed = false;
+  private disconnected = false;
   private failed = false;
 
   public constructor(
@@ -40,6 +47,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
   public readonly onDidClose: vscode.Event<void> = this.closeEmitter.event;
+  public readonly onDidChangeName: vscode.Event<string> = this.nameEmitter.event;
 
   public open(): void {
     void this.start();
@@ -50,7 +58,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   }
 
   public handleInput(data: string): void {
-    if (this.failed) {
+    if (this.failed || this.disconnected) {
       this.dispose();
       return;
     }
@@ -59,8 +67,12 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
     void this.transport.writePort(this.sidecarSessionId, Buffer.from(data, "utf8")).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : "unknown serial write error";
-      this.writeEmitter.fire(`\r\n[Nexus Serial Error] ${message}\r\n`);
       this.logger.log(`serial write failed ${message}`);
+      if (message.includes("unknown serial session")) {
+        this.handleDisconnect("Port no longer available");
+      } else {
+        this.writeEmitter.fire(`\r\n[Nexus Serial Error] ${message}\r\n`);
+      }
     });
   }
 
@@ -70,12 +82,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
     this.disposed = true;
 
-    const sessionId = this.sidecarSessionId;
-    this.sidecarSessionId = undefined;
-    this.dataSubscription?.();
-    this.errorSubscription?.();
-    this.dataSubscription = undefined;
-    this.errorSubscription = undefined;
+    const sessionId = this.releaseSubscriptions();
 
     if (sessionId) {
       this.callbacks.onSessionClosed(sessionId);
@@ -88,9 +95,44 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.transcript?.close();
     this.logger.log("serial terminal closed");
     this.logger.close();
+    this.nameEmitter.dispose();
     this.closeEmitter.fire();
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
+  }
+
+  /** Clear sidecar session and event subscriptions; returns the former session ID. */
+  private releaseSubscriptions(): string | undefined {
+    const sessionId = this.sidecarSessionId;
+    this.sidecarSessionId = undefined;
+    this.dataSubscription?.();
+    this.errorSubscription?.();
+    this.dataSubscription = undefined;
+    this.errorSubscription = undefined;
+    return sessionId;
+  }
+
+  private handleDisconnect(message: string): void {
+    if (this.disposed || this.disconnected) {
+      return;
+    }
+    this.disconnected = true;
+
+    const sessionId = this.releaseSubscriptions();
+
+    this.logger.log(`serial port disconnected: ${message}`);
+
+    if (sessionId) {
+      if (this.callbacks.onDisconnected) {
+        this.callbacks.onDisconnected(sessionId);
+      } else {
+        this.callbacks.onSessionClosed(sessionId);
+      }
+    }
+
+    this.nameEmitter.fire(`Nexus Serial: ${this.options.path} [Disconnected]`);
+    this.writeEmitter.fire(`\r\n\r\n[Nexus Serial] Port disconnected.\r\n`);
+    this.writeEmitter.fire("[Nexus Serial] Press any key to close this terminal.\r\n");
   }
 
   private async start(): Promise<void> {
@@ -118,12 +160,16 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.transcript?.write(output);
         this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(output) : output);
       });
-      this.errorSubscription = this.transport.onDidReceiveError((eventSessionId, message) => {
+      this.errorSubscription = this.transport.onDidReceiveError((eventSessionId, errorMessage) => {
         if (eventSessionId !== this.sidecarSessionId) {
           return;
         }
-        this.logger.log(`serial port error ${message}`);
-        this.writeEmitter.fire(`\r\n[Nexus Serial Error] ${message}\r\n`);
+        this.logger.log(`serial port error ${errorMessage}`);
+        if (DISCONNECT_MESSAGES.some(msg => errorMessage.includes(msg))) {
+          this.handleDisconnect(errorMessage);
+        } else {
+          this.writeEmitter.fire(`\r\n[Nexus Serial Error] ${errorMessage}\r\n`);
+        }
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown serial connection error";

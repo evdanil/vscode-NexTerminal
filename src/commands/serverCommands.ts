@@ -422,6 +422,14 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
             if (!ctx.core.isServerConnected(server.id)) {
               stopAutoStopTunnels(ctx, server.id).catch(() => {});
             }
+          },
+          onDisconnected: (sessionId) => {
+            ctx.core.unregisterSession(sessionId);
+            ctx.sessionTerminals.delete(sessionId);
+            // Intentionally keep terminalsByServer entry (terminal is still
+            // alive for reconnect) and do NOT stop auto-stop tunnels — they
+            // will be cleaned up when the terminal is fully closed via
+            // onSessionClosed.
           }
         },
         ctx.loggerFactory.create("terminal", server.id),

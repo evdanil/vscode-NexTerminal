@@ -190,6 +190,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   const fileSystemProvider = new NexusFileSystemProvider(sftpService);
   const fsRegistration = vscode.workspace.registerFileSystemProvider(NEXTERM_SCHEME, fileSystemProvider, { isCaseSensitive: true });
+
+  // Register a label formatter so VS Code displays remote paths with forward
+  // slashes on Windows instead of converting them to backslashes via fsPath.
+  try {
+    const registerFormatter = (vscode.workspace as any).registerResourceLabelFormatter;
+    if (typeof registerFormatter === "function") {
+      registerFormatter.call(vscode.workspace, {
+        scheme: NEXTERM_SCHEME,
+        formatting: {
+          label: "${authority}${path}",
+          separator: "/",
+          tildify: false,
+          workspaceSuffix: "",
+        },
+      });
+    }
+  } catch {
+    // API not available — paths may show with backslashes on Windows
+  }
   const fileExplorerProvider = new FileExplorerTreeProvider(sftpService);
   const defaultSessionLogDir = path.join(context.globalStorageUri.fsPath, "session-logs");
 
