@@ -337,7 +337,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusBarItem.command = "nexusCommandCenter.focus";
   statusBarItem.show();
 
-  const syncViews = (): void => {
+  const syncViewsImmediate = (): void => {
     const snapshot = core.getSnapshot();
     nexusTreeProvider.setSnapshot(snapshot);
     tunnelTreeProvider.setSnapshot(snapshot);
@@ -355,7 +355,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       fileExplorerProvider.clearActiveServer();
     }
   };
-  syncViews();
+  let syncTimer: ReturnType<typeof setTimeout> | undefined;
+  const syncViews = (): void => {
+    if (syncTimer !== undefined) {
+      return;
+    }
+    syncTimer = setTimeout(() => {
+      syncTimer = undefined;
+      syncViewsImmediate();
+    }, 150);
+  };
+  syncViewsImmediate();
 
   let previousServers = new Map<string, import("./models/config").ServerConfig>(
     core.getSnapshot().servers.map(s => [s.id, s])
@@ -428,7 +438,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const refreshCommand = vscode.commands.registerCommand("nexus.refresh", async () => {
     await core.initialize();
-    syncViews();
+    syncViewsImmediate();
   });
 
   const windowFocusListener = vscode.window.onDidChangeWindowState((state) => {

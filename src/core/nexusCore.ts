@@ -204,6 +204,9 @@ export class NexusCore {
     if (!tunnel) {
       return;
     }
+    if (tunnel.bytesIn === bytesIn && tunnel.bytesOut === bytesOut) {
+      return;
+    }
     tunnel.bytesIn = bytesIn;
     tunnel.bytesOut = bytesOut;
     this.emitChanged();
