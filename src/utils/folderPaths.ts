@@ -22,6 +22,26 @@ export function normalizeFolderPath(path: string): string | undefined {
 }
 
 /**
+ * Normalize optional folder input (e.g. form values).
+ * - Missing/blank input => undefined
+ * - Valid input => normalized path
+ * - Invalid non-empty input => null
+ */
+export function normalizeOptionalFolderPath(input: unknown): string | undefined | null {
+  if (typeof input !== "string") {
+    return undefined;
+  }
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  return normalizeFolderPath(trimmed) ?? null;
+}
+
+export const INVALID_FOLDER_PATH_MESSAGE =
+  `Invalid folder path. Use up to ${MAX_FOLDER_DEPTH} levels and avoid '.', '..', or '\\'.`;
+
+/**
  * True if `candidate` equals `ancestor` or is nested inside it.
  * Safe against prefix collisions (e.g. "Apps" vs "AppServer").
  */

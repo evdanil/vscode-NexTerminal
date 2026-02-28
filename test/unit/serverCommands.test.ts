@@ -378,6 +378,33 @@ describe("formValuesToServer with proxy", () => {
   });
 });
 
+describe("formValuesToServer group normalization", () => {
+  it("normalizes valid group values", () => {
+    const server = formValuesToServer({
+      name: "Test",
+      host: "example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      group: "  Prod / US-East  "
+    });
+    expect(server).toBeDefined();
+    expect(server!.group).toBe("Prod/US-East");
+  });
+
+  it("rejects invalid non-empty group values", () => {
+    const server = formValuesToServer({
+      name: "Test",
+      host: "example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      group: "/"
+    });
+    expect(server).toBeUndefined();
+  });
+});
+
 describe("syncProxyPasswordSecret", () => {
   it("stores SOCKS5 proxy password when username is set and password provided", async () => {
     const { ctx, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });

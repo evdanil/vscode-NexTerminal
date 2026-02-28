@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   normalizeFolderPath,
+  normalizeOptionalFolderPath,
   isDescendantOrSelf,
   parentPath,
   folderDisplayName,
@@ -58,6 +59,27 @@ describe("normalizeFolderPath", () => {
 
   it("returns undefined for whitespace-only input", () => {
     expect(normalizeFolderPath("   ")).toBeUndefined();
+  });
+});
+
+describe("normalizeOptionalFolderPath", () => {
+  it("returns undefined for missing values", () => {
+    expect(normalizeOptionalFolderPath(undefined)).toBeUndefined();
+    expect(normalizeOptionalFolderPath(null)).toBeUndefined();
+  });
+
+  it("returns undefined for blank values", () => {
+    expect(normalizeOptionalFolderPath("")).toBeUndefined();
+    expect(normalizeOptionalFolderPath("   ")).toBeUndefined();
+  });
+
+  it("returns normalized value for valid input", () => {
+    expect(normalizeOptionalFolderPath("  Prod / US-East  ")).toBe("Prod/US-East");
+  });
+
+  it("returns null for invalid non-empty input", () => {
+    expect(normalizeOptionalFolderPath("/")).toBeNull();
+    expect(normalizeOptionalFolderPath("A/../B")).toBeNull();
   });
 });
 

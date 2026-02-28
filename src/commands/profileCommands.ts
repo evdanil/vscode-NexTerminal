@@ -8,7 +8,14 @@ import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecre
 import { authProfilePasswordSecretKey, passwordSecretKey } from "../services/ssh/silentAuth";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
 import type { CommandContext } from "./types";
-import { normalizeFolderPath, folderDisplayName, isDescendantOrSelf, MAX_FOLDER_DEPTH } from "../utils/folderPaths";
+import {
+  normalizeFolderPath,
+  normalizeOptionalFolderPath,
+  INVALID_FOLDER_PATH_MESSAGE,
+  folderDisplayName,
+  isDescendantOrSelf,
+  MAX_FOLDER_DEPTH
+} from "../utils/folderPaths";
 
 export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed): void {
   const existingGroups = collectGroups(ctx);
@@ -18,6 +25,9 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles);
   WebviewFormPanel.open("profile-add", definition, {
     onSubmit: async (values: FormValues) => {
+      if (normalizeOptionalFolderPath(values.group) === null) {
+        throw new Error(INVALID_FOLDER_PATH_MESSAGE);
+      }
       if (values.profileType === "serial") {
         const profile = formValuesToSerial(values);
         if (!profile) {

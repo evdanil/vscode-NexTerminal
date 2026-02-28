@@ -16,7 +16,13 @@ import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyP
 import type { KeyPairInfo } from "../services/ssh/deploySshKey";
 import { resolveTunnelConnectionMode, startTunnel } from "./tunnelCommands";
 import type { CommandContext, ServerTerminalMap } from "./types";
-import { getAncestorPaths, isDescendantOrSelf, folderDisplayName, normalizeFolderPath } from "../utils/folderPaths";
+import {
+  getAncestorPaths,
+  isDescendantOrSelf,
+  folderDisplayName,
+  normalizeOptionalFolderPath,
+  INVALID_FOLDER_PATH_MESSAGE
+} from "../utils/folderPaths";
 
 /** @deprecated Use FolderTreeItem */
 const GroupTreeItem = FolderTreeItem;
@@ -320,7 +326,11 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const host = typeof values.host === "string" ? values.host.trim() : "";
   const username = typeof values.username === "string" ? values.username.trim() : "";
+  const normalizedGroup = normalizeOptionalFolderPath(values.group);
   if (!name || !host || !username) {
+    return undefined;
+  }
+  if (normalizedGroup === null) {
     return undefined;
   }
   return {
@@ -331,7 +341,7 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     username,
     authType: isAuthType(values.authType) ? values.authType : "password",
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
-    group: typeof values.group === "string" && values.group ? normalizeFolderPath(values.group) : undefined,
+    group: normalizedGroup,
     isHidden: preserveIsHidden,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
     multiplexing: typeof values.multiplexing === "boolean" ? values.multiplexing : undefined,
@@ -499,6 +509,9 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
       WebviewFormPanel.open("server-edit", definition, {
         onSubmit: async (values) => {
+          if (normalizeOptionalFolderPath(values.group) === null) {
+            throw new Error(INVALID_FOLDER_PATH_MESSAGE);
+          }
           const updated = formValuesToServer(values, existing.id, existing.isHidden);
           if (!updated) {
             return;

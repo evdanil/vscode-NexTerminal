@@ -12,7 +12,7 @@ import {
 } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { toParityCode } from "../utils/helpers";
-import { normalizeFolderPath } from "../utils/folderPaths";
+import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { collectGroups } from "./serverCommands";
 import type { CommandContext } from "./types";
 
@@ -132,7 +132,11 @@ function getDefaultSessionTranscriptsEnabled(): boolean {
 export function formValuesToSerial(values: FormValues, existingId?: string): SerialProfile | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const portPath = typeof values.path === "string" ? values.path.trim() : "";
+  const normalizedGroup = normalizeOptionalFolderPath(values.group);
   if (!name || !portPath) {
+    return undefined;
+  }
+  if (normalizedGroup === null) {
     return undefined;
   }
   const dataBits = typeof values.dataBits === "string" ? Number(values.dataBits) : 8;
@@ -148,7 +152,7 @@ export function formValuesToSerial(values: FormValues, existingId?: string): Ser
     parity: VALID_PARITY.has(parity) ? (parity as SerialParity) : "none",
     rtscts: values.rtscts === true,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
-    group: typeof values.group === "string" && values.group ? normalizeFolderPath(values.group) : undefined
+    group: normalizedGroup
   };
 }
 
@@ -168,6 +172,9 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       WebviewFormPanel.open("serial-edit", definition, {
         onScan: () => scanForPort(ctx),
         onSubmit: async (values) => {
+          if (normalizeOptionalFolderPath(values.group) === null) {
+            throw new Error(INVALID_FOLDER_PATH_MESSAGE);
+          }
           const updated = formValuesToSerial(values, existing.id);
           if (!updated) {
             return;
