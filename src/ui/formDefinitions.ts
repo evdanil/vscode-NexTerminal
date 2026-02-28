@@ -40,7 +40,7 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDes
       value: seed?.authType ?? "password",
       visibleWhen: vw
     },
-    { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, visibleWhen: vw },
+    { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, visibleWhen: vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "authType", value: "key" }] : { field: "authType", value: "key" } },
     { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, hint: "Overrides the global multiplexing setting for this server", visibleWhen: vw }
   ];
 }

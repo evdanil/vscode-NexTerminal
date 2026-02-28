@@ -12,6 +12,7 @@ import {
 } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { toParityCode } from "../utils/helpers";
+import { normalizeFolderPath } from "../utils/folderPaths";
 import { collectGroups } from "./serverCommands";
 import type { CommandContext } from "./types";
 
@@ -147,7 +148,7 @@ export function formValuesToSerial(values: FormValues, existingId?: string): Ser
     parity: VALID_PARITY.has(parity) ? (parity as SerialParity) : "none",
     rtscts: values.rtscts === true,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
-    group: typeof values.group === "string" && values.group ? values.group : undefined
+    group: typeof values.group === "string" && values.group ? normalizeFolderPath(values.group) : undefined
   };
 }
 

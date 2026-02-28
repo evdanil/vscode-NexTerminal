@@ -16,7 +16,7 @@ import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyP
 import type { KeyPairInfo } from "../services/ssh/deploySshKey";
 import { resolveTunnelConnectionMode, startTunnel } from "./tunnelCommands";
 import type { CommandContext, ServerTerminalMap } from "./types";
-import { getAncestorPaths, isDescendantOrSelf, folderDisplayName } from "../utils/folderPaths";
+import { getAncestorPaths, isDescendantOrSelf, folderDisplayName, normalizeFolderPath } from "../utils/folderPaths";
 
 /** @deprecated Use FolderTreeItem */
 const GroupTreeItem = FolderTreeItem;
@@ -331,7 +331,7 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     username,
     authType: isAuthType(values.authType) ? values.authType : "password",
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
-    group: typeof values.group === "string" && values.group ? values.group : undefined,
+    group: typeof values.group === "string" && values.group ? normalizeFolderPath(values.group) : undefined,
     isHidden: preserveIsHidden,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
     multiplexing: typeof values.multiplexing === "boolean" ? values.multiplexing : undefined,
