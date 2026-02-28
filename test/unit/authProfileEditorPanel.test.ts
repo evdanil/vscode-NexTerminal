@@ -170,6 +170,28 @@ describe("AuthProfileEditorPanel", () => {
     expect(vault.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
   });
 
+  it("save with authType switch from key to password and blank password clears stale vault secret", async () => {
+    const profile = makeAuthProfile({ id: "ap1", authType: "key", keyPath: "/keys/id_ed25519" });
+    const { core, vault, sendMessage } = await openPanel(
+      [profile],
+      { [authProfilePasswordSecretKey("ap1")]: "stale-secret" }
+    );
+
+    await sendMessage({
+      type: "save",
+      id: "ap1",
+      name: "Prod Auth",
+      username: "root",
+      authType: "password",
+      password: "",
+      keyPath: ""
+    });
+
+    expect(core.getAuthProfile("ap1")?.authType).toBe("password");
+    expect(vault.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
   it("delete profile removes from core and vault after confirmation", async () => {
     const profile = makeAuthProfile({ id: "ap1" });
     const { core, vault, sendMessage } = await openPanel([profile]);

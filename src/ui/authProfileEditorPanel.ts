@@ -28,7 +28,7 @@ export class AuthProfileEditorPanel {
   private selectedId: string | null = null;
   private readonly core: NexusCore;
   private readonly secretVault: SecretVault | undefined;
-  private readonly unsubscribe: () => void;
+  private unsubscribe: () => void = () => {};
   private lastProfileSignature: string;
 
   private constructor(core: NexusCore, secretVault: SecretVault | undefined, initialId: string | null) {
@@ -94,110 +94,118 @@ export class AuthProfileEditorPanel {
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
-    switch (msg.type) {
-      case "selectProfile": {
-        const value = msg.value as string;
-        this.selectedId = value === "__new__" ? null : value;
-        this.render();
-        break;
-      }
-      case "confirmSwitch": {
-        const target = msg.targetValue as string;
-        const answer = await vscode.window.showWarningMessage(
-          "You have unsaved changes. Discard them?",
-          { modal: true },
-          "Discard"
-        );
-        if (answer === "Discard") {
-          this.selectedId = target === "__new__" ? null : target;
+    try {
+      switch (msg.type) {
+        case "selectProfile": {
+          if (typeof msg.value !== "string") {
+            break;
+          }
+          this.selectedId = msg.value === "__new__" ? null : msg.value;
           this.render();
+          break;
         }
-        break;
-      }
-      case "save": {
-        const name = (msg.name as string).trim();
-        const username = (msg.username as string).trim();
-        if (!name || !username) {
-          return;
+        case "confirmSwitch": {
+          if (typeof msg.targetValue !== "string") {
+            break;
+          }
+          const target = msg.targetValue;
+          const answer = await vscode.window.showWarningMessage(
+            "You have unsaved changes. Discard them?",
+            { modal: true },
+            "Discard"
+          );
+          if (answer === "Discard") {
+            this.selectedId = target === "__new__" ? null : target;
+            this.render();
+          }
+          break;
         }
-        const authType: AuthType = isAuthType(msg.authType) ? msg.authType : "password";
-        const password = typeof msg.password === "string" ? msg.password : "";
-        const keyPath = typeof msg.keyPath === "string" && msg.keyPath.trim() ? msg.keyPath.trim() : undefined;
-        const existingId = typeof msg.id === "string" ? msg.id : null;
+        case "save": {
+          const name = typeof msg.name === "string" ? msg.name.trim() : "";
+          const username = typeof msg.username === "string" ? msg.username.trim() : "";
+          if (!name || !username) {
+            break;
+          }
+          const authType: AuthType = isAuthType(msg.authType) ? msg.authType : "password";
+          const password = typeof msg.password === "string" ? msg.password : "";
+          const keyPath = typeof msg.keyPath === "string" && msg.keyPath.trim() ? msg.keyPath.trim() : undefined;
+          const requestedId = typeof msg.id === "string" ? msg.id : null;
+          const previousProfile = requestedId ? this.core.getAuthProfile(requestedId) : undefined;
+          const existingId = previousProfile ? requestedId : null;
 
-        const profile: AuthProfile = {
-          id: existingId ?? randomUUID(),
-          name,
-          username,
-          authType,
-          keyPath: authType === "key" ? keyPath : undefined
-        };
+          const profile: AuthProfile = {
+            id: existingId ?? randomUUID(),
+            name,
+            username,
+            authType,
+            keyPath: authType === "key" ? keyPath : undefined
+          };
 
-        await this.core.addOrUpdateAuthProfile(profile);
+          await this.core.addOrUpdateAuthProfile(profile);
 
-        // Handle password in SecretVault
-        if (this.secretVault) {
-          const secretKey = authProfilePasswordSecretKey(profile.id);
-          if (authType !== "password") {
-            // Switching away from password auth — remove stored password
-            await this.secretVault.delete(secretKey);
-          } else if (password) {
-            // New or updated password
-            await this.secretVault.store(secretKey, password);
-          } else if (existingId === null) {
-            // New profile with no password — nothing to store
-          } else {
-            // Editing existing profile, password left blank — keep existing
-            const existingProfile = this.core.getAuthProfile(existingId);
-            if (existingProfile && existingProfile.authType !== "password") {
-              // Was previously not password, now is — no stale secret to preserve
+          // Handle password in SecretVault
+          if (this.secretVault) {
+            const secretKey = authProfilePasswordSecretKey(profile.id);
+            if (authType !== "password") {
+              // Switching away from password auth — remove stored password
+              await this.secretVault.delete(secretKey);
+            } else if (password) {
+              // New or updated password
+              await this.secretVault.store(secretKey, password);
+            } else if (existingId !== null && previousProfile && previousProfile.authType !== "password") {
+              // Switching to password auth with no password should not retain stale secret.
               await this.secretVault.delete(secretKey);
             }
-            // Otherwise: existing was password, blank means keep — do nothing
           }
+
+          this.selectedId = profile.id;
+          this.render();
+          void this.panel.webview.postMessage({ type: "saved" });
+          break;
         }
+        case "delete": {
+          if (typeof msg.id !== "string") {
+            break;
+          }
+          const id = msg.id;
+          const profile = this.core.getAuthProfile(id);
+          if (!profile) break;
 
-        this.selectedId = profile.id;
-        this.render();
-        void this.panel.webview.postMessage({ type: "saved" });
-        break;
-      }
-      case "delete": {
-        const id = msg.id as string;
-        const profile = this.core.getAuthProfile(id);
-        if (!profile) break;
+          const confirm = await vscode.window.showWarningMessage(
+            `Delete auth profile "${profile.name}"?`,
+            { modal: true },
+            "Delete"
+          );
+          if (confirm !== "Delete") break;
 
-        const confirm = await vscode.window.showWarningMessage(
-          `Delete auth profile "${profile.name}"?`,
-          { modal: true },
-          "Delete"
-        );
-        if (confirm !== "Delete") break;
+          if (this.secretVault) {
+            await this.secretVault.delete(authProfilePasswordSecretKey(id));
+          }
+          await this.core.removeAuthProfile(id);
 
-        if (this.secretVault) {
-          await this.secretVault.delete(authProfilePasswordSecretKey(id));
+          const profiles = this.core.getSnapshot().authProfiles;
+          this.selectedId = profiles.length > 0 ? profiles[0].id : null;
+          this.render();
+          break;
         }
-        await this.core.removeAuthProfile(id);
-
-        const profiles = this.core.getSnapshot().authProfiles;
-        this.selectedId = profiles.length > 0 ? profiles[0].id : null;
-        this.render();
-        break;
-      }
-      case "browse": {
-        const uris = await vscode.window.showOpenDialog({
-          canSelectFiles: true,
-          canSelectMany: false,
-          title: "Select SSH Private Key",
-          defaultUri: vscode.Uri.file(os.homedir() + "/.ssh/"),
-          openLabel: "Select Key",
-          filters: { "All Files": ["*"] }
-        });
-        if (uris?.[0]?.fsPath) {
-          void this.panel.webview.postMessage({ type: "browseResult", path: uris[0].fsPath });
+        case "browse": {
+          const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectMany: false,
+            title: "Select SSH Private Key",
+            defaultUri: vscode.Uri.file(os.homedir() + "/.ssh/"),
+            openLabel: "Select Key",
+            filters: { "All Files": ["*"] }
+          });
+          if (uris?.[0]?.fsPath) {
+            void this.panel.webview.postMessage({ type: "browseResult", path: uris[0].fsPath });
+          }
+          break;
         }
-        break;
       }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      void vscode.window.showErrorMessage(`Auth profile action failed: ${detail}`);
     }
   }
 }

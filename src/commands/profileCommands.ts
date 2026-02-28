@@ -5,10 +5,10 @@ import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
-import { AuthProfileEditorPanel } from "../ui/authProfileEditorPanel";
 import { authProfilePasswordSecretKey, passwordSecretKey } from "../services/ssh/silentAuth";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
 import type { CommandContext } from "./types";
+import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import {
   normalizeFolderPath,
   normalizeOptionalFolderPath,
@@ -24,6 +24,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   const snapshot = ctx.core.getSnapshot();
   const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
   const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles);
+  const inlineAuthProfile = createInlineAuthProfileCreation(ctx);
   const panel = WebviewFormPanel.open("profile-add", definition, {
     onSubmit: async (values: FormValues) => {
       if (normalizeOptionalFolderPath(values.group) === null) {
@@ -54,20 +55,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
     },
     onBrowse: browseForKey,
     onScan: () => scanForPort(ctx),
-    onCreateInline: (key) => {
-      if (key === "authProfileId") {
-        AuthProfileEditorPanel.openNew(ctx.core, ctx.secretVault);
-        const knownIds = new Set(snapshot.authProfiles.map((p) => p.id));
-        const unsub = ctx.core.onDidChange(() => {
-          const newProfiles = ctx.core.getSnapshot().authProfiles;
-          const added = newProfiles.find((p) => !knownIds.has(p.id));
-          if (added) {
-            panel.addSelectOption("authProfileId", added.id, `${added.name} — ${added.authType} — ${added.username}`);
-            unsub();
-          }
-        });
-      }
-    },
+    onCreateInline: inlineAuthProfile.handleCreateInline,
     onAutofill: async (_key, value) => {
       const profile = ctx.core.getAuthProfile(value);
       if (!profile) {
@@ -80,6 +68,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
       };
     }
   });
+  inlineAuthProfile.attachPanel(panel);
 }
 
 export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[] {

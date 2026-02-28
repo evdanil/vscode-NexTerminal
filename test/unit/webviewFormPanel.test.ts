@@ -114,4 +114,20 @@ describe("WebviewFormPanel submit handling", () => {
     expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1");
     expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "fillFields" }));
   });
+
+  it("supports disposal listeners for external cleanup", () => {
+    const onSubmit = vi.fn();
+    const panel = WebviewFormPanel.open("panel-dispose-listener", { title: "Dispose", fields: [] }, { onSubmit });
+    const listenerA = vi.fn();
+    const listenerB = vi.fn();
+
+    const disposableA = panel.onDidDispose(listenerA);
+    panel.onDidDispose(listenerB);
+    disposableA.dispose();
+
+    panel.dispose();
+
+    expect(listenerA).not.toHaveBeenCalled();
+    expect(listenerB).toHaveBeenCalledTimes(1);
+  });
 });

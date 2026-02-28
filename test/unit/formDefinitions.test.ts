@@ -29,4 +29,17 @@ describe("formDefinitions keyPath visibility", () => {
       { field: "authType", value: "key" }
     ]);
   });
+
+  it("always includes auth profile selector with inline-create option in server form", () => {
+    const definition = serverFormDefinition();
+    const authProfileField = definition.fields.find(
+      (field): field is Extract<(typeof definition.fields)[number], { key: string }> =>
+        "key" in field && field.key === "authProfileId"
+    );
+    expect(authProfileField).toBeDefined();
+    expect(authProfileField!.type).toBe("select");
+    if (authProfileField && authProfileField.type === "select") {
+      expect(authProfileField.options.some((option) => option.value === "__create__authProfile")).toBe(true);
+    }
+  });
 });

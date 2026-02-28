@@ -8,6 +8,7 @@ export class WebviewFormPanel {
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
   private submitInFlight = false;
+  private readonly disposeListeners = new Set<() => void>();
 
   private constructor(
     private readonly formId: string,
@@ -76,6 +77,14 @@ export class WebviewFormPanel {
 
     this.panel.onDidDispose(() => {
       this.disposed = true;
+      for (const listener of this.disposeListeners) {
+        try {
+          listener();
+        } catch {
+          // Never block panel cleanup on listener failures.
+        }
+      }
+      this.disposeListeners.clear();
       WebviewFormPanel.activePanels.delete(formId);
     });
   }
@@ -115,6 +124,19 @@ export class WebviewFormPanel {
     if (!this.disposed) {
       void this.panel.webview.postMessage({ type: "addSelectOption", key, value, label });
     }
+  }
+
+  public onDidDispose(listener: () => void): vscode.Disposable {
+    if (this.disposed) {
+      listener();
+      return { dispose: () => {} };
+    }
+    this.disposeListeners.add(listener);
+    return {
+      dispose: () => {
+        this.disposeListeners.delete(listener);
+      }
+    };
   }
 
   public dispose(): void {
