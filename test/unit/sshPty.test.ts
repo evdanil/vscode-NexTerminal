@@ -48,7 +48,55 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
   };
 }
 
-describe("SshPty banner handling", () => {
+function createConnection(stream: PassThrough, banner?: string): {
+  connection: {
+    openShell: ReturnType<typeof vi.fn>;
+    getBanner: ReturnType<typeof vi.fn>;
+    onClose: ReturnType<typeof vi.fn>;
+    dispose: ReturnType<typeof vi.fn>;
+  };
+  emitClose: () => void;
+} {
+  let closeListener: (() => void) | undefined;
+  return {
+    connection: {
+      openShell: vi.fn(async () => stream),
+      getBanner: vi.fn(() => banner),
+      onClose: vi.fn((listener: () => void) => {
+        closeListener = listener;
+        return () => {
+          if (closeListener === listener) {
+            closeListener = undefined;
+          }
+        };
+      }),
+      dispose: vi.fn()
+    },
+    emitClose: () => closeListener?.()
+  };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function flushAsync(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+describe("SshPty", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -83,6 +131,56 @@ describe("SshPty banner handling", () => {
     expect(connection.getBanner).toHaveBeenCalledTimes(1);
     expect(writes[0]).toBe("Authorized users only\r\nDisconnect if not authorized");
     expect(mockShowErrorMessage).not.toHaveBeenCalled();
+
+    pty.dispose();
+  });
+
+  it("ignores stale disconnect events from a previous connection during reconnect", async () => {
+    const stream1 = new PassThrough();
+    const first = createConnection(stream1);
+
+    const stream2 = new PassThrough();
+    const openShell2 = deferred<PassThrough>();
+    const second = createConnection(stream2);
+    second.connection.openShell = vi.fn(() => openShell2.promise);
+
+    const sshFactory = {
+      connect: vi
+        .fn()
+        .mockResolvedValueOnce(first.connection)
+        .mockResolvedValueOnce(second.connection)
+    };
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn(),
+      onDisconnected: vi.fn()
+    };
+    const logger = {
+      log: vi.fn(),
+      close: vi.fn()
+    };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+
+    pty.open();
+    await flushAsync();
+
+    first.emitClose();
+    await flushAsync();
+    expect(callbacks.onDisconnected).toHaveBeenCalledTimes(1);
+
+    pty.handleInput("R");
+    await Promise.resolve();
+
+    // Late close from the old connection must not tear down reconnect state.
+    first.emitClose();
+
+    openShell2.resolve(stream2);
+    await flushAsync();
+
+    const writeSpy = vi.spyOn(stream2, "write");
+    pty.handleInput("echo");
+    expect(writeSpy).toHaveBeenCalled();
+    expect(callbacks.onDisconnected).toHaveBeenCalledTimes(1);
 
     pty.dispose();
   });

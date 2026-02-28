@@ -21,6 +21,10 @@ export interface RpcNotification {
   params?: unknown;
 }
 
+export const PORT_DATA_NOTIFICATION = "portData";
+export const PORT_ERROR_NOTIFICATION = "portError";
+export const PORT_DISCONNECTED_NOTIFICATION = "portDisconnected";
+
 export interface SerialPortInfo {
   path: string;
   manufacturer?: string;

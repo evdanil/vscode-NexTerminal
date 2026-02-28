@@ -1,6 +1,15 @@
 import { randomUUID } from "node:crypto";
 import * as readline from "node:readline";
-import type { OpenPortParams, RpcNotification, RpcRequest, RpcResponse, SerialPortInfo } from "./protocol";
+import {
+  PORT_DATA_NOTIFICATION,
+  PORT_DISCONNECTED_NOTIFICATION,
+  PORT_ERROR_NOTIFICATION,
+  type OpenPortParams,
+  type RpcNotification,
+  type RpcRequest,
+  type RpcResponse,
+  type SerialPortInfo
+} from "./protocol";
 
 type PortRecord = {
   write(data: Buffer, callback: (error?: Error | null) => void): void;
@@ -97,7 +106,7 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
     });
     port.on("data", (data: Buffer) => {
       writeLine({
-        method: "portData",
+        method: PORT_DATA_NOTIFICATION,
         params: {
           sessionId,
           data: data.toString("base64")
@@ -106,7 +115,7 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
     });
     port.on("error", (error: Error) => {
       writeLine({
-        method: "portError",
+        method: PORT_ERROR_NOTIFICATION,
         params: {
           sessionId,
           message: error.message
@@ -117,8 +126,8 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
       if (ports.has(sessionId)) {
         ports.delete(sessionId);
         writeLine({
-          method: "portError",
-          params: { sessionId, message: "Port closed" }
+          method: PORT_DISCONNECTED_NOTIFICATION,
+          params: { sessionId, reason: "Port closed" }
         });
       }
     });

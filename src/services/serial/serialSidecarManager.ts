@@ -1,10 +1,20 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as readline from "node:readline";
-import type { OpenPortParams, RpcNotification, RpcRequest, RpcResponse, SerialPortInfo } from "./protocol";
+import {
+  PORT_DATA_NOTIFICATION,
+  PORT_DISCONNECTED_NOTIFICATION,
+  PORT_ERROR_NOTIFICATION,
+  type OpenPortParams,
+  type RpcNotification,
+  type RpcRequest,
+  type RpcResponse,
+  type SerialPortInfo
+} from "./protocol";
 
 type DataListener = (sessionId: string, data: Buffer) => void;
 type ErrorListener = (sessionId: string, message: string) => void;
+type DisconnectListener = (sessionId: string, reason: string) => void;
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -16,6 +26,7 @@ export class SerialSidecarManager {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly dataListeners = new Set<DataListener>();
   private readonly errorListeners = new Set<ErrorListener>();
+  private readonly disconnectListeners = new Set<DisconnectListener>();
 
   public constructor(
     private readonly sidecarScriptPath: string,
@@ -30,6 +41,11 @@ export class SerialSidecarManager {
   public onDidReceiveError(listener: ErrorListener): () => void {
     this.errorListeners.add(listener);
     return () => this.errorListeners.delete(listener);
+  }
+
+  public onDidDisconnect(listener: DisconnectListener): () => void {
+    this.disconnectListeners.add(listener);
+    return () => this.disconnectListeners.delete(listener);
   }
 
   public async listPorts(): Promise<SerialPortInfo[]> {
@@ -74,6 +90,9 @@ export class SerialSidecarManager {
       deferred.reject(new Error("Serial sidecar disposed"));
     }
     this.pending.clear();
+    this.dataListeners.clear();
+    this.errorListeners.clear();
+    this.disconnectListeners.clear();
     this.processRef?.kill();
     this.processRef = undefined;
   }
@@ -152,7 +171,7 @@ export class SerialSidecarManager {
   }
 
   private handleNotification(notification: RpcNotification): void {
-    if (notification.method === "portData") {
+    if (notification.method === PORT_DATA_NOTIFICATION) {
       const data = notification.params as { sessionId?: string; data?: string };
       if (!data.sessionId || !data.data) {
         return;
@@ -163,7 +182,18 @@ export class SerialSidecarManager {
       }
       return;
     }
-    if (notification.method === "portError") {
+    if (notification.method === PORT_DISCONNECTED_NOTIFICATION) {
+      const disconnected = notification.params as { sessionId?: string; reason?: string };
+      if (!disconnected.sessionId) {
+        return;
+      }
+      const reason = disconnected.reason ?? "Port closed";
+      for (const listener of this.disconnectListeners) {
+        listener(disconnected.sessionId, reason);
+      }
+      return;
+    }
+    if (notification.method === PORT_ERROR_NOTIFICATION) {
       const error = notification.params as { sessionId?: string; message?: string };
       if (!error.sessionId || !error.message) {
         return;

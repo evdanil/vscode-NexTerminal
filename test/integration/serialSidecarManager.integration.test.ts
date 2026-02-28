@@ -26,12 +26,16 @@ describe("SerialSidecarManager integration", () => {
     const manager = new SerialSidecarManager(sidecarPath);
     const dataEvents: Array<{ sessionId: string; payload: string }> = [];
     const errorEvents: Array<{ sessionId: string; message: string }> = [];
+    const disconnectEvents: Array<{ sessionId: string; reason: string }> = [];
 
     manager.onDidReceiveData((sessionId, data) => {
       dataEvents.push({ sessionId, payload: data.toString("utf8") });
     });
     manager.onDidReceiveError((sessionId, message) => {
       errorEvents.push({ sessionId, message });
+    });
+    manager.onDidDisconnect((sessionId, reason) => {
+      disconnectEvents.push({ sessionId, reason });
     });
 
     const ports = await manager.listPorts();
@@ -54,11 +58,12 @@ describe("SerialSidecarManager integration", () => {
 
     const readyData = await waitFor(() => dataEvents.find((item) => item.payload === "ready"));
     const echoedData = await waitFor(() => dataEvents.find((item) => item.payload === "hello"));
-    const closedEvent = await waitFor(() => errorEvents.find((item) => item.message === "closed"));
+    const disconnectedEvent = await waitFor(() => disconnectEvents.find((item) => item.reason === "Port closed"));
 
     expect(readyData.sessionId).toBe("session-1");
     expect(echoedData.sessionId).toBe("session-1");
-    expect(closedEvent.sessionId).toBe("session-1");
+    expect(disconnectedEvent.sessionId).toBe("session-1");
+    expect(errorEvents).toHaveLength(0);
 
     manager.dispose();
   });

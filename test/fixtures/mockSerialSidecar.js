@@ -42,7 +42,7 @@ rl.on("line", (line) => {
   }
   if (request.method === "closePort") {
     respond(request.id, { ok: true });
-    notify("portError", { sessionId: request.params.sessionId, message: "closed" });
+    notify("portDisconnected", { sessionId: request.params.sessionId, reason: "Port closed" });
     return;
   }
 
