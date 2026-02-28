@@ -8,8 +8,6 @@ import type {
   TunnelProfile,
   TunnelRegistryEntry
 } from "../models/config";
-import type { SecretVault } from "../services/ssh/contracts";
-import { passwordSecretKey, authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
@@ -105,38 +103,6 @@ export class NexusCore {
     this.authProfiles.delete(profileId);
     await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
     this.emitChanged();
-  }
-
-  public async applyAuthProfileToFolder(
-    profileId: string,
-    folderPath: string,
-    vault: SecretVault,
-    profilePassword: string | undefined
-  ): Promise<number> {
-    const profile = this.authProfiles.get(profileId);
-    if (!profile) {
-      return 0;
-    }
-    let count = 0;
-    for (const server of this.servers.values()) {
-      if (!server.group || !isDescendantOrSelf(server.group, folderPath)) {
-        continue;
-      }
-      server.username = profile.username;
-      server.authType = profile.authType;
-      server.keyPath = profile.keyPath;
-      if (profile.authType === "password" && profilePassword) {
-        await vault.store(passwordSecretKey(server.id), profilePassword);
-      } else {
-        await vault.delete(passwordSecretKey(server.id));
-      }
-      count++;
-    }
-    if (count > 0) {
-      await this.repository.saveServers([...this.servers.values()]);
-      this.emitChanged();
-    }
-    return count;
   }
 
   public isServerConnected(serverId: string): boolean {

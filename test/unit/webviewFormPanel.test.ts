@@ -85,4 +85,33 @@ describe("WebviewFormPanel submit handling", () => {
     expect(onSubmit).toHaveBeenCalledTimes(2);
     expect(panelDispose).toHaveBeenCalledTimes(1);
   });
+
+  it("handles autofill messages and posts fillFields results", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockResolvedValue({ username: "root", authType: "key" });
+
+    WebviewFormPanel.open("panel-autofill", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    expect(messageHandler).toBeDefined();
+
+    await Promise.resolve(messageHandler!({ type: "autofill", key: "authProfileId", value: "ap1" }));
+
+    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1");
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "fillFields",
+      values: { username: "root", authType: "key" }
+    });
+  });
+
+  it("does not post fillFields when autofill returns undefined", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockResolvedValue(undefined);
+
+    WebviewFormPanel.open("panel-autofill-empty", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    expect(messageHandler).toBeDefined();
+
+    await Promise.resolve(messageHandler!({ type: "autofill", key: "authProfileId", value: "ap1" }));
+
+    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1");
+    expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "fillFields" }));
+  });
 });

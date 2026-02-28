@@ -72,7 +72,7 @@ import { registerConfigCommands, isValidExport, SETTINGS_KEYS, sanitizeForSharin
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { SecretVault } from "../../src/services/ssh/contracts";
-import type { ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
+import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 
 class MockVault implements SecretVault {
   private secrets = new Map<string, string>();
@@ -118,6 +118,16 @@ function makeSerialProfile(overrides: Partial<SerialProfile> = {}): SerialProfil
     stopBits: 1,
     parity: "none",
     rtscts: false,
+    ...overrides
+  };
+}
+
+function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+  return {
+    id: "ap1",
+    name: "Prod Auth",
+    username: "deploy",
+    authType: "password",
     ...overrides
   };
 }
@@ -401,6 +411,7 @@ describe("share export command", () => {
     await core.addOrUpdateServer(makeServer({ username: "alice", keyPath: "/home/alice/.ssh/id_rsa" }));
     await core.addOrUpdateTunnel(makeTunnel({ defaultServerId: "s1" }));
     await core.addOrUpdateSerialProfile(makeSerialProfile());
+    await core.addOrUpdateAuthProfile(makeAuthProfile({ authType: "key", keyPath: "/home/alice/.ssh/id_ed25519" }));
 
     configStore.set("nexus.terminal.macros", [
       { name: "Hello", text: "echo hi", secret: false },
@@ -431,6 +442,10 @@ describe("share export command", () => {
 
     expect(writtenData.serialProfiles).toHaveLength(1);
     expect(writtenData.serialProfiles[0].id).not.toBe("sp1");
+
+    expect(writtenData.authProfiles).toHaveLength(1);
+    expect(writtenData.authProfiles[0].id).not.toBe("ap1");
+    expect(writtenData.authProfiles[0].keyPath).toBeUndefined();
 
     // Secret macros stripped
     const macros = writtenData.settings["nexus.terminal.macros"];
@@ -468,8 +483,10 @@ describe("backup export command", () => {
 
   it("exports with encrypted secrets and strips secret macro text from settings", async () => {
     await core.addOrUpdateServer(makeServer());
+    await core.addOrUpdateAuthProfile(makeAuthProfile());
     await vault.store("password-s1", "mypassword");
     await vault.store("passphrase-s1", "mypassphrase");
+    await vault.store("auth-profile-password-ap1", "profile-secret");
 
     configStore.set("nexus.terminal.macros", [
       { name: "Hello", text: "echo hi", secret: false },
@@ -494,6 +511,12 @@ describe("backup export command", () => {
     expect(writtenData.exportType).toBe("backup");
     expect(writtenData.encryptedSecrets).toBeDefined();
     expect(writtenData.encryptedSecrets.cipher).toBe("aes-256-gcm");
+    expect(writtenData.authProfiles).toHaveLength(1);
+    expect(writtenData.authProfiles[0].id).toBe("ap1");
+
+    const { decrypt } = await import("../../src/utils/configCrypto");
+    const decrypted = JSON.parse(decrypt(writtenData.encryptedSecrets, "testpass123"));
+    expect(decrypted.authProfilePasswords).toEqual({ ap1: "profile-secret" });
 
     // Secret macro text should be stripped in the settings block
     const macros = writtenData.settings["nexus.terminal.macros"];
@@ -529,12 +552,14 @@ describe("backup import", () => {
     const secrets = {
       passwords: { s1: "restored-pw" },
       passphrases: { s1: "restored-pp" },
+      authProfilePasswords: { ap1: "restored-auth-pw" },
       secretMacros: [{ name: "Secret", text: "super-secret", secret: true }]
     };
     const encrypted = encrypt(JSON.stringify(secrets), "testpass");
 
     const exportData = makeExportData({
       exportType: "backup",
+      authProfiles: [makeAuthProfile()],
       encryptedSecrets: encrypted,
       settings: {
         "nexus.terminal.macros": [
@@ -555,12 +580,14 @@ describe("backup import", () => {
     // Passwords restored to vault
     expect(await vault.get("password-s1")).toBe("restored-pw");
     expect(await vault.get("passphrase-s1")).toBe("restored-pp");
+    expect(await vault.get("auth-profile-password-ap1")).toBe("restored-auth-pw");
 
     // Secret macros merged back
     const macros = configStore.get("nexus.terminal.macros") as Array<{ name: string; text: string; secret?: boolean }>;
     expect(macros).toBeDefined();
     const secretMacro = macros.find(m => m.name === "Secret");
     expect(secretMacro?.text).toBe("super-secret");
+    expect(core.getSnapshot().authProfiles).toHaveLength(1);
   });
 
   it("shows error on wrong password", async () => {
@@ -1182,8 +1209,10 @@ describe("backup export round-trip", () => {
     const sourceCore = new NexusCore(sourceRepo);
     await sourceCore.initialize();
     await sourceCore.addOrUpdateServer(makeServer());
+    await sourceCore.addOrUpdateAuthProfile(makeAuthProfile());
     await vault.store("password-s1", "mypw");
     await vault.store("passphrase-s1", "mypp");
+    await vault.store("auth-profile-password-ap1", "authpw");
 
     configStore.set("nexus.terminal.macros", [
       { name: "Public", text: "echo hi" },
@@ -1227,8 +1256,10 @@ describe("backup export round-trip", () => {
 
     const snapshot = destCore.getSnapshot();
     expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.authProfiles).toHaveLength(1);
     expect(await vault.get("password-s1")).toBe("mypw");
     expect(await vault.get("passphrase-s1")).toBe("mypp");
+    expect(await vault.get("auth-profile-password-ap1")).toBe("authpw");
 
     // Secret macros restored
     const macros = configStore.get("nexus.terminal.macros") as Array<{ name: string; text: string; secret?: boolean }>;

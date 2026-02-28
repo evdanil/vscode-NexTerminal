@@ -346,6 +346,38 @@ describe("renderFormHtml", () => {
     expect(html).toContain("inputs[ii].disabled = false");
   });
 
+  it("submit handler skips disabled fields so hidden values are not posted", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [{ type: "text", key: "x", label: "X" }]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain("if (el.disabled) continue;");
+  });
+
+  it("renders autofill-enabled selects and posts autofill messages", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "authProfileId",
+          label: "Auth Profile",
+          options: [
+            { label: "(None)", value: "" },
+            { label: "Prod", value: "ap1" }
+          ],
+          value: "",
+          autofill: true
+        }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain('data-autofill="true"');
+    expect(html).toContain("type: 'autofill'");
+    expect(html).toContain('if (msg.type === "fillFields")');
+  });
+
   it("guards visibleWhen JSON parsing to avoid script breakage", () => {
     const definition: FormDefinition = {
       title: "Test",

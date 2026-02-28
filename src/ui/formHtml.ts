@@ -215,6 +215,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         var values = {};
         for (var i = 0; i < form.elements.length; i++) {
           var el = form.elements[i];
+          if (el.disabled) continue;
           if (!el.name) continue;
           if (el.type === "checkbox") {
             values[el.name] = el.checked;

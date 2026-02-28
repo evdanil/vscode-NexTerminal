@@ -52,10 +52,9 @@ async function applyAuthProfileToServers(
   profile: AuthProfile,
   servers: import("../models/config").ServerConfig[]
 ): Promise<void> {
-  if (!ctx.secretVault) {
-    return;
-  }
-  const profilePw = await ctx.secretVault.get(authProfilePasswordSecretKey(profile.id));
+  const profilePw = ctx.secretVault
+    ? await ctx.secretVault.get(authProfilePasswordSecretKey(profile.id))
+    : undefined;
   for (const server of servers) {
     const updated = {
       ...server,
@@ -64,6 +63,9 @@ async function applyAuthProfileToServers(
       keyPath: profile.keyPath
     };
     await ctx.core.addOrUpdateServer(updated);
+    if (!ctx.secretVault) {
+      continue;
+    }
     if (profile.authType === "password" && profilePw) {
       await ctx.secretVault.store(passwordSecretKey(server.id), profilePw);
     } else {
@@ -84,8 +86,13 @@ export function registerAuthProfileCommands(ctx: CommandContext): vscode.Disposa
           }
           await ctx.core.addOrUpdateAuthProfile(profile);
           const password = typeof values.password === "string" ? values.password : "";
-          if (password && ctx.secretVault) {
-            await ctx.secretVault.store(authProfilePasswordSecretKey(profile.id), password);
+          if (ctx.secretVault) {
+            const key = authProfilePasswordSecretKey(profile.id);
+            if (profile.authType === "password" && password) {
+              await ctx.secretVault.store(key, password);
+            } else {
+              await ctx.secretVault.delete(key);
+            }
           }
           void vscode.window.showInformationMessage(`Auth profile "${profile.name}" created.`);
         },
@@ -148,8 +155,16 @@ export function registerAuthProfileCommands(ctx: CommandContext): vscode.Disposa
           }
           await ctx.core.addOrUpdateAuthProfile(updated);
           const password = typeof values.password === "string" ? values.password : "";
-          if (password && ctx.secretVault) {
-            await ctx.secretVault.store(authProfilePasswordSecretKey(updated.id), password);
+          if (ctx.secretVault) {
+            const key = authProfilePasswordSecretKey(updated.id);
+            if (updated.authType !== "password") {
+              await ctx.secretVault.delete(key);
+            } else if (password) {
+              await ctx.secretVault.store(key, password);
+            } else if (existing.authType !== "password") {
+              // Don't retain stale password when switching from key/agent to password with no new secret.
+              await ctx.secretVault.delete(key);
+            }
           }
           void vscode.window.showInformationMessage(`Auth profile "${updated.name}" updated.`);
         },
