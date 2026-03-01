@@ -23,11 +23,10 @@ describe("renderAuthProfileEditorHtml", () => {
 
   it("calls selectCustomOption for authtype-selector in onOptionClick callback", () => {
     const html = render();
-    // The authtype-selector branch must call selectCustomOption to actually
-    // update the hidden input and trigger text when user picks an auth method.
-    // Regression: previously only called markDirty()/updateConditionalFields()
-    // without selectCustomOption, so the dropdown never changed value.
-    expect(html).toMatch(/authtype-selector[\s\S]*?selectCustomOption\s*\(\s*wrapper/);
+    // Assert the exact authtype branch body so this fails if the call is removed.
+    expect(html).toMatch(
+      /if\s*\(\s*wrapper\.id\s*===\s*"authtype-selector"\s*\)\s*\{\s*selectCustomOption\s*\(\s*wrapper\s*,\s*value\s*\)\s*;\s*markDirty\s*\(\s*\)\s*;\s*updateConditionalFields\s*\(\s*\)\s*;\s*\}/
+    );
   });
 
   it("populates form fields for selected profile", () => {
