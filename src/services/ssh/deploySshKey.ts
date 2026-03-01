@@ -165,11 +165,16 @@ export async function execRemoteCommand(connection: SshConnection, command: stri
   return new Promise<ExecResult>((resolve, reject) => {
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
+    let exitCode: number | undefined;
 
     stream.on("data", (chunk: Buffer) => stdoutChunks.push(Buffer.from(chunk)));
     (stream as any).stderr.on("data", (chunk: Buffer) => stderrChunks.push(Buffer.from(chunk)));
 
-    stream.on("exit", (exitCode: number) => {
+    stream.on("exit", (code: number) => {
+      exitCode = code;
+    });
+
+    stream.on("close", () => {
       resolve({
         stdout: Buffer.concat(stdoutChunks).toString(),
         stderr: Buffer.concat(stderrChunks).toString(),

@@ -205,6 +205,7 @@ function mockConnection(responses: Array<{ stdout: string; stderr?: string; exit
         }
         stream.stderr.push(null);
         stream.emit("exit", resp.exitCode);
+        stream.emit("close");
       });
       return stream;
     }),
@@ -232,6 +233,27 @@ describe("execRemoteCommand", () => {
   it("returns non-zero exit code", async () => {
     const conn = mockConnection([{ stdout: "", exitCode: 1 }]);
     const result = await execRemoteCommand(conn, "false");
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("resolves when stream emits close without exit", async () => {
+    const conn = {
+      ...mockConnection([]),
+      exec: vi.fn(async () => {
+        const stream = new PassThrough() as any;
+        stream.stderr = new PassThrough();
+        process.nextTick(() => {
+          stream.push("ok\n");
+          stream.push(null);
+          stream.stderr.push(null);
+          // No "exit" event — only "close"
+          stream.emit("close");
+        });
+        return stream;
+      }),
+    };
+    const result = await execRemoteCommand(conn, "test");
+    expect(result.stdout).toBe("ok\n");
     expect(result.exitCode).toBe(1);
   });
 });
