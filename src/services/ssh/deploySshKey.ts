@@ -166,19 +166,27 @@ export async function execRemoteCommand(connection: SshConnection, command: stri
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let exitCode: number | undefined;
+    const appendChunk = (target: Buffer[], chunk: Buffer | string): void => {
+      target.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk));
+    };
 
-    stream.on("data", (chunk: Buffer) => stdoutChunks.push(Buffer.from(chunk)));
-    (stream as any).stderr.on("data", (chunk: Buffer) => stderrChunks.push(Buffer.from(chunk)));
+    stream.on("data", (chunk: Buffer | string) => appendChunk(stdoutChunks, chunk));
+    const stderrStream = (stream as any).stderr;
+    if (stderrStream && typeof stderrStream.on === "function") {
+      stderrStream.on("data", (chunk: Buffer | string) => appendChunk(stderrChunks, chunk));
+    }
 
-    stream.on("exit", (code: number) => {
-      exitCode = code;
+    stream.on("exit", (code: number | null | undefined) => {
+      if (typeof code === "number") {
+        exitCode = code;
+      }
     });
 
-    stream.on("close", () => {
+    stream.on("close", (code?: number | null) => {
       resolve({
         stdout: Buffer.concat(stdoutChunks).toString(),
         stderr: Buffer.concat(stderrChunks).toString(),
-        exitCode: exitCode ?? 1,
+        exitCode: exitCode ?? (typeof code === "number" ? code : 1),
       });
     });
 

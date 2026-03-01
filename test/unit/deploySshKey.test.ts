@@ -246,7 +246,7 @@ describe("execRemoteCommand", () => {
           stream.push("ok\n");
           stream.push(null);
           stream.stderr.push(null);
-          // No "exit" event — only "close"
+          // No "exit" event -- only "close"
           stream.emit("close");
         });
         return stream;
@@ -255,6 +255,45 @@ describe("execRemoteCommand", () => {
     const result = await execRemoteCommand(conn, "test");
     expect(result.stdout).toBe("ok\n");
     expect(result.exitCode).toBe(1);
+  });
+
+  it("uses close exit code when exit is not emitted", async () => {
+    const conn = {
+      ...mockConnection([]),
+      exec: vi.fn(async () => {
+        const stream = new PassThrough() as any;
+        stream.stderr = new PassThrough();
+        process.nextTick(() => {
+          stream.push("ok\n");
+          stream.push(null);
+          stream.stderr.push(null);
+          stream.emit("close", 0);
+        });
+        return stream;
+      }),
+    };
+    const result = await execRemoteCommand(conn, "test");
+    expect(result.stdout).toBe("ok\n");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("handles streams without stderr", async () => {
+    const conn = {
+      ...mockConnection([]),
+      exec: vi.fn(async () => {
+        const stream = new PassThrough() as any;
+        process.nextTick(() => {
+          stream.push("ok\n");
+          stream.push(null);
+          stream.emit("close", 0);
+        });
+        return stream;
+      }),
+    };
+    const result = await execRemoteCommand(conn, "test");
+    expect(result.stdout).toBe("ok\n");
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
   });
 });
 
@@ -320,3 +359,4 @@ describe("deployPublicKeyToRemote", () => {
     await expect(deployPublicKeyToRemote(conn, "not-a-valid-public-key")).rejects.toThrow("format is invalid");
   });
 });
+
