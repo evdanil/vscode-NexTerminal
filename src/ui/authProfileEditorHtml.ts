@@ -207,6 +207,7 @@ export function renderAuthProfileEditorHtml(
           return;
         }
         if (wrapper.id === "authtype-selector") {
+          selectCustomOption(wrapper, value);
           markDirty();
           updateConditionalFields();
         }
