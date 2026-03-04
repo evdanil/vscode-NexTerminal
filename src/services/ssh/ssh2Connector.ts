@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
-import { Client, type ConnectConfig, type SFTPWrapper, type VerifyCallback } from "ssh2";
+import { Client, type Algorithms, type ConnectConfig, type SFTPWrapper, type VerifyCallback } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import type {
   HostKeyVerifier,
@@ -10,6 +10,37 @@ import type {
   SshConnector,
   TcpConnectionInfo
 } from "./contracts";
+
+/**
+ * Legacy SSH algorithms appended as fallbacks when `ServerConfig.legacyAlgorithms`
+ * is enabled. Targets older devices (Cisco IOS, embedded systems) that lack modern
+ * algorithm support.
+ *
+ * Security notes:
+ * - `diffie-hellman-group1-sha1` uses a 1024-bit group considered breakable by
+ *   nation-state adversaries, but is required by many legacy devices.
+ * - `ssh-dss` uses 1024-bit DSA keys, similarly weak but still common on older hosts.
+ * - RC4/arcfour ciphers are intentionally excluded — they are cryptographically broken
+ *   and unnecessary even for legacy devices (which typically support aes*-cbc or 3des-cbc).
+ * - These are appended, not prepended, so modern algorithms are always preferred when
+ *   the server supports them.
+ */
+export const LEGACY_ALGORITHMS: Algorithms = {
+  kex: { append: [
+    "diffie-hellman-group-exchange-sha1",
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group1-sha1"
+  ], prepend: [], remove: [] },
+  cipher: { append: [
+    "aes256-cbc", "aes192-cbc", "aes128-cbc",
+    "blowfish-cbc", "3des-cbc", "cast128-cbc"
+  ], prepend: [], remove: [] },
+  serverHostKey: { append: ["ssh-dss"], prepend: [], remove: [] },
+  hmac: { append: [
+    "hmac-md5", "hmac-sha2-256-96", "hmac-sha2-512-96",
+    "hmac-ripemd160", "hmac-sha1-96", "hmac-md5-96"
+  ], prepend: [], remove: [] }
+};
 
 class Ssh2Connection implements SshConnection {
   private readonly closeListeners = new Set<() => void>();
@@ -137,7 +168,7 @@ class Ssh2Connection implements SshConnection {
   }
 }
 
-async function toConnectConfig(server: ServerConfig, password?: string, passphrase?: string, sock?: Duplex): Promise<ConnectConfig> {
+export async function buildConnectConfig(server: ServerConfig, password?: string, passphrase?: string, sock?: Duplex): Promise<ConnectConfig> {
   const base: ConnectConfig = {
     host: server.host,
     port: server.port,
@@ -146,7 +177,8 @@ async function toConnectConfig(server: ServerConfig, password?: string, passphra
     keepaliveInterval: 10_000,
     keepaliveCountMax: 3,
     tryKeyboard: true,
-    ...(sock && { sock })
+    ...(sock && { sock }),
+    ...(server.legacyAlgorithms && { algorithms: LEGACY_ALGORITHMS })
   };
 
   if (server.authType === "password") {
@@ -182,7 +214,7 @@ export class Ssh2Connector implements SshConnector {
     server: ServerConfig,
     auth: { password?: string; passphrase?: string; sock?: Duplex; onKeyboardInteractive?: KeyboardInteractiveHandler }
   ): Promise<SshConnection> {
-    const config = await toConnectConfig(server, auth.password, auth.passphrase, auth.sock);
+    const config = await buildConnectConfig(server, auth.password, auth.passphrase, auth.sock);
     if (this.hostKeyVerifier) {
       config.hostVerifier = (hostKey: Buffer | string, verify: VerifyCallback): void => {
         const rawHostKey = Buffer.isBuffer(hostKey) ? hostKey : Buffer.from(hostKey, "hex");

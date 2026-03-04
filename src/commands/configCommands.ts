@@ -28,12 +28,12 @@ interface NexusConfigExport {
   version: 1;
   exportType?: "backup" | "share";
   exportedAt: string;
-  servers: ServerConfig[];
-  tunnels: TunnelProfile[];
-  serialProfiles: SerialProfile[];
+  servers?: ServerConfig[];
+  tunnels?: TunnelProfile[];
+  serialProfiles?: SerialProfile[];
   authProfiles?: AuthProfile[];
   groups?: string[];
-  settings: Record<string, unknown>;
+  settings?: Record<string, unknown>;
   encryptedSecrets?: EncryptedPayload;
 }
 
@@ -121,12 +121,10 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
     return false;
   }
   const obj = data as Record<string, unknown>;
-  return (
-    obj.version === 1 &&
-    Array.isArray(obj.servers) &&
-    Array.isArray(obj.tunnels) &&
-    Array.isArray(obj.serialProfiles)
-  );
+  const hasServers = Array.isArray(obj.servers) && obj.servers.length > 0;
+  const hasTunnels = Array.isArray(obj.tunnels) && obj.tunnels.length > 0;
+  const hasSerialProfiles = Array.isArray(obj.serialProfiles) && obj.serialProfiles.length > 0;
+  return obj.version === 1 && (hasServers || hasTunnels || hasSerialProfiles);
 }
 
 function ensureId(item: Record<string, unknown>): void {
@@ -139,7 +137,6 @@ interface SanitizedSnapshot {
   servers: ServerConfig[];
   tunnels: TunnelProfile[];
   serialProfiles: SerialProfile[];
-  authProfiles: AuthProfile[];
   settings: Record<string, unknown>;
 }
 
@@ -163,8 +160,7 @@ export function sanitizeForSharing(
   servers: ServerConfig[],
   tunnels: TunnelProfile[],
   serialProfiles: SerialProfile[],
-  settings: Record<string, unknown>,
-  authProfiles: AuthProfile[] = []
+  settings: Record<string, unknown>
 ): SanitizedSnapshot {
   const idMap = new Map<string, string>();
 
@@ -206,17 +202,10 @@ export function sanitizeForSharing(
     sanitizedSettings["nexus.logging.sessionLogDirectory"] = "";
   }
 
-  const newAuthProfiles = authProfiles.map((p) => ({
-    ...p,
-    id: randomUUID(),
-    keyPath: undefined
-  }));
-
   return {
     servers: newServers,
     tunnels: newTunnels,
     serialProfiles: newSerialProfiles,
-    authProfiles: newAuthProfiles,
     settings: sanitizedSettings
   };
 }
@@ -328,8 +317,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       snapshot.servers,
       snapshot.tunnels,
       snapshot.serialProfiles,
-      settings,
-      snapshot.authProfiles
+      settings
     );
 
     const exportData: NexusConfigExport = {
@@ -339,7 +327,6 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       servers: sanitized.servers,
       tunnels: sanitized.tunnels,
       serialProfiles: sanitized.serialProfiles,
-      authProfiles: sanitized.authProfiles,
       groups: snapshot.explicitGroups,
       settings: sanitized.settings
     };
@@ -419,8 +406,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     // Generate fresh IDs to prevent duplicates on re-import
     const idMap = new Map<string, string>();
 
+    const servers = data.servers ?? [];
+    const tunnels = data.tunnels ?? [];
+    const serialProfiles = data.serialProfiles ?? [];
+
     // First pass: assign new IDs
-    for (const server of data.servers) {
+    for (const server of servers) {
       ensureId(server as unknown as Record<string, unknown>);
       const newId = randomUUID();
       idMap.set(server.id, newId);
@@ -430,7 +421,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     // Second pass: remap jump host references and import
     let imported = 0;
     let skipped = 0;
-    for (const server of data.servers) {
+    for (const server of servers) {
       if (server.proxy?.type === "ssh") {
         const remapped = idMap.get(server.proxy.jumpHostId);
         if (remapped) {
@@ -446,7 +437,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         skipped++;
       }
     }
-    for (const tunnel of data.tunnels) {
+    for (const tunnel of tunnels) {
       ensureId(tunnel as unknown as Record<string, unknown>);
       const newId = randomUUID();
       idMap.set(tunnel.id, newId);
@@ -461,7 +452,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         skipped++;
       }
     }
-    for (const profile of data.serialProfiles) {
+    for (const profile of serialProfiles) {
       ensureId(profile as unknown as Record<string, unknown>);
       const newId = randomUUID();
       idMap.set(profile.id, newId);
@@ -474,6 +465,8 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       }
     }
 
+    // Backward compat: older share exports included auth profiles. Accept them
+    // on import so files created by previous versions still work correctly.
     for (const profile of data.authProfiles ?? []) {
       ensureId(profile as unknown as Record<string, unknown>);
       const newId = randomUUID();
@@ -541,7 +534,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
 
     let imported = 0;
     let skipped = 0;
-    for (const server of data.servers) {
+    for (const server of data.servers ?? []) {
       ensureId(server as unknown as Record<string, unknown>);
       if (existingIds.has(server.id)) {
         skipped++;
@@ -552,7 +545,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         imported++;
       }
     }
-    for (const tunnel of data.tunnels) {
+    for (const tunnel of data.tunnels ?? []) {
       ensureId(tunnel as unknown as Record<string, unknown>);
       if (existingIds.has(tunnel.id)) {
         skipped++;
@@ -563,7 +556,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         imported++;
       }
     }
-    for (const profile of data.serialProfiles) {
+    for (const profile of data.serialProfiles ?? []) {
       ensureId(profile as unknown as Record<string, unknown>);
       if (existingIds.has(profile.id)) {
         skipped++;

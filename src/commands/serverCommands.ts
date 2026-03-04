@@ -346,6 +346,7 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     isHidden: preserveIsHidden,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
     multiplexing: typeof values.multiplexing === "boolean" ? values.multiplexing : undefined,
+    legacyAlgorithms: typeof values.legacyAlgorithms === "boolean" ? values.legacyAlgorithms : undefined,
     proxy: formValuesToProxy(values)
   };
 }

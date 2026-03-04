@@ -41,6 +41,7 @@ export interface ServerConfig {
   isHidden: boolean;
   logSession?: boolean;
   multiplexing?: boolean;  // undefined = follow global, false = always standalone
+  legacyAlgorithms?: boolean;
   proxy?: ProxyConfig;
 }
 

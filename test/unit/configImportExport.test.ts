@@ -167,16 +167,24 @@ describe("isValidExport", () => {
     expect(isValidExport(makeExportData({ version: 2 }))).toBe(false);
   });
 
-  it("rejects missing servers array", () => {
-    expect(isValidExport(makeExportData({ servers: "not-array" }))).toBe(false);
+  it("rejects when no arrays are present", () => {
+    expect(isValidExport(makeExportData({ servers: "not-array", tunnels: null, serialProfiles: undefined }))).toBe(false);
   });
 
-  it("rejects missing tunnels array", () => {
-    expect(isValidExport(makeExportData({ tunnels: null }))).toBe(false);
+  it("accepts servers-only partial config", () => {
+    expect(isValidExport({ version: 1, servers: [makeServer()] })).toBe(true);
   });
 
-  it("rejects missing serialProfiles array", () => {
-    expect(isValidExport(makeExportData({ serialProfiles: undefined }))).toBe(false);
+  it("accepts tunnels-only partial config", () => {
+    expect(isValidExport({ version: 1, tunnels: [makeTunnel()] })).toBe(true);
+  });
+
+  it("accepts serialProfiles-only partial config", () => {
+    expect(isValidExport({ version: 1, serialProfiles: [makeSerialProfile()] })).toBe(true);
+  });
+
+  it("rejects when all arrays are empty", () => {
+    expect(isValidExport({ version: 1, servers: [], tunnels: [], serialProfiles: [] })).toBe(false);
   });
 });
 
@@ -353,9 +361,6 @@ describe("config import command (legacy)", () => {
 
   it("ignores unknown imported settings keys", async () => {
     const exportData = makeExportData({
-      servers: [],
-      tunnels: [],
-      serialProfiles: [],
       settings: {
         "nexus.logging.maxFileSizeMb": 12,
         "nexus.tunnel.defaultBindAddress": "0.0.0.0",
@@ -389,6 +394,35 @@ describe("config import command (legacy)", () => {
     expect(snapshot.serialProfiles).toHaveLength(1);
     expect(snapshot.serialProfiles[0].id).toBeTruthy();
     expect(snapshot.serialProfiles[0].id.trim()).not.toBe("");
+  });
+
+  it("preserves legacyAlgorithms through import round-trip", async () => {
+    const exportData = makeExportData({
+      servers: [makeServer({ legacyAlgorithms: true })],
+      tunnels: [],
+      serialProfiles: []
+    });
+    await runImport(exportData);
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0].legacyAlgorithms).toBe(true);
+  });
+
+  it("imports partial config with only servers", async () => {
+    const partialExport = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      servers: [makeServer()]
+    };
+    await runImport(partialExport);
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0].id).toBe("s1");
+    expect(snapshot.tunnels).toHaveLength(0);
+    expect(snapshot.serialProfiles).toHaveLength(0);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profiles.");
   });
 });
 
@@ -443,9 +477,8 @@ describe("share export command", () => {
     expect(writtenData.serialProfiles).toHaveLength(1);
     expect(writtenData.serialProfiles[0].id).not.toBe("sp1");
 
-    expect(writtenData.authProfiles).toHaveLength(1);
-    expect(writtenData.authProfiles[0].id).not.toBe("ap1");
-    expect(writtenData.authProfiles[0].keyPath).toBeUndefined();
+    // Auth profiles should NOT be in share exports
+    expect(writtenData.authProfiles).toBeUndefined();
 
     // Secret macros stripped
     const macros = writtenData.settings["nexus.terminal.macros"];
@@ -1078,6 +1111,11 @@ describe("sanitizeForSharing", () => {
     });
     const result = sanitizeForSharing([server], [], [], {});
     expect(result.servers[0].proxy).toBeUndefined();
+  });
+
+  it("does not include authProfiles in result", () => {
+    const result = sanitizeForSharing([makeServer()], [], [], {});
+    expect((result as any).authProfiles).toBeUndefined();
   });
 });
 

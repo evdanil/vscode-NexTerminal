@@ -39,7 +39,8 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDes
       visibleWhen: vw
     },
     { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, visibleWhen: vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "authType", value: "key" }] : { field: "authType", value: "key" } },
-    { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, hint: "Overrides the global multiplexing setting for this server", visibleWhen: vw }
+    { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, hint: "Overrides the global multiplexing setting for this server", visibleWhen: vw },
+    { type: "checkbox", key: "legacyAlgorithms", label: "Enable legacy SSH algorithms", value: seed?.legacyAlgorithms ?? false, hint: "Append older key exchange, cipher, and MAC algorithms for connecting to legacy devices (e.g. Cisco IOS, embedded systems)", visibleWhen: vw }
   ];
 }
 

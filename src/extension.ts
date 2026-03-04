@@ -377,6 +377,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         prev.authType !== server.authType ||
         prev.keyPath !== server.keyPath ||
         prev.multiplexing !== server.multiplexing ||
+        prev.legacyAlgorithms !== server.legacyAlgorithms ||
         JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)
       )) {
         pool.disconnect(server.id);

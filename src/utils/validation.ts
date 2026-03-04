@@ -47,6 +47,9 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
       return false;
     }
   }
+  if (obj.legacyAlgorithms !== undefined && typeof obj.legacyAlgorithms !== "boolean") {
+    return false;
+  }
   return true;
 }
 
