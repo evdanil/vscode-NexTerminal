@@ -44,9 +44,12 @@ describe("buildConnectConfig", () => {
 
   it("LEGACY_ALGORITHMS excludes broken and unsupported ciphers", () => {
     const ciphers = LEGACY_ALGORITHMS.cipher.append as string[];
+    // RC4 - cryptographically broken
     expect(ciphers).not.toContain("arcfour");
     expect(ciphers).not.toContain("arcfour128");
     expect(ciphers).not.toContain("arcfour256");
+    // Dropped by OpenSSL 3.x - cause silent handshake timeouts
     expect(ciphers).not.toContain("cast128-cbc");
+    expect(ciphers).not.toContain("blowfish-cbc");
   });
 });
