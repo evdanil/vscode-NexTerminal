@@ -42,10 +42,11 @@ describe("buildConnectConfig", () => {
     expect(LEGACY_ALGORITHMS.hmac.append).toContain("hmac-md5");
   });
 
-  it("LEGACY_ALGORITHMS excludes broken RC4/arcfour ciphers", () => {
+  it("LEGACY_ALGORITHMS excludes broken and unsupported ciphers", () => {
     const ciphers = LEGACY_ALGORITHMS.cipher.append as string[];
     expect(ciphers).not.toContain("arcfour");
     expect(ciphers).not.toContain("arcfour128");
     expect(ciphers).not.toContain("arcfour256");
+    expect(ciphers).not.toContain("cast128-cbc");
   });
 });

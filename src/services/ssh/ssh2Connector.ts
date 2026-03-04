@@ -22,6 +22,7 @@ import type {
  * - `ssh-dss` uses 1024-bit DSA keys, similarly weak but still common on older hosts.
  * - RC4/arcfour ciphers are intentionally excluded — they are cryptographically broken
  *   and unnecessary even for legacy devices (which typically support aes*-cbc or 3des-cbc).
+ * - cast128-cbc is excluded — OpenSSL 3.x (used by modern Node.js) dropped CAST5 support.
  * - These are appended, not prepended, so modern algorithms are always preferred when
  *   the server supports them.
  */
@@ -33,7 +34,7 @@ export const LEGACY_ALGORITHMS: Algorithms = {
   ], prepend: [], remove: [] },
   cipher: { append: [
     "aes256-cbc", "aes192-cbc", "aes128-cbc",
-    "blowfish-cbc", "3des-cbc", "cast128-cbc"
+    "blowfish-cbc", "3des-cbc"
   ], prepend: [], remove: [] },
   serverHostKey: { append: ["ssh-dss"], prepend: [], remove: [] },
   hmac: { append: [
