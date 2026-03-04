@@ -1,4 +1,4 @@
-export const MAX_FOLDER_DEPTH = 3;
+export const MAX_FOLDER_DEPTH = 4;
 
 /**
  * Normalize a folder path: split on "/", trim segments, filter empty,

@@ -157,13 +157,13 @@ HugePort=#109#0%host.example.com%70000%user%%-1%
 
   it("truncates folder deeper than max depth", () => {
     const text = `[Bookmarks_1]
-SubRep=A\\B\\C\\D
+SubRep=A\\B\\C\\D\\E
 ImgNum=42
 Deep=#109#0%deep.example.com%22%user%%-1%
 `;
     const result = parseMobaxtermSessions(text);
     expect(result.sessions).toHaveLength(1);
-    // normalizeFolderPath rejects > 3 depth, so folder falls back to ""
+    // normalizeFolderPath rejects > MAX_FOLDER_DEPTH, so folder falls back to ""
     expect(result.sessions[0].folder).toBe("");
   });
 

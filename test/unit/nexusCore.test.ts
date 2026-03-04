@@ -424,6 +424,38 @@ describe("NexusCore", () => {
     expect(snapshot.explicitGroups).toContain("Parent");
   });
 
+  it("removeFolderCascade without deleteContents preserves nested subfolder structure", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addGroup("ProjectA/Dev/Staging");
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "ProjectA/Dev"
+    });
+    await core.addOrUpdateServer({
+      id: "s2", name: "S2", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "ProjectA/Dev/Staging"
+    });
+    await core.addOrUpdateServer({
+      id: "s3", name: "S3", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "ProjectA"
+    });
+
+    await core.removeFolderCascade("ProjectA", false);
+    const snapshot = core.getSnapshot();
+    const s1 = snapshot.servers.find((s) => s.id === "s1")!;
+    const s2 = snapshot.servers.find((s) => s.id === "s2")!;
+    const s3 = snapshot.servers.find((s) => s.id === "s3")!;
+    expect(s1.group).toBe("Dev");
+    expect(s2.group).toBe("Dev/Staging");
+    expect(s3.group).toBeUndefined();
+    expect(snapshot.explicitGroups).toContain("Dev/Staging");
+    expect(snapshot.explicitGroups).not.toContain("ProjectA");
+    expect(snapshot.explicitGroups).not.toContain("ProjectA/Dev/Staging");
+  });
+
   it("removeFolderCascade root folder moves items to ungrouped", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

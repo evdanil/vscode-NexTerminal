@@ -298,19 +298,32 @@ export class NexusCore {
     } else {
       for (const server of this.servers.values()) {
         if (server.group && isDescendantOrSelf(server.group, path)) {
-          server.group = parent;
+          const suffix = server.group.slice(path.length);
+          server.group = parent ? parent + suffix : suffix.slice(1) || undefined;
         }
       }
       for (const profile of this.serialProfiles.values()) {
         if (profile.group && isDescendantOrSelf(profile.group, path)) {
-          profile.group = parent;
+          const suffix = profile.group.slice(path.length);
+          profile.group = parent ? parent + suffix : suffix.slice(1) || undefined;
         }
       }
     }
+    const reparentedGroups: string[] = [];
     for (const g of this.explicitGroups) {
       if (isDescendantOrSelf(g, path)) {
         this.explicitGroups.delete(g);
+        if (!deleteContents && g !== path) {
+          const suffix = g.slice(path.length);
+          const newGroup = parent ? parent + suffix : suffix.slice(1);
+          if (newGroup) {
+            reparentedGroups.push(newGroup);
+          }
+        }
       }
+    }
+    for (const g of reparentedGroups) {
+      this.explicitGroups.add(g);
     }
     await Promise.all([
       this.repository.saveServers([...this.servers.values()]),

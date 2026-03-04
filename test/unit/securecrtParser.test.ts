@@ -139,7 +139,7 @@ D:"[SSH2] Port"=00000016
 S:"Hostname"=host.test
 D:"[SSH2] Port"=00000016
 `;
-    const result = parseSecureCrtSessionFile(content, "Test", "A/B/C/D");
+    const result = parseSecureCrtSessionFile(content, "Test", "A/B/C/D/E");
     expect(result!.folder).toBe("");
   });
 
