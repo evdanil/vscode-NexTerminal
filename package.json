@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, terminal macros, regex highlighting, and configuration import/export.",
-  "version": "2.7.38",
+  "version": "2.7.39",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -268,12 +268,12 @@
       },
       {
         "command": "nexus.group.connect",
-        "title": "Connect All",
+        "title": "Connect Folder Servers",
         "icon": "$(plug)"
       },
       {
         "command": "nexus.group.disconnect",
-        "title": "Disconnect All",
+        "title": "Disconnect Folder Servers",
         "icon": "$(debug-disconnect)"
       },
       {
@@ -485,6 +485,16 @@
         "title": "Terminal Appearance",
         "category": "Nexus",
         "icon": "$(paintcan)"
+      },
+      {
+        "command": "nexus.filter",
+        "title": "Filter",
+        "icon": "$(search)"
+      },
+      {
+        "command": "nexus.filter.clear",
+        "title": "Clear Filter",
+        "icon": "$(search-stop)"
       }
     ],
     "menus": {
@@ -500,14 +510,14 @@
           "group": "navigation@1"
         },
         {
-          "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter",
+          "command": "nexus.filter",
+          "when": "view == nexusCommandCenter && !nexus.filterActive",
           "group": "navigation@2"
         },
         {
-          "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter",
-          "group": "navigation@3"
+          "command": "nexus.filter.clear",
+          "when": "view == nexusCommandCenter && nexus.filterActive",
+          "group": "navigation@2"
         },
         {
           "command": "nexus.group.add",
@@ -673,47 +683,47 @@
         },
         {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
           "group": "inline@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
           "group": "inline@2"
         },
         {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.group.rename",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.group.add",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.profile.add",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.authProfile.applyToFolder",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
           "group": "1_manage@4"
         },
         {
           "command": "nexus.group.remove",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folder",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
           "group": "3_destructive"
         },
         {

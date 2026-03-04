@@ -231,7 +231,7 @@ describe("ProxySshFactory", () => {
     servers.set("srv-jump", jumpServer);
 
     const jumpConn = makeFakeConnection();
-    const tunnelStream = {} as Duplex;
+    const tunnelStream = { pause: vi.fn() } as unknown as Duplex;
     jumpConn.openDirectTcp = vi.fn(async () => tunnelStream);
 
     const targetConn = makeFakeConnection();
@@ -247,6 +247,8 @@ describe("ProxySshFactory", () => {
     expect(authFactory.connect).toHaveBeenCalledWith(jumpServer);
     // Then opened a TCP tunnel
     expect(jumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
+    // Stream should be paused to prevent banner data loss
+    expect(tunnelStream.pause).toHaveBeenCalled();
     // Then connected to target with sock
     expect(authFactory.connect).toHaveBeenCalledWith(targetServer, { sock: tunnelStream });
     // Result should be a ProxiedSshConnection
@@ -310,11 +312,11 @@ describe("ProxySshFactory", () => {
     servers.set("srv-c", serverC);
 
     const connC = makeFakeConnection();
-    const tunnelBC = {} as Duplex;
+    const tunnelBC = { pause: vi.fn() } as unknown as Duplex;
     connC.openDirectTcp = vi.fn(async () => tunnelBC);
 
     const connB = makeFakeConnection();
-    const tunnelAB = {} as Duplex;
+    const tunnelAB = { pause: vi.fn() } as unknown as Duplex;
     connB.openDirectTcp = vi.fn(async () => tunnelAB);
 
     const connA = makeFakeConnection();
@@ -350,7 +352,7 @@ describe("ProxySshFactory", () => {
     servers.set("srv-jump", jumpServer);
 
     const jumpConn = makeFakeConnection();
-    jumpConn.openDirectTcp = vi.fn(async () => ({} as Duplex));
+    jumpConn.openDirectTcp = vi.fn(async () => ({ pause: vi.fn() } as unknown as Duplex));
 
     authFactory.connect = vi.fn()
       .mockResolvedValueOnce(jumpConn)

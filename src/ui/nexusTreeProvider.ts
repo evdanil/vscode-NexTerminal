@@ -9,10 +9,11 @@ export class FolderTreeItem extends vscode.TreeItem {
   public constructor(
     public readonly folderPath: string,
     displayName: string,
-    collapsibleState: vscode.TreeItemCollapsibleState = vscode.TreeItemCollapsibleState.Expanded
+    collapsibleState: vscode.TreeItemCollapsibleState = vscode.TreeItemCollapsibleState.Expanded,
+    hasDirectServers = false
   ) {
     super(displayName, collapsibleState);
-    this.contextValue = "nexus.folder";
+    this.contextValue = hasDirectServers ? "nexus.folderWithServers" : "nexus.folder";
     this.id = `folder:${folderPath}`;
     this.tooltip = folderPath;
     this.iconPath = new vscode.ThemeIcon("folder");
@@ -100,6 +101,7 @@ export class NexusTreeProvider
 {
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<NexusTreeItem | undefined>();
   private readonly collapsedFolders = new Set<string>();
+  private filterText: string = "";
   private snapshot: SessionSnapshot = {
     servers: [],
     tunnels: [],
@@ -144,6 +146,20 @@ export class NexusTreeProvider
     for (const p of paths) {
       this.collapsedFolders.add(p);
     }
+  }
+
+  public setFilter(text: string): void {
+    this.filterText = text.toLowerCase().trim();
+    this.refresh();
+  }
+
+  public clearFilter(): void {
+    this.filterText = "";
+    this.refresh();
+  }
+
+  public getFilterText(): string {
+    return this.filterText;
   }
 
   public refresh(): void {
@@ -268,6 +284,21 @@ export class NexusTreeProvider
     return this.snapshot.tunnels.some((tunnel) => tunnel.id === id);
   }
 
+  private folderHasMatchingDescendant(folderPath: string): boolean {
+    const hasServer = this.snapshot.servers.some((s) => {
+      if (s.isHidden || !s.group) return false;
+      if (!isDescendantOrSelf(s.group, folderPath)) return false;
+      return s.name.toLowerCase().includes(this.filterText) ||
+             s.host.toLowerCase().includes(this.filterText);
+    });
+    if (hasServer) return true;
+    return this.snapshot.serialProfiles.some((p) => {
+      if (!p.group) return false;
+      if (!isDescendantOrSelf(p.group, folderPath)) return false;
+      return p.name.toLowerCase().includes(this.filterText);
+    });
+  }
+
   private getFolderChildren(parentPath: string | undefined): NexusTreeItem[] {
     // Collect all folder paths from explicitGroups + item groups, synthesizing ancestors
     const allPaths = new Set<string>();
@@ -309,9 +340,15 @@ export class NexusTreeProvider
           return false;
         }
         if (parentPath === undefined) {
-          return !server.group;
+          if (server.group) return false;
+        } else {
+          if (server.group !== parentPath) return false;
         }
-        return server.group === parentPath;
+        if (this.filterText) {
+          return server.name.toLowerCase().includes(this.filterText) ||
+                 server.host.toLowerCase().includes(this.filterText);
+        }
+        return true;
       })
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((server) => this.toServerItem(server));
@@ -319,22 +356,36 @@ export class NexusTreeProvider
     const directSerialProfiles = this.snapshot.serialProfiles
       .filter((profile) => {
         if (parentPath === undefined) {
-          return !profile.group;
+          if (profile.group) return false;
+        } else {
+          if (profile.group !== parentPath) return false;
         }
-        return profile.group === parentPath;
+        if (this.filterText) {
+          return profile.name.toLowerCase().includes(this.filterText);
+        }
+        return true;
       })
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((profile) => this.toSerialProfileItem(profile));
 
-    const folderItems = [...childFolderNames]
+    const filteredFolders = this.filterText
+      ? [...childFolderNames].filter((p) => this.folderHasMatchingDescendant(p))
+      : [...childFolderNames];
+
+    const snapshot = this.snapshot;
+    const folderItems = filteredFolders
       .sort((a, b) => a.localeCompare(b))
-      .map((p) => new FolderTreeItem(
-        p,
-        folderDisplayName(p),
-        this.collapsedFolders.has(p)
-          ? vscode.TreeItemCollapsibleState.Collapsed
-          : vscode.TreeItemCollapsibleState.Expanded
-      ));
+      .map((p) => {
+        const hasDirectServers = snapshot.servers.some((s) => !s.isHidden && s.group === p);
+        return new FolderTreeItem(
+          p,
+          folderDisplayName(p),
+          this.collapsedFolders.has(p)
+            ? vscode.TreeItemCollapsibleState.Collapsed
+            : vscode.TreeItemCollapsibleState.Expanded,
+          hasDirectServers
+        );
+      });
 
     return [...folderItems, ...directServers, ...directSerialProfiles];
   }

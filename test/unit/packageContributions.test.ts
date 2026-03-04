@@ -79,4 +79,12 @@ describe("package contributions", () => {
     expect(addCommands).toHaveLength(1);
     expect(addCommands[0].command).toBe("nexus.profile.add");
   });
+
+  it("uses explicit folder-server wording for folder connect actions", () => {
+    const commands = packageJson.contributes.commands;
+    const connect = commands.find((item) => item.command === "nexus.group.connect");
+    const disconnect = commands.find((item) => item.command === "nexus.group.disconnect");
+    expect(connect?.title).toBe("Connect Folder Servers");
+    expect(disconnect?.title).toBe("Disconnect Folder Servers");
+  });
 });

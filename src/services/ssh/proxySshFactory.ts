@@ -71,6 +71,12 @@ export class ProxySshFactory implements SshFactory {
     let tunnelStream: Duplex;
     try {
       tunnelStream = await jumpConnection.openDirectTcp(target.host, target.port);
+
+      // Pause the tunnel stream to prevent the target's SSH banner from being
+      // lost during the async gap before ssh2 attaches its data listeners
+      // (vault password lookup, buildConnectConfig, etc.).
+      // Same banner-loss issue as the SOCKS5 fix below (see connectViaSocks5).
+      tunnelStream.pause();
     } catch (error) {
       jumpConnection.dispose();
       throw error;

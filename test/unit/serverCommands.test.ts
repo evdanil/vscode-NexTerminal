@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
 import { registerServerCommands, formValuesToServer, formValuesToProxy, syncProxyPasswordSecret } from "../../src/commands/serverCommands";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
+import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
 import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
@@ -116,10 +117,11 @@ interface Harness {
 function setupHarness(options: {
   activeTunnels: Array<{ id: string; profileId: string; serverId: string }>;
   profiles: TunnelProfile[];
+  servers?: ServerConfig[];
   confirmRemove?: boolean;
 }): Harness {
   let snapshot = {
-    servers: [makeServer()],
+    servers: options.servers ?? [makeServer()],
     tunnels: options.profiles,
     serialProfiles: [],
     activeSessions: [],
@@ -258,6 +260,31 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
+  });
+
+  it("group disconnect applies only to direct-folder servers and skips hidden ones", async () => {
+    const { ctx, disconnectPool } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [
+        makeServer({ id: "s-root", group: "Prod" }),
+        makeServer({ id: "s-child", group: "Prod/API" }),
+        makeServer({ id: "s-hidden", group: "Prod/Secret", isHidden: true }),
+        makeServer({ id: "s-other", group: "Staging" })
+      ]
+    });
+
+    registerServerCommands(ctx);
+    const groupDisconnectCmd = registeredCommands.get("nexus.group.disconnect");
+    expect(groupDisconnectCmd).toBeDefined();
+
+    await groupDisconnectCmd!(new FolderTreeItem("Prod", "Prod"));
+
+    expect(disconnectPool).toHaveBeenCalledTimes(1);
+    expect(disconnectPool).toHaveBeenCalledWith("s-root");
+    expect(disconnectPool).not.toHaveBeenCalledWith("s-child");
+    expect(disconnectPool).not.toHaveBeenCalledWith("s-hidden");
+    expect(disconnectPool).not.toHaveBeenCalledWith("s-other");
   });
 });
 

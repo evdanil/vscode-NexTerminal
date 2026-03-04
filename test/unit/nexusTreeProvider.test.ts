@@ -248,3 +248,97 @@ describe("NexusTreeProvider folder collapse state", () => {
     expect(provider.getCollapsedFolders()).toEqual(["Staging"]);
   });
 });
+
+describe("NexusTreeProvider folder contexts and filtering", () => {
+  const callbacks = {
+    onTunnelDropped: vi.fn(async () => {}),
+    onItemGroupChanged: vi.fn(async () => {}),
+    onFolderMoved: vi.fn(async () => {})
+  };
+
+  it("marks only direct-server folders as folderWithServers", () => {
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      servers: [makeServer({ id: "s1", group: "Parent/Child" })],
+      tunnels: [],
+      serialProfiles: [],
+      activeSessions: [],
+      activeSerialSessions: [],
+      activeTunnels: [],
+      remoteTunnels: [],
+      explicitGroups: [],
+      authProfiles: []
+    });
+
+    const rootChildren = provider.getChildren(undefined) as FolderTreeItem[];
+    const parent = rootChildren.find((c) => c instanceof FolderTreeItem && c.folderPath === "Parent");
+    expect(parent).toBeDefined();
+    expect(parent!.contextValue).toBe("nexus.folder");
+
+    const childChildren = provider.getChildren(parent!) as FolderTreeItem[];
+    const child = childChildren.find((c) => c instanceof FolderTreeItem && c.folderPath === "Parent/Child");
+    expect(child).toBeDefined();
+    expect(child!.contextValue).toBe("nexus.folderWithServers");
+  });
+
+  it("keeps serial-only folders as nexus.folder", () => {
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      servers: [],
+      tunnels: [],
+      serialProfiles: [{
+        id: "sp1",
+        name: "UART 1",
+        group: "Lab",
+        path: "COM4",
+        baudRate: 115200,
+        dataBits: 8,
+        stopBits: 1,
+        parity: "none",
+        rtscts: false
+      }],
+      activeSessions: [],
+      activeSerialSessions: [],
+      activeTunnels: [],
+      remoteTunnels: [],
+      explicitGroups: [],
+      authProfiles: []
+    });
+
+    const rootChildren = provider.getChildren(undefined) as FolderTreeItem[];
+    const folder = rootChildren.find((c) => c instanceof FolderTreeItem && c.folderPath === "Lab");
+    expect(folder).toBeDefined();
+    expect(folder!.contextValue).toBe("nexus.folder");
+  });
+
+  it("filters folder hierarchy by matching server name or host", () => {
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      servers: [
+        makeServer({ id: "s1", name: "Prod API", host: "prod.example", group: "Team/Prod" }),
+        makeServer({ id: "s2", name: "Dev API", host: "dev.example", group: "Team/Dev" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      activeSessions: [],
+      activeSerialSessions: [],
+      activeTunnels: [],
+      remoteTunnels: [],
+      explicitGroups: [],
+      authProfiles: []
+    });
+
+    provider.setFilter("prod");
+
+    const rootChildren = provider.getChildren(undefined) as FolderTreeItem[];
+    const team = rootChildren.find((c) => c instanceof FolderTreeItem && c.folderPath === "Team");
+    expect(team).toBeDefined();
+
+    const teamChildren = provider.getChildren(team!) as FolderTreeItem[];
+    const childFolders = teamChildren
+      .filter((c): c is FolderTreeItem => c instanceof FolderTreeItem)
+      .map((c) => c.folderPath);
+    expect(childFolders).toContain("Team/Prod");
+    expect(childFolders).not.toContain("Team/Dev");
+  });
+});

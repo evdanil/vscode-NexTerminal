@@ -89,6 +89,8 @@ const unsupportedCommands = [
   "nexus.files.copyPath",
   "nexus.files.refresh",
   "nexus.files.disconnect",
+  "nexus.filter",
+  "nexus.filter.clear",
   "nexus.terminal.appearance",
   "nexus.authProfile.add",
   "nexus.authProfile.manage",

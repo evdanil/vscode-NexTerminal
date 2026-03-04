@@ -121,10 +121,24 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
     return false;
   }
   const obj = data as Record<string, unknown>;
-  const hasServers = Array.isArray(obj.servers) && obj.servers.length > 0;
-  const hasTunnels = Array.isArray(obj.tunnels) && obj.tunnels.length > 0;
-  const hasSerialProfiles = Array.isArray(obj.serialProfiles) && obj.serialProfiles.length > 0;
-  return obj.version === 1 && (hasServers || hasTunnels || hasSerialProfiles);
+  const profileArrayKeys = ["servers", "tunnels", "serialProfiles", "authProfiles"] as const;
+  for (const key of profileArrayKeys) {
+    const value = obj[key];
+    if (value !== undefined && !Array.isArray(value)) {
+      return false;
+    }
+  }
+  if (obj.groups !== undefined && !Array.isArray(obj.groups)) {
+    return false;
+  }
+  if (
+    obj.settings !== undefined &&
+    (typeof obj.settings !== "object" || obj.settings === null || Array.isArray(obj.settings))
+  ) {
+    return false;
+  }
+  const hasProfileArrays = profileArrayKeys.some((key) => Array.isArray(obj[key]));
+  return obj.version === 1 && hasProfileArrays;
 }
 
 function ensureId(item: Record<string, unknown>): void {

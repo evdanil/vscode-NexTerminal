@@ -183,8 +183,17 @@ describe("isValidExport", () => {
     expect(isValidExport({ version: 1, serialProfiles: [makeSerialProfile()] })).toBe(true);
   });
 
-  it("rejects when all arrays are empty", () => {
-    expect(isValidExport({ version: 1, servers: [], tunnels: [], serialProfiles: [] })).toBe(false);
+  it("accepts authProfiles-only partial config", () => {
+    expect(isValidExport({ version: 1, authProfiles: [makeAuthProfile()] })).toBe(true);
+  });
+
+  it("accepts empty profile arrays (valid backup scaffold)", () => {
+    expect(isValidExport({ version: 1, servers: [], tunnels: [], serialProfiles: [] })).toBe(true);
+  });
+
+  it("rejects invalid profile array types", () => {
+    expect(isValidExport({ version: 1, servers: {} })).toBe(false);
+    expect(isValidExport({ version: 1, authProfiles: "bad" })).toBe(false);
   });
 });
 
@@ -640,6 +649,32 @@ describe("backup import", () => {
     expect(mockShowErrorMessage).toHaveBeenCalledWith("Incorrect password or corrupted backup.");
     // Nothing imported
     expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("imports backup with only auth profiles", async () => {
+    const exportData = {
+      version: 1,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [makeAuthProfile()]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Merge", value: "merge" });
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.authProfiles).toHaveLength(1);
+    expect(snapshot.authProfiles[0].id).toBe("ap1");
+    expect(snapshot.servers).toHaveLength(0);
+    expect(snapshot.tunnels).toHaveLength(0);
+    expect(snapshot.serialProfiles).toHaveLength(0);
   });
 });
 

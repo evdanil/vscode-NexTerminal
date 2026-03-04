@@ -293,6 +293,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     dragAndDropController: nexusTreeProvider,
     showCollapseAll: true
   });
+  void vscode.commands.executeCommand("setContext", "nexus.filterActive", false);
+
+  const filterCommand = vscode.commands.registerCommand("nexus.filter", async () => {
+    const value = await vscode.window.showInputBox({
+      title: "Filter Connectivity Hub",
+      prompt: "Show only matching servers by name or hostname",
+      placeHolder: "e.g. prod or 192.168",
+      value: nexusTreeProvider.getFilterText(),
+    });
+    if (value === undefined) return;
+    if (value.trim() === "") {
+      nexusTreeProvider.clearFilter();
+      void vscode.commands.executeCommand("setContext", "nexus.filterActive", false);
+    } else {
+      nexusTreeProvider.setFilter(value);
+      void vscode.commands.executeCommand("setContext", "nexus.filterActive", true);
+    }
+  });
+
+  const filterClearCommand = vscode.commands.registerCommand("nexus.filter.clear", () => {
+    nexusTreeProvider.clearFilter();
+    void vscode.commands.executeCommand("setContext", "nexus.filterActive", false);
+  });
+
   const collapseListener = commandCenterView.onDidCollapseElement((e) => {
     handleFolderStateChange(e.element, true);
   });
@@ -493,6 +517,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     fsRegistration,
     statusBarItem,
     refreshCommand,
+    filterCommand,
+    filterClearCommand,
     appearanceCommand,
     windowFocusListener,
     configChangeListener,

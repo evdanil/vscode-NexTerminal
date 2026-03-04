@@ -18,7 +18,6 @@ import { resolveTunnelConnectionMode, startTunnel } from "./tunnelCommands";
 import type { CommandContext, ServerTerminalMap } from "./types";
 import {
   getAncestorPaths,
-  isDescendantOrSelf,
   folderDisplayName,
   normalizeOptionalFolderPath,
   INVALID_FOLDER_PATH_MESSAGE
@@ -651,7 +650,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const folderPath = arg.folderPath;
       const servers = ctx.core
         .getSnapshot()
-        .servers.filter((s) => s.group && isDescendantOrSelf(s.group, folderPath) && !s.isHidden);
+        .servers.filter((s) => s.group === folderPath && !s.isHidden);
       for (const server of servers) {
         void connectServer(ctx, server.id);
       }
@@ -664,7 +663,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const folderPath = arg.folderPath;
       const servers = ctx.core
         .getSnapshot()
-        .servers.filter((s) => s.group && isDescendantOrSelf(s.group, folderPath) && !s.isHidden);
+        .servers.filter((s) => s.group === folderPath && !s.isHidden);
       for (const server of servers) {
         await disconnectServer(ctx, server.id);
       }
