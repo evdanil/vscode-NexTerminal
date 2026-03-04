@@ -471,6 +471,42 @@ describe("SshConnectionPool", () => {
     expect(f.connect).toHaveBeenCalledTimes(1); // no fallback connection created
   });
 
+  it("retries with fresh connection when pooled connection is stale ('Not connected')", async () => {
+    const staleConn = createMockConnection();
+    staleConn.openShell = vi.fn(async () => {
+      throw new Error("Not connected");
+    });
+    const freshConn = createMockConnection();
+    freshConn.openShell = vi.fn(async () => ({ fresh: true }) as any);
+
+    const f = createMockFactory([staleConn, freshConn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    // First connect — pool creates entry, but the connection is already dead
+    const lease = await p.connect(testServer);
+    const stream = await lease.openShell();
+    // Should have transparently retried with a fresh connection
+    expect(stream).toEqual({ fresh: true });
+    expect(f.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries with fresh connection when stale error contains additional context", async () => {
+    const staleConn = createMockConnection();
+    staleConn.openShell = vi.fn(async () => {
+      throw new Error("Not connected to server");
+    });
+    const freshConn = createMockConnection();
+    freshConn.openShell = vi.fn(async () => ({ fresh: true }) as any);
+
+    const f = createMockFactory([staleConn, freshConn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const lease = await p.connect(testServer);
+    const stream = await lease.openShell();
+    expect(stream).toEqual({ fresh: true });
+    expect(f.connect).toHaveBeenCalledTimes(2);
+  });
+
   it("idle timeout 0 means keep alive until explicit disconnect", async () => {
     const conn = createMockConnection();
     const f = createMockFactory([conn]);

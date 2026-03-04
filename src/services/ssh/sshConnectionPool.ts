@@ -46,6 +46,11 @@ function hasAnyNeedle(text: string, needles: readonly string[]): boolean {
   return needles.some((needle) => text.includes(needle));
 }
 
+function isStaleConnectionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return message.toLowerCase().includes("not connected");
+}
+
 function shouldFallbackForChannelLimit(error: unknown): boolean {
   const reason = typeof error === "object" && error !== null
     ? (error as { reason?: unknown }).reason
@@ -89,7 +94,8 @@ class PooledSshConnection implements SshConnection {
   public constructor(
     private readonly inner: SshConnection,
     private onRelease: () => void,
-    private readonly createFallback?: () => Promise<SshConnection>
+    private readonly createFallback?: () => Promise<SshConnection>,
+    private readonly isReused = false
   ) {}
 
   private get active(): SshConnection {
@@ -205,7 +211,13 @@ class PooledSshConnection implements SshConnection {
   private fallbackPromise?: Promise<SshConnection | undefined>;
 
   private shouldAttemptFallback(error: unknown): boolean {
-    return Boolean(this.createFallback) && !this.fallbackUsed && shouldFallbackForChannelLimit(error);
+    if (this.fallbackUsed || !this.createFallback) return false;
+    // Stale connections ("Not connected") should always retry — the pooled
+    // socket is dead but the close event hasn't fired yet.
+    if (isStaleConnectionError(error)) return true;
+    // Channel-limit fallback only makes sense on reused connections where
+    // the server refuses additional channels on the multiplexed session.
+    return this.isReused && shouldFallbackForChannelLimit(error);
   }
 
   private tryFallback(): Promise<SshConnection | undefined> {
@@ -273,24 +285,24 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
     this.cancelIdleTimer(entry);
     entry.refCount++;
 
-    // Offer fallback when this is a reused connection (refCount > 1).
-    // If a channel open fails on a multiplexed connection (e.g. Cisco devices
-    // that reject additional channels), automatically create a standalone
+    // Offer fallback: if a channel open fails on a multiplexed connection
+    // (e.g. Cisco devices that reject additional channels) or the pooled
+    // connection is stale ("Not connected"), automatically create a standalone
     // connection so the caller doesn't see the failure.
-    // Offer fallback: soft-remove the pool entry (mark unhealthy, remove from
-    // map) but do NOT dispose the underlying connection — other leases may
-    // still hold active streams. The last lease to release will dispose it.
-    const createFallback = entry.refCount > 1
-      ? async (): Promise<SshConnection> => {
-          if (this.entries.get(server.id) === entry) {
-            entry.healthy = false;
-            this.cancelIdleTimer(entry);
-            this.entries.delete(server.id);
-            this.emit({ type: "disconnected", serverId: server.id });
-          }
-          return this.innerFactory.connect(server);
-        }
-      : undefined;
+    // Soft-remove the pool entry (mark unhealthy, remove from map) but do NOT
+    // dispose the underlying connection — other leases may still hold active
+    // streams. The last lease to release will dispose it via orphan cleanup.
+    const createFallback = async (): Promise<SshConnection> => {
+      if (this.entries.get(server.id) === entry) {
+        entry.healthy = false;
+        this.cancelIdleTimer(entry);
+        this.entries.delete(server.id);
+        this.emit({ type: "disconnected", serverId: server.id });
+      }
+      return this.innerFactory.connect(server);
+    };
+
+    const isReused = entry.refCount > 1;
 
     return new PooledSshConnection(entry.connection, () => {
       entry.refCount--;
@@ -303,7 +315,7 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
           entry.connection.dispose();
         }
       }
-    }, createFallback);
+    }, createFallback, isReused);
   }
 
   public disconnect(serverId: string): void {
