@@ -21,6 +21,8 @@ interface MacroEntry {
   text?: string;
   secret?: boolean;
   keybinding?: string;
+  triggerPattern?: string;
+  triggerCooldown?: number;
   [key: string]: unknown;
 }
 
@@ -48,6 +50,7 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.terminal", key: "keyboardPassthrough" },
   { section: "nexus.terminal", key: "passthroughKeys" },
   { section: "nexus.terminal", key: "macros" },
+  { section: "nexus.terminal.macros", key: "autoTrigger" },
   { section: "nexus.terminal.highlighting", key: "enabled" },
   { section: "nexus.terminal.highlighting", key: "rules" },
   { section: "nexus.ssh.multiplexing", key: "enabled" },
@@ -99,6 +102,17 @@ async function applySettings(settings: Record<string, unknown>): Promise<void> {
       const safeMacro = { ...macro };
       if (safeMacro.keybinding && (typeof safeMacro.keybinding !== "string" || !isValidBinding(safeMacro.keybinding))) {
         delete safeMacro.keybinding;
+      }
+      if (safeMacro.triggerPattern) {
+        try {
+          const re = new RegExp(safeMacro.triggerPattern);
+          if (re.test("")) delete safeMacro.triggerPattern;
+        } catch { delete safeMacro.triggerPattern; }
+      }
+      if (safeMacro.triggerCooldown !== undefined) {
+        if (typeof safeMacro.triggerCooldown !== "number" || safeMacro.triggerCooldown < 0 || safeMacro.triggerCooldown > 300) {
+          delete safeMacro.triggerCooldown;
+        }
       }
       return safeMacro;
     });

@@ -6,6 +6,7 @@ import {
   CRITICAL_CTRL_SHIFT_KEYS,
   SPECIAL_BINDING_WARNINGS
 } from "../macroBindings";
+import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
 import type { TerminalMacro } from "./macroTreeProvider";
 
@@ -119,6 +120,10 @@ export class MacroEditorPanel {
 
         const macro: TerminalMacro = { name, text };
         if (secret) macro.secret = true;
+        const triggerPattern = ((msg.triggerPattern as string | null) ?? "").trim();
+        const triggerCooldown = msg.triggerCooldown as number | undefined;
+        if (triggerPattern) macro.triggerPattern = triggerPattern;
+        if (triggerCooldown !== undefined && triggerCooldown !== DEFAULT_TRIGGER_COOLDOWN) macro.triggerCooldown = triggerCooldown;
         if (bindingRaw) {
           const normalized = bindingRaw.toLowerCase();
           if (isValidBinding(normalized)) {

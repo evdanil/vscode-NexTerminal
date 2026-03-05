@@ -24,6 +24,8 @@ export function renderMacroEditorHtml(
   const hiddenValue = selectedIndex !== null ? String(selectedIndex) : "__new__";
 
   const bindingValue = macro?.keybinding ?? "";
+  const triggerValue = macro?.triggerPattern ?? "";
+  const cooldownValue = macro?.triggerCooldown ?? 3;
 
   const nameValue = macro?.name ?? "";
   const textValue = macro?.text?.replace(/\n/g, "\n") ?? "";
@@ -106,6 +108,19 @@ export function renderMacroEditorHtml(
   </div>
 
   <div class="form-group">
+    <label for="macro-trigger">Auto-Trigger Pattern</label>
+    <input type="text" id="macro-trigger" value="${escapeHtml(triggerValue)}" placeholder="e.g., [Pp]assword:\\s*$" />
+    <div class="field-error" id="error-trigger"></div>
+    <div class="hint">Regex matched against terminal output. When matched, this macro's text is sent automatically (expect/send).</div>
+  </div>
+
+  <div class="form-group">
+    <label for="macro-cooldown">Trigger Cooldown (seconds)</label>
+    <input type="number" id="macro-cooldown" value="${escapeHtml(String(cooldownValue))}" min="0" max="300" step="1" />
+    <div class="hint">Seconds between auto-triggers on the same terminal. Prevents echo-loops where server re-prompts after each response.</div>
+  </div>
+
+  <div class="form-group">
     <label for="macro-binding">Keyboard Shortcut</label>
     <input type="text" id="macro-binding" value="${escapeHtml(bindingValue)}" placeholder="e.g., alt+m, alt+shift+5, ctrl+shift+a" />
     <div class="field-error" id="error-binding"></div>
@@ -148,6 +163,26 @@ export function renderMacroEditorHtml(
       document.getElementById("macro-name").addEventListener("input", markDirty);
       document.getElementById("macro-text").addEventListener("input", markDirty);
       document.getElementById("macro-secret").addEventListener("change", markDirty);
+      document.getElementById("macro-trigger").addEventListener("input", function() {
+        markDirty();
+        var val = this.value.trim();
+        var errorEl = document.getElementById("error-trigger");
+        if (val) {
+          try {
+            var re = new RegExp(val);
+            if (re.test("")) {
+              errorEl.textContent = "Pattern must not match empty strings.";
+            } else {
+              errorEl.textContent = "";
+            }
+          } catch(e) {
+            errorEl.textContent = e.message || "Invalid regex.";
+          }
+        } else {
+          errorEl.textContent = "";
+        }
+      });
+      document.getElementById("macro-cooldown").addEventListener("input", markDirty);
       document.getElementById("macro-binding").addEventListener("input", function() {
         markDirty();
         var val = this.value.trim();
@@ -179,6 +214,8 @@ export function renderMacroEditorHtml(
         var text = document.getElementById("macro-text").value;
         var secret = document.getElementById("macro-secret").checked;
         var bindingVal = document.getElementById("macro-binding").value.trim().toLowerCase();
+        var triggerVal = document.getElementById("macro-trigger").value.trim();
+        var cooldownVal = parseInt(document.getElementById("macro-cooldown").value, 10);
 
         // Validate
         var valid = true;
@@ -200,6 +237,22 @@ export function renderMacroEditorHtml(
         } else {
           document.getElementById("error-binding").textContent = "";
         }
+        if (triggerVal) {
+          try {
+            var re = new RegExp(triggerVal);
+            if (re.test("")) {
+              document.getElementById("error-trigger").textContent = "Pattern must not match empty strings.";
+              valid = false;
+            } else {
+              document.getElementById("error-trigger").textContent = "";
+            }
+          } catch(e) {
+            document.getElementById("error-trigger").textContent = e.message || "Invalid regex.";
+            valid = false;
+          }
+        } else {
+          document.getElementById("error-trigger").textContent = "";
+        }
         if (!valid) return;
 
         vscode.postMessage({
@@ -208,7 +261,9 @@ export function renderMacroEditorHtml(
           name: name,
           text: text,
           secret: secret,
-          keybinding: bindingVal || null
+          keybinding: bindingVal || null,
+          triggerPattern: triggerVal || null,
+          triggerCooldown: isNaN(cooldownVal) ? 3 : cooldownVal
         });
       });
 

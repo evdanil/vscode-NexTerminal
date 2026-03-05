@@ -395,6 +395,10 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
     async () => {
       const terminalName = `Nexus SSH: ${server.name}`;
       let terminalRef: vscode.Terminal | undefined;
+      let ptyRef: SshPty | undefined;
+      const triggerObserver = ctx.macroAutoTrigger.createObserver(
+        (text) => ptyRef?.handleInput(text)
+      );
       const pty = new SshPty(
         server,
         ctx.sshFactory,
@@ -450,8 +454,10 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
           server.name,
           server.logSession ?? getDefaultSessionTranscriptsEnabled()
         ),
-        ctx.highlighter
+        ctx.highlighter,
+        triggerObserver
       );
+      ptyRef = pty;
       const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
       const terminal = vscode.window.createTerminal({
         name: terminalName,

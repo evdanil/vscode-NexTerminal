@@ -1,8 +1,8 @@
 {
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
-  "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros, regex highlighting, color schemes, and configuration import/export.",
-  "version": "2.7.41",
+  "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros with auto-trigger (expect/send), regex highlighting, color schemes, and configuration import/export.",
+  "version": "2.7.42",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -420,6 +420,16 @@
         "command": "nexus.macro.runItem",
         "title": "Run",
         "icon": "$(play)"
+      },
+      {
+        "command": "nexus.macro.disableTrigger",
+        "title": "Pause Auto-Trigger",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "nexus.macro.enableTrigger",
+        "title": "Resume Auto-Trigger",
+        "icon": "$(debug-start)"
       },
       {
         "command": "nexus.files.browse",
@@ -859,32 +869,52 @@
         },
         {
           "command": "nexus.macro.runItem",
-          "when": "view == nexusMacros && viewItem == nexus.macro",
+          "when": "view == nexusMacros && viewItem =~ /^nexus\\.macro/",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.macro.disableTrigger",
+          "when": "view == nexusMacros && viewItem == nexus.macro.triggered",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.macro.enableTrigger",
+          "when": "view == nexusMacros && viewItem == nexus.macro.triggered.disabled",
           "group": "inline"
         },
         {
           "command": "nexus.macro.edit",
-          "when": "view == nexusMacros && viewItem == nexus.macro",
+          "when": "view == nexusMacros && viewItem =~ /^nexus\\.macro/",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.macro.moveUp",
-          "when": "view == nexusMacros && viewItem == nexus.macro",
+          "when": "view == nexusMacros && viewItem =~ /^nexus\\.macro/",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.macro.moveDown",
-          "when": "view == nexusMacros && viewItem == nexus.macro",
+          "when": "view == nexusMacros && viewItem =~ /^nexus\\.macro/",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.macro.assignSlot",
-          "when": "view == nexusMacros && viewItem == nexus.macro",
+          "when": "view == nexusMacros && viewItem =~ /^nexus\\.macro/",
           "group": "1_manage@4"
         },
         {
+          "command": "nexus.macro.disableTrigger",
+          "when": "view == nexusMacros && viewItem == nexus.macro.triggered",
+          "group": "1_manage@5"
+        },
+        {
+          "command": "nexus.macro.enableTrigger",
+          "when": "view == nexusMacros && viewItem == nexus.macro.triggered.disabled",
+          "group": "1_manage@5"
+        },
+        {
           "command": "nexus.macro.remove",
-          "when": "view == nexusMacros && viewItem == nexus.macro",
+          "when": "view == nexusMacros && viewItem =~ /^nexus\\.macro/",
           "group": "2_destructive"
         },
         {
@@ -1167,6 +1197,14 @@
         },
         {
           "command": "nexus.macro.runItem",
+          "when": "false"
+        },
+        {
+          "command": "nexus.macro.disableTrigger",
+          "when": "false"
+        },
+        {
+          "command": "nexus.macro.enableTrigger",
           "when": "false"
         },
         {
@@ -2362,10 +2400,27 @@
                 "type": "boolean",
                 "default": false,
                 "description": "Hide macro value in sidebar/pickers. Note: if the remote side echoes input, it can still appear in terminal output and transcripts."
+              },
+              "triggerPattern": {
+                "type": "string",
+                "description": "Regex to match against terminal output. When matched, this macro's text is auto-sent."
+              },
+              "triggerCooldown": {
+                "type": "number",
+                "default": 3,
+                "minimum": 0,
+                "maximum": 300,
+                "description": "Seconds between auto-triggers on the same terminal (default 3)."
               }
             }
           },
-          "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or assign a `keybinding` (e.g., `alt+m`, `alt+shift+5`, `ctrl+shift+a`) to trigger directly. Supports Alt, Alt+Shift, and Ctrl+Shift modifier groups with A-Z and 0-9 keys."
+          "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or assign a `keybinding` (e.g., `alt+m`, `alt+shift+5`, `ctrl+shift+a`) to trigger directly. Supports Alt, Alt+Shift, and Ctrl+Shift modifier groups with A-Z and 0-9 keys. Add a `triggerPattern` to auto-send when terminal output matches (expect/send)."
+        },
+        "nexus.terminal.macros.autoTrigger": {
+          "type": "boolean",
+          "default": true,
+          "order": 9,
+          "markdownDescription": "Enable auto-trigger for macros that have a `triggerPattern`. When terminal output matches the pattern, the macro text is sent automatically."
         },
         "nexus.terminal.highlighting.enabled": {
           "type": "boolean",

@@ -219,6 +219,10 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         }
         const terminalName = `Nexus Serial: ${profile.name}`;
         let terminalRef: vscode.Terminal | undefined;
+        let ptyRef: SerialPty | undefined;
+        const triggerObserver = ctx.macroAutoTrigger.createObserver(
+          (text) => ptyRef?.handleInput(text)
+        );
         const pty = new SerialPty(
           ctx.serialSidecar,
           {
@@ -252,8 +256,10 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
             profile.name,
             profile.logSession ?? getDefaultSessionTranscriptsEnabled()
           ),
-          ctx.highlighter
+          ctx.highlighter,
+          triggerObserver
         );
+        ptyRef = pty;
 
         const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
         const terminal = vscode.window.createTerminal({

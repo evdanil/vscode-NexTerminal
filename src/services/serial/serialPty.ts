@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { TerminalHighlighter } from "../terminalHighlighter";
+import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { toParityCode } from "../../utils/helpers";
 import type { OpenPortParams } from "./protocol";
 
@@ -39,7 +40,8 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly callbacks: SerialPtyCallbacks,
     private readonly logger: SessionLogger,
     private readonly transcript?: SessionTranscript,
-    private readonly highlighter?: TerminalHighlighter
+    private readonly highlighter?: TerminalHighlighter,
+    private readonly outputObserver?: PtyOutputObserver
   ) {}
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
@@ -78,6 +80,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.disposed = true;
+    this.outputObserver?.dispose();
 
     const sessionId = this.releaseSubscriptions();
 
@@ -153,6 +156,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         const output = data.toString("utf8");
         this.logger.log(`serial stdout ${JSON.stringify(output)}`);
         this.transcript?.write(output);
+        this.outputObserver?.onOutput(output);
         this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(output) : output);
       });
       this.errorSubscription = this.transport.onDidReceiveError((eventSessionId, errorMessage) => {

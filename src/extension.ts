@@ -17,6 +17,7 @@ import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
 import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
 import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
+import { MacroAutoTrigger } from "./services/macroAutoTrigger";
 import { TerminalHighlighter } from "./services/terminalHighlighter";
 import { TunnelManager } from "./services/tunnel/tunnelManager";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
@@ -35,7 +36,7 @@ import { registerMacroCommands, updateMacroContext, migrateMacroSlots } from "./
 import { registerProfileCommands } from "./commands/profileCommands";
 import { registerAuthProfileCommands } from "./commands/authProfileCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
-import { MacroTreeProvider } from "./ui/macroTreeProvider";
+import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
 import { VscodeColorSchemeStorage } from "./storage/vscodeColorSchemeStorage";
 import { ColorSchemeService } from "./services/colorSchemeService";
 import { TerminalAppearancePanel } from "./ui/terminalAppearancePanel";
@@ -184,6 +185,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const serialTerminals: SerialTerminalMap = new Map();
 
   const highlighter = new TerminalHighlighter();
+  const macroAutoTrigger = new MacroAutoTrigger();
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
   const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
   const sftpConfig = vscode.workspace.getConfiguration("nexus.sftp");
@@ -214,6 +216,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     sessionTerminals,
     serialTerminals,
     highlighter,
+    macroAutoTrigger,
     sftpService,
     fileExplorerProvider,
     secretVault,
@@ -340,7 +343,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     canSelectMany: true
   });
 
-  const macroTreeProvider = new MacroTreeProvider();
+  const macroTreeProvider = new MacroTreeProvider((name) => macroAutoTrigger.isDisabled(name));
   const macroView = vscode.window.createTreeView("nexusMacros", {
     treeDataProvider: macroTreeProvider
   });
@@ -471,6 +474,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (event.affectsConfiguration("nexus.terminal.macros")) {
       macroTreeProvider.refresh();
       updateMacroContext();
+      macroAutoTrigger.reload();
     }
     if (event.affectsConfiguration("nexus.terminal.keyboardPassthrough") || event.affectsConfiguration("nexus.terminal.passthroughKeys")) {
       updatePassthroughContext();
@@ -502,6 +506,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const authProfileDisposables = registerAuthProfileCommands(ctx);
   const configDisposables = registerConfigCommands(core, secretVault);
   const macroDisposables = registerMacroCommands(macroTreeProvider);
+  const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
+    if (item?.macro.triggerPattern) {
+      macroAutoTrigger.setDisabled(item.macro.name, true);
+      macroTreeProvider.refresh();
+    }
+  });
+  const enableTriggerCmd = vscode.commands.registerCommand("nexus.macro.enableTrigger", (item?: MacroTreeItem) => {
+    if (item?.macro.triggerPattern) {
+      macroAutoTrigger.setDisabled(item.macro.name, false);
+      macroTreeProvider.refresh();
+    }
+  });
   const fileDisposables = registerFileCommands(ctx);
 
   const appearanceCommand = vscode.commands.registerCommand("nexus.terminal.appearance", () => {
@@ -533,6 +549,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ...authProfileDisposables,
     ...configDisposables,
     ...macroDisposables,
+    disableTriggerCmd,
+    enableTriggerCmd,
     ...fileDisposables,
     {
       dispose: () => {

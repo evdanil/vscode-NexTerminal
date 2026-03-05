@@ -8,13 +8,16 @@ export interface TerminalMacro {
   /** @deprecated Use keybinding instead. Auto-migrated on first load. */
   slot?: number;
   secret?: boolean;
+  triggerPattern?: string;
+  triggerCooldown?: number;
 }
 
 export class MacroTreeItem extends vscode.TreeItem {
   public constructor(
     public readonly macro: TerminalMacro,
     public readonly index: number,
-    public readonly displayBinding?: string
+    public readonly displayBinding?: string,
+    triggerDisabled?: boolean
   ) {
     const prefix = displayBinding ? `[${bindingToDisplayLabel(displayBinding)}] ` : "";
     super(`${prefix}${macro.name}`, vscode.TreeItemCollapsibleState.None);
@@ -25,7 +28,6 @@ export class MacroTreeItem extends vscode.TreeItem {
       const preview = macro.text.replace(/\n/g, "\u21b5");
       this.description = `\u2192 ${preview.length > 40 ? preview.slice(0, 37) + "..." : preview}`;
     }
-    this.contextValue = "nexus.macro";
     this.command = {
       command: "nexus.macro.runItem",
       title: "Run Macro",
@@ -37,13 +39,25 @@ export class MacroTreeItem extends vscode.TreeItem {
     } else {
       this.tooltip = `${macro.name}${bindingHint}\n${macro.text.replace(/\n/g, "\\n")}`;
     }
-    this.iconPath = new vscode.ThemeIcon(macro.secret ? "lock" : "terminal");
+    if (macro.triggerPattern) {
+      const state = triggerDisabled ? "paused" : "active";
+      this.tooltip += `\nAuto-trigger: /${macro.triggerPattern}/ (${state})`;
+      this.contextValue = triggerDisabled ? "nexus.macro.triggered.disabled" : "nexus.macro.triggered";
+      this.iconPath = new vscode.ThemeIcon(triggerDisabled ? "circle-slash" : "zap");
+    } else {
+      this.contextValue = "nexus.macro";
+      this.iconPath = new vscode.ThemeIcon(macro.secret ? "lock" : "terminal");
+    }
   }
 }
 
 export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem> {
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<MacroTreeItem | undefined>();
   public readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
+
+  public constructor(
+    private readonly isTriggerDisabled: (macroName: string) => boolean = () => false
+  ) {}
 
   public refresh(): void {
     this.onDidChangeTreeDataEmitter.fire(undefined);
@@ -70,7 +84,8 @@ export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem>
         // Legacy positional mode: no macros have explicit keybinding or slot
         displayBinding = `alt+${(index + 1) % 10}`;
       }
-      return new MacroTreeItem(macro, index, displayBinding);
+      const triggerDisabled = macro.triggerPattern ? this.isTriggerDisabled(macro.name) : undefined;
+      return new MacroTreeItem(macro, index, displayBinding, triggerDisabled);
     });
   }
 }

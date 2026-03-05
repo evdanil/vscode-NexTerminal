@@ -105,7 +105,29 @@ describe("MacroTreeItem", () => {
     expect((item.iconPath as { id: string }).id).toBe("terminal");
   });
 
-  it("sets contextValue to nexus.macro for all items", () => {
+  it("uses zap icon for macros with active triggerPattern", () => {
+    const macro = { name: "Auto", text: "yes\n", triggerPattern: "Continue\\?" };
+    const item = new MacroTreeItem(macro, 0, undefined, false);
+    expect((item.iconPath as { id: string }).id).toBe("zap");
+    expect(item.contextValue).toBe("nexus.macro.triggered");
+  });
+
+  it("uses circle-slash icon for disabled triggers", () => {
+    const macro = { name: "Auto", text: "yes\n", triggerPattern: "Continue\\?" };
+    const item = new MacroTreeItem(macro, 0, undefined, true);
+    expect((item.iconPath as { id: string }).id).toBe("circle-slash");
+    expect(item.contextValue).toBe("nexus.macro.triggered.disabled");
+  });
+
+  it("includes trigger state in tooltip", () => {
+    const macro = { name: "Auto", text: "yes\n", triggerPattern: "Continue\\?" };
+    const active = new MacroTreeItem(macro, 0, undefined, false);
+    expect(active.tooltip).toContain("(active)");
+    const paused = new MacroTreeItem(macro, 0, undefined, true);
+    expect(paused.tooltip).toContain("(paused)");
+  });
+
+  it("sets contextValue to nexus.macro for regular items", () => {
     const item = new MacroTreeItem({ name: "Test", text: "test" }, 0);
     expect(item.contextValue).toBe("nexus.macro");
   });

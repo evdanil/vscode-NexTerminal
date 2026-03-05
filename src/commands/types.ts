@@ -4,6 +4,7 @@ import type { TerminalLoggerFactory } from "../logging/terminalLogger";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
 import type { SftpService } from "../services/sftp/sftpService";
 import type { SecretVault, SshFactory, SshPoolControl } from "../services/ssh/contracts";
+import type { MacroAutoTrigger } from "../services/macroAutoTrigger";
 import type { TerminalHighlighter } from "../services/terminalHighlighter";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
 import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
@@ -25,6 +26,7 @@ export interface CommandContext {
   sessionTerminals: SessionTerminalMap;
   serialTerminals: SerialTerminalMap;
   highlighter: TerminalHighlighter;
+  macroAutoTrigger: MacroAutoTrigger;
   sftpService: SftpService;
   fileExplorerProvider: FileExplorerTreeProvider;
   secretVault?: SecretVault;

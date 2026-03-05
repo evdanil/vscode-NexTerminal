@@ -1288,7 +1288,7 @@ describe("backup export round-trip", () => {
     await vault.store("auth-profile-password-ap1", "authpw");
 
     configStore.set("nexus.terminal.macros", [
-      { name: "Public", text: "echo hi" },
+      { name: "Public", text: "echo hi", triggerPattern: "[Pp]assword:\\s*$", triggerCooldown: 5 },
       { name: "Secret", text: "hidden", secret: true }
     ]);
 
@@ -1339,5 +1339,7 @@ describe("backup export round-trip", () => {
     expect(macros).toBeDefined();
     expect(macros.find(m => m.name === "Secret")?.text).toBe("hidden");
     expect(macros.find(m => m.name === "Public")?.text).toBe("echo hi");
+    expect(macros.find(m => m.name === "Public")?.triggerPattern).toBe("[Pp]assword:\\s*$");
+    expect(macros.find(m => m.name === "Public")?.triggerCooldown).toBe(5);
   });
 });

@@ -77,6 +77,8 @@ const unsupportedCommands = [
   "nexus.macro.moveDown",
   "nexus.macro.assignSlot",
   "nexus.macro.runItem",
+  "nexus.macro.disableTrigger",
+  "nexus.macro.enableTrigger",
   "nexus.files.browse",
   "nexus.files.open",
   "nexus.files.upload",
