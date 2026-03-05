@@ -175,10 +175,8 @@ export class SettingsPanel {
       case "openMacroEditor":
         void vscode.commands.executeCommand("nexus.macro.editor");
         break;
-      case "openHighlightingJson":
-        void vscode.commands.executeCommand("workbench.action.openSettingsJson", {
-          revealSetting: { key: "nexus.terminal.highlighting.rules" }
-        });
+      case "openHighlightRuleEditor":
+        void vscode.commands.executeCommand("nexus.openHighlightRuleEditor");
         break;
       case "reloadWindow": {
         const action = await vscode.window.showInformationMessage(

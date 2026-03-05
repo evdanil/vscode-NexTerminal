@@ -3,14 +3,15 @@ export interface SettingMeta {
   section: string;
   label: string;
   type: "boolean" | "number" | "string" | "enum" | "directory" | "multi-checkbox";
-  category: "logging" | "ssh" | "tunnels" | "terminal" | "ui" | "sftp" | "highlighting";
+  category: "logging" | "ssh" | "tunnels" | "terminal" | "ui" | "sftp";
   description?: string;
   badge?: string;
-  enumOptions?: Array<{ label: string; value: string; description?: string }>;
+  enumOptions?: Array<{ label: string; value: string; description?: string; recommended?: boolean }>;
   checkboxOptions?: Array<{ label: string; value: string }>;
   min?: number;
   max?: number;
   unit?: string;
+  subgroup?: string;
   visibleWhen?: { setting: string; value: unknown };
 }
 
@@ -19,7 +20,7 @@ export const SETTINGS_META: SettingMeta[] = [
   {
     key: "sessionTranscripts",
     section: "nexus.logging",
-    label: "Session Transcripts",
+    label: "Session Logging",
     type: "boolean",
     category: "logging",
     description: "Log session transcripts for SSH and serial connections by default."
@@ -58,15 +59,17 @@ export const SETTINGS_META: SettingMeta[] = [
     label: "Connection Multiplexing",
     type: "boolean",
     category: "ssh",
+    subgroup: "Connection",
     description: "Share a single SSH connection per server across terminals, tunnels, and SFTP.",
     badge: "Requires reload"
   },
   {
     key: "idleTimeout",
     section: "nexus.ssh.multiplexing",
-    label: "Idle Timeout",
+    label: "Multiplexing Idle Timeout",
     type: "number",
     category: "ssh",
+    subgroup: "Connection",
     description: "Seconds to keep an idle multiplexed connection alive after all channels close.",
     min: 0,
     max: 3600,
@@ -79,7 +82,8 @@ export const SETTINGS_META: SettingMeta[] = [
     label: "Trust New Hosts",
     type: "boolean",
     category: "ssh",
-    description: "Auto-accept host keys on first connection. Only prompt when a key changes (possible MITM)."
+    subgroup: "Security",
+    description: "Trust-On-First-Use: auto-accept host keys on first connection. Only prompt when a key changes (possible MITM)."
   },
   // --- Tunnels ---
   {
@@ -89,7 +93,7 @@ export const SETTINGS_META: SettingMeta[] = [
     type: "enum",
     category: "tunnels",
     enumOptions: [
-      { label: "Shared", value: "shared", description: "All clients share a single SSH connection (recommended)" },
+      { label: "Shared", value: "shared", description: "All clients share a single SSH connection", recommended: true },
       { label: "Isolated", value: "isolated", description: "Each TCP client gets its own SSH connection" }
     ]
   },
@@ -108,8 +112,9 @@ export const SETTINGS_META: SettingMeta[] = [
     label: "Open Location",
     type: "enum",
     category: "terminal",
+    subgroup: "General",
     enumOptions: [
-      { label: "Panel", value: "panel" },
+      { label: "Panel", value: "panel", recommended: true },
       { label: "Editor Tab", value: "editor" }
     ]
   },
@@ -128,6 +133,7 @@ export const SETTINGS_META: SettingMeta[] = [
     label: "Keyboard Passthrough",
     type: "boolean",
     category: "terminal",
+    subgroup: "Keyboard",
     description: "Pass Ctrl+ key combinations through to the terminal instead of VS Code."
   },
   {
@@ -136,6 +142,7 @@ export const SETTINGS_META: SettingMeta[] = [
     label: "Passthrough Keys",
     type: "multi-checkbox",
     category: "terminal",
+    subgroup: "Keyboard",
     checkboxOptions: [
       { label: "Ctrl+B", value: "b" },
       { label: "Ctrl+E", value: "e" },
@@ -154,7 +161,7 @@ export const SETTINGS_META: SettingMeta[] = [
   {
     key: "cacheTtlSeconds",
     section: "nexus.sftp",
-    label: "Cache TTL",
+    label: "Directory Cache Duration",
     type: "number",
     category: "sftp",
     description: "How long directory listings are cached before being re-fetched from the server.",
@@ -189,12 +196,13 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.terminal.highlighting",
     label: "Terminal Highlighting",
     type: "boolean",
-    category: "highlighting",
+    category: "terminal",
+    subgroup: "Highlighting",
     description: "Enable regex-based pattern highlighting in terminal output."
   }
 ];
 
-export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "highlighting"] as const;
+export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "ui", "sftp"] as const;
 
 export const CATEGORY_LABELS: Record<string, string> = {
   logging: "Logging",
@@ -202,8 +210,7 @@ export const CATEGORY_LABELS: Record<string, string> = {
   tunnels: "Tunnels",
   terminal: "Terminal",
   ui: "Interface",
-  sftp: "SFTP / File Explorer",
-  highlighting: "Highlighting"
+  sftp: "SFTP / File Explorer"
 };
 
 export const CATEGORY_ICONS: Record<string, string> = {
@@ -212,8 +219,7 @@ export const CATEGORY_ICONS: Record<string, string> = {
   tunnels: "plug",
   terminal: "terminal",
   ui: "layout",
-  sftp: "folder-opened",
-  highlighting: "symbol-color"
+  sftp: "folder-opened"
 };
 
 export function formatSettingValueForTree(meta: SettingMeta, rawValue: unknown): string {
@@ -231,7 +237,8 @@ export function formatSettingValueForTree(meta: SettingMeta, rawValue: unknown):
     case "enum": {
       const val = typeof rawValue === "string" ? rawValue : (meta.enumOptions?.[0]?.value ?? "");
       const opt = meta.enumOptions?.find((o) => o.value === val);
-      return opt?.label ?? val;
+      const label = opt?.label ?? val;
+      return opt?.recommended ? `${label} \u2713` : label;
     }
     case "multi-checkbox": {
       const arr = Array.isArray(rawValue) ? rawValue : [];

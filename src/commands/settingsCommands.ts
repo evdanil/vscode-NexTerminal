@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { SettingsPanel } from "../ui/settingsPanel";
+import { HighlightRuleEditorPanel } from "../ui/highlightRuleEditorPanel";
 import { SETTINGS_META } from "../ui/settingsMetadata";
 
 export function registerSettingsCommands(
@@ -8,6 +9,10 @@ export function registerSettingsCommands(
   return [
     vscode.commands.registerCommand("nexus.settings.openPanel", (category?: string) => {
       SettingsPanel.open(typeof category === "string" ? category : undefined);
+    }),
+
+    vscode.commands.registerCommand("nexus.openHighlightRuleEditor", () => {
+      HighlightRuleEditorPanel.open();
     }),
 
     vscode.commands.registerCommand("nexus.settings.openJson", () => {

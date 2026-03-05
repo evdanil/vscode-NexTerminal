@@ -21,13 +21,18 @@ function renderToggle(meta: SettingMeta, value: boolean): string {
 
 function renderNumber(meta: SettingMeta, value: number): string {
   const unitHtml = meta.unit ? `<span class="unit-suffix">${escapeHtml(meta.unit)}</span>` : "";
+  const rangeHtml = (meta.min != null || meta.max != null)
+    ? `<span class="range-hint">(${meta.min ?? "\u2026"}\u2013${meta.max ?? "\u2026"})</span>`
+    : "";
   return `<div class="form-group"${visibleWhenAttrs(meta)}>
   <label>${escapeHtml(meta.label)}${meta.badge ? ` <span class="setting-badge">${escapeHtml(meta.badge)}</span>` : ""}</label>
   ${meta.description ? `<div class="setting-desc">${escapeHtml(meta.description)}</div>` : ""}
   <div class="number-with-unit">
     <input type="number" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}" value="${value}" min="${meta.min ?? ""}" max="${meta.max ?? ""}" />
     ${unitHtml}
+    ${rangeHtml}
   </div>
+  <span class="validation-error" data-for="${meta.section}.${meta.key}"></span>
   <span class="save-indicator" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
 </div>`;
 }
@@ -50,7 +55,7 @@ function renderEnum(meta: SettingMeta, value: string): string {
   const optionsHtml = options
     .map(
       (opt) =>
-        `<div class="custom-select-option${opt.value === value ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}</div>`
+        `<div class="custom-select-option${opt.value === value ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}${opt.recommended ? ' <span class="recommended-badge">recommended</span>' : ""}</div>`
     )
     .join("\n        ");
   return `<div class="form-group"${visibleWhenAttrs(meta)}>
@@ -136,16 +141,21 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
     // Focused mode: render only the target category
     const metas = grouped.get(categoryFilter);
     if (metas && metas.length > 0) {
+      let currentSubgroup: string | undefined;
       for (const meta of metas) {
+        if (meta.subgroup && meta.subgroup !== currentSubgroup) {
+          currentSubgroup = meta.subgroup;
+          sectionsHtml += `  <h4 class="settings-subgroup">${escapeHtml(meta.subgroup)}</h4>\n`;
+        }
         sectionsHtml += `  <div class="settings-card">${renderSetting(meta, values)}</div>\n`;
       }
     }
 
-    // Show highlighting JSON link for highlighting category
-    if (categoryFilter === "highlighting") {
+    // Show highlighting rule editor button for terminal category
+    if (categoryFilter === "terminal") {
       sectionsHtml += `
-  <div class="setting-desc" style="margin-top: 8px;">
-    <a href="#" id="open-highlighting-json">Edit highlighting rules in settings.json</a>
+  <div class="button-row" style="margin-top: 8px;">
+    <button type="button" class="btn-secondary" id="open-highlight-editor-btn">Edit Rules\u2026</button>
   </div>`;
     }
 
@@ -161,7 +171,12 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       if (!metas || metas.length === 0) continue;
       const label = CATEGORY_LABELS[cat] ?? cat;
       sectionsHtml += `\n  <h3 id="section-${escapeHtml(cat)}">${escapeHtml(label)}</h3>\n`;
+      let currentSubgroup: string | undefined;
       for (const meta of metas) {
+        if (meta.subgroup && meta.subgroup !== currentSubgroup) {
+          currentSubgroup = meta.subgroup;
+          sectionsHtml += `  <h4 class="settings-subgroup">${escapeHtml(meta.subgroup)}</h4>\n`;
+        }
         sectionsHtml += `  ${renderSetting(meta, values)}\n`;
       }
     }
@@ -171,12 +186,7 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
   <div class="button-row">
     <button type="button" class="btn-secondary" id="open-appearance-btn">Terminal Appearance\u2026</button>
     <button type="button" class="btn-secondary" id="open-macros-btn">Edit Macros\u2026</button>
-  </div>`;
-
-    // After Highlighting section
-    sectionsHtml += `
-  <div class="setting-desc" style="margin-top: 8px;">
-    <a href="#" id="open-highlighting-json">Edit highlighting rules in settings.json</a>
+    <button type="button" class="btn-secondary" id="open-highlight-editor-btn">Edit Rules\u2026</button>
   </div>`;
 
     // Import / Export section
@@ -197,10 +207,12 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
 
     // Danger Zone
     sectionsHtml += `
-  <h3 id="section-dangerzone">Danger Zone</h3>
-  <div class="setting-desc">Permanently delete all your data. This cannot be undone.</div>
-  <div class="button-row">
-    <button type="button" class="btn-danger" id="complete-reset-btn">Delete All Data\u2026</button>
+  <div class="danger-zone">
+    <h3 id="section-dangerzone">\u26A0 Danger Zone</h3>
+    <div class="setting-desc">Permanently delete all your data. This cannot be undone.</div>
+    <div class="button-row">
+      <button type="button" class="btn-danger" id="complete-reset-btn">Delete All Data\u2026</button>
+    </div>
   </div>`;
   }
 
@@ -252,6 +264,16 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       font-size: 12px;
       color: var(--vscode-descriptionForeground, var(--vscode-foreground));
     }
+    .range-hint {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      margin-left: 2px;
+    }
+    .recommended-badge {
+      font-size: 10px;
+      opacity: 0.7;
+      font-style: italic;
+    }
     .multi-checkbox-group {
       display: flex;
       flex-wrap: wrap;
@@ -265,6 +287,15 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       font-weight: normal;
       cursor: pointer;
     }
+    .validation-error {
+      display: none;
+      font-size: 11px;
+      color: var(--vscode-errorForeground, #f48771);
+      margin-left: 6px;
+    }
+    .validation-error.visible {
+      display: inline;
+    }
     .save-indicator {
       display: none;
       font-size: 11px;
@@ -276,6 +307,17 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
     }
     .form-group[data-visible-when-setting] { display: none; }
     .form-group[data-visible-when-setting].field-visible { display: block; }
+    .danger-zone {
+      margin-top: 32px;
+      padding: 16px;
+      border: 1px solid var(--vscode-inputValidation-errorBorder, #f48771);
+      border-radius: 4px;
+      background: var(--vscode-inputValidation-errorBackground, rgba(90, 29, 29, 0.15));
+    }
+    .danger-zone h3 {
+      margin-top: 0;
+      color: var(--vscode-errorForeground, #f48771);
+    }
     .btn-danger {
       padding: 6px 16px;
       background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
@@ -288,6 +330,15 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
     }
     .btn-danger:hover {
       opacity: 0.9;
+    }
+    .settings-subgroup {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--vscode-descriptionForeground);
+      margin: 20px 0 8px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
     }
     .settings-card {
       border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
@@ -342,9 +393,18 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
             clearTimeout(timer);
             timer = setTimeout(function() {
               var val = parseInt(input.value, 10);
-              if (!isNaN(val)) {
-                saveSetting(input.dataset.section, input.dataset.key, val);
+              var min = input.min !== "" ? parseInt(input.min, 10) : null;
+              var max = input.max !== "" ? parseInt(input.max, 10) : null;
+              var errEl = document.querySelector('.validation-error[data-for="' + input.dataset.section + '.' + input.dataset.key + '"]');
+              if (isNaN(val) || (min !== null && val < min) || (max !== null && val > max)) {
+                if (errEl) {
+                  errEl.textContent = "Must be " + (min != null ? min : "\\u2026") + "\\u2013" + (max != null ? max : "\\u2026");
+                  errEl.classList.add("visible");
+                }
+                return;
               }
+              if (errEl) errEl.classList.remove("visible");
+              saveSetting(input.dataset.section, input.dataset.key, val);
             }, 500);
           });
         })(numbers[ni]);
@@ -414,9 +474,8 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       bindClick("open-macros-btn", function() {
         vscode.postMessage({ type: "openMacroEditor" });
       });
-      bindClick("open-highlighting-json", function(e) {
-        e.preventDefault();
-        vscode.postMessage({ type: "openHighlightingJson" });
+      bindClick("open-highlight-editor-btn", function() {
+        vscode.postMessage({ type: "openHighlightRuleEditor" });
       });
       bindClick("reset-all-btn", function() {
         vscode.postMessage({ type: "resetAll" });

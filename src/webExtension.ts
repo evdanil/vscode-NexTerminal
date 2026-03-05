@@ -55,6 +55,7 @@ const unsupportedCommands = [
   "nexus.settings.openJson",
   "nexus.settings.openLogDir",
   "nexus.settings.resetAll",
+  "nexus.openHighlightRuleEditor",
   "nexus.tunnel.openBrowser",
   "nexus.profile.add",
   "nexus.group.add",

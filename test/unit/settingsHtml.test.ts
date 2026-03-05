@@ -61,7 +61,7 @@ describe("renderSettingsHtml", () => {
   it("renders boolean settings with checkboxes", () => {
     const html = renderWithDefaults();
     expect(html).toContain('type="checkbox"');
-    expect(html).toContain("Session Transcripts");
+    expect(html).toContain("Session Logging");
   });
 
   it("renders number settings with number inputs", () => {
@@ -93,7 +93,7 @@ describe("renderSettingsHtml", () => {
     const html = renderWithDefaults();
     expect(html).toContain("open-appearance-btn");
     expect(html).toContain("open-macros-btn");
-    expect(html).toContain("open-highlighting-json");
+    expect(html).toContain("open-highlight-editor-btn");
   });
 
   it("includes reset all button", () => {
@@ -118,18 +118,19 @@ describe("renderSettingsHtml", () => {
       const values = buildDefaultValues();
       const html = renderSettingsHtml(values, "test-nonce-123", "logging");
       // Should contain logging settings
-      expect(html).toContain("Session Transcripts");
+      expect(html).toContain("Session Logging");
       expect(html).toContain("Max Log File Size");
       // Should NOT contain other category settings
       expect(html).not.toContain("Connection Multiplexing");
       expect(html).not.toContain("Open Location");
-      expect(html).not.toContain("Cache TTL");
+      expect(html).not.toContain("Directory Cache Duration");
     });
 
     it("omits category headings in focused mode", () => {
       const values = buildDefaultValues();
       const html = renderSettingsHtml(values, "test-nonce-123", "logging");
       expect(html).not.toContain('id="section-logging"');
+      // h3 used for category headings should not appear
       expect(html).not.toContain("<h3");
     });
 
@@ -168,16 +169,16 @@ describe("renderSettingsHtml", () => {
       expect(html).toContain("settings-card");
     });
 
-    it("includes highlighting JSON link for highlighting category", () => {
+    it("includes highlight editor button for terminal category", () => {
       const values = buildDefaultValues();
-      const html = renderSettingsHtml(values, "test-nonce-123", "highlighting");
-      expect(html).toContain("open-highlighting-json");
+      const html = renderSettingsHtml(values, "test-nonce-123", "terminal");
+      expect(html).toContain("open-highlight-editor-btn");
     });
 
-    it("omits highlighting JSON link element for non-highlighting category", () => {
+    it("omits highlight editor button for non-terminal category", () => {
       const values = buildDefaultValues();
       const html = renderSettingsHtml(values, "test-nonce-123", "ssh");
-      expect(html).not.toContain('id="open-highlighting-json"');
+      expect(html).not.toContain('id="open-highlight-editor-btn"');
     });
 
     it("renders everything when filter is undefined (backward compat)", () => {
@@ -188,6 +189,7 @@ describe("renderSettingsHtml", () => {
         expect(html).toContain(`id="section-${cat}"`);
       }
       expect(html).toContain("open-appearance-btn");
+      expect(html).toContain("open-highlight-editor-btn");
       expect(html).toContain("backup-btn");
       expect(html).toContain("complete-reset-btn");
     });

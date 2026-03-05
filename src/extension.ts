@@ -478,6 +478,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (event.affectsConfiguration("nexus.terminal.highlighting")) {
       highlighter.reload();
     }
+    if (event.affectsConfiguration("nexus.ui.showTreeDescriptions")) {
+      nexusTreeProvider.refresh();
+    }
     if (event.affectsConfiguration("nexus.sftp.cacheTtlSeconds") || event.affectsConfiguration("nexus.sftp.maxCacheEntries")) {
       const cfg = vscode.workspace.getConfiguration("nexus.sftp");
       sftpService.updateCacheConfig({

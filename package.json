@@ -288,6 +288,12 @@
         "icon": "$(settings-gear)"
       },
       {
+        "command": "nexus.openHighlightRuleEditor",
+        "title": "Edit Highlighting Rules",
+        "category": "Nexus",
+        "icon": "$(symbol-color)"
+      },
+      {
         "command": "nexus.settings.openJson",
         "title": "Open VS Code Settings",
         "icon": "$(settings-gear)"
@@ -1085,6 +1091,10 @@
         },
         {
           "command": "nexus.settings.openLogDir",
+          "when": "true"
+        },
+        {
+          "command": "nexus.openHighlightRuleEditor",
           "when": "true"
         },
         {

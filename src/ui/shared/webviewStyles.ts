@@ -260,7 +260,7 @@ export function baseWebviewCss(): string {
       margin-bottom: 16px;
       font-size: 12px;
       line-height: 1.4;
-      color: var(--vscode-editorInfo-foreground, var(--vscode-foreground));
+      color: var(--vscode-foreground);
       background: var(--vscode-inputValidation-infoBackground, rgba(0, 120, 212, 0.1));
       border: 1px solid var(--vscode-inputValidation-infoBorder, rgba(0, 120, 212, 0.4));
       border-radius: 2px;
