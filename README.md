@@ -6,8 +6,10 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 
 ## Features
 
-- **SSH Terminal Sessions** — Connect to remote servers with password, private key, or SSH agent authentication. Two-factor authentication (keyboard-interactive) is fully supported — passwords auto-fill while verification codes are prompted separately. Credentials are cached securely via VS Code SecretStorage with silent re-auth.
+- **SSH Terminal Sessions** — Connect to remote servers with password, private key, or SSH agent authentication. Two-factor authentication (keyboard-interactive) is fully supported — passwords auto-fill while verification codes are prompted separately. Credentials are cached securely via VS Code SecretStorage with silent re-auth. Per-server legacy algorithm toggle for older devices (Cisco IOS, embedded systems).
 - **SSH Key Deployment** — Right-click any server and select "Deploy SSH Key" to automate key-based authentication setup. Discovers existing local keys or generates new ed25519 key pairs, deploys the public key to the remote `authorized_keys`, and optionally converts the server profile to key auth. Cross-platform (Windows, macOS, Linux).
+- **SSH Host Key Verification** — Trust-on-first-use (TOFU) model stores host keys on first connection and alerts if a key changes (potential MITM). Configurable via `nexus.ssh.trustNewHosts`.
+- **Auth Profiles** — Define reusable credential sets (password, private key, or SSH agent) and apply them to individual servers or entire folders in bulk. Manage profiles from a dedicated editor panel accessible via the Settings tree or context menu.
 - **Proxy Support** — Route SSH connections through intermediaries when direct access isn't available. Three proxy types are supported per server:
   - **SSH Jump Host** — Select another configured server as a bastion/jump host (ProxyJump equivalent). Supports multi-hop chaining (A → B → C) with full auth reuse.
   - **SOCKS5 Proxy** — Connect through a SOCKS5 proxy server with optional username/password authentication.
@@ -21,9 +23,9 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 
   All modes support configurable local bind addresses (localhost, LAN, or all interfaces), auto-start/auto-stop with server connections, live traffic counters, and a browser URL shortcut for quick access.
 - **SSH Connection Multiplexing** — Share SSH connections across terminals, tunnels, and SFTP for the same server. Reduces connection overhead with automatic ref-counting and configurable idle timeout. Per-server toggle lets you disable multiplexing for devices that don't support multiple channels (e.g. Cisco). Automatic fallback to standalone connections handles channel failures transparently.
-- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized into nested folders. Drag and drop to rearrange profiles, move between folders, or assign tunnels to servers.
+- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized into nested folders. Built-in filter to quickly search by name. Drag and drop to rearrange profiles, move between folders, or assign tunnels to servers.
 - **Terminal Appearance** — Customize terminal font family, size, and weight. Import color schemes from MobaXterm INI files or configure custom themes with live preview.
-- **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH and serial terminal output. 16+ built-in rules detect errors, warnings, IP addresses, UUIDs, URLs and more with inline ANSI colouring while respecting existing remote colours.
+- **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH and serial terminal output. 20+ built-in rules detect errors, warnings, status keywords, IP/MAC addresses, UUIDs, URLs, interface counters and more with inline ANSI colouring while respecting existing remote colours. Includes a visual Rule Editor with live preview, color picker, and one-click reset to defaults.
 - **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign any macro a custom keybinding from 108 combinations across three modifier groups: `Alt`, `Alt+Shift`, and `Ctrl+Shift` with A-Z or 0-9 keys. Macros without a keybinding are accessible via `Alt+S` quick-pick. Includes a Macro Editor panel with multiline editing, secret macro support, and inline keybinding assignment.
 - **Keyboard Passthrough** — Optionally pass `Ctrl+` key combinations (e.g. `Ctrl+B`, `Ctrl+N`) directly to the terminal for applications like vim, nano, and htop. Configurable per-key with 10 supported combinations.
 - **Session Transcript Logging** — Automatically log clean terminal output (ANSI codes stripped) to files with configurable rotation. Per-profile toggle.
@@ -126,6 +128,7 @@ npm run package:vsix
 | `nexus.logging.maxRotatedFiles` | `1` | Number of rotated log files to keep |
 | `nexus.ssh.multiplexing.enabled` | `true` | Share SSH connections across terminals, tunnels, and SFTP |
 | `nexus.ssh.multiplexing.idleTimeout` | `300` | Seconds to keep idle multiplexed connection alive |
+| `nexus.ssh.trustNewHosts` | `true` | Auto-trust host keys on first connection (TOFU); prompt only on key change |
 | `nexus.tunnel.defaultConnectionMode` | `shared` | `shared` or `isolated` SSH mode for tunnels |
 | `nexus.tunnel.defaultBindAddress` | `127.0.0.1` | Default bind address for reverse tunnels |
 | `nexus.terminal.openLocation` | `panel` | Where to open terminals: `panel` or `editor` tab |
