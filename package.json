@@ -2417,7 +2417,7 @@
               "flags": "gi"
             },
             {
-              "pattern": "\\bOK\\b|\\bPASS(?:ED)?\\b|\\bSUCCESS(?:FUL)?\\b|\\bDONE\\b",
+              "pattern": "\\bOK\\b|\\bPASS(?:ED)?\\b|\\bSUCCESS(?:FUL)?\\b|\\bDONE\\b|\\bLOADED\\b|\\bSTARTED\\b|\\bMOUNTED\\b",
               "color": "green",
               "flags": "gi",
               "bold": true
@@ -2428,22 +2428,27 @@
               "flags": "gi"
             },
             {
-              "pattern": "\\bTIMEOUT\\b|\\bTIMED OUT\\b|\\bUNREACHABLE\\b|\\bNO ROUTE\\b",
+              "pattern": "\\bACCEPTED\\b|\\bALLOWED\\b|\\bGRANTED\\b|\\bAUTHENTICATED\\b",
+              "color": "green",
+              "flags": "gi"
+            },
+            {
+              "pattern": "\\bTIMEOUT\\b|\\bTIMED OUT\\b|\\bUNREACHABLE\\b|\\bNO ROUTE\\b|\\bRESET\\b|\\bRETRANSMIT\\b|\\bDUPLICATE\\b",
               "color": "red",
               "flags": "gi"
             },
             {
               "pattern": "\\bDOWN\\b|\\bINACTIVE\\b|\\bDISABLED\\b|\\bOFFLINE\\b|\\bDEAD\\b",
               "color": "red",
-              "flags": "gi"
+              "flags": "g"
             },
             {
               "pattern": "\\bUP\\b|\\bACTIVE\\b|\\bENABLED\\b|\\bRUNNING\\b|\\bESTABLISHED\\b|\\bCONNECTED\\b|\\bONLINE\\b|\\bALIVE\\b|\\bREACHABLE\\b",
               "color": "green",
-              "flags": "gi"
+              "flags": "g"
             },
             {
-              "pattern": "\\bPENDING\\b|\\bWAITING\\b|\\bLISTENING\\b",
+              "pattern": "\\bPENDING\\b|\\bWAITING\\b|\\bLISTENING\\b|\\bSTARTING\\b|\\bRELOADING\\b|\\bSTOPPING\\b",
               "color": "yellow",
               "flags": "gi"
             },
@@ -2464,7 +2469,7 @@
               "flags": "g"
             },
             {
-              "pattern": "[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}|(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}",
+              "pattern": "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b",
               "color": "magenta",
               "flags": "g"
             },
@@ -2480,9 +2485,14 @@
               "underline": true
             },
             {
-              "pattern": "\\b(?:errors|dropped|overruns|collisions|discards|retransmits|failures|loss):",
+              "pattern": "\\b(?:errors|dropped|overruns|collisions|discards|giants|runts|throttles|CRC|frame|ignored|abort|resets|carrier transitions|no buffer|underruns|retransmits|failures|loss):",
               "color": "red",
               "flags": "gi"
+            },
+            {
+              "pattern": "\\b(?:exit-code|core-dump|signal|timeout|watchdog)\\b",
+              "color": "red",
+              "flags": "g"
             }
           ],
           "items": {

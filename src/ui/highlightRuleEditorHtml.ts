@@ -207,7 +207,7 @@ DEBUG: packet sent 1024 bytes</div>
       var vscode = acquireVsCodeApi();
       var VALID_COLORS = ${JSON.stringify(COLOR_NAMES)};
       var COLOR_CSS_MAP = ${JSON.stringify(COLOR_CSS)};
-      var SAMPLE_TEXT = "Connection ERROR: timeout on port 22\\nWARNING: disk usage at 90%\\nServer ready - OK\\nINFO: session started for user admin\\nDEBUG: packet sent 1024 bytes";
+      var SAMPLE_TEXT = "eth0: <BROADCAST,MULTICAST,UP> state UP\\nERROR: connection refused on port 443\\nWARNING: disk usage at 90%\\nINFO: session started for user admin\\n192.168.1.100 - ESTABLISHED\\nsshd: ACCEPTED publickey for root\\n5 input errors, 0 CRC, 0 frame, 3 overruns, 0 ignored";
       var REDOS_RE = /(\\+|\\*|\\{[^}]*\\})\\)(\\+|\\*|\\{)/;
 
       var rules = ${JSON.stringify(rules)};
