@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
 import type { ActiveSerialSession, ActiveSession, ProxyConfig, SerialProfile, ServerConfig } from "../models/config";
-import { getAncestorPaths, folderDisplayName, isDescendantOrSelf } from "../utils/folderPaths";
+import { getAncestorPaths, folderDisplayName, isDescendantOrSelf, parentPath as folderParentPath } from "../utils/folderPaths";
 import { toParityCode } from "../utils/helpers";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
 
@@ -43,7 +43,7 @@ export class ServerTreeItem extends vscode.TreeItem {
     serverLookup?: (id: string) => ServerConfig | undefined
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
-    this.id = `server:${server.id}:${connected ? "on" : "off"}`;
+    this.id = `server:${server.id}`;
     this.tooltip = `${server.username}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}`;
     this.description = `${server.username}@${server.host}`;
     this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
@@ -67,7 +67,7 @@ export class SessionTreeItem extends vscode.TreeItem {
 export class SerialProfileTreeItem extends vscode.TreeItem {
   public constructor(public readonly profile: SerialProfile, connected: boolean) {
     super(profile.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
-    this.id = `serial:${profile.id}:${connected ? "on" : "off"}`;
+    this.id = `serial:${profile.id}`;
     this.tooltip = `${profile.path} @ ${profile.baudRate}`;
     this.description = `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`;
     this.contextValue = connected ? "nexus.serialProfileConnected" : "nexus.serialProfile";
@@ -101,6 +101,7 @@ export class NexusTreeProvider
 {
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<NexusTreeItem | undefined>();
   private readonly collapsedFolders = new Set<string>();
+  private cachedChildFolderMap = new Map<string | undefined, string[]>();
   private filterText: string = "";
   private snapshot: SessionSnapshot = {
     servers: [],
@@ -126,6 +127,7 @@ export class NexusTreeProvider
 
   public setSnapshot(snapshot: SessionSnapshot): void {
     this.snapshot = snapshot;
+    this.computeFolderCache();
     this.refresh();
   }
 
@@ -168,6 +170,28 @@ export class NexusTreeProvider
 
   public getTreeItem(element: NexusTreeItem): vscode.TreeItem {
     return element;
+  }
+
+  public getParent(element: NexusTreeItem): vscode.ProviderResult<NexusTreeItem> {
+    if (element instanceof FolderTreeItem) {
+      const parent = folderParentPath(element.folderPath);
+      return parent ? this.makeFolderItem(parent) : undefined;
+    }
+    if (element instanceof ServerTreeItem) {
+      return element.server.group ? this.makeFolderItem(element.server.group) : undefined;
+    }
+    if (element instanceof SerialProfileTreeItem) {
+      return element.profile.group ? this.makeFolderItem(element.profile.group) : undefined;
+    }
+    if (element instanceof SessionTreeItem) {
+      const server = this.snapshot.servers.find((s) => s.id === element.session.serverId);
+      return server ? this.toServerItem(server) : undefined;
+    }
+    if (element instanceof SerialSessionTreeItem) {
+      const profile = this.snapshot.serialProfiles.find((p) => p.id === element.session.profileId);
+      return profile ? this.toSerialProfileItem(profile) : undefined;
+    }
+    return undefined;
   }
 
   public getChildren(element?: NexusTreeItem): vscode.ProviderResult<NexusTreeItem[]> {
@@ -299,8 +323,7 @@ export class NexusTreeProvider
     });
   }
 
-  private getFolderChildren(parentPath: string | undefined): NexusTreeItem[] {
-    // Collect all folder paths from explicitGroups + item groups, synthesizing ancestors
+  private computeFolderCache(): void {
     const allPaths = new Set<string>();
     for (const g of this.snapshot.explicitGroups) {
       for (const ancestor of getAncestorPaths(g)) {
@@ -322,16 +345,33 @@ export class NexusTreeProvider
       }
     }
 
-    // Find direct child folders at this level
-    const childFolderNames = new Set<string>();
-    const prefix = parentPath ? parentPath + "/" : "";
-    const depth = parentPath ? parentPath.split("/").length + 1 : 1;
+    const childFolderMap = new Map<string | undefined, string[]>();
     for (const p of allPaths) {
-      const segments = p.split("/");
-      if (segments.length === depth && p.startsWith(prefix)) {
-        childFolderNames.add(p);
+      const parent = folderParentPath(p);
+      const children = childFolderMap.get(parent);
+      if (children) {
+        children.push(p);
+      } else {
+        childFolderMap.set(parent, [p]);
       }
     }
+    this.cachedChildFolderMap = childFolderMap;
+  }
+
+  private makeFolderItem(path: string): FolderTreeItem {
+    const hasDirectServers = this.snapshot.servers.some((s) => !s.isHidden && s.group === path);
+    return new FolderTreeItem(
+      path,
+      folderDisplayName(path),
+      this.collapsedFolders.has(path)
+        ? vscode.TreeItemCollapsibleState.Collapsed
+        : vscode.TreeItemCollapsibleState.Expanded,
+      hasDirectServers
+    );
+  }
+
+  private getFolderChildren(parentPath: string | undefined): NexusTreeItem[] {
+    const childFolderPaths = this.cachedChildFolderMap.get(parentPath) ?? [];
 
     // Find direct child items (group matches parentPath exactly, or no group for root)
     const directServers = this.snapshot.servers
@@ -369,23 +409,12 @@ export class NexusTreeProvider
       .map((profile) => this.toSerialProfileItem(profile));
 
     const filteredFolders = this.filterText
-      ? [...childFolderNames].filter((p) => this.folderHasMatchingDescendant(p))
-      : [...childFolderNames];
+      ? childFolderPaths.filter((p) => this.folderHasMatchingDescendant(p))
+      : childFolderPaths;
 
-    const snapshot = this.snapshot;
     const folderItems = filteredFolders
       .sort((a, b) => a.localeCompare(b))
-      .map((p) => {
-        const hasDirectServers = snapshot.servers.some((s) => !s.isHidden && s.group === p);
-        return new FolderTreeItem(
-          p,
-          folderDisplayName(p),
-          this.collapsedFolders.has(p)
-            ? vscode.TreeItemCollapsibleState.Collapsed
-            : vscode.TreeItemCollapsibleState.Expanded,
-          hasDirectServers
-        );
-      });
+      .map((p) => this.makeFolderItem(p));
 
     return [...folderItems, ...directServers, ...directSerialProfiles];
   }

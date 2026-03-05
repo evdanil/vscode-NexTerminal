@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
-import { FolderTreeItem, NexusTreeProvider, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
+import { FolderTreeItem, NexusTreeProvider, SerialProfileTreeItem, SerialSessionTreeItem, ServerTreeItem, SessionTreeItem } from "../../src/ui/nexusTreeProvider";
 import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
-import type { ServerConfig, TunnelProfile } from "../../src/models/config";
+import type { SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 
 vi.mock("vscode", () => ({
   TreeItem: class {
@@ -340,5 +340,247 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       .map((c) => c.folderPath);
     expect(childFolders).toContain("Team/Prod");
     expect(childFolders).not.toContain("Team/Dev");
+  });
+});
+
+function makeSerial(overrides: Partial<SerialProfile> = {}): SerialProfile {
+  return {
+    id: "sp-1",
+    name: "Serial 1",
+    path: "COM4",
+    baudRate: 115200,
+    dataBits: 8,
+    stopBits: 1,
+    parity: "none",
+    rtscts: false,
+    ...overrides
+  };
+}
+
+function emptySnapshot() {
+  return {
+    servers: [] as ServerConfig[],
+    tunnels: [] as TunnelProfile[],
+    serialProfiles: [] as SerialProfile[],
+    activeSessions: [] as any[],
+    activeSerialSessions: [] as any[],
+    activeTunnels: [] as any[],
+    remoteTunnels: [] as any[],
+    explicitGroups: [] as string[],
+    authProfiles: [] as any[]
+  };
+}
+
+const noopCallbacks = {
+  onTunnelDropped: vi.fn(async () => {}),
+  onItemGroupChanged: vi.fn(async () => {}),
+  onFolderMoved: vi.fn(async () => {})
+};
+
+describe("NexusTreeProvider stable IDs", () => {
+  it("ServerTreeItem ID does not change with connection state", () => {
+    const server = makeServer({ id: "s1" });
+    const disconnected = new ServerTreeItem(server, false);
+    const connected = new ServerTreeItem(server, true);
+    expect(disconnected.id).toBe("server:s1");
+    expect(connected.id).toBe("server:s1");
+    expect(disconnected.id).toBe(connected.id);
+  });
+
+  it("SerialProfileTreeItem ID does not change with connection state", () => {
+    const profile = makeSerial({ id: "sp1" });
+    const disconnected = new SerialProfileTreeItem(profile, false);
+    const connected = new SerialProfileTreeItem(profile, true);
+    expect(disconnected.id).toBe("serial:sp1");
+    expect(connected.id).toBe("serial:sp1");
+    expect(disconnected.id).toBe(connected.id);
+  });
+});
+
+describe("NexusTreeProvider getParent", () => {
+  it("returns undefined for root-level folder", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({ ...emptySnapshot(), servers: [makeServer({ id: "s1", group: "Root" })] });
+    const folder = new FolderTreeItem("Root", "Root");
+    expect(provider.getParent(folder)).toBeUndefined();
+  });
+
+  it("returns parent FolderTreeItem for nested folder", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({ ...emptySnapshot(), servers: [makeServer({ id: "s1", group: "A/B/C" })] });
+    const child = new FolderTreeItem("A/B/C", "C");
+    const parent = provider.getParent(child) as FolderTreeItem;
+    expect(parent).toBeInstanceOf(FolderTreeItem);
+    expect(parent.folderPath).toBe("A/B");
+    expect(parent.id).toBe("folder:A/B");
+  });
+
+  it("returns FolderTreeItem for server with group", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    const server = makeServer({ id: "s1", group: "Prod" });
+    provider.setSnapshot({ ...emptySnapshot(), servers: [server] });
+    const item = new ServerTreeItem(server, false);
+    const parent = provider.getParent(item) as FolderTreeItem;
+    expect(parent).toBeInstanceOf(FolderTreeItem);
+    expect(parent.folderPath).toBe("Prod");
+  });
+
+  it("returns undefined for root-level server", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    const server = makeServer({ id: "s1" });
+    provider.setSnapshot({ ...emptySnapshot(), servers: [server] });
+    const item = new ServerTreeItem(server, false);
+    expect(provider.getParent(item)).toBeUndefined();
+  });
+
+  it("returns FolderTreeItem for serial profile with group", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    const profile = makeSerial({ id: "sp1", group: "Lab" });
+    provider.setSnapshot({ ...emptySnapshot(), serialProfiles: [profile] });
+    const item = new SerialProfileTreeItem(profile, false);
+    const parent = provider.getParent(item) as FolderTreeItem;
+    expect(parent).toBeInstanceOf(FolderTreeItem);
+    expect(parent.folderPath).toBe("Lab");
+  });
+
+  it("returns ServerTreeItem for SessionTreeItem", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    const server = makeServer({ id: "s1" });
+    const session = { id: "sess-1", serverId: "s1", terminalName: "bash", startedAt: 0 };
+    provider.setSnapshot({ ...emptySnapshot(), servers: [server], activeSessions: [session] });
+    const item = new SessionTreeItem(session);
+    const parent = provider.getParent(item) as ServerTreeItem;
+    expect(parent).toBeInstanceOf(ServerTreeItem);
+    expect(parent.server.id).toBe("s1");
+  });
+
+  it("returns SerialProfileTreeItem for SerialSessionTreeItem", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    const profile = makeSerial({ id: "sp1" });
+    const session = { id: "ss-1", profileId: "sp1", terminalName: "serial", startedAt: 0 };
+    provider.setSnapshot({ ...emptySnapshot(), serialProfiles: [profile], activeSerialSessions: [session] });
+    const item = new SerialSessionTreeItem(session);
+    const parent = provider.getParent(item) as SerialProfileTreeItem;
+    expect(parent).toBeInstanceOf(SerialProfileTreeItem);
+    expect(parent.profile.id).toBe("sp1");
+  });
+});
+
+describe("NexusTreeProvider large tree", () => {
+  it("returns all items across deeply nested folders with 100 servers", () => {
+    const folders = ["DC1", "DC1/Rack1", "DC1/Rack2", "DC2", "DC2/Rack1", "DC2/Rack2", "DC2/Rack2/Shelf1"];
+    const servers: ServerConfig[] = [];
+    for (let i = 0; i < 100; i++) {
+      const group = folders[i % folders.length];
+      servers.push(makeServer({ id: `s-${i}`, name: `Server ${i}`, group }));
+    }
+
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({ ...emptySnapshot(), servers });
+
+    // Collect all servers by recursively walking the tree
+    const allFound: ServerTreeItem[] = [];
+    function walk(element?: any) {
+      const children = provider.getChildren(element) as any[];
+      for (const child of children) {
+        if (child instanceof ServerTreeItem) {
+          allFound.push(child);
+        } else if (child instanceof FolderTreeItem) {
+          walk(child);
+        }
+      }
+    }
+    walk(undefined);
+
+    expect(allFound).toHaveLength(100);
+    const ids = new Set(allFound.map((s) => s.server.id));
+    expect(ids.size).toBe(100);
+  });
+
+  it("returns consistent items before and after filter toggle", () => {
+    const servers = [
+      makeServer({ id: "s1", name: "Alpha", group: "A/B" }),
+      makeServer({ id: "s2", name: "Beta", group: "A/B" }),
+      makeServer({ id: "s3", name: "Gamma", group: "A/C" })
+    ];
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({ ...emptySnapshot(), servers });
+
+    function collectAll(): string[] {
+      const result: string[] = [];
+      function walk(element?: any) {
+        const children = provider.getChildren(element) as any[];
+        for (const child of children) {
+          if (child instanceof ServerTreeItem) {
+            result.push(child.server.id);
+          } else if (child instanceof FolderTreeItem) {
+            walk(child);
+          }
+        }
+      }
+      walk(undefined);
+      return result.sort();
+    }
+
+    const before = collectAll();
+    provider.setFilter("alpha");
+    provider.clearFilter();
+    const after = collectAll();
+
+    expect(before).toEqual(after);
+  });
+});
+
+describe("NexusTreeProvider getParent/getChildren ID consistency", () => {
+  it("getParent returns items with IDs matching getChildren output", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    const server = makeServer({ id: "s1", name: "Web", group: "DC/Rack1" });
+    const session = { id: "sess-1", serverId: "s1", terminalName: "bash", startedAt: 0 };
+    provider.setSnapshot({ ...emptySnapshot(), servers: [server], activeSessions: [session] });
+
+    // Walk the tree and build a map of child -> parent ID from getChildren
+    const parentIdByChildId = new Map<string, string | undefined>();
+    function walk(element?: any, parentId?: string) {
+      const children = provider.getChildren(element) as any[];
+      for (const child of children) {
+        parentIdByChildId.set(child.id, parentId);
+        walk(child, child.id);
+      }
+    }
+    walk(undefined, undefined);
+
+    // Verify getParent returns matching IDs for every node
+    function walkAndVerify(element?: any) {
+      const children = provider.getChildren(element) as any[];
+      for (const child of children) {
+        const parent = provider.getParent(child) as any;
+        const expectedParentId = parentIdByChildId.get(child.id);
+        if (expectedParentId === undefined) {
+          expect(parent).toBeUndefined();
+        } else {
+          expect(parent).toBeDefined();
+          expect(parent.id).toBe(expectedParentId);
+        }
+        walkAndVerify(child);
+      }
+    }
+    walkAndVerify(undefined);
+
+    // Ensure we actually checked something
+    expect(parentIdByChildId.size).toBeGreaterThanOrEqual(4); // DC, DC/Rack1, server, session
+  });
+
+  it("getParent returns undefined for orphaned SessionTreeItem", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot(emptySnapshot()); // no servers in snapshot
+    const orphanSession = new SessionTreeItem({ id: "sess-orphan", serverId: "deleted-server", terminalName: "bash", startedAt: 0 });
+    expect(provider.getParent(orphanSession)).toBeUndefined();
+  });
+
+  it("getParent returns undefined for orphaned SerialSessionTreeItem", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot(emptySnapshot()); // no profiles in snapshot
+    const orphanSession = new SerialSessionTreeItem({ id: "ss-orphan", profileId: "deleted-profile", terminalName: "serial", startedAt: 0 });
+    expect(provider.getParent(orphanSession)).toBeUndefined();
   });
 });
