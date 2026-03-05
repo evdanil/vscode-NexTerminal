@@ -2253,6 +2253,12 @@
           "order": 5.2,
           "markdownDescription": "Seconds to keep an idle multiplexed connection alive after all channels close (`0` = keep alive until window closes, max `3600`). Requires window reload."
         },
+        "nexus.ssh.trustNewHosts": {
+          "type": "boolean",
+          "default": true,
+          "order": 5.3,
+          "markdownDescription": "Automatically trust SSH host keys on first connection (Trust-On-First-Use). When enabled, you will only be prompted if a host's key **changes** from what was previously stored — which may indicate a man-in-the-middle attack. Disable to be prompted for every new host."
+        },
         "nexus.terminal.openLocation": {
           "type": "string",
           "enum": [
@@ -2266,6 +2272,12 @@
             "Open in the terminal panel (default)",
             "Open as an editor tab"
           ]
+        },
+        "nexus.ui.showTreeDescriptions": {
+          "type": "boolean",
+          "default": true,
+          "order": 6.1,
+          "markdownDescription": "Show connection details (e.g. `user@host`) next to device names in the Connectivity Hub tree."
         },
         "nexus.terminal.keyboardPassthrough": {
           "type": "boolean",

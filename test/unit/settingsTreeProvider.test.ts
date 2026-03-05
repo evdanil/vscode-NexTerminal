@@ -84,19 +84,19 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 10 root items", () => {
+    it("returns 11 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(10);
+      expect(roots).toHaveLength(11);
     });
 
-    it("has 6 category items first", () => {
+    it("has 7 category items first", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const categories = roots.filter((r) => r instanceof SettingsCategoryItem);
-      expect(categories).toHaveLength(6);
+      expect(categories).toHaveLength(7);
       expect(categories.map((c) => (c as SettingsCategoryItem).categoryKey))
-        .toEqual(["logging", "ssh", "tunnels", "terminal", "sftp", "highlighting"]);
+        .toEqual(["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "highlighting"]);
     });
 
     it("has 3 link items for Appearance, Macros, and Auth Profiles", () => {
@@ -126,11 +126,11 @@ describe("SettingsTreeProvider", () => {
       expect(children.every((c) => c instanceof SettingsValueItem)).toBe(true);
     });
 
-    it("returns 2 children for ssh category", () => {
+    it("returns 3 children for ssh category", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("ssh");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(2);
+      expect(children).toHaveLength(3);
     });
 
     it("returns 2 children for tunnels category", () => {

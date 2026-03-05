@@ -42,6 +42,9 @@ vi.mock("vscode", () => ({
     public async asString(): Promise<string> {
       return this.value;
     }
+  },
+  workspace: {
+    getConfiguration: vi.fn(() => ({ get: () => undefined }))
   }
 }));
 
@@ -582,5 +585,40 @@ describe("NexusTreeProvider getParent/getChildren ID consistency", () => {
     provider.setSnapshot(emptySnapshot()); // no profiles in snapshot
     const orphanSession = new SerialSessionTreeItem({ id: "ss-orphan", profileId: "deleted-profile", terminalName: "serial", startedAt: 0 });
     expect(provider.getParent(orphanSession)).toBeUndefined();
+  });
+});
+
+describe("NexusTreeProvider description visibility", () => {
+  it("hides server description when showTreeDescriptions is false", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: (key: string) => key === "showTreeDescriptions" ? false : undefined
+    } as any);
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({ ...emptySnapshot(), servers: [makeServer()] });
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    const server = children.find((c) => c instanceof ServerTreeItem);
+    expect(server!.description).toBeUndefined();
+  });
+
+  it("shows server description when showTreeDescriptions is true", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: (key: string) => key === "showTreeDescriptions" ? true : undefined
+    } as any);
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({ ...emptySnapshot(), servers: [makeServer()] });
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    const server = children.find((c) => c instanceof ServerTreeItem);
+    expect(server!.description).toBe("dev@example.com");
+  });
+
+  it("hides serial profile description when showTreeDescriptions is false", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: (key: string) => key === "showTreeDescriptions" ? false : undefined
+    } as any);
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({ ...emptySnapshot(), serialProfiles: [makeSerial()] });
+    const children = provider.getChildren(undefined) as SerialProfileTreeItem[];
+    const serial = children.find((c) => c instanceof SerialProfileTreeItem);
+    expect(serial!.description).toBeUndefined();
   });
 });

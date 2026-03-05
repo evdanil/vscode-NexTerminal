@@ -5,7 +5,7 @@ import type { HostKeyVerifier } from "./contracts";
 
 const KNOWN_HOSTS_STATE_KEY = "nexus.ssh.knownHostFingerprints.v1";
 const TRUST_NEW_LABEL = "Trust and Continue";
-const TRUST_REPLACE_LABEL = "Replace and Continue";
+const TRUST_REPLACE_LABEL = "Accept New Key";
 
 function hostIdentity(server: ServerConfig): string {
   return `${server.host.toLowerCase()}:${server.port}`;
@@ -41,6 +41,12 @@ export class VscodeHostKeyVerifier implements HostKeyVerifier {
     const knownFingerprint = knownHosts[identity];
 
     if (!knownFingerprint) {
+      const trustNewHosts = vscode.workspace.getConfiguration("nexus.ssh").get<boolean>("trustNewHosts", true);
+      if (trustNewHosts) {
+        knownHosts[identity] = fingerprint;
+        await this.state.update(KNOWN_HOSTS_STATE_KEY, knownHosts);
+        return true;
+      }
       const choice = await vscode.window.showWarningMessage(
         `First SSH connection to ${identity} (${server.name}). Host fingerprint: ${fingerprint}`,
         { modal: true },
@@ -59,7 +65,12 @@ export class VscodeHostKeyVerifier implements HostKeyVerifier {
     }
 
     const choice = await vscode.window.showWarningMessage(
-      `SSH host key mismatch for ${identity}. Expected ${knownFingerprint} but got ${fingerprint}. This may indicate a MITM attack or host key rotation.`,
+      `SSH host key for "${server.name}" (${identity}) has CHANGED since the last connection.\n\n` +
+      `Previously stored: ${knownFingerprint}\n` +
+      `Received now: ${fingerprint}\n\n` +
+      `This could mean the server was reinstalled or its keys were rotated — ` +
+      `or it could indicate a man-in-the-middle (MITM) attack. ` +
+      `Only continue if you trust this change.`,
       { modal: true },
       TRUST_REPLACE_LABEL
     );

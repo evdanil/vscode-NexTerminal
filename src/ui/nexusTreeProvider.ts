@@ -40,12 +40,13 @@ export class ServerTreeItem extends vscode.TreeItem {
   public constructor(
     public readonly server: ServerConfig,
     connected: boolean,
-    serverLookup?: (id: string) => ServerConfig | undefined
+    serverLookup?: (id: string) => ServerConfig | undefined,
+    showDescription = true
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
     this.tooltip = `${server.username}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}`;
-    this.description = `${server.username}@${server.host}`;
+    this.description = showDescription ? `${server.username}@${server.host}` : undefined;
     this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
     this.iconPath = new vscode.ThemeIcon(
       connected ? "plug" : "debug-disconnect",
@@ -65,11 +66,13 @@ export class SessionTreeItem extends vscode.TreeItem {
 }
 
 export class SerialProfileTreeItem extends vscode.TreeItem {
-  public constructor(public readonly profile: SerialProfile, connected: boolean) {
+  public constructor(public readonly profile: SerialProfile, connected: boolean, showDescription = true) {
     super(profile.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `serial:${profile.id}`;
     this.tooltip = `${profile.path} @ ${profile.baudRate}`;
-    this.description = `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`;
+    this.description = showDescription
+      ? `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`
+      : undefined;
     this.contextValue = connected ? "nexus.serialProfileConnected" : "nexus.serialProfile";
     this.iconPath = new vscode.ThemeIcon(
       connected ? "plug" : "debug-disconnect",
@@ -422,11 +425,13 @@ export class NexusTreeProvider
   private toServerItem(server: ServerConfig): ServerTreeItem {
     const connected = this.snapshot.activeSessions.some((session) => session.serverId === server.id);
     const lookup = (id: string): ServerConfig | undefined => this.snapshot.servers.find((s) => s.id === id);
-    return new ServerTreeItem(server, connected, lookup);
+    const showDesc = vscode.workspace.getConfiguration("nexus.ui").get<boolean>("showTreeDescriptions", true);
+    return new ServerTreeItem(server, connected, lookup, showDesc);
   }
 
   private toSerialProfileItem(profile: SerialProfile): SerialProfileTreeItem {
     const connected = this.snapshot.activeSerialSessions.some((session) => session.profileId === profile.id);
-    return new SerialProfileTreeItem(profile, connected);
+    const showDesc = vscode.workspace.getConfiguration("nexus.ui").get<boolean>("showTreeDescriptions", true);
+    return new SerialProfileTreeItem(profile, connected, showDesc);
   }
 }

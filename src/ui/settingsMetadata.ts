@@ -3,7 +3,7 @@ export interface SettingMeta {
   section: string;
   label: string;
   type: "boolean" | "number" | "string" | "enum" | "directory" | "multi-checkbox";
-  category: "logging" | "ssh" | "tunnels" | "terminal" | "sftp" | "highlighting";
+  category: "logging" | "ssh" | "tunnels" | "terminal" | "ui" | "sftp" | "highlighting";
   description?: string;
   badge?: string;
   enumOptions?: Array<{ label: string; value: string; description?: string }>;
@@ -73,6 +73,14 @@ export const SETTINGS_META: SettingMeta[] = [
     unit: "seconds",
     badge: "Requires reload"
   },
+  {
+    key: "trustNewHosts",
+    section: "nexus.ssh",
+    label: "Trust New Hosts",
+    type: "boolean",
+    category: "ssh",
+    description: "Auto-accept host keys on first connection. Only prompt when a key changes (possible MITM)."
+  },
   // --- Tunnels ---
   {
     key: "defaultConnectionMode",
@@ -104,6 +112,15 @@ export const SETTINGS_META: SettingMeta[] = [
       { label: "Panel", value: "panel" },
       { label: "Editor Tab", value: "editor" }
     ]
+  },
+  // --- UI ---
+  {
+    key: "showTreeDescriptions",
+    section: "nexus.ui",
+    label: "Show Tree Descriptions",
+    type: "boolean",
+    category: "ui",
+    description: "Show connection details (user@host) next to device names in the Connectivity Hub."
   },
   {
     key: "keyboardPassthrough",
@@ -177,13 +194,14 @@ export const SETTINGS_META: SettingMeta[] = [
   }
 ];
 
-export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "sftp", "highlighting"] as const;
+export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "highlighting"] as const;
 
 export const CATEGORY_LABELS: Record<string, string> = {
   logging: "Logging",
   ssh: "SSH",
   tunnels: "Tunnels",
   terminal: "Terminal",
+  ui: "Interface",
   sftp: "SFTP / File Explorer",
   highlighting: "Highlighting"
 };
@@ -193,6 +211,7 @@ export const CATEGORY_ICONS: Record<string, string> = {
   ssh: "remote",
   tunnels: "plug",
   terminal: "terminal",
+  ui: "layout",
   sftp: "folder-opened",
   highlighting: "symbol-color"
 };
