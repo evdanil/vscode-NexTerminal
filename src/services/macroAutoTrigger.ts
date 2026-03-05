@@ -5,7 +5,7 @@ import type { TerminalMacro } from "../ui/macroTreeProvider";
 const MAX_INPUT_LENGTH = 8192;
 const MAX_BUFFER_LENGTH = 2048;
 export const DEFAULT_TRIGGER_COOLDOWN = 3;
-const CONTROL_CHARS_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+const CONTROL_CHARS_RE = /[\x00-\x08\x0b-\x1f\x7f]/g;
 
 export interface PtyOutputObserver {
   onOutput(text: string): void;
@@ -96,12 +96,14 @@ export class MacroAutoTrigger {
           const match = rule.regex.exec(buffer);
           if (!match) continue;
 
+          // Always truncate buffer past the match to prevent re-triggering
+          // on same text — even when cooldown blocks the fire.
+          buffer = buffer.slice(match.index + match[0].length);
+
           const lastTime = lastFired.get(i) ?? 0;
-          if (now - lastTime < rule.cooldownMs) continue;
+          if (now - lastTime < rule.cooldownMs) break;
 
           lastFired.set(i, now);
-          // Truncate buffer past the match to prevent re-triggering on same text
-          buffer = buffer.slice(match.index + match[0].length);
           // Defer writeBack to the next event-loop turn so the stream data
           // handler unwinds before we write back.  Prevents re-entrant writes
           // on the SSH channel that can exhaust the channel window and cause

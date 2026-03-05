@@ -120,6 +120,33 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("cleans buffer on cooldown-blocked match to prevent stale re-trigger", () => {
+    setConfig([
+      { name: "pw", text: "secret\n", triggerPattern: "Password:\\s*$", triggerCooldown: 5 }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("Password: ");
+    flush();
+    expect(sent).toHaveLength(1);
+
+    // Server redraws prompt during cooldown window
+    obs.onOutput("Password: ");
+    flush();
+    expect(sent).toHaveLength(1); // blocked by cooldown
+
+    // Advance past cooldown
+    vi.advanceTimersByTime(6000);
+
+    // Whitespace-only output must NOT re-trigger on stale buffer content
+    obs.onOutput("\n");
+    flush();
+    expect(sent).toHaveLength(1);
+    obs.dispose();
+  });
+
   it("fires after cooldown expires", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:", triggerCooldown: 0 }
