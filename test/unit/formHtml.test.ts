@@ -378,6 +378,42 @@ describe("renderFormHtml", () => {
     expect(html).toContain('if (msg.type === "fillFields")');
   });
 
+  it("keeps profile-managed field values submittable by using readonly instead of disabling inputs", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "authProfileId",
+          label: "Auth Profile",
+          options: [
+            { label: "(None)", value: "" },
+            { label: "Prod", value: "ap1" }
+          ],
+          value: "ap1",
+          autofill: true
+        },
+        { type: "text", key: "username", label: "Username", value: "root" },
+        {
+          type: "select",
+          key: "authType",
+          label: "Authentication",
+          options: [
+            { label: "Password", value: "password" },
+            { label: "Private Key", value: "key" }
+          ],
+          value: "password"
+        },
+        { type: "file", key: "keyPath", label: "Private Key File", value: "/tmp/id_rsa" }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain("if (input.type === \"hidden\") continue;");
+    expect(html).toContain("input.readOnly = isLinked || input.dataset.baseReadonly === \"true\";");
+    expect(html).toContain("button.disabled = isLinked || button.dataset.baseDisabled === \"true\";");
+    expect(html).toContain("trigger.style.pointerEvents = \"none\"");
+  });
+
   it("guards visibleWhen JSON parsing to avoid script breakage", () => {
     const definition: FormDefinition = {
       title: "Test",

@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
-import type { ActiveSerialSession, ActiveSession, ProxyConfig, SerialProfile, ServerConfig } from "../models/config";
+import type { ActiveSerialSession, ActiveSession, AuthProfile, ProxyConfig, SerialProfile, ServerConfig } from "../models/config";
 import { getAncestorPaths, folderDisplayName, isDescendantOrSelf, parentPath as folderParentPath } from "../utils/folderPaths";
 import { toParityCode } from "../utils/helpers";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
@@ -109,6 +109,7 @@ export class NexusTreeProvider
 {
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<NexusTreeItem | undefined>();
   private readonly collapsedFolders = new Set<string>();
+  private authProfileById = new Map<string, AuthProfile>();
   private cachedChildFolderMap = new Map<string | undefined, string[]>();
   private filterText: string = "";
   private snapshot: SessionSnapshot = {
@@ -135,6 +136,7 @@ export class NexusTreeProvider
 
   public setSnapshot(snapshot: SessionSnapshot): void {
     this.snapshot = snapshot;
+    this.authProfileById = new Map(snapshot.authProfiles.map((profile) => [profile.id, profile]));
     this.computeFolderCache();
     this.refresh();
   }
@@ -431,9 +433,7 @@ export class NexusTreeProvider
     const connected = this.snapshot.activeSessions.some((session) => session.serverId === server.id);
     const lookup = (id: string): ServerConfig | undefined => this.snapshot.servers.find((s) => s.id === id);
     const showDesc = vscode.workspace.getConfiguration("nexus.ui").get<boolean>("showTreeDescriptions", true);
-    const authProfile = server.authProfileId
-      ? this.snapshot.authProfiles.find((p) => p.id === server.authProfileId)
-      : undefined;
+    const authProfile = server.authProfileId ? this.authProfileById.get(server.authProfileId) : undefined;
     return new ServerTreeItem(server, connected, lookup, showDesc, authProfile?.name, authProfile?.username);
   }
 

@@ -209,23 +209,14 @@ export function serverFormDefinition(
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
 
-  // Resolve live profile credentials into seed so the form shows current profile values
-  let resolvedSeed = seed;
-  if (seed?.authProfileId && authProfiles) {
-    const profile = authProfiles.find(p => p.id === seed.authProfileId);
-    if (profile) {
-      resolvedSeed = { ...seed, username: profile.username, authType: profile.authType, keyPath: profile.keyPath };
-    }
-  }
-
   return {
     title: isEdit ? "Edit Server" : "Add Server",
     fields: [
-      { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: resolvedSeed?.name },
+      { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
       authProfileSelectField(authProfiles, undefined, seed?.authProfileId),
-      ...sshFields(resolvedSeed),
-      ...proxyFields(resolvedSeed, servers),
-      ...sharedTrailingFields(resolvedSeed, existingGroups, defaultLogSession)
+      ...sshFields(seed),
+      ...proxyFields(seed, servers),
+      ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ]
   };
 }

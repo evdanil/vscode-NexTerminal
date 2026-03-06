@@ -393,6 +393,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let previousServers = new Map<string, import("./models/config").ServerConfig>(
     core.getSnapshot().servers.map(s => [s.id, s])
   );
+  let previousAuthProfiles = new Map<string, import("./models/config").AuthProfile>(
+    core.getSnapshot().authProfiles.map((profile) => [profile.id, profile])
+  );
 
   const unsubscribeCore = core.onDidChange((snapshot) => {
     syncViews();
@@ -404,11 +407,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         prev.username !== server.username ||
         prev.authType !== server.authType ||
         prev.keyPath !== server.keyPath ||
+        prev.authProfileId !== server.authProfileId ||
         prev.multiplexing !== server.multiplexing ||
         prev.legacyAlgorithms !== server.legacyAlgorithms ||
         JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)
       )) {
-        pool.disconnect(server.id);
+        pool.invalidate(server.id);
         // Clear stale proxy password when proxy endpoint changes to prevent
         // sending one proxy's credentials to a different proxy server.
         if (JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)) {
@@ -416,7 +420,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }
     }
+    const changedAuthProfileIds = new Set<string>();
+    const currentAuthProfileIds = new Set(snapshot.authProfiles.map((profile) => profile.id));
+    for (const profile of snapshot.authProfiles) {
+      if (previousAuthProfiles.get(profile.id) !== profile) {
+        changedAuthProfileIds.add(profile.id);
+      }
+    }
+    for (const profileId of previousAuthProfiles.keys()) {
+      if (!currentAuthProfileIds.has(profileId)) {
+        changedAuthProfileIds.add(profileId);
+      }
+    }
+    if (changedAuthProfileIds.size > 0) {
+      const affectedServerIds = new Set<string>();
+      for (const server of snapshot.servers) {
+        if (server.authProfileId && changedAuthProfileIds.has(server.authProfileId)) {
+          affectedServerIds.add(server.id);
+        }
+      }
+      for (const server of previousServers.values()) {
+        if (server.authProfileId && changedAuthProfileIds.has(server.authProfileId)) {
+          affectedServerIds.add(server.id);
+        }
+      }
+      for (const serverId of affectedServerIds) {
+        pool.invalidate(serverId);
+      }
+    }
     previousServers = new Map(snapshot.servers.map(s => [s.id, s]));
+    previousAuthProfiles = new Map(snapshot.authProfiles.map((profile) => [profile.id, profile]));
   });
   const unsubscribeTunnel = tunnelManager.onDidChange((event) => {
     if (event.type === "started") {

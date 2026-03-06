@@ -42,4 +42,26 @@ describe("formDefinitions keyPath visibility", () => {
       expect(authProfileField.options.some((option) => option.value === "__create__authProfile")).toBe(true);
     }
   });
+
+  it("preserves stored server credentials in edit form when auth profile is linked", () => {
+    const definition = serverFormDefinition(
+      {
+        id: "srv-1",
+        username: "stored-user",
+        authType: "password",
+        keyPath: "/stored/key",
+        authProfileId: "ap-1"
+      },
+      [],
+      true,
+      [],
+      [{ id: "ap-1", name: "Production", username: "live-user", authType: "key", keyPath: "/live/key" }]
+    );
+    const usernameField = definition.fields.find(
+      (field): field is Extract<(typeof definition.fields)[number], { key: string; value?: unknown }> =>
+        "key" in field && field.key === "username"
+    );
+    expect(usernameField).toBeDefined();
+    expect(usernameField!.value).toBe("stored-user");
+  });
 });

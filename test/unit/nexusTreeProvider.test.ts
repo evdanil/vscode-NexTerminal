@@ -611,6 +611,22 @@ describe("NexusTreeProvider description visibility", () => {
     expect(server!.description).toBe("dev@example.com");
   });
 
+  it("shows resolved auth profile details in server description", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: (key: string) => key === "showTreeDescriptions" ? true : undefined
+    } as any);
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer({ authProfileId: "ap-1", username: "stored-user" })],
+      authProfiles: [{ id: "ap-1", name: "Production Auth", username: "deploy", authType: "password" }]
+    });
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    const server = children.find((c) => c instanceof ServerTreeItem);
+    expect(server!.description).toBe("deploy@example.com (Production Auth)");
+    expect(server!.tooltip).toContain("[auth: Production Auth]");
+  });
+
   it("hides serial profile description when showTreeDescriptions is false", () => {
     vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
       get: (key: string) => key === "showTreeDescriptions" ? false : undefined

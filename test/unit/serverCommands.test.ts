@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
-import { registerServerCommands, formValuesToServer, formValuesToProxy, syncProxyPasswordSecret } from "../../src/commands/serverCommands";
+import { registerServerCommands, formValuesToServer, formValuesToProxy, preserveLinkedServerCredentials, syncProxyPasswordSecret } from "../../src/commands/serverCommands";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
 import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
 import { readFile } from "node:fs/promises";
@@ -442,6 +442,35 @@ describe("formValuesToServer authProfileId", () => {
     });
     expect(server).toBeDefined();
     expect(server!.authProfileId).toBeUndefined();
+  });
+});
+
+describe("preserveLinkedServerCredentials", () => {
+  it("preserves existing local credentials when auth profile is linked", () => {
+    const existing = makeServer({
+      username: "stored-user",
+      authType: "key",
+      keyPath: "/stored/key"
+    });
+    const next = makeServer({
+      username: "profile-user",
+      authType: "password",
+      authProfileId: "ap-123"
+    });
+    expect(preserveLinkedServerCredentials(existing, next)).toEqual(
+      expect.objectContaining({
+        username: "stored-user",
+        authType: "key",
+        keyPath: "/stored/key",
+        authProfileId: "ap-123"
+      })
+    );
+  });
+
+  it("leaves standalone servers unchanged", () => {
+    const existing = makeServer({ username: "stored-user", authType: "key", keyPath: "/stored/key" });
+    const next = makeServer({ username: "edited-user", authType: "password" });
+    expect(preserveLinkedServerCredentials(existing, next)).toEqual(next);
   });
 });
 

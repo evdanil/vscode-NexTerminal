@@ -185,6 +185,39 @@ describe("SshConnectionPool", () => {
     expect(conn.dispose).toHaveBeenCalled();
   });
 
+  it("invalidate keeps active leases alive but prevents reuse", async () => {
+    const conn1 = createMockConnection();
+    const conn2 = createMockConnection();
+    const f = createMockFactory([conn1, conn2]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const lease1 = await p.connect(testServer);
+    p.invalidate(testServer.id);
+
+    expect(conn1.dispose).not.toHaveBeenCalled();
+
+    const lease2 = await p.connect(testServer);
+    expect(f.connect).toHaveBeenCalledTimes(2);
+
+    lease2.dispose();
+    expect(conn2.dispose).not.toHaveBeenCalled();
+
+    lease1.dispose();
+    expect(conn1.dispose).toHaveBeenCalled();
+  });
+
+  it("invalidate disposes idle entries immediately", async () => {
+    const conn = createMockConnection();
+    const f = createMockFactory([conn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const lease = await p.connect(testServer);
+    lease.dispose();
+
+    p.invalidate(testServer.id);
+    expect(conn.dispose).toHaveBeenCalled();
+  });
+
   it("disabled mode bypasses pool (factory called each time)", async () => {
     const f = createMockFactory();
     const p = new SshConnectionPool(f, { enabled: false, idleTimeoutMs: 5000 });

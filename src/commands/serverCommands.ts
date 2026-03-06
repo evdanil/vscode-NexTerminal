@@ -351,6 +351,18 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
   };
 }
 
+export function preserveLinkedServerCredentials(existing: ServerConfig | undefined, next: ServerConfig): ServerConfig {
+  if (!existing || !next.authProfileId) {
+    return next;
+  }
+  return {
+    ...next,
+    username: existing.username,
+    authType: existing.authType,
+    keyPath: existing.keyPath
+  };
+}
+
 export { browseForKey, collectGroups };
 
 async function browseForKey(): Promise<string | undefined> {
@@ -521,10 +533,11 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const updated = formValuesToServer(values, existing.id, existing.isHidden);
-          if (!updated) {
+          const candidate = formValuesToServer(values, existing.id, existing.isHidden);
+          if (!candidate) {
             return;
           }
+          const updated = preserveLinkedServerCredentials(existing, candidate);
           await ctx.core.addOrUpdateServer(updated);
           await syncProxyPasswordSecret(ctx, updated.id, values);
           if (ctx.core.isServerConnected(existing.id)) {

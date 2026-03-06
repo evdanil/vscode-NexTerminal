@@ -1296,6 +1296,52 @@ describe("share export round-trip", () => {
     expect(snapshot.tunnels[0].browserUrl).toBe("https://myapp.local:{localPort}/admin");
     expect(snapshot.tunnels[0].notes).toBe("test note");
   });
+
+  it("share export then import preserves linked auth profile references", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const sourceRepo = new InMemoryConfigRepository();
+    const sourceCore = new NexusCore(sourceRepo);
+    await sourceCore.initialize();
+    await sourceCore.addOrUpdateAuthProfile(makeAuthProfile({ id: "ap1", name: "Production Auth" }));
+    await sourceCore.addOrUpdateServer(makeServer({ id: "s1", authProfileId: "ap1" }));
+
+    registerConfigCommands(sourceCore, vault);
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/share.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+
+    const exportCmd = registeredCommands.get("nexus.config.export")!;
+    await exportCmd();
+
+    const exported = JSON.parse(exportedJson);
+    expect(exported.authProfiles).toHaveLength(1);
+    expect(exported.servers[0].authProfileId).toBe(exported.authProfiles[0].id);
+
+    registeredCommands.clear();
+    const destRepo = new InMemoryConfigRepository();
+    const destCore = new NexusCore(destRepo);
+    await destCore.initialize();
+    registerConfigCommands(destCore, vault);
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(exportedJson, "utf8"));
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const snapshot = destCore.getSnapshot();
+    expect(snapshot.authProfiles).toHaveLength(1);
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0].authProfileId).toBe(snapshot.authProfiles[0].id);
+    expect(snapshot.servers[0].authProfileId).not.toBe("ap1");
+  });
 });
 
 describe("backup export round-trip", () => {

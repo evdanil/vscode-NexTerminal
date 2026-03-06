@@ -401,7 +401,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     const json = JSON.stringify(exportData, null, 2);
     await vscode.workspace.fs.writeFile(uri, Buffer.from(json, "utf8"));
 
-    const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length;
+    const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + sanitized.authProfiles.length;
     void vscode.window.showInformationMessage(`Exported ${count} profiles for sharing to ${uri.fsPath}`);
   }
 
@@ -466,32 +466,55 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     // Generate fresh IDs to prevent duplicates on re-import
     const idMap = new Map<string, string>();
 
+    const authProfiles = data.authProfiles ?? [];
     const servers = data.servers ?? [];
     const tunnels = data.tunnels ?? [];
     const serialProfiles = data.serialProfiles ?? [];
 
-    // First pass: assign new IDs
+    // First pass: assign new IDs for auth profiles and servers so links can be remapped.
+    for (const profile of authProfiles) {
+      ensureId(profile as unknown as Record<string, unknown>);
+      idMap.set(profile.id, randomUUID());
+    }
     for (const server of servers) {
       ensureId(server as unknown as Record<string, unknown>);
-      const newId = randomUUID();
-      idMap.set(server.id, newId);
-      server.id = newId;
+      idMap.set(server.id, randomUUID());
     }
 
-    // Second pass: remap jump host references and import
     let imported = 0;
     let skipped = 0;
+
+    for (const profile of authProfiles) {
+      const remappedProfile: AuthProfile = {
+        ...profile,
+        id: idMap.get(profile.id)!
+      };
+      if (validateAuthProfile(remappedProfile)) {
+        await core.addOrUpdateAuthProfile(remappedProfile);
+        imported++;
+      } else {
+        skipped++;
+      }
+    }
+
     for (const server of servers) {
-      if (server.proxy?.type === "ssh") {
-        const remapped = idMap.get(server.proxy.jumpHostId);
+      let remappedProxy = server.proxy;
+      if (remappedProxy?.type === "ssh") {
+        const remapped = idMap.get(remappedProxy.jumpHostId);
         if (remapped) {
-          server.proxy = { ...server.proxy, jumpHostId: remapped };
+          remappedProxy = { ...remappedProxy, jumpHostId: remapped };
         } else {
-          server.proxy = undefined; // Jump host not in export
+          remappedProxy = undefined; // Jump host not in export
         }
       }
-      if (validateServerConfig(server)) {
-        await core.addOrUpdateServer(server);
+      const remappedServer: ServerConfig = {
+        ...server,
+        id: idMap.get(server.id)!,
+        proxy: remappedProxy,
+        authProfileId: server.authProfileId ? idMap.get(server.authProfileId) : undefined
+      };
+      if (validateServerConfig(remappedServer)) {
+        await core.addOrUpdateServer(remappedServer);
         imported++;
       } else {
         skipped++;
@@ -499,14 +522,13 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     }
     for (const tunnel of tunnels) {
       ensureId(tunnel as unknown as Record<string, unknown>);
-      const newId = randomUUID();
-      idMap.set(tunnel.id, newId);
-      tunnel.id = newId;
-      if (tunnel.defaultServerId) {
-        tunnel.defaultServerId = idMap.get(tunnel.defaultServerId) ?? undefined;
-      }
-      if (validateTunnelProfile(tunnel)) {
-        await core.addOrUpdateTunnel(tunnel);
+      const remappedTunnel: TunnelProfile = {
+        ...tunnel,
+        id: randomUUID(),
+        defaultServerId: tunnel.defaultServerId ? idMap.get(tunnel.defaultServerId) ?? undefined : undefined
+      };
+      if (validateTunnelProfile(remappedTunnel)) {
+        await core.addOrUpdateTunnel(remappedTunnel);
         imported++;
       } else {
         skipped++;
@@ -514,25 +536,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     }
     for (const profile of serialProfiles) {
       ensureId(profile as unknown as Record<string, unknown>);
-      const newId = randomUUID();
-      idMap.set(profile.id, newId);
-      profile.id = newId;
-      if (validateSerialProfile(profile)) {
-        await core.addOrUpdateSerialProfile(profile);
-        imported++;
-      } else {
-        skipped++;
-      }
-    }
-
-    // Backward compat: older share exports included auth profiles. Accept them
-    // on import so files created by previous versions still work correctly.
-    for (const profile of data.authProfiles ?? []) {
-      ensureId(profile as unknown as Record<string, unknown>);
-      const newId = randomUUID();
-      profile.id = newId;
-      if (validateAuthProfile(profile)) {
-        await core.addOrUpdateAuthProfile(profile);
+      const remappedProfile: SerialProfile = {
+        ...profile,
+        id: randomUUID()
+      };
+      if (validateSerialProfile(remappedProfile)) {
+        await core.addOrUpdateSerialProfile(remappedProfile);
         imported++;
       } else {
         skipped++;

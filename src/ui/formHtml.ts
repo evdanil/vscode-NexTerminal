@@ -191,6 +191,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             }
           }
         }
+        updateProfileManagedFields();
       }
 
       var watchedFields = {};
@@ -273,15 +274,24 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           if (!fieldEl) continue;
           var group = fieldEl.closest ? fieldEl.closest(".form-group") : fieldEl.parentElement;
           if (!group) continue;
-          var inputs = group.querySelectorAll("input, select, textarea");
+          var inputs = group.querySelectorAll("input, textarea");
           for (var ii = 0; ii < inputs.length; ii++) {
-            if (isLinked) {
-              inputs[ii].disabled = true;
-              inputs[ii].style.opacity = "0.6";
-            } else {
-              inputs[ii].disabled = false;
-              inputs[ii].style.opacity = "";
+            var input = inputs[ii];
+            if (input.type === "hidden") continue;
+            if (input.dataset.baseReadonly === undefined) {
+              input.dataset.baseReadonly = input.readOnly ? "true" : "false";
             }
+            input.readOnly = isLinked || input.dataset.baseReadonly === "true";
+            input.style.opacity = isLinked ? "0.6" : "";
+          }
+          var buttons = group.querySelectorAll("button");
+          for (var bi = 0; bi < buttons.length; bi++) {
+            var button = buttons[bi];
+            if (button.dataset.baseDisabled === undefined) {
+              button.dataset.baseDisabled = button.disabled ? "true" : "false";
+            }
+            button.disabled = isLinked || button.dataset.baseDisabled === "true";
+            button.style.opacity = isLinked ? "0.6" : "";
           }
           // For custom-select wrappers (authType), also disable the trigger
           var customSelect = group.querySelector(".custom-select");

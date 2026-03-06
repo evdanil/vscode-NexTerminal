@@ -326,6 +326,14 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
     this.evictEntry(serverId, entry);
   }
 
+  public invalidate(serverId: string): void {
+    const entry = this.entries.get(serverId);
+    if (!entry) {
+      return;
+    }
+    this.softRemoveEntry(serverId, entry);
+  }
+
   public dispose(): void {
     if (this.disposed) {
       return;
@@ -401,6 +409,17 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
     this.entries.delete(serverId);
     entry.connection.dispose();
     this.emit({ type: "disconnected", serverId });
+  }
+
+  private softRemoveEntry(serverId: string, entry: PoolEntry): void {
+    this.cancelIdleTimer(entry);
+    entry.healthy = false;
+    this.entries.delete(serverId);
+    this.emit({ type: "disconnected", serverId });
+    if (entry.refCount === 0) {
+      entry.closeUnsubscribe();
+      entry.connection.dispose();
+    }
   }
 
   private startIdleTimer(serverId: string, entry: PoolEntry): void {
