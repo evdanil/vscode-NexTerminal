@@ -1,24 +1,18 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
+import { isValidBinding } from "../macroBindings";
 import {
-  isValidBinding,
-  bindingToDisplayLabel,
-  CRITICAL_CTRL_SHIFT_KEYS,
-  SPECIAL_BINDING_WARNINGS
-} from "../macroBindings";
+  assignBinding,
+  normalizeBinding
+} from "../macroBindingHelpers";
+import {
+  confirmBindingWarnings,
+  getMacros,
+  saveMacros
+} from "../macroSettings";
+import type { TerminalMacro } from "../models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
-import type { TerminalMacro } from "./macroTreeProvider";
-
-function getMacros(): TerminalMacro[] {
-  return vscode.workspace.getConfiguration("nexus.terminal").get<TerminalMacro[]>("macros", []);
-}
-
-async function saveMacros(macros: TerminalMacro[]): Promise<void> {
-  await vscode.workspace
-    .getConfiguration("nexus.terminal")
-    .update("macros", macros, vscode.ConfigurationTarget.Global);
-}
 
 export class MacroEditorPanel {
   private static instance: MacroEditorPanel | undefined;
@@ -117,49 +111,38 @@ export class MacroEditorPanel {
         const bindingRaw = msg.keybinding as string | null;
         const index = msg.index as number | null;
         const macros = getMacros();
+        const triggerInitiallyDisabled = msg.triggerInitiallyDisabled as boolean | undefined;
 
         const macro: TerminalMacro = { name, text };
         if (secret) macro.secret = true;
         const triggerPattern = ((msg.triggerPattern as string | null) ?? "").trim();
         const triggerCooldown = msg.triggerCooldown as number | undefined;
-        if (triggerPattern) macro.triggerPattern = triggerPattern;
-        if (triggerCooldown !== undefined && triggerCooldown !== DEFAULT_TRIGGER_COOLDOWN) macro.triggerCooldown = triggerCooldown;
-        if (bindingRaw) {
-          const normalized = bindingRaw.toLowerCase();
-          if (isValidBinding(normalized)) {
-            // Warn about critical Ctrl+Shift keys
-            if (normalized.startsWith("ctrl+shift+")) {
-              const key = normalized.slice(11);
-              if (CRITICAL_CTRL_SHIFT_KEYS.has(key)) {
-                const proceed = await vscode.window.showWarningMessage(
-                  `${bindingToDisplayLabel(normalized)} is a common VS Code shortcut. Using it for a macro will override the default behavior in the terminal.`,
-                  "Use Anyway",
-                  "Cancel"
-                );
-                if (proceed !== "Use Anyway") break;
-              }
-            }
-            // Warn about alt+s override
-            const specialWarning = SPECIAL_BINDING_WARNINGS[normalized];
-            if (specialWarning) {
-              const proceed = await vscode.window.showWarningMessage(
-                specialWarning,
-                "Use Anyway",
-                "Cancel"
-              );
-              if (proceed !== "Use Anyway") break;
-            }
-            // Clear conflicting binding
-            for (const m of macros) {
-              if (m.keybinding?.toLowerCase() === normalized) {
-                delete m.keybinding;
-              }
-            }
-            macro.keybinding = normalized;
+        if (triggerPattern) {
+          macro.triggerPattern = triggerPattern;
+          if (triggerInitiallyDisabled) {
+            macro.triggerInitiallyDisabled = true;
           }
         }
-
-        if (index !== null && index < macros.length) {
+        if (triggerCooldown !== undefined && triggerCooldown !== DEFAULT_TRIGGER_COOLDOWN) macro.triggerCooldown = triggerCooldown;
+        const normalizedBinding = normalizeBinding(bindingRaw);
+        if (normalizedBinding) {
+          if (!isValidBinding(normalizedBinding)) {
+            break;
+          }
+          if (!(await confirmBindingWarnings(normalizedBinding))) {
+            break;
+          }
+          if (index !== null && index < macros.length) {
+            macros[index] = macro;
+            assignBinding(macros, index, normalizedBinding);
+            this.selectedIndex = index;
+          } else {
+            macros.push(macro);
+            const newIndex = macros.length - 1;
+            assignBinding(macros, newIndex, normalizedBinding);
+            this.selectedIndex = newIndex;
+          }
+        } else if (index !== null && index < macros.length) {
           macros[index] = macro;
           this.selectedIndex = index;
         } else {

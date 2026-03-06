@@ -98,14 +98,18 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - Groups can be created from the `+` menu or inline while editing a profile.
 
 ### 4.9 Terminal Macros
-- Define named macros in `nexus.terminal.macros` settings (name + text + optional slot).
+- Define named macros in `nexus.terminal.macros` settings (name + text + optional `keybinding`).
 - Macros appear in the **Terminal Macros** sidebar view (`nexusMacros`).
 - Click the play button or the label to send macro text to the active terminal.
 - Press `Alt+S` to open a quick pick of all macros.
-- Press `Alt+1` through `Alt+0` to trigger macros by slot assignment.
-- **Slot assignment:** each macro can have an explicit `slot` (0-9) binding it to a specific `Alt+N` shortcut. Right-click a macro and select **Assign Shortcut** to pick a slot. If no macros have explicit slots, the first 10 macros auto-assign positionally (legacy mode).
-- Conflict resolution: assigning a slot already taken by another macro clears the old assignment.
-- Add, edit, remove, reorder, and assign shortcuts via the context menu.
+- Each macro can have an explicit `keybinding` such as `alt+m`, `alt+shift+5`, or `ctrl+shift+a`. Right-click a macro and select **Assign Shortcut** to edit it.
+- Conflict resolution: assigning a shortcut already taken by another macro clears the old assignment.
+- Macros without a shortcut remain available via the `Alt+S` quick pick.
+- Add `triggerPattern` to enable auto-trigger (expect/send). Matching terminal output sends the macro text automatically, with optional per-macro `triggerCooldown`.
+- Add `triggerInitiallyDisabled` when a macro should start paused until you manually resume it from the macros view. If the prompt already matched recently, resuming can fire immediately without extra terminal output.
+- Auto-trigger can be paused/resumed per macro from the macros view, and globally toggled with `nexus.terminal.macros.autoTrigger`.
+- Legacy `slot` values are still read and auto-migrated to `keybinding` on startup.
+- Add, edit, remove, reorder, pause/resume auto-trigger, and assign shortcuts via the context menu.
 
 ### 4.10 Configuration Export/Import
 - `Nexus: Export Configuration` saves all server, tunnel, and serial profiles to a JSON file.
@@ -117,7 +121,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - `nexusCommandCenter`: servers, serial profiles, and active sessions.
 - `nexusTunnels`: tunnel profiles and active traffic state.
 - `nexusTunnelMonitor`: dedicated traffic/status panel for active tunnels.
-- `nexusMacros`: terminal macros with slot-based keyboard shortcuts.
+- `nexusMacros`: terminal macros with optional custom keyboard shortcuts and auto-trigger state.
 - `nexusSettings`: extension settings sidebar panel.
 
 ### 5.2 Commands
@@ -147,10 +151,11 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 **Macros:**
 - `nexus.macro.add`, `nexus.macro.edit`, `nexus.macro.remove`
 - `nexus.macro.run` (Alt+S quick pick)
-- `nexus.macro.slot` (Alt+1–Alt+0 keybinding dispatch)
+- `nexus.macro.runBinding` (explicit shortcut dispatch)
 - `nexus.macro.runItem` (tree item click/play button)
-- `nexus.macro.assignSlot` (assign Alt+N shortcut via context menu)
+- `nexus.macro.assignSlot` (assign/remove custom shortcut via context menu)
 - `nexus.macro.moveUp`, `nexus.macro.moveDown`
+- `nexus.macro.disableTrigger`, `nexus.macro.enableTrigger`
 
 **Config:**
 - `nexus.config.export`, `nexus.config.import`

@@ -189,7 +189,7 @@ describe("MacroTreeProvider", () => {
     expect(children[1].label).toBe("World");
   });
 
-  it("legacy positional mode when no macros have keybinding or slot", () => {
+  it("shows no prefix when macros have no assigned shortcut", () => {
     const macros = [
       { name: "Hello", text: "echo hello" },
       { name: "World", text: "echo world" }
@@ -200,8 +200,8 @@ describe("MacroTreeProvider", () => {
 
     const children = provider.getChildren();
     expect(children).toHaveLength(2);
-    expect(children[0].label).toBe("[Alt+1] Hello");
-    expect(children[1].label).toBe("[Alt+2] World");
+    expect(children[0].label).toBe("Hello");
+    expect(children[1].label).toBe("World");
   });
 
   it("mixed: once any macro has a keybinding, unassigned ones show no prefix", () => {
@@ -220,25 +220,14 @@ describe("MacroTreeProvider", () => {
     expect(children[2].label).toBe("C");
   });
 
-  it("legacy mode: index 9 gets Alt+0", () => {
-    const macros = Array.from({ length: 10 }, (_, i) => ({ name: `M${i}`, text: `t${i}` }));
-    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-      get: vi.fn().mockReturnValue(macros)
-    } as unknown as vscode.WorkspaceConfiguration);
-
-    const children = provider.getChildren();
-    expect(children[0].label).toBe("[Alt+1] M0");
-    expect(children[8].label).toBe("[Alt+9] M8");
-    expect(children[9].label).toBe("[Alt+0] M9");
-  });
-
-  it("legacy mode: index 10+ gets no prefix", () => {
+  it("unbound macros stay unprefixed even beyond ten entries", () => {
     const macros = Array.from({ length: 12 }, (_, i) => ({ name: `M${i}`, text: `t${i}` }));
     vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
       get: vi.fn().mockReturnValue(macros)
     } as unknown as vscode.WorkspaceConfiguration);
 
     const children = provider.getChildren();
+    expect(children[0].label).toBe("M0");
     expect(children[10].label).toBe("M10");
     expect(children[11].label).toBe("M11");
   });

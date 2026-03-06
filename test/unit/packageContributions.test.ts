@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
   dependencies: Record<string, string>;
+  configurationDefaults?: Record<string, unknown>;
   contributes: {
     commands: Array<{ command: string; title: string }>;
     menus: Record<string, Array<{ command: string; when?: string; group?: string }>>;
@@ -52,12 +53,19 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.macro.editor");
   });
 
+  it("does not contribute the legacy macro.slot command", () => {
+    const commands = packageJson.contributes.commands.map((item) => item.command);
+    expect(commands).not.toContain("nexus.macro.slot");
+  });
+
   it("includes secret property in macro schema", () => {
     const cfg = packageJson.contributes.configuration;
     const macroSchema = cfg?.properties?.["nexus.terminal.macros"];
     expect(macroSchema).toBeDefined();
     expect(macroSchema?.items?.properties?.secret).toBeDefined();
     expect(macroSchema?.items?.properties?.secret?.type).toBe("boolean");
+    expect(macroSchema?.items?.properties?.triggerInitiallyDisabled).toBeDefined();
+    expect(macroSchema?.items?.properties?.triggerInitiallyDisabled?.type).toBe("boolean");
   });
 
   it("uses nexus.folder contextValue in folder menu when clauses", () => {
@@ -86,5 +94,10 @@ describe("package contributions", () => {
     const disconnect = commands.find((item) => item.command === "nexus.group.disconnect");
     expect(connect?.title).toBe("Connect Folder Servers");
     expect(disconnect?.title).toBe("Disconnect Folder Servers");
+  });
+
+  it("only skips shell for live macro commands", () => {
+    const commandsToSkipShell = packageJson.configurationDefaults?.["terminal.integrated.commandsToSkipShell"];
+    expect(commandsToSkipShell).toEqual(["nexus.macro.run", "nexus.macro.runBinding"]);
   });
 });

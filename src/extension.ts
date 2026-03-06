@@ -42,15 +42,15 @@ import { ColorSchemeService } from "./services/colorSchemeService";
 import { TerminalAppearancePanel } from "./ui/terminalAppearancePanel";
 import { tryRegisterResourceLabelFormatter } from "./services/sftp/resourceLabelFormatter";
 
-const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.slot", "nexus.macro.runBinding"];
+const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
 const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
 
 /**
- * Ensure VS Code settings allow Alt+S / Alt+N macro keybindings to reach the extension.
+ * Ensure VS Code settings allow macro shortcuts to reach the extension.
  * Three settings are patched:
  *  1. terminal.integrated.commandsToSkipShell — our commands must be in the list
  *  2. terminal.integrated.sendKeybindingsToShell — must be false so the shell doesn't swallow shortcuts
- *  3. window.enableMenuBarMnemonics — must be false so Alt+letter doesn't open menus (Linux/Windows)
+ *  3. window.enableMenuBarMnemonics — must be false so Alt+letter shortcuts don't open menus (Linux/Windows)
  */
 function ensureMacroKeybindingsWork(): void {
   // --- 1. commandsToSkipShell ---
@@ -87,7 +87,7 @@ function ensureMacroKeybindingsWork(): void {
   }
 
   // --- 2. sendKeybindingsToShell ---
-  // When true the terminal shell receives matched keybindings before VS Code, swallowing Alt+N.
+  // When true the terminal shell receives matched keybindings before VS Code, swallowing macro shortcuts.
   const sendInspect = termConfig.inspect<boolean>("sendKeybindingsToShell");
   if (sendInspect?.globalValue === true) {
     void termConfig.update("sendKeybindingsToShell", false, vscode.ConfigurationTarget.Global);
@@ -343,7 +343,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     canSelectMany: true
   });
 
-  const macroTreeProvider = new MacroTreeProvider((name) => macroAutoTrigger.isDisabled(name));
+  const macroTreeProvider = new MacroTreeProvider((_macro, index) => macroAutoTrigger.isDisabled(index));
   const macroView = vscode.window.createTreeView("nexusMacros", {
     treeDataProvider: macroTreeProvider
   });
@@ -472,9 +472,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const configChangeListener = vscode.workspace.onDidChangeConfiguration((event) => {
     if (event.affectsConfiguration("nexus.terminal.macros")) {
-      macroTreeProvider.refresh();
-      updateMacroContext();
       macroAutoTrigger.reload();
+      updateMacroContext();
+      macroTreeProvider.refresh();
     }
     if (event.affectsConfiguration("nexus.terminal.keyboardPassthrough") || event.affectsConfiguration("nexus.terminal.passthroughKeys")) {
       updatePassthroughContext();
@@ -505,16 +505,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);
   const configDisposables = registerConfigCommands(core, secretVault);
-  const macroDisposables = registerMacroCommands(macroTreeProvider);
+  const macroDisposables = registerMacroCommands();
   const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
-      macroAutoTrigger.setDisabled(item.macro.name, true);
+      macroAutoTrigger.setDisabled(item.index, true);
       macroTreeProvider.refresh();
     }
   });
   const enableTriggerCmd = vscode.commands.registerCommand("nexus.macro.enableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
-      macroAutoTrigger.setDisabled(item.macro.name, false);
+      macroAutoTrigger.setDisabled(item.index, false);
       macroTreeProvider.refresh();
     }
   });

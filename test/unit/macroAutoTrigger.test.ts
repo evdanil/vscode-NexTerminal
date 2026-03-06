@@ -296,6 +296,15 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("starts configured triggers paused until enabled", () => {
+    setConfig([
+      { name: "route", text: "show ip route 0.0.0.0\n", triggerPattern: "router#", triggerInitiallyDisabled: true }
+    ]);
+    const trigger = new MacroAutoTrigger();
+
+    expect(trigger.isDisabled(0)).toBe(true);
+  });
+
   it("large chunk guard — chunks > 8192 chars skipped", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:" }
@@ -333,8 +342,8 @@ describe("MacroAutoTrigger", () => {
     const sent: string[] = [];
     const obs = trigger.createObserver((text) => sent.push(text));
 
-    trigger.setDisabled("pw", true);
-    expect(trigger.isDisabled("pw")).toBe(true);
+    trigger.setDisabled(0, true);
+    expect(trigger.isDisabled(0)).toBe(true);
 
     obs.onOutput("Password:");
     flush();
@@ -344,10 +353,49 @@ describe("MacroAutoTrigger", () => {
     flush();
     expect(sent).toEqual(["yes\n"]); // other macro still works
 
-    trigger.setDisabled("pw", false);
+    trigger.setDisabled(0, false);
     obs.onOutput("Password:");
     flush();
     expect(sent).toEqual(["yes\n", "secret\n"]); // re-enabled
+    obs.dispose();
+  });
+
+  it("enabling a previously paused trigger re-evaluates buffered output", () => {
+    setConfig([
+      { name: "route", text: "show ip route 0.0.0.0\n", triggerPattern: "router#", triggerInitiallyDisabled: true }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("router#");
+    flush();
+    expect(sent).toEqual([]);
+
+    trigger.setDisabled(0, false);
+    flush();
+    expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
+    obs.dispose();
+  });
+
+  it("disabling one duplicate-named macro does not disable the other", () => {
+    setConfig([
+      { name: "dup", text: "first\n", triggerPattern: "FirstPrompt" },
+      { name: "dup", text: "second\n", triggerPattern: "SecondPrompt" }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    trigger.setDisabled(0, true);
+
+    obs.onOutput("FirstPrompt");
+    flush();
+    expect(sent).toEqual([]);
+
+    obs.onOutput("SecondPrompt");
+    flush();
+    expect(sent).toEqual(["second\n"]);
     obs.dispose();
   });
 });

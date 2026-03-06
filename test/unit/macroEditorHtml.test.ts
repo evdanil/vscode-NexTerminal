@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderMacroEditorHtml } from "../../src/ui/macroEditorHtml";
-import type { TerminalMacro } from "../../src/ui/macroTreeProvider";
+import type { TerminalMacro } from "../../src/models/terminalMacro";
 
 const nonce = "test-nonce-456";
 
@@ -87,6 +87,12 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain('placeholder="e.g., alt+m, alt+shift+5, ctrl+shift+a"');
   });
 
+  it("renders start-paused checkbox for auto-triggers", () => {
+    const html = render([], null);
+    expect(html).toContain("macro-trigger-disabled");
+    expect(html).toContain("Start auto-trigger paused");
+  });
+
   it("shows current binding value when macro has keybinding", () => {
     const macros: TerminalMacro[] = [
       { name: "Quick", text: "q", keybinding: "alt+m" }
@@ -102,6 +108,14 @@ describe("renderMacroEditorHtml", () => {
     const html = render(macros, 0);
     // The binding input should have empty value
     expect(html).toMatch(/id="macro-binding"[^>]*value=""/);
+  });
+
+  it("checks start-paused checkbox when macro starts disabled", () => {
+    const macros: TerminalMacro[] = [
+      { name: "Route", text: "show ip route 0.0.0.0\n", triggerPattern: "router#", triggerInitiallyDisabled: true }
+    ];
+    const html = render(macros, 0);
+    expect(html).toMatch(/id="macro-trigger-disabled"[^>]*checked/);
   });
 
   it("includes binding validation hint", () => {

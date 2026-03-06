@@ -1,16 +1,7 @@
 import * as vscode from "vscode";
 import { bindingToDisplayLabel } from "../macroBindings";
-
-export interface TerminalMacro {
-  name: string;
-  text: string;
-  keybinding?: string;
-  /** @deprecated Use keybinding instead. Auto-migrated on first load. */
-  slot?: number;
-  secret?: boolean;
-  triggerPattern?: string;
-  triggerCooldown?: number;
-}
+import { getAssignedBinding } from "../macroBindingHelpers";
+import type { TerminalMacro } from "../models/terminalMacro";
 
 export class MacroTreeItem extends vscode.TreeItem {
   public constructor(
@@ -56,7 +47,7 @@ export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem>
   public readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
 
   public constructor(
-    private readonly isTriggerDisabled: (macroName: string) => boolean = () => false
+    private readonly isTriggerDisabled: (macro: TerminalMacro, index: number) => boolean = () => false
   ) {}
 
   public refresh(): void {
@@ -72,19 +63,9 @@ export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem>
       .getConfiguration("nexus.terminal")
       .get<TerminalMacro[]>("macros", []);
 
-    const anyHasBindingOrSlot = macros.some((m) => m.keybinding !== undefined || m.slot !== undefined);
-
     return macros.map((macro, index) => {
-      let displayBinding: string | undefined;
-      if (macro.keybinding) {
-        displayBinding = macro.keybinding;
-      } else if (macro.slot !== undefined) {
-        displayBinding = `alt+${macro.slot}`;
-      } else if (!anyHasBindingOrSlot && index < 10) {
-        // Legacy positional mode: no macros have explicit keybinding or slot
-        displayBinding = `alt+${(index + 1) % 10}`;
-      }
-      const triggerDisabled = macro.triggerPattern ? this.isTriggerDisabled(macro.name) : undefined;
+      const displayBinding = getAssignedBinding(macro);
+      const triggerDisabled = macro.triggerPattern ? this.isTriggerDisabled(macro, index) : undefined;
       return new MacroTreeItem(macro, index, displayBinding, triggerDisabled);
     });
   }

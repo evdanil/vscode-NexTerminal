@@ -1,7 +1,8 @@
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
-import type { TerminalMacro } from "./macroTreeProvider";
+import { getAssignedBinding } from "../macroBindingHelpers";
+import type { TerminalMacro } from "../models/terminalMacro";
 
 export function renderMacroEditorHtml(
   macros: TerminalMacro[],
@@ -23,9 +24,10 @@ export function renderMacroEditorHtml(
   const triggerLabel = macro ? macro.name : (macros.length > 0 ? "Select a macro\u2026" : "+ New Macro");
   const hiddenValue = selectedIndex !== null ? String(selectedIndex) : "__new__";
 
-  const bindingValue = macro?.keybinding ?? "";
+  const bindingValue = macro ? (getAssignedBinding(macro) ?? "") : "";
   const triggerValue = macro?.triggerPattern ?? "";
   const cooldownValue = macro?.triggerCooldown ?? 3;
+  const triggerInitiallyDisabled = macro?.triggerInitiallyDisabled ?? false;
 
   const nameValue = macro?.name ?? "";
   const textValue = macro?.text?.replace(/\n/g, "\n") ?? "";
@@ -120,6 +122,14 @@ export function renderMacroEditorHtml(
     <div class="hint">Seconds between auto-triggers on the same terminal. Prevents echo-loops where server re-prompts after each response.</div>
   </div>
 
+  <div class="form-group form-group-checkbox">
+    <label>
+      <input type="checkbox" id="macro-trigger-disabled"${triggerInitiallyDisabled ? " checked" : ""} />
+      Start auto-trigger paused until manually resumed
+    </label>
+    <div class="hint">Useful for command macros that should wait for you to enable them after login. If the prompt already matched recently, resuming can trigger immediately.</div>
+  </div>
+
   <div class="form-group">
     <label for="macro-binding">Keyboard Shortcut</label>
     <input type="text" id="macro-binding" value="${escapeHtml(bindingValue)}" placeholder="e.g., alt+m, alt+shift+5, ctrl+shift+a" />
@@ -183,6 +193,7 @@ export function renderMacroEditorHtml(
         }
       });
       document.getElementById("macro-cooldown").addEventListener("input", markDirty);
+      document.getElementById("macro-trigger-disabled").addEventListener("change", markDirty);
       document.getElementById("macro-binding").addEventListener("input", function() {
         markDirty();
         var val = this.value.trim();
@@ -216,6 +227,7 @@ export function renderMacroEditorHtml(
         var bindingVal = document.getElementById("macro-binding").value.trim().toLowerCase();
         var triggerVal = document.getElementById("macro-trigger").value.trim();
         var cooldownVal = parseInt(document.getElementById("macro-cooldown").value, 10);
+        var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
 
         // Validate
         var valid = true;
@@ -263,7 +275,8 @@ export function renderMacroEditorHtml(
           secret: secret,
           keybinding: bindingVal || null,
           triggerPattern: triggerVal || null,
-          triggerCooldown: isNaN(cooldownVal) ? 3 : cooldownVal
+          triggerCooldown: isNaN(cooldownVal) ? 3 : cooldownVal,
+          triggerInitiallyDisabled: triggerInitiallyDisabled
         });
       });
 

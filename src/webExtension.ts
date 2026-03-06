@@ -71,7 +71,6 @@ const unsupportedCommands = [
   "nexus.macro.edit",
   "nexus.macro.remove",
   "nexus.macro.run",
-  "nexus.macro.slot",
   "nexus.macro.runBinding",
   "nexus.macro.moveUp",
   "nexus.macro.moveDown",
