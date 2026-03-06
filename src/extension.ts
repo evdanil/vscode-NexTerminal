@@ -530,6 +530,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const interval = vscode.workspace.getConfiguration("nexus.sftp").get<number>("autoRefreshInterval", 10);
       fileExplorerProvider.setAutoRefreshInterval(interval);
     }
+    if (event.affectsConfiguration("nexus.sftp.maxOpenFileSizeMB")) {
+      fileExplorerProvider.refresh();
+    }
   });
 
   const serverDisposables = registerServerCommands(ctx);

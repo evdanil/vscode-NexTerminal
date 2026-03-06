@@ -59,7 +59,8 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.ssh.multiplexing", key: "idleTimeout" },
   { section: "nexus.sftp", key: "cacheTtlSeconds" },
   { section: "nexus.sftp", key: "maxCacheEntries" },
-  { section: "nexus.sftp", key: "autoRefreshInterval" }
+  { section: "nexus.sftp", key: "autoRefreshInterval" },
+  { section: "nexus.sftp", key: "maxOpenFileSizeMB" }
 ];
 
 const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`));

@@ -5,7 +5,9 @@ import { isSafeEntryName } from "../../utils/pathSafety";
 
 export const NEXTERM_SCHEME = "nexterm";
 
-const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+function getMaxFileSize(): number {
+  return vscode.workspace.getConfiguration("nexus.sftp").get<number>("maxOpenFileSizeMB", 5) * 1024 * 1024;
+}
 const MAX_COPY_DEPTH = 100;
 
 export function buildUri(serverId: string, remotePath: string): vscode.Uri {
@@ -56,11 +58,15 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
 
   public async readFile(uri: vscode.Uri): Promise<Uint8Array> {
     const { serverId, remotePath } = parseUri(uri);
+    const maxSize = getMaxFileSize();
     const entry = await this.sftp.stat(serverId, remotePath);
-    if (entry.size > MAX_FILE_SIZE) {
-      throw vscode.FileSystemError.Unavailable(`File too large (${Math.round(entry.size / 1024 / 1024)}MB). Maximum is 50MB.`);
+    if (entry.size > maxSize) {
+      const limitMB = Math.round(maxSize / 1024 / 1024);
+      throw vscode.FileSystemError.Unavailable(
+        `File too large (${Math.round(entry.size / 1024 / 1024)}MB). Maximum is ${limitMB}MB — change nexus.sftp.maxOpenFileSizeMB to increase.`
+      );
     }
-    return this.sftp.readFile(serverId, remotePath, MAX_FILE_SIZE);
+    return this.sftp.readFile(serverId, remotePath, maxSize);
   }
 
   public async writeFile(uri: vscode.Uri, content: Uint8Array): Promise<void> {

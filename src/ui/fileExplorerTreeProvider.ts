@@ -138,11 +138,14 @@ export class FileTreeItem extends vscode.TreeItem {
     } else {
       this.contextValue = "nexus.fileExplorer.file";
       this.iconPath = vscode.ThemeIcon.File;
-      this.command = {
-        command: "vscode.open",
-        title: "Open File",
-        arguments: [uri],
-      };
+      const maxOpenBytes = vscode.workspace.getConfiguration("nexus.sftp").get<number>("maxOpenFileSizeMB", 5) * 1024 * 1024;
+      if (entry.size <= maxOpenBytes) {
+        this.command = {
+          command: "vscode.open",
+          title: "Open File",
+          arguments: [uri],
+        };
+      }
     }
 
     this.tooltip = fullPath;

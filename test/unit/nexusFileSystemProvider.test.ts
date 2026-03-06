@@ -48,6 +48,7 @@ vi.mock("vscode", () => {
         createDirectory: vi.fn(),
         delete: vi.fn(),
       },
+      getConfiguration: vi.fn(() => ({ get: (_key: string, def: unknown) => def })),
     },
     Disposable: class { constructor(private cb: () => void) {} dispose() { this.cb(); } },
     EventEmitter,
@@ -151,12 +152,29 @@ describe("NexusFileSystemProvider", () => {
     expect(result).toEqual(content);
   });
 
-  it("readFile rejects files over 50MB", async () => {
-    const largeEntry: DirectoryEntry = { ...fileEntry, size: 60 * 1024 * 1024 };
+  it("readFile rejects files over configured max size", async () => {
+    const largeEntry: DirectoryEntry = { ...fileEntry, size: 6 * 1024 * 1024 };
     (sftp.stat as any).mockResolvedValue(largeEntry);
 
     const uri = buildUri("srv-1", "/home/dev/large.bin");
     await expect(provider.readFile(uri)).rejects.toThrow(/too large/i);
+  });
+
+  it("readFile respects custom maxOpenFileSizeMB setting", async () => {
+    const vscode = await import("vscode");
+    (vscode.workspace.getConfiguration as any).mockReturnValue({ get: (_key: string, _def: unknown) => 10 });
+
+    const entry7MB: DirectoryEntry = { ...fileEntry, size: 7 * 1024 * 1024 };
+    (sftp.stat as any).mockResolvedValue(entry7MB);
+    const content = Buffer.from("ok");
+    (sftp.readFile as any).mockResolvedValue(content);
+
+    const uri = buildUri("srv-1", "/home/dev/medium.bin");
+    const result = await provider.readFile(uri);
+    expect(result).toEqual(content);
+
+    // Restore default mock
+    (vscode.workspace.getConfiguration as any).mockReturnValue({ get: (_key: string, def: unknown) => def });
   });
 
   it("writeFile delegates and fires change event", async () => {
@@ -223,8 +241,8 @@ describe("NexusFileSystemProvider", () => {
     const uri = buildUri("srv-1", "/home/dev/test.txt");
     await provider.readFile(uri);
 
-    // readFile should be called with maxSize = 50MB
-    expect(sftp.readFile).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt", 50 * 1024 * 1024);
+    // readFile should be called with maxSize = default 5MB
+    expect(sftp.readFile).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt", 5 * 1024 * 1024);
   });
 
   it("rename delegates and fires events for old and new URIs", async () => {

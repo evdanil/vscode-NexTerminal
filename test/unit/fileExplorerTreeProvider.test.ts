@@ -89,6 +89,7 @@ vi.mock("vscode", () => {
         stat: vi.fn(),
         readDirectory: vi.fn(),
       },
+      getConfiguration: vi.fn(() => ({ get: (_key: string, def: unknown) => def })),
     },
     EventEmitter,
   };
@@ -280,6 +281,13 @@ describe("FileExplorerTreeProvider", () => {
     expect(item.resourceUri!.scheme).toBe("nexterm");
     expect(item.resourceUri!.authority).toBe("srv-1");
     expect(item.resourceUri!.path).toBe("/home/dev/file.txt");
+  });
+
+  it("file items above max size have no open command", () => {
+    const largeFile: DirectoryEntry = { ...fileEntry, size: 10 * 1024 * 1024 };
+    const item = new FileTreeItem("srv-1", "/home/dev", largeFile);
+    expect(item.contextValue).toBe("nexus.fileExplorer.file");
+    expect(item.command).toBeUndefined();
   });
 
   it("directory items expose nexterm:// resourceUri", () => {

@@ -190,6 +190,17 @@ export const SETTINGS_META: SettingMeta[] = [
     max: 60,
     unit: "seconds"
   },
+  {
+    key: "maxOpenFileSizeMB",
+    section: "nexus.sftp",
+    label: "Max File Size to Open",
+    type: "number",
+    category: "sftp",
+    description: "Maximum file size (in MB) that can be opened in the editor. Larger files can still be downloaded via right-click.",
+    min: 1,
+    max: 200,
+    unit: "MB"
+  },
   // --- Highlighting ---
   {
     key: "enabled",
