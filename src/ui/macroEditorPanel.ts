@@ -112,6 +112,7 @@ export class MacroEditorPanel {
         const index = msg.index as number | null;
         const macros = getMacros();
         const triggerInitiallyDisabled = msg.triggerInitiallyDisabled as boolean | undefined;
+        const triggerInterval = msg.triggerInterval as number | undefined | null;
 
         const macro: TerminalMacro = { name, text };
         if (secret) macro.secret = true;
@@ -121,6 +122,9 @@ export class MacroEditorPanel {
           macro.triggerPattern = triggerPattern;
           if (triggerInitiallyDisabled) {
             macro.triggerInitiallyDisabled = true;
+          }
+          if (typeof triggerInterval === "number" && triggerInterval > 0) {
+            macro.triggerInterval = triggerInterval;
           }
         }
         if (triggerCooldown !== undefined && triggerCooldown !== DEFAULT_TRIGGER_COOLDOWN) macro.triggerCooldown = triggerCooldown;

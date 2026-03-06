@@ -93,6 +93,12 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("Start auto-trigger paused");
   });
 
+  it("renders trigger interval field for polling macros", () => {
+    const html = render([], null);
+    expect(html).toContain("macro-interval");
+    expect(html).toContain("Trigger Interval");
+  });
+
   it("shows current binding value when macro has keybinding", () => {
     const macros: TerminalMacro[] = [
       { name: "Quick", text: "q", keybinding: "alt+m" }
@@ -116,6 +122,14 @@ describe("renderMacroEditorHtml", () => {
     ];
     const html = render(macros, 0);
     expect(html).toMatch(/id="macro-trigger-disabled"[^>]*checked/);
+  });
+
+  it("shows trigger interval value when configured", () => {
+    const macros: TerminalMacro[] = [
+      { name: "Route", text: "show ip route 0.0.0.0\n", triggerPattern: "router#", triggerInterval: 10 }
+    ];
+    const html = render(macros, 0);
+    expect(html).toMatch(/id="macro-interval"[^>]*value="10"/);
   });
 
   it("includes binding validation hint", () => {

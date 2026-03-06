@@ -66,6 +66,8 @@ describe("package contributions", () => {
     expect(macroSchema?.items?.properties?.secret?.type).toBe("boolean");
     expect(macroSchema?.items?.properties?.triggerInitiallyDisabled).toBeDefined();
     expect(macroSchema?.items?.properties?.triggerInitiallyDisabled?.type).toBe("boolean");
+    expect(macroSchema?.items?.properties?.triggerInterval).toBeDefined();
+    expect(macroSchema?.items?.properties?.triggerInterval?.type).toBe("number");
   });
 
   it("uses nexus.folder contextValue in folder menu when clauses", () => {

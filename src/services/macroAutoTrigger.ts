@@ -16,11 +16,13 @@ interface CompiledTriggerRule {
   regex: RegExp;
   macroText: string;
   cooldownMs: number;
+  intervalMs?: number;
   macroIndex: number;
 }
 
 interface ObserverState {
   evaluate(): void;
+  prune(activeRules: ReadonlyMap<number, CompiledTriggerRule>): void;
   dispose(): void;
 }
 
@@ -45,6 +47,7 @@ export class MacroAutoTrigger {
 
     this.rules = [];
     this.defaultDisabledIndexes.clear();
+    const activeRules = new Map<number, CompiledTriggerRule>();
     for (const [macroIndex, macro] of macros.entries()) {
       if (!macro.triggerPattern) continue;
       if (macro.triggerInitiallyDisabled) {
@@ -53,17 +56,24 @@ export class MacroAutoTrigger {
       try {
         const regex = new RegExp(macro.triggerPattern);
         if (regex.test("")) continue;
-        this.rules.push({
+        const rule: CompiledTriggerRule = {
           regex,
           macroText: macro.text,
           cooldownMs: (macro.triggerCooldown ?? DEFAULT_TRIGGER_COOLDOWN) * 1000,
+          intervalMs:
+            typeof macro.triggerInterval === "number" && macro.triggerInterval > 0
+              ? macro.triggerInterval * 1000
+              : undefined,
           macroIndex
-        });
+        };
+        this.rules.push(rule);
+        activeRules.set(macroIndex, rule);
       } catch {
         // Invalid regex — skip silently
       }
     }
     this.pruneState(macros.length);
+    this.pruneObservers(activeRules);
     this.reevaluateObservers();
   }
 
@@ -99,16 +109,85 @@ export class MacroAutoTrigger {
   ): PtyOutputObserver {
     let buffer = "";
     const lastFired = new Map<number, number>();
+    const readyMatches = new Set<number>();
+    const scheduledTimers = new Map<number, ReturnType<typeof setTimeout>>();
     let disposed = false;
     const ansiRe = createAnsiRegex();
+
+    const clearScheduledTimer = (macroIndex: number): void => {
+      const timer = scheduledTimers.get(macroIndex);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        scheduledTimers.delete(macroIndex);
+      }
+    };
+
+    const clearReadyMatch = (macroIndex: number): void => {
+      readyMatches.delete(macroIndex);
+      clearScheduledTimer(macroIndex);
+    };
+
+    const clearAllTimers = (): void => {
+      for (const timer of scheduledTimers.values()) {
+        clearTimeout(timer);
+      }
+      scheduledTimers.clear();
+    };
+
+    const getRemainingDelay = (rule: CompiledTriggerRule, now: number): number => {
+      const lastTime = lastFired.get(rule.macroIndex);
+      if (lastTime === undefined) {
+        return 0;
+      }
+      if (rule.intervalMs !== undefined) {
+        return Math.max(0, lastTime + rule.intervalMs - now);
+      }
+      return Math.max(0, lastTime + rule.cooldownMs - now);
+    };
+
+    const scheduleEvaluation = (rule: CompiledTriggerRule, delayMs: number): void => {
+      clearScheduledTimer(rule.macroIndex);
+      scheduledTimers.set(
+        rule.macroIndex,
+        setTimeout(() => {
+          scheduledTimers.delete(rule.macroIndex);
+          if (!disposed) {
+            evaluate();
+          }
+        }, Math.max(0, delayMs))
+      );
+    };
+
+    const fireRule = (rule: CompiledTriggerRule, now: number): void => {
+      lastFired.set(rule.macroIndex, now);
+      clearReadyMatch(rule.macroIndex);
+
+      // Interval-driven macros should not keep stale prompt text after firing.
+      if (rule.intervalMs !== undefined) {
+        buffer = "";
+      }
+
+      const macroText = rule.macroText;
+      setTimeout(() => {
+        if (!disposed) writeBack(macroText);
+      }, 0);
+    };
 
     const evaluate = (): void => {
       if (disposed || !this.enabled || this.rules.length === 0) return;
 
       const now = Date.now();
-      for (let i = 0; i < this.rules.length; i++) {
-        const rule = this.rules[i];
+      for (const rule of this.rules) {
         if (this.isDisabled(rule.macroIndex)) continue;
+        if (readyMatches.has(rule.macroIndex)) {
+          const remaining = getRemainingDelay(rule, now);
+          if (remaining > 0) {
+            scheduleEvaluation(rule, remaining);
+          } else {
+            fireRule(rule, now);
+          }
+          break;
+        }
         rule.regex.lastIndex = 0;
         const match = rule.regex.exec(buffer);
         if (!match) continue;
@@ -117,25 +196,46 @@ export class MacroAutoTrigger {
         // on same text — even when cooldown blocks the fire.
         buffer = buffer.slice(match.index + match[0].length);
 
-        const lastTime = lastFired.get(i) ?? 0;
-        if (now - lastTime < rule.cooldownMs) break;
+        if (rule.intervalMs !== undefined) {
+          readyMatches.add(rule.macroIndex);
+          const remaining = getRemainingDelay(rule, now);
+          if (remaining > 0) {
+            scheduleEvaluation(rule, remaining);
+          } else {
+            fireRule(rule, now);
+          }
+          break;
+        }
 
-        lastFired.set(i, now);
-        const macroText = rule.macroText;
-        // Defer writeBack so the current output handler unwinds before we write.
-        setTimeout(() => {
-          if (!disposed) writeBack(macroText);
-        }, 0);
+        const remaining = getRemainingDelay(rule, now);
+        if (remaining > 0) break;
+
+        fireRule(rule, now);
         break;
       }
     };
 
     const observerState: ObserverState = {
       evaluate,
+      prune: (activeRules) => {
+        for (const macroIndex of [...lastFired.keys()]) {
+          if (!activeRules.has(macroIndex)) {
+            lastFired.delete(macroIndex);
+          }
+        }
+        for (const macroIndex of [...readyMatches]) {
+          if (activeRules.get(macroIndex)?.intervalMs === undefined) {
+            clearReadyMatch(macroIndex);
+          }
+        }
+        clearAllTimers();
+      },
       dispose: () => {
         disposed = true;
         buffer = "";
         lastFired.clear();
+        readyMatches.clear();
+        clearAllTimers();
         this.observers.delete(observerState);
       }
     };
@@ -144,7 +244,12 @@ export class MacroAutoTrigger {
     return {
       onOutput: (text: string) => {
         if (disposed || !this.enabled || this.rules.length === 0) return;
-        if (text.length > MAX_INPUT_LENGTH) return;
+
+        // Keep the tail of oversized output chunks so prompts arriving with
+        // banners/login noise can still be matched without scanning unbounded text.
+        if (text.length > MAX_INPUT_LENGTH) {
+          text = text.slice(text.length - MAX_INPUT_LENGTH);
+        }
 
         let stripped = text.replace(ansiRe, "");
         stripped = stripped.replace(CONTROL_CHARS_RE, "");
@@ -169,6 +274,12 @@ export class MacroAutoTrigger {
       if (index >= macroCount || !this.defaultDisabledIndexes.has(index)) {
         this.enabledIndexes.delete(index);
       }
+    }
+  }
+
+  private pruneObservers(activeRules: ReadonlyMap<number, CompiledTriggerRule>): void {
+    for (const observer of this.observers) {
+      observer.prune(activeRules);
     }
   }
 

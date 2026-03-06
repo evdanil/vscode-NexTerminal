@@ -2403,6 +2403,12 @@
                 "maximum": 300,
                 "description": "Seconds between auto-triggers on the same terminal (default 3)."
               },
+              "triggerInterval": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 86400,
+                "description": "Optional polling interval in seconds. Once the prompt matches again, the macro is armed and fires on this schedule without extra user input."
+              },
               "triggerInitiallyDisabled": {
                 "type": "boolean",
                 "default": false,

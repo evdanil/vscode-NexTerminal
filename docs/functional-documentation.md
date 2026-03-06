@@ -106,6 +106,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - Conflict resolution: assigning a shortcut already taken by another macro clears the old assignment.
 - Macros without a shortcut remain available via the `Alt+S` quick pick.
 - Add `triggerPattern` to enable auto-trigger (expect/send). Matching terminal output sends the macro text automatically, with optional per-macro `triggerCooldown`.
+- Add `triggerInterval` for polling-style macros. Once the prompt matches again, the macro is armed and can fire on this interval without extra user input.
 - Add `triggerInitiallyDisabled` when a macro should start paused until you manually resume it from the macros view. If the prompt already matched recently, resuming can fire immediately without extra terminal output.
 - Auto-trigger can be paused/resumed per macro from the macros view, and globally toggled with `nexus.terminal.macros.autoTrigger`.
 - Legacy `slot` values are still read and auto-migrated to `keybinding` on startup.

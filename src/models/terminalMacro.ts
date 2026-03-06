@@ -7,5 +7,6 @@ export interface TerminalMacro {
   secret?: boolean;
   triggerPattern?: string;
   triggerCooldown?: number;
+  triggerInterval?: number;
   triggerInitiallyDisabled?: boolean;
 }

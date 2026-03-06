@@ -305,7 +305,7 @@ describe("MacroAutoTrigger", () => {
     expect(trigger.isDisabled(0)).toBe(true);
   });
 
-  it("large chunk guard — chunks > 8192 chars skipped", () => {
+  it("large chunk guard keeps the tail so prompt-at-end still matches", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:" }
     ]);
@@ -313,9 +313,9 @@ describe("MacroAutoTrigger", () => {
     const sent: string[] = [];
     const obs = trigger.createObserver((text) => sent.push(text));
 
-    obs.onOutput("Password:" + "x".repeat(8200));
+    obs.onOutput("x".repeat(8200) + "Password:");
     flush();
-    expect(sent).toEqual([]);
+    expect(sent).toEqual(["secret\n"]);
     obs.dispose();
   });
 
@@ -369,6 +369,94 @@ describe("MacroAutoTrigger", () => {
     const obs = trigger.createObserver((text) => sent.push(text));
 
     obs.onOutput("router#");
+    flush();
+    expect(sent).toEqual([]);
+
+    trigger.setDisabled(0, false);
+    flush();
+    expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
+    obs.dispose();
+  });
+
+  it("fires interval macros later without extra input once the prompt has re-armed them", () => {
+    setConfig([
+      {
+        name: "route",
+        text: "show ip route 0.0.0.0\n",
+        triggerPattern: "router#",
+        triggerInterval: 10,
+        triggerInitiallyDisabled: true
+      }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("router#");
+    flush();
+    expect(sent).toEqual([]);
+
+    trigger.setDisabled(0, false);
+    flush();
+    expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
+
+    obs.onOutput("Codes: C connected\r\nrouter#");
+    expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
+
+    vi.advanceTimersByTime(9999);
+    expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
+
+    vi.advanceTimersByTime(1);
+    flush();
+    expect(sent).toEqual([
+      "show ip route 0.0.0.0\n",
+      "show ip route 0.0.0.0\n"
+    ]);
+    obs.dispose();
+  });
+
+  it("does not fire interval macros until the prompt has matched again", () => {
+    setConfig([
+      {
+        name: "route",
+        text: "show ip route 0.0.0.0\n",
+        triggerPattern: "router#",
+        triggerInterval: 10,
+        triggerInitiallyDisabled: true
+      }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("router#");
+    flush();
+    trigger.setDisabled(0, false);
+    flush();
+    expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
+
+    vi.advanceTimersByTime(15000);
+    flush();
+    expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
+
+    obs.onOutput("router#");
+    flush();
+    expect(sent).toEqual([
+      "show ip route 0.0.0.0\n",
+      "show ip route 0.0.0.0\n"
+    ]);
+    obs.dispose();
+  });
+
+  it("enabling a paused trigger can fire from the tail of a large login chunk", () => {
+    setConfig([
+      { name: "route", text: "show ip route 0.0.0.0\n", triggerPattern: "router#", triggerInitiallyDisabled: true }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("Welcome\r\n" + "x".repeat(8200) + "router#");
     flush();
     expect(sent).toEqual([]);
 

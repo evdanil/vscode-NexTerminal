@@ -23,6 +23,7 @@ interface MacroEntry {
   keybinding?: string;
   triggerPattern?: string;
   triggerCooldown?: number;
+  triggerInterval?: number;
   triggerInitiallyDisabled?: boolean;
   [key: string]: unknown;
 }
@@ -113,6 +114,11 @@ async function applySettings(settings: Record<string, unknown>): Promise<void> {
       if (safeMacro.triggerCooldown !== undefined) {
         if (typeof safeMacro.triggerCooldown !== "number" || safeMacro.triggerCooldown < 0 || safeMacro.triggerCooldown > 300) {
           delete safeMacro.triggerCooldown;
+        }
+      }
+      if (safeMacro.triggerInterval !== undefined) {
+        if (typeof safeMacro.triggerInterval !== "number" || safeMacro.triggerInterval < 1 || safeMacro.triggerInterval > 86400) {
+          delete safeMacro.triggerInterval;
         }
       }
       if (safeMacro.triggerInitiallyDisabled !== undefined && typeof safeMacro.triggerInitiallyDisabled !== "boolean") {

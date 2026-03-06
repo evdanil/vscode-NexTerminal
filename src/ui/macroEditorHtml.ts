@@ -27,6 +27,7 @@ export function renderMacroEditorHtml(
   const bindingValue = macro ? (getAssignedBinding(macro) ?? "") : "";
   const triggerValue = macro?.triggerPattern ?? "";
   const cooldownValue = macro?.triggerCooldown ?? 3;
+  const intervalValue = macro?.triggerInterval ?? "";
   const triggerInitiallyDisabled = macro?.triggerInitiallyDisabled ?? false;
 
   const nameValue = macro?.name ?? "";
@@ -122,6 +123,12 @@ export function renderMacroEditorHtml(
     <div class="hint">Seconds between auto-triggers on the same terminal. Prevents echo-loops where server re-prompts after each response.</div>
   </div>
 
+  <div class="form-group">
+    <label for="macro-interval">Trigger Interval (seconds)</label>
+    <input type="number" id="macro-interval" value="${escapeHtml(String(intervalValue))}" min="1" max="86400" step="1" placeholder="Optional" />
+    <div class="hint">Optional scheduler for polling-style macros. Once the prompt matches again, the macro is armed and fires on this interval without extra user input.</div>
+  </div>
+
   <div class="form-group form-group-checkbox">
     <label>
       <input type="checkbox" id="macro-trigger-disabled"${triggerInitiallyDisabled ? " checked" : ""} />
@@ -193,6 +200,7 @@ export function renderMacroEditorHtml(
         }
       });
       document.getElementById("macro-cooldown").addEventListener("input", markDirty);
+      document.getElementById("macro-interval").addEventListener("input", markDirty);
       document.getElementById("macro-trigger-disabled").addEventListener("change", markDirty);
       document.getElementById("macro-binding").addEventListener("input", function() {
         markDirty();
@@ -227,6 +235,7 @@ export function renderMacroEditorHtml(
         var bindingVal = document.getElementById("macro-binding").value.trim().toLowerCase();
         var triggerVal = document.getElementById("macro-trigger").value.trim();
         var cooldownVal = parseInt(document.getElementById("macro-cooldown").value, 10);
+        var intervalVal = parseInt(document.getElementById("macro-interval").value, 10);
         var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
 
         // Validate
@@ -276,6 +285,7 @@ export function renderMacroEditorHtml(
           keybinding: bindingVal || null,
           triggerPattern: triggerVal || null,
           triggerCooldown: isNaN(cooldownVal) ? 3 : cooldownVal,
+          triggerInterval: isNaN(intervalVal) || intervalVal < 1 ? null : intervalVal,
           triggerInitiallyDisabled: triggerInitiallyDisabled
         });
       });

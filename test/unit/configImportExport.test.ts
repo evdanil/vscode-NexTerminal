@@ -457,7 +457,7 @@ describe("share export command", () => {
     await core.addOrUpdateAuthProfile(makeAuthProfile({ authType: "key", keyPath: "/home/alice/.ssh/id_ed25519" }));
 
     configStore.set("nexus.terminal.macros", [
-      { name: "Hello", text: "echo hi", secret: false, triggerPattern: "router#", triggerInitiallyDisabled: true },
+      { name: "Hello", text: "echo hi", secret: false, triggerPattern: "router#", triggerInterval: 10, triggerInitiallyDisabled: true },
       { name: "Secret", text: "super-secret", secret: true }
     ]);
     configStore.set("nexus.logging.sessionLogDirectory", "/home/alice/logs");
@@ -493,6 +493,7 @@ describe("share export command", () => {
     const macros = writtenData.settings["nexus.terminal.macros"];
     expect(macros).toHaveLength(1);
     expect(macros[0].name).toBe("Hello");
+    expect(macros[0].triggerInterval).toBe(10);
     expect(macros[0].triggerInitiallyDisabled).toBe(true);
 
     // Session log dir stripped
@@ -1289,7 +1290,7 @@ describe("backup export round-trip", () => {
     await vault.store("auth-profile-password-ap1", "authpw");
 
     configStore.set("nexus.terminal.macros", [
-      { name: "Public", text: "echo hi", triggerPattern: "[Pp]assword:\\s*$", triggerCooldown: 5, triggerInitiallyDisabled: true },
+      { name: "Public", text: "echo hi", triggerPattern: "[Pp]assword:\\s*$", triggerCooldown: 5, triggerInterval: 10, triggerInitiallyDisabled: true },
       { name: "Secret", text: "hidden", secret: true }
     ]);
 
@@ -1342,6 +1343,7 @@ describe("backup export round-trip", () => {
     expect(macros.find(m => m.name === "Public")?.text).toBe("echo hi");
     expect(macros.find(m => m.name === "Public")?.triggerPattern).toBe("[Pp]assword:\\s*$");
     expect(macros.find(m => m.name === "Public")?.triggerCooldown).toBe(5);
+    expect(macros.find(m => m.name === "Public")?.triggerInterval).toBe(10);
     expect(macros.find(m => m.name === "Public")?.triggerInitiallyDisabled).toBe(true);
   });
 });

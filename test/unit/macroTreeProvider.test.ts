@@ -127,6 +127,12 @@ describe("MacroTreeItem", () => {
     expect(paused.tooltip).toContain("(paused)");
   });
 
+  it("includes trigger interval in tooltip when configured", () => {
+    const macro = { name: "Auto", text: "show\n", triggerPattern: "router#", triggerInterval: 10 };
+    const item = new MacroTreeItem(macro, 0, undefined, false);
+    expect(item.tooltip).toContain("every 10s");
+  });
+
   it("sets contextValue to nexus.macro for regular items", () => {
     const item = new MacroTreeItem({ name: "Test", text: "test" }, 0);
     expect(item.contextValue).toBe("nexus.macro");

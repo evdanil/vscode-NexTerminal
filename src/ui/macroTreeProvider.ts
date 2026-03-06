@@ -32,7 +32,8 @@ export class MacroTreeItem extends vscode.TreeItem {
     }
     if (macro.triggerPattern) {
       const state = triggerDisabled ? "paused" : "active";
-      this.tooltip += `\nAuto-trigger: /${macro.triggerPattern}/ (${state})`;
+      const intervalHint = macro.triggerInterval ? `, every ${macro.triggerInterval}s` : "";
+      this.tooltip += `\nAuto-trigger: /${macro.triggerPattern}/ (${state}${intervalHint})`;
       this.contextValue = triggerDisabled ? "nexus.macro.triggered.disabled" : "nexus.macro.triggered";
       this.iconPath = new vscode.ThemeIcon(triggerDisabled ? "circle-slash" : "zap");
     } else {
