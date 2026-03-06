@@ -260,6 +260,46 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         })(clearBtns[cli]);
       }
 
+      function updateProfileManagedFields() {
+        var profileWrapper = document.getElementById("field-authProfileId");
+        if (!profileWrapper) return;
+        var profileInput = profileWrapper.querySelector('input[name="authProfileId"]');
+        if (!profileInput) return;
+        var isLinked = profileInput.value && profileInput.value !== "";
+        var managedKeys = ["username", "authType", "keyPath"];
+        for (var mi = 0; mi < managedKeys.length; mi++) {
+          var fieldId = "field-" + managedKeys[mi];
+          var fieldEl = document.getElementById(fieldId);
+          if (!fieldEl) continue;
+          var group = fieldEl.closest ? fieldEl.closest(".form-group") : fieldEl.parentElement;
+          if (!group) continue;
+          var inputs = group.querySelectorAll("input, select, textarea");
+          for (var ii = 0; ii < inputs.length; ii++) {
+            if (isLinked) {
+              inputs[ii].disabled = true;
+              inputs[ii].style.opacity = "0.6";
+            } else {
+              inputs[ii].disabled = false;
+              inputs[ii].style.opacity = "";
+            }
+          }
+          // For custom-select wrappers (authType), also disable the trigger
+          var customSelect = group.querySelector(".custom-select");
+          if (customSelect) {
+            var trigger = customSelect.querySelector(".custom-select-trigger");
+            if (trigger) {
+              if (isLinked) {
+                trigger.style.pointerEvents = "none";
+                trigger.style.opacity = "0.6";
+              } else {
+                trigger.style.pointerEvents = "";
+                trigger.style.opacity = "";
+              }
+            }
+          }
+        }
+      }
+
       initCustomSelects(function(wrapper, opt) {
         var value = opt.dataset.value;
         if (value && value.indexOf('__create__') === 0) {
@@ -272,8 +312,12 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         if (wrapper.dataset.autofill === 'true' && value) {
           vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: value });
         }
+        if (wrapper.dataset.name === 'authProfileId') {
+          updateProfileManagedFields();
+        }
       });
       initCustomComboboxes();
+      updateProfileManagedFields();
 
       window.addEventListener("message", function(event) {
         var msg = event.data;
@@ -312,6 +356,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             }
           }
           updateVisibility();
+          updateProfileManagedFields();
         }
         if (msg.type === "validationError") {
           var errEls = document.querySelectorAll(".field-error");

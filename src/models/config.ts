@@ -43,6 +43,7 @@ export interface ServerConfig {
   multiplexing?: boolean;  // undefined = follow global, false = always standalone
   legacyAlgorithms?: boolean;
   proxy?: ProxyConfig;
+  authProfileId?: string;  // references AuthProfile.id; credentials resolved at connection time
 }
 
 export interface TunnelProfile {

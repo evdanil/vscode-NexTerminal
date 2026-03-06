@@ -177,7 +177,7 @@ describe("authProfileCommands", () => {
     expect(mockOpen).toHaveBeenCalledWith(ctx.core, ctx.secretVault);
   });
 
-  it("applies auth profile to folder even when secretVault is unavailable", async () => {
+  it("applies auth profile to folder stores reference, not credentials", async () => {
     const { ctx, core } = await setupContext({
       withVault: false,
       servers: [makeServer({ id: "s1", group: "Prod" }), makeServer({ id: "s2", group: "Other", username: "stay" })],
@@ -186,19 +186,19 @@ describe("authProfileCommands", () => {
     registerAuthProfileCommands(ctx);
 
     mockShowQuickPick.mockResolvedValue({ profile: core.getAuthProfile("ap1") });
-    mockShowWarningMessage.mockResolvedValue("Apply");
+    mockShowWarningMessage.mockResolvedValue("Link");
 
     const cmd = registeredCommands.get("nexus.authProfile.applyToFolder");
     expect(cmd).toBeDefined();
     await cmd!(new FolderTreeItem("Prod"));
 
-    expect(core.getServer("s1")?.username).toBe("new-user");
-    expect(core.getServer("s1")?.authType).toBe("key");
-    expect(core.getServer("s1")?.keyPath).toBe("/keys/id_ed25519");
-    expect(core.getServer("s2")?.username).toBe("stay");
+    // Should store reference, NOT copy credentials
+    expect(core.getServer("s1")?.authProfileId).toBe("ap1");
+    expect(core.getServer("s1")?.username).toBe("old-user"); // unchanged
+    expect(core.getServer("s2")?.authProfileId).toBeUndefined(); // not in folder
   });
 
-  it("applyToServer copies profile password into server password secret", async () => {
+  it("applyToServer stores authProfileId reference without copying password", async () => {
     const profile = makeAuthProfile({ id: "ap1", username: "deploy", authType: "password" });
     const server = makeServer({ id: "s1", username: "old" });
     const { ctx, core, vault } = await setupContext({
@@ -215,8 +215,9 @@ describe("authProfileCommands", () => {
     expect(applyToServer).toBeDefined();
     await applyToServer!(new ServerTreeItem(server));
 
-    expect(core.getServer("s1")?.username).toBe("deploy");
-    expect(core.getServer("s1")?.authType).toBe("password");
-    expect(vault?.store).toHaveBeenCalledWith(passwordSecretKey("s1"), "profile-pass");
+    // Should store reference, NOT copy credentials or password
+    expect(core.getServer("s1")?.authProfileId).toBe("ap1");
+    expect(core.getServer("s1")?.username).toBe("old"); // unchanged
+    expect(vault?.store).not.toHaveBeenCalledWith(passwordSecretKey("s1"), expect.anything());
   });
 });

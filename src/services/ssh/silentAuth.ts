@@ -1,5 +1,5 @@
 import type { Duplex } from "node:stream";
-import type { ServerConfig } from "../../models/config";
+import type { AuthProfile, ServerConfig } from "../../models/config";
 import type { KeyboardInteractiveHandler, PasswordPrompt, SecretVault, SshConnection, SshConnector, SshFactory } from "./contracts";
 
 export type InputPromptFn = (message: string, password: boolean) => Promise<string | undefined>;
@@ -45,8 +45,23 @@ export class SilentAuthSshFactory implements SshFactory {
     private readonly connector: SshConnector,
     private readonly vault: SecretVault,
     private readonly prompt: PasswordPrompt,
-    private readonly inputPromptFn?: InputPromptFn
+    private readonly inputPromptFn?: InputPromptFn,
+    private readonly authProfileLookup?: (id: string) => AuthProfile | undefined
   ) {}
+
+  private resolveServer(server: ServerConfig): { resolved: ServerConfig; passwordKey: string } {
+    if (!server.authProfileId || !this.authProfileLookup) {
+      return { resolved: server, passwordKey: passwordSecretKey(server.id) };
+    }
+    const profile = this.authProfileLookup(server.authProfileId);
+    if (!profile) {
+      return { resolved: server, passwordKey: passwordSecretKey(server.id) };
+    }
+    return {
+      resolved: { ...server, username: profile.username, authType: profile.authType, keyPath: profile.keyPath },
+      passwordKey: authProfilePasswordSecretKey(profile.id)
+    };
+  }
 
   private buildKeyboardInteractiveHandler(password?: string): KeyboardInteractiveHandler | undefined {
     if (!this.inputPromptFn) {
@@ -72,16 +87,17 @@ export class SilentAuthSshFactory implements SshFactory {
   }
 
   public async connect(server: ServerConfig, options?: { sock?: Duplex }): Promise<SshConnection> {
+    const { resolved, passwordKey } = this.resolveServer(server);
     const sockOpt = options?.sock ? { sock: options.sock } : {};
 
-    if (server.authType === "key") {
+    if (resolved.authType === "key") {
       const handler = this.buildKeyboardInteractiveHandler();
       const ppKey = passphraseSecretKey(server.id);
       const savedPassphrase = await this.vault.get(ppKey);
 
       // Try saved passphrase (or no passphrase on first attempt).
       try {
-        return await this.connector.connect(server, {
+        return await this.connector.connect(resolved, {
           ...(savedPassphrase && { passphrase: savedPassphrase }),
           ...(handler && { onKeyboardInteractive: handler }),
           ...sockOpt
@@ -98,14 +114,14 @@ export class SilentAuthSshFactory implements SshFactory {
 
       // Prompt user for passphrase.
       const promptResult = await this.prompt.prompt({
-        ...server,
+        ...resolved,
         name: `${server.name} (key passphrase)`
       });
       if (!promptResult) {
         throw new Error(`Passphrase entry canceled for ${server.name}`);
       }
 
-      const connection = await this.connector.connect(server, {
+      const connection = await this.connector.connect(resolved, {
         passphrase: promptResult.password,
         ...(handler && { onKeyboardInteractive: handler }),
         ...sockOpt
@@ -118,20 +134,19 @@ export class SilentAuthSshFactory implements SshFactory {
       return connection;
     }
 
-    if (server.authType !== "password") {
+    if (resolved.authType !== "password") {
       const handler = this.buildKeyboardInteractiveHandler();
-      return this.connector.connect(server, {
+      return this.connector.connect(resolved, {
         ...(handler && { onKeyboardInteractive: handler }),
         ...sockOpt
       });
     }
 
-    const key = passwordSecretKey(server.id);
-    const savedPassword = await this.vault.get(key);
+    const savedPassword = await this.vault.get(passwordKey);
     if (savedPassword) {
       const handler = this.buildKeyboardInteractiveHandler(savedPassword);
       try {
-        return await this.connector.connect(server, {
+        return await this.connector.connect(resolved, {
           password: savedPassword,
           ...(handler && { onKeyboardInteractive: handler }),
           ...sockOpt
@@ -140,25 +155,25 @@ export class SilentAuthSshFactory implements SshFactory {
         if (!isAuthError(error)) {
           throw error;
         }
-        await this.vault.delete(key);
+        await this.vault.delete(passwordKey);
       }
     }
 
-    const promptResult = await this.prompt.prompt(server);
+    const promptResult = await this.prompt.prompt({ ...resolved, name: server.name });
     if (!promptResult) {
       throw new Error(`Password entry canceled for ${server.name}`);
     }
 
     const handler = this.buildKeyboardInteractiveHandler(promptResult.password);
-    const connection = await this.connector.connect(server, {
+    const connection = await this.connector.connect(resolved, {
       password: promptResult.password,
       ...(handler && { onKeyboardInteractive: handler }),
       ...sockOpt
     });
     if (promptResult.save) {
-      await this.vault.store(key, promptResult.password);
+      await this.vault.store(passwordKey, promptResult.password);
     } else {
-      await this.vault.delete(key);
+      await this.vault.delete(passwordKey);
     }
     return connection;
   }

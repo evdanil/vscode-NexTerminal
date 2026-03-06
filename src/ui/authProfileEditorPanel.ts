@@ -171,8 +171,14 @@ export class AuthProfileEditorPanel {
           const profile = this.core.getAuthProfile(id);
           if (!profile) break;
 
+          const linkedCount = this.core.getSnapshot().servers.filter(
+            (s) => s.authProfileId === id
+          ).length;
+          const linkedNote = linkedCount > 0
+            ? ` ${linkedCount} server(s) are linked and will revert to their own stored credentials.`
+            : "";
           const confirm = await vscode.window.showWarningMessage(
-            `Delete auth profile "${profile.name}"?`,
+            `Delete auth profile "${profile.name}"?${linkedNote}`,
             { modal: true },
             "Delete"
           );

@@ -1150,9 +1150,34 @@ describe("sanitizeForSharing", () => {
     expect(result.servers[0].proxy).toBeUndefined();
   });
 
-  it("does not include authProfiles in result", () => {
+  it("returns empty authProfiles when none referenced", () => {
     const result = sanitizeForSharing([makeServer()], [], [], {});
-    expect((result as any).authProfiles).toBeUndefined();
+    expect(result.authProfiles).toHaveLength(0);
+  });
+
+  it("preserves authProfileId link with sanitized auth profile copy", () => {
+    const profile = makeAuthProfile({ id: "ap-123", name: "Prod Auth", username: "deploy", keyPath: "/key" });
+    const server = makeServer({ authProfileId: "ap-123" });
+    const result = sanitizeForSharing([server], [], [], {}, [profile]);
+
+    // Server should have remapped authProfileId
+    expect(result.servers[0].authProfileId).toBeDefined();
+    expect(result.servers[0].authProfileId).not.toBe("ap-123"); // new ID
+
+    // Auth profile should be included, sanitized
+    expect(result.authProfiles).toHaveLength(1);
+    expect(result.authProfiles[0].name).toBe("Prod Auth");
+    expect(result.authProfiles[0].username).toBe("user");
+    expect(result.authProfiles[0].keyPath).toBeUndefined();
+    expect(result.authProfiles[0].id).toBe(result.servers[0].authProfileId);
+  });
+
+  it("omits unreferenced auth profiles from share export", () => {
+    const profile = makeAuthProfile({ id: "ap-unused" });
+    const server = makeServer(); // no authProfileId
+    const result = sanitizeForSharing([server], [], [], {}, [profile]);
+    expect(result.authProfiles).toHaveLength(0);
+    expect(result.servers[0].authProfileId).toBeUndefined();
   });
 });
 
@@ -1345,5 +1370,92 @@ describe("backup export round-trip", () => {
     expect(macros.find(m => m.name === "Public")?.triggerCooldown).toBe(5);
     expect(macros.find(m => m.name === "Public")?.triggerInterval).toBe(10);
     expect(macros.find(m => m.name === "Public")?.triggerInitiallyDisabled).toBe(true);
+  });
+
+  it("backup export then import preserves authProfileId on servers", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const sourceRepo = new InMemoryConfigRepository();
+    const sourceCore = new NexusCore(sourceRepo);
+    await sourceCore.initialize();
+    await sourceCore.addOrUpdateAuthProfile(makeAuthProfile({ id: "ap1" }));
+    await sourceCore.addOrUpdateServer(makeServer({ id: "s1", authProfileId: "ap1" }));
+
+    registerConfigCommands(sourceCore, vault);
+
+    mockShowInputBox
+      .mockResolvedValueOnce("masterpass1")
+      .mockResolvedValueOnce("masterpass1");
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+
+    const backupCmd = registeredCommands.get("nexus.config.export.backup")!;
+    await backupCmd();
+
+    // Verify authProfileId is in the exported JSON
+    const parsed = JSON.parse(exportedJson);
+    expect(parsed.servers[0].authProfileId).toBe("ap1");
+
+    vault.clear();
+    configStore.clear();
+    registeredCommands.clear();
+
+    const destRepo = new InMemoryConfigRepository();
+    const destCore = new NexusCore(destRepo);
+    await destCore.initialize();
+    registerConfigCommands(destCore, vault);
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(exportedJson, "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowInputBox.mockResolvedValueOnce("masterpass1");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const snapshot = destCore.getSnapshot();
+    expect(snapshot.servers[0].authProfileId).toBe("ap1");
+    expect(snapshot.authProfiles).toHaveLength(1);
+  });
+
+  it("import clears dangling authProfileId when profile not imported", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // Import data with a server referencing a profile that doesn't exist
+    const importData = {
+      version: 1,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [makeServer({ id: "s1", authProfileId: "nonexistent-profile" })],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: []
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/import.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0].authProfileId).toBeUndefined();
   });
 });

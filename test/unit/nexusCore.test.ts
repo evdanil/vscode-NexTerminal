@@ -495,6 +495,57 @@ describe("NexusCore", () => {
     expect(snapshot.explicitGroups).toContain("Legacy/Group");
   });
 
+  it("removeAuthProfile clears authProfileId from referencing servers", async () => {
+    const repository = new InMemoryConfigRepository(
+      [],
+      [],
+      [],
+      [],
+      [{ id: "ap1", name: "Prod", username: "root", authType: "password" }]
+    );
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, authProfileId: "ap1"
+    });
+    await core.addOrUpdateServer({
+      id: "s2", name: "S2", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false
+    });
+
+    await core.removeAuthProfile("ap1");
+
+    expect(core.getServer("s1")?.authProfileId).toBeUndefined();
+    expect(core.getServer("s2")?.authProfileId).toBeUndefined();
+    expect(core.getSnapshot().authProfiles).toHaveLength(0);
+  });
+
+  it("removeAuthProfile saves servers when references cleared", async () => {
+    const repository = new InMemoryConfigRepository(
+      [],
+      [],
+      [],
+      [],
+      [{ id: "ap1", name: "Prod", username: "root", authType: "password" }]
+    );
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, authProfileId: "ap1"
+    });
+
+    await core.removeAuthProfile("ap1");
+
+    // Re-initialize to verify persistence
+    const core2 = new NexusCore(repository);
+    await core2.initialize();
+    expect(core2.getServer("s1")?.authProfileId).toBeUndefined();
+  });
+
   it("getItemsInFolder returns direct items when not recursive", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

@@ -2,7 +2,6 @@ import * as vscode from "vscode";
 import type { AuthProfile } from "../models/config";
 import { FolderTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { AuthProfileEditorPanel } from "../ui/authProfileEditorPanel";
-import { authProfilePasswordSecretKey, passwordSecretKey } from "../services/ssh/silentAuth";
 import { isDescendantOrSelf } from "../utils/folderPaths";
 import type { CommandContext } from "./types";
 
@@ -28,25 +27,8 @@ async function applyAuthProfileToServers(
   profile: AuthProfile,
   servers: import("../models/config").ServerConfig[]
 ): Promise<void> {
-  const profilePw = ctx.secretVault
-    ? await ctx.secretVault.get(authProfilePasswordSecretKey(profile.id))
-    : undefined;
   for (const server of servers) {
-    const updated = {
-      ...server,
-      username: profile.username,
-      authType: profile.authType,
-      keyPath: profile.keyPath
-    };
-    await ctx.core.addOrUpdateServer(updated);
-    if (!ctx.secretVault) {
-      continue;
-    }
-    if (profile.authType === "password" && profilePw) {
-      await ctx.secretVault.store(passwordSecretKey(server.id), profilePw);
-    } else {
-      await ctx.secretVault.delete(passwordSecretKey(server.id));
-    }
+    await ctx.core.addOrUpdateServer({ ...server, authProfileId: profile.id });
   }
 }
 
@@ -77,18 +59,18 @@ export function registerAuthProfileCommands(ctx: CommandContext): vscode.Disposa
         return;
       }
       const confirm = await vscode.window.showWarningMessage(
-        `Apply "${profile.name}" to ${servers.length} server(s) in "${folderPath}"?\nThis overwrites their authentication settings.`,
+        `Link "${profile.name}" to ${servers.length} server(s) in "${folderPath}"?\nThis links their credentials to the auth profile.`,
         { modal: true },
-        "Apply"
+        "Link"
       );
-      if (confirm !== "Apply") {
+      if (confirm !== "Link") {
         return;
       }
       await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: `Applying auth profile "${profile.name}"...` },
+        { location: vscode.ProgressLocation.Notification, title: `Linking auth profile "${profile.name}"...` },
         () => applyAuthProfileToServers(ctx, profile, servers)
       );
-      void vscode.window.showInformationMessage(`Applied auth profile "${profile.name}" to ${servers.length} server(s).`);
+      void vscode.window.showInformationMessage(`Linked auth profile "${profile.name}" to ${servers.length} server(s).`);
     }),
 
     vscode.commands.registerCommand("nexus.authProfile.applyToServer", async (arg?: unknown) => {
@@ -104,7 +86,7 @@ export function registerAuthProfileCommands(ctx: CommandContext): vscode.Disposa
         return;
       }
       await applyAuthProfileToServers(ctx, profile, [server]);
-      void vscode.window.showInformationMessage(`Applied auth profile "${profile.name}" to "${server.name}".`);
+      void vscode.window.showInformationMessage(`Linked auth profile "${profile.name}" to "${server.name}".`);
     })
   ];
 }

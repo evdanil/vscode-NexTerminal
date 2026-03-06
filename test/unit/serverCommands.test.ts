@@ -405,6 +405,46 @@ describe("formValuesToServer with proxy", () => {
   });
 });
 
+describe("formValuesToServer authProfileId", () => {
+  it("includes authProfileId when set", () => {
+    const server = formValuesToServer({
+      name: "Test",
+      host: "example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      authProfileId: "ap-123"
+    });
+    expect(server).toBeDefined();
+    expect(server!.authProfileId).toBe("ap-123");
+  });
+
+  it("omits authProfileId when empty string", () => {
+    const server = formValuesToServer({
+      name: "Test",
+      host: "example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      authProfileId: ""
+    });
+    expect(server).toBeDefined();
+    expect(server!.authProfileId).toBeUndefined();
+  });
+
+  it("omits authProfileId when not provided", () => {
+    const server = formValuesToServer({
+      name: "Test",
+      host: "example.com",
+      port: 22,
+      username: "root",
+      authType: "password"
+    });
+    expect(server).toBeDefined();
+    expect(server!.authProfileId).toBeUndefined();
+  });
+});
+
 describe("formValuesToServer group normalization", () => {
   it("normalizes valid group values", () => {
     const server = formValuesToServer({

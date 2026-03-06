@@ -175,6 +175,7 @@ interface SanitizedSnapshot {
   servers: ServerConfig[];
   tunnels: TunnelProfile[];
   serialProfiles: SerialProfile[];
+  authProfiles: AuthProfile[];
   settings: Record<string, unknown>;
 }
 
@@ -198,18 +199,36 @@ export function sanitizeForSharing(
   servers: ServerConfig[],
   tunnels: TunnelProfile[],
   serialProfiles: SerialProfile[],
-  settings: Record<string, unknown>
+  settings: Record<string, unknown>,
+  authProfiles: AuthProfile[] = []
 ): SanitizedSnapshot {
   const idMap = new Map<string, string>();
 
-  // First pass: assign new IDs
+  // First pass: assign new IDs for auth profiles
+  for (const p of authProfiles) {
+    idMap.set(p.id, randomUUID());
+  }
+
+  // Second pass: assign new IDs for servers
   for (const s of servers) {
     idMap.set(s.id, randomUUID());
   }
 
+  // Build sanitized auth profiles (redact credentials, keep name)
+  const referencedProfileIds = new Set(servers.map((s) => s.authProfileId).filter(Boolean) as string[]);
+  const newAuthProfiles = authProfiles
+    .filter((p) => referencedProfileIds.has(p.id))
+    .map((p) => ({
+      ...p,
+      id: idMap.get(p.id)!,
+      username: "user",
+      keyPath: undefined
+    }));
+
   const newServers = servers.map((s) => {
     const newId = idMap.get(s.id)!;
-    return { ...s, id: newId, username: "user", keyPath: "", proxy: remapProxy(s.proxy, idMap) };
+    const newAuthProfileId = s.authProfileId ? idMap.get(s.authProfileId) : undefined;
+    return { ...s, id: newId, username: "user", keyPath: "", proxy: remapProxy(s.proxy, idMap), authProfileId: newAuthProfileId };
   });
 
   const newTunnels = tunnels.map((t) => {
@@ -244,6 +263,7 @@ export function sanitizeForSharing(
     servers: newServers,
     tunnels: newTunnels,
     serialProfiles: newSerialProfiles,
+    authProfiles: newAuthProfiles,
     settings: sanitizedSettings
   };
 }
@@ -355,7 +375,8 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       snapshot.servers,
       snapshot.tunnels,
       snapshot.serialProfiles,
-      settings
+      settings,
+      snapshot.authProfiles
     );
 
     const exportData: NexusConfigExport = {
@@ -365,6 +386,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       servers: sanitized.servers,
       tunnels: sanitized.tunnels,
       serialProfiles: sanitized.serialProfiles,
+      authProfiles: sanitized.authProfiles.length > 0 ? sanitized.authProfiles : undefined,
       groups: snapshot.explicitGroups,
       settings: sanitized.settings
     };
@@ -614,6 +636,15 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       } else {
         await core.addOrUpdateAuthProfile(profile);
         imported++;
+      }
+    }
+
+    // Clear dangling authProfileId references
+    const postImportSnapshot = core.getSnapshot();
+    const knownProfileIds = new Set(postImportSnapshot.authProfiles.map((p) => p.id));
+    for (const server of postImportSnapshot.servers) {
+      if (server.authProfileId && !knownProfileIds.has(server.authProfileId)) {
+        await core.addOrUpdateServer({ ...server, authProfileId: undefined });
       }
     }
 

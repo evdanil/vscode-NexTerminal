@@ -5,7 +5,6 @@ import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
-import { authProfilePasswordSecretKey, passwordSecretKey } from "../services/ssh/silentAuth";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
 import type { CommandContext } from "./types";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
@@ -43,14 +42,6 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         }
         await ctx.core.addOrUpdateServer(server);
         await syncProxyPasswordSecret(ctx, server.id, values);
-        // Copy auth profile password to server if profile was selected
-        const authProfileId = typeof values.authProfileId === "string" ? values.authProfileId : "";
-        if (authProfileId && ctx.secretVault) {
-          const profilePw = await ctx.secretVault.get(authProfilePasswordSecretKey(authProfileId));
-          if (profilePw) {
-            await ctx.secretVault.store(passwordSecretKey(server.id), profilePw);
-          }
-        }
       }
     },
     onBrowse: browseForKey,

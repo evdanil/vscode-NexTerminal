@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ServerConfig } from "../../src/models/config";
+import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import type { PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
-import { SilentAuthSshFactory, passwordSecretKey } from "../../src/services/ssh/silentAuth";
+import { SilentAuthSshFactory, passwordSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
 
 const baseServer: ServerConfig = {
   id: "srv-1",
@@ -125,5 +125,78 @@ describe("SilentAuthSshFactory", () => {
 
     expect(connector.connect).toHaveBeenCalledWith(server, {});
     expect(prompt.prompt).not.toHaveBeenCalled();
+  });
+
+  it("resolves credentials from auth profile when authProfileId is set", async () => {
+    const profile: AuthProfile = {
+      id: "prof-1",
+      name: "Production",
+      username: "root",
+      authType: "password"
+    };
+    const server: ServerConfig = {
+      ...baseServer,
+      username: "alice",
+      authType: "key",
+      authProfileId: "prof-1"
+    };
+    const profilePwKey = authProfilePasswordSecretKey("prof-1");
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const vault = createVault({ [profilePwKey]: "profile-secret" });
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const lookup = (id: string) => id === "prof-1" ? profile : undefined;
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+
+    await factory.connect(server);
+
+    // Should use profile credentials, not server's
+    expect(connector.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ username: "root", authType: "password" }),
+      expect.objectContaining({ password: "profile-secret" })
+    );
+    expect(prompt.prompt).not.toHaveBeenCalled();
+  });
+
+  it("falls back to server credentials when profile not found", async () => {
+    const server: ServerConfig = {
+      ...baseServer,
+      authProfileId: "nonexistent"
+    };
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const vault = createVault({ [passwordSecretKey(server.id)]: "server-pw" });
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const lookup = (_id: string) => undefined;
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+
+    await factory.connect(server);
+
+    expect(connector.connect).toHaveBeenCalledWith(
+      server,
+      expect.objectContaining({ password: "server-pw" })
+    );
+  });
+
+  it("uses server credentials when no lookup provided", async () => {
+    const server: ServerConfig = {
+      ...baseServer,
+      authProfileId: "prof-1"
+    };
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const vault = createVault({ [passwordSecretKey(server.id)]: "server-pw" });
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+    await factory.connect(server);
+
+    expect(connector.connect).toHaveBeenCalledWith(
+      server,
+      expect.objectContaining({ password: "server-pw" })
+    );
   });
 });

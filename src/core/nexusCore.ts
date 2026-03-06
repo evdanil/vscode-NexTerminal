@@ -101,7 +101,17 @@ export class NexusCore {
 
   public async removeAuthProfile(profileId: string): Promise<void> {
     this.authProfiles.delete(profileId);
+    let serversChanged = false;
+    for (const [id, server] of this.servers.entries()) {
+      if (server.authProfileId === profileId) {
+        this.servers.set(id, { ...server, authProfileId: undefined });
+        serversChanged = true;
+      }
+    }
     await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
+    if (serversChanged) {
+      await this.repository.saveServers([...this.servers.values()]);
+    }
     this.emitChanged();
   }
 

@@ -50,6 +50,9 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   if (obj.legacyAlgorithms !== undefined && typeof obj.legacyAlgorithms !== "boolean") {
     return false;
   }
+  if (obj.authProfileId !== undefined && (typeof obj.authProfileId !== "string" || obj.authProfileId === "")) {
+    return false;
+  }
   return true;
 }
 

@@ -41,12 +41,17 @@ export class ServerTreeItem extends vscode.TreeItem {
     public readonly server: ServerConfig,
     connected: boolean,
     serverLookup?: (id: string) => ServerConfig | undefined,
-    showDescription = true
+    showDescription = true,
+    authProfileName?: string,
+    authProfileUsername?: string
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
-    this.tooltip = `${server.username}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}`;
-    this.description = showDescription ? `${server.username}@${server.host}` : undefined;
+    const displayUsername = authProfileUsername ?? server.username;
+    const authSuffix = authProfileName ? ` [auth: ${authProfileName}]` : "";
+    this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}`;
+    const authDesc = authProfileName ? ` (${authProfileName})` : "";
+    this.description = showDescription ? `${displayUsername}@${server.host}${authDesc}` : undefined;
     this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
     this.iconPath = new vscode.ThemeIcon(
       connected ? "plug" : "debug-disconnect",
@@ -426,7 +431,10 @@ export class NexusTreeProvider
     const connected = this.snapshot.activeSessions.some((session) => session.serverId === server.id);
     const lookup = (id: string): ServerConfig | undefined => this.snapshot.servers.find((s) => s.id === id);
     const showDesc = vscode.workspace.getConfiguration("nexus.ui").get<boolean>("showTreeDescriptions", true);
-    return new ServerTreeItem(server, connected, lookup, showDesc);
+    const authProfile = server.authProfileId
+      ? this.snapshot.authProfiles.find((p) => p.id === server.authProfileId)
+      : undefined;
+    return new ServerTreeItem(server, connected, lookup, showDesc, authProfile?.name, authProfile?.username);
   }
 
   private toSerialProfileItem(profile: SerialProfile): SerialProfileTreeItem {

@@ -8,7 +8,6 @@ import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { serverFormDefinition } from "../ui/formDefinitions";
-import { authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -346,7 +345,9 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
     multiplexing: typeof values.multiplexing === "boolean" ? values.multiplexing : undefined,
     legacyAlgorithms: typeof values.legacyAlgorithms === "boolean" ? values.legacyAlgorithms : undefined,
-    proxy: formValuesToProxy(values)
+    proxy: formValuesToProxy(values),
+    authProfileId: typeof values.authProfileId === "string" && values.authProfileId
+      ? values.authProfileId : undefined
   };
 }
 
@@ -526,14 +527,6 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           }
           await ctx.core.addOrUpdateServer(updated);
           await syncProxyPasswordSecret(ctx, updated.id, values);
-          // Copy auth profile password to server if profile was selected
-          const authProfileId = typeof values.authProfileId === "string" ? values.authProfileId : "";
-          if (authProfileId && ctx.secretVault) {
-            const profilePw = await ctx.secretVault.get(authProfilePasswordSecretKey(authProfileId));
-            if (profilePw) {
-              await ctx.secretVault.store(passwordSecretKey(updated.id), profilePw);
-            }
-          }
           if (ctx.core.isServerConnected(existing.id)) {
             void vscode.window.showInformationMessage(
               "Server profile updated. Existing sessions keep current connection settings until reconnect."

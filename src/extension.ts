@@ -157,7 +157,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           password: isPassword,
           ignoreFocusOut: true
         })
-      )
+      ),
+    (id) => core.getAuthProfile(id)
   );
   const proxiedFactory = new ProxySshFactory(
     sshFactory,

@@ -3,7 +3,7 @@ import { resolveTunnelType } from "../models/config";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
 
-function authProfileSelectField(authProfiles?: AuthProfile[], vw?: VisibleWhen): FormFieldDescriptor {
+function authProfileSelectField(authProfiles?: AuthProfile[], vw?: VisibleWhen, selectedId?: string): FormFieldDescriptor {
   const options = [
     { label: "(None)", value: "" },
     ...(authProfiles ?? []).map((p) => ({ label: `${p.name} — ${p.authType} — ${p.username}`, value: p.id })),
@@ -14,8 +14,8 @@ function authProfileSelectField(authProfiles?: AuthProfile[], vw?: VisibleWhen):
     key: "authProfileId",
     label: "Auth Profile",
     options,
-    value: "",
-    hint: "Auto-fill credentials from a saved auth profile",
+    value: selectedId ?? "",
+    hint: "Link server credentials to a saved auth profile",
     autofill: true,
     visibleWhen: vw
   };
@@ -209,14 +209,23 @@ export function serverFormDefinition(
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
 
+  // Resolve live profile credentials into seed so the form shows current profile values
+  let resolvedSeed = seed;
+  if (seed?.authProfileId && authProfiles) {
+    const profile = authProfiles.find(p => p.id === seed.authProfileId);
+    if (profile) {
+      resolvedSeed = { ...seed, username: profile.username, authType: profile.authType, keyPath: profile.keyPath };
+    }
+  }
+
   return {
     title: isEdit ? "Edit Server" : "Add Server",
     fields: [
-      { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
-      authProfileSelectField(authProfiles),
-      ...sshFields(seed),
-      ...proxyFields(seed, servers),
-      ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
+      { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: resolvedSeed?.name },
+      authProfileSelectField(authProfiles, undefined, seed?.authProfileId),
+      ...sshFields(resolvedSeed),
+      ...proxyFields(resolvedSeed, servers),
+      ...sharedTrailingFields(resolvedSeed, existingGroups, defaultLogSession)
     ]
   };
 }
