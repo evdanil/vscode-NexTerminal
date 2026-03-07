@@ -250,7 +250,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
               ctx.core.unregisterSerialSession(sessionId);
             },
             onDataReceived: (sessionId) => {
-              if (terminalRef && vscode.window.activeTerminal !== terminalRef) {
+              if (terminalRef && ctx.focusedTerminal !== terminalRef) {
                 ctx.core.markSessionActivity(sessionId);
               }
             }

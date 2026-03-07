@@ -459,7 +459,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
             // onSessionClosed.
           },
           onDataReceived: (sessionId) => {
-            if (terminalRef && vscode.window.activeTerminal !== terminalRef) {
+            if (terminalRef && ctx.focusedTerminal !== terminalRef) {
               ctx.core.markSessionActivity(sessionId);
             }
           }

@@ -31,4 +31,5 @@ export interface CommandContext {
   fileExplorerProvider: FileExplorerTreeProvider;
   secretVault?: SecretVault;
   registrySync?: TunnelRegistrySync;
+  focusedTerminal?: vscode.Terminal;
 }

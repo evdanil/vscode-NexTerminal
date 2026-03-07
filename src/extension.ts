@@ -426,7 +426,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   syncViewsImmediate();
 
+  const editorFocusListener = vscode.window.onDidChangeActiveTextEditor(() => {
+    ctx.focusedTerminal = undefined;
+  });
+
   const terminalActivityListener = vscode.window.onDidChangeActiveTerminal((terminal) => {
+    ctx.focusedTerminal = terminal ?? undefined;
     if (!terminal) {
       return;
     }
@@ -651,6 +656,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     appearanceCommand,
     windowFocusListener,
     configChangeListener,
+    editorFocusListener,
     terminalActivityListener,
     ...serverDisposables,
     ...tunnelDisposables,
