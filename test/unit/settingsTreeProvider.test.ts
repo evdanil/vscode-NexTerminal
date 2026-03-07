@@ -161,11 +161,11 @@ describe("SettingsTreeProvider", () => {
       expect(children).toHaveLength(5);
     });
 
-    it("returns 7 children for sftp", () => {
+    it("returns 8 children for sftp", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("sftp");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(7);
+      expect(children).toHaveLength(8);
     });
 
     it("shows formatted values in labels", () => {

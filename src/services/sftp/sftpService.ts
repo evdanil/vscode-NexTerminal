@@ -26,8 +26,41 @@ interface CacheEntry {
 const DEFAULT_CACHE_TTL_MS = 10_000;
 const DEFAULT_MAX_CACHE_ENTRIES = 500;
 const DEFAULT_COMMAND_TIMEOUT_MS = 300_000;
+const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
 const MAX_DELETE_DEPTH = 100;
 const MAX_DELETE_OPS = 10_000;
+
+function withTimeout<T>(
+  label: string,
+  timeoutMs: number,
+  executor: (resolve: (value: T) => void, reject: (reason: unknown) => void) => void
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new Error(`SFTP ${label} timed out after ${Math.round(timeoutMs / 1000)}s`));
+      }
+    }, timeoutMs);
+    executor(
+      (value) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        }
+      },
+      (reason) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(reason);
+        }
+      }
+    );
+  });
+}
 
 function normalizeConfigValue(value: number | undefined, fallback: number, min: number, max: number): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -84,6 +117,7 @@ export interface SftpServiceConfig {
   cacheTtlMs: number;
   maxCacheEntries: number;
   commandTimeoutMs?: number;
+  operationTimeoutMs?: number;
   maxDeleteDepth?: number;
   maxDeleteOps?: number;
 }
@@ -96,6 +130,7 @@ export class SftpService {
   private cacheTtlMs: number;
   private maxCacheEntries: number;
   private commandTimeoutMs: number;
+  private operationTimeoutMs: number;
   private maxDeleteDepth: number;
   private maxDeleteOps: number;
 
@@ -103,6 +138,7 @@ export class SftpService {
     this.cacheTtlMs = normalizeConfigValue(config?.cacheTtlMs, DEFAULT_CACHE_TTL_MS, 0, 300_000);
     this.maxCacheEntries = normalizeConfigValue(config?.maxCacheEntries, DEFAULT_MAX_CACHE_ENTRIES, 10, 5_000);
     this.commandTimeoutMs = normalizeConfigValue(config?.commandTimeoutMs, DEFAULT_COMMAND_TIMEOUT_MS, 10_000, 3_600_000);
+    this.operationTimeoutMs = normalizeConfigValue(config?.operationTimeoutMs, DEFAULT_OPERATION_TIMEOUT_MS, 5_000, 300_000);
     this.maxDeleteDepth = normalizeConfigValue(config?.maxDeleteDepth, MAX_DELETE_DEPTH, 10, 500);
     this.maxDeleteOps = normalizeConfigValue(config?.maxDeleteOps, MAX_DELETE_OPS, 100, 100_000);
   }
@@ -112,6 +148,9 @@ export class SftpService {
     this.maxCacheEntries = normalizeConfigValue(config.maxCacheEntries, DEFAULT_MAX_CACHE_ENTRIES, 10, 5_000);
     if (config.commandTimeoutMs != null) {
       this.commandTimeoutMs = normalizeConfigValue(config.commandTimeoutMs, DEFAULT_COMMAND_TIMEOUT_MS, 10_000, 3_600_000);
+    }
+    if (config.operationTimeoutMs != null) {
+      this.operationTimeoutMs = normalizeConfigValue(config.operationTimeoutMs, DEFAULT_OPERATION_TIMEOUT_MS, 5_000, 300_000);
     }
     if (config.maxDeleteDepth != null) {
       this.maxDeleteDepth = normalizeConfigValue(config.maxDeleteDepth, MAX_DELETE_DEPTH, 10, 500);
@@ -157,7 +196,7 @@ export class SftpService {
     }
 
     const sftp = this.getSftp(serverId);
-    const entries = await new Promise<FileEntry[]>((resolve, reject) => {
+    const entries = await withTimeout<FileEntry[]>("readdir", this.operationTimeoutMs, (resolve, reject) => {
       sftp.readdir(remotePath, (error, list) => {
         if (error) {
           reject(error);
@@ -178,7 +217,7 @@ export class SftpService {
 
   public async stat(serverId: string, remotePath: string): Promise<DirectoryEntry> {
     const sftp = this.getSftp(serverId);
-    const stats = await new Promise<Stats>((resolve, reject) => {
+    const stats = await withTimeout<Stats>("stat", this.operationTimeoutMs, (resolve, reject) => {
       sftp.stat(remotePath, (error, stats) => {
         if (error) {
           reject(error);
@@ -200,7 +239,7 @@ export class SftpService {
 
   public async lstat(serverId: string, remotePath: string): Promise<DirectoryEntry> {
     const sftp = this.getSftp(serverId);
-    const stats = await new Promise<Stats>((resolve, reject) => {
+    const stats = await withTimeout<Stats>("lstat", this.operationTimeoutMs, (resolve, reject) => {
       sftp.lstat(remotePath, (error, stats) => {
         if (error) {
           reject(error);
@@ -258,7 +297,7 @@ export class SftpService {
     if (isDir) {
       await this.deleteRecursive(sftp, serverId, remotePath, 0, { count: 0 });
     } else {
-      await new Promise<void>((resolve, reject) => {
+      await withTimeout<void>("unlink", this.operationTimeoutMs, (resolve, reject) => {
         sftp.unlink(remotePath, (error) => {
           if (error) {
             reject(error);
@@ -273,7 +312,7 @@ export class SftpService {
 
   public async rename(serverId: string, oldPath: string, newPath: string): Promise<void> {
     const sftp = this.getSftp(serverId);
-    await new Promise<void>((resolve, reject) => {
+    await withTimeout<void>("rename", this.operationTimeoutMs, (resolve, reject) => {
       sftp.rename(oldPath, newPath, (error) => {
         if (error) {
           reject(error);
@@ -288,7 +327,7 @@ export class SftpService {
 
   public async createDirectory(serverId: string, remotePath: string): Promise<void> {
     const sftp = this.getSftp(serverId);
-    await new Promise<void>((resolve, reject) => {
+    await withTimeout<void>("mkdir", this.operationTimeoutMs, (resolve, reject) => {
       sftp.mkdir(remotePath, (error) => {
         if (error) {
           reject(error);
@@ -302,7 +341,7 @@ export class SftpService {
 
   public async realpath(serverId: string, remotePath: string): Promise<string> {
     const sftp = this.getSftp(serverId);
-    return new Promise<string>((resolve, reject) => {
+    return withTimeout<string>("realpath", this.operationTimeoutMs, (resolve, reject) => {
       sftp.realpath(remotePath, (error, absPath) => {
         if (error) {
           reject(error);
@@ -388,7 +427,7 @@ export class SftpService {
 
   public async download(serverId: string, remotePath: string, localPath: string): Promise<void> {
     const sftp = this.getSftp(serverId);
-    return new Promise<void>((resolve, reject) => {
+    return withTimeout<void>("download", this.commandTimeoutMs, (resolve, reject) => {
       sftp.fastGet(remotePath, localPath, (error) => {
         if (error) {
           reject(error);
@@ -401,7 +440,7 @@ export class SftpService {
 
   public async upload(serverId: string, localPath: string, remotePath: string): Promise<void> {
     const sftp = this.getSftp(serverId);
-    await new Promise<void>((resolve, reject) => {
+    await withTimeout<void>("upload", this.commandTimeoutMs, (resolve, reject) => {
       sftp.fastPut(localPath, remotePath, (error) => {
         if (error) {
           reject(error);
@@ -494,7 +533,7 @@ export class SftpService {
       if (entry.isDirectory && !entry.isSymlink) {
         await this.deleteRecursive(sftp, serverId, fullPath, depth + 1, ops);
       } else {
-        await new Promise<void>((resolve, reject) => {
+        await withTimeout<void>("unlink", this.operationTimeoutMs, (resolve, reject) => {
           sftp.unlink(fullPath, (error) => {
             if (error) {
               reject(error);
@@ -505,7 +544,7 @@ export class SftpService {
         });
       }
     }
-    await new Promise<void>((resolve, reject) => {
+    await withTimeout<void>("rmdir", this.operationTimeoutMs, (resolve, reject) => {
       sftp.rmdir(dirPath, (error) => {
         if (error) {
           reject(error);

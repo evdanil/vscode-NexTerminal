@@ -177,6 +177,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   private pollIntervalMs = 0;
   private isViewVisible = false;
+  private refreshInFlight = false;
 
   public constructor(private readonly sftp: SftpService) {}
 
@@ -237,6 +238,19 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   }
 
   public async getChildren(element?: FileExplorerItem): Promise<FileExplorerItem[]> {
+    if (!this.activeServerId || !this.activeServerConfig || !this.currentRootPath) {
+      return [];
+    }
+
+    this.refreshInFlight = true;
+    try {
+      return await this.getChildrenInner(element);
+    } finally {
+      this.refreshInFlight = false;
+    }
+  }
+
+  private async getChildrenInner(element?: FileExplorerItem): Promise<FileExplorerItem[]> {
     if (!this.activeServerId || !this.activeServerConfig || !this.currentRootPath) {
       return [];
     }
@@ -701,7 +715,9 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     this.stopPolling();
     if (this.isViewVisible && this.activeServerId && this.pollIntervalMs > 0) {
       this.pollTimer = setInterval(() => {
-        this.refresh();
+        if (!this.refreshInFlight) {
+          this.refresh();
+        }
       }, this.pollIntervalMs);
     }
   }

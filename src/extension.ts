@@ -155,6 +155,7 @@ function readSftpServiceConfig(): SftpServiceConfig {
     cacheTtlMs: readBoundedMs("nexus.sftp", "cacheTtlSeconds", 10, 0, 300),
     maxCacheEntries: Math.floor(readBoundedNumber("nexus.sftp", "maxCacheEntries", 500, 10, 5000)),
     commandTimeoutMs: readBoundedMs("nexus.sftp", "commandTimeout", 300, 10, 3600),
+    operationTimeoutMs: readBoundedMs("nexus.sftp", "operationTimeout", 30, 5, 300),
     maxDeleteDepth: Math.floor(readBoundedNumber("nexus.sftp", "deleteDepthLimit", 100, 10, 500)),
     maxDeleteOps: Math.floor(readBoundedNumber("nexus.sftp", "deleteOperationLimit", 10000, 100, 100000)),
   };
@@ -592,6 +593,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       event.affectsConfiguration("nexus.sftp.cacheTtlSeconds") ||
       event.affectsConfiguration("nexus.sftp.maxCacheEntries") ||
       event.affectsConfiguration("nexus.sftp.commandTimeout") ||
+      event.affectsConfiguration("nexus.sftp.operationTimeout") ||
       event.affectsConfiguration("nexus.sftp.deleteDepthLimit") ||
       event.affectsConfiguration("nexus.sftp.deleteOperationLimit")
     ) {

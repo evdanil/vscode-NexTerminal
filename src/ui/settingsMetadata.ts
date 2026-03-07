@@ -286,13 +286,26 @@ export const SETTINGS_META: SettingMeta[] = [
   },
   // --- SFTP > Advanced ---
   {
+    key: "operationTimeout",
+    section: "nexus.sftp",
+    label: "Operation Timeout",
+    type: "number",
+    category: "sftp",
+    subgroup: "Advanced",
+    description: "Timeout for SFTP metadata operations (listing, stat, rename, delete). Prevents file explorer freezing on congested connections.",
+    min: 5,
+    max: 300,
+    unit: "seconds",
+    default: 30
+  },
+  {
     key: "commandTimeout",
     section: "nexus.sftp",
     label: "Remote Command Timeout",
     type: "number",
     category: "sftp",
     subgroup: "Advanced",
-    description: "Timeout for remote SFTP commands (e.g. server-side copy). Increase for slow servers.",
+    description: "Timeout for remote SFTP commands (e.g. server-side copy) and file transfers. Increase for slow servers.",
     min: 10,
     max: 3600,
     unit: "seconds",

@@ -2670,13 +2670,21 @@
           "order": 5.8,
           "markdownDescription": "Timeout in seconds for proxy handshake (SOCKS5 or HTTP CONNECT) when connecting through a proxy."
         },
+        "nexus.sftp.operationTimeout": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "maximum": 300,
+          "order": 23.5,
+          "markdownDescription": "Timeout in seconds for individual SFTP operations (directory listing, stat, rename, delete). Prevents the file explorer from freezing when the SSH connection is congested."
+        },
         "nexus.sftp.commandTimeout": {
           "type": "number",
           "default": 300,
           "minimum": 10,
           "maximum": 3600,
           "order": 24,
-          "markdownDescription": "Timeout in seconds for remote SFTP commands (e.g. server-side copy). Increase for slow servers or large operations."
+          "markdownDescription": "Timeout in seconds for remote SFTP commands (e.g. server-side copy) and file transfers. Increase for slow servers or large operations."
         },
         "nexus.sftp.deleteDepthLimit": {
           "type": "number",

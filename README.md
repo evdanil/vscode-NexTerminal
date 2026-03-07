@@ -149,7 +149,8 @@ npm run package:vsix
 | `nexus.sftp.cacheTtlSeconds` | `10` | SFTP directory listing cache TTL |
 | `nexus.sftp.maxCacheEntries` | `500` | Maximum cached SFTP directory listings |
 | `nexus.sftp.autoRefreshInterval` | `10` | Auto-refresh interval for file explorer (seconds) |
-| `nexus.sftp.commandTimeout` | `300` | Timeout for remote SFTP-side shell commands such as server-side copy |
+| `nexus.sftp.operationTimeout` | `30` | Timeout for SFTP metadata operations (listing, stat, rename, delete) |
+| `nexus.sftp.commandTimeout` | `300` | Timeout for remote SFTP commands and file transfers |
 | `nexus.sftp.deleteDepthLimit` | `100` | Safety limit for recursive delete directory depth |
 | `nexus.sftp.deleteOperationLimit` | `10000` | Safety limit for items removed by one recursive delete |
 | `nexus.serial.rpcTimeout` | `10` | Timeout for serial sidecar commands in seconds |

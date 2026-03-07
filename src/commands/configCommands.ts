@@ -68,6 +68,7 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.ssh", key: "keepaliveCountMax" },
   { section: "nexus.ssh", key: "terminalType" },
   { section: "nexus.ssh", key: "proxyTimeout" },
+  { section: "nexus.sftp", key: "operationTimeout" },
   { section: "nexus.sftp", key: "commandTimeout" },
   { section: "nexus.sftp", key: "deleteDepthLimit" },
   { section: "nexus.sftp", key: "deleteOperationLimit" },
