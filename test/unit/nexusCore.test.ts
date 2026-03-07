@@ -546,6 +546,135 @@ describe("NexusCore", () => {
     expect(core2.getServer("s1")?.authProfileId).toBeUndefined();
   });
 
+  it("markSessionActivity adds session to activitySessionIds and emits change", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    core.registerSession({
+      id: "session-1",
+      serverId: "s1",
+      terminalName: "Nexus SSH: S1",
+      startedAt: Date.now()
+    });
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    core.markSessionActivity("session-1");
+    expect(core.getSnapshot().activitySessionIds.has("session-1")).toBe(true);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("markSessionActivity does not emit when session already marked", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    core.registerSession({
+      id: "session-1",
+      serverId: "s1",
+      terminalName: "Nexus SSH: S1",
+      startedAt: Date.now()
+    });
+
+    core.markSessionActivity("session-1");
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    core.markSessionActivity("session-1");
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("clearSessionActivity removes session from activitySessionIds and emits change", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    core.registerSession({
+      id: "session-1",
+      serverId: "s1",
+      terminalName: "Nexus SSH: S1",
+      startedAt: Date.now()
+    });
+    core.markSessionActivity("session-1");
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    core.clearSessionActivity("session-1");
+    expect(core.getSnapshot().activitySessionIds.has("session-1")).toBe(false);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("clearSessionActivity does not emit when session was not marked", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    core.clearSessionActivity("nonexistent");
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("unregisterSession clears activity for that session", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    core.registerSession({
+      id: "session-1",
+      serverId: "s1",
+      terminalName: "Nexus SSH: S1",
+      startedAt: Date.now()
+    });
+    core.markSessionActivity("session-1");
+    core.unregisterSession("session-1");
+
+    expect(core.getSnapshot().activitySessionIds.has("session-1")).toBe(false);
+  });
+
+  it("unregisterSerialSession clears activity for that session", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    core.registerSerialSession({
+      id: "serial-1",
+      profileId: "sp1",
+      terminalName: "Nexus Serial: Lab",
+      startedAt: Date.now()
+    });
+    core.markSessionActivity("serial-1");
+    core.unregisterSerialSession("serial-1");
+
+    expect(core.getSnapshot().activitySessionIds.has("serial-1")).toBe(false);
+  });
+
+  it("getSnapshot returns an isolated copy of activitySessionIds", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    core.registerSession({
+      id: "session-1",
+      serverId: "s1",
+      terminalName: "Nexus SSH: S1",
+      startedAt: Date.now()
+    });
+    core.markSessionActivity("session-1");
+
+    const snap1 = core.getSnapshot();
+    core.clearSessionActivity("session-1");
+    const snap2 = core.getSnapshot();
+
+    expect(snap1.activitySessionIds.has("session-1")).toBe(true);
+    expect(snap2.activitySessionIds.has("session-1")).toBe(false);
+  });
+
   it("getItemsInFolder returns direct items when not recursive", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

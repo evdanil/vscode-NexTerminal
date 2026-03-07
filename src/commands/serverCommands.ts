@@ -459,6 +459,11 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
             // alive for reconnect) and do NOT stop auto-stop tunnels — they
             // will be cleaned up when the terminal is fully closed via
             // onSessionClosed.
+          },
+          onDataReceived: (sessionId) => {
+            if (terminalRef && vscode.window.activeTerminal !== terminalRef) {
+              ctx.core.markSessionActivity(sessionId);
+            }
           }
         },
         ctx.loggerFactory.create("terminal", server.id),

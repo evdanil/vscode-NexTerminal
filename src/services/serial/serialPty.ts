@@ -20,6 +20,7 @@ export type SerialPtyOptions = OpenPortParams;
 export interface SerialPtyCallbacks {
   onSessionOpened(sessionId: string): void;
   onSessionClosed(sessionId: string): void;
+  onDataReceived?(sessionId: string): void;
 }
 
 export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
@@ -157,6 +158,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.logger.log(`serial stdout ${JSON.stringify(output)}`);
         this.transcript?.write(output);
         this.outputObserver?.onOutput(output);
+        this.callbacks.onDataReceived?.(eventSessionId);
         this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(output) : output);
       });
       this.errorSubscription = this.transport.onDidReceiveError((eventSessionId, errorMessage) => {

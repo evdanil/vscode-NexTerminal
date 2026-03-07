@@ -61,12 +61,15 @@ export class ServerTreeItem extends vscode.TreeItem {
 }
 
 export class SessionTreeItem extends vscode.TreeItem {
-  public constructor(public readonly session: ActiveSession) {
+  public constructor(public readonly session: ActiveSession, hasActivity = false) {
     super(session.terminalName, vscode.TreeItemCollapsibleState.None);
     this.id = `session:${session.id}`;
     this.contextValue = "nexus.sessionNode";
     this.description = "active";
-    this.iconPath = new vscode.ThemeIcon("terminal");
+    this.iconPath = new vscode.ThemeIcon(
+      "terminal",
+      hasActivity ? new vscode.ThemeColor("terminal.ansiYellow") : undefined
+    );
   }
 }
 
@@ -87,12 +90,15 @@ export class SerialProfileTreeItem extends vscode.TreeItem {
 }
 
 export class SerialSessionTreeItem extends vscode.TreeItem {
-  public constructor(public readonly session: ActiveSerialSession) {
+  public constructor(public readonly session: ActiveSerialSession, hasActivity = false) {
     super(session.terminalName, vscode.TreeItemCollapsibleState.None);
     this.id = `serial-session:${session.id}`;
     this.contextValue = "nexus.serialSessionNode";
     this.description = "active";
-    this.iconPath = new vscode.ThemeIcon("terminal");
+    this.iconPath = new vscode.ThemeIcon(
+      "terminal",
+      hasActivity ? new vscode.ThemeColor("terminal.ansiYellow") : undefined
+    );
   }
 }
 
@@ -121,7 +127,8 @@ export class NexusTreeProvider
     activeTunnels: [],
     remoteTunnels: [],
     explicitGroups: [],
-    authProfiles: []
+    authProfiles: [],
+    activitySessionIds: new Set()
   };
 
   public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME];
@@ -214,12 +221,12 @@ export class NexusTreeProvider
     if (element instanceof ServerTreeItem) {
       return this.snapshot.activeSessions
         .filter((session) => session.serverId === element.server.id)
-        .map((session) => new SessionTreeItem(session));
+        .map((session) => new SessionTreeItem(session, this.snapshot.activitySessionIds.has(session.id)));
     }
     if (element instanceof SerialProfileTreeItem) {
       return this.snapshot.activeSerialSessions
         .filter((session) => session.profileId === element.profile.id)
-        .map((session) => new SerialSessionTreeItem(session));
+        .map((session) => new SerialSessionTreeItem(session, this.snapshot.activitySessionIds.has(session.id)));
     }
     return [];
   }

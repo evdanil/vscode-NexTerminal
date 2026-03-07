@@ -12,6 +12,7 @@ export interface SshPtyCallbacks {
   onSessionOpened(sessionId: string): void;
   onSessionClosed(sessionId: string): void;
   onDisconnected?(sessionId: string): void;
+  onDataReceived?(sessionId: string): void;
 }
 
 export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
@@ -177,6 +178,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.logger.log(`stdout ${JSON.stringify(text)}`);
         this.transcript?.write(text);
         this.outputObserver?.onOutput(text);
+        this.callbacks.onDataReceived?.(this.sessionId);
         this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(text) : text);
       });
       stream.on("close", () => this.handleDisconnect(generation));

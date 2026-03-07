@@ -111,7 +111,8 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       activeTunnels: [],
       remoteTunnels: [],
       explicitGroups: [],
-      authProfiles: []
+      authProfiles: [],
+      activitySessionIds: new Set()
     });
 
     const target = new ServerTreeItem(makeServer(), false);
@@ -137,7 +138,8 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       activeTunnels: [],
       remoteTunnels: [],
       explicitGroups: [],
-      authProfiles: []
+      authProfiles: [],
+      activitySessionIds: new Set()
     });
 
     const target = new ServerTreeItem(makeServer(), false);
@@ -162,7 +164,8 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       activeTunnels: [],
       remoteTunnels: [],
       explicitGroups: [],
-      authProfiles: []
+      authProfiles: [],
+      activitySessionIds: new Set()
     });
 
     const target = new ServerTreeItem(makeServer(), false);
@@ -193,7 +196,8 @@ describe("NexusTreeProvider folder collapse state", () => {
       activeTunnels: [],
       remoteTunnels: [],
       explicitGroups: [],
-      authProfiles: []
+      authProfiles: [],
+      activitySessionIds: new Set()
     });
     return provider;
   }
@@ -270,7 +274,8 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       activeTunnels: [],
       remoteTunnels: [],
       explicitGroups: [],
-      authProfiles: []
+      authProfiles: [],
+      activitySessionIds: new Set()
     });
 
     const rootChildren = provider.getChildren(undefined) as FolderTreeItem[];
@@ -305,7 +310,8 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       activeTunnels: [],
       remoteTunnels: [],
       explicitGroups: [],
-      authProfiles: []
+      authProfiles: [],
+      activitySessionIds: new Set()
     });
 
     const rootChildren = provider.getChildren(undefined) as FolderTreeItem[];
@@ -328,7 +334,8 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       activeTunnels: [],
       remoteTunnels: [],
       explicitGroups: [],
-      authProfiles: []
+      authProfiles: [],
+      activitySessionIds: new Set()
     });
 
     provider.setFilter("prod");
@@ -370,7 +377,8 @@ function emptySnapshot() {
     activeTunnels: [] as any[],
     remoteTunnels: [] as any[],
     explicitGroups: [] as string[],
-    authProfiles: [] as any[]
+    authProfiles: [] as any[],
+    activitySessionIds: new Set()
   };
 }
 
@@ -636,5 +644,71 @@ describe("NexusTreeProvider description visibility", () => {
     const children = provider.getChildren(undefined) as SerialProfileTreeItem[];
     const serial = children.find((c) => c instanceof SerialProfileTreeItem);
     expect(serial!.description).toBeUndefined();
+  });
+});
+
+describe("NexusTreeProvider session activity indicators", () => {
+  it("SessionTreeItem shows yellow icon when session has activity", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer()],
+      activeSessions: [{ id: "sess-1", serverId: "srv-1", terminalName: "Nexus SSH: S1", startedAt: 0 }],
+      activitySessionIds: new Set(["sess-1"])
+    });
+    const server = (provider.getChildren(undefined) as ServerTreeItem[]).find((c) => c instanceof ServerTreeItem)!;
+    const sessions = provider.getChildren(server) as SessionTreeItem[];
+    expect(sessions).toHaveLength(1);
+    const icon = sessions[0].iconPath as { id: string; color?: { id: string } };
+    expect(icon.id).toBe("terminal");
+    expect(icon.color).toBeDefined();
+    expect(icon.color!.id).toBe("terminal.ansiYellow");
+  });
+
+  it("SessionTreeItem shows default icon when session has no activity", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer()],
+      activeSessions: [{ id: "sess-1", serverId: "srv-1", terminalName: "Nexus SSH: S1", startedAt: 0 }],
+      activitySessionIds: new Set()
+    });
+    const server = (provider.getChildren(undefined) as ServerTreeItem[]).find((c) => c instanceof ServerTreeItem)!;
+    const sessions = provider.getChildren(server) as SessionTreeItem[];
+    const icon = sessions[0].iconPath as { id: string; color?: unknown };
+    expect(icon.id).toBe("terminal");
+    expect(icon.color).toBeUndefined();
+  });
+
+  it("SerialSessionTreeItem shows yellow icon when session has activity", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      serialProfiles: [makeSerial()],
+      activeSerialSessions: [{ id: "ss-1", profileId: "sp-1", terminalName: "Nexus Serial: S1", startedAt: 0 }],
+      activitySessionIds: new Set(["ss-1"])
+    });
+    const profile = (provider.getChildren(undefined) as SerialProfileTreeItem[]).find((c) => c instanceof SerialProfileTreeItem)!;
+    const sessions = provider.getChildren(profile) as SerialSessionTreeItem[];
+    expect(sessions).toHaveLength(1);
+    const icon = sessions[0].iconPath as { id: string; color?: { id: string } };
+    expect(icon.id).toBe("terminal");
+    expect(icon.color).toBeDefined();
+    expect(icon.color!.id).toBe("terminal.ansiYellow");
+  });
+
+  it("SerialSessionTreeItem shows default icon when session has no activity", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      serialProfiles: [makeSerial()],
+      activeSerialSessions: [{ id: "ss-1", profileId: "sp-1", terminalName: "Nexus Serial: S1", startedAt: 0 }],
+      activitySessionIds: new Set()
+    });
+    const profile = (provider.getChildren(undefined) as SerialProfileTreeItem[]).find((c) => c instanceof SerialProfileTreeItem)!;
+    const sessions = provider.getChildren(profile) as SerialSessionTreeItem[];
+    const icon = sessions[0].iconPath as { id: string; color?: unknown };
+    expect(icon.id).toBe("terminal");
+    expect(icon.color).toBeUndefined();
   });
 });

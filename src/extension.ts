@@ -390,6 +390,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   syncViewsImmediate();
 
+  const terminalActivityListener = vscode.window.onDidChangeActiveTerminal((terminal) => {
+    if (!terminal) {
+      return;
+    }
+    for (const [sessionId, t] of sessionTerminals) {
+      if (t === terminal) {
+        core.clearSessionActivity(sessionId);
+        return;
+      }
+    }
+    for (const [sessionId, entry] of serialTerminals) {
+      if (entry.terminal === terminal) {
+        core.clearSessionActivity(sessionId);
+        return;
+      }
+    }
+  });
+
   let previousServers = new Map<string, import("./models/config").ServerConfig>(
     core.getSnapshot().servers.map(s => [s.id, s])
   );
@@ -578,6 +596,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     appearanceCommand,
     windowFocusListener,
     configChangeListener,
+    terminalActivityListener,
     ...serverDisposables,
     ...tunnelDisposables,
     ...serialDisposables,

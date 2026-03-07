@@ -21,6 +21,7 @@ export class NexusCore {
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly activeSerialSessions = new Map<string, ActiveSerialSession>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
+  private readonly activitySessionIds = new Set<string>();
   private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
   private readonly authProfiles = new Map<string, AuthProfile>();
@@ -68,7 +69,8 @@ export class NexusCore {
       activeTunnels: [...this.activeTunnels.values()],
       remoteTunnels: [...this.remoteTunnels],
       explicitGroups: [...this.explicitGroups],
-      authProfiles: [...this.authProfiles.values()]
+      authProfiles: [...this.authProfiles.values()],
+      activitySessionIds: new Set(this.activitySessionIds)
     };
   }
 
@@ -196,11 +198,13 @@ export class NexusCore {
 
   public unregisterSerialSession(sessionId: string): void {
     this.activeSerialSessions.delete(sessionId);
+    this.activitySessionIds.delete(sessionId);
     this.emitChanged();
   }
 
   public unregisterSession(sessionId: string): void {
     this.activeSessions.delete(sessionId);
+    this.activitySessionIds.delete(sessionId);
     this.emitChanged();
   }
 
@@ -224,6 +228,22 @@ export class NexusCore {
 
   public unregisterTunnel(activeTunnelId: string): void {
     this.activeTunnels.delete(activeTunnelId);
+    this.emitChanged();
+  }
+
+  public markSessionActivity(sessionId: string): void {
+    if (this.activitySessionIds.has(sessionId)) {
+      return;
+    }
+    this.activitySessionIds.add(sessionId);
+    this.emitChanged();
+  }
+
+  public clearSessionActivity(sessionId: string): void {
+    if (!this.activitySessionIds.has(sessionId)) {
+      return;
+    }
+    this.activitySessionIds.delete(sessionId);
     this.emitChanged();
   }
 

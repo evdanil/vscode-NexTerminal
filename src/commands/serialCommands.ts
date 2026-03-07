@@ -248,6 +248,11 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
             onSessionClosed: (sessionId) => {
               ctx.serialTerminals.delete(sessionId);
               ctx.core.unregisterSerialSession(sessionId);
+            },
+            onDataReceived: (sessionId) => {
+              if (terminalRef && vscode.window.activeTerminal !== terminalRef) {
+                ctx.core.markSessionActivity(sessionId);
+              }
             }
           },
           ctx.loggerFactory.create("terminal", `serial-${profile.id}`),

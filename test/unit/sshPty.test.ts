@@ -135,6 +135,33 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
+  it("fires onDataReceived callback when stream data arrives", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => connection) };
+    const onDataReceived = vi.fn();
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn(),
+      onDataReceived
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.open();
+    await flushAsync();
+
+    const receivedSessionId = callbacks.onSessionOpened.mock.calls[0][0];
+
+    stream.push("hello");
+    expect(onDataReceived).toHaveBeenCalledWith(receivedSessionId);
+
+    stream.push("world");
+    expect(onDataReceived).toHaveBeenCalledTimes(2);
+
+    pty.dispose();
+  });
+
   it("ignores stale disconnect events from a previous connection during reconnect", async () => {
     const stream1 = new PassThrough();
     const first = createConnection(stream1);

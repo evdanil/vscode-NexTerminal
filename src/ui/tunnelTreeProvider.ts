@@ -59,7 +59,8 @@ export class TunnelTreeProvider
     activeTunnels: [],
     remoteTunnels: [],
     explicitGroups: [],
-    authProfiles: []
+    authProfiles: [],
+    activitySessionIds: new Set()
   };
 
   public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, "text/plain"];

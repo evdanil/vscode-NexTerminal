@@ -32,6 +32,7 @@ export interface SessionSnapshot {
   remoteTunnels: TunnelRegistryEntry[];
   explicitGroups: string[];
   authProfiles: AuthProfile[];
+  activitySessionIds: ReadonlySet<string>;
 }
 
 export interface TunnelRegistryStore {

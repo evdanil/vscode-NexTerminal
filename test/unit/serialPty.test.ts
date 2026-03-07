@@ -125,6 +125,35 @@ describe("SerialPty", () => {
     expect(closePort).not.toHaveBeenCalled();
   });
 
+  it("fires onDataReceived callback when transport data arrives", async () => {
+    const { transport, emitData } = createTransport();
+    const onDataReceived = vi.fn();
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn(),
+      onDataReceived
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      callbacks,
+      logger as any
+    );
+
+    pty.open();
+    await flushAsync();
+
+    emitData("session-1", "hello");
+    expect(onDataReceived).toHaveBeenCalledWith("session-1");
+
+    emitData("session-1", "world");
+    expect(onDataReceived).toHaveBeenCalledTimes(2);
+
+    pty.dispose();
+  });
+
   it("shows serial errors without forcing disconnect", async () => {
     const { transport, emitError, writePort, closePort } = createTransport();
     const callbacks = {
