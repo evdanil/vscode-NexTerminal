@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   build:
@@ -83,3 +84,18 @@ jobs:
         run: npx ovsx publish *.vsix --pat "$OVSX_PAT"
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
+
+      - name: Prune old npm caches
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Pruning stale npm caches..."
+          gh cache list --key node-cache- --json id,createdAt --order desc \
+            | jq -r '.[1:][].id' \
+            | while read -r id; do
+                echo "Deleting cache $id"
+                gh cache delete "$id"
+              done
+          echo "Remaining caches:"
+          gh cache list
