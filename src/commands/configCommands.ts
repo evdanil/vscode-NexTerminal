@@ -46,6 +46,7 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.logging", key: "sessionLogDirectory" },
   { section: "nexus.logging", key: "maxFileSizeMb" },
   { section: "nexus.logging", key: "maxRotatedFiles" },
+  { section: "nexus.ui", key: "showTreeDescriptions" },
   { section: "nexus.tunnel", key: "defaultConnectionMode" },
   { section: "nexus.tunnel", key: "defaultBindAddress" },
   { section: "nexus.terminal", key: "openLocation" },
@@ -57,10 +58,23 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.terminal.highlighting", key: "rules" },
   { section: "nexus.ssh.multiplexing", key: "enabled" },
   { section: "nexus.ssh.multiplexing", key: "idleTimeout" },
+  { section: "nexus.ssh", key: "trustNewHosts" },
   { section: "nexus.sftp", key: "cacheTtlSeconds" },
   { section: "nexus.sftp", key: "maxCacheEntries" },
   { section: "nexus.sftp", key: "autoRefreshInterval" },
-  { section: "nexus.sftp", key: "maxOpenFileSizeMB" }
+  { section: "nexus.sftp", key: "maxOpenFileSizeMB" },
+  { section: "nexus.ssh", key: "connectionTimeout" },
+  { section: "nexus.ssh", key: "keepaliveInterval" },
+  { section: "nexus.ssh", key: "keepaliveCountMax" },
+  { section: "nexus.ssh", key: "terminalType" },
+  { section: "nexus.ssh", key: "proxyTimeout" },
+  { section: "nexus.sftp", key: "commandTimeout" },
+  { section: "nexus.sftp", key: "deleteDepthLimit" },
+  { section: "nexus.sftp", key: "deleteOperationLimit" },
+  { section: "nexus.tunnel", key: "socks5HandshakeTimeout" },
+  { section: "nexus.terminal.macros", key: "defaultCooldown" },
+  { section: "nexus.terminal.macros", key: "bufferLength" },
+  { section: "nexus.serial", key: "rpcTimeout" }
 ];
 
 const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`));

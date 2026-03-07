@@ -116,16 +116,84 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - `Nexus: Export Configuration` saves all server, tunnel, and serial profiles to a JSON file.
 - `Nexus: Import Configuration` restores from a backup with merge or replace options.
 
-## 5. Commands and Views
+## 5. Settings Reference
 
-### 5.1 Views
+### 5.1 SSH
+
+| Setting | Type | Default | Range | Description |
+|---------|------|---------|-------|-------------|
+| `nexus.ssh.trustNewHosts` | boolean | `true` | — | Auto-trust host keys on first connection (TOFU) |
+| `nexus.ssh.multiplexing.enabled` | boolean | `true` | — | Share SSH connections across terminals, tunnels, and SFTP |
+| `nexus.ssh.multiplexing.idleTimeout` | number | `300` | 0–3600 s | Idle timeout before closing a multiplexed connection |
+| `nexus.ssh.connectionTimeout` | number | `60` | 5–300 s | SSH handshake timeout |
+| `nexus.ssh.keepaliveInterval` | number | `10` | 0–300 s | Interval between keepalive packets (`0` disables) |
+| `nexus.ssh.keepaliveCountMax` | number | `3` | 1–30 | Missed keepalives before the connection is treated as dead |
+| `nexus.ssh.terminalType` | enum | `xterm-256color` | `xterm-256color`, `xterm`, `vt100`, `vt220`, `dumb` | `$TERM` value reported to the remote shell |
+| `nexus.ssh.proxyTimeout` | number | `60` | 5–300 s | SOCKS5 / HTTP CONNECT proxy handshake timeout |
+
+### 5.2 SFTP
+
+| Setting | Type | Default | Range | Description |
+|---------|------|---------|-------|-------------|
+| `nexus.sftp.cacheTtlSeconds` | number | `10` | 0–3600 s | Directory listing cache TTL |
+| `nexus.sftp.maxCacheEntries` | number | `500` | 0–10000 | Maximum cached directory listings |
+| `nexus.sftp.autoRefreshInterval` | number | `10` | 0–3600 s | Auto-refresh interval for the file explorer |
+| `nexus.sftp.commandTimeout` | number | `300` | 10–3600 s | Timeout for remote shell commands (e.g. server-side copy) |
+| `nexus.sftp.deleteDepthLimit` | number | `100` | 10–500 levels | Safety limit: max directory depth for recursive delete |
+| `nexus.sftp.deleteOperationLimit` | number | `10000` | 100–100000 | Safety limit: max items removed by one recursive delete |
+
+### 5.3 Tunnels
+
+| Setting | Type | Default | Range | Description |
+|---------|------|---------|-------|-------------|
+| `nexus.tunnel.defaultConnectionMode` | enum | `shared` | `shared`, `isolated` | SSH connection mode for tunnels |
+| `nexus.tunnel.defaultBindAddress` | string | `127.0.0.1` | — | Default bind address for reverse tunnels |
+| `nexus.tunnel.socks5HandshakeTimeout` | number | `10` | 2–60 s | Dynamic tunnel SOCKS5 handshake timeout |
+
+### 5.4 Terminal
+
+| Setting | Type | Default | Range | Description |
+|---------|------|---------|-------|-------------|
+| `nexus.terminal.openLocation` | enum | `panel` | `panel`, `editor` | Where to open terminals |
+| `nexus.terminal.keyboardPassthrough` | boolean | `false` | — | Pass Ctrl+ key combinations to the terminal |
+| `nexus.terminal.passthroughKeys` | array | `[b,e,g,j,k,n,o,p,r,w]` | — | Which Ctrl+ keys to pass through |
+| `nexus.terminal.macros` | array | `[]` | — | Terminal macros with optional `keybinding`, `triggerPattern`, `triggerCooldown`, `triggerInterval`, `triggerInitiallyDisabled` |
+| `nexus.terminal.macros.autoTrigger` | boolean | `true` | — | Enable auto-trigger for macros with a `triggerPattern` |
+| `nexus.terminal.macros.defaultCooldown` | number | `3` | 0–300 s | Default cooldown for auto-trigger macros |
+| `nexus.terminal.macros.bufferLength` | number | `2048` | 256–16384 chars | Max characters retained per terminal for pattern matching |
+| `nexus.terminal.highlighting.enabled` | boolean | `true` | — | Enable regex-based terminal highlighting |
+
+### 5.5 Logging
+
+| Setting | Type | Default | Range | Description |
+|---------|------|---------|-------|-------------|
+| `nexus.logging.sessionTranscripts` | boolean | `true` | — | Enable session transcript logging |
+| `nexus.logging.sessionLogDirectory` | string | *(extension storage)* | — | Custom directory for session logs |
+| `nexus.logging.maxFileSizeMb` | number | `10` | 1–100 MB | Max log file size before rotation |
+| `nexus.logging.maxRotatedFiles` | number | `1` | 0–99 | Number of rotated log files to keep |
+
+### 5.6 Serial
+
+| Setting | Type | Default | Range | Description |
+|---------|------|---------|-------|-------------|
+| `nexus.serial.rpcTimeout` | number | `10` | 2–60 s | Timeout for serial sidecar commands |
+
+### 5.7 UI
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `nexus.ui.showTreeDescriptions` | boolean | `true` | Show connection details beside items in the Connectivity Hub |
+
+## 6. Commands and Views
+
+### 6.1 Views
 - `nexusCommandCenter`: servers, serial profiles, and active sessions.
 - `nexusTunnels`: tunnel profiles and active traffic state.
 - `nexusTunnelMonitor`: dedicated traffic/status panel for active tunnels.
 - `nexusMacros`: terminal macros with optional custom keyboard shortcuts and auto-trigger state.
 - `nexusSettings`: extension settings sidebar panel.
 
-### 5.2 Commands
+### 6.2 Commands
 **Server:**
 - `nexus.server.add`, `nexus.server.edit`, `nexus.server.remove`
 - `nexus.server.connect`, `nexus.server.disconnect`
@@ -168,13 +236,13 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 **General:**
 - `nexus.refresh`
 
-## 6. Test Strategy
+## 7. Test Strategy
 
-### 6.1 Unit Tests
+### 7.1 Unit Tests
 - `test/unit/silentAuth.test.ts`: vault reuse, auth retry, cancellation, non-password auth path.
 - `test/unit/nexusCore.test.ts`: repository load, CRUD, session/tunnel lifecycle updates.
 
-### 6.2 Integration Tests
+### 7.2 Integration Tests
 - `test/integration/tunnelManager.integration.test.ts`: local/reverse/dynamic tunnel forwarding through real TCP sockets, SOCKS5 handshake, and traffic event verification.
 - `test/integration/serialSidecarManager.integration.test.ts`: sidecar request/response and notification flow with a mock worker process.
 
@@ -183,7 +251,7 @@ Run:
 npm test
 ```
 
-## 7. MVP Coverage vs Spec
+## 8. MVP Coverage vs Spec
 
 Implemented (~90% target):
 - Hybrid architecture with serial sidecar process.

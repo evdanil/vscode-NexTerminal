@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
 import { Client, type Algorithms, type ConnectConfig, type SFTPWrapper, type VerifyCallback } from "ssh2";
 import type { ServerConfig } from "../../models/config";
+import { clamp } from "../../utils/helpers";
 import type {
   HostKeyVerifier,
   KeyboardInteractiveHandler,
@@ -171,14 +172,35 @@ class Ssh2Connection implements SshConnection {
   }
 }
 
-export async function buildConnectConfig(server: ServerConfig, password?: string, passphrase?: string, sock?: Duplex): Promise<ConnectConfig> {
+export interface SshConnectionOptions {
+  readyTimeoutMs?: number;
+  keepaliveIntervalMs?: number;
+  keepaliveCountMax?: number;
+}
+
+function normalizeTimeout(value: number | undefined, fallback: number, min: number, max: number): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? clamp(Math.floor(value), min, max)
+    : fallback;
+}
+
+function normalizeConnectionOptions(options?: SshConnectionOptions): Required<SshConnectionOptions> {
+  return {
+    readyTimeoutMs: normalizeTimeout(options?.readyTimeoutMs, 60_000, 5_000, 300_000),
+    keepaliveIntervalMs: normalizeTimeout(options?.keepaliveIntervalMs, 10_000, 0, 300_000),
+    keepaliveCountMax: normalizeTimeout(options?.keepaliveCountMax, 3, 1, 30)
+  };
+}
+
+export async function buildConnectConfig(server: ServerConfig, password?: string, passphrase?: string, sock?: Duplex, options?: SshConnectionOptions): Promise<ConnectConfig> {
+  const normalized = normalizeConnectionOptions(options);
   const base: ConnectConfig = {
     host: server.host,
     port: server.port,
     username: server.username,
-    readyTimeout: 60_000,
-    keepaliveInterval: 10_000,
-    keepaliveCountMax: 3,
+    readyTimeout: normalized.readyTimeoutMs,
+    keepaliveInterval: normalized.keepaliveIntervalMs,
+    keepaliveCountMax: normalized.keepaliveCountMax,
     tryKeyboard: true,
     ...(sock && { sock }),
     ...(server.legacyAlgorithms && { algorithms: LEGACY_ALGORITHMS })
@@ -211,13 +233,24 @@ export async function buildConnectConfig(server: ServerConfig, password?: string
 }
 
 export class Ssh2Connector implements SshConnector {
-  public constructor(private readonly hostKeyVerifier?: HostKeyVerifier) {}
+  private connectionOptions: Required<SshConnectionOptions>;
+
+  public constructor(
+    private readonly hostKeyVerifier?: HostKeyVerifier,
+    connectionOptions?: SshConnectionOptions
+  ) {
+    this.connectionOptions = normalizeConnectionOptions(connectionOptions);
+  }
+
+  public updateConnectionOptions(connectionOptions: SshConnectionOptions): void {
+    this.connectionOptions = normalizeConnectionOptions(connectionOptions);
+  }
 
   public async connect(
     server: ServerConfig,
     auth: { password?: string; passphrase?: string; sock?: Duplex; onKeyboardInteractive?: KeyboardInteractiveHandler }
   ): Promise<SshConnection> {
-    const config = await buildConnectConfig(server, auth.password, auth.passphrase, auth.sock);
+    const config = await buildConnectConfig(server, auth.password, auth.passphrase, auth.sock, this.connectionOptions);
     if (this.hostKeyVerifier) {
       config.hostVerifier = (hostKey: Buffer | string, verify: VerifyCallback): void => {
         const rawHostKey = Buffer.isBuffer(hostKey) ? hostKey : Buffer.from(hostKey, "hex");

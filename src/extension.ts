@@ -41,6 +41,8 @@ import { VscodeColorSchemeStorage } from "./storage/vscodeColorSchemeStorage";
 import { ColorSchemeService } from "./services/colorSchemeService";
 import { TerminalAppearancePanel } from "./ui/terminalAppearancePanel";
 import { tryRegisterResourceLabelFormatter } from "./services/sftp/resourceLabelFormatter";
+import type { SftpServiceConfig } from "./services/sftp/sftpService";
+import type { SshConnectionOptions } from "./services/ssh/ssh2Connector";
 
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
 const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
@@ -131,6 +133,33 @@ function updatePassthroughContext(): void {
   }
 }
 
+function readBoundedNumber(section: string, key: string, fallback: number, min: number, max: number): number {
+  const raw = vscode.workspace.getConfiguration(section).get<number>(key, fallback);
+  return typeof raw === "number" && Number.isFinite(raw) ? clamp(raw, min, max) : fallback;
+}
+
+function readBoundedMs(section: string, key: string, fallbackSeconds: number, minSeconds: number, maxSeconds: number): number {
+  return readBoundedNumber(section, key, fallbackSeconds, minSeconds, maxSeconds) * 1000;
+}
+
+function readSshConnectionOptions(): SshConnectionOptions {
+  return {
+    readyTimeoutMs: readBoundedMs("nexus.ssh", "connectionTimeout", 60, 5, 300),
+    keepaliveIntervalMs: readBoundedMs("nexus.ssh", "keepaliveInterval", 10, 0, 300),
+    keepaliveCountMax: Math.floor(readBoundedNumber("nexus.ssh", "keepaliveCountMax", 3, 1, 30))
+  };
+}
+
+function readSftpServiceConfig(): SftpServiceConfig {
+  return {
+    cacheTtlMs: readBoundedMs("nexus.sftp", "cacheTtlSeconds", 10, 0, 300),
+    maxCacheEntries: Math.floor(readBoundedNumber("nexus.sftp", "maxCacheEntries", 500, 10, 5000)),
+    commandTimeoutMs: readBoundedMs("nexus.sftp", "commandTimeout", 300, 10, 3600),
+    maxDeleteDepth: Math.floor(readBoundedNumber("nexus.sftp", "deleteDepthLimit", 100, 10, 500)),
+    maxDeleteOps: Math.floor(readBoundedNumber("nexus.sftp", "deleteOperationLimit", 10000, 100, 100000)),
+  };
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const repository = new VscodeConfigRepository(context);
   const core = new NexusCore(repository);
@@ -145,8 +174,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   const secretVault = new VscodeSecretVault(context);
   const hostKeyVerifier = new VscodeHostKeyVerifier(context.globalState);
+  const sshConnector = new Ssh2Connector(hostKeyVerifier, readSshConnectionOptions());
   const sshFactory = new SilentAuthSshFactory(
-    new Ssh2Connector(hostKeyVerifier),
+    sshConnector,
     secretVault,
     new VscodePasswordPrompt(),
     (message, isPassword) =>
@@ -163,7 +193,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const proxiedFactory = new ProxySshFactory(
     sshFactory,
     (id) => core.getServer(id),
-    secretVault
+    secretVault,
+    readBoundedMs("nexus.ssh", "proxyTimeout", 60, 5, 300)
   );
   const multiplexingConfig = vscode.workspace.getConfiguration("nexus.ssh.multiplexing");
   const pool = new SshConnectionPool(proxiedFactory, {
@@ -173,10 +204,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       3_600_000
     )
   });
-  const tunnelManager = new TunnelManager(pool, sshFactory);
+  const tunnelManager = new TunnelManager(
+    pool,
+    sshFactory,
+    readBoundedMs("nexus.tunnel", "socks5HandshakeTimeout", 10, 2, 60)
+  );
   const extensionRoot = path.resolve(__dirname, "..");
   const sidecarPath = path.join(__dirname, "services", "serial", "serialSidecarWorker.js");
-  const serialSidecar = new SerialSidecarManager(sidecarPath, extensionRoot);
+  const serialSidecar = new SerialSidecarManager(
+    sidecarPath,
+    extensionRoot,
+    readBoundedMs("nexus.serial", "rpcTimeout", 10, 2, 60)
+  );
   const registryStore = new VscodeTunnelRegistryStore(context);
   const registrySync = new TunnelRegistrySync(registryStore, core, vscode.env.sessionId);
   await registrySync.initialize();
@@ -189,11 +228,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const macroAutoTrigger = new MacroAutoTrigger();
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
   const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
-  const sftpConfig = vscode.workspace.getConfiguration("nexus.sftp");
-  const sftpService = new SftpService(pool, {
-    cacheTtlMs: sftpConfig.get<number>("cacheTtlSeconds", 10) * 1000,
-    maxCacheEntries: sftpConfig.get<number>("maxCacheEntries", 500),
-  });
+  const sftpService = new SftpService(pool, readSftpServiceConfig());
   const fileSystemProvider = new NexusFileSystemProvider(sftpService);
   const fsRegistration = vscode.workspace.registerFileSystemProvider(NEXTERM_SCHEME, fileSystemProvider, { isCaseSensitive: true });
 
@@ -537,12 +572,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (event.affectsConfiguration("nexus.ui.showTreeDescriptions")) {
       nexusTreeProvider.refresh();
     }
-    if (event.affectsConfiguration("nexus.sftp.cacheTtlSeconds") || event.affectsConfiguration("nexus.sftp.maxCacheEntries")) {
-      const cfg = vscode.workspace.getConfiguration("nexus.sftp");
-      sftpService.updateCacheConfig({
-        cacheTtlMs: cfg.get<number>("cacheTtlSeconds", 10) * 1000,
-        maxCacheEntries: cfg.get<number>("maxCacheEntries", 500),
-      });
+    if (
+      event.affectsConfiguration("nexus.ssh.connectionTimeout") ||
+      event.affectsConfiguration("nexus.ssh.keepaliveInterval") ||
+      event.affectsConfiguration("nexus.ssh.keepaliveCountMax")
+    ) {
+      sshConnector.updateConnectionOptions(readSshConnectionOptions());
+    }
+    if (event.affectsConfiguration("nexus.ssh.proxyTimeout")) {
+      proxiedFactory.updateProxyTimeout(readBoundedMs("nexus.ssh", "proxyTimeout", 60, 5, 300));
+    }
+    if (event.affectsConfiguration("nexus.tunnel.socks5HandshakeTimeout")) {
+      tunnelManager.updateSocks5HandshakeTimeout(readBoundedMs("nexus.tunnel", "socks5HandshakeTimeout", 10, 2, 60));
+    }
+    if (event.affectsConfiguration("nexus.serial.rpcTimeout")) {
+      serialSidecar.updateRpcTimeout(readBoundedMs("nexus.serial", "rpcTimeout", 10, 2, 60));
+    }
+    if (
+      event.affectsConfiguration("nexus.sftp.cacheTtlSeconds") ||
+      event.affectsConfiguration("nexus.sftp.maxCacheEntries") ||
+      event.affectsConfiguration("nexus.sftp.commandTimeout") ||
+      event.affectsConfiguration("nexus.sftp.deleteDepthLimit") ||
+      event.affectsConfiguration("nexus.sftp.deleteOperationLimit")
+    ) {
+      sftpService.updateConfig(readSftpServiceConfig());
     }
     if (event.affectsConfiguration("nexus.sftp.autoRefreshInterval")) {
       const interval = vscode.workspace.getConfiguration("nexus.sftp").get<number>("autoRefreshInterval", 10);

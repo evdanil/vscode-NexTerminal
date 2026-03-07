@@ -84,19 +84,19 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 10 root items", () => {
+    it("returns 11 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(10);
+      expect(roots).toHaveLength(11);
     });
 
-    it("has 6 category items first", () => {
+    it("has 7 category items first", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const categories = roots.filter((r) => r instanceof SettingsCategoryItem);
-      expect(categories).toHaveLength(6);
+      expect(categories).toHaveLength(7);
       expect(categories.map((c) => (c as SettingsCategoryItem).categoryKey))
-        .toEqual(["logging", "ssh", "tunnels", "terminal", "ui", "sftp"]);
+        .toEqual(["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial"]);
     });
 
     it("has 3 link items for Appearance, Macros, and Auth Profiles", () => {
@@ -126,28 +126,28 @@ describe("SettingsTreeProvider", () => {
       expect(children.every((c) => c instanceof SettingsValueItem)).toBe(true);
     });
 
-    it("returns 3 children for ssh category", () => {
+    it("returns 8 children for ssh category", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("ssh");
+      const children = provider.getChildren(category);
+      expect(children).toHaveLength(8);
+    });
+
+    it("returns 3 children for tunnels category", () => {
+      const provider = createProvider();
+      const category = new SettingsCategoryItem("tunnels");
       const children = provider.getChildren(category);
       expect(children).toHaveLength(3);
     });
 
-    it("returns 2 children for tunnels category", () => {
-      const provider = createProvider();
-      const category = new SettingsCategoryItem("tunnels");
-      const children = provider.getChildren(category);
-      expect(children).toHaveLength(2);
-    });
-
-    it("returns 4 children for terminal when passthrough ON", () => {
+    it("returns 6 children for terminal when passthrough ON", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("terminal");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(4);
+      expect(children).toHaveLength(6);
     });
 
-    it("returns 3 children for terminal when passthrough OFF (visibleWhen filtering)", () => {
+    it("returns 5 children for terminal when passthrough OFF (visibleWhen filtering)", () => {
       mockGetConfiguration.mockImplementation(() => ({
         get: (key: string) => {
           if (key === "keyboardPassthrough") return false;
@@ -158,14 +158,14 @@ describe("SettingsTreeProvider", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("terminal");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(3);
+      expect(children).toHaveLength(5);
     });
 
-    it("returns 4 children for sftp", () => {
+    it("returns 7 children for sftp", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("sftp");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(4);
+      expect(children).toHaveLength(7);
     });
 
     it("shows formatted values in labels", () => {

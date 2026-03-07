@@ -89,6 +89,14 @@ describe("renderSettingsHtml", () => {
     expect(html).toContain("setting-badge");
   });
 
+  it("renders safety badges and default value hints for advanced limits", () => {
+    const html = renderWithDefaults();
+    expect(html).toContain("Safety limit");
+    expect(html).toContain("setting-badge-safety");
+    expect(html).toContain("default: 100");
+    expect(html).toContain("default: 10000");
+  });
+
   it("includes cross-link buttons", () => {
     const html = renderWithDefaults();
     expect(html).toContain("open-appearance-btn");

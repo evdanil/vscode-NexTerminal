@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
 // Capture registered command handlers
@@ -73,6 +75,15 @@ import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
+
+const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
+const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+  contributes?: {
+    configuration?: {
+      properties?: Record<string, unknown>;
+    };
+  };
+};
 
 class MockVault implements SecretVault {
   private secrets = new Map<string, string>();
@@ -198,6 +209,13 @@ describe("isValidExport", () => {
 });
 
 describe("SETTINGS_KEYS", () => {
+  it("covers every contributed Nexus setting", () => {
+    const keys = new Set(SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`));
+    const contributedKeys = Object.keys(packageJson.contributes?.configuration?.properties ?? {})
+      .filter((key) => key.startsWith("nexus."));
+    expect(contributedKeys.filter((key) => !keys.has(key))).toEqual([]);
+  });
+
   it("includes all terminal settings", () => {
     const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
     expect(keys).toContain("nexus.terminal.openLocation");
@@ -226,6 +244,7 @@ describe("SETTINGS_KEYS", () => {
     const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
     expect(keys).toContain("nexus.ssh.multiplexing.enabled");
     expect(keys).toContain("nexus.ssh.multiplexing.idleTimeout");
+    expect(keys).toContain("nexus.ssh.trustNewHosts");
   });
 
   it("includes SFTP settings", () => {
@@ -233,6 +252,11 @@ describe("SETTINGS_KEYS", () => {
     expect(keys).toContain("nexus.sftp.cacheTtlSeconds");
     expect(keys).toContain("nexus.sftp.maxCacheEntries");
     expect(keys).toContain("nexus.sftp.autoRefreshInterval");
+  });
+
+  it("includes interface settings", () => {
+    const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
+    expect(keys).toContain("nexus.ui.showTreeDescriptions");
   });
 });
 

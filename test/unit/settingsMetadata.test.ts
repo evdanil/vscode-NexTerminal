@@ -3,7 +3,7 @@ import { formatSettingValueForTree, CATEGORY_ICONS, type SettingMeta } from "../
 
 describe("CATEGORY_ICONS", () => {
   it("has an icon for every category", () => {
-    const expectedCategories = ["logging", "ssh", "tunnels", "terminal", "sftp"];
+    const expectedCategories = ["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial"];
     for (const cat of expectedCategories) {
       expect(CATEGORY_ICONS[cat]).toBeDefined();
       expect(typeof CATEGORY_ICONS[cat]).toBe("string");

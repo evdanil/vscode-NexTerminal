@@ -444,4 +444,28 @@ describe("ProxySshFactory", () => {
     const pushed = socket.unshift.mock.calls[0][0] as Buffer;
     expect(pushed.toString()).toBe("SSH-2.0-test-banner");
   });
+
+  it("passes the configured timeout to SOCKS5 proxy handshakes", async () => {
+    const server = makeServer({
+      proxy: { type: "socks5", host: "proxy.local", port: 1080 }
+    });
+    const socket = { pause: vi.fn() };
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const { ProxySshFactory } = await import("../../src/services/ssh/proxySshFactory");
+    const factory = new ProxySshFactory(
+      authFactory,
+      (id: string) => servers.get(id),
+      vault,
+      42_000
+    );
+
+    await factory.connect(server);
+
+    expect(socksMod.SocksClient.createConnection).toHaveBeenCalledWith(
+      expect.objectContaining({ timeout: 42_000 })
+    );
+    expect(socket.pause).toHaveBeenCalled();
+  });
 });

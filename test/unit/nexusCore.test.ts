@@ -620,6 +620,19 @@ describe("NexusCore", () => {
     expect(listener).not.toHaveBeenCalled();
   });
 
+  it("markSessionActivity ignores unknown session ids", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    core.markSessionActivity("unknown-session");
+    expect(core.getSnapshot().activitySessionIds.size).toBe(0);
+    expect(listener).not.toHaveBeenCalled();
+  });
+
   it("unregisterSession clears activity for that session", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);
@@ -651,6 +664,106 @@ describe("NexusCore", () => {
     core.markSessionActivity("serial-1");
     core.unregisterSerialSession("serial-1");
 
+    expect(core.getSnapshot().activitySessionIds.has("serial-1")).toBe(false);
+  });
+
+  it("removeServer clears activity for removed sessions", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addOrUpdateServer({
+      id: "s1",
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      isHidden: false
+    });
+    core.registerSession({
+      id: "session-1",
+      serverId: "s1",
+      terminalName: "Nexus SSH: S1",
+      startedAt: Date.now()
+    });
+    core.markSessionActivity("session-1");
+
+    await core.removeServer("s1");
+    expect(core.getSnapshot().activitySessionIds.has("session-1")).toBe(false);
+  });
+
+  it("removeSerialProfile clears activity for removed sessions", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addOrUpdateSerialProfile({
+      id: "sp1",
+      name: "Serial 1",
+      path: "COM1",
+      baudRate: 115200,
+      dataBits: 8,
+      stopBits: 1,
+      parity: "none",
+      rtscts: false
+    });
+    core.registerSerialSession({
+      id: "serial-1",
+      profileId: "sp1",
+      terminalName: "Nexus Serial: S1",
+      startedAt: Date.now()
+    });
+    core.markSessionActivity("serial-1");
+
+    await core.removeSerialProfile("sp1");
+    expect(core.getSnapshot().activitySessionIds.has("serial-1")).toBe(false);
+  });
+
+  it("removeFolderCascade clears activity for deleted folder sessions", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addOrUpdateServer({
+      id: "s1",
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      group: "Project/DeleteMe",
+      isHidden: false
+    });
+    await core.addOrUpdateSerialProfile({
+      id: "sp1",
+      name: "Serial 1",
+      path: "COM1",
+      baudRate: 115200,
+      dataBits: 8,
+      stopBits: 1,
+      parity: "none",
+      rtscts: false,
+      group: "Project/DeleteMe"
+    });
+    core.registerSession({
+      id: "session-1",
+      serverId: "s1",
+      terminalName: "Nexus SSH: S1",
+      startedAt: Date.now()
+    });
+    core.registerSerialSession({
+      id: "serial-1",
+      profileId: "sp1",
+      terminalName: "Nexus Serial: S1",
+      startedAt: Date.now()
+    });
+    core.markSessionActivity("session-1");
+    core.markSessionActivity("serial-1");
+
+    await core.removeFolderCascade("Project/DeleteMe", true);
+
+    expect(core.getSnapshot().activitySessionIds.has("session-1")).toBe(false);
     expect(core.getSnapshot().activitySessionIds.has("serial-1")).toBe(false);
   });
 

@@ -87,11 +87,12 @@ function buildSocks5Reply(rep: number): Buffer {
   return Buffer.from([SOCKS5_VERSION, rep, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]);
 }
 
-export async function handleSocks5Handshake(socket: Socket): Promise<Socks5Target> {
+export async function handleSocks5Handshake(socket: Socket, timeoutMs?: number): Promise<Socks5Target> {
+  const effectiveTimeout = timeoutMs ?? HANDSHAKE_TIMEOUT_MS;
   socket.pause();
 
   // Phase 1: Greeting
-  const greetingHeader = await readBytes(socket, 2, HANDSHAKE_TIMEOUT_MS);
+  const greetingHeader = await readBytes(socket, 2, effectiveTimeout);
   if (greetingHeader[0] !== SOCKS5_VERSION) {
     socket.end(buildGreetingReply(AUTH_NO_ACCEPTABLE));
     throw new Error(`Invalid SOCKS5 version: ${greetingHeader[0]}`);
@@ -103,7 +104,7 @@ export async function handleSocks5Handshake(socket: Socket): Promise<Socks5Targe
     throw new Error("No authentication methods offered");
   }
 
-  const methods = await readBytes(socket, nMethods, HANDSHAKE_TIMEOUT_MS);
+  const methods = await readBytes(socket, nMethods, effectiveTimeout);
   if (!methods.includes(AUTH_NO_AUTH)) {
     socket.end(buildGreetingReply(AUTH_NO_ACCEPTABLE));
     throw new Error("No acceptable authentication method (only no-auth supported)");
@@ -112,7 +113,7 @@ export async function handleSocks5Handshake(socket: Socket): Promise<Socks5Targe
   socket.write(buildGreetingReply(AUTH_NO_AUTH));
 
   // Phase 2: Request
-  const requestHeader = await readBytes(socket, 4, HANDSHAKE_TIMEOUT_MS);
+  const requestHeader = await readBytes(socket, 4, effectiveTimeout);
   if (requestHeader[0] !== SOCKS5_VERSION) {
     socket.end(buildSocks5Reply(REP_GENERAL_FAILURE));
     throw new Error(`Invalid SOCKS5 version in request: ${requestHeader[0]}`);
@@ -128,19 +129,19 @@ export async function handleSocks5Handshake(socket: Socket): Promise<Socks5Targe
   let destAddr: string;
 
   if (atyp === ATYP_IPV4) {
-    const addrBuf = await readBytes(socket, 4, HANDSHAKE_TIMEOUT_MS);
+    const addrBuf = await readBytes(socket, 4, effectiveTimeout);
     destAddr = `${addrBuf[0]}.${addrBuf[1]}.${addrBuf[2]}.${addrBuf[3]}`;
   } else if (atyp === ATYP_DOMAIN) {
-    const lenBuf = await readBytes(socket, 1, HANDSHAKE_TIMEOUT_MS);
+    const lenBuf = await readBytes(socket, 1, effectiveTimeout);
     const domainLen = lenBuf[0];
     if (domainLen === 0) {
       socket.end(buildSocks5Reply(REP_GENERAL_FAILURE));
       throw new Error("Empty domain name");
     }
-    const domainBuf = await readBytes(socket, domainLen, HANDSHAKE_TIMEOUT_MS);
+    const domainBuf = await readBytes(socket, domainLen, effectiveTimeout);
     destAddr = domainBuf.toString("ascii");
   } else if (atyp === ATYP_IPV6) {
-    const addrBuf = await readBytes(socket, 16, HANDSHAKE_TIMEOUT_MS);
+    const addrBuf = await readBytes(socket, 16, effectiveTimeout);
     const groups: string[] = [];
     for (let i = 0; i < 16; i += 2) {
       groups.push(addrBuf.readUInt16BE(i).toString(16));
@@ -151,7 +152,7 @@ export async function handleSocks5Handshake(socket: Socket): Promise<Socks5Targe
     throw new Error(`Unsupported address type: ${atyp}`);
   }
 
-  const portBuf = await readBytes(socket, 2, HANDSHAKE_TIMEOUT_MS);
+  const portBuf = await readBytes(socket, 2, effectiveTimeout);
   const destPort = portBuf.readUInt16BE(0);
 
   return { destAddr, destPort };

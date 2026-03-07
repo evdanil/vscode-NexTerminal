@@ -2,6 +2,7 @@ import * as net from "node:net";
 import type { Duplex } from "node:stream";
 import { SocksClient } from "socks";
 import type { ServerConfig, ProxyConfig } from "../../models/config";
+import { clamp } from "../../utils/helpers";
 import type { SecretVault, SshConnection, SshFactory } from "./contracts";
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup } from "./proxiedSshConnection";
 import type { SilentAuthSshFactory } from "./silentAuth";
@@ -9,12 +10,25 @@ import { proxyPasswordSecretKey } from "./silentAuth";
 
 const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT headers
 
+function normalizeProxyTimeoutMs(timeoutMs: number): number {
+  return Number.isFinite(timeoutMs) ? clamp(Math.floor(timeoutMs), 5_000, 300_000) : 60_000;
+}
+
 export class ProxySshFactory implements SshFactory {
+  private proxyTimeoutMs: number;
+
   public constructor(
     private readonly authFactory: SilentAuthSshFactory,
     private readonly serverLookup: (id: string) => ServerConfig | undefined,
-    private readonly vault: SecretVault
-  ) {}
+    private readonly vault: SecretVault,
+    proxyTimeoutMs: number = 60_000
+  ) {
+    this.proxyTimeoutMs = normalizeProxyTimeoutMs(proxyTimeoutMs);
+  }
+
+  public updateProxyTimeout(timeoutMs: number): void {
+    this.proxyTimeoutMs = normalizeProxyTimeoutMs(timeoutMs);
+  }
 
   public async connect(server: ServerConfig): Promise<SshConnection> {
     if (!server.proxy) {
@@ -116,7 +130,8 @@ export class ProxySshFactory implements SshFactory {
       destination: {
         host: target.host,
         port: target.port
-      }
+      },
+      timeout: this.proxyTimeoutMs
     });
 
     // The socks library schedules setImmediate(() => socket.resume()) after the
@@ -225,7 +240,7 @@ export class ProxySshFactory implements SshFactory {
 
       socket.on("data", onData);
 
-      socket.setTimeout(60_000, () => {
+      socket.setTimeout(this.proxyTimeoutMs, () => {
         socket.destroy();
         reject(new Error("HTTP CONNECT proxy handshake timed out"));
       });

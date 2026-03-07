@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as readline from "node:readline";
+import { clamp } from "../../utils/helpers";
 import {
   PORT_DATA_NOTIFICATION,
   PORT_DISCONNECTED_NOTIFICATION,
@@ -19,6 +20,11 @@ type DisconnectListener = (sessionId: string, reason: string) => void;
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+function normalizeRpcTimeoutMs(timeoutMs: number): number {
+  return Number.isFinite(timeoutMs) ? clamp(Math.floor(timeoutMs), 2_000, 60_000) : 10_000;
 }
 
 export class SerialSidecarManager {
@@ -27,11 +33,19 @@ export class SerialSidecarManager {
   private readonly dataListeners = new Set<DataListener>();
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly disconnectListeners = new Set<DisconnectListener>();
+  private rpcTimeoutMs: number;
 
   public constructor(
     private readonly sidecarScriptPath: string,
-    private readonly extensionRoot?: string
-  ) {}
+    private readonly extensionRoot?: string,
+    rpcTimeoutMs: number = 10_000
+  ) {
+    this.rpcTimeoutMs = normalizeRpcTimeoutMs(rpcTimeoutMs);
+  }
+
+  public updateRpcTimeout(timeoutMs: number): void {
+    this.rpcTimeoutMs = normalizeRpcTimeoutMs(timeoutMs);
+  }
 
   public onDidReceiveData(listener: DataListener): () => void {
     this.dataListeners.add(listener);
@@ -87,6 +101,9 @@ export class SerialSidecarManager {
 
   public dispose(): void {
     for (const [, deferred] of this.pending) {
+      if (deferred.timer) {
+        clearTimeout(deferred.timer);
+      }
       deferred.reject(new Error("Serial sidecar disposed"));
     }
     this.pending.clear();
@@ -109,6 +126,9 @@ export class SerialSidecarManager {
     child.on("exit", () => {
       const error = new Error("Serial sidecar exited unexpectedly");
       for (const [, deferred] of this.pending) {
+        if (deferred.timer) {
+          clearTimeout(deferred.timer);
+        }
         deferred.reject(error);
       }
       this.pending.clear();
@@ -130,16 +150,19 @@ export class SerialSidecarManager {
     const id = randomUUID();
     const payload: RpcRequest = { id, method, params };
     const responsePromise = new Promise<unknown>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const deferred: PendingRequest = { resolve, reject };
+      deferred.timer = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (!pending) {
+          return;
+        }
+        this.pending.delete(id);
+        pending.reject(new Error(`Serial sidecar RPC timed out after ${this.rpcTimeoutMs / 1000}s (method=${method})`));
+      }, this.rpcTimeoutMs);
+      this.pending.set(id, deferred);
     });
     child.stdin.write(`${JSON.stringify(payload)}\n`);
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`Serial sidecar RPC timed out after 10s (method=${method})`));
-      }, 10_000);
-    });
-    return Promise.race([responsePromise, timeoutPromise]);
+    return responsePromise;
   }
 
   private handleMessage(line: string): void {
@@ -159,6 +182,9 @@ export class SerialSidecarManager {
         return;
       }
       this.pending.delete(payload.id);
+      if (deferred.timer) {
+        clearTimeout(deferred.timer);
+      }
       if (payload.error) {
         deferred.reject(new Error(payload.error.message));
         return;

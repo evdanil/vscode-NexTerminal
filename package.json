@@ -2617,6 +2617,114 @@
           "maximum": 200,
           "order": 23,
           "markdownDescription": "Maximum file size (in MB) that can be opened in the editor by clicking in the File Explorer. Larger files can still be downloaded via the right-click menu."
+        },
+        "nexus.ssh.connectionTimeout": {
+          "type": "number",
+          "default": 60,
+          "minimum": 5,
+          "maximum": 300,
+          "order": 5.4,
+          "markdownDescription": "SSH connection timeout in seconds. Increase for slow or high-latency networks."
+        },
+        "nexus.ssh.keepaliveInterval": {
+          "type": "number",
+          "default": 10,
+          "minimum": 0,
+          "maximum": 300,
+          "order": 5.5,
+          "markdownDescription": "Interval in seconds between SSH keepalive packets. Set to `0` to disable keepalives."
+        },
+        "nexus.ssh.keepaliveCountMax": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 30,
+          "order": 5.6,
+          "markdownDescription": "Number of missed keepalive responses before the connection is considered dead."
+        },
+        "nexus.ssh.terminalType": {
+          "type": "string",
+          "default": "xterm-256color",
+          "enum": [
+            "xterm-256color",
+            "xterm",
+            "vt100",
+            "vt220",
+            "dumb"
+          ],
+          "order": 5.7,
+          "markdownDescription": "Terminal type (`$TERM`) reported to the remote server.",
+          "enumDescriptions": [
+            "Full 256-color xterm emulation (recommended)",
+            "Standard xterm emulation",
+            "DEC VT100 terminal",
+            "DEC VT220 terminal",
+            "Minimal terminal with no special capabilities"
+          ]
+        },
+        "nexus.ssh.proxyTimeout": {
+          "type": "number",
+          "default": 60,
+          "minimum": 5,
+          "maximum": 300,
+          "order": 5.8,
+          "markdownDescription": "Timeout in seconds for proxy handshake (SOCKS5 or HTTP CONNECT) when connecting through a proxy."
+        },
+        "nexus.sftp.commandTimeout": {
+          "type": "number",
+          "default": 300,
+          "minimum": 10,
+          "maximum": 3600,
+          "order": 24,
+          "markdownDescription": "Timeout in seconds for remote SFTP commands (e.g. server-side copy). Increase for slow servers or large operations."
+        },
+        "nexus.sftp.deleteDepthLimit": {
+          "type": "number",
+          "default": 100,
+          "minimum": 10,
+          "maximum": 500,
+          "order": 25,
+          "markdownDescription": "⚠ **Safety limit** — Maximum directory nesting depth for recursive delete operations."
+        },
+        "nexus.sftp.deleteOperationLimit": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 100,
+          "maximum": 100000,
+          "order": 26,
+          "markdownDescription": "⚠ **Safety limit** — Maximum number of files and directories that can be deleted in a single recursive delete."
+        },
+        "nexus.tunnel.socks5HandshakeTimeout": {
+          "type": "number",
+          "default": 10,
+          "minimum": 2,
+          "maximum": 60,
+          "order": 5.06,
+          "markdownDescription": "Timeout in seconds for the SOCKS5 proxy handshake on dynamic tunnels."
+        },
+        "nexus.terminal.macros.defaultCooldown": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 300,
+          "order": 9.1,
+          "markdownDescription": "Default cooldown in seconds between auto-trigger firings on the same terminal. Individual macros can override this with `triggerCooldown`."
+        },
+        "nexus.terminal.macros.bufferLength": {
+          "type": "number",
+          "default": 2048,
+          "minimum": 256,
+          "maximum": 16384,
+          "order": 9.2,
+          "markdownDescription": "Maximum number of characters kept in the auto-trigger prompt buffer per terminal. Larger values allow matching against more terminal output."
+        },
+        "nexus.serial.rpcTimeout": {
+          "type": "number",
+          "default": 10,
+          "minimum": 2,
+          "maximum": 60,
+          "order": 30,
+          "markdownDescription": "Timeout in seconds for commands sent to the serial port sidecar process."
         }
       }
     }

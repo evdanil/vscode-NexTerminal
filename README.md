@@ -23,7 +23,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 
   All modes support configurable local bind addresses (localhost, LAN, or all interfaces), auto-start/auto-stop with server connections, live traffic counters, and a browser URL shortcut for quick access.
 - **SSH Connection Multiplexing** — Share SSH connections across terminals, tunnels, and SFTP for the same server. Reduces connection overhead with automatic ref-counting and configurable idle timeout. Per-server toggle lets you disable multiplexing for devices that don't support multiple channels (e.g. Cisco). Automatic fallback to standalone connections handles channel failures transparently.
-- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized into nested folders. Built-in filter to quickly search by name. Drag and drop to rearrange profiles, move between folders, or assign tunnels to servers.
+- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized into nested folders. Built-in filter to quickly search by name. Drag and drop to rearrange profiles, move between folders, or assign tunnels to servers. Active SSH and serial sessions highlight unread terminal activity until you focus that terminal again.
 - **Terminal Appearance** — Customize terminal font family, size, and weight. Import color schemes from MobaXterm INI files or configure custom themes with live preview.
 - **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH and serial terminal output. 20+ built-in rules detect errors, warnings, status keywords, IP/MAC addresses, UUIDs, URLs, interface counters and more with inline ANSI colouring while respecting existing remote colours. Includes a visual Rule Editor with live preview, color picker, and one-click reset to defaults.
 - **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign any macro a custom keybinding from 108 combinations across three modifier groups: `Alt`, `Alt+Shift`, and `Ctrl+Shift` with A-Z or 0-9 keys. Macros without a keybinding are accessible via `Alt+S` quick-pick. Includes a Macro Editor panel with multiline editing, secret macro support, and inline keybinding assignment. **Auto-trigger (expect/send)**: add a `triggerPattern` regex to any macro — when terminal output matches, the macro text is sent automatically. Classic expect/send for password prompts, confirmations, and interactive scripts. `triggerCooldown` prevents echo loops, `triggerInterval` enables prompt-gated polling macros, and macros can optionally start with auto-trigger paused until you resume them from the Macros view.
@@ -129,17 +129,30 @@ npm run package:vsix
 | `nexus.ssh.multiplexing.enabled` | `true` | Share SSH connections across terminals, tunnels, and SFTP |
 | `nexus.ssh.multiplexing.idleTimeout` | `300` | Seconds to keep idle multiplexed connection alive |
 | `nexus.ssh.trustNewHosts` | `true` | Auto-trust host keys on first connection (TOFU); prompt only on key change |
+| `nexus.ssh.connectionTimeout` | `60` | SSH connection timeout in seconds |
+| `nexus.ssh.keepaliveInterval` | `10` | Interval between SSH keepalive packets in seconds (`0` disables keepalives) |
+| `nexus.ssh.keepaliveCountMax` | `3` | Missed keepalive responses before the connection is treated as dead |
+| `nexus.ssh.terminalType` | `xterm-256color` | `$TERM` value reported to the remote shell |
+| `nexus.ssh.proxyTimeout` | `60` | Proxy handshake timeout for SOCKS5 and HTTP CONNECT proxies |
 | `nexus.tunnel.defaultConnectionMode` | `shared` | `shared` or `isolated` SSH mode for tunnels |
 | `nexus.tunnel.defaultBindAddress` | `127.0.0.1` | Default bind address for reverse tunnels |
+| `nexus.tunnel.socks5HandshakeTimeout` | `10` | Dynamic tunnel SOCKS5 handshake timeout in seconds |
 | `nexus.terminal.openLocation` | `panel` | Where to open terminals: `panel` or `editor` tab |
 | `nexus.terminal.keyboardPassthrough` | `false` | Pass Ctrl+ key combinations to the terminal |
 | `nexus.terminal.passthroughKeys` | `[b,e,g,j,k,n,o,p,r,w]` | Which Ctrl+ keys to pass through when enabled |
 | `nexus.terminal.macros` | `[]` | Terminal macros with optional `keybinding`, `triggerPattern`, `triggerCooldown`, `triggerInterval`, and `triggerInitiallyDisabled` |
 | `nexus.terminal.macros.autoTrigger` | `true` | Enable auto-trigger for macros with a `triggerPattern` |
+| `nexus.terminal.macros.defaultCooldown` | `3` | Default cooldown in seconds for auto-trigger macros without a per-macro override |
+| `nexus.terminal.macros.bufferLength` | `2048` | Max characters retained per terminal for auto-trigger pattern matching |
 | `nexus.terminal.highlighting.enabled` | `true` | Enable regex-based terminal highlighting |
+| `nexus.ui.showTreeDescriptions` | `true` | Show connection details beside items in the Connectivity Hub |
 | `nexus.sftp.cacheTtlSeconds` | `10` | SFTP directory listing cache TTL |
 | `nexus.sftp.maxCacheEntries` | `500` | Maximum cached SFTP directory listings |
 | `nexus.sftp.autoRefreshInterval` | `10` | Auto-refresh interval for file explorer (seconds) |
+| `nexus.sftp.commandTimeout` | `300` | Timeout for remote SFTP-side shell commands such as server-side copy |
+| `nexus.sftp.deleteDepthLimit` | `100` | Safety limit for recursive delete directory depth |
+| `nexus.sftp.deleteOperationLimit` | `10000` | Safety limit for items removed by one recursive delete |
+| `nexus.serial.rpcTimeout` | `10` | Timeout for serial sidecar commands in seconds |
 
 ## Documentation
 

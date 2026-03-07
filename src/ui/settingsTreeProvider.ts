@@ -157,7 +157,7 @@ export class SettingsTreeProvider
   private getRootItems(): SettingsTreeItem[] {
     const items: SettingsTreeItem[] = [];
 
-    // 6 setting categories
+    // Setting categories
     for (const cat of CATEGORY_ORDER) {
       items.push(new SettingsCategoryItem(cat));
     }

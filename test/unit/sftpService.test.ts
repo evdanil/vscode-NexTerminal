@@ -174,6 +174,31 @@ describe("SftpService", () => {
     expect(sftp.readdir).toHaveBeenCalledTimes(4);
   });
 
+  it("enforces a lower cache size immediately after config updates", async () => {
+    await service.connect(testServer);
+
+    sftp.readdir.mockImplementation((_path: string, cb: Function) => {
+      cb(null, []);
+    });
+
+    for (let index = 0; index < 11; index += 1) {
+      await service.readDirectory("srv-1", `/dir-${index}`);
+    }
+
+    service.updateConfig({
+      cacheTtlMs: 10_000,
+      maxCacheEntries: 10,
+      commandTimeoutMs: 300_000,
+      maxDeleteDepth: 100,
+      maxDeleteOps: 10_000
+    });
+
+    await service.readDirectory("srv-1", "/dir-10");
+    await service.readDirectory("srv-1", "/dir-0");
+
+    expect(sftp.readdir).toHaveBeenCalledTimes(12);
+  });
+
   it("stat resolves file stats", async () => {
     await service.connect(testServer);
 

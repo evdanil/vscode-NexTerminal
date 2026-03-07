@@ -3,9 +3,11 @@ export interface SettingMeta {
   section: string;
   label: string;
   type: "boolean" | "number" | "string" | "enum" | "directory" | "multi-checkbox";
-  category: "logging" | "ssh" | "tunnels" | "terminal" | "ui" | "sftp";
+  category: "logging" | "ssh" | "tunnels" | "terminal" | "ui" | "sftp" | "serial";
   description?: string;
   badge?: string;
+  badgeClass?: string;
+  default?: number | string | boolean;
   enumOptions?: Array<{ label: string; value: string; description?: string; recommended?: boolean }>;
   checkboxOptions?: Array<{ label: string; value: string }>;
   min?: number;
@@ -85,6 +87,73 @@ export const SETTINGS_META: SettingMeta[] = [
     subgroup: "Security",
     description: "Trust-On-First-Use: auto-accept host keys on first connection. Only prompt when a key changes (possible MITM)."
   },
+  // --- SSH > Advanced ---
+  {
+    key: "connectionTimeout",
+    section: "nexus.ssh",
+    label: "Connection Timeout",
+    type: "number",
+    category: "ssh",
+    subgroup: "Advanced",
+    description: "SSH connection timeout. Increase for slow or high-latency networks.",
+    min: 5,
+    max: 300,
+    unit: "seconds",
+    default: 60
+  },
+  {
+    key: "keepaliveInterval",
+    section: "nexus.ssh",
+    label: "Keepalive Interval",
+    type: "number",
+    category: "ssh",
+    subgroup: "Advanced",
+    description: "Interval between SSH keepalive packets. Set to 0 to disable.",
+    min: 0,
+    max: 300,
+    unit: "seconds",
+    default: 10
+  },
+  {
+    key: "keepaliveCountMax",
+    section: "nexus.ssh",
+    label: "Missed Keepalive Limit",
+    type: "number",
+    category: "ssh",
+    subgroup: "Advanced",
+    description: "Number of missed keepalive responses before the connection is considered dead.",
+    min: 1,
+    max: 30,
+    default: 3
+  },
+  {
+    key: "terminalType",
+    section: "nexus.ssh",
+    label: "Terminal Type",
+    type: "enum",
+    category: "ssh",
+    subgroup: "Advanced",
+    enumOptions: [
+      { label: "xterm-256color", value: "xterm-256color", description: "Full 256-color xterm emulation", recommended: true },
+      { label: "xterm", value: "xterm", description: "Standard xterm emulation" },
+      { label: "vt100", value: "vt100", description: "DEC VT100 terminal" },
+      { label: "vt220", value: "vt220", description: "DEC VT220 terminal" },
+      { label: "dumb", value: "dumb", description: "Minimal terminal" }
+    ]
+  },
+  {
+    key: "proxyTimeout",
+    section: "nexus.ssh",
+    label: "Proxy Handshake Timeout",
+    type: "number",
+    category: "ssh",
+    subgroup: "Advanced",
+    description: "Timeout for proxy handshake (SOCKS5 or HTTP CONNECT).",
+    min: 5,
+    max: 300,
+    unit: "seconds",
+    default: 60
+  },
   // --- Tunnels ---
   {
     key: "defaultConnectionMode",
@@ -104,6 +173,20 @@ export const SETTINGS_META: SettingMeta[] = [
     type: "string",
     category: "tunnels",
     description: "Default bind address for reverse tunnels. Use 127.0.0.1 for local-only or 0.0.0.0 for all interfaces (requires GatewayPorts on server)."
+  },
+  // --- Tunnels > Advanced ---
+  {
+    key: "socks5HandshakeTimeout",
+    section: "nexus.tunnel",
+    label: "SOCKS5 Handshake Timeout",
+    type: "number",
+    category: "tunnels",
+    subgroup: "Advanced",
+    description: "Timeout for the SOCKS5 proxy handshake on dynamic tunnels.",
+    min: 2,
+    max: 60,
+    unit: "seconds",
+    default: 10
   },
   // --- Terminal ---
   {
@@ -201,6 +284,49 @@ export const SETTINGS_META: SettingMeta[] = [
     max: 200,
     unit: "MB"
   },
+  // --- SFTP > Advanced ---
+  {
+    key: "commandTimeout",
+    section: "nexus.sftp",
+    label: "Remote Command Timeout",
+    type: "number",
+    category: "sftp",
+    subgroup: "Advanced",
+    description: "Timeout for remote SFTP commands (e.g. server-side copy). Increase for slow servers.",
+    min: 10,
+    max: 3600,
+    unit: "seconds",
+    default: 300
+  },
+  {
+    key: "deleteDepthLimit",
+    section: "nexus.sftp",
+    label: "Delete Depth Limit",
+    type: "number",
+    category: "sftp",
+    subgroup: "Advanced",
+    description: "Maximum directory nesting depth for recursive delete operations.",
+    min: 10,
+    max: 500,
+    unit: "levels",
+    default: 100,
+    badge: "Safety limit",
+    badgeClass: "setting-badge-safety"
+  },
+  {
+    key: "deleteOperationLimit",
+    section: "nexus.sftp",
+    label: "Delete Operation Limit",
+    type: "number",
+    category: "sftp",
+    subgroup: "Advanced",
+    description: "Maximum number of files and directories in a single recursive delete.",
+    min: 100,
+    max: 100000,
+    default: 10000,
+    badge: "Safety limit",
+    badgeClass: "setting-badge-safety"
+  },
   // --- Highlighting ---
   {
     key: "enabled",
@@ -210,10 +336,50 @@ export const SETTINGS_META: SettingMeta[] = [
     category: "terminal",
     subgroup: "Highlighting",
     description: "Enable regex-based pattern highlighting in terminal output."
+  },
+  // --- Terminal > Macro Auto-Trigger ---
+  {
+    key: "defaultCooldown",
+    section: "nexus.terminal.macros",
+    label: "Default Trigger Cooldown",
+    type: "number",
+    category: "terminal",
+    subgroup: "Macro Auto-Trigger",
+    description: "Default cooldown between auto-trigger firings on the same terminal. Individual macros can override this.",
+    min: 0,
+    max: 300,
+    unit: "seconds",
+    default: 3
+  },
+  {
+    key: "bufferLength",
+    section: "nexus.terminal.macros",
+    label: "Prompt Buffer Size",
+    type: "number",
+    category: "terminal",
+    subgroup: "Macro Auto-Trigger",
+    description: "Maximum characters kept in the auto-trigger prompt buffer per terminal.",
+    min: 256,
+    max: 16384,
+    unit: "characters",
+    default: 2048
+  },
+  // --- Serial ---
+  {
+    key: "rpcTimeout",
+    section: "nexus.serial",
+    label: "Command Timeout",
+    type: "number",
+    category: "serial",
+    description: "Timeout for commands sent to the serial port sidecar process.",
+    min: 2,
+    max: 60,
+    unit: "seconds",
+    default: 10
   }
 ];
 
-export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "ui", "sftp"] as const;
+export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial"] as const;
 
 export const CATEGORY_LABELS: Record<string, string> = {
   logging: "Logging",
@@ -221,7 +387,8 @@ export const CATEGORY_LABELS: Record<string, string> = {
   tunnels: "Tunnels",
   terminal: "Terminal",
   ui: "Interface",
-  sftp: "SFTP / File Explorer"
+  sftp: "SFTP / File Explorer",
+  serial: "Serial"
 };
 
 export const CATEGORY_ICONS: Record<string, string> = {
@@ -230,7 +397,8 @@ export const CATEGORY_ICONS: Record<string, string> = {
   tunnels: "plug",
   terminal: "terminal",
   ui: "layout",
-  sftp: "folder-opened"
+  sftp: "folder-opened",
+  serial: "circuit-board"
 };
 
 export function formatSettingValueForTree(meta: SettingMeta, rawValue: unknown): string {

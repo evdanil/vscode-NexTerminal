@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { createAnsiRegex } from "../utils/ansi";
+import { clamp } from "../utils/helpers";
 import type { TerminalMacro } from "../models/terminalMacro";
 
 const MAX_INPUT_LENGTH = 8192;
@@ -10,6 +11,14 @@ const CONTROL_CHARS_RE = /[\x00-\x08\x0b-\x1f\x7f]/g;
 export interface PtyOutputObserver {
   onOutput(text: string): void;
   dispose(): void;
+}
+
+function clampSeconds(value: number | undefined, fallback: number, min: number, max: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? clamp(value, min, max) : fallback;
+}
+
+function clampLength(value: number | undefined, fallback: number, min: number, max: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? clamp(Math.floor(value), min, max) : fallback;
 }
 
 interface CompiledTriggerRule {
@@ -29,6 +38,8 @@ interface ObserverState {
 export class MacroAutoTrigger {
   private rules: CompiledTriggerRule[] = [];
   private enabled = true;
+  private defaultCooldownMs = DEFAULT_TRIGGER_COOLDOWN * 1000;
+  private maxBufferLength = MAX_BUFFER_LENGTH;
   private readonly defaultDisabledIndexes = new Set<number>();
   private readonly disabledIndexes = new Set<number>();
   private readonly enabledIndexes = new Set<number>();
@@ -41,9 +52,20 @@ export class MacroAutoTrigger {
   public reload(): void {
     const macroConfig = vscode.workspace.getConfiguration("nexus.terminal");
     const macros = macroConfig.get<TerminalMacro[]>("macros", []);
-    this.enabled = vscode.workspace
-      .getConfiguration("nexus.terminal.macros")
-      .get<boolean>("autoTrigger", true);
+    const macrosConfig = vscode.workspace.getConfiguration("nexus.terminal.macros");
+    this.enabled = macrosConfig.get<boolean>("autoTrigger", true);
+    this.defaultCooldownMs = clampSeconds(
+      macrosConfig.get<number>("defaultCooldown", DEFAULT_TRIGGER_COOLDOWN),
+      DEFAULT_TRIGGER_COOLDOWN,
+      0,
+      300
+    ) * 1000;
+    this.maxBufferLength = clampLength(
+      macrosConfig.get<number>("bufferLength", MAX_BUFFER_LENGTH),
+      MAX_BUFFER_LENGTH,
+      256,
+      16384
+    );
 
     this.rules = [];
     this.defaultDisabledIndexes.clear();
@@ -59,7 +81,9 @@ export class MacroAutoTrigger {
         const rule: CompiledTriggerRule = {
           regex,
           macroText: macro.text,
-          cooldownMs: (macro.triggerCooldown ?? DEFAULT_TRIGGER_COOLDOWN) * 1000,
+          cooldownMs: macro.triggerCooldown != null
+            ? clampSeconds(macro.triggerCooldown, DEFAULT_TRIGGER_COOLDOWN, 0, 300) * 1000
+            : this.defaultCooldownMs,
           intervalMs:
             typeof macro.triggerInterval === "number" && macro.triggerInterval > 0
               ? macro.triggerInterval * 1000
@@ -255,8 +279,8 @@ export class MacroAutoTrigger {
         stripped = stripped.replace(CONTROL_CHARS_RE, "");
 
         buffer += stripped;
-        if (buffer.length > MAX_BUFFER_LENGTH) {
-          buffer = buffer.slice(buffer.length - MAX_BUFFER_LENGTH);
+        if (buffer.length > this.maxBufferLength) {
+          buffer = buffer.slice(buffer.length - this.maxBufferLength);
         }
         evaluate();
       },

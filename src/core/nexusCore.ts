@@ -143,11 +143,7 @@ export class NexusCore {
 
   public async removeServer(serverId: string): Promise<void> {
     this.servers.delete(serverId);
-    for (const [sessionId, session] of this.activeSessions.entries()) {
-      if (session.serverId === serverId) {
-        this.activeSessions.delete(sessionId);
-      }
-    }
+    this.removeServerSessions(serverId);
     await this.repository.saveServers([...this.servers.values()]);
     this.emitChanged();
   }
@@ -166,11 +162,7 @@ export class NexusCore {
 
   public async removeSerialProfile(profileId: string): Promise<void> {
     this.serialProfiles.delete(profileId);
-    for (const [sessionId, session] of this.activeSerialSessions.entries()) {
-      if (session.profileId === profileId) {
-        this.activeSerialSessions.delete(sessionId);
-      }
-    }
+    this.removeSerialProfileSessions(profileId);
     await this.repository.saveSerialProfiles([...this.serialProfiles.values()]);
     this.emitChanged();
   }
@@ -232,7 +224,7 @@ export class NexusCore {
   }
 
   public markSessionActivity(sessionId: string): void {
-    if (this.activitySessionIds.has(sessionId)) {
+    if (!this.hasSession(sessionId) || this.activitySessionIds.has(sessionId)) {
       return;
     }
     this.activitySessionIds.add(sessionId);
@@ -308,21 +300,13 @@ export class NexusCore {
       for (const [id, server] of this.servers.entries()) {
         if (server.group && isDescendantOrSelf(server.group, path)) {
           this.servers.delete(id);
-          for (const [sessionId, session] of this.activeSessions.entries()) {
-            if (session.serverId === id) {
-              this.activeSessions.delete(sessionId);
-            }
-          }
+          this.removeServerSessions(id);
         }
       }
       for (const [id, profile] of this.serialProfiles.entries()) {
         if (profile.group && isDescendantOrSelf(profile.group, path)) {
           this.serialProfiles.delete(id);
-          for (const [sessionId, session] of this.activeSerialSessions.entries()) {
-            if (session.profileId === id) {
-              this.activeSerialSessions.delete(sessionId);
-            }
-          }
+          this.removeSerialProfileSessions(id);
         }
       }
     } else {
@@ -426,6 +410,28 @@ export class NexusCore {
     const snapshot = this.getSnapshot();
     for (const listener of this.listeners) {
       listener(snapshot);
+    }
+  }
+
+  private hasSession(sessionId: string): boolean {
+    return this.activeSessions.has(sessionId) || this.activeSerialSessions.has(sessionId);
+  }
+
+  private removeServerSessions(serverId: string): void {
+    for (const [sessionId, session] of this.activeSessions.entries()) {
+      if (session.serverId === serverId) {
+        this.activeSessions.delete(sessionId);
+        this.activitySessionIds.delete(sessionId);
+      }
+    }
+  }
+
+  private removeSerialProfileSessions(profileId: string): void {
+    for (const [sessionId, session] of this.activeSerialSessions.entries()) {
+      if (session.profileId === profileId) {
+        this.activeSerialSessions.delete(sessionId);
+        this.activitySessionIds.delete(sessionId);
+      }
     }
   }
 }

@@ -18,11 +18,12 @@ import { MacroAutoTrigger } from "../../src/services/macroAutoTrigger";
 
 function setConfig(
   macros: Array<Record<string, unknown>>,
-  autoTrigger = true
+  autoTrigger = true,
+  macroSettings: Record<string, unknown> = {}
 ): void {
   mockConfig = {
     "nexus.terminal": { macros },
-    "nexus.terminal.macros": { autoTrigger }
+    "nexus.terminal.macros": { autoTrigger, ...macroSettings }
   };
 }
 
@@ -208,6 +209,51 @@ describe("MacroAutoTrigger", () => {
     // Buffer is now capped at 2048 from the end — all x's
 
     // MARKER at end of a new chunk should still work (appended to trimmed buffer)
+    obs.onOutput("MARKER");
+    flush();
+    expect(sent).toEqual(["found\n"]);
+    obs.dispose();
+  });
+
+  it("uses the configured default cooldown when macros do not override it", () => {
+    setConfig(
+      [{ name: "pw", text: "secret\n", triggerPattern: "Password:" }],
+      true,
+      { defaultCooldown: 10 }
+    );
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("Password:");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+
+    obs.onOutput("Password:");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+
+    vi.advanceTimersByTime(10_000);
+    obs.onOutput("Password:");
+    flush();
+    expect(sent).toEqual(["secret\n", "secret\n"]);
+    obs.dispose();
+  });
+
+  it("uses the configured buffer length when trimming prompt history", () => {
+    setConfig(
+      [{ name: "end", text: "found\n", triggerPattern: "MARKER$" }],
+      true,
+      { bufferLength: 256 }
+    );
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("MARKER" + "x".repeat(300));
+    flush();
+    expect(sent).toEqual([]);
+
     obs.onOutput("MARKER");
     flush();
     expect(sent).toEqual(["found\n"]);

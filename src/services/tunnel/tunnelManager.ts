@@ -2,6 +2,7 @@ import * as net from "node:net";
 import { randomUUID } from "node:crypto";
 import type { ActiveTunnel, ResolvedTunnelConnectionMode, ServerConfig, TunnelProfile, TunnelType } from "../../models/config";
 import { resolveTunnelType } from "../../models/config";
+import { clamp } from "../../utils/helpers";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
 import { handleSocks5Handshake, sendSocks5Failure, sendSocks5Success, Socks5HandshakeAbortedError } from "./socks5";
 
@@ -45,16 +46,28 @@ function closeServer(server: net.Server): Promise<void> {
   });
 }
 
+function normalizeSocks5HandshakeTimeoutMs(timeoutMs: number): number {
+  return Number.isFinite(timeoutMs) ? clamp(Math.floor(timeoutMs), 2_000, 60_000) : 10_000;
+}
+
 export class TunnelManager {
   private readonly listeners = new Set<TunnelListener>();
   private readonly activeTunnels = new Map<string, ActiveTunnelRuntime>();
   private readonly activeByProfile = new Map<string, string>();
   private trafficTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private socks5HandshakeTimeoutMs: number;
 
   public constructor(
     private readonly sharedFactory: SshFactory,
-    private readonly isolatedFactory: SshFactory
-  ) {}
+    private readonly isolatedFactory: SshFactory,
+    socks5HandshakeTimeoutMs: number = 10_000
+  ) {
+    this.socks5HandshakeTimeoutMs = normalizeSocks5HandshakeTimeoutMs(socks5HandshakeTimeoutMs);
+  }
+
+  public updateSocks5HandshakeTimeout(timeoutMs: number): void {
+    this.socks5HandshakeTimeoutMs = normalizeSocks5HandshakeTimeoutMs(timeoutMs);
+  }
 
   public onDidChange(listener: TunnelListener): () => void {
     this.listeners.add(listener);
@@ -450,7 +463,7 @@ export class TunnelManager {
 
     try {
       // SOCKS5 handshake to determine destination
-      const target = await handleSocks5Handshake(socket);
+      const target = await handleSocks5Handshake(socket, this.socks5HandshakeTimeoutMs);
 
       if (useSharedConnection) {
         sshConnection = await this.getOrCreateSharedConnection(runtime, activeTunnelId);

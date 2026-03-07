@@ -36,7 +36,8 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly logger: SessionLogger,
     private readonly transcript?: SessionTranscript,
     private readonly highlighter?: TerminalHighlighter,
-    private readonly outputObserver?: PtyOutputObserver
+    private readonly outputObserver?: PtyOutputObserver,
+    private readonly terminalType: string = "xterm-256color"
   ) {}
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
@@ -151,7 +152,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       }
 
       const stream = await connection.openShell({
-        term: "xterm-256color",
+        term: this.terminalType,
         rows: dimensions?.rows,
         cols: dimensions?.columns
       });

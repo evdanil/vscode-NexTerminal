@@ -23,9 +23,6 @@ import {
 } from "../utils/folderPaths";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 
-/** @deprecated Use FolderTreeItem */
-const GroupTreeItem = FolderTreeItem;
-
 async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
   if (servers.length === 0) {
@@ -412,6 +409,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
       const triggerObserver = ctx.macroAutoTrigger.createObserver(
         (text) => ptyRef?.handleInput(text)
       );
+      const terminalType = vscode.workspace.getConfiguration("nexus.ssh").get<string>("terminalType", "xterm-256color");
       const pty = new SshPty(
         server,
         ctx.sshFactory,
@@ -473,7 +471,8 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
           server.logSession ?? getDefaultSessionTranscriptsEnabled()
         ),
         ctx.highlighter,
-        triggerObserver
+        triggerObserver,
+        terminalType
       );
       ptyRef = pty;
       const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";

@@ -35,6 +35,42 @@ describe("buildConnectConfig", () => {
     expect((config as any).algorithms).toBe(LEGACY_ALGORITHMS);
   });
 
+  it("applies custom connection options", async () => {
+    const config = await buildConnectConfig(
+      makeServer(),
+      "password123",
+      undefined,
+      undefined,
+      {
+        readyTimeoutMs: 12_000,
+        keepaliveIntervalMs: 0,
+        keepaliveCountMax: 7
+      }
+    );
+
+    expect(config.readyTimeout).toBe(12_000);
+    expect(config.keepaliveInterval).toBe(0);
+    expect(config.keepaliveCountMax).toBe(7);
+  });
+
+  it("clamps connection options to safe runtime bounds", async () => {
+    const config = await buildConnectConfig(
+      makeServer(),
+      "password123",
+      undefined,
+      undefined,
+      {
+        readyTimeoutMs: 1,
+        keepaliveIntervalMs: -5,
+        keepaliveCountMax: 999
+      }
+    );
+
+    expect(config.readyTimeout).toBe(5_000);
+    expect(config.keepaliveInterval).toBe(0);
+    expect(config.keepaliveCountMax).toBe(30);
+  });
+
   it("LEGACY_ALGORITHMS contains expected algorithm families", () => {
     expect(LEGACY_ALGORITHMS.kex.append).toContain("diffie-hellman-group1-sha1");
     expect(LEGACY_ALGORITHMS.cipher.append).toContain("3des-cbc");

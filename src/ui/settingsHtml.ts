@@ -21,11 +21,15 @@ function renderToggle(meta: SettingMeta, value: boolean): string {
 
 function renderNumber(meta: SettingMeta, value: number): string {
   const unitHtml = meta.unit ? `<span class="unit-suffix">${escapeHtml(meta.unit)}</span>` : "";
+  const defaultSuffix = meta.default != null ? `, default: ${meta.default}` : "";
   const rangeHtml = (meta.min != null || meta.max != null)
-    ? `<span class="range-hint">(${meta.min ?? "\u2026"}\u2013${meta.max ?? "\u2026"})</span>`
+    ? `<span class="range-hint">(${meta.min ?? "\u2026"}\u2013${meta.max ?? "\u2026"}${defaultSuffix})</span>`
+    : "";
+  const badgeHtml = meta.badge
+    ? ` <span class="setting-badge${meta.badgeClass ? ` ${meta.badgeClass}` : ""}">${escapeHtml(meta.badge)}</span>`
     : "";
   return `<div class="form-group"${visibleWhenAttrs(meta)}>
-  <label>${escapeHtml(meta.label)}${meta.badge ? ` <span class="setting-badge">${escapeHtml(meta.badge)}</span>` : ""}</label>
+  <label>${escapeHtml(meta.label)}${badgeHtml}</label>
   ${meta.description ? `<div class="setting-desc">${escapeHtml(meta.description)}</div>` : ""}
   <div class="number-with-unit">
     <input type="number" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}" value="${value}" min="${meta.min ?? ""}" max="${meta.max ?? ""}" />
@@ -250,6 +254,10 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
     }
     .setting-badge:hover {
       opacity: 0.85;
+    }
+    .setting-badge-safety {
+      background: var(--vscode-inputValidation-warningBackground, rgba(200, 150, 0, 0.15));
+      color: var(--vscode-editorWarning-foreground, #cca700);
     }
     .number-with-unit {
       display: flex;

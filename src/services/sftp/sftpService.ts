@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import type { SFTPWrapper, FileEntry, Stats } from "ssh2";
 import type { ServerConfig } from "../../models/config";
+import { clamp } from "../../utils/helpers";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
 
 export interface DirectoryEntry {
@@ -24,8 +25,15 @@ interface CacheEntry {
 
 const DEFAULT_CACHE_TTL_MS = 10_000;
 const DEFAULT_MAX_CACHE_ENTRIES = 500;
+const DEFAULT_COMMAND_TIMEOUT_MS = 300_000;
 const MAX_DELETE_DEPTH = 100;
 const MAX_DELETE_OPS = 10_000;
+
+function normalizeConfigValue(value: number | undefined, fallback: number, min: number, max: number): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? clamp(Math.floor(value), min, max)
+    : fallback;
+}
 
 function toDirectoryEntry(entry: FileEntry): DirectoryEntry {
   const attrs = entry.attrs;
@@ -72,9 +80,12 @@ function cacheKey(serverId: string, remotePath: string): string {
   return `${serverId}:${remotePath}`;
 }
 
-export interface SftpCacheConfig {
+export interface SftpServiceConfig {
   cacheTtlMs: number;
   maxCacheEntries: number;
+  commandTimeoutMs?: number;
+  maxDeleteDepth?: number;
+  maxDeleteOps?: number;
 }
 
 export class SftpService {
@@ -84,15 +95,31 @@ export class SftpService {
   private readonly pending = new Map<string, Promise<void>>();
   private cacheTtlMs: number;
   private maxCacheEntries: number;
+  private commandTimeoutMs: number;
+  private maxDeleteDepth: number;
+  private maxDeleteOps: number;
 
-  public constructor(private readonly sshFactory: SshFactory, cacheConfig?: SftpCacheConfig) {
-    this.cacheTtlMs = cacheConfig?.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
-    this.maxCacheEntries = cacheConfig?.maxCacheEntries ?? DEFAULT_MAX_CACHE_ENTRIES;
+  public constructor(private readonly sshFactory: SshFactory, config?: SftpServiceConfig) {
+    this.cacheTtlMs = normalizeConfigValue(config?.cacheTtlMs, DEFAULT_CACHE_TTL_MS, 0, 300_000);
+    this.maxCacheEntries = normalizeConfigValue(config?.maxCacheEntries, DEFAULT_MAX_CACHE_ENTRIES, 10, 5_000);
+    this.commandTimeoutMs = normalizeConfigValue(config?.commandTimeoutMs, DEFAULT_COMMAND_TIMEOUT_MS, 10_000, 3_600_000);
+    this.maxDeleteDepth = normalizeConfigValue(config?.maxDeleteDepth, MAX_DELETE_DEPTH, 10, 500);
+    this.maxDeleteOps = normalizeConfigValue(config?.maxDeleteOps, MAX_DELETE_OPS, 100, 100_000);
   }
 
-  public updateCacheConfig(config: SftpCacheConfig): void {
-    this.cacheTtlMs = config.cacheTtlMs;
-    this.maxCacheEntries = config.maxCacheEntries;
+  public updateConfig(config: SftpServiceConfig): void {
+    this.cacheTtlMs = normalizeConfigValue(config.cacheTtlMs, DEFAULT_CACHE_TTL_MS, 0, 300_000);
+    this.maxCacheEntries = normalizeConfigValue(config.maxCacheEntries, DEFAULT_MAX_CACHE_ENTRIES, 10, 5_000);
+    if (config.commandTimeoutMs != null) {
+      this.commandTimeoutMs = normalizeConfigValue(config.commandTimeoutMs, DEFAULT_COMMAND_TIMEOUT_MS, 10_000, 3_600_000);
+    }
+    if (config.maxDeleteDepth != null) {
+      this.maxDeleteDepth = normalizeConfigValue(config.maxDeleteDepth, MAX_DELETE_DEPTH, 10, 500);
+    }
+    if (config.maxDeleteOps != null) {
+      this.maxDeleteOps = normalizeConfigValue(config.maxDeleteOps, MAX_DELETE_OPS, 100, 100_000);
+    }
+    this.evictCacheIfNeeded();
   }
 
   public async connect(server: ServerConfig): Promise<void> {
@@ -286,7 +313,8 @@ export class SftpService {
     });
   }
 
-  private async execCommand(serverId: string, command: string, timeoutMs = 300_000): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  private async execCommand(serverId: string, command: string, timeoutMs?: number): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    const effectiveTimeout = timeoutMs ?? this.commandTimeoutMs;
     const session = this.sessions.get(serverId);
     if (!session) {
       throw new Error(`No SFTP session for server ${serverId}`);
@@ -303,9 +331,9 @@ export class SftpService {
         if (!settled) {
           settled = true;
           stream.destroy();
-          reject(new Error(`Command timed out after ${timeoutMs}ms`));
+          reject(new Error(`Command timed out after ${effectiveTimeout}ms`));
         }
-      }, timeoutMs);
+      }, effectiveTimeout);
 
       const onStdoutData = (chunk: Buffer | string): void => {
         stdoutChunks.push(toBufferChunk(chunk));
@@ -438,11 +466,11 @@ export class SftpService {
   }
 
   private evictCacheIfNeeded(): void {
-    if (this.dirCache.size <= this.maxCacheEntries) {
-      return;
-    }
-    const oldest = this.dirCache.keys().next().value;
-    if (oldest) {
+    while (this.dirCache.size > this.maxCacheEntries) {
+      const oldest = this.dirCache.keys().next().value;
+      if (!oldest) {
+        return;
+      }
       this.dirCache.delete(oldest);
     }
   }
@@ -454,13 +482,13 @@ export class SftpService {
     depth: number,
     ops: { count: number }
   ): Promise<void> {
-    if (depth > MAX_DELETE_DEPTH) {
-      throw new Error(`Delete aborted: directory nesting exceeds ${MAX_DELETE_DEPTH} levels`);
+    if (depth > this.maxDeleteDepth) {
+      throw new Error(`Delete aborted: directory nesting exceeds ${this.maxDeleteDepth} levels`);
     }
     const entries = await this.readDirectory(serverId, dirPath);
     for (const entry of entries) {
-      if (++ops.count > MAX_DELETE_OPS) {
-        throw new Error(`Delete aborted: more than ${MAX_DELETE_OPS} items`);
+      if (++ops.count > this.maxDeleteOps) {
+        throw new Error(`Delete aborted: more than ${this.maxDeleteOps} items`);
       }
       const fullPath = path.posix.join(dirPath, entry.name);
       if (entry.isDirectory && !entry.isSymlink) {
