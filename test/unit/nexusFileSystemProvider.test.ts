@@ -77,6 +77,10 @@ const dirEntry: DirectoryEntry = {
   permissions: 0o755,
 };
 
+function missingRemoteError(message = "No such file"): Error & { code: number } {
+  return Object.assign(new Error(message), { code: 2 });
+}
+
 describe("NexusFileSystemProvider", () => {
   let sftp: ReturnType<typeof createMockSftpService>;
   let provider: NexusFileSystemProvider;
@@ -279,7 +283,7 @@ describe("NexusFileSystemProvider", () => {
       if (remotePath === "/home/dev/a.txt") {
         return fileEntry;
       }
-      throw new Error("missing");
+      throw missingRemoteError();
     });
     (sftp.copyRemote as any).mockResolvedValue(undefined);
 

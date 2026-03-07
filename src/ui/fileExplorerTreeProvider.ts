@@ -177,7 +177,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   private pollIntervalMs = 0;
   private isViewVisible = false;
-  private refreshInFlight = false;
+  private pendingChildrenRequests = 0;
 
   public constructor(private readonly sftp: SftpService) {}
 
@@ -242,11 +242,11 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       return [];
     }
 
-    this.refreshInFlight = true;
+    this.pendingChildrenRequests += 1;
     try {
       return await this.getChildrenInner(element);
     } finally {
-      this.refreshInFlight = false;
+      this.pendingChildrenRequests = Math.max(0, this.pendingChildrenRequests - 1);
     }
   }
 
@@ -669,7 +669,15 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   }
 
   private async ensureRemoteDirectory(serverId: string, remoteDir: string, summary: UploadSummary): Promise<boolean> {
-    const existing = await this.sftp.tryStat(serverId, remoteDir);
+    let existing: DirectoryEntry | undefined;
+    try {
+      existing = await this.sftp.tryStat(serverId, remoteDir);
+    } catch (err: unknown) {
+      summary.skipped += 1;
+      const message = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Failed to check remote directory "${remoteDir}": ${message}`);
+      return false;
+    }
     if (existing) {
       if (existing.isDirectory) {
         return true;
@@ -697,7 +705,15 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     conflictState: { mode: ConflictMode },
     summary: UploadSummary
   ): Promise<ConflictDecision> {
-    const existing = await this.sftp.tryStat(serverId, remotePath);
+    let existing: DirectoryEntry | undefined;
+    try {
+      existing = await this.sftp.tryStat(serverId, remotePath);
+    } catch (err: unknown) {
+      summary.skipped += 1;
+      const message = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Failed to check remote path "${remotePath}": ${message}`);
+      return "skip";
+    }
     if (!existing) {
       return "overwrite";
     }
@@ -715,7 +731,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     this.stopPolling();
     if (this.isViewVisible && this.activeServerId && this.pollIntervalMs > 0) {
       this.pollTimer = setInterval(() => {
-        if (!this.refreshInFlight) {
+        if (this.pendingChildrenRequests === 0) {
           this.refresh();
         }
       }, this.pollIntervalMs);

@@ -128,6 +128,10 @@ const dirEntry: DirectoryEntry = {
   permissions: 0o755,
 };
 
+function missingRemoteError(message = "No such file"): Error & { code: number } {
+  return Object.assign(new Error(message), { code: 2 });
+}
+
 describe("FileExplorerTreeProvider", () => {
   let sftp: ReturnType<typeof createMockSftpService>;
   let provider: FileExplorerTreeProvider;
@@ -331,6 +335,37 @@ describe("FileExplorerTreeProvider", () => {
     expect(provider.getHomeDir()).toBe("/home/dev");
     provider.setRootPath("/etc");
     expect(provider.getHomeDir()).toBe("/home/dev");
+  });
+
+  it("skips auto-refresh until all pending getChildren calls finish", async () => {
+    vi.useFakeTimers();
+    try {
+      const pendingResolvers: Array<(entries: DirectoryEntry[]) => void> = [];
+      (sftp.readDirectory as any).mockImplementation(() => new Promise((resolve) => pendingResolvers.push(resolve)));
+
+      provider.setActiveServer(testServer, "/home/dev");
+      provider.setViewVisibility(true);
+      provider.setAutoRefreshInterval(1);
+
+      const refreshSpy = vi.spyOn(provider, "refresh");
+      const rootPromise = provider.getChildren();
+      const childPromise = provider.getChildren(new FileTreeItem("srv-1", "/home/dev", dirEntry));
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(refreshSpy).not.toHaveBeenCalled();
+
+      pendingResolvers[0]([]);
+      await rootPromise;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(refreshSpy).not.toHaveBeenCalled();
+
+      pendingResolvers[1]([]);
+      await childPromise;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   describe('"." current directory item', () => {
@@ -621,7 +656,7 @@ describe("FileExplorerTreeProvider", () => {
       const vscode = await import("vscode");
       provider.setActiveServer(testServer, "/home/dev");
       (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.File });
-      (sftp.stat as any).mockRejectedValue(new Error("missing"));
+      (sftp.stat as any).mockRejectedValue(missingRemoteError());
       (sftp.upload as any).mockResolvedValue(undefined);
 
       const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
@@ -650,7 +685,7 @@ describe("FileExplorerTreeProvider", () => {
       (vscode.workspace.fs.readDirectory as any).mockResolvedValue([
         ["nested.txt", vscode.FileType.File],
       ]);
-      (sftp.stat as any).mockRejectedValue(new Error("missing"));
+      (sftp.stat as any).mockRejectedValue(missingRemoteError());
       (sftp.createDirectory as any).mockResolvedValue(undefined);
       (sftp.upload as any).mockResolvedValue(undefined);
 
@@ -681,7 +716,7 @@ describe("FileExplorerTreeProvider", () => {
       (vscode.workspace.fs.readDirectory as any).mockResolvedValue([
         ["nested", vscode.FileType.Directory],
       ]);
-      (sftp.stat as any).mockRejectedValue(new Error("missing"));
+      (sftp.stat as any).mockRejectedValue(missingRemoteError());
       (sftp.createDirectory as any).mockResolvedValue(undefined);
 
       const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
@@ -713,7 +748,7 @@ describe("FileExplorerTreeProvider", () => {
       (sftp.createDirectory as any).mockResolvedValue(undefined);
       (sftp.stat as any).mockImplementation(async (_serverId: string, remotePath: string) => {
         if (remotePath.endsWith("/mydir")) {
-          throw new Error("missing");
+          throw missingRemoteError();
         }
         return { ...fileEntry, name: "existing.txt", isDirectory: false };
       });
@@ -755,6 +790,30 @@ describe("FileExplorerTreeProvider", () => {
 
       expect(sftp.upload).not.toHaveBeenCalled();
       expect(vscode.window.showWarningMessage).toHaveBeenCalled();
+    });
+
+    it("handleDrop skips uploads when remote destination checks fail", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.File });
+      (sftp.stat as any).mockRejectedValue(new Error("permission denied"));
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem("file:///tmp/local.txt");
+      const mockTransfer = {
+        get: (mime: string) => {
+          if (mime === "text/uri-list") { return uriListItem; }
+          return undefined;
+        },
+      };
+
+      await provider.handleDrop(targetDir, mockTransfer as any);
+
+      expect(sftp.upload).not.toHaveBeenCalled();
+      expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to check remote path "/home/dev/subdir/local.txt"')
+      );
     });
 
     it("handleDrag sets text/uri-list with nexterm:// URIs", async () => {

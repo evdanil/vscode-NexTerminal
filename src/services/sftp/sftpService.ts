@@ -29,6 +29,11 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 300_000;
 const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
 const MAX_DELETE_DEPTH = 100;
 const MAX_DELETE_OPS = 10_000;
+const SSH_FX_NO_SUCH_FILE = 2;
+
+function createTimeoutError(label: string, timeoutMs: number): Error {
+  return new Error(`SFTP ${label} timed out after ${Math.round(timeoutMs / 1000)}s`);
+}
 
 function withTimeout<T>(
   label: string,
@@ -37,29 +42,42 @@ function withTimeout<T>(
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let settled = false;
+    const resolveOnce = (value: T): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const rejectOnce = (reason: unknown): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      reject(reason);
+    };
     const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        reject(new Error(`SFTP ${label} timed out after ${Math.round(timeoutMs / 1000)}s`));
-      }
+      rejectOnce(createTimeoutError(label, timeoutMs));
     }, timeoutMs);
-    executor(
-      (value) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          resolve(value);
-        }
-      },
-      (reason) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          reject(reason);
-        }
-      }
-    );
+    try {
+      executor(resolveOnce, rejectOnce);
+    } catch (error) {
+      rejectOnce(error);
+    }
   });
+}
+
+function isMissingPathError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as { code?: number | string; message?: string };
+  if (candidate.code === SSH_FX_NO_SUCH_FILE || candidate.code === "ENOENT") {
+    return true;
+  }
+  return typeof candidate.message === "string" && /\b(no such file|not found)\b/i.test(candidate.message);
 }
 
 function normalizeConfigValue(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -232,9 +250,95 @@ export class SftpService {
   public async tryStat(serverId: string, remotePath: string): Promise<DirectoryEntry | undefined> {
     try {
       return await this.stat(serverId, remotePath);
-    } catch {
-      return undefined;
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        return undefined;
+      }
+      throw error;
     }
+  }
+
+  private readFileWithTimeout(
+    maxSize: number | undefined,
+    timeoutMs: number,
+    createStream: () => NodeJS.ReadableStream & { destroy(error?: Error): void }
+  ): Promise<Buffer> {
+    return new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let totalSize = 0;
+      let settled = false;
+      const fail = (reason: unknown): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        reject(reason);
+      };
+      const succeed = (value: Buffer): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        const error = createTimeoutError("readFile", timeoutMs);
+        stream.destroy(error);
+        fail(error);
+      }, timeoutMs);
+
+      const stream = createStream();
+      stream.on("data", (chunk: Buffer | string) => {
+        const buffer = toBufferChunk(chunk);
+        totalSize += buffer.length;
+        if (maxSize && totalSize > maxSize) {
+          stream.destroy();
+          fail(new Error(`File exceeds maximum size of ${Math.round(maxSize / 1024 / 1024)}MB`));
+          return;
+        }
+        chunks.push(buffer);
+      });
+      stream.on("end", () => succeed(Buffer.concat(chunks)));
+      stream.on("error", fail);
+    });
+  }
+
+  private writeFileWithTimeout(
+    timeoutMs: number,
+    content: Buffer,
+    createStream: () => NodeJS.WritableStream & { destroy(error?: Error): void; end(chunk: Buffer): void }
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const fail = (reason: unknown): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        reject(reason);
+      };
+      const succeed = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        const error = createTimeoutError("writeFile", timeoutMs);
+        stream.destroy(error);
+        fail(error);
+      }, timeoutMs);
+
+      const stream = createStream();
+      stream.on("close", succeed);
+      stream.on("error", fail);
+      stream.end(content);
+    });
   }
 
   public async lstat(serverId: string, remotePath: string): Promise<DirectoryEntry> {
@@ -254,42 +358,31 @@ export class SftpService {
   public async tryLstat(serverId: string, remotePath: string): Promise<DirectoryEntry | undefined> {
     try {
       return await this.lstat(serverId, remotePath);
-    } catch {
-      return undefined;
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        return undefined;
+      }
+      throw error;
     }
   }
 
   public async readFile(serverId: string, remotePath: string, maxSize?: number): Promise<Buffer> {
     const sftp = this.getSftp(serverId);
-    return new Promise<Buffer>((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      let totalSize = 0;
-      const stream = sftp.createReadStream(remotePath);
-      stream.on("data", (chunk: Buffer) => {
-        totalSize += chunk.length;
-        if (maxSize && totalSize > maxSize) {
-          stream.destroy();
-          reject(new Error(`File exceeds maximum size of ${Math.round(maxSize / 1024 / 1024)}MB`));
-          return;
-        }
-        chunks.push(chunk);
-      });
-      stream.on("end", () => resolve(Buffer.concat(chunks)));
-      stream.on("error", reject);
-    });
+    return this.readFileWithTimeout(
+      maxSize,
+      this.commandTimeoutMs,
+      () => sftp.createReadStream(remotePath) as NodeJS.ReadableStream & { destroy(error?: Error): void }
+    );
   }
 
   public async writeFile(serverId: string, remotePath: string, content: Buffer): Promise<void> {
     const sftp = this.getSftp(serverId);
-    return new Promise<void>((resolve, reject) => {
-      const stream = sftp.createWriteStream(remotePath);
-      stream.on("close", () => {
-        this.invalidateCache(serverId, parentDir(remotePath));
-        resolve();
-      });
-      stream.on("error", reject);
-      stream.end(content);
-    });
+    await this.writeFileWithTimeout(
+      this.commandTimeoutMs,
+      content,
+      () => sftp.createWriteStream(remotePath) as NodeJS.WritableStream & { destroy(error?: Error): void; end(chunk: Buffer): void }
+    );
+    this.invalidateCache(serverId, parentDir(remotePath));
   }
 
   public async delete(serverId: string, remotePath: string, isDir: boolean): Promise<void> {

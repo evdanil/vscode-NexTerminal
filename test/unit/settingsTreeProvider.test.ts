@@ -70,7 +70,11 @@ function setupDefaultConfig(): void {
         passthroughKeys: ["b", "e"],
         cacheTtlSeconds: 60,
         maxCacheEntries: 500,
-        autoRefreshInterval: 0
+        autoRefreshInterval: 0,
+        operationTimeout: 30,
+        commandTimeout: 300,
+        deleteDepthLimit: 100,
+        deleteOperationLimit: 10000
       };
       return defaults[key];
     }
@@ -166,6 +170,13 @@ describe("SettingsTreeProvider", () => {
       const category = new SettingsCategoryItem("sftp");
       const children = provider.getChildren(category);
       expect(children).toHaveLength(8);
+    });
+
+    it("includes the operation timeout setting in the sftp category", () => {
+      const provider = createProvider();
+      const category = new SettingsCategoryItem("sftp");
+      const children = provider.getChildren(category) as SettingsValueItem[];
+      expect(children.some((child) => child.label?.includes("Operation Timeout: 30 seconds"))).toBe(true);
     });
 
     it("shows formatted values in labels", () => {

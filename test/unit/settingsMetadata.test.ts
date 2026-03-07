@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatSettingValueForTree, CATEGORY_ICONS, type SettingMeta } from "../../src/ui/settingsMetadata";
+import { formatSettingValueForTree, CATEGORY_ICONS, SETTINGS_META, type SettingMeta } from "../../src/ui/settingsMetadata";
 
 describe("CATEGORY_ICONS", () => {
   it("has an icon for every category", () => {
@@ -8,6 +8,16 @@ describe("CATEGORY_ICONS", () => {
       expect(CATEGORY_ICONS[cat]).toBeDefined();
       expect(typeof CATEGORY_ICONS[cat]).toBe("string");
     }
+  });
+});
+
+describe("SETTINGS_META", () => {
+  it("includes the SFTP operation timeout setting with its documented bounds", () => {
+    const meta = SETTINGS_META.find((item) => item.section === "nexus.sftp" && item.key === "operationTimeout");
+    expect(meta).toBeDefined();
+    expect(meta?.default).toBe(30);
+    expect(meta?.min).toBe(5);
+    expect(meta?.max).toBe(300);
   });
 });
 

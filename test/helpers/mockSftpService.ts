@@ -1,6 +1,16 @@
 import { vi } from "vitest";
 import type { SftpService } from "../../src/services/sftp/sftpService";
 
+function isMissingPathError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as { code?: number | string; message?: string };
+  return candidate.code === 2 || candidate.code === "ENOENT" || (
+    typeof candidate.message === "string" && /\b(no such file|not found)\b/i.test(candidate.message)
+  );
+}
+
 export function createMockSftpService(): SftpService {
   const service: any = {
     connect: vi.fn(),
@@ -26,15 +36,21 @@ export function createMockSftpService(): SftpService {
   service.tryStat.mockImplementation(async (...args: any[]) => {
     try {
       return await service.stat(...args);
-    } catch {
-      return undefined;
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        return undefined;
+      }
+      throw error;
     }
   });
   service.tryLstat.mockImplementation(async (...args: any[]) => {
     try {
       return await service.lstat(...args);
-    } catch {
-      return undefined;
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        return undefined;
+      }
+      throw error;
     }
   });
   return service as SftpService;

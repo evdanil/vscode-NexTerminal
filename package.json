@@ -2597,7 +2597,7 @@
         "nexus.sftp.maxCacheEntries": {
           "type": "number",
           "default": 500,
-          "minimum": 50,
+          "minimum": 10,
           "maximum": 5000,
           "order": 21,
           "markdownDescription": "Maximum number of directory listings kept in the SFTP cache. Oldest entries are evicted when this limit is exceeded."
@@ -2676,7 +2676,7 @@
           "minimum": 5,
           "maximum": 300,
           "order": 23.5,
-          "markdownDescription": "Timeout in seconds for individual SFTP operations (directory listing, stat, rename, delete). Prevents the file explorer from freezing when the SSH connection is congested."
+          "markdownDescription": "Timeout in seconds for SFTP directory and metadata operations (listing, stat, realpath, rename, mkdir, delete). Prevents the file explorer from freezing when the shared SSH connection is congested."
         },
         "nexus.sftp.commandTimeout": {
           "type": "number",
@@ -2684,7 +2684,7 @@
           "minimum": 10,
           "maximum": 3600,
           "order": 24,
-          "markdownDescription": "Timeout in seconds for remote SFTP commands (e.g. server-side copy) and file transfers. Increase for slow servers or large operations."
+          "markdownDescription": "Timeout in seconds for remote SFTP commands (e.g. server-side copy), file transfers, and editor file open/save streams. Increase for slow servers or large operations."
         },
         "nexus.sftp.deleteDepthLimit": {
           "type": "number",

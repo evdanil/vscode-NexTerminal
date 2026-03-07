@@ -93,6 +93,8 @@ describe("renderSettingsHtml", () => {
     const html = renderWithDefaults();
     expect(html).toContain("Safety limit");
     expect(html).toContain("setting-badge-safety");
+    expect(html).toContain("default: 30");
+    expect(html).toContain("default: 300");
     expect(html).toContain("default: 100");
     expect(html).toContain("default: 10000");
   });

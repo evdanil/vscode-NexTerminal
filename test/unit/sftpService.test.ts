@@ -52,6 +52,10 @@ function createMockFactory(connection: SshConnection): SshFactory {
   };
 }
 
+function missingPathError(message = "No such file"): Error & { code: number } {
+  return Object.assign(new Error(message), { code: 2 });
+}
+
 describe("SftpService", () => {
   let sftp: ReturnType<typeof createMockSftp>;
   let connection: SshConnection;
@@ -212,6 +216,20 @@ describe("SftpService", () => {
     expect(entry.size).toBe(2048);
   });
 
+  it("tryStat returns undefined only for missing paths", async () => {
+    await service.connect(testServer);
+
+    sftp.stat.mockImplementation((_path: string, cb: Function) => {
+      cb(missingPathError());
+    });
+    await expect(service.tryStat("srv-1", "/missing")).resolves.toBeUndefined();
+
+    sftp.stat.mockImplementation((_path: string, cb: Function) => {
+      cb(new Error("permission denied"));
+    });
+    await expect(service.tryStat("srv-1", "/denied")).rejects.toThrow("permission denied");
+  });
+
   it("realpath resolves paths", async () => {
     await service.connect(testServer);
 
@@ -277,6 +295,36 @@ describe("SftpService", () => {
     sftp.createReadStream.mockReturnValue(mockStream);
 
     await expect(service.readFile("srv-1", "/big", 50 * 1024 * 1024)).rejects.toThrow(/exceeds maximum size/);
+    expect(mockStream.destroy).toHaveBeenCalled();
+  });
+
+  it("readFile times out and destroys the stream", async () => {
+    await service.connect(testServer);
+    (service as any).commandTimeoutMs = 50;
+
+    const mockStream = {
+      on: vi.fn(() => mockStream),
+      destroy: vi.fn(),
+    };
+    sftp.createReadStream.mockReturnValue(mockStream);
+
+    await expect(service.readFile("srv-1", "/hung")).rejects.toThrow("SFTP readFile timed out");
+    expect(mockStream.destroy).toHaveBeenCalled();
+  });
+
+  it("writeFile times out and destroys the stream", async () => {
+    await service.connect(testServer);
+    (service as any).commandTimeoutMs = 50;
+
+    const mockStream = {
+      on: vi.fn(() => mockStream),
+      destroy: vi.fn(),
+      end: vi.fn(),
+    };
+    sftp.createWriteStream.mockReturnValue(mockStream);
+
+    await expect(service.writeFile("srv-1", "/hung.txt", Buffer.from("data"))).rejects.toThrow("SFTP writeFile timed out");
+    expect(mockStream.end).toHaveBeenCalledWith(Buffer.from("data"));
     expect(mockStream.destroy).toHaveBeenCalled();
   });
 

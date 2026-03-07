@@ -136,10 +136,10 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 | Setting | Type | Default | Range | Description |
 |---------|------|---------|-------|-------------|
 | `nexus.sftp.cacheTtlSeconds` | number | `10` | 0–3600 s | Directory listing cache TTL |
-| `nexus.sftp.maxCacheEntries` | number | `500` | 0–10000 | Maximum cached directory listings |
-| `nexus.sftp.autoRefreshInterval` | number | `10` | 0–3600 s | Auto-refresh interval for the file explorer |
-| `nexus.sftp.operationTimeout` | number | `30` | 5–300 s | Timeout for SFTP metadata operations (listing, stat, rename, delete) |
-| `nexus.sftp.commandTimeout` | number | `300` | 10–3600 s | Timeout for remote shell commands and file transfers |
+| `nexus.sftp.maxCacheEntries` | number | `500` | 10–5000 | Maximum cached directory listings |
+| `nexus.sftp.autoRefreshInterval` | number | `10` | 0–60 s | Auto-refresh interval for the file explorer |
+| `nexus.sftp.operationTimeout` | number | `30` | 5–300 s | Timeout for SFTP directory and metadata operations (listing, stat, realpath, rename, mkdir, delete) |
+| `nexus.sftp.commandTimeout` | number | `300` | 10–3600 s | Timeout for remote shell commands, file transfers, and editor file open/save |
 | `nexus.sftp.deleteDepthLimit` | number | `100` | 10–500 levels | Safety limit: max directory depth for recursive delete |
 | `nexus.sftp.deleteOperationLimit` | number | `10000` | 100–100000 | Safety limit: max items removed by one recursive delete |
 
