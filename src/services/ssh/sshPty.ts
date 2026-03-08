@@ -28,6 +28,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   private connectFailed = false;
   private lastDimensions?: vscode.TerminalDimensions;
   private connectionGeneration = 0;
+  private activityIndicator = false;
 
   public constructor(
     private readonly serverConfig: ServerConfig,
@@ -43,6 +44,18 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
   public readonly onDidClose: vscode.Event<void> = this.closeEmitter.event;
   public readonly onDidChangeName: vscode.Event<string> = this.nameEmitter.event;
+
+  private get baseName(): string {
+    return `Nexus SSH: ${this.serverConfig.name}`;
+  }
+
+  public setActivityIndicator(active: boolean): void {
+    if (this.activityIndicator === active || this.disposed || this.disconnected) {
+      return;
+    }
+    this.activityIndicator = active;
+    this.nameEmitter.fire(active ? `● ${this.baseName}` : this.baseName);
+  }
 
   public open(initialDimensions?: vscode.TerminalDimensions): void {
     this.lastDimensions = initialDimensions;
@@ -113,7 +126,8 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.callbacks.onSessionClosed(this.sessionId);
     }
 
-    this.nameEmitter.fire(`Nexus SSH: ${this.serverConfig.name} [Disconnected]`);
+    this.activityIndicator = false;
+    this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
     this.writeEmitter.fire("\r\n\r\n[Nexus SSH] Connection lost.\r\n");
     this.writeEmitter.fire("[Nexus SSH] Press R to reconnect, Enter to close.\r\n");
   }
@@ -123,7 +137,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.reconnecting = true;
-    this.nameEmitter.fire(`Nexus SSH: ${this.serverConfig.name}`);
+    this.nameEmitter.fire(this.baseName);
     this.writeEmitter.fire("\r\n[Nexus SSH] Reconnecting...\r\n");
     this.logger.log("reconnecting");
 
@@ -135,7 +149,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.reconnecting = false;
       if (!this.disposed) {
         this.disconnected = true;
-        this.nameEmitter.fire(`Nexus SSH: ${this.serverConfig.name} [Disconnected]`);
+        this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
         this.writeEmitter.fire("[Nexus SSH] Press R to reconnect, Enter to close.\r\n");
       }
     }

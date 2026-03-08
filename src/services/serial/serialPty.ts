@@ -34,6 +34,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   private disposed = false;
   private disconnected = false;
   private failed = false;
+  private activityIndicator = false;
 
   public constructor(
     private readonly transport: SerialTransport,
@@ -48,6 +49,18 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
   public readonly onDidClose: vscode.Event<void> = this.closeEmitter.event;
   public readonly onDidChangeName: vscode.Event<string> = this.nameEmitter.event;
+
+  private get baseName(): string {
+    return `Nexus Serial: ${this.options.path}`;
+  }
+
+  public setActivityIndicator(active: boolean): void {
+    if (this.activityIndicator === active || this.disposed || this.disconnected) {
+      return;
+    }
+    this.activityIndicator = active;
+    this.nameEmitter.fire(active ? `● ${this.baseName}` : this.baseName);
+  }
 
   public open(): void {
     void this.start();
@@ -129,7 +142,8 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.callbacks.onSessionClosed(sessionId);
     }
 
-    this.nameEmitter.fire(`Nexus Serial: ${this.options.path} [Disconnected]`);
+    this.activityIndicator = false;
+    this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
     this.writeEmitter.fire(`\r\n\r\n[Nexus Serial] Port disconnected.\r\n`);
     this.writeEmitter.fire("[Nexus Serial] Press any key to close this terminal.\r\n");
   }

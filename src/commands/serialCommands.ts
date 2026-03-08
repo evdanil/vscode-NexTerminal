@@ -238,6 +238,9 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
               if (terminalRef) {
                 ctx.serialTerminals.set(sessionId, { terminal: terminalRef, profileId: profile.id });
               }
+              if (ptyRef) {
+                ctx.activityIndicators.set(sessionId, ptyRef);
+              }
               ctx.core.registerSerialSession({
                 id: sessionId,
                 profileId: profile.id,
@@ -247,11 +250,13 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
             },
             onSessionClosed: (sessionId) => {
               ctx.serialTerminals.delete(sessionId);
+              ctx.activityIndicators.delete(sessionId);
               ctx.core.unregisterSerialSession(sessionId);
             },
             onDataReceived: (sessionId) => {
               if (terminalRef && ctx.focusedTerminal !== terminalRef) {
                 ctx.core.markSessionActivity(sessionId);
+                ptyRef?.setActivityIndicator(true);
               }
             }
           },

@@ -32,4 +32,5 @@ export interface CommandContext {
   secretVault?: SecretVault;
   registrySync?: TunnelRegistrySync;
   focusedTerminal?: vscode.Terminal;
+  activityIndicators: Map<string, { setActivityIndicator(active: boolean): void }>;
 }

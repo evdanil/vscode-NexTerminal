@@ -257,7 +257,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     sftpService,
     fileExplorerProvider,
     secretVault,
-    registrySync
+    registrySync,
+    activityIndicators: new Map()
   };
 
   const nexusTreeProvider = new NexusTreeProvider({
@@ -438,12 +439,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     for (const [sessionId, t] of sessionTerminals) {
       if (t === terminal) {
         core.clearSessionActivity(sessionId);
+        ctx.activityIndicators.get(sessionId)?.setActivityIndicator(false);
         return;
       }
     }
     for (const [sessionId, entry] of serialTerminals) {
       if (entry.terminal === terminal) {
         core.clearSessionActivity(sessionId);
+        ctx.activityIndicators.get(sessionId)?.setActivityIndicator(false);
         return;
       }
     }

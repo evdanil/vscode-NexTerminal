@@ -424,6 +424,9 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
             if (terminalRef) {
               ctx.sessionTerminals.set(sessionId, terminalRef);
             }
+            if (ptyRef) {
+              ctx.activityIndicators.set(sessionId, ptyRef);
+            }
 
             for (const tunnel of ctx.core.getSnapshot().tunnels) {
               if (tunnel.autoStart && tunnel.defaultServerId === server.id) {
@@ -443,6 +446,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
           onSessionClosed: (sessionId) => {
             ctx.core.unregisterSession(sessionId);
             ctx.sessionTerminals.delete(sessionId);
+            ctx.activityIndicators.delete(sessionId);
             if (terminalRef) {
               removeTerminal(server.id, terminalRef, ctx.terminalsByServer);
             }
@@ -453,6 +457,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
           onDisconnected: (sessionId) => {
             ctx.core.unregisterSession(sessionId);
             ctx.sessionTerminals.delete(sessionId);
+            ctx.activityIndicators.delete(sessionId);
             // Intentionally keep terminalsByServer entry (terminal is still
             // alive for reconnect) and do NOT stop auto-stop tunnels — they
             // will be cleaned up when the terminal is fully closed via
@@ -461,6 +466,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
           onDataReceived: (sessionId) => {
             if (terminalRef && ctx.focusedTerminal !== terminalRef) {
               ctx.core.markSessionActivity(sessionId);
+              ptyRef?.setActivityIndicator(true);
             }
           }
         },
