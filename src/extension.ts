@@ -258,6 +258,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     fileExplorerProvider,
     secretVault,
     registrySync,
+    focusedTerminal: vscode.window.activeTerminal ?? undefined,
     activityIndicators: new Map()
   };
 

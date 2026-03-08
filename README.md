@@ -2,7 +2,7 @@
 
 Unified SSH, Serial, and Port Forwarding hub for VS Code.
 
-Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support, SFTP file explorer, connection multiplexing, terminal macros, regex highlighting, color schemes, and configuration import/export.
+Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support, SFTP file explorer, connection multiplexing, terminal macros, regex highlighting, unread activity indicators, color schemes, and configuration import/export.
 
 ## Features
 
@@ -23,7 +23,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 
   All modes support configurable local bind addresses (localhost, LAN, or all interfaces), auto-start/auto-stop with server connections, live traffic counters, and a browser URL shortcut for quick access.
 - **SSH Connection Multiplexing** — Share SSH connections across terminals, tunnels, and SFTP for the same server. Reduces connection overhead with automatic ref-counting and configurable idle timeout. Per-server toggle lets you disable multiplexing for devices that don't support multiple channels (e.g. Cisco). Automatic fallback to standalone connections handles channel failures transparently.
-- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized into nested folders. Built-in filter to quickly search by name. Drag and drop to rearrange profiles, move between folders, or assign tunnels to servers. Active SSH and serial sessions highlight unread terminal activity until you focus that terminal again.
+- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized into nested folders. Built-in filter to quickly search by name. Drag and drop to rearrange profiles, move between folders, or assign tunnels to servers. Active SSH and serial sessions highlight unread terminal activity in the tree and prepend `●` to the terminal tab title until you focus that terminal again.
 - **Terminal Appearance** — Customize terminal font family, size, and weight. Import color schemes from MobaXterm INI files or configure custom themes with live preview.
 - **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH and serial terminal output. 20+ built-in rules detect errors, warnings, status keywords, IP/MAC addresses, UUIDs, URLs, interface counters and more with inline ANSI colouring while respecting existing remote colours. Includes a visual Rule Editor with live preview, color picker, and one-click reset to defaults.
 - **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign any macro a custom keybinding from 108 combinations across three modifier groups: `Alt`, `Alt+Shift`, and `Ctrl+Shift` with A-Z or 0-9 keys. Macros without a keybinding are accessible via `Alt+S` quick-pick. Includes a Macro Editor panel with multiline editing, secret macro support, and inline keybinding assignment. **Auto-trigger (expect/send)**: add a `triggerPattern` regex to any macro — when terminal output matches, the macro text is sent automatically. Classic expect/send for password prompts, confirmations, and interactive scripts. `triggerCooldown` prevents echo loops, `triggerInterval` enables prompt-gated polling macros, and macros can optionally start with auto-trigger paused until you resume them from the Macros view.
@@ -39,7 +39,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 ### Install from VS Code Marketplace
 
 1. Open VS Code and go to the Extensions view (`Ctrl+Shift+X`)
-2. Search for **NexTerminal**
+2. Search for **Nexus Terminal**
 3. Click **Install**
 4. Open the **Nexus** sidebar (activity bar icon)
 

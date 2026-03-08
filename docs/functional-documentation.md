@@ -32,7 +32,7 @@ Nexus Terminal provides one operational surface in VS Code for:
 ### 4.1 Server Management
 1. Run `Nexus: Add Server` (or use the unified `Nexus: Add Profile` form).
 2. Fill host/auth details.
-3. Server appears in **Command Center**.
+3. Server appears in **Connectivity Hub**.
 4. Right-click server item to connect/disconnect/edit/remove/duplicate/rename.
 
 ### 4.2 Silent Auth (Password mode)
@@ -54,8 +54,9 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 1. Run `Nexus: Connect Server` (or context action).
 2. A custom PTY terminal is created (`Nexus SSH: <server>`).
 3. Terminal opens in the panel or an editor tab based on `nexus.terminal.openLocation`.
-4. Session appears in **Command Center**.
-5. Output/input logs are written under extension global storage logs.
+4. Session appears in **Connectivity Hub**.
+5. Unread output marks both the sidebar session node and the terminal tab title until the terminal regains focus.
+6. Output/input logs are written under extension global storage logs.
 
 ### 4.5 Tunnel Patch Bay
 1. Create tunnel profile with `Nexus: Add Tunnel`. Choose tunnel type from the dropdown:
@@ -63,7 +64,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
    - **Reverse Forward (-R)**: the remote SSH server listens and forwards incoming connections back to a local target.
    - **Dynamic SOCKS5 (-D)**: local SOCKS5 proxy routes connections through SSH to arbitrary destinations.
 2. Assign a default server, or leave unassigned to choose at start time.
-3. Start a tunnel from **Port Forwarding** (right-click > Start), or drag it onto a server in **Command Center**.
+3. Start a tunnel from **Port Forwarding** (right-click > Start), or drag it onto a server in **Connectivity Hub**.
 4. In shared mode (default), the SSH connection is established eagerly at tunnel start — 2FA happens once upfront.
 5. Active tunnels show traffic counters (bytes in/out).
 6. **Tunnel Monitor** panel shows live route, type, server, counters, and start time.
@@ -74,11 +75,12 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 
 ### 4.6 Serial Sidecar
 1. Create a serial profile with `Nexus: Add Serial Profile` (name + group + line settings).
-2. Profiles appear in **Command Center** and support right-click connect/edit/remove/duplicate/rename.
+2. Profiles appear in **Connectivity Hub** and support right-click connect/edit/remove/duplicate/rename.
 3. Run `Nexus: Connect Serial Port` (or item context action) to open an interactive serial terminal.
-4. Active serial sessions are shown under the profile node in **Command Center**.
-5. Use `Nexus: Disconnect Serial Session` from profile/session context menu or command.
-6. `Nexus: List Serial Ports` reports detected ports and manufacturers for diagnostics.
+4. Active serial sessions are shown under the profile node in **Connectivity Hub**.
+5. Unread output marks both the sidebar session node and the terminal tab title until the terminal regains focus.
+6. Use `Nexus: Disconnect Serial Session` from profile/session context menu or command.
+7. `Nexus: List Serial Ports` reports detected ports and manufacturers for diagnostics.
 
 ### 4.7 Logging and Rotation
 1. Terminal and tunnel event logs are enabled automatically.
@@ -93,7 +95,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 
 ### 4.8 Group Management
 - Servers and serial profiles can be organized into named groups.
-- Drag and drop items between groups in the Command Center.
+- Drag and drop items between groups in the Connectivity Hub.
 - Right-click a group to rename or remove it.
 - Groups can be created from the `+` menu or inline while editing a profile.
 

@@ -154,6 +154,42 @@ describe("SerialPty", () => {
     pty.dispose();
   });
 
+  it("updates the terminal name when activity is flagged and clears it on disconnect", async () => {
+    const { transport, emitDisconnect } = createTransport();
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn()
+    };
+    const logger = {
+      log: vi.fn(),
+      close: vi.fn()
+    };
+    const nameChanges: string[] = [];
+
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      callbacks,
+      logger as any
+    );
+    pty.onDidChangeName((name) => {
+      nameChanges.push(name);
+    });
+
+    pty.open();
+    await flushAsync();
+
+    pty.setActivityIndicator(true);
+    pty.setActivityIndicator(true);
+    expect(nameChanges).toEqual(["\u25cf Nexus Serial: COM9"]);
+
+    emitDisconnect("session-1", "Port closed");
+    expect(nameChanges.at(-1)).toBe("Nexus Serial: COM9 [Disconnected]");
+
+    pty.setActivityIndicator(true);
+    expect(nameChanges.at(-1)).toBe("Nexus Serial: COM9 [Disconnected]");
+  });
+
   it("shows serial errors without forcing disconnect", async () => {
     const { transport, emitError, writePort, closePort } = createTransport();
     const callbacks = {

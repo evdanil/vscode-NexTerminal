@@ -54,7 +54,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.activityIndicator = active;
-    this.nameEmitter.fire(active ? `● ${this.baseName}` : this.baseName);
+    this.nameEmitter.fire(active ? `\u25cf ${this.baseName}` : this.baseName);
   }
 
   public open(initialDimensions?: vscode.TerminalDimensions): void {
@@ -143,7 +143,6 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
 
     try {
       await this.start(this.lastDimensions);
-      this.disconnected = false;
       this.reconnecting = false;
     } catch {
       this.reconnecting = false;
@@ -177,6 +176,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       }
       this.connection = connection;
       this.stream = stream;
+      this.disconnected = false;
 
       this.callbacks.onSessionOpened(this.sessionId);
       this.logger.log(`connected to ${this.serverConfig.name}`);

@@ -489,6 +489,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
       });
       terminalRef = terminal;
       addTerminal(server.id, terminal, ctx.terminalsByServer);
+      ctx.focusedTerminal = terminal;
       terminal.show();
     }
   );

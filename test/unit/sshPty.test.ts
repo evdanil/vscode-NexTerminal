@@ -162,6 +162,55 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
+  it("allows activity indicators to be restored as soon as a reconnect session opens", async () => {
+    const stream1 = new PassThrough();
+    const first = createConnection(stream1);
+    const stream2 = new PassThrough();
+    const second = createConnection(stream2);
+    const sshFactory = {
+      connect: vi
+        .fn()
+        .mockResolvedValueOnce(first.connection)
+        .mockResolvedValueOnce(second.connection)
+    };
+    const logger = {
+      log: vi.fn(),
+      close: vi.fn()
+    };
+    const nameChanges: string[] = [];
+    let openCount = 0;
+    let pty!: SshPty;
+    const callbacks = {
+      onSessionOpened: vi.fn(() => {
+        openCount += 1;
+        if (openCount === 2) {
+          pty.setActivityIndicator(true);
+        }
+      }),
+      onSessionClosed: vi.fn(),
+      onDisconnected: vi.fn()
+    };
+
+    pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.onDidChangeName((name) => {
+      nameChanges.push(name);
+    });
+
+    pty.open();
+    await flushAsync();
+
+    first.emitClose();
+    await flushAsync();
+    nameChanges.length = 0;
+
+    pty.handleInput("R");
+    await flushAsync();
+
+    expect(nameChanges.at(-1)).toBe("\u25cf Nexus SSH: Server 1");
+
+    pty.dispose();
+  });
+
   it("ignores stale disconnect events from a previous connection during reconnect", async () => {
     const stream1 = new PassThrough();
     const first = createConnection(stream1);

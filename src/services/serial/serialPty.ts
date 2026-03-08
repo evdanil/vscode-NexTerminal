@@ -59,7 +59,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.activityIndicator = active;
-    this.nameEmitter.fire(active ? `● ${this.baseName}` : this.baseName);
+    this.nameEmitter.fire(active ? `\u25cf ${this.baseName}` : this.baseName);
   }
 
   public open(): void {

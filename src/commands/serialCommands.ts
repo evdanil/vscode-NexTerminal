@@ -278,6 +278,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
           location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
         });
         terminalRef = terminal;
+        ctx.focusedTerminal = terminal;
         terminal.show();
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown serial connection error";
