@@ -1,7 +1,16 @@
 import type { Duplex } from "node:stream";
 import type { SFTPWrapper } from "ssh2";
 import type { ServerConfig } from "../../models/config";
-import type { PtyOptions, SshConnection, SshFactory, SshPoolControl, TcpConnectionInfo } from "./contracts";
+import type {
+  ContextAwareSshFactory,
+  PtyOptions,
+  SshConnectContext,
+  SshConnection,
+  SshFactory,
+  SshPoolControl,
+  TcpConnectionInfo
+} from "./contracts";
+import { hasContextAwareConnect } from "./contracts";
 
 export interface PoolOptions {
   enabled: boolean;
@@ -256,7 +265,7 @@ class PooledSshConnection implements SshConnection {
   }
 }
 
-export class SshConnectionPool implements SshFactory, SshPoolControl {
+export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl {
   private readonly entries = new Map<string, PoolEntry>();
   private readonly pending = new Map<string, Promise<PoolEntry>>();
   private readonly listeners = new Set<(event: PoolEvent) => void>();
@@ -272,16 +281,23 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
     return () => this.listeners.delete(listener);
   }
 
-  public async connect(server: ServerConfig): Promise<SshConnection> {
+  public connect(server: ServerConfig): Promise<SshConnection> {
+    return this.connectWithContext(server);
+  }
+
+  public async connectWithContext(
+    server: ServerConfig,
+    context?: SshConnectContext
+  ): Promise<SshConnection> {
     if (this.disposed) {
       throw new Error("Connection pool is disposed");
     }
     const multiplexingEnabled = server.multiplexing ?? this.options.enabled;
     if (!multiplexingEnabled) {
-      return this.innerFactory.connect(server);
+      return this.connectInner(server, context);
     }
 
-    const entry = await this.getOrCreateEntry(server);
+    const entry = await this.getOrCreateEntry(server, context);
     this.cancelIdleTimer(entry);
     entry.refCount++;
 
@@ -299,7 +315,7 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
         this.entries.delete(server.id);
         this.emit({ type: "disconnected", serverId: server.id });
       }
-      return this.innerFactory.connect(server);
+      return this.connectInner(server, context);
     };
 
     const isReused = entry.refCount > 1;
@@ -350,7 +366,10 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
     this.listeners.clear();
   }
 
-  private async getOrCreateEntry(server: ServerConfig): Promise<PoolEntry> {
+  private async getOrCreateEntry(
+    server: ServerConfig,
+    context?: SshConnectContext
+  ): Promise<PoolEntry> {
     const existing = this.entries.get(server.id);
     if (existing && existing.healthy) {
       return existing;
@@ -366,15 +385,15 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
       return pendingPromise;
     }
 
-    const promise = this.createEntry(server).finally(() => {
+    const promise = this.createEntry(server, context).finally(() => {
       this.pending.delete(server.id);
     });
     this.pending.set(server.id, promise);
     return promise;
   }
 
-  private async createEntry(server: ServerConfig): Promise<PoolEntry> {
-    const connection = await this.innerFactory.connect(server);
+  private async createEntry(server: ServerConfig, context?: SshConnectContext): Promise<PoolEntry> {
+    const connection = await this.connectInner(server, context);
 
     if (this.disposed) {
       connection.dispose();
@@ -446,5 +465,12 @@ export class SshConnectionPool implements SshFactory, SshPoolControl {
     for (const listener of this.listeners) {
       listener(event);
     }
+  }
+
+  private connectInner(server: ServerConfig, context?: SshConnectContext): Promise<SshConnection> {
+    if (hasContextAwareConnect(this.innerFactory)) {
+      return this.innerFactory.connectWithContext(server, context);
+    }
+    return this.innerFactory.connect(server);
   }
 }

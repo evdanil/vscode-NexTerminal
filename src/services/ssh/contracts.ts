@@ -48,6 +48,10 @@ export interface SshConnection {
   dispose(): void;
 }
 
+export interface SshConnectContext {
+  proxyVisited?: ReadonlySet<string>;
+}
+
 export type KeyboardInteractiveHandler = (
   name: string,
   instructions: string,
@@ -65,7 +69,15 @@ export interface SshFactory {
   connect(server: ServerConfig): Promise<SshConnection>;
 }
 
+export interface ContextAwareSshFactory extends SshFactory {
+  connectWithContext(server: ServerConfig, context?: SshConnectContext): Promise<SshConnection>;
+}
+
 export interface SshPoolControl {
   disconnect(serverId: string): void;
   dispose(): void;
+}
+
+export function hasContextAwareConnect(factory: SshFactory): factory is ContextAwareSshFactory {
+  return typeof (factory as Partial<ContextAwareSshFactory>).connectWithContext === "function";
 }

@@ -3,7 +3,12 @@ import type { Duplex } from "node:stream";
 import { SocksClient } from "socks";
 import type { ServerConfig, ProxyConfig } from "../../models/config";
 import { clamp } from "../../utils/helpers";
-import type { SecretVault, SshConnection, SshFactory } from "./contracts";
+import type {
+  ContextAwareSshFactory,
+  SecretVault,
+  SshConnectContext,
+  SshConnection
+} from "./contracts";
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup } from "./proxiedSshConnection";
 import type { SilentAuthSshFactory } from "./silentAuth";
 import { proxyPasswordSecretKey } from "./silentAuth";
@@ -14,8 +19,9 @@ function normalizeProxyTimeoutMs(timeoutMs: number): number {
   return Number.isFinite(timeoutMs) ? clamp(Math.floor(timeoutMs), 5_000, 300_000) : 60_000;
 }
 
-export class ProxySshFactory implements SshFactory {
+export class ProxySshFactory implements ContextAwareSshFactory {
   private proxyTimeoutMs: number;
+  private jumpHostFactory?: ContextAwareSshFactory;
 
   public constructor(
     private readonly authFactory: SilentAuthSshFactory,
@@ -30,17 +36,28 @@ export class ProxySshFactory implements SshFactory {
     this.proxyTimeoutMs = normalizeProxyTimeoutMs(timeoutMs);
   }
 
-  public async connect(server: ServerConfig): Promise<SshConnection> {
+  public setJumpHostConnectionFactory(factory: ContextAwareSshFactory): void {
+    this.jumpHostFactory = factory;
+  }
+
+  public connect(server: ServerConfig): Promise<SshConnection> {
+    return this.connectWithContext(server);
+  }
+
+  public async connectWithContext(
+    server: ServerConfig,
+    context?: SshConnectContext
+  ): Promise<SshConnection> {
     if (!server.proxy) {
       return this.authFactory.connect(server);
     }
-    return this.connectViaProxy(server, server.proxy, new Set<string>());
+    return this.connectViaProxy(server, server.proxy, context?.proxyVisited ?? new Set<string>());
   }
 
   private async connectViaProxy(
     server: ServerConfig,
     proxy: ProxyConfig,
-    visited: Set<string>
+    visited: ReadonlySet<string>
   ): Promise<SshConnection> {
     switch (proxy.type) {
       case "ssh":
@@ -55,31 +72,16 @@ export class ProxySshFactory implements SshFactory {
   private async connectViaSshJump(
     target: ServerConfig,
     jumpHostId: string,
-    visited: Set<string>
+    visited: ReadonlySet<string>
   ): Promise<SshConnection> {
-    if (visited.has(target.id)) {
-      throw new Error(`Circular proxy reference detected: ${target.name} (${target.id})`);
-    }
-    visited.add(target.id);
-
+    const nextVisited = this.addToVisited(visited, target);
     const jumpServer = this.serverLookup(jumpHostId);
     if (!jumpServer) {
       throw new Error(`Jump host server not found (id: ${jumpHostId})`);
     }
 
-    if (visited.has(jumpServer.id)) {
-      throw new Error(
-        `Circular proxy reference detected: ${jumpServer.name} (${jumpServer.id}) is already in the proxy chain`
-      );
-    }
-
-    // Recursively connect to jump host (it may itself have a proxy)
-    let jumpConnection: SshConnection;
-    if (jumpServer.proxy) {
-      jumpConnection = await this.connectViaProxy(jumpServer, jumpServer.proxy, visited);
-    } else {
-      jumpConnection = await this.authFactory.connect(jumpServer);
-    }
+    this.assertNoCircularProxyChain(jumpServer, nextVisited);
+    const jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited);
 
     // Open a TCP tunnel through the jump host to the target
     let tunnelStream: Duplex;
@@ -178,6 +180,52 @@ export class ProxySshFactory implements SshFactory {
       throw error;
     }
     return new ProxiedSshConnection(connection, socketCleanup(socket));
+  }
+
+  private addToVisited(visited: ReadonlySet<string>, server: ServerConfig): Set<string> {
+    if (visited.has(server.id)) {
+      throw new Error(`Circular proxy reference detected: ${server.name} (${server.id})`);
+    }
+    const next = new Set(visited);
+    next.add(server.id);
+    return next;
+  }
+
+  private assertNoCircularProxyChain(server: ServerConfig, visited: ReadonlySet<string>): void {
+    const chainVisited = new Set(visited);
+    let current = server;
+
+    while (true) {
+      if (chainVisited.has(current.id)) {
+        throw new Error(
+          `Circular proxy reference detected: ${current.name} (${current.id}) is already in the proxy chain`
+        );
+      }
+      chainVisited.add(current.id);
+
+      if (!current.proxy || current.proxy.type !== "ssh") {
+        return;
+      }
+
+      const jumpServer = this.serverLookup(current.proxy.jumpHostId);
+      if (!jumpServer) {
+        throw new Error(`Jump host server not found (id: ${current.proxy.jumpHostId})`);
+      }
+      current = jumpServer;
+    }
+  }
+
+  private connectToJumpHost(
+    jumpServer: ServerConfig,
+    visited: ReadonlySet<string>
+  ): Promise<SshConnection> {
+    if (this.jumpHostFactory) {
+      return this.jumpHostFactory.connectWithContext(jumpServer, { proxyVisited: visited });
+    }
+    if (jumpServer.proxy) {
+      return this.connectWithContext(jumpServer, { proxyVisited: visited });
+    }
+    return this.authFactory.connect(jumpServer);
   }
 
   private httpConnectHandshake(

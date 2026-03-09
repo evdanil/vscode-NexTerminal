@@ -206,6 +206,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       3_600_000
     )
   });
+  proxiedFactory.setJumpHostConnectionFactory(pool);
   const tunnelManager = new TunnelManager(
     pool,
     sshFactory,

@@ -4,6 +4,7 @@ import type { SFTPWrapper } from "ssh2";
 import type { ServerConfig } from "../../src/models/config";
 import type { SecretVault, SshConnection } from "../../src/services/ssh/contracts";
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup } from "../../src/services/ssh/proxiedSshConnection";
+import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 
 const makeServer = (overrides: Partial<ServerConfig> = {}): ServerConfig => ({
   id: "srv-target",
@@ -214,6 +215,13 @@ describe("ProxySshFactory", () => {
     );
   }
 
+  async function createPooledFactory() {
+    const factory = await createFactory();
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 5000 });
+    factory.setJumpHostConnectionFactory(pool);
+    return { factory, pool };
+  }
+
   it("delegates to authFactory when server has no proxy", async () => {
     const factory = await createFactory();
     const server = makeServer();
@@ -333,6 +341,80 @@ describe("ProxySshFactory", () => {
     expect(connection).toBeInstanceOf(ProxiedSshConnection);
   });
 
+  it("reuses an active pooled jump host instead of re-authenticating it", async () => {
+    const jumpServer = makeServer({ id: "srv-jump", name: "Jump Host", host: "jump.example.com" });
+    const targetServer = makeServer({
+      proxy: { type: "ssh", jumpHostId: "srv-jump" }
+    });
+    servers.set("srv-jump", jumpServer);
+
+    const jumpConn = makeFakeConnection();
+    const tunnelStream = { pause: vi.fn() } as unknown as Duplex;
+    jumpConn.openDirectTcp = vi.fn(async () => tunnelStream);
+    const targetConn = makeFakeConnection();
+
+    authFactory.connect = vi.fn()
+      .mockResolvedValueOnce(jumpConn)   // Pre-warm jump host pool entry
+      .mockResolvedValueOnce(targetConn); // Final target auth over tunnel
+
+    const { pool } = await createPooledFactory();
+    const jumpLease = await pool.connect(jumpServer);
+    const targetLease = await pool.connect(targetServer);
+
+    expect(authFactory.connect).toHaveBeenCalledTimes(2);
+    expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
+    expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, { sock: tunnelStream });
+    expect(jumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
+
+    targetLease.dispose();
+    expect(jumpConn.dispose).not.toHaveBeenCalled();
+    jumpLease.dispose();
+  });
+
+  it("reuses a pooled proxied jump host in a chained setup (A -> B -> C)", async () => {
+    const serverC = makeServer({ id: "srv-c", name: "C", host: "c.example.com" });
+    const serverB = makeServer({
+      id: "srv-b",
+      name: "B",
+      host: "b.example.com",
+      proxy: { type: "ssh", jumpHostId: "srv-c" }
+    });
+    const serverA = makeServer({
+      id: "srv-a",
+      name: "A",
+      host: "a.example.com",
+      proxy: { type: "ssh", jumpHostId: "srv-b" }
+    });
+    servers.set("srv-a", serverA);
+    servers.set("srv-b", serverB);
+    servers.set("srv-c", serverC);
+
+    const connC = makeFakeConnection();
+    const tunnelBC = { pause: vi.fn() } as unknown as Duplex;
+    connC.openDirectTcp = vi.fn(async () => tunnelBC);
+
+    const connB = makeFakeConnection();
+    const tunnelAB = { pause: vi.fn() } as unknown as Duplex;
+    connB.openDirectTcp = vi.fn(async () => tunnelAB);
+
+    const connA = makeFakeConnection();
+
+    authFactory.connect = vi.fn()
+      .mockResolvedValueOnce(connC) // B pre-warm: connect to C
+      .mockResolvedValueOnce(connB) // B pre-warm: connect to B via C
+      .mockResolvedValueOnce(connA); // A connect: final target auth via B
+
+    const { pool } = await createPooledFactory();
+    const leaseB = await pool.connect(serverB);
+    const leaseA = await pool.connect(serverA);
+
+    expect(authFactory.connect).toHaveBeenCalledTimes(3);
+    expect(connB.openDirectTcp).toHaveBeenCalledWith("a.example.com", 22);
+
+    leaseA.dispose();
+    leaseB.dispose();
+  });
+
   it("ProxiedSshConnection.dispose() cleans up both connections", () => {
     const inner = makeFakeConnection();
     const jump = makeFakeConnection();
@@ -378,6 +460,99 @@ describe("ProxySshFactory", () => {
     const factory = await createFactory();
     await expect(factory.connect(targetServer)).rejects.toThrow("Connection refused");
     expect(jumpConn.dispose).toHaveBeenCalled();
+  });
+
+  it("throws immediately for circular chains when using pooled jump-host reuse", async () => {
+    const serverA = makeServer({
+      id: "srv-a",
+      name: "A",
+      host: "a.example.com",
+      proxy: { type: "ssh", jumpHostId: "srv-b" }
+    });
+    const serverB = makeServer({
+      id: "srv-b",
+      name: "B",
+      host: "b.example.com",
+      proxy: { type: "ssh", jumpHostId: "srv-a" }
+    });
+    servers.set("srv-a", serverA);
+    servers.set("srv-b", serverB);
+
+    const { pool } = await createPooledFactory();
+    await expect(pool.connect(serverA)).rejects.toThrow("Circular proxy reference");
+  });
+
+  it("does not reuse jump host connections when jump host multiplexing is disabled", async () => {
+    const jumpServer = makeServer({
+      id: "srv-jump",
+      name: "Jump Host",
+      host: "jump.example.com",
+      multiplexing: false
+    });
+    const targetServer = makeServer({
+      proxy: { type: "ssh", jumpHostId: "srv-jump" }
+    });
+    servers.set("srv-jump", jumpServer);
+
+    const activeJumpConn = makeFakeConnection();
+    const proxiedJumpConn = makeFakeConnection();
+    const tunnelStream = { pause: vi.fn() } as unknown as Duplex;
+    proxiedJumpConn.openDirectTcp = vi.fn(async () => tunnelStream);
+    const targetConn = makeFakeConnection();
+
+    authFactory.connect = vi.fn()
+      .mockResolvedValueOnce(activeJumpConn)
+      .mockResolvedValueOnce(proxiedJumpConn)
+      .mockResolvedValueOnce(targetConn);
+
+    const { pool } = await createPooledFactory();
+    const activeJumpLease = await pool.connect(jumpServer);
+    const targetLease = await pool.connect(targetServer);
+
+    expect(authFactory.connect).toHaveBeenCalledTimes(3);
+    expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
+    expect(authFactory.connect).toHaveBeenNthCalledWith(2, jumpServer);
+    expect(authFactory.connect).toHaveBeenNthCalledWith(3, targetServer, { sock: tunnelStream });
+
+    targetLease.dispose();
+    activeJumpLease.dispose();
+  });
+
+  it("falls back to a standalone jump-host connection when a reused hop refuses extra channels", async () => {
+    const jumpServer = makeServer({ id: "srv-jump", name: "Jump Host", host: "jump.example.com" });
+    const targetServer = makeServer({
+      proxy: { type: "ssh", jumpHostId: "srv-jump" }
+    });
+    servers.set("srv-jump", jumpServer);
+
+    const pooledJumpConn = makeFakeConnection();
+    pooledJumpConn.openDirectTcp = vi.fn(async () => {
+      throw new Error("Channel open failure: Administratively prohibited");
+    });
+
+    const fallbackJumpConn = makeFakeConnection();
+    const tunnelStream = { pause: vi.fn() } as unknown as Duplex;
+    fallbackJumpConn.openDirectTcp = vi.fn(async () => tunnelStream);
+
+    const targetConn = makeFakeConnection();
+
+    authFactory.connect = vi.fn()
+      .mockResolvedValueOnce(pooledJumpConn)
+      .mockResolvedValueOnce(fallbackJumpConn)
+      .mockResolvedValueOnce(targetConn);
+
+    const { pool } = await createPooledFactory();
+    const jumpLease = await pool.connect(jumpServer);
+    const targetLease = await pool.connect(targetServer);
+
+    expect(authFactory.connect).toHaveBeenCalledTimes(3);
+    expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
+    expect(authFactory.connect).toHaveBeenNthCalledWith(2, jumpServer);
+    expect(authFactory.connect).toHaveBeenNthCalledWith(3, targetServer, { sock: tunnelStream });
+    expect(fallbackJumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
+
+    targetLease.dispose();
+    jumpLease.dispose();
   });
 
   it("sanitizes CRLF in HTTP CONNECT host and proxy username", async () => {
