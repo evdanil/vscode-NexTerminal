@@ -532,4 +532,232 @@ describe("MacroAutoTrigger", () => {
     expect(sent).toEqual(["second\n"]);
     obs.dispose();
   });
+
+  it("interval macro only fires on the terminal where it was enabled", () => {
+    setConfig([
+      {
+        name: "poll",
+        text: "show status\n",
+        triggerPattern: "router#",
+        triggerInterval: 10,
+        triggerInitiallyDisabled: true
+      }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sentA: string[] = [];
+    const sentB: string[] = [];
+    let activeObs: "a" | "b" = "b";
+    const obsA = trigger.createObserver(
+      (text) => sentA.push(text),
+      () => activeObs === "a"
+    );
+    const obsB = trigger.createObserver(
+      (text) => sentB.push(text),
+      () => activeObs === "b"
+    );
+
+    // Both terminals show a prompt
+    obsA.onOutput("router#");
+    obsB.onOutput("router#");
+    flush();
+    expect(sentA).toEqual([]);
+    expect(sentB).toEqual([]);
+
+    // Enable the macro while terminal B is active
+    trigger.setDisabled(0, false);
+    flush();
+
+    // Only terminal B should fire
+    expect(sentA).toEqual([]);
+    expect(sentB).toEqual(["show status\n"]);
+
+    // Simulate interval cycle: server echoes back on B
+    obsB.onOutput("show status\nrouter#");
+    vi.advanceTimersByTime(10000);
+    flush();
+    expect(sentB).toEqual(["show status\n", "show status\n"]);
+    expect(sentA).toEqual([]);
+
+    // Switch focus to terminal A — interval stays on B, does NOT move to A
+    activeObs = "a";
+    // No reevaluate call — focus change alone should not start intervals.
+    expect(sentA).toEqual([]);
+
+    // Terminal B keeps running even though unfocused
+    obsB.onOutput("show status\nrouter#");
+    vi.advanceTimersByTime(10000);
+    flush();
+    expect(sentB).toEqual(["show status\n", "show status\n", "show status\n"]);
+    expect(sentA).toEqual([]);
+
+    obsA.dispose();
+    obsB.dispose();
+  });
+
+  it("interval macro does not start on unfocused terminal receiving matching output", () => {
+    setConfig([
+      {
+        name: "poll",
+        text: "show status\n",
+        triggerPattern: "router#",
+        triggerInterval: 10
+      }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sentA: string[] = [];
+    const sentB: string[] = [];
+    let activeObs: "a" | "b" = "a";
+    const obsA = trigger.createObserver(
+      (text) => sentA.push(text),
+      () => activeObs === "a"
+    );
+    const obsB = trigger.createObserver(
+      (text) => sentB.push(text),
+      () => activeObs === "b"
+    );
+
+    // Terminal A (focused) gets output — interval starts
+    obsA.onOutput("router#");
+    flush();
+    expect(sentA).toEqual(["show status\n"]);
+
+    // Terminal B (unfocused) gets same output — interval should NOT start
+    obsB.onOutput("router#");
+    flush();
+    expect(sentB).toEqual([]);
+
+    // Even after waiting the full interval, B should not fire
+    vi.advanceTimersByTime(15000);
+    flush();
+    expect(sentB).toEqual([]);
+
+    obsA.dispose();
+    obsB.dispose();
+  });
+
+  it("disabling an interval macro clears armed state so re-enable targets focused terminal", () => {
+    setConfig([
+      {
+        name: "poll",
+        text: "show status\n",
+        triggerPattern: "router#",
+        triggerInterval: 10,
+        triggerInitiallyDisabled: true
+      }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sentA: string[] = [];
+    const sentB: string[] = [];
+    let activeObs: "a" | "b" = "a";
+    const obsA = trigger.createObserver(
+      (text) => sentA.push(text),
+      () => activeObs === "a"
+    );
+    const obsB = trigger.createObserver(
+      (text) => sentB.push(text),
+      () => activeObs === "b"
+    );
+
+    // Both terminals show prompt
+    obsA.onOutput("router#");
+    obsB.onOutput("router#");
+    flush();
+
+    // Enable while on A — starts on A
+    trigger.setDisabled(0, false);
+    flush();
+    expect(sentA).toEqual(["show status\n"]);
+    expect(sentB).toEqual([]);
+
+    // Disable the macro
+    trigger.setDisabled(0, true);
+    // Run a cycle so isDisabled clears armed state
+    obsA.onOutput("router#");
+    flush();
+
+    // Switch to B and re-enable — should start on B now
+    activeObs = "b";
+    obsB.onOutput("router#");
+    trigger.setDisabled(0, false);
+    flush();
+    expect(sentB).toEqual(["show status\n"]);
+    // A should not have fired again
+    expect(sentA).toEqual(["show status\n"]);
+
+    obsA.dispose();
+    obsB.dispose();
+  });
+
+  it("interval macro waiting for delay does not block non-interval rules", () => {
+    setConfig([
+      {
+        name: "poll",
+        text: "show status\n",
+        triggerPattern: "router#",
+        triggerInterval: 10
+      },
+      {
+        name: "pw",
+        text: "secret123\n",
+        triggerPattern: "[Pp]assword:\\s*$"
+      }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    // Trigger the interval macro first
+    obs.onOutput("router#");
+    flush();
+    expect(sent).toEqual(["show status\n"]);
+
+    // While interval is waiting, a password prompt arrives
+    obs.onOutput("Password: ");
+    flush();
+
+    // Password macro should fire even though interval is pending
+    expect(sent).toEqual(["show status\n", "secret123\n"]);
+    obs.dispose();
+  });
+
+  it("non-interval rule on cooldown does not block other rules", () => {
+    setConfig([
+      { name: "first", text: "aaa\n", triggerPattern: "ALPHA", triggerCooldown: 5 },
+      { name: "second", text: "bbb\n", triggerPattern: "BETA" }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("ALPHA");
+    flush();
+    expect(sent).toEqual(["aaa\n"]);
+
+    // Within cooldown, both patterns arrive
+    obs.onOutput("ALPHA BETA");
+    flush();
+
+    // ALPHA is on cooldown so it's skipped, but BETA should still fire
+    expect(sent).toEqual(["aaa\n", "bbb\n"]);
+    obs.dispose();
+  });
+
+  it("non-interval macro fires on inactive observer (password prompt use-case)", () => {
+    setConfig([
+      { name: "pw", text: "secret123\n", triggerPattern: "[Pp]assword:\\s*$" }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver(
+      (text) => sent.push(text),
+      () => false // always inactive
+    );
+
+    obs.onOutput("Password: ");
+    flush();
+
+    // Non-interval macros fire regardless of focus
+    expect(sent).toEqual(["secret123\n"]);
+    obs.dispose();
+  });
 });

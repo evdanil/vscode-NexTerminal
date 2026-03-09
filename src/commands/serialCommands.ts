@@ -221,7 +221,8 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         let terminalRef: vscode.Terminal | undefined;
         let ptyRef: SerialPty | undefined;
         const triggerObserver = ctx.macroAutoTrigger.createObserver(
-          (text) => ptyRef?.handleInput(text)
+          (text) => ptyRef?.handleInput(text),
+          () => ctx.focusedTerminal === terminalRef
         );
         const pty = new SerialPty(
           ctx.serialSidecar,

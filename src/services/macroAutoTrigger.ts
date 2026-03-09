@@ -129,12 +129,17 @@ export class MacroAutoTrigger {
   }
 
   public createObserver(
-    writeBack: (text: string) => void
+    writeBack: (text: string) => void,
+    isActive?: () => boolean
   ): PtyOutputObserver {
     let buffer = "";
     const lastFired = new Map<number, number>();
     const readyMatches = new Set<number>();
     const scheduledTimers = new Map<number, ReturnType<typeof setTimeout>>();
+    // Tracks which interval macros have been armed on this observer.
+    // An interval cycle only starts when the observer is active (focused)
+    // and then keeps running regardless of subsequent focus changes.
+    const armedIntervals = new Set<number>();
     let disposed = false;
     const ansiRe = createAnsiRegex();
 
@@ -200,23 +205,41 @@ export class MacroAutoTrigger {
     const evaluate = (): void => {
       if (disposed || !this.enabled || this.rules.length === 0) return;
 
+      const active = !isActive || isActive();
       const now = Date.now();
       for (const rule of this.rules) {
-        if (this.isDisabled(rule.macroIndex)) continue;
+        if (this.isDisabled(rule.macroIndex)) {
+          // Clean up armed state for disabled macros.
+          if (armedIntervals.delete(rule.macroIndex)) {
+            clearReadyMatch(rule.macroIndex);
+          }
+          continue;
+        }
         if (readyMatches.has(rule.macroIndex)) {
+          // Interval cycle already running on this observer — continue it
+          // regardless of focus.
           const remaining = getRemainingDelay(rule, now);
           if (remaining > 0) {
             scheduleEvaluation(rule, remaining);
-          } else {
-            fireRule(rule, now);
+            // Don't block other rules while waiting for interval.
+            continue;
           }
+          fireRule(rule, now);
           break;
         }
         rule.regex.lastIndex = 0;
         const match = rule.regex.exec(buffer);
         if (!match) continue;
 
-        // Always truncate buffer past the match to prevent re-triggering
+        if (rule.intervalMs !== undefined && !armedIntervals.has(rule.macroIndex)) {
+          // Only start a new interval cycle on the focused terminal.
+          // Don't consume the buffer so the match is available when the
+          // observer becomes active later.
+          if (!active) continue;
+          armedIntervals.add(rule.macroIndex);
+        }
+
+        // Truncate buffer past the match to prevent re-triggering
         // on same text — even when cooldown blocks the fire.
         buffer = buffer.slice(match.index + match[0].length);
 
@@ -225,14 +248,15 @@ export class MacroAutoTrigger {
           const remaining = getRemainingDelay(rule, now);
           if (remaining > 0) {
             scheduleEvaluation(rule, remaining);
-          } else {
-            fireRule(rule, now);
+            continue;
           }
+          fireRule(rule, now);
           break;
         }
 
+        // Non-interval rules (e.g. password prompts) fire on any terminal.
         const remaining = getRemainingDelay(rule, now);
-        if (remaining > 0) break;
+        if (remaining > 0) continue;
 
         fireRule(rule, now);
         break;
@@ -252,6 +276,11 @@ export class MacroAutoTrigger {
             clearReadyMatch(macroIndex);
           }
         }
+        for (const macroIndex of [...armedIntervals]) {
+          if (!activeRules.has(macroIndex)) {
+            armedIntervals.delete(macroIndex);
+          }
+        }
         clearAllTimers();
       },
       dispose: () => {
@@ -259,6 +288,7 @@ export class MacroAutoTrigger {
         buffer = "";
         lastFired.clear();
         readyMatches.clear();
+        armedIntervals.clear();
         clearAllTimers();
         this.observers.delete(observerState);
       }
@@ -305,6 +335,10 @@ export class MacroAutoTrigger {
     for (const observer of this.observers) {
       observer.prune(activeRules);
     }
+  }
+
+  public reevaluate(): void {
+    this.reevaluateObservers();
   }
 
   private reevaluateObservers(): void {
