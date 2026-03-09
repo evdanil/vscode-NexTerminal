@@ -162,6 +162,37 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
+  it("pauses interval macros when the SSH session disconnects", async () => {
+    const stream = new PassThrough();
+    const first = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => first.connection) };
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn(),
+      onDisconnected: vi.fn()
+    };
+    const logger = {
+      log: vi.fn(),
+      close: vi.fn()
+    };
+    const outputObserver = {
+      onOutput: vi.fn(),
+      pauseIntervalMacros: vi.fn(),
+      dispose: vi.fn()
+    };
+
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any, undefined, undefined, outputObserver);
+    pty.open();
+    await flushAsync();
+
+    first.emitClose();
+    await flushAsync();
+
+    expect(outputObserver.pauseIntervalMacros).toHaveBeenCalledTimes(1);
+
+    pty.dispose();
+  });
+
   it("allows activity indicators to be restored as soon as a reconnect session opens", async () => {
     const stream1 = new PassThrough();
     const first = createConnection(stream1);

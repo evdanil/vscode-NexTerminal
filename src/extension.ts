@@ -387,6 +387,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const macroView = vscode.window.createTreeView("nexusMacros", {
     treeDataProvider: macroTreeProvider
   });
+  const macroAutoTriggerListener = macroAutoTrigger.onDidChange(() => {
+    macroTreeProvider.refresh();
+  });
   await migrateMacroSlots();
   updateMacroContext();
   updatePassthroughContext();
@@ -643,13 +646,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
       macroAutoTrigger.setDisabled(item.index, true);
-      macroTreeProvider.refresh();
     }
   });
   const enableTriggerCmd = vscode.commands.registerCommand("nexus.macro.enableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
       macroAutoTrigger.setDisabled(item.index, false);
-      macroTreeProvider.refresh();
     }
   });
   const fileDisposables = registerFileCommands(ctx);
@@ -665,7 +666,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     tunnelView,
     settingsView,
     settingsTreeProvider,
+    macroAutoTrigger,
     macroView,
+    macroAutoTriggerListener,
     fileExplorerView,
     fsRegistration,
     statusBarItem,

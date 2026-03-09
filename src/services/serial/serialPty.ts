@@ -132,6 +132,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     if (this.disposed || this.disconnected) {
       return;
     }
+    this.outputObserver?.pauseIntervalMacros();
     this.disconnected = true;
 
     const sessionId = this.releaseSubscriptions();

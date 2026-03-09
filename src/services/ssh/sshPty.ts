@@ -113,6 +113,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     if (this.disposed || this.disconnected || generation !== this.connectionGeneration) {
       return;
     }
+    this.outputObserver?.pauseIntervalMacros();
     this.disconnected = true;
     this.stream?.destroy();
     this.connection?.dispose();

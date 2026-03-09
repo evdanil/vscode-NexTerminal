@@ -3,6 +3,28 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 let mockConfig: Record<string, Record<string, unknown>> = {};
 
 vi.mock("vscode", () => ({
+  EventEmitter: class MockEventEmitter<T> {
+    private listeners = new Set<(value: T) => void>();
+
+    public readonly event = (listener: (value: T) => void): { dispose: () => void } => {
+      this.listeners.add(listener);
+      return {
+        dispose: () => {
+          this.listeners.delete(listener);
+        }
+      };
+    };
+
+    public fire(value?: T): void {
+      for (const listener of this.listeners) {
+        listener(value as T);
+      }
+    }
+
+    public dispose(): void {
+      this.listeners.clear();
+    }
+  },
   workspace: {
     getConfiguration: vi.fn((section: string) => ({
       get: vi.fn((key: string, defaultValue?: unknown) => {
@@ -685,6 +707,157 @@ describe("MacroAutoTrigger", () => {
     expect(sentA).toEqual(["show status\n"]);
 
     obsA.dispose();
+    obsB.dispose();
+  });
+
+  it("re-enabling an interval macro rebinds it to the focused terminal and keeps ownership sticky", () => {
+    setConfig([
+      {
+        name: "poll",
+        text: "show status\n",
+        triggerPattern: "router#",
+        triggerInterval: 10,
+        triggerInitiallyDisabled: true
+      }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sentA: string[] = [];
+    const sentB: string[] = [];
+    const sentC: string[] = [];
+    let activeObs: "a" | "b" | "c" = "a";
+    const obsA = trigger.createObserver(
+      (text) => sentA.push(text),
+      () => activeObs === "a"
+    );
+    const obsB = trigger.createObserver(
+      (text) => sentB.push(text),
+      () => activeObs === "b"
+    );
+    const obsC = trigger.createObserver(
+      (text) => sentC.push(text),
+      () => activeObs === "c"
+    );
+
+    obsA.onOutput("router#");
+    obsB.onOutput("router#");
+    obsC.onOutput("router#");
+    flush();
+
+    trigger.setDisabled(0, false);
+    flush();
+    expect(sentA).toEqual(["show status\n"]);
+    expect(sentB).toEqual([]);
+    expect(sentC).toEqual([]);
+
+    trigger.setDisabled(0, true);
+    activeObs = "b";
+    trigger.setDisabled(0, false);
+    flush();
+    expect(sentA).toEqual(["show status\n"]);
+    expect(sentB).toEqual(["show status\n"]);
+    expect(sentC).toEqual([]);
+
+    activeObs = "c";
+    obsC.onOutput("router#");
+    flush();
+    expect(sentC).toEqual([]);
+
+    obsB.onOutput("router#");
+    vi.advanceTimersByTime(10_000);
+    flush();
+    expect(sentB).toEqual(["show status\n", "show status\n"]);
+    expect(sentA).toEqual(["show status\n"]);
+    expect(sentC).toEqual([]);
+
+    obsA.dispose();
+    obsB.dispose();
+    obsC.dispose();
+  });
+
+  it("disabling an interval macro clears owner and timers immediately", () => {
+    setConfig([
+      {
+        name: "poll",
+        text: "show status\n",
+        triggerPattern: "router#",
+        triggerInterval: 10
+      }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sentA: string[] = [];
+    const sentB: string[] = [];
+    let activeObs: "a" | "b" = "a";
+    const obsA = trigger.createObserver(
+      (text) => sentA.push(text),
+      () => activeObs === "a"
+    );
+    const obsB = trigger.createObserver(
+      (text) => sentB.push(text),
+      () => activeObs === "b"
+    );
+
+    obsA.onOutput("router#");
+    flush();
+    expect(sentA).toEqual(["show status\n"]);
+
+    obsA.onOutput("router#");
+    trigger.setDisabled(0, true);
+    vi.advanceTimersByTime(15_000);
+    flush();
+    expect(sentA).toEqual(["show status\n"]);
+
+    activeObs = "b";
+    obsB.onOutput("router#");
+    flush();
+    trigger.setDisabled(0, false);
+    flush();
+    expect(sentB).toEqual(["show status\n"]);
+
+    obsA.dispose();
+    obsB.dispose();
+  });
+
+  it("disposing the owning observer pauses the interval macro until manually restarted", () => {
+    setConfig([
+      {
+        name: "poll",
+        text: "show status\n",
+        triggerPattern: "router#",
+        triggerInterval: 10
+      }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const changes = vi.fn();
+    trigger.onDidChange(changes);
+    const sentA: string[] = [];
+    const sentB: string[] = [];
+    let activeObs: "a" | "b" = "a";
+    const obsA = trigger.createObserver(
+      (text) => sentA.push(text),
+      () => activeObs === "a"
+    );
+    const obsB = trigger.createObserver(
+      (text) => sentB.push(text),
+      () => activeObs === "b"
+    );
+
+    obsA.onOutput("router#");
+    flush();
+    expect(sentA).toEqual(["show status\n"]);
+
+    obsA.dispose();
+    expect(trigger.isDisabled(0)).toBe(true);
+    expect(changes).toHaveBeenCalled();
+
+    activeObs = "b";
+    obsB.onOutput("router#");
+    flush();
+    expect(sentB).toEqual([]);
+
+    trigger.setDisabled(0, false);
+    flush();
+    expect(sentB).toEqual(["show status\n"]);
+
     obsB.dispose();
   });
 

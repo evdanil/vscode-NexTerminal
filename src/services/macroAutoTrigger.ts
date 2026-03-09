@@ -10,6 +10,7 @@ const CONTROL_CHARS_RE = /[\x00-\x08\x0b-\x1f\x7f]/g;
 
 export interface PtyOutputObserver {
   onOutput(text: string): void;
+  pauseIntervalMacros(): void;
   dispose(): void;
 }
 
@@ -32,11 +33,13 @@ interface CompiledTriggerRule {
 interface ObserverState {
   evaluate(): void;
   prune(activeRules: ReadonlyMap<number, CompiledTriggerRule>): void;
+  clearIntervalState(macroIndex: number): boolean;
   dispose(): void;
 }
 
-export class MacroAutoTrigger {
+export class MacroAutoTrigger implements vscode.Disposable {
   private rules: CompiledTriggerRule[] = [];
+  private rulesByIndex = new Map<number, CompiledTriggerRule>();
   private enabled = true;
   private defaultCooldownMs = DEFAULT_TRIGGER_COOLDOWN * 1000;
   private maxBufferLength = MAX_BUFFER_LENGTH;
@@ -44,12 +47,20 @@ export class MacroAutoTrigger {
   private readonly disabledIndexes = new Set<number>();
   private readonly enabledIndexes = new Set<number>();
   private readonly observers = new Set<ObserverState>();
+  private readonly intervalOwners = new Map<number, ObserverState>();
+  private readonly onDidChangeEmitter = new vscode.EventEmitter<void>();
+  private disposed = false;
+
+  public readonly onDidChange: vscode.Event<void> = this.onDidChangeEmitter.event;
 
   public constructor() {
     this.reload();
   }
 
   public reload(): void {
+    const previousIntervalIndexes = new Set(
+      this.rules.filter((rule) => rule.intervalMs !== undefined).map((rule) => rule.macroIndex)
+    );
     const macroConfig = vscode.workspace.getConfiguration("nexus.terminal");
     const macros = macroConfig.get<TerminalMacro[]>("macros", []);
     const macrosConfig = vscode.workspace.getConfiguration("nexus.terminal.macros");
@@ -68,6 +79,7 @@ export class MacroAutoTrigger {
     );
 
     this.rules = [];
+    this.rulesByIndex = new Map();
     this.defaultDisabledIndexes.clear();
     const activeRules = new Map<number, CompiledTriggerRule>();
     for (const [macroIndex, macro] of macros.entries()) {
@@ -91,6 +103,7 @@ export class MacroAutoTrigger {
           macroIndex
         };
         this.rules.push(rule);
+        this.rulesByIndex.set(macroIndex, rule);
         activeRules.set(macroIndex, rule);
       } catch {
         // Invalid regex — skip silently
@@ -98,26 +111,33 @@ export class MacroAutoTrigger {
     }
     this.pruneState(macros.length);
     this.pruneObservers(activeRules);
+    for (const macroIndex of previousIntervalIndexes) {
+      const nextRule = activeRules.get(macroIndex);
+      if (!nextRule || nextRule.intervalMs === undefined || this.isDisabled(macroIndex)) {
+        this.clearIntervalState(macroIndex);
+      }
+    }
+    for (const rule of this.rules) {
+      if (rule.intervalMs !== undefined && this.isDisabled(rule.macroIndex)) {
+        this.clearIntervalState(rule.macroIndex);
+      }
+    }
     this.reevaluateObservers();
   }
 
   public setDisabled(macroIndex: number, disabled: boolean): void {
-    if (this.defaultDisabledIndexes.has(macroIndex)) {
-      if (disabled) {
-        this.enabledIndexes.delete(macroIndex);
-      } else {
-        this.enabledIndexes.add(macroIndex);
-      }
-    } else {
-      if (disabled) {
-        this.disabledIndexes.add(macroIndex);
-      } else {
-        this.disabledIndexes.delete(macroIndex);
-      }
-    }
+    const disabledChanged = this.updateDisabledState(macroIndex, disabled);
+    const intervalRule = this.rulesByIndex.get(macroIndex);
+    const intervalChanged =
+      disabled && intervalRule?.intervalMs !== undefined
+        ? this.clearIntervalState(macroIndex)
+        : false;
 
     if (!disabled) {
       this.reevaluateObservers();
+    }
+    if (disabledChanged || intervalChanged) {
+      this.emitDidChange();
     }
   }
 
@@ -136,24 +156,23 @@ export class MacroAutoTrigger {
     const lastFired = new Map<number, number>();
     const readyMatches = new Set<number>();
     const scheduledTimers = new Map<number, ReturnType<typeof setTimeout>>();
-    // Tracks which interval macros have been armed on this observer.
-    // An interval cycle only starts when the observer is active (focused)
-    // and then keeps running regardless of subsequent focus changes.
-    const armedIntervals = new Set<number>();
+    const ownedIntervals = new Set<number>();
     let disposed = false;
     const ansiRe = createAnsiRegex();
 
-    const clearScheduledTimer = (macroIndex: number): void => {
+    const clearScheduledTimer = (macroIndex: number): boolean => {
       const timer = scheduledTimers.get(macroIndex);
-      if (timer !== undefined) {
-        clearTimeout(timer);
-        scheduledTimers.delete(macroIndex);
+      if (timer === undefined) {
+        return false;
       }
+      clearTimeout(timer);
+      scheduledTimers.delete(macroIndex);
+      return true;
     };
 
-    const clearReadyMatch = (macroIndex: number): void => {
-      readyMatches.delete(macroIndex);
-      clearScheduledTimer(macroIndex);
+    const clearReadyMatch = (macroIndex: number): boolean => {
+      const removed = readyMatches.delete(macroIndex);
+      return clearScheduledTimer(macroIndex) || removed;
     };
 
     const clearAllTimers = (): void => {
@@ -161,6 +180,13 @@ export class MacroAutoTrigger {
         clearTimeout(timer);
       }
       scheduledTimers.clear();
+    };
+
+    const clearIntervalState = (macroIndex: number): boolean => {
+      const clearedOwnership = ownedIntervals.delete(macroIndex);
+      const clearedLastFired = lastFired.delete(macroIndex);
+      const clearedReady = clearReadyMatch(macroIndex);
+      return clearedOwnership || clearedLastFired || clearedReady;
     };
 
     const getRemainingDelay = (rule: CompiledTriggerRule, now: number): number => {
@@ -191,31 +217,45 @@ export class MacroAutoTrigger {
       lastFired.set(rule.macroIndex, now);
       clearReadyMatch(rule.macroIndex);
 
-      // Interval-driven macros should not keep stale prompt text after firing.
       if (rule.intervalMs !== undefined) {
         buffer = "";
       }
 
       const macroText = rule.macroText;
       setTimeout(() => {
-        if (!disposed) writeBack(macroText);
+        if (disposed) {
+          return;
+        }
+        if (
+          rule.intervalMs !== undefined &&
+          (this.isDisabled(rule.macroIndex) || this.intervalOwners.get(rule.macroIndex) !== observerState)
+        ) {
+          return;
+        }
+        writeBack(macroText);
       }, 0);
     };
 
     const evaluate = (): void => {
-      if (disposed || !this.enabled || this.rules.length === 0) return;
+      if (disposed || !this.enabled || this.rules.length === 0) {
+        return;
+      }
 
       const active = !isActive || isActive();
       const now = Date.now();
       for (const rule of this.rules) {
         if (this.isDisabled(rule.macroIndex)) {
-          // Clean up armed state for disabled macros.
-          if (armedIntervals.delete(rule.macroIndex)) {
-            clearReadyMatch(rule.macroIndex);
+          if (rule.intervalMs !== undefined) {
+            clearIntervalState(rule.macroIndex);
           }
           continue;
         }
-        if (readyMatches.has(rule.macroIndex)) {
+        if (rule.intervalMs !== undefined) {
+          const owner = this.intervalOwners.get(rule.macroIndex);
+          if (owner && owner !== observerState) {
+            continue;
+          }
+          if (readyMatches.has(rule.macroIndex)) {
           // Interval cycle already running on this observer — continue it
           // regardless of focus.
           const remaining = getRemainingDelay(rule, now);
@@ -227,16 +267,18 @@ export class MacroAutoTrigger {
           fireRule(rule, now);
           break;
         }
+        }
         rule.regex.lastIndex = 0;
         const match = rule.regex.exec(buffer);
         if (!match) continue;
 
-        if (rule.intervalMs !== undefined && !armedIntervals.has(rule.macroIndex)) {
-          // Only start a new interval cycle on the focused terminal.
-          // Don't consume the buffer so the match is available when the
-          // observer becomes active later.
-          if (!active) continue;
-          armedIntervals.add(rule.macroIndex);
+        if (rule.intervalMs !== undefined) {
+          const owner = this.intervalOwners.get(rule.macroIndex);
+          if (!owner) {
+            if (!active) continue;
+            this.intervalOwners.set(rule.macroIndex, observerState);
+            ownedIntervals.add(rule.macroIndex);
+          }
         }
 
         // Truncate buffer past the match to prevent re-triggering
@@ -273,22 +315,24 @@ export class MacroAutoTrigger {
         }
         for (const macroIndex of [...readyMatches]) {
           if (activeRules.get(macroIndex)?.intervalMs === undefined) {
-            clearReadyMatch(macroIndex);
+            clearIntervalState(macroIndex);
           }
         }
-        for (const macroIndex of [...armedIntervals]) {
-          if (!activeRules.has(macroIndex)) {
-            armedIntervals.delete(macroIndex);
+        for (const macroIndex of [...ownedIntervals]) {
+          if (activeRules.get(macroIndex)?.intervalMs === undefined) {
+            clearIntervalState(macroIndex);
           }
         }
         clearAllTimers();
       },
+      clearIntervalState,
       dispose: () => {
+        this.pauseOwnedIntervals(observerState);
         disposed = true;
         buffer = "";
         lastFired.clear();
         readyMatches.clear();
-        armedIntervals.clear();
+        ownedIntervals.clear();
         clearAllTimers();
         this.observers.delete(observerState);
       }
@@ -297,7 +341,9 @@ export class MacroAutoTrigger {
 
     return {
       onOutput: (text: string) => {
-        if (disposed || !this.enabled || this.rules.length === 0) return;
+        if (disposed || !this.enabled || this.rules.length === 0) {
+          return;
+        }
 
         // Keep the tail of oversized output chunks so prompts arriving with
         // banners/login noise can still be matched without scanning unbounded text.
@@ -313,6 +359,11 @@ export class MacroAutoTrigger {
           buffer = buffer.slice(buffer.length - this.maxBufferLength);
         }
         evaluate();
+      },
+      pauseIntervalMacros: () => {
+        if (!disposed) {
+          this.pauseOwnedIntervals(observerState);
+        }
       },
       dispose: () => observerState.dispose()
     };
@@ -341,12 +392,70 @@ export class MacroAutoTrigger {
     this.reevaluateObservers();
   }
 
+  public dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    for (const observer of [...this.observers]) {
+      observer.dispose();
+    }
+    this.intervalOwners.clear();
+    this.onDidChangeEmitter.dispose();
+  }
+
   private reevaluateObservers(): void {
     if (!this.enabled || this.rules.length === 0) {
       return;
     }
     for (const observer of this.observers) {
       observer.evaluate();
+    }
+  }
+
+  private updateDisabledState(macroIndex: number, disabled: boolean): boolean {
+    const wasDisabled = this.isDisabled(macroIndex);
+    if (this.defaultDisabledIndexes.has(macroIndex)) {
+      if (disabled) {
+        this.enabledIndexes.delete(macroIndex);
+      } else {
+        this.enabledIndexes.add(macroIndex);
+      }
+    } else {
+      if (disabled) {
+        this.disabledIndexes.add(macroIndex);
+      } else {
+        this.disabledIndexes.delete(macroIndex);
+      }
+    }
+    return wasDisabled !== this.isDisabled(macroIndex);
+  }
+
+  private clearIntervalState(macroIndex: number): boolean {
+    let changed = this.intervalOwners.delete(macroIndex);
+    for (const observer of this.observers) {
+      changed = observer.clearIntervalState(macroIndex) || changed;
+    }
+    return changed;
+  }
+
+  private pauseOwnedIntervals(owner: ObserverState): void {
+    let changed = false;
+    for (const [macroIndex, currentOwner] of [...this.intervalOwners.entries()]) {
+      if (currentOwner !== owner) {
+        continue;
+      }
+      changed = this.updateDisabledState(macroIndex, true) || changed;
+      changed = this.clearIntervalState(macroIndex) || changed;
+    }
+    if (changed) {
+      this.emitDidChange();
+    }
+  }
+
+  private emitDidChange(): void {
+    if (!this.disposed) {
+      this.onDidChangeEmitter.fire();
     }
   }
 }

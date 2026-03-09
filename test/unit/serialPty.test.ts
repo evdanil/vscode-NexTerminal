@@ -154,6 +154,42 @@ describe("SerialPty", () => {
     pty.dispose();
   });
 
+  it("pauses interval macros when the serial session disconnects", async () => {
+    const { transport, emitDisconnect } = createTransport();
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn()
+    };
+    const logger = {
+      log: vi.fn(),
+      close: vi.fn()
+    };
+    const outputObserver = {
+      onOutput: vi.fn(),
+      pauseIntervalMacros: vi.fn(),
+      dispose: vi.fn()
+    };
+
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      callbacks,
+      logger as any,
+      undefined,
+      undefined,
+      outputObserver
+    );
+
+    pty.open();
+    await flushAsync();
+
+    emitDisconnect("session-1", "Port closed");
+
+    expect(outputObserver.pauseIntervalMacros).toHaveBeenCalledTimes(1);
+
+    pty.dispose();
+  });
+
   it("updates the terminal name when activity is flagged and clears it on disconnect", async () => {
     const { transport, emitDisconnect } = createTransport();
     const callbacks = {
