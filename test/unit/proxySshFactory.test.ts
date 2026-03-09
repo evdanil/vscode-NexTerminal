@@ -17,8 +17,9 @@ const makeServer = (overrides: Partial<ServerConfig> = {}): ServerConfig => ({
   ...overrides
 });
 
-function makeFakeConnection(): SshConnection & { disposed: boolean } {
-  const conn: SshConnection & { disposed: boolean } = {
+function makeFakeConnection(): SshConnection & { disposed: boolean; fireClose: () => void } {
+  const closeListeners = new Set<() => void>();
+  const conn: SshConnection & { disposed: boolean; fireClose: () => void } = {
     disposed: false,
     openShell: vi.fn(async () => ({} as Duplex)),
     openDirectTcp: vi.fn(async () => ({} as Duplex)),
@@ -27,9 +28,22 @@ function makeFakeConnection(): SshConnection & { disposed: boolean } {
     requestForwardIn: vi.fn(async () => 0),
     cancelForwardIn: vi.fn(async () => {}),
     onTcpConnection: vi.fn(() => () => {}),
-    onClose: vi.fn(() => () => {}),
+    onClose: vi.fn((listener: () => void) => {
+      closeListeners.add(listener);
+      return () => closeListeners.delete(listener);
+    }),
     getBanner: vi.fn(() => undefined),
-    dispose: vi.fn(() => { conn.disposed = true; })
+    dispose: vi.fn(() => {
+      conn.disposed = true;
+      for (const listener of closeListeners) {
+        listener();
+      }
+    }),
+    fireClose: () => {
+      for (const listener of closeListeners) {
+        listener();
+      }
+    }
   };
   return conn;
 }
@@ -45,6 +59,9 @@ function createVault(seed?: Record<string, string>): SecretVault {
 
 function createMockHttpSocket() {
   const dataListeners = new Set<(chunk: Buffer) => void>();
+  const closeListeners = new Set<() => void>();
+  const endListeners = new Set<() => void>();
+  const runtimeErrorListeners = new Set<(error: Error) => void>();
   let errorListener: ((error: Error) => void) | undefined;
   let timeoutListener: (() => void) | undefined;
 
@@ -64,12 +81,24 @@ function createMockHttpSocket() {
     on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
       if (event === "data") {
         dataListeners.add(handler as (chunk: Buffer) => void);
+      } else if (event === "close") {
+        closeListeners.add(handler as () => void);
+      } else if (event === "end") {
+        endListeners.add(handler as () => void);
+      } else if (event === "error") {
+        runtimeErrorListeners.add(handler as (error: Error) => void);
       }
       return socket;
     }),
     removeListener: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
       if (event === "data") {
         dataListeners.delete(handler as (chunk: Buffer) => void);
+      } else if (event === "close") {
+        closeListeners.delete(handler as () => void);
+      } else if (event === "end") {
+        endListeners.delete(handler as () => void);
+      } else if (event === "error") {
+        runtimeErrorListeners.delete(handler as (error: Error) => void);
       }
       return socket;
     }),
@@ -85,6 +114,20 @@ function createMockHttpSocket() {
         const listener = errorListener;
         errorListener = undefined;
         listener(error);
+        return;
+      }
+      for (const listener of [...runtimeErrorListeners]) {
+        listener(error);
+      }
+    },
+    emitClose: () => {
+      for (const listener of [...closeListeners]) {
+        listener();
+      }
+    },
+    emitEnd: () => {
+      for (const listener of [...endListeners]) {
+        listener();
       }
     },
     emitTimeout: () => {
@@ -144,9 +187,10 @@ describe("ProxiedSshConnection", () => {
     proxied.onTcpConnection(handler as any);
     expect(inner.onTcpConnection).toHaveBeenCalled();
 
-    const listener = () => {};
+    const listener = vi.fn();
     proxied.onClose(listener);
-    expect(inner.onClose).toHaveBeenCalledWith(listener);
+    inner.fireClose();
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 
   it("dispose() cleans up inner connection and proxy resources", () => {
@@ -172,6 +216,22 @@ describe("ProxiedSshConnection", () => {
     const cleanup = socketCleanup(socket as any);
     cleanup();
     expect(socket.destroy).toHaveBeenCalled();
+  });
+
+  it("emits onClose when the proxy connection closes", () => {
+    const inner = makeFakeConnection();
+    const jump = makeFakeConnection();
+    const proxied = new ProxiedSshConnection(
+      inner,
+      jumpHostCleanup(jump),
+      (listener) => jump.onClose(listener)
+    );
+    const listener = vi.fn();
+    proxied.onClose(listener);
+
+    jump.fireClose();
+
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -620,11 +680,39 @@ describe("ProxySshFactory", () => {
     expect(pushed.toString()).toBe("SSH-2.0-test-banner");
   });
 
+  it("emits onClose when an HTTP CONNECT proxy socket closes after connection", async () => {
+    const server = makeServer({
+      proxy: { type: "http", host: "proxy.local", port: 3128 }
+    });
+    const socket = createMockHttpSocket();
+    await mockNetCreateConnectionWithSocket(socket);
+    const targetConn = makeFakeConnection();
+    authFactory.connect = vi.fn().mockResolvedValueOnce(targetConn);
+
+    const factory = await createFactory();
+    const connection = await (async () => {
+      const promise = factory.connect(server);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      socket.emitData("HTTP/1.1 200 Connection Established\r\n\r\n");
+      return promise;
+    })();
+
+    const listener = vi.fn();
+    connection.onClose(listener);
+    socket.emitClose();
+
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
   it("passes the configured timeout to SOCKS5 proxy handshakes", async () => {
     const server = makeServer({
       proxy: { type: "socks5", host: "proxy.local", port: 1080 }
     });
-    const socket = { pause: vi.fn() };
+    const socket = {
+      pause: vi.fn(),
+      on: vi.fn(() => socket),
+      removeListener: vi.fn(() => socket)
+    };
     const socksMod = await import("socks");
     (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
 
@@ -642,5 +730,56 @@ describe("ProxySshFactory", () => {
       expect.objectContaining({ timeout: 42_000 })
     );
     expect(socket.pause).toHaveBeenCalled();
+  });
+
+  it("emits onClose when a SOCKS5 proxy socket closes after connection", async () => {
+    const server = makeServer({
+      proxy: { type: "socks5", host: "proxy.local", port: 1080 }
+    });
+    const closeListeners = new Set<() => void>();
+    const endListeners = new Set<() => void>();
+    const errorListeners = new Set<(error: Error) => void>();
+    const socket: any = {
+      pause: vi.fn(),
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === "close") {
+          closeListeners.add(handler as () => void);
+        } else if (event === "end") {
+          endListeners.add(handler as () => void);
+        } else if (event === "error") {
+          errorListeners.add(handler as (error: Error) => void);
+        }
+        return socket;
+      }),
+      removeListener: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === "close") {
+          closeListeners.delete(handler as () => void);
+        } else if (event === "end") {
+          endListeners.delete(handler as () => void);
+        } else if (event === "error") {
+          errorListeners.delete(handler as (error: Error) => void);
+        }
+        return socket;
+      }),
+      emitClose: () => {
+        for (const listener of [...closeListeners]) {
+          listener();
+        }
+      }
+    };
+    const targetConn = makeFakeConnection();
+    authFactory.connect = vi.fn().mockResolvedValueOnce(targetConn);
+
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const factory = await createFactory();
+    const connection = await factory.connect(server);
+    const listener = vi.fn();
+    connection.onClose(listener);
+
+    socket.emitClose();
+
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 });

@@ -49,14 +49,21 @@ export const LEGACY_ALGORITHMS: Algorithms = {
 class Ssh2Connection implements SshConnection {
   private readonly closeListeners = new Set<() => void>();
   private banner?: string;
+  private closed = false;
 
   public constructor(private readonly client: Client, banner?: string) {
     this.banner = banner;
-    this.client.on("close", () => {
+    const emitClose = (): void => {
+      if (this.closed) {
+        return;
+      }
+      this.closed = true;
       for (const listener of this.closeListeners) {
         listener();
       }
-    });
+    };
+    this.client.on("close", emitClose);
+    this.client.on("end", emitClose);
   }
 
   public getBanner(): string | undefined {

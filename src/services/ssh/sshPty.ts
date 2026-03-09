@@ -109,7 +109,10 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.callbacks.onSessionClosed(this.sessionId);
   }
 
-  private handleDisconnect(generation: number): void {
+  private handleDisconnect(
+    generation: number,
+    reason: "lost" | "remote-closed" = "lost"
+  ): void {
     if (this.disposed || this.disconnected || generation !== this.connectionGeneration) {
       return;
     }
@@ -119,7 +122,11 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.connection?.dispose();
     this.stream = undefined;
     this.connection = undefined;
-    this.logger.log("connection lost - entering disconnected state");
+    this.logger.log(
+      reason === "remote-closed"
+        ? "remote host closed the session - entering disconnected state"
+        : "connection lost - entering disconnected state"
+    );
 
     if (this.callbacks.onDisconnected) {
       this.callbacks.onDisconnected(this.sessionId);
@@ -129,7 +136,11 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
 
     this.activityIndicator = false;
     this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
-    this.writeEmitter.fire("\r\n\r\n[Nexus SSH] Connection lost.\r\n");
+    if (reason === "remote-closed") {
+      this.writeEmitter.fire("\r\n\r\n[Nexus SSH] Remote host closed the session.\r\n");
+    } else {
+      this.writeEmitter.fire("\r\n\r\n[Nexus SSH] Connection lost.\r\n");
+    }
     this.writeEmitter.fire("[Nexus SSH] Press R to reconnect, Enter to close.\r\n");
   }
 
@@ -197,6 +208,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.callbacks.onDataReceived?.(this.sessionId);
         this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(text) : text);
       });
+      stream.on("end", () => this.handleDisconnect(generation, "remote-closed"));
       stream.on("close", () => this.handleDisconnect(generation));
       stream.on("error", (error: Error) => {
         this.logger.log(`error ${error.message}`);

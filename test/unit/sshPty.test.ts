@@ -193,6 +193,37 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
+  it("reports when the remote host closes the shell stream", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => connection) };
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn(),
+      onDisconnected: vi.fn()
+    };
+    const logger = {
+      log: vi.fn(),
+      close: vi.fn()
+    };
+    const writes: string[] = [];
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.onDidWrite((text) => {
+      writes.push(text);
+    });
+
+    pty.open();
+    await flushAsync();
+
+    stream.emit("end");
+    await flushAsync();
+
+    expect(callbacks.onDisconnected).toHaveBeenCalledTimes(1);
+    expect(writes).toContain("\r\n\r\n[Nexus SSH] Remote host closed the session.\r\n");
+
+    pty.dispose();
+  });
+
   it("allows activity indicators to be restored as soon as a reconnect session opens", async () => {
     const stream1 = new PassThrough();
     const first = createConnection(stream1);

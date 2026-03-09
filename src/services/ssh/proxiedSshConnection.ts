@@ -3,11 +3,26 @@ import type { SFTPWrapper } from "ssh2";
 import type { PtyOptions, SshConnection, TcpConnectionInfo } from "./contracts";
 import type { Socket } from "node:net";
 
+type CloseRelay = (listener: () => void) => () => void;
+
 export class ProxiedSshConnection implements SshConnection {
+  private readonly closeListeners = new Set<() => void>();
+  private readonly innerCloseUnsubscribe: () => void;
+  private readonly proxyCloseUnsubscribe?: () => void;
+  private closed = false;
+
   public constructor(
     private readonly inner: SshConnection,
-    private readonly proxyCleanup: () => void
-  ) {}
+    private readonly proxyCleanup: () => void,
+    proxyOnClose?: CloseRelay
+  ) {
+    this.innerCloseUnsubscribe = this.inner.onClose(() => {
+      this.emitClose();
+    });
+    this.proxyCloseUnsubscribe = proxyOnClose?.(() => {
+      this.emitClose();
+    });
+  }
 
   public openShell(ptyOptions?: PtyOptions): Promise<Duplex> {
     return this.inner.openShell(ptyOptions);
@@ -40,7 +55,8 @@ export class ProxiedSshConnection implements SshConnection {
   }
 
   public onClose(listener: () => void): () => void {
-    return this.inner.onClose(listener);
+    this.closeListeners.add(listener);
+    return () => this.closeListeners.delete(listener);
   }
 
   public getBanner(): string | undefined {
@@ -48,8 +64,20 @@ export class ProxiedSshConnection implements SshConnection {
   }
 
   public dispose(): void {
+    this.innerCloseUnsubscribe();
+    this.proxyCloseUnsubscribe?.();
     this.inner.dispose();
     this.proxyCleanup();
+  }
+
+  private emitClose(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    for (const listener of this.closeListeners) {
+      listener();
+    }
   }
 }
 
@@ -59,4 +87,25 @@ export function jumpHostCleanup(jumpConnection: SshConnection): () => void {
 
 export function socketCleanup(socket: Socket | Duplex): () => void {
   return () => socket.destroy();
+}
+
+export function socketCloseRelay(socket: Socket | Duplex): CloseRelay {
+  return (listener) => {
+    let notified = false;
+    const notify = (): void => {
+      if (notified) {
+        return;
+      }
+      notified = true;
+      listener();
+    };
+    socket.on("close", notify);
+    socket.on("end", notify);
+    socket.on("error", notify);
+    return () => {
+      socket.removeListener("close", notify);
+      socket.removeListener("end", notify);
+      socket.removeListener("error", notify);
+    };
+  };
 }

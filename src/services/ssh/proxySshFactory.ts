@@ -9,7 +9,7 @@ import type {
   SshConnectContext,
   SshConnection
 } from "./contracts";
-import { ProxiedSshConnection, jumpHostCleanup, socketCleanup } from "./proxiedSshConnection";
+import { ProxiedSshConnection, jumpHostCleanup, socketCleanup, socketCloseRelay } from "./proxiedSshConnection";
 import type { SilentAuthSshFactory } from "./silentAuth";
 import { proxyPasswordSecretKey } from "./silentAuth";
 
@@ -107,7 +107,11 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       throw error;
     }
 
-    return new ProxiedSshConnection(targetConnection, jumpHostCleanup(jumpConnection));
+    return new ProxiedSshConnection(
+      targetConnection,
+      jumpHostCleanup(jumpConnection),
+      (listener) => jumpConnection.onClose(listener)
+    );
   }
 
   private async connectViaSocks5(
@@ -179,7 +183,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       socket.destroy();
       throw error;
     }
-    return new ProxiedSshConnection(connection, socketCleanup(socket));
+    return new ProxiedSshConnection(connection, socketCleanup(socket), socketCloseRelay(socket));
   }
 
   private addToVisited(visited: ReadonlySet<string>, server: ServerConfig): Set<string> {
