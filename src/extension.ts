@@ -30,6 +30,7 @@ import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
 import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
 import { createCoalescedInvoker } from "./utils/coalescedInvoker";
+import { clearTrackedSessionActivity, focusSessionTerminal } from "./utils/sessionTerminalFocus";
 import { registerSettingsCommands } from "./commands/settingsCommands";
 import { registerConfigCommands } from "./commands/configCommands";
 import { registerMacroCommands, updateMacroContext, migrateMacroSlots } from "./commands/macroCommands";
@@ -439,15 +440,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     for (const [sessionId, t] of sessionTerminals) {
       if (t === terminal) {
-        core.clearSessionActivity(sessionId);
-        ctx.activityIndicators.get(sessionId)?.setActivityIndicator(false);
+        clearTrackedSessionActivity({ core, activityIndicators: ctx.activityIndicators }, sessionId);
         return;
       }
     }
     for (const [sessionId, entry] of serialTerminals) {
       if (entry.terminal === terminal) {
-        core.clearSessionActivity(sessionId);
-        ctx.activityIndicators.get(sessionId)?.setActivityIndicator(false);
+        clearTrackedSessionActivity({ core, activityIndicators: ctx.activityIndicators }, sessionId);
         return;
       }
     }
@@ -556,6 +555,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
 
+  const focusSessionCommand = vscode.commands.registerCommand("nexus.focusSessionTerminal", (sessionId: string, type: "ssh" | "serial") => {
+    focusSessionTerminal(
+      {
+        core,
+        sessionTerminals,
+        serialTerminals,
+        activityIndicators: ctx.activityIndicators,
+        onTerminalFocused: (terminal) => {
+          ctx.focusedTerminal = terminal;
+        }
+      },
+      sessionId,
+      type
+    );
+  });
+
   const refreshCommand = vscode.commands.registerCommand("nexus.refresh", async () => {
     await core.initialize();
     viewSync.flush();
@@ -655,6 +670,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     fsRegistration,
     statusBarItem,
     refreshCommand,
+    focusSessionCommand,
     filterCommand,
     filterClearCommand,
     appearanceCommand,

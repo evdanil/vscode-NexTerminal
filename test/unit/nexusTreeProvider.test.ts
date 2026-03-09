@@ -680,6 +680,17 @@ describe("NexusTreeProvider session activity indicators", () => {
     expect(icon.color).toBeUndefined();
   });
 
+  it("SessionTreeItem focuses the matching SSH terminal on click", () => {
+    const session = { id: "sess-1", serverId: "srv-1", terminalName: "Nexus SSH: S1", startedAt: 0 };
+    const item = new SessionTreeItem(session);
+
+    expect(item.command).toEqual({
+      command: "nexus.focusSessionTerminal",
+      title: "Focus Terminal",
+      arguments: ["sess-1", "ssh"]
+    });
+  });
+
   it("SerialSessionTreeItem shows yellow icon when session has activity", () => {
     const provider = new NexusTreeProvider(noopCallbacks);
     provider.setSnapshot({
@@ -710,5 +721,16 @@ describe("NexusTreeProvider session activity indicators", () => {
     const icon = sessions[0].iconPath as { id: string; color?: unknown };
     expect(icon.id).toBe("terminal");
     expect(icon.color).toBeUndefined();
+  });
+
+  it("SerialSessionTreeItem focuses the matching serial terminal on click", () => {
+    const session = { id: "ss-1", profileId: "sp-1", terminalName: "Nexus Serial: S1", startedAt: 0 };
+    const item = new SerialSessionTreeItem(session);
+
+    expect(item.command).toEqual({
+      command: "nexus.focusSessionTerminal",
+      title: "Focus Terminal",
+      arguments: ["ss-1", "serial"]
+    });
   });
 });

@@ -70,6 +70,11 @@ export class SessionTreeItem extends vscode.TreeItem {
       "terminal",
       hasActivity ? new vscode.ThemeColor("terminal.ansiYellow") : undefined
     );
+    this.command = {
+      command: "nexus.focusSessionTerminal",
+      title: "Focus Terminal",
+      arguments: [session.id, "ssh"]
+    };
   }
 }
 
@@ -99,6 +104,11 @@ export class SerialSessionTreeItem extends vscode.TreeItem {
       "terminal",
       hasActivity ? new vscode.ThemeColor("terminal.ansiYellow") : undefined
     );
+    this.command = {
+      command: "nexus.focusSessionTerminal",
+      title: "Focus Terminal",
+      arguments: [session.id, "serial"]
+    };
   }
 }
 
