@@ -116,7 +116,7 @@ const activePassthroughKeys = new Set<string>();
 
 function updatePassthroughContext(): void {
   const config = vscode.workspace.getConfiguration("nexus.terminal");
-  const masterEnabled = config.get<boolean>("keyboardPassthrough", false);
+  const masterEnabled = config.get<boolean>("keyboardPassthrough", true);
   const selectedKeys = config.get<string[]>("passthroughKeys", [...ALL_PASSTHROUGH_KEYS]);
   const activeSet = masterEnabled ? new Set(selectedKeys.map(k => k.toLowerCase())) : new Set<string>();
 
