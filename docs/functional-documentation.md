@@ -4,6 +4,7 @@
 Nexus Terminal provides one operational surface in VS Code for:
 - SSH terminals
 - SSH port-forwarding tunnels
+- SFTP file management over SSH
 - Serial connectivity through isolated sidecar IPC
 
 ## 2. Implemented Architecture
@@ -12,18 +13,23 @@ Nexus Terminal provides one operational surface in VS Code for:
 - `NexusCore` (`src/core/nexusCore.ts`): state manager for servers, tunnel profiles, active sessions, active tunnels.
 - `SilentAuthSshFactory` (`src/services/ssh/silentAuth.ts`): credential loop with `SecretStorage` and keyboard-interactive 2FA support.
 - `Ssh2Connector` (`src/services/ssh/ssh2Connector.ts`): concrete SSH transport.
+- `SshConnectionPool` (`src/services/ssh/sshConnectionPool.ts`): shared SSH connection manager for multiplexed terminals, tunnels, and SFTP.
 - `TunnelManager` (`src/services/tunnel/tunnelManager.ts`): local TCP listeners + SSH forwarding.
+- `SftpService` (`src/services/sftp/sftpService.ts`): shared SFTP operations layer backing the file explorer and `nexterm://` filesystem provider.
+- `TunnelRegistrySync` (`src/services/tunnel/tunnelRegistrySync.ts`): cross-window tunnel ownership and visibility sync.
 - `SerialSidecarManager` (`src/services/serial/serialSidecarManager.ts`): JSON-RPC sidecar client.
 - `serialSidecarWorker` (`src/services/serial/serialSidecarWorker.ts`): isolated process runtime.
 
 ### 2.2 Isolation Model
-- Every interactive SSH terminal uses its own SSH connection (`SshPty`).
+- Interactive SSH terminals use `SshPty` shell channels. When SSH multiplexing is enabled, those channels can share a pooled underlying SSH connection; per-server disable and automatic standalone fallback are supported.
 - Tunnels default to shared mode: all TCP clients reuse a single SSH connection. Isolated mode (one SSH connection per client) is available as a per-profile or global setting.
+- SFTP reuses the shared SSH pool when connected to the same server.
 - Serial code executes outside the extension host process.
 
 ## 3. Data Models
 - `ServerConfig` and `TunnelProfile` defined in `src/models/config.ts`.
 - `SerialProfile` defined in `src/models/config.ts` (`path`, `baudRate`, `dataBits`, `stopBits`, `parity`, `rtscts`, optional `group`).
+- `AuthProfile` defined in `src/models/config.ts` for reusable username/auth method templates linked to multiple servers.
 - Persisted via `VscodeConfigRepository` into `globalState`.
 - Password secrets persisted via VS Code `SecretStorage` using key pattern `password-${serverId}`.
 
@@ -53,24 +59,24 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 ### 4.4 SSH Terminal Session
 1. Run `Nexus: Connect Server` (or context action).
 2. A custom PTY terminal is created (`Nexus SSH: <server>`).
-3. Terminal opens in the panel or an editor tab based on `nexus.terminal.openLocation`.
+3. Terminal opens in an editor tab by default, or in the terminal panel when `nexus.terminal.openLocation` is set to `panel`.
 4. Session appears in **Connectivity Hub**.
 5. Unread output marks both the sidebar session node and the terminal tab title until the terminal regains focus.
 6. Output/input logs are written under extension global storage logs.
 
-### 4.5 Tunnel Patch Bay
+### 4.5 Port Forwarding
 1. Create tunnel profile with `Nexus: Add Tunnel`. Choose tunnel type from the dropdown:
    - **Local Forward (-L)**: local TCP listener forwards to a remote target through SSH.
    - **Reverse Forward (-R)**: the remote SSH server listens and forwards incoming connections back to a local target.
    - **Dynamic SOCKS5 (-D)**: local SOCKS5 proxy routes connections through SSH to arbitrary destinations.
 2. Assign a default server, or leave unassigned to choose at start time.
 3. Start a tunnel from **Port Forwarding** (right-click > Start), or drag it onto a server in **Connectivity Hub**.
-4. In shared mode (default), the SSH connection is established eagerly at tunnel start — 2FA happens once upfront.
+4. In shared mode (default), the SSH connection is established eagerly at tunnel start - 2FA happens once upfront.
 5. Active tunnels show traffic counters (bytes in/out).
-6. **Tunnel Monitor** panel shows live route, type, server, counters, and start time.
+6. The **Port Forwarding** view shows live route and traffic counters for active tunnels, and marks tunnels owned by another VS Code window separately.
 7. Connection mode can be profile-based: `isolated`, `shared`, or `ask every start`. Reverse tunnels always use shared mode.
 8. Right-click tunnel item to start/stop/restart/edit/remove/duplicate/copy info/open in browser.
-9. Tree view indicates tunnel type with prefix: `R` for reverse, `D` for dynamic SOCKS5.
+9. Route labels indicate tunnel type with `L`, `R`, or `D`.
 10. Cross-window tunnel visibility: all three tunnel types are registered in globalState and visible across VS Code windows.
 
 ### 4.6 Serial Sidecar
@@ -115,8 +121,10 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - Add, edit, remove, reorder, pause/resume auto-trigger, and assign shortcuts via the context menu.
 
 ### 4.10 Configuration Export/Import
-- `Nexus: Export Configuration` saves all server, tunnel, and serial profiles to a JSON file.
-- `Nexus: Import Configuration` restores from a backup with merge or replace options.
+- `Nexus: Export Configuration` creates a sanitized JSON export suitable for sharing (credentials stripped, IDs remapped).
+- `Nexus: Export Backup` creates an encrypted backup that includes profiles, settings, and saved credentials.
+- `Nexus: Import Configuration` restores from either format with merge or replace options.
+- `Nexus: Import from MobaXterm` and `Nexus: Import from SecureCRT` migrate external SSH profiles while preserving folder hierarchy where possible.
 
 ## 5. Settings Reference
 
@@ -157,11 +165,11 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 
 | Setting | Type | Default | Range | Description |
 |---------|------|---------|-------|-------------|
-| `nexus.terminal.openLocation` | enum | `panel` | `panel`, `editor` | Where to open terminals |
-| `nexus.terminal.keyboardPassthrough` | boolean | `false` | — | Pass Ctrl+ key combinations to the terminal |
-| `nexus.terminal.passthroughKeys` | array | `[b,e,g,j,k,n,o,p,r,w]` | — | Which Ctrl+ keys to pass through |
-| `nexus.terminal.macros` | array | `[]` | — | Terminal macros with optional `keybinding`, `triggerPattern`, `triggerCooldown`, `triggerInterval`, `triggerInitiallyDisabled` |
-| `nexus.terminal.macros.autoTrigger` | boolean | `true` | — | Enable auto-trigger for macros with a `triggerPattern` |
+| `nexus.terminal.openLocation` | enum | `editor` | `panel`, `editor` | Where to open terminals |
+| `nexus.terminal.keyboardPassthrough` | boolean | `true` | - | Pass Ctrl+ key combinations to the terminal |
+| `nexus.terminal.passthroughKeys` | array | `[b,e,g,j,k,n,o,p,r,w]` | - | Which Ctrl+ keys to pass through |
+| `nexus.terminal.macros` | array | `[]` | - | Terminal macros with optional `keybinding`, `triggerPattern`, `triggerCooldown`, `triggerInterval`, `triggerInitiallyDisabled` |
+| `nexus.terminal.macros.autoTrigger` | boolean | `true` | - | Enable auto-trigger for macros with a `triggerPattern` |
 | `nexus.terminal.macros.defaultCooldown` | number | `3` | 0–300 s | Default cooldown for auto-trigger macros |
 | `nexus.terminal.macros.bufferLength` | number | `2048` | 256–16384 chars | Max characters retained per terminal for pattern matching |
 | `nexus.terminal.highlighting.enabled` | boolean | `true` | — | Enable regex-based terminal highlighting |
@@ -192,7 +200,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 ### 6.1 Views
 - `nexusCommandCenter`: servers, serial profiles, and active sessions.
 - `nexusTunnels`: tunnel profiles and active traffic state.
-- `nexusTunnelMonitor`: dedicated traffic/status panel for active tunnels.
+- `nexusFileExplorer`: remote file browser for the active connected server.
 - `nexusMacros`: terminal macros with optional custom keyboard shortcuts and auto-trigger state.
 - `nexusSettings`: extension settings sidebar panel.
 
@@ -201,6 +209,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - `nexus.server.add`, `nexus.server.edit`, `nexus.server.remove`
 - `nexus.server.connect`, `nexus.server.disconnect`
 - `nexus.server.copyInfo`, `nexus.server.duplicate`, `nexus.server.rename`
+- `nexus.server.deployKey`
 
 **Group:**
 - `nexus.group.add`, `nexus.group.remove`, `nexus.group.rename`
@@ -215,12 +224,17 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - `nexus.serial.add`, `nexus.serial.edit`, `nexus.serial.remove`
 - `nexus.serial.connect`, `nexus.serial.disconnect`
 - `nexus.serial.copyInfo`, `nexus.serial.duplicate`, `nexus.serial.rename`
-- `nexus.serial.listPorts`
+- `nexus.serial.listPorts`, `nexus.serial.sendBreak`
 
 **Profile:**
 - `nexus.profile.add` (unified add form)
 
+**Auth Profile:**
+- `nexus.authProfile.add`, `nexus.authProfile.manage`
+- `nexus.authProfile.applyToFolder`, `nexus.authProfile.applyToServer`
+
 **Macros:**
+- `nexus.macro.editor`
 - `nexus.macro.add`, `nexus.macro.edit`, `nexus.macro.remove`
 - `nexus.macro.run` (Alt+S quick pick)
 - `nexus.macro.runBinding` (explicit shortcut dispatch)
@@ -229,15 +243,29 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - `nexus.macro.moveUp`, `nexus.macro.moveDown`
 - `nexus.macro.disableTrigger`, `nexus.macro.enableTrigger`
 
-**Config:**
-- `nexus.config.export`, `nexus.config.import`
+**Files:**
+- `nexus.files.browse`, `nexus.files.open`
+- `nexus.files.upload`, `nexus.files.download`
+- `nexus.files.delete`, `nexus.files.rename`
+- `nexus.files.createDir`, `nexus.files.createFile`
+- `nexus.files.goToPath`, `nexus.files.goHome`
+- `nexus.files.copyPath`, `nexus.files.refresh`, `nexus.files.disconnect`
 
-**Settings:**
-- `nexus.settings.edit`, `nexus.settings.reset`
+**Config:**
+- `nexus.config.export`, `nexus.config.export.backup`
+- `nexus.config.import`, `nexus.config.import.mobaxterm`, `nexus.config.import.securecrt`
+- `nexus.config.completeReset`
+
+**Settings and Appearance:**
+- `nexus.settings.openPanel`
+- `nexus.openHighlightRuleEditor`
+- `nexus.terminal.appearance`
 - `nexus.settings.openJson`, `nexus.settings.openLogDir`
+- `nexus.settings.resetAll`
 
 **General:**
 - `nexus.refresh`
+- `nexus.filter`, `nexus.filter.clear`
 
 ## 7. Test Strategy
 
@@ -261,8 +289,8 @@ Implemented (~90% target):
 - Nexus core state manager.
 - Silent Auth workflow with secret invalidation + save/retry.
 - Two-factor authentication (keyboard-interactive) for all SSH auth types.
-- Tunnel Patch Bay model with drag/drop start and eager shared connection.
-- Dedicated Tunnel Monitor sidebar panel for active tunnel traffic/status.
+- Port Forwarding model with drag/drop start and eager shared connection.
+- Active tunnel counters and cross-window visibility in the Port Forwarding view.
 - Dedicated terminal/tunnel connection model.
 - Interactive serial terminal sessions through sidecar-managed ports.
 - Session transcript logging with ANSI stripping and rotation.

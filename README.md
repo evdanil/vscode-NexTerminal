@@ -137,8 +137,8 @@ npm run package:vsix
 | `nexus.tunnel.defaultConnectionMode` | `shared` | `shared` or `isolated` SSH mode for tunnels |
 | `nexus.tunnel.defaultBindAddress` | `127.0.0.1` | Default bind address for reverse tunnels |
 | `nexus.tunnel.socks5HandshakeTimeout` | `10` | Dynamic tunnel SOCKS5 handshake timeout in seconds |
-| `nexus.terminal.openLocation` | `panel` | Where to open terminals: `panel` or `editor` tab |
-| `nexus.terminal.keyboardPassthrough` | `false` | Pass Ctrl+ key combinations to the terminal |
+| `nexus.terminal.openLocation` | `editor` | Where to open terminals: `panel` or `editor` tab |
+| `nexus.terminal.keyboardPassthrough` | `true` | Pass Ctrl+ key combinations to the terminal |
 | `nexus.terminal.passthroughKeys` | `[b,e,g,j,k,n,o,p,r,w]` | Which Ctrl+ keys to pass through when enabled |
 | `nexus.terminal.macros` | `[]` | Terminal macros with optional `keybinding`, `triggerPattern`, `triggerCooldown`, `triggerInterval`, and `triggerInitiallyDisabled` |
 | `nexus.terminal.macros.autoTrigger` | `true` | Enable auto-trigger for macros with a `triggerPattern` |
