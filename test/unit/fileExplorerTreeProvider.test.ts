@@ -375,7 +375,7 @@ describe("FileExplorerTreeProvider", () => {
     }
   });
 
-  it("stops polling after auto watch resolves to recursive inotify", async () => {
+  it("keeps polling as safety net even when auto watch resolves to recursive inotify", async () => {
     vi.useFakeTimers();
     try {
       const watchReady = createDeferred<void>();
@@ -396,8 +396,9 @@ describe("FileExplorerTreeProvider", () => {
       await Promise.resolve();
       await Promise.resolve();
 
+      // Polling continues as a safety net even with inotifywait active
       await vi.advanceTimersByTimeAsync(1000);
-      expect(refreshSpy).toHaveBeenCalledTimes(1);
+      expect(refreshSpy).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }

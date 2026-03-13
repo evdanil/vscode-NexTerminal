@@ -41,10 +41,10 @@ describe("RemoteDirectoryWatcher", () => {
 
     expect(exec).toHaveBeenNthCalledWith(
       2,
-      "inotifywait -m -r -q -e modify,create,delete,move --format '%w%0' --no-newline '/home/dev'"
+      "inotifywait -m -r -q -e modify,create,delete,move --format '%w' '/home/dev'"
     );
 
-    watchStream.emit("data", Buffer.from("/home/dev/subdir/\0"));
+    watchStream.emit("data", Buffer.from("/home/dev/subdir/\n"));
     await vi.advanceTimersByTimeAsync(500);
 
     expect(listener).toHaveBeenCalledWith({
@@ -77,14 +77,14 @@ describe("RemoteDirectoryWatcher", () => {
     await vi.advanceTimersByTimeAsync(0);
     await secondWatch;
 
-    const oldCommand = "inotifywait -m -r -q -e modify,create,delete,move --format '%w%0' --no-newline '/old/path'";
+    const oldCommand = "inotifywait -m -r -q -e modify,create,delete,move --format '%w' '/old/path'";
     watchStreams.get(oldCommand)?.emit("close");
 
     await vi.advanceTimersByTimeAsync(5_000);
 
     expect(exec.mock.calls.filter(([command]) => command === oldCommand)).toHaveLength(1);
     expect(exec).toHaveBeenCalledWith(
-      "inotifywait -m -r -q -e modify,create,delete,move --format '%w%0' --no-newline '/new/path'"
+      "inotifywait -m -r -q -e modify,create,delete,move --format '%w' '/new/path'"
     );
   });
 
@@ -107,12 +107,13 @@ describe("RemoteDirectoryWatcher", () => {
     await vi.advanceTimersByTimeAsync(0);
     await watchPromise;
 
-    watchStream.emit("data", Buffer.from("/home/dev/weird|name\nsubdir/\0", "utf8"));
+    // Pipe characters and other special chars are preserved in newline-delimited output
+    watchStream.emit("data", Buffer.from("/home/dev/weird|name subdir/\n", "utf8"));
     await vi.advanceTimersByTimeAsync(500);
 
     expect(listener).toHaveBeenCalledWith({
       serverId: "srv-1",
-      dirPath: "/home/dev/weird|name\nsubdir",
+      dirPath: "/home/dev/weird|name subdir",
     });
   });
 });

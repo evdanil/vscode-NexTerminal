@@ -756,13 +756,9 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     if (!this.isViewVisible || !this.activeServerId || this.pollIntervalMs <= 0) {
       return;
     }
-    // Recursive inotify can keep the tree fresh by itself. Other modes still rely on polling.
-    if (this.remoteWatchMode === "auto") {
-      const watchMode = this.sftp.getWatchMode(this.activeServerId);
-      if (watchMode === "inotifywait") {
-        return;
-      }
-    }
+    // Polling always runs as a safety net. Event-driven watchers (inotifywait)
+    // provide faster detection but never replace polling entirely — if the
+    // watcher silently fails, polling still catches changes.
     this.pollTimer = setInterval(() => {
       if (this.pendingChildrenRequests === 0) {
         this.refresh();

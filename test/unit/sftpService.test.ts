@@ -372,7 +372,7 @@ describe("SftpService", () => {
       const watchPromise = service.startWatching("srv-1", "/home/dev", 1_000);
       await vi.advanceTimersByTimeAsync(0);
       await watchPromise;
-      watchStream.emit("data", Buffer.from("/home/dev/subdir/\0"));
+      watchStream.emit("data", Buffer.from("/home/dev/subdir/\n"));
       await vi.advanceTimersByTimeAsync(500);
 
       await service.readDirectory("srv-1", "/home/dev");

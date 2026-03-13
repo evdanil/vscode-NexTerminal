@@ -215,7 +215,7 @@ export class RemoteDirectoryWatcher {
     }
 
     try {
-      const command = `inotifywait -m -r -q -e modify,create,delete,move --format '%w%0' --no-newline ${shellEscape(dirPath)}`;
+      const command = `inotifywait -m -r -q -e modify,create,delete,move --format '%w' ${shellEscape(dirPath)}`;
       const stream = await this.connection.exec(command);
       if (!this.isActiveGeneration(generation)) {
         stream.destroy();
@@ -227,15 +227,14 @@ export class RemoteDirectoryWatcher {
         const text = typeof chunk === "string" ? chunk : chunk.toString("utf-8");
         this.inotifyBuffer += text;
 
-        // Process NUL-delimited paths so directory names may safely contain newlines or pipes.
-        const entries = this.inotifyBuffer.split("\0");
-        this.inotifyBuffer = entries.pop() ?? "";
+        const lines = this.inotifyBuffer.split("\n");
+        this.inotifyBuffer = lines.pop() ?? "";
 
-        for (const entry of entries) {
-          if (!entry) {
+        for (const line of lines) {
+          if (!line) {
             continue;
           }
-          this.queueDirChange(this.normalizeDirPath(entry));
+          this.queueDirChange(this.normalizeDirPath(line));
         }
       });
 
