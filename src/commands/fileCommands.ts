@@ -266,12 +266,11 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       }
 
       const remoteFile = path.posix.join(item.remotePath, item.entry.name);
-      const sourceUri = buildUri(item.serverId, remoteFile);
       try {
         await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: `Downloading ${item.entry.name}...` },
           async () => {
-            await vscode.workspace.fs.copy(sourceUri, dest, { overwrite: true });
+            await ctx.sftpService.download(item.serverId, remoteFile, dest.fsPath);
           }
         );
         vscode.window.showInformationMessage(`Downloaded ${item.entry.name}`);
