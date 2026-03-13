@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { EventEmitter } from "node:events";
 import { SftpService } from "../../src/services/sftp/sftpService";
 import type { SshConnection, SshFactory } from "../../src/services/ssh/contracts";
 import type { ServerConfig } from "../../src/models/config";
@@ -54,6 +55,14 @@ function createMockFactory(connection: SshConnection): SshFactory {
 
 function missingPathError(message = "No such file"): Error & { code: number } {
   return Object.assign(new Error(message), { code: 2 });
+}
+
+type MockExecStream = EventEmitter & { destroy: ReturnType<typeof vi.fn> };
+
+function createExecStream(): MockExecStream {
+  const stream = new EventEmitter() as MockExecStream;
+  stream.destroy = vi.fn();
+  return stream;
 }
 
 describe("SftpService", () => {
@@ -335,6 +344,46 @@ describe("SftpService", () => {
     expect(sftp.end).toHaveBeenCalled();
     expect(connection.dispose).toHaveBeenCalled();
     expect(service.isConnected("srv-1")).toBe(false);
+  });
+
+  it("invalidates only the changed cache subtree when a remote watch event arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      const watchStream = createExecStream();
+      (connection.exec as ReturnType<typeof vi.fn>).mockImplementation(async (command: string) => {
+        if (command === "command -v inotifywait") {
+          const probeStream = createExecStream();
+          setTimeout(() => probeStream.emit("close", 0), 0);
+          return probeStream as unknown as Awaited<ReturnType<SshConnection["exec"]>>;
+        }
+        return watchStream as unknown as Awaited<ReturnType<SshConnection["exec"]>>;
+      });
+
+      await service.connect(testServer);
+
+      sftp.readdir.mockImplementation((_path: string, cb: Function) => {
+        cb(null, [{ filename: "file.txt", attrs: { mode: 0o100644, size: 100, mtime: 1700000000 } }]);
+      });
+
+      await service.readDirectory("srv-1", "/home/dev");
+      await service.readDirectory("srv-1", "/home/dev/subdir");
+      await service.readDirectory("srv-1", "/home/dev/other");
+
+      const watchPromise = service.startWatching("srv-1", "/home/dev", 1_000);
+      await vi.advanceTimersByTimeAsync(0);
+      await watchPromise;
+      watchStream.emit("data", Buffer.from("/home/dev/subdir/\0"));
+      await vi.advanceTimersByTimeAsync(500);
+
+      await service.readDirectory("srv-1", "/home/dev");
+      await service.readDirectory("srv-1", "/home/dev/subdir");
+      await service.readDirectory("srv-1", "/home/dev/other");
+
+      expect(sftp.readdir).toHaveBeenCalledTimes(4);
+      expect(sftp.readdir).toHaveBeenNthCalledWith(4, "/home/dev/subdir", expect.any(Function));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   describe("execCommand (private, tested via copyRemote)", () => {

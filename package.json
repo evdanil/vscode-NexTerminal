@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros with auto-trigger (expect/send), regex highlighting, unread activity indicators, color schemes, and configuration import/export.",
-  "version": "2.7.60",
+  "version": "2.7.61",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -2608,14 +2608,14 @@
           "minimum": 0,
           "maximum": 60,
           "order": 22,
-          "markdownDescription": "Fallback polling interval for the SFTP File Explorer (in seconds). Used when `remoteWatchMode` is `polling`, or when the remote server does not support inotifywait or stat-based change detection. Set to `0` to disable. Only active when the view is visible and a server is connected."
+          "markdownDescription": "Polling interval for the SFTP File Explorer (in seconds). Used when `remoteWatchMode` is `polling`, and as a safety-net refresh cadence in `auto` mode unless recursive `inotifywait` support is available. Set to `0` to disable polling. Only active when the view is visible and a server is connected."
         },
         "nexus.sftp.remoteWatchMode": {
           "type": "string",
           "enum": ["auto", "polling"],
           "default": "auto",
           "order": 23,
-          "markdownDescription": "How the File Explorer detects remote filesystem changes. `auto` tries `inotifywait` then `stat`-based mtime checks, falling back to polling. `polling` uses the traditional polling interval set by `autoRefreshInterval`."
+          "markdownDescription": "How the File Explorer detects remote filesystem changes. `auto` prefers recursive `inotifywait` watching when available and otherwise keeps polling enabled as the safety net. `polling` disables remote watch probes and uses only the interval set by `autoRefreshInterval`."
         },
         "nexus.sftp.maxOpenFileSizeMB": {
           "type": "number",

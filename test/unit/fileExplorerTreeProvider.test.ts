@@ -132,6 +132,16 @@ function missingRemoteError(message = "No such file"): Error & { code: number } 
   return Object.assign(new Error(message), { code: 2 });
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("FileExplorerTreeProvider", () => {
   let sftp: ReturnType<typeof createMockSftpService>;
   let provider: FileExplorerTreeProvider;
@@ -330,11 +340,74 @@ describe("FileExplorerTreeProvider", () => {
     expect(parentItem.parentPath).toBe("/");
   });
 
+  it("stops the previous server watch before switching active servers", () => {
+    const secondServer: ServerConfig = { ...testServer, id: "srv-2", name: "Other Server" };
+
+    provider.setActiveServer(testServer, "/home/dev");
+    provider.setActiveServer(secondServer, "/srv/other");
+
+    expect(sftp.stopWatching).toHaveBeenCalledWith("srv-1");
+    expect(sftp.startWatching).toHaveBeenLastCalledWith("srv-2", "/srv/other", 0);
+  });
+
   it("getHomeDir returns the original home directory", () => {
     provider.setActiveServer(testServer, "/home/dev");
     expect(provider.getHomeDir()).toBe("/home/dev");
     provider.setRootPath("/etc");
     expect(provider.getHomeDir()).toBe("/home/dev");
+  });
+
+  it("keeps polling in auto mode when only stat watching is available", async () => {
+    vi.useFakeTimers();
+    try {
+      (sftp.getWatchMode as any).mockReturnValue("stat");
+
+      provider.setViewVisibility(true);
+      provider.setAutoRefreshInterval(1);
+      const refreshSpy = vi.spyOn(provider, "refresh");
+
+      provider.setActiveServer(testServer, "/home/dev");
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops polling after auto watch resolves to recursive inotify", async () => {
+    vi.useFakeTimers();
+    try {
+      const watchReady = createDeferred<void>();
+      let watchMode: string | undefined;
+      (sftp.startWatching as any).mockImplementation(() => watchReady.promise);
+      (sftp.getWatchMode as any).mockImplementation(() => watchMode);
+
+      provider.setViewVisibility(true);
+      provider.setAutoRefreshInterval(1);
+      const refreshSpy = vi.spyOn(provider, "refresh");
+
+      provider.setActiveServer(testServer, "/home/dev");
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+
+      watchMode = "inotifywait";
+      watchReady.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("restarts auto watching when the refresh interval changes", () => {
+    provider.setActiveServer(testServer, "/home/dev");
+    provider.setAutoRefreshInterval(3);
+
+    expect(sftp.startWatching).toHaveBeenLastCalledWith("srv-1", "/home/dev", 3000);
   });
 
   it("skips auto-refresh until all pending getChildren calls finish", async () => {

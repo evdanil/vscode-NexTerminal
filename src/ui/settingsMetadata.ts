@@ -268,10 +268,22 @@ export const SETTINGS_META: SettingMeta[] = [
     label: "Auto-Refresh Interval",
     type: "number",
     category: "sftp",
-    description: "Auto-refresh interval for the File Explorer (in seconds). Set to 0 to disable. Only polls when the view is visible.",
+    description: "Polling interval for the File Explorer (in seconds). Used for polling mode and as a safety-net refresh cadence in auto mode unless recursive inotify watching is available.",
     min: 0,
     max: 60,
     unit: "seconds"
+  },
+  {
+    key: "remoteWatchMode",
+    section: "nexus.sftp",
+    label: "Remote Watch Mode",
+    type: "enum",
+    category: "sftp",
+    description: "Choose how the File Explorer tracks remote changes. Auto prefers recursive inotify watching and otherwise keeps polling available as the safety net.",
+    enumOptions: [
+      { label: "Auto", value: "auto", description: "Prefer recursive inotify watching when the server supports it.", recommended: true },
+      { label: "Polling", value: "polling", description: "Disable remote watch probes and refresh using only the polling interval." }
+    ]
   },
   {
     key: "maxOpenFileSizeMB",

@@ -252,6 +252,7 @@ describe("SETTINGS_KEYS", () => {
     expect(keys).toContain("nexus.sftp.cacheTtlSeconds");
     expect(keys).toContain("nexus.sftp.maxCacheEntries");
     expect(keys).toContain("nexus.sftp.autoRefreshInterval");
+    expect(keys).toContain("nexus.sftp.remoteWatchMode");
   });
 
   it("includes interface settings", () => {

@@ -32,7 +32,7 @@ export function createMockSftpService(): SftpService {
     copyRemote: vi.fn(),
     invalidateCache: vi.fn(),
     onRemoteChange: vi.fn().mockReturnValue(() => {}),
-    startWatching: vi.fn(),
+    startWatching: vi.fn().mockResolvedValue(undefined),
     stopWatching: vi.fn(),
     getWatchMode: vi.fn().mockReturnValue(undefined),
     dispose: vi.fn(),

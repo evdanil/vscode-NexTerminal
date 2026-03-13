@@ -3,7 +3,7 @@ import type { SFTPWrapper, FileEntry, Stats } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import { clamp } from "../../utils/helpers";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
-import { RemoteDirectoryWatcher, type RemoteChangeEvent } from "./remoteDirectoryWatcher";
+import { RemoteDirectoryWatcher, type RemoteChangeEvent, type WatchMode } from "./remoteDirectoryWatcher";
 
 export interface DirectoryEntry {
   name: string;
@@ -560,6 +560,19 @@ export class SftpService {
     }
   }
 
+  private invalidateCacheTree(serverId: string, remotePath: string): void {
+    const exactKey = cacheKey(serverId, remotePath);
+    const childPrefix = remotePath === "/"
+      ? `${serverId}:/`
+      : `${exactKey}/`;
+
+    for (const key of this.dirCache.keys()) {
+      if (key === exactKey || key.startsWith(childPrefix)) {
+        this.dirCache.delete(key);
+      }
+    }
+  }
+
   public onRemoteChange(listener: (event: RemoteChangeEvent) => void): () => void {
     this.changeListeners.push(listener);
     return () => {
@@ -570,17 +583,17 @@ export class SftpService {
     };
   }
 
-  public startWatching(serverId: string, dirPath: string, pollIntervalMs: number): void {
+  public async startWatching(serverId: string, dirPath: string, pollIntervalMs: number): Promise<WatchMode | undefined> {
     const session = this.sessions.get(serverId);
     if (!session) {
-      return;
+      return undefined;
     }
 
     let watcher = this.watchers.get(serverId);
     if (!watcher) {
       watcher = new RemoteDirectoryWatcher(session.connection, serverId);
       watcher.onDidChange((event) => {
-        this.invalidateCache(event.serverId, event.dirPath);
+        this.invalidateCacheTree(event.serverId, event.dirPath);
         for (const listener of this.changeListeners) {
           listener(event);
         }
@@ -588,7 +601,7 @@ export class SftpService {
       this.watchers.set(serverId, watcher);
     }
 
-    void watcher.watch(dirPath, pollIntervalMs);
+    return watcher.watch(dirPath, pollIntervalMs);
   }
 
   public stopWatching(serverId: string): void {
@@ -599,7 +612,7 @@ export class SftpService {
     }
   }
 
-  public getWatchMode(serverId: string): string | undefined {
+  public getWatchMode(serverId: string): WatchMode | undefined {
     return this.watchers.get(serverId)?.mode;
   }
 

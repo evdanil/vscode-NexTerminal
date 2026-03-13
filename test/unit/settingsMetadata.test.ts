@@ -19,6 +19,13 @@ describe("SETTINGS_META", () => {
     expect(meta?.min).toBe(5);
     expect(meta?.max).toBe(300);
   });
+
+  it("includes the remote watch mode setting in the SFTP metadata", () => {
+    const meta = SETTINGS_META.find((item) => item.section === "nexus.sftp" && item.key === "remoteWatchMode");
+    expect(meta).toBeDefined();
+    expect(meta?.type).toBe("enum");
+    expect(meta?.enumOptions?.map((option) => option.value)).toEqual(["auto", "polling"]);
+  });
 });
 
 describe("formatSettingValueForTree", () => {

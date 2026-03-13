@@ -196,6 +196,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   }
 
   public setActiveServer(server: ServerConfig, homeDir: string): void {
+    this.stopRemoteWatch(this.activeServerId);
     this.activeServerId = server.id;
     this.activeServerConfig = server;
     this.homeDir = homeDir;
@@ -206,13 +207,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   }
 
   public clearActiveServer(): void {
-    if (this.activeServerId) {
-      this.sftp.stopWatching(this.activeServerId);
-    }
-    if (this.watcherUnsubscribe) {
-      this.watcherUnsubscribe();
-      this.watcherUnsubscribe = undefined;
-    }
+    this.stopRemoteWatch(this.activeServerId);
     this.activeServerId = undefined;
     this.activeServerConfig = undefined;
     this.homeDir = undefined;
@@ -224,7 +219,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   public setRootPath(rootPath: string): void {
     this.currentRootPath = rootPath;
     if (this.activeServerId && this.remoteWatchMode === "auto") {
-      this.sftp.startWatching(this.activeServerId, rootPath, this.pollIntervalMs);
+      this.startRemoteWatch(this.activeServerId, rootPath);
     }
     this.onDidChangeTreeDataEmitter.fire(undefined);
   }
@@ -236,6 +231,9 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
 
   public setAutoRefreshInterval(seconds: number): void {
     this.pollIntervalMs = seconds * 1000;
+    if (this.activeServerId && this.currentRootPath && this.remoteWatchMode === "auto") {
+      this.startRemoteWatch(this.activeServerId, this.currentRootPath);
+    }
     this.updatePolling();
   }
 
@@ -245,11 +243,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       if (mode === "auto") {
         this.startRemoteWatch(this.activeServerId, this.currentRootPath);
       } else {
-        this.sftp.stopWatching(this.activeServerId);
-        if (this.watcherUnsubscribe) {
-          this.watcherUnsubscribe();
-          this.watcherUnsubscribe = undefined;
-        }
+        this.stopRemoteWatch(this.activeServerId);
       }
       this.updatePolling();
     }
@@ -377,13 +371,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
 
   public dispose(): void {
     this.stopPolling();
-    if (this.activeServerId) {
-      this.sftp.stopWatching(this.activeServerId);
-    }
-    if (this.watcherUnsubscribe) {
-      this.watcherUnsubscribe();
-      this.watcherUnsubscribe = undefined;
-    }
+    this.stopRemoteWatch(this.activeServerId);
   }
 
   private resolveTargetDirectory(target: FileExplorerItem | undefined): string | undefined {
@@ -768,10 +756,10 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     if (!this.isViewVisible || !this.activeServerId || this.pollIntervalMs <= 0) {
       return;
     }
-    // When in auto mode, only fall back to polling if the watcher reported "none"
+    // Recursive inotify can keep the tree fresh by itself. Other modes still rely on polling.
     if (this.remoteWatchMode === "auto") {
       const watchMode = this.sftp.getWatchMode(this.activeServerId);
-      if (watchMode && watchMode !== "none") {
+      if (watchMode === "inotifywait") {
         return;
       }
     }
@@ -790,14 +778,26 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       this.watcherUnsubscribe();
       this.watcherUnsubscribe = undefined;
     }
-    this.sftp.startWatching(serverId, dirPath, this.pollIntervalMs);
     this.watcherUnsubscribe = this.sftp.onRemoteChange((event) => {
       if (event.serverId === this.activeServerId) {
         this.onDidChangeTreeDataEmitter.fire(undefined);
-        // Re-evaluate polling: the watcher may have probed by now
+      }
+    });
+    void this.sftp.startWatching(serverId, dirPath, this.pollIntervalMs).finally(() => {
+      if (serverId === this.activeServerId && dirPath === this.currentRootPath) {
         this.updatePolling();
       }
     });
+  }
+
+  private stopRemoteWatch(serverId: string | undefined): void {
+    if (serverId) {
+      this.sftp.stopWatching(serverId);
+    }
+    if (this.watcherUnsubscribe) {
+      this.watcherUnsubscribe();
+      this.watcherUnsubscribe = undefined;
+    }
   }
 
   private stopPolling(): void {

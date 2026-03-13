@@ -148,7 +148,8 @@ npm run package:vsix
 | `nexus.ui.showTreeDescriptions` | `true` | Show connection details beside items in the Connectivity Hub |
 | `nexus.sftp.cacheTtlSeconds` | `10` | SFTP directory listing cache TTL |
 | `nexus.sftp.maxCacheEntries` | `500` | Maximum cached SFTP directory listings |
-| `nexus.sftp.autoRefreshInterval` | `10` | Auto-refresh interval for file explorer (seconds) |
+| `nexus.sftp.autoRefreshInterval` | `10` | Polling interval for file explorer (seconds); also used as the auto-mode safety net unless recursive inotify is available |
+| `nexus.sftp.remoteWatchMode` | `auto` | Remote change detection mode: `auto` prefers recursive inotify, `polling` uses interval-based refresh only |
 | `nexus.sftp.operationTimeout` | `30` | Timeout for SFTP directory and metadata operations (listing, stat, realpath, rename, mkdir, delete) |
 | `nexus.sftp.commandTimeout` | `300` | Timeout for remote SFTP commands, file transfers, and editor file open/save |
 | `nexus.sftp.deleteDepthLimit` | `100` | Safety limit for recursive delete directory depth |
