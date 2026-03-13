@@ -1,11 +1,15 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
+import type { SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
 import { ServerTreeItem } from "../ui/nexusTreeProvider";
 import { FileTreeItem } from "../ui/fileExplorerTreeProvider";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "../ui/conflictResolution";
+import { isSafeEntryName } from "../utils/pathSafety";
 import type { CommandContext } from "./types";
+
+const MAX_DOWNLOAD_DEPTH = 100;
 
 function validateFilename(value: string): string | undefined {
   if (!value) {
@@ -122,28 +126,31 @@ async function resolveDownloadConflict(
   return resolveConflict(`Local target "${targetLabel}" already exists. Choose an action.`, conflictState);
 }
 
-async function copyRemoteToLocalWithConflict(
-  sourceUri: vscode.Uri,
-  destinationUri: vscode.Uri,
+async function tryLocalStat(uri: vscode.Uri): Promise<vscode.FileStat | undefined> {
+  try {
+    return await vscode.workspace.fs.stat(uri);
+  } catch {
+    return undefined;
+  }
+}
+
+async function downloadItemToLocal(
+  sftp: SftpService,
+  serverId: string,
+  remotePath: string,
+  isDirectory: boolean,
+  localUri: vscode.Uri,
   conflictState: { mode: ConflictMode },
   summary: DownloadSummary
 ): Promise<void> {
-  let overwrite = conflictState.mode === "overwrite";
+  if (summary.canceled) {
+    return;
+  }
 
-  while (true) {
-    try {
-      await vscode.workspace.fs.copy(sourceUri, destinationUri, { overwrite });
-      summary.downloaded += 1;
-      return;
-    } catch (error) {
-      if (!isFileExistsError(error)) {
-        summary.failed += 1;
-        const message = error instanceof Error ? error.message : String(error);
-        void vscode.window.showErrorMessage(`Failed to download "${path.basename(destinationUri.fsPath)}": ${message}`);
-        return;
-      }
-
-      const decision = await resolveDownloadConflict(destinationUri.fsPath, conflictState, summary);
+  const existing = await tryLocalStat(localUri);
+  if (existing) {
+    if (conflictState.mode !== "overwrite") {
+      const decision = await resolveDownloadConflict(localUri.fsPath, conflictState, summary);
       if (decision === "cancel") {
         summary.canceled = true;
         return;
@@ -152,8 +159,74 @@ async function copyRemoteToLocalWithConflict(
         summary.skipped += 1;
         return;
       }
+    }
+    // If overwriting and types differ, remove the existing entry first
+    if (isDirectory !== ((existing.type & vscode.FileType.Directory) !== 0)) {
+      await vscode.workspace.fs.delete(localUri, { recursive: true, useTrash: false });
+    }
+  }
 
-      overwrite = true;
+  if (isDirectory) {
+    await downloadDirectoryToLocal(sftp, serverId, remotePath, localUri, conflictState, summary, 0);
+  } else {
+    try {
+      await sftp.download(serverId, remotePath, localUri.fsPath);
+      summary.downloaded += 1;
+    } catch (error) {
+      summary.failed += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      void vscode.window.showErrorMessage(`Failed to download "${path.basename(localUri.fsPath)}": ${message}`);
+    }
+  }
+}
+
+async function downloadDirectoryToLocal(
+  sftp: SftpService,
+  serverId: string,
+  remoteDir: string,
+  localDir: vscode.Uri,
+  conflictState: { mode: ConflictMode },
+  summary: DownloadSummary,
+  depth: number
+): Promise<void> {
+  if (depth > MAX_DOWNLOAD_DEPTH) {
+    summary.failed += 1;
+    void vscode.window.showErrorMessage(`Download aborted: directory nesting exceeds ${MAX_DOWNLOAD_DEPTH} levels`);
+    return;
+  }
+
+  await vscode.workspace.fs.createDirectory(localDir);
+
+  let entries;
+  try {
+    entries = await sftp.readDirectory(serverId, remoteDir);
+  } catch (error) {
+    summary.failed += 1;
+    const message = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(`Failed to list "${remoteDir}": ${message}`);
+    return;
+  }
+
+  for (const entry of entries) {
+    if (summary.canceled) {
+      return;
+    }
+    if (entry.isSymlink || !isSafeEntryName(entry.name)) {
+      continue;
+    }
+    const childRemote = path.posix.join(remoteDir, entry.name);
+    const childLocal = vscode.Uri.joinPath(localDir, entry.name);
+    if (entry.isDirectory) {
+      await downloadDirectoryToLocal(sftp, serverId, childRemote, childLocal, conflictState, summary, depth + 1);
+    } else {
+      try {
+        await sftp.download(serverId, childRemote, childLocal.fsPath);
+        summary.downloaded += 1;
+      } catch (error) {
+        summary.failed += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(`Failed to download "${entry.name}": ${message}`);
+      }
     }
   }
 }
@@ -310,9 +383,11 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
           }
           progress.report({ message: item.entry.name });
 
-          const sourceUri = buildUri(item.serverId, remotePath);
           const destinationUri = vscode.Uri.joinPath(destRoot, item.entry.name);
-          await copyRemoteToLocalWithConflict(sourceUri, destinationUri, conflictState, summary);
+          await downloadItemToLocal(
+            ctx.sftpService, item.serverId, remotePath, item.entry.isDirectory,
+            destinationUri, conflictState, summary
+          );
         }
       }
     );
