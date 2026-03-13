@@ -94,13 +94,6 @@ interface DownloadItem {
   remotePath: string;
 }
 
-function isFileExistsError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return /already exists|file exists/i.test(error.message);
-}
-
 function dedupeDownloadItems(items: FileTreeItem[]): DownloadItem[] {
   const normalized = items
     .filter((item) => item.label !== ".")
@@ -219,6 +212,20 @@ async function downloadDirectoryToLocal(
     if (entry.isDirectory) {
       await downloadDirectoryToLocal(sftp, serverId, childRemote, childLocal, conflictState, summary, depth + 1);
     } else {
+      const existing = await tryLocalStat(childLocal);
+      if (existing) {
+        if (conflictState.mode !== "overwrite") {
+          const decision = await resolveDownloadConflict(childLocal.fsPath, conflictState, summary);
+          if (decision === "cancel") {
+            summary.canceled = true;
+            return;
+          }
+          if (decision === "skip") {
+            summary.skipped += 1;
+            continue;
+          }
+        }
+      }
       try {
         await sftp.download(serverId, childRemote, childLocal.fsPath);
         summary.downloaded += 1;
@@ -380,6 +387,10 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
         for (const { item, remotePath } of items) {
           if (summary.canceled) {
             break;
+          }
+          if (!isSafeEntryName(item.entry.name)) {
+            summary.skipped += 1;
+            continue;
           }
           progress.report({ message: item.entry.name });
 

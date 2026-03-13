@@ -1,4 +1,5 @@
 import type { SshConnection } from "../ssh/contracts";
+import { shellEscape } from "../../utils/shellEscape";
 
 export interface RemoteChangeEvent {
   serverId: string;
@@ -12,10 +13,6 @@ const INOTIFY_RESTART_DELAY_MS = 5_000;
 const INOTIFY_DEBOUNCE_MS = 500;
 const EXEC_PROBE_TIMEOUT_MS = 5_000;
 const STAT_TIMEOUT_MS = 10_000;
-
-function shellEscape(s: string): string {
-  return "'" + s.replace(/'/g, "'\\''") + "'";
-}
 
 async function execProbe(connection: SshConnection, command: string): Promise<boolean> {
   try {

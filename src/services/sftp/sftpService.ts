@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type { SFTPWrapper, FileEntry, Stats } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import { clamp } from "../../utils/helpers";
+import { shellEscape } from "../../utils/shellEscape";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
 import { RemoteDirectoryWatcher, type RemoteChangeEvent, type WatchMode } from "./remoteDirectoryWatcher";
 
@@ -112,10 +113,6 @@ function statsToDirectoryEntry(name: string, stats: Stats): DirectoryEntry {
 
 function parentDir(remotePath: string): string {
   return path.posix.dirname(remotePath);
-}
-
-function shellEscape(s: string): string {
-  return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
 function toBufferChunk(chunk: Buffer | string): Buffer {
