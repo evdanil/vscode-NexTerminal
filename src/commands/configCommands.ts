@@ -75,7 +75,8 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.tunnel", key: "socks5HandshakeTimeout" },
   { section: "nexus.terminal.macros", key: "defaultCooldown" },
   { section: "nexus.terminal.macros", key: "bufferLength" },
-  { section: "nexus.serial", key: "rpcTimeout" }
+  { section: "nexus.serial", key: "rpcTimeout" },
+  { section: "nexus.sftp", key: "remoteWatchMode" }
 ];
 
 const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`));

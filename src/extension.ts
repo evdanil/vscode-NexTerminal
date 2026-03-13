@@ -396,8 +396,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   updatePassthroughContext();
   ensureMacroKeybindingsWork();
 
-  const autoRefreshInterval = vscode.workspace.getConfiguration("nexus.sftp").get<number>("autoRefreshInterval", 10);
+  const sftpConfig = vscode.workspace.getConfiguration("nexus.sftp");
+  const autoRefreshInterval = sftpConfig.get<number>("autoRefreshInterval", 10);
   fileExplorerProvider.setAutoRefreshInterval(autoRefreshInterval);
+  const remoteWatchMode = sftpConfig.get<string>("remoteWatchMode", "auto") === "polling" ? "polling" as const : "auto" as const;
+  fileExplorerProvider.setRemoteWatchMode(remoteWatchMode);
   fileExplorerView.onDidChangeVisibility((e) => {
     fileExplorerProvider.setViewVisibility(e.visible);
     if (e.visible) {
@@ -630,6 +633,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (event.affectsConfiguration("nexus.sftp.autoRefreshInterval")) {
       const interval = vscode.workspace.getConfiguration("nexus.sftp").get<number>("autoRefreshInterval", 10);
       fileExplorerProvider.setAutoRefreshInterval(interval);
+    }
+    if (event.affectsConfiguration("nexus.sftp.remoteWatchMode")) {
+      const mode = vscode.workspace.getConfiguration("nexus.sftp").get<string>("remoteWatchMode", "auto") === "polling" ? "polling" as const : "auto" as const;
+      fileExplorerProvider.setRemoteWatchMode(mode);
     }
     if (event.affectsConfiguration("nexus.sftp.maxOpenFileSizeMB")) {
       fileExplorerProvider.refresh();

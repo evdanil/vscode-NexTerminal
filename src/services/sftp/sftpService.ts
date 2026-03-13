@@ -3,6 +3,7 @@ import type { SFTPWrapper, FileEntry, Stats } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import { clamp } from "../../utils/helpers";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
+import { RemoteDirectoryWatcher, type RemoteChangeEvent } from "./remoteDirectoryWatcher";
 
 export interface DirectoryEntry {
   name: string;
@@ -145,6 +146,8 @@ export class SftpService {
   private readonly dirCache = new Map<string, CacheEntry>();
   private readonly unsubscribers = new Map<string, () => void>();
   private readonly pending = new Map<string, Promise<void>>();
+  private readonly watchers = new Map<string, RemoteDirectoryWatcher>();
+  private readonly changeListeners: Array<(event: RemoteChangeEvent) => void> = [];
   private cacheTtlMs: number;
   private maxCacheEntries: number;
   private commandTimeoutMs: number;
@@ -557,10 +560,57 @@ export class SftpService {
     }
   }
 
+  public onRemoteChange(listener: (event: RemoteChangeEvent) => void): () => void {
+    this.changeListeners.push(listener);
+    return () => {
+      const index = this.changeListeners.indexOf(listener);
+      if (index >= 0) {
+        this.changeListeners.splice(index, 1);
+      }
+    };
+  }
+
+  public startWatching(serverId: string, dirPath: string, pollIntervalMs: number): void {
+    const session = this.sessions.get(serverId);
+    if (!session) {
+      return;
+    }
+
+    let watcher = this.watchers.get(serverId);
+    if (!watcher) {
+      watcher = new RemoteDirectoryWatcher(session.connection, serverId);
+      watcher.onDidChange((event) => {
+        this.invalidateCache(event.serverId, event.dirPath);
+        for (const listener of this.changeListeners) {
+          listener(event);
+        }
+      });
+      this.watchers.set(serverId, watcher);
+    }
+
+    void watcher.watch(dirPath, pollIntervalMs);
+  }
+
+  public stopWatching(serverId: string): void {
+    const watcher = this.watchers.get(serverId);
+    if (watcher) {
+      watcher.dispose();
+      this.watchers.delete(serverId);
+    }
+  }
+
+  public getWatchMode(serverId: string): string | undefined {
+    return this.watchers.get(serverId)?.mode;
+  }
+
   public dispose(): void {
     for (const serverId of [...this.sessions.keys()]) {
       this.disconnect(serverId);
     }
+    for (const [serverId, watcher] of this.watchers) {
+      watcher.dispose();
+    }
+    this.watchers.clear();
   }
 
   private async doConnect(server: ServerConfig): Promise<void> {
@@ -588,6 +638,7 @@ export class SftpService {
   }
 
   private cleanupSession(serverId: string): void {
+    this.stopWatching(serverId);
     this.sessions.delete(serverId);
     const unsub = this.unsubscribers.get(serverId);
     if (unsub) {

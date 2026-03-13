@@ -31,6 +31,10 @@ export function createMockSftpService(): SftpService {
     upload: vi.fn(),
     copyRemote: vi.fn(),
     invalidateCache: vi.fn(),
+    onRemoteChange: vi.fn().mockReturnValue(() => {}),
+    startWatching: vi.fn(),
+    stopWatching: vi.fn(),
+    getWatchMode: vi.fn().mockReturnValue(undefined),
     dispose: vi.fn(),
   };
   service.tryStat.mockImplementation(async (...args: any[]) => {

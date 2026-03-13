@@ -2608,14 +2608,21 @@
           "minimum": 0,
           "maximum": 60,
           "order": 22,
-          "markdownDescription": "Auto-refresh interval for the SFTP File Explorer (in seconds). Set to `0` to disable. Only polls when the view is visible and a server is connected."
+          "markdownDescription": "Fallback polling interval for the SFTP File Explorer (in seconds). Used when `remoteWatchMode` is `polling`, or when the remote server does not support inotifywait or stat-based change detection. Set to `0` to disable. Only active when the view is visible and a server is connected."
+        },
+        "nexus.sftp.remoteWatchMode": {
+          "type": "string",
+          "enum": ["auto", "polling"],
+          "default": "auto",
+          "order": 23,
+          "markdownDescription": "How the File Explorer detects remote filesystem changes. `auto` tries `inotifywait` then `stat`-based mtime checks, falling back to polling. `polling` uses the traditional polling interval set by `autoRefreshInterval`."
         },
         "nexus.sftp.maxOpenFileSizeMB": {
           "type": "number",
           "default": 5,
           "minimum": 1,
           "maximum": 200,
-          "order": 23,
+          "order": 24,
           "markdownDescription": "Maximum file size (in MB) that can be opened in the editor by clicking in the File Explorer. Larger files can still be downloaded via the right-click menu."
         },
         "nexus.ssh.connectionTimeout": {
