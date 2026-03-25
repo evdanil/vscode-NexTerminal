@@ -332,6 +332,18 @@ describe("config import command (legacy)", () => {
     );
   });
 
+  it("replace mode deletes existing auth-profile password and passphrase secrets", async () => {
+    await core.addOrUpdateAuthProfile(makeAuthProfile({ id: "existing-ap", authType: "key", keyPath: "/keys/id_ed25519" }));
+    await vault.store("auth-profile-password-existing-ap", "old-password");
+    await vault.store("auth-profile-passphrase-existing-ap", "old-passphrase");
+
+    const exportData = makeExportData({ authProfiles: [] });
+    await runImport(exportData, "replace");
+
+    expect(await vault.get("auth-profile-password-existing-ap")).toBeUndefined();
+    expect(await vault.get("auth-profile-passphrase-existing-ap")).toBeUndefined();
+  });
+
   it("imports old-format tunnels without browserUrl or notes", async () => {
     const legacyTunnel = { id: "t-old", name: "Legacy", localPort: 8080, remoteIP: "127.0.0.1", remotePort: 80, autoStart: false };
     const exportData = makeExportData({ tunnels: [legacyTunnel] });
@@ -556,6 +568,7 @@ describe("backup export command", () => {
     await vault.store("password-s1", "mypassword");
     await vault.store("passphrase-s1", "mypassphrase");
     await vault.store("auth-profile-password-ap1", "profile-secret");
+    await vault.store("auth-profile-passphrase-ap1", "profile-passphrase");
 
     configStore.set("nexus.terminal.macros", [
       { name: "Hello", text: "echo hi", secret: false },
@@ -586,6 +599,7 @@ describe("backup export command", () => {
     const { decrypt } = await import("../../src/utils/configCrypto");
     const decrypted = JSON.parse(decrypt(writtenData.encryptedSecrets, "testpass123"));
     expect(decrypted.authProfilePasswords).toEqual({ ap1: "profile-secret" });
+    expect(decrypted.authProfilePassphrases).toEqual({ ap1: "profile-passphrase" });
 
     // Secret macro text should be stripped in the settings block
     const macros = writtenData.settings["nexus.terminal.macros"];
@@ -622,6 +636,7 @@ describe("backup import", () => {
       passwords: { s1: "restored-pw" },
       passphrases: { s1: "restored-pp" },
       authProfilePasswords: { ap1: "restored-auth-pw" },
+      authProfilePassphrases: { ap1: "restored-auth-pp" },
       secretMacros: [{ name: "Secret", text: "super-secret", secret: true }]
     };
     const encrypted = encrypt(JSON.stringify(secrets), "testpass");
@@ -650,6 +665,7 @@ describe("backup import", () => {
     expect(await vault.get("password-s1")).toBe("restored-pw");
     expect(await vault.get("passphrase-s1")).toBe("restored-pp");
     expect(await vault.get("auth-profile-password-ap1")).toBe("restored-auth-pw");
+    expect(await vault.get("auth-profile-passphrase-ap1")).toBe("restored-auth-pp");
 
     // Secret macros merged back
     const macros = configStore.get("nexus.terminal.macros") as Array<{ name: string; text: string; secret?: boolean }>;
@@ -1225,9 +1241,12 @@ describe("complete reset", () => {
     await core.addOrUpdateServer(makeServer());
     await core.addOrUpdateTunnel(makeTunnel());
     await core.addOrUpdateSerialProfile(makeSerialProfile());
+    await core.addOrUpdateAuthProfile(makeAuthProfile());
     await core.addGroup("Production");
     await vault.store("password-s1", "pw");
     await vault.store("passphrase-s1", "pp");
+    await vault.store("auth-profile-password-ap1", "auth-pw");
+    await vault.store("auth-profile-passphrase-ap1", "auth-pp");
     configStore.set("nexus.terminal.macros", [{ name: "M", text: "echo" }]);
 
     mockShowWarningMessage.mockResolvedValue("Delete Everything");
@@ -1243,6 +1262,8 @@ describe("complete reset", () => {
     expect(snapshot.explicitGroups).toHaveLength(0);
     expect(await vault.get("password-s1")).toBeUndefined();
     expect(await vault.get("passphrase-s1")).toBeUndefined();
+    expect(await vault.get("auth-profile-password-ap1")).toBeUndefined();
+    expect(await vault.get("auth-profile-passphrase-ap1")).toBeUndefined();
     expect(mockShowInformationMessage).toHaveBeenCalledWith("All Nexus data has been deleted.");
   });
 
@@ -1384,6 +1405,7 @@ describe("backup export round-trip", () => {
     await vault.store("password-s1", "mypw");
     await vault.store("passphrase-s1", "mypp");
     await vault.store("auth-profile-password-ap1", "authpw");
+    await vault.store("auth-profile-passphrase-ap1", "authpp");
 
     configStore.set("nexus.terminal.macros", [
       { name: "Public", text: "echo hi", triggerPattern: "[Pp]assword:\\s*$", triggerCooldown: 5, triggerInterval: 10, triggerInitiallyDisabled: true },
@@ -1431,6 +1453,7 @@ describe("backup export round-trip", () => {
     expect(await vault.get("password-s1")).toBe("mypw");
     expect(await vault.get("passphrase-s1")).toBe("mypp");
     expect(await vault.get("auth-profile-password-ap1")).toBe("authpw");
+    expect(await vault.get("auth-profile-passphrase-ap1")).toBe("authpp");
 
     // Secret macros restored
     const macros = configStore.get("nexus.terminal.macros") as Array<{ name: string; text: string; secret?: boolean }>;

@@ -3,7 +3,7 @@ import { NexusCore } from "../../src/core/nexusCore";
 import type { AuthProfile } from "../../src/models/config";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { validateAuthProfile } from "../../src/utils/validation";
-import { authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
 
 function makeAuthProfile(overrides?: Partial<AuthProfile>): AuthProfile {
   return {
@@ -52,6 +52,12 @@ describe("validateAuthProfile", () => {
 describe("authProfilePasswordSecretKey", () => {
   it("returns the correct key format", () => {
     expect(authProfilePasswordSecretKey("abc-123")).toBe("auth-profile-password-abc-123");
+  });
+});
+
+describe("authProfilePassphraseSecretKey", () => {
+  it("returns the correct key format", () => {
+    expect(authProfilePassphraseSecretKey("abc-123")).toBe("auth-profile-passphrase-abc-123");
   });
 });
 

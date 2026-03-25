@@ -123,6 +123,7 @@ export interface AuthProfile {
   authType: AuthType;
   keyPath?: string;  // only for authType === "key"
   // Password stored in SecretVault under "auth-profile-password-{id}"
+  // Key passphrase stored in SecretVault under "auth-profile-passphrase-{id}"
 }
 
 export function resolveTunnelType(profile: TunnelProfile): TunnelType {

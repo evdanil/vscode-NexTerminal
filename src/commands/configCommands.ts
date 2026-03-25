@@ -3,7 +3,13 @@ import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
 import type { SecretVault } from "../services/ssh/contracts";
-import { passwordSecretKey, passphraseSecretKey, proxyPasswordSecretKey, authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
+import {
+  passwordSecretKey,
+  passphraseSecretKey,
+  proxyPasswordSecretKey,
+  authProfilePasswordSecretKey,
+  authProfilePassphraseSecretKey
+} from "../services/ssh/silentAuth";
 import { validateAuthProfile } from "../utils/validation";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
@@ -329,11 +335,19 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         const settings = readSettings();
 
         // Collect secrets
-        const secrets: Record<string, unknown> = { passwords: {}, passphrases: {}, proxyPasswords: {}, authProfilePasswords: {}, secretMacros: [] };
+        const secrets: Record<string, unknown> = {
+          passwords: {},
+          passphrases: {},
+          proxyPasswords: {},
+          authProfilePasswords: {},
+          authProfilePassphrases: {},
+          secretMacros: []
+        };
         const passwords = secrets.passwords as Record<string, string>;
         const passphrases = secrets.passphrases as Record<string, string>;
         const proxyPasswords = secrets.proxyPasswords as Record<string, string>;
         const authProfilePasswords = secrets.authProfilePasswords as Record<string, string>;
+        const authProfilePassphrases = secrets.authProfilePassphrases as Record<string, string>;
         for (const server of snapshot.servers) {
           const pw = await vault.get(passwordSecretKey(server.id));
           if (pw) passwords[server.id] = pw;
@@ -345,6 +359,8 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
         for (const profile of snapshot.authProfiles) {
           const pw = await vault.get(authProfilePasswordSecretKey(profile.id));
           if (pw) authProfilePasswords[profile.id] = pw;
+          const pp = await vault.get(authProfilePassphraseSecretKey(profile.id));
+          if (pp) authProfilePassphrases[profile.id] = pp;
         }
 
         // Collect secret macros
@@ -601,6 +617,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       for (const profile of snapshot.authProfiles) {
         if (vault) {
           await vault.delete(authProfilePasswordSecretKey(profile.id));
+          await vault.delete(authProfilePassphraseSecretKey(profile.id));
         }
         await core.removeAuthProfile(profile.id);
       }
@@ -738,6 +755,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
           await vault.store(authProfilePasswordSecretKey(profileId), pw);
         }
       }
+      const authProfilePassphrases = decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined;
+      if (authProfilePassphrases) {
+        for (const [profileId, passphrase] of Object.entries(authProfilePassphrases)) {
+          await vault.store(authProfilePassphraseSecretKey(profileId), passphrase);
+        }
+      }
     }
 
     const skipNote = skipped > 0 ? ` (${skipped} skipped)` : "";
@@ -789,6 +812,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
     // Remove all auth profiles
     for (const profile of snapshot.authProfiles) {
       await vault.delete(authProfilePasswordSecretKey(profile.id));
+      await vault.delete(authProfilePassphraseSecretKey(profile.id));
       await core.removeAuthProfile(profile.id);
     }
 

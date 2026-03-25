@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, AuthType } from "../models/config";
-import { authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
+import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import { renderAuthProfileEditorHtml } from "./authProfileEditorHtml";
 
 interface SecretVault {
@@ -145,16 +145,21 @@ export class AuthProfileEditorPanel {
 
           // Handle password in SecretVault
           if (this.secretVault) {
-            const secretKey = authProfilePasswordSecretKey(profile.id);
+            const passwordKey = authProfilePasswordSecretKey(profile.id);
+            const passphraseKey = authProfilePassphraseSecretKey(profile.id);
             if (authType !== "password") {
               // Switching away from password auth — remove stored password
-              await this.secretVault.delete(secretKey);
+              await this.secretVault.delete(passwordKey);
             } else if (password) {
               // New or updated password
-              await this.secretVault.store(secretKey, password);
+              await this.secretVault.store(passwordKey, password);
             } else if (existingId !== null && previousProfile && previousProfile.authType !== "password") {
               // Switching to password auth with no password should not retain stale secret.
-              await this.secretVault.delete(secretKey);
+              await this.secretVault.delete(passwordKey);
+            }
+
+            if (authType !== "key") {
+              await this.secretVault.delete(passphraseKey);
             }
           }
 
@@ -186,6 +191,7 @@ export class AuthProfileEditorPanel {
 
           if (this.secretVault) {
             await this.secretVault.delete(authProfilePasswordSecretKey(id));
+            await this.secretVault.delete(authProfilePassphraseSecretKey(id));
           }
           await this.core.removeAuthProfile(id);
 

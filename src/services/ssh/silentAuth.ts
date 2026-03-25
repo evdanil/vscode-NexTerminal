@@ -20,6 +20,10 @@ export function authProfilePasswordSecretKey(profileId: string): string {
   return `auth-profile-password-${profileId}`;
 }
 
+export function authProfilePassphraseSecretKey(profileId: string): string {
+  return `auth-profile-passphrase-${profileId}`;
+}
+
 function isAuthError(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;
@@ -49,17 +53,34 @@ export class SilentAuthSshFactory implements SshFactory {
     private readonly authProfileLookup?: (id: string) => AuthProfile | undefined
   ) {}
 
-  private resolveServer(server: ServerConfig): { resolved: ServerConfig; passwordKey: string } {
+  private resolveServer(
+    server: ServerConfig
+  ): {
+    resolved: ServerConfig;
+    passwordKey: string;
+    passphraseKey: string;
+    legacyServerPassphraseKey?: string;
+  } {
     if (!server.authProfileId || !this.authProfileLookup) {
-      return { resolved: server, passwordKey: passwordSecretKey(server.id) };
+      return {
+        resolved: server,
+        passwordKey: passwordSecretKey(server.id),
+        passphraseKey: passphraseSecretKey(server.id)
+      };
     }
     const profile = this.authProfileLookup(server.authProfileId);
     if (!profile) {
-      return { resolved: server, passwordKey: passwordSecretKey(server.id) };
+      return {
+        resolved: server,
+        passwordKey: passwordSecretKey(server.id),
+        passphraseKey: passphraseSecretKey(server.id)
+      };
     }
     return {
       resolved: { ...server, username: profile.username, authType: profile.authType, keyPath: profile.keyPath },
-      passwordKey: authProfilePasswordSecretKey(profile.id)
+      passwordKey: profile.authType === "password" ? authProfilePasswordSecretKey(profile.id) : passwordSecretKey(server.id),
+      passphraseKey: profile.authType === "key" ? authProfilePassphraseSecretKey(profile.id) : passphraseSecretKey(server.id),
+      legacyServerPassphraseKey: profile.authType === "key" ? passphraseSecretKey(server.id) : undefined
     };
   }
 
@@ -87,13 +108,12 @@ export class SilentAuthSshFactory implements SshFactory {
   }
 
   public async connect(server: ServerConfig, options?: { sock?: Duplex }): Promise<SshConnection> {
-    const { resolved, passwordKey } = this.resolveServer(server);
+    const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey } = this.resolveServer(server);
     const sockOpt = options?.sock ? { sock: options.sock } : {};
 
     if (resolved.authType === "key") {
       const handler = this.buildKeyboardInteractiveHandler();
-      const ppKey = passphraseSecretKey(server.id);
-      const savedPassphrase = await this.vault.get(ppKey);
+      const savedPassphrase = await this.vault.get(passphraseKey);
 
       // Try saved passphrase (or no passphrase on first attempt).
       try {
@@ -108,7 +128,7 @@ export class SilentAuthSshFactory implements SshFactory {
         }
         // Saved passphrase was wrong — clear it.
         if (savedPassphrase) {
-          await this.vault.delete(ppKey);
+          await this.vault.delete(passphraseKey);
         }
       }
 
@@ -127,9 +147,12 @@ export class SilentAuthSshFactory implements SshFactory {
         ...sockOpt
       });
       if (promptResult.save) {
-        await this.vault.store(ppKey, promptResult.password);
+        await this.vault.store(passphraseKey, promptResult.password);
+        if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
+          await this.vault.delete(legacyServerPassphraseKey);
+        }
       } else {
-        await this.vault.delete(ppKey);
+        await this.vault.delete(passphraseKey);
       }
       return connection;
     }

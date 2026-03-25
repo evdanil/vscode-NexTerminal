@@ -21,7 +21,7 @@ import {
   normalizeOptionalFolderPath,
   INVALID_FOLDER_PATH_MESSAGE
 } from "../utils/folderPaths";
-import { formatAuthProfileLabel, formatKeyPathDisplayName } from "../utils/authProfileLabel";
+import { formatAuthProfileLabel, formatKeyPathDisplayName, normalizeKeyPathForComparison } from "../utils/authProfileLabel";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 
 async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
@@ -286,12 +286,12 @@ function buildProfileLinkedKeyServer(
   };
 }
 
-function isStandalonePasswordServer(server: ServerConfig): boolean {
-  return !server.authProfileId && server.authType === "password";
-}
-
 async function maybeRemoveStoredPasswordAfterKeyConversion(ctx: CommandContext, originalServer: ServerConfig): Promise<void> {
-  if (!ctx.secretVault || !isStandalonePasswordServer(originalServer)) {
+  if (!ctx.secretVault || originalServer.authType !== "password") {
+    return;
+  }
+  const existingPassword = await ctx.secretVault.get(passwordSecretKey(originalServer.id));
+  if (!existingPassword) {
     return;
   }
   const response = await vscode.window.showInformationMessage(
@@ -328,10 +328,12 @@ function findMatchingKeyAuthProfiles(
   username: string,
   privateKeyPath: string
 ): AuthProfile[] {
+  const normalizedKeyPath = normalizeKeyPathForComparison(privateKeyPath);
   return core.getSnapshot().authProfiles.filter((profile) =>
     profile.authType === "key" &&
     profile.username === username &&
-    profile.keyPath === privateKeyPath
+    typeof profile.keyPath === "string" &&
+    normalizeKeyPathForComparison(profile.keyPath) === normalizedKeyPath
   );
 }
 

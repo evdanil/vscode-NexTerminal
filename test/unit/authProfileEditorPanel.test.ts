@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { AuthProfile } from "../../src/models/config";
-import { authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 
 // --- vscode mock state ---
@@ -145,7 +145,7 @@ describe("AuthProfileEditorPanel", () => {
     expect(core.getAuthProfile("ap1")?.name).toBe("Updated Name");
     // Password was blank — should NOT have been deleted or stored
     expect(vault.store).not.toHaveBeenCalled();
-    expect(vault.delete).not.toHaveBeenCalled();
+    expect(vault.delete).not.toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
   });
 
   it("save with authType switch from password to key deletes vault secret", async () => {
@@ -174,7 +174,10 @@ describe("AuthProfileEditorPanel", () => {
     const profile = makeAuthProfile({ id: "ap1", authType: "key", keyPath: "/keys/id_ed25519" });
     const { core, vault, sendMessage } = await openPanel(
       [profile],
-      { [authProfilePasswordSecretKey("ap1")]: "stale-secret" }
+      {
+        [authProfilePasswordSecretKey("ap1")]: "stale-secret",
+        [authProfilePassphraseSecretKey("ap1")]: "key-passphrase"
+      }
     );
 
     await sendMessage({
@@ -189,6 +192,7 @@ describe("AuthProfileEditorPanel", () => {
 
     expect(core.getAuthProfile("ap1")?.authType).toBe("password");
     expect(vault.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
+    expect(vault.delete).toHaveBeenCalledWith(authProfilePassphraseSecretKey("ap1"));
     expect(vault.store).not.toHaveBeenCalled();
   });
 
@@ -202,6 +206,7 @@ describe("AuthProfileEditorPanel", () => {
 
     expect(core.getAuthProfile("ap1")).toBeUndefined();
     expect(vault.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
+    expect(vault.delete).toHaveBeenCalledWith(authProfilePassphraseSecretKey("ap1"));
   });
 
   it("delete profile does nothing if user cancels", async () => {

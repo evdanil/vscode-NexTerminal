@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import type { PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
-import { SilentAuthSshFactory, passwordSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import {
+  SilentAuthSshFactory,
+  passwordSecretKey,
+  authProfilePasswordSecretKey,
+  authProfilePassphraseSecretKey,
+  passphraseSecretKey
+} from "../../src/services/ssh/silentAuth";
 
 const baseServer: ServerConfig = {
   id: "srv-1",
@@ -157,6 +163,72 @@ describe("SilentAuthSshFactory", () => {
       expect.objectContaining({ password: "profile-secret" })
     );
     expect(prompt.prompt).not.toHaveBeenCalled();
+  });
+
+  it("uses auth-profile passphrase storage for linked key auth", async () => {
+    const profile: AuthProfile = {
+      id: "prof-key",
+      name: "Shared Key",
+      username: "root",
+      authType: "key",
+      keyPath: "/keys/id_ed25519"
+    };
+    const server: ServerConfig = {
+      ...baseServer,
+      authType: "password",
+      authProfileId: "prof-key"
+    };
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const lookup = (id: string) => id === "prof-key" ? profile : undefined;
+    const vault = createVault({ [authProfilePassphraseSecretKey("prof-key")]: "shared-passphrase" });
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+
+    await factory.connect(server);
+
+    expect(connector.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ username: "root", authType: "key", keyPath: "/keys/id_ed25519" }),
+      expect.objectContaining({ passphrase: "shared-passphrase" })
+    );
+    expect(vault.get).toHaveBeenCalledWith(authProfilePassphraseSecretKey("prof-key"));
+    expect(vault.get).not.toHaveBeenCalledWith(passphraseSecretKey(server.id));
+    expect(prompt.prompt).not.toHaveBeenCalled();
+  });
+
+  it("stores prompted passphrase on auth profile and removes server-scoped duplicate", async () => {
+    const profile: AuthProfile = {
+      id: "prof-key",
+      name: "Shared Key",
+      username: "root",
+      authType: "key",
+      keyPath: "/keys/id_ed25519"
+    };
+    const server: ServerConfig = {
+      ...baseServer,
+      authProfileId: "prof-key"
+    };
+    const connector: SshConnector = {
+      connect: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("Encrypted private key requires passphrase"))
+        .mockResolvedValueOnce(fakeConnection)
+    };
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "fresh-passphrase", save: true }))
+    };
+    const lookup = (id: string) => id === "prof-key" ? profile : undefined;
+    const vault = createVault({ [passphraseSecretKey(server.id)]: "old-duplicate" });
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+
+    const connection = await factory.connect(server);
+
+    expect(connection).toBe(fakeConnection);
+    expect(prompt.prompt).toHaveBeenCalledOnce();
+    expect(vault.store).toHaveBeenCalledWith(authProfilePassphraseSecretKey("prof-key"), "fresh-passphrase");
+    expect(vault.delete).toHaveBeenCalledWith(passphraseSecretKey(server.id));
+    expect(vault.store).not.toHaveBeenCalledWith(passphraseSecretKey(server.id), expect.anything());
   });
 
   it("falls back to server credentials when profile not found", async () => {
