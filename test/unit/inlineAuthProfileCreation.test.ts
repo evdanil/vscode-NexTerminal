@@ -76,7 +76,7 @@ describe("inlineAuthProfileCreation", () => {
     expect(panel.addSelectOption).toHaveBeenCalledWith(
       "authProfileId",
       "ap1",
-      "Prod — key — deploy"
+      "Prod — key — deploy — id_ed25519"
     );
     expect(core.listenerCount()).toBe(0);
   });

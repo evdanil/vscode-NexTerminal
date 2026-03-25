@@ -1,12 +1,13 @@
 import type { AuthProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
 import { resolveTunnelType } from "../models/config";
+import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
 
 function authProfileSelectField(authProfiles?: AuthProfile[], vw?: VisibleWhen, selectedId?: string): FormFieldDescriptor {
   const options = [
     { label: "(None)", value: "" },
-    ...(authProfiles ?? []).map((p) => ({ label: `${p.name} — ${p.authType} — ${p.username}`, value: p.id })),
+    ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id })),
     { label: "Create new auth profile\u2026", value: "__create__authProfile" }
   ];
   return {

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
 import { registerServerCommands, formValuesToServer, formValuesToProxy, preserveLinkedServerCredentials, syncProxyPasswordSecret } from "../../src/commands/serverCommands";
-import type { ServerConfig, TunnelProfile } from "../../src/models/config";
+import type { AuthProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
 import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
@@ -103,12 +103,23 @@ function makeTunnel(overrides: Partial<TunnelProfile> = {}): TunnelProfile {
   };
 }
 
+function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+  return {
+    id: "ap1",
+    name: "Prod Auth",
+    username: "root",
+    authType: "password",
+    ...overrides
+  };
+}
+
 interface Harness {
   ctx: CommandContext;
   stopTunnel: ReturnType<typeof vi.fn>;
   disconnectPool: ReturnType<typeof vi.fn>;
   removeServer: ReturnType<typeof vi.fn>;
   addOrUpdateServer: ReturnType<typeof vi.fn>;
+  addOrUpdateAuthProfile: ReturnType<typeof vi.fn>;
   terminalDispose: ReturnType<typeof vi.fn>;
   secretDelete: ReturnType<typeof vi.fn>;
   secretStore: ReturnType<typeof vi.fn>;
@@ -118,6 +129,7 @@ function setupHarness(options: {
   activeTunnels: Array<{ id: string; profileId: string; serverId: string }>;
   profiles: TunnelProfile[];
   servers?: ServerConfig[];
+  authProfiles?: AuthProfile[];
   confirmRemove?: boolean;
 }): Harness {
   let snapshot = {
@@ -133,7 +145,7 @@ function setupHarness(options: {
     })),
     remoteTunnels: [],
     explicitGroups: [],
-    authProfiles: [],
+    authProfiles: options.authProfiles ?? [],
     activitySessionIds: new Set()
   };
 
@@ -145,7 +157,18 @@ function setupHarness(options: {
   });
   const disconnectPool = vi.fn();
   const removeServer = vi.fn(async () => {});
-  const addOrUpdateServer = vi.fn(async () => {});
+  const addOrUpdateServer = vi.fn(async (server: ServerConfig) => {
+    snapshot = {
+      ...snapshot,
+      servers: [...snapshot.servers.filter((item) => item.id !== server.id), server]
+    };
+  });
+  const addOrUpdateAuthProfile = vi.fn(async (profile: AuthProfile) => {
+    snapshot = {
+      ...snapshot,
+      authProfiles: [...snapshot.authProfiles.filter((item) => item.id !== profile.id), profile]
+    };
+  });
   const secretDelete = vi.fn(async () => {});
   const secretStore = vi.fn(async () => {});
 
@@ -155,11 +178,13 @@ function setupHarness(options: {
 
   const core = {
     getServer: vi.fn((id: string) => snapshot.servers.find((s) => s.id === id)),
+    getAuthProfile: vi.fn((id: string) => snapshot.authProfiles.find((p) => p.id === id)),
     getTunnel: vi.fn((id: string) => snapshot.tunnels.find((t) => t.id === id)),
     getSnapshot: vi.fn(() => snapshot),
     isServerConnected: vi.fn(() => false),
     removeServer,
-    addOrUpdateServer
+    addOrUpdateServer,
+    addOrUpdateAuthProfile
   };
 
   const ctx: CommandContext = {
@@ -186,7 +211,17 @@ function setupHarness(options: {
 
   mockShowWarningMessage.mockResolvedValue(options.confirmRemove === false ? undefined : "Remove");
 
-  return { ctx, stopTunnel, disconnectPool, removeServer, addOrUpdateServer, terminalDispose, secretDelete, secretStore };
+  return {
+    ctx,
+    stopTunnel,
+    disconnectPool,
+    removeServer,
+    addOrUpdateServer,
+    addOrUpdateAuthProfile,
+    terminalDispose,
+    secretDelete,
+    secretStore
+  };
 }
 
 describe("server disconnect with tunnel autoStop", () => {
@@ -559,8 +594,14 @@ describe("deploy key command", () => {
     vi.mocked(vscode.window.withProgress as any).mockImplementation(async (_options: unknown, task: () => Promise<unknown>) => task());
   });
 
-  it("deploys selected key and switches server to key auth", async () => {
-    const { ctx, addOrUpdateServer, secretDelete } = setupHarness({ profiles: [], activeTunnels: [] });
+  it("deploys selected key and converts a linked password-profile server to standalone key auth", async () => {
+    const passwordProfile = makeAuthProfile({ id: "ap-pass", username: "profile-user", authType: "password" });
+    const { ctx, addOrUpdateServer, secretDelete } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "stored-user", authProfileId: "ap-pass" })],
+      authProfiles: [passwordProfile]
+    });
     const connection = { dispose: vi.fn() };
     (ctx.sshFactory as any).connect = vi.fn(async () => connection);
 
@@ -581,9 +622,7 @@ describe("deploy key command", () => {
     });
     vi.mocked(readFile).mockResolvedValueOnce("ssh-ed25519 AAAA user@example");
     vi.mocked(deployPublicKeyToRemote).mockResolvedValueOnce({ alreadyDeployed: false });
-    vi.mocked(vscode.window.showInformationMessage as any)
-      .mockResolvedValueOnce("Switch to key auth")
-      .mockResolvedValueOnce("Remove stored password");
+    vi.mocked(vscode.window.showInformationMessage as any).mockResolvedValueOnce("Use standalone key");
 
     registerServerCommands(ctx);
     const deployCmd = registeredCommands.get("nexus.server.deployKey");
@@ -596,12 +635,193 @@ describe("deploy key command", () => {
     expect(addOrUpdateServer).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "srv-1",
+        username: "profile-user",
+        authProfileId: undefined,
+        authType: "key",
+        keyPath: "/home/user/.ssh/id_ed25519"
+      })
+    );
+    expect(secretDelete).not.toHaveBeenCalledWith(passwordSecretKey("srv-1"));
+    expect(connection.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("links the server to a selected matching key auth profile", async () => {
+    const passwordProfile = makeAuthProfile({ id: "ap-pass", username: "profile-user", authType: "password" });
+    const keyProfile = makeAuthProfile({
+      id: "ap-key",
+      name: "Shared Deploy Key",
+      username: "profile-user",
+      authType: "key",
+      keyPath: "/home/user/.ssh/id_ed25519"
+    });
+    const { ctx, addOrUpdateServer, secretDelete } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "stored-user", authProfileId: "ap-pass" })],
+      authProfiles: [passwordProfile, keyProfile]
+    });
+    const connection = { dispose: vi.fn() };
+    (ctx.sshFactory as any).connect = vi.fn(async () => connection);
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      {
+        name: "id_ed25519",
+        publicKeyPath: "/home/user/.ssh/id_ed25519.pub",
+        privateKeyPath: "/home/user/.ssh/id_ed25519"
+      }
+    ]);
+    vi.mocked(vscode.window.showQuickPick as any)
+      .mockResolvedValueOnce({
+        label: "id_ed25519",
+        keyPair: {
+          name: "id_ed25519",
+          publicKeyPath: "/home/user/.ssh/id_ed25519.pub",
+          privateKeyPath: "/home/user/.ssh/id_ed25519"
+        }
+      })
+      .mockResolvedValueOnce({ label: "Shared Deploy Key — key — profile-user — id_ed25519", profile: keyProfile });
+    vi.mocked(readFile).mockResolvedValueOnce("ssh-ed25519 AAAA user@example");
+    vi.mocked(deployPublicKeyToRemote).mockResolvedValueOnce({ alreadyDeployed: false });
+    vi.mocked(vscode.window.showInformationMessage as any).mockResolvedValueOnce("Use key auth profile");
+
+    registerServerCommands(ctx);
+    const deployCmd = registeredCommands.get("nexus.server.deployKey");
+    expect(deployCmd).toBeDefined();
+
+    await deployCmd!("srv-1");
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "srv-1",
+        username: "profile-user",
+        authProfileId: "ap-key",
+        authType: "key",
+        keyPath: "/home/user/.ssh/id_ed25519"
+      })
+    );
+    expect(secretDelete).not.toHaveBeenCalledWith(passwordSecretKey("srv-1"));
+  });
+
+  it("creates a new key auth profile, links it, and offers to remove stored standalone password", async () => {
+    const { ctx, addOrUpdateServer, addOrUpdateAuthProfile, secretDelete } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "deploy-user", authType: "password" })]
+    });
+    const connection = { dispose: vi.fn() };
+    (ctx.sshFactory as any).connect = vi.fn(async () => connection);
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      {
+        name: "id_ed25519",
+        publicKeyPath: "/home/user/.ssh/id_ed25519.pub",
+        privateKeyPath: "/home/user/.ssh/id_ed25519"
+      }
+    ]);
+    vi.mocked(vscode.window.showQuickPick as any).mockResolvedValueOnce({
+      label: "id_ed25519",
+      keyPair: {
+        name: "id_ed25519",
+        publicKeyPath: "/home/user/.ssh/id_ed25519.pub",
+        privateKeyPath: "/home/user/.ssh/id_ed25519"
+      }
+    });
+    vi.mocked(vscode.window.showInputBox as any).mockImplementationOnce(async (options: any) => {
+      expect(options.value).toBe("deploy-user — id_ed25519");
+      return "Deploy Key Profile";
+    });
+    vi.mocked(readFile).mockResolvedValueOnce("ssh-ed25519 AAAA user@example");
+    vi.mocked(deployPublicKeyToRemote).mockResolvedValueOnce({ alreadyDeployed: false });
+    vi.mocked(vscode.window.showInformationMessage as any)
+      .mockResolvedValueOnce("Use key auth profile")
+      .mockResolvedValueOnce("Remove stored password");
+
+    registerServerCommands(ctx);
+    const deployCmd = registeredCommands.get("nexus.server.deployKey");
+    expect(deployCmd).toBeDefined();
+
+    await deployCmd!("srv-1");
+
+    expect(addOrUpdateAuthProfile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "Deploy Key Profile",
+        username: "deploy-user",
+        authType: "key",
+        keyPath: "/home/user/.ssh/id_ed25519"
+      })
+    );
+    const createdProfile = addOrUpdateAuthProfile.mock.calls[0][0];
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "srv-1",
+        username: "deploy-user",
+        authProfileId: createdProfile.id,
         authType: "key",
         keyPath: "/home/user/.ssh/id_ed25519"
       })
     );
     expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
-    expect(connection.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("still offers conversion choices when the public key is already deployed", async () => {
+    const keyProfile = makeAuthProfile({
+      id: "ap-key",
+      name: "Existing Key",
+      username: "deploy-user",
+      authType: "key",
+      keyPath: "/home/user/.ssh/id_ed25519"
+    });
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "deploy-user", authType: "password" })],
+      authProfiles: [keyProfile]
+    });
+    const connection = { dispose: vi.fn() };
+    (ctx.sshFactory as any).connect = vi.fn(async () => connection);
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      {
+        name: "id_ed25519",
+        publicKeyPath: "/home/user/.ssh/id_ed25519.pub",
+        privateKeyPath: "/home/user/.ssh/id_ed25519"
+      }
+    ]);
+    vi.mocked(vscode.window.showQuickPick as any)
+      .mockResolvedValueOnce({
+        label: "id_ed25519",
+        keyPair: {
+          name: "id_ed25519",
+          publicKeyPath: "/home/user/.ssh/id_ed25519.pub",
+          privateKeyPath: "/home/user/.ssh/id_ed25519"
+        }
+      })
+      .mockResolvedValueOnce({ label: "Existing Key — key — deploy-user — id_ed25519", profile: keyProfile });
+    vi.mocked(readFile).mockResolvedValueOnce("ssh-ed25519 AAAA user@example");
+    vi.mocked(deployPublicKeyToRemote).mockResolvedValueOnce({ alreadyDeployed: true });
+    vi.mocked(vscode.window.showInformationMessage as any)
+      .mockResolvedValueOnce("Use key auth profile")
+      .mockResolvedValueOnce(undefined);
+
+    registerServerCommands(ctx);
+    const deployCmd = registeredCommands.get("nexus.server.deployKey");
+    expect(deployCmd).toBeDefined();
+
+    await deployCmd!("srv-1");
+
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
+      "Public key is already deployed on Server 1. Choose how to use it for future connections.",
+      "Use standalone key",
+      "Use key auth profile"
+    );
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "srv-1",
+        authProfileId: "ap-key",
+        authType: "key",
+        keyPath: "/home/user/.ssh/id_ed25519"
+      })
+    );
   });
 
   it("validates generated key name and uses generated private key path", async () => {
@@ -626,7 +846,7 @@ describe("deploy key command", () => {
       .mockResolvedValueOnce("exists")
       .mockResolvedValueOnce("ssh-ed25519 AAAA id_custom");
     vi.mocked(deployPublicKeyToRemote).mockResolvedValueOnce({ alreadyDeployed: false });
-    vi.mocked(vscode.window.showInformationMessage as any).mockResolvedValueOnce("Switch to key auth");
+    vi.mocked(vscode.window.showInformationMessage as any).mockResolvedValueOnce("Use standalone key");
 
     registerServerCommands(ctx);
     const deployCmd = registeredCommands.get("nexus.server.deployKey");

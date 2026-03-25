@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import type { AuthType, ProxyConfig, ServerConfig } from "../models/config";
+import type { AuthProfile, AuthType, ProxyConfig, ServerConfig } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
@@ -21,6 +21,7 @@ import {
   normalizeOptionalFolderPath,
   INVALID_FOLDER_PATH_MESSAGE
 } from "../utils/folderPaths";
+import { formatAuthProfileLabel, formatKeyPathDisplayName } from "../utils/authProfileLabel";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 
 async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
@@ -127,6 +128,10 @@ function isValidProxyPort(port: number): boolean {
 const DEPLOY_DEFAULT_KEY_NAME = "id_ed25519";
 const DEPLOY_FALLBACK_KEY_NAME = "id_ed25519_nexus";
 const DEPLOY_KEY_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+const DEPLOY_USE_STANDALONE_KEY_ACTION = "Use standalone key";
+const DEPLOY_USE_KEY_PROFILE_ACTION = "Use key auth profile";
+const DEPLOY_CREATE_KEY_PROFILE_ACTION = "Create new key auth profile...";
+const DEPLOY_REMOVE_STORED_PASSWORD_ACTION = "Remove stored password";
 
 function validateDeployKeyNameInput(value: string): string | null {
   const trimmed = value.trim();
@@ -247,6 +252,159 @@ async function pickKeyForDeployment(sshDir: string): Promise<SelectedDeployKey |
     () => generateKeyPair({ sshDir, name: keyName, passphrase })
   );
   return { publicKeyPath: generated.publicKeyPath, privateKeyPath: generated.privateKeyPath };
+}
+
+function resolveEffectiveUsername(core: import("../core/nexusCore").NexusCore, server: ServerConfig): string {
+  if (!server.authProfileId) {
+    return server.username;
+  }
+  return core.getAuthProfile(server.authProfileId)?.username ?? server.username;
+}
+
+function buildStandaloneKeyServer(server: ServerConfig, username: string, privateKeyPath: string): ServerConfig {
+  return {
+    ...server,
+    username,
+    authProfileId: undefined,
+    authType: "key",
+    keyPath: privateKeyPath
+  };
+}
+
+function buildProfileLinkedKeyServer(
+  server: ServerConfig,
+  username: string,
+  privateKeyPath: string,
+  authProfileId: string
+): ServerConfig {
+  return {
+    ...server,
+    username,
+    authProfileId,
+    authType: "key",
+    keyPath: privateKeyPath
+  };
+}
+
+function isStandalonePasswordServer(server: ServerConfig): boolean {
+  return !server.authProfileId && server.authType === "password";
+}
+
+async function maybeRemoveStoredPasswordAfterKeyConversion(ctx: CommandContext, originalServer: ServerConfig): Promise<void> {
+  if (!ctx.secretVault || !isStandalonePasswordServer(originalServer)) {
+    return;
+  }
+  const response = await vscode.window.showInformationMessage(
+    "Server switched to key authentication.",
+    DEPLOY_REMOVE_STORED_PASSWORD_ACTION
+  );
+  if (response === DEPLOY_REMOVE_STORED_PASSWORD_ACTION) {
+    await ctx.secretVault.delete(passwordSecretKey(originalServer.id));
+  }
+}
+
+async function pickDeployConversionMode(
+  serverName: string,
+  alreadyDeployed: boolean
+): Promise<"standalone" | "profile" | undefined> {
+  const response = await vscode.window.showInformationMessage(
+    alreadyDeployed
+      ? `Public key is already deployed on ${serverName}. Choose how to use it for future connections.`
+      : `SSH key deployed to ${serverName} successfully. Choose how to use it for future connections.`,
+    DEPLOY_USE_STANDALONE_KEY_ACTION,
+    DEPLOY_USE_KEY_PROFILE_ACTION
+  );
+  if (response === DEPLOY_USE_STANDALONE_KEY_ACTION) {
+    return "standalone";
+  }
+  if (response === DEPLOY_USE_KEY_PROFILE_ACTION) {
+    return "profile";
+  }
+  return undefined;
+}
+
+function findMatchingKeyAuthProfiles(
+  core: import("../core/nexusCore").NexusCore,
+  username: string,
+  privateKeyPath: string
+): AuthProfile[] {
+  return core.getSnapshot().authProfiles.filter((profile) =>
+    profile.authType === "key" &&
+    profile.username === username &&
+    profile.keyPath === privateKeyPath
+  );
+}
+
+function getDefaultKeyAuthProfileName(username: string, privateKeyPath: string): string {
+  return `${username} — ${formatKeyPathDisplayName(privateKeyPath)}`;
+}
+
+async function promptForKeyAuthProfileName(username: string, privateKeyPath: string): Promise<string | undefined> {
+  const name = await vscode.window.showInputBox({
+    title: "Key Auth Profile Name",
+    prompt: "Enter a name for the new key auth profile",
+    value: getDefaultKeyAuthProfileName(username, privateKeyPath),
+    validateInput: (value) => value.trim() ? null : "Name cannot be empty"
+  });
+  return name?.trim() || undefined;
+}
+
+async function createKeyAuthProfile(
+  ctx: CommandContext,
+  username: string,
+  privateKeyPath: string
+): Promise<AuthProfile | undefined> {
+  const name = await promptForKeyAuthProfileName(username, privateKeyPath);
+  if (!name) {
+    return undefined;
+  }
+  const profile: AuthProfile = {
+    id: randomUUID(),
+    name,
+    username,
+    authType: "key",
+    keyPath: privateKeyPath
+  };
+  await ctx.core.addOrUpdateAuthProfile(profile);
+  return profile;
+}
+
+async function pickOrCreateKeyAuthProfile(
+  ctx: CommandContext,
+  username: string,
+  privateKeyPath: string
+): Promise<AuthProfile | undefined> {
+  const matches = findMatchingKeyAuthProfiles(ctx.core, username, privateKeyPath);
+  if (matches.length === 0) {
+    return createKeyAuthProfile(ctx, username, privateKeyPath);
+  }
+
+  type ProfilePickItem = vscode.QuickPickItem & { profile?: AuthProfile; createNew?: boolean };
+  const pick = await vscode.window.showQuickPick<ProfilePickItem>(
+    [
+      ...matches.map((profile) => ({
+        label: formatAuthProfileLabel(profile),
+        description: "Reuse existing key auth profile",
+        profile
+      })),
+      {
+        label: DEPLOY_CREATE_KEY_PROFILE_ACTION,
+        description: "Create a new reusable key auth profile for this key",
+        createNew: true
+      }
+    ],
+    {
+      title: "Select Key Auth Profile",
+      placeHolder: "Choose an existing matching key auth profile or create a new one"
+    }
+  );
+  if (!pick) {
+    return undefined;
+  }
+  if (pick.createNew) {
+    return createKeyAuthProfile(ctx, username, privateKeyPath);
+  }
+  return pick.profile;
 }
 
 export function formValuesToProxy(values: FormValues): ProxyConfig | undefined {
@@ -736,28 +894,26 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           },
         );
 
-        if (deployResult.alreadyDeployed) {
-          void vscode.window.showInformationMessage("Public key is already deployed on this server.");
-        } else {
-          const switchAction = "Switch to key auth";
-          const response = await vscode.window.showInformationMessage(
-            `SSH key deployed to ${server.name} successfully.`,
-            switchAction,
-          );
-          if (response === switchAction) {
-            await ctx.core.addOrUpdateServer({ ...server, authType: "key", keyPath: privateKeyPath });
-            if (server.authType === "password" && ctx.secretVault) {
-              const removeAction = "Remove stored password";
-              const pwResponse = await vscode.window.showInformationMessage(
-                "Server switched to key authentication.",
-                removeAction,
-              );
-              if (pwResponse === removeAction) {
-                await ctx.secretVault.delete(passwordSecretKey(server.id));
-              }
-            }
-          }
+        const conversionMode = await pickDeployConversionMode(server.name, deployResult.alreadyDeployed);
+        if (!conversionMode) {
+          return;
         }
+
+        const effectiveUsername = resolveEffectiveUsername(ctx.core, server);
+        if (conversionMode === "standalone") {
+          await ctx.core.addOrUpdateServer(buildStandaloneKeyServer(server, effectiveUsername, privateKeyPath));
+          await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
+          return;
+        }
+
+        const profile = await pickOrCreateKeyAuthProfile(ctx, effectiveUsername, privateKeyPath);
+        if (!profile) {
+          return;
+        }
+        await ctx.core.addOrUpdateServer(
+          buildProfileLinkedKeyServer(server, effectiveUsername, privateKeyPath, profile.id)
+        );
+        await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
       } catch (err: any) {
         void vscode.window.showErrorMessage(`Deploy failed: ${err?.message ?? err}`);
       } finally {

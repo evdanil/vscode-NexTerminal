@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { AuthProfile } from "../models/config";
 import { FolderTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { AuthProfileEditorPanel } from "../ui/authProfileEditorPanel";
+import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import { isDescendantOrSelf } from "../utils/folderPaths";
 import type { CommandContext } from "./types";
 
@@ -13,8 +14,7 @@ async function pickAuthProfile(ctx: CommandContext): Promise<AuthProfile | undef
   }
   const pick = await vscode.window.showQuickPick(
     profiles.map((p) => ({
-      label: p.name,
-      description: `${p.authType} — ${p.username}`,
+      label: formatAuthProfileLabel(p),
       profile: p
     })),
     { title: "Select Auth Profile" }

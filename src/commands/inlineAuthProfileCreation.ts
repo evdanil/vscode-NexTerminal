@@ -1,12 +1,13 @@
 import type { AuthProfile } from "../models/config";
 import { AuthProfileEditorPanel } from "../ui/authProfileEditorPanel";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import type { CommandContext } from "./types";
 
 type InlineAuthProfileContext = Pick<CommandContext, "core" | "secretVault">;
 
 function authProfileOptionLabel(profile: AuthProfile): string {
-  return `${profile.name} — ${profile.authType} — ${profile.username}`;
+  return formatAuthProfileLabel(profile);
 }
 
 export interface InlineAuthProfileCreationController {

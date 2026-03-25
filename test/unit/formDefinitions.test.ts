@@ -43,6 +43,22 @@ describe("formDefinitions keyPath visibility", () => {
     }
   });
 
+  it("formats key auth profile options with the private key file name", () => {
+    const definition = serverFormDefinition(
+      undefined,
+      [],
+      true,
+      [],
+      [{ id: "ap-1", name: "Shared Key", username: "deploy", authType: "key", keyPath: "/keys/id_ed25519" }]
+    );
+    const authProfileField = definition.fields.find(
+      (field): field is Extract<(typeof definition.fields)[number], { key: string; options: Array<{ label: string; value: string }> }> =>
+        "key" in field && field.key === "authProfileId" && "options" in field
+    );
+    expect(authProfileField).toBeDefined();
+    expect(authProfileField!.options.some((option) => option.label === "Shared Key — key — deploy — id_ed25519")).toBe(true);
+  });
+
   it("preserves stored server credentials in edit form when auth profile is linked", () => {
     const definition = serverFormDefinition(
       {

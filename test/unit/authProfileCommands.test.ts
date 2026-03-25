@@ -220,4 +220,33 @@ describe("authProfileCommands", () => {
     expect(core.getServer("s1")?.username).toBe("old"); // unchanged
     expect(vault?.store).not.toHaveBeenCalledWith(passwordSecretKey("s1"), expect.anything());
   });
+
+  it("formats key auth profiles in auth profile quick picks with the key file name", async () => {
+    const profile = makeAuthProfile({
+      id: "ap1",
+      name: "Shared Key",
+      username: "deploy",
+      authType: "key",
+      keyPath: "/keys/id_ed25519"
+    });
+    const server = makeServer({ id: "s1", username: "old" });
+    const { ctx } = await setupContext({
+      servers: [server],
+      authProfiles: [profile]
+    });
+    registerAuthProfileCommands(ctx);
+
+    mockShowQuickPick.mockResolvedValue({ profile });
+
+    const applyToServer = registeredCommands.get("nexus.authProfile.applyToServer");
+    expect(applyToServer).toBeDefined();
+    await applyToServer!(new ServerTreeItem(server));
+
+    expect(mockShowQuickPick).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({ label: "Shared Key — key — deploy — id_ed25519" })
+      ]),
+      expect.any(Object)
+    );
+  });
 });
