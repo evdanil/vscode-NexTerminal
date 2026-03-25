@@ -2691,7 +2691,7 @@
           "minimum": 10,
           "maximum": 3600,
           "order": 24,
-          "markdownDescription": "Timeout in seconds for remote SFTP commands (e.g. server-side copy), file transfers, and editor file open/save streams. Increase for slow servers or large operations."
+          "markdownDescription": "Timeout in seconds for remote SFTP commands (e.g. server-side copy), file transfers, and editor file open/save streams. Upload/download treat this as an inactivity timeout, so long transfers can continue while progress is still flowing."
         },
         "nexus.sftp.deleteDepthLimit": {
           "type": "number",

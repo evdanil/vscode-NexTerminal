@@ -151,7 +151,7 @@ npm run package:vsix
 | `nexus.sftp.autoRefreshInterval` | `10` | Polling interval for file explorer (seconds); also used as the auto-mode safety net unless recursive inotify is available |
 | `nexus.sftp.remoteWatchMode` | `auto` | Remote change detection mode: `auto` prefers recursive inotify, `polling` uses interval-based refresh only |
 | `nexus.sftp.operationTimeout` | `30` | Timeout for SFTP directory and metadata operations (listing, stat, realpath, rename, mkdir, delete) |
-| `nexus.sftp.commandTimeout` | `300` | Timeout for remote SFTP commands, file transfers, and editor file open/save |
+| `nexus.sftp.commandTimeout` | `300` | Timeout for remote SFTP commands, file transfers, and editor file open/save; upload/download use it as an inactivity timeout rather than a total duration cap |
 | `nexus.sftp.deleteDepthLimit` | `100` | Safety limit for recursive delete directory depth |
 | `nexus.sftp.deleteOperationLimit` | `10000` | Safety limit for items removed by one recursive delete |
 | `nexus.serial.rpcTimeout` | `10` | Timeout for serial sidecar commands in seconds |

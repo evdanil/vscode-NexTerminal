@@ -337,6 +337,130 @@ describe("SftpService", () => {
     expect(mockStream.destroy).toHaveBeenCalled();
   });
 
+  it("allows uploads to exceed the timeout while transfer progress continues", async () => {
+    vi.useFakeTimers();
+    try {
+      await service.connect(testServer);
+      (service as any).commandTimeoutMs = 50;
+
+      let step: ((total: number, nb: number, fsize: number) => void) | undefined;
+      let complete: ((error?: Error) => void) | undefined;
+
+      sftp.fastPut.mockImplementation((
+        _localPath: string,
+        _remotePath: string,
+        options: { step?: (total: number, nb: number, fsize: number) => void },
+        callback: (error?: Error) => void
+      ) => {
+        step = options.step;
+        complete = callback;
+      });
+
+      const uploadPromise = service.upload("srv-1", "/tmp/big.bin", "/remote/big.bin");
+
+      expect(sftp.fastPut).toHaveBeenCalledWith(
+        "/tmp/big.bin",
+        "/remote/big.bin",
+        expect.objectContaining({ step: expect.any(Function) }),
+        expect.any(Function)
+      );
+
+      await vi.advanceTimersByTimeAsync(40);
+      step?.(32_768, 32_768, 8_000_000_000);
+      await vi.advanceTimersByTimeAsync(40);
+      step?.(65_536, 32_768, 8_000_000_000);
+      await vi.advanceTimersByTimeAsync(40);
+      complete?.();
+
+      await expect(uploadPromise).resolves.toBeUndefined();
+      expect(sftp.end).not.toHaveBeenCalled();
+      expect(connection.dispose).not.toHaveBeenCalled();
+      expect(service.isConnected("srv-1")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("allows downloads to exceed the timeout while transfer progress continues", async () => {
+    vi.useFakeTimers();
+    try {
+      await service.connect(testServer);
+      (service as any).commandTimeoutMs = 50;
+
+      let step: ((total: number, nb: number, fsize: number) => void) | undefined;
+      let complete: ((error?: Error) => void) | undefined;
+
+      sftp.fastGet.mockImplementation((
+        _remotePath: string,
+        _localPath: string,
+        options: { step?: (total: number, nb: number, fsize: number) => void },
+        callback: (error?: Error) => void
+      ) => {
+        step = options.step;
+        complete = callback;
+      });
+
+      const downloadPromise = service.download("srv-1", "/remote/big.bin", "/tmp/big.bin");
+
+      expect(sftp.fastGet).toHaveBeenCalledWith(
+        "/remote/big.bin",
+        "/tmp/big.bin",
+        expect.objectContaining({ step: expect.any(Function) }),
+        expect.any(Function)
+      );
+
+      await vi.advanceTimersByTimeAsync(40);
+      step?.(32_768, 32_768, 8_000_000_000);
+      await vi.advanceTimersByTimeAsync(40);
+      step?.(65_536, 32_768, 8_000_000_000);
+      await vi.advanceTimersByTimeAsync(40);
+      complete?.();
+
+      await expect(downloadPromise).resolves.toBeUndefined();
+      expect(sftp.end).not.toHaveBeenCalled();
+      expect(connection.dispose).not.toHaveBeenCalled();
+      expect(service.isConnected("srv-1")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out stalled uploads, disconnects the session, and ignores late completion", async () => {
+    vi.useFakeTimers();
+    try {
+      await service.connect(testServer);
+      (service as any).commandTimeoutMs = 50;
+
+      let complete: ((error?: Error) => void) | undefined;
+      sftp.fastPut.mockImplementation((
+        _localPath: string,
+        _remotePath: string,
+        _options: { step?: (total: number, nb: number, fsize: number) => void },
+        callback: (error?: Error) => void
+      ) => {
+        complete = callback;
+      });
+
+      const uploadPromise = service.upload("srv-1", "/tmp/stalled.bin", "/remote/stalled.bin");
+      const rejection = expect(uploadPromise).rejects.toThrow("SFTP upload timed out");
+
+      await vi.advanceTimersByTimeAsync(60);
+      await rejection;
+
+      expect(sftp.end).toHaveBeenCalledTimes(1);
+      expect(connection.dispose).toHaveBeenCalledTimes(1);
+      expect(service.isConnected("srv-1")).toBe(false);
+
+      complete?.();
+
+      expect(sftp.end).toHaveBeenCalledTimes(1);
+      expect(connection.dispose).toHaveBeenCalledTimes(1);
+      expect(service.isConnected("srv-1")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("dispose disconnects all sessions", async () => {
     await service.connect(testServer);
     service.dispose();

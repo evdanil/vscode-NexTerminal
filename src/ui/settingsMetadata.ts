@@ -317,7 +317,7 @@ export const SETTINGS_META: SettingMeta[] = [
     type: "number",
     category: "sftp",
     subgroup: "Advanced",
-    description: "Timeout for remote SFTP commands, file transfers, and editor file open/save streams. Increase for slow servers or large files.",
+    description: "Timeout for remote SFTP commands, file transfers, and editor file open/save streams. Upload/download use it as an inactivity timeout, so long transfers can continue while progress is still flowing.",
     min: 10,
     max: 3600,
     unit: "seconds",

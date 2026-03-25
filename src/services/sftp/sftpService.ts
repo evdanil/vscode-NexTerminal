@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import type { SFTPWrapper, FileEntry, Stats } from "ssh2";
+import type { SFTPWrapper, FileEntry, Stats, TransferOptions } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import { clamp } from "../../utils/helpers";
 import { shellEscape } from "../../utils/shellEscape";
@@ -519,28 +519,16 @@ export class SftpService {
   }
 
   public async download(serverId: string, remotePath: string, localPath: string): Promise<void> {
-    const sftp = this.getSftp(serverId);
-    return withTimeout<void>("download", this.commandTimeoutMs, (resolve, reject) => {
-      sftp.fastGet(remotePath, localPath, (error) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve();
-      });
+    const session = this.getSession(serverId);
+    return this.runTransferWithIdleTimeout(serverId, session, "download", (options, callback) => {
+      session.sftp.fastGet(remotePath, localPath, options, callback);
     });
   }
 
   public async upload(serverId: string, localPath: string, remotePath: string): Promise<void> {
-    const sftp = this.getSftp(serverId);
-    await withTimeout<void>("upload", this.commandTimeoutMs, (resolve, reject) => {
-      sftp.fastPut(localPath, remotePath, (error) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve();
-      });
+    const session = this.getSession(serverId);
+    await this.runTransferWithIdleTimeout(serverId, session, "upload", (options, callback) => {
+      session.sftp.fastPut(localPath, remotePath, options, callback);
     });
     this.invalidateCache(serverId, parentDir(remotePath));
   }
@@ -639,12 +627,105 @@ export class SftpService {
     this.unsubscribers.set(server.id, unsub);
   }
 
-  private getSftp(serverId: string): SFTPWrapper {
+  private getSession(serverId: string): SftpSession {
     const session = this.sessions.get(serverId);
     if (!session) {
       throw new Error(`No SFTP session for server ${serverId}`);
     }
-    return session.sftp;
+    return session;
+  }
+
+  private getSftp(serverId: string): SFTPWrapper {
+    return this.getSession(serverId).sftp;
+  }
+
+  private runTransferWithIdleTimeout(
+    serverId: string,
+    session: SftpSession,
+    label: "download" | "upload",
+    executor: (options: TransferOptions, callback: (error?: Error | null) => void) => void
+  ): Promise<void> {
+    const timeoutMs = this.commandTimeoutMs;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const clearTimer = (): void => {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+      };
+
+      const resolveOnce = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimer();
+        resolve();
+      };
+
+      const rejectOnce = (reason: unknown): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimer();
+        reject(reason);
+      };
+
+      const armTimer = (): void => {
+        clearTimer();
+        timer = setTimeout(() => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearTimer();
+          // ssh2 fastGet/fastPut does not expose a cancellation handle. Tear down
+          // the SFTP session so a stalled transfer cannot continue silently.
+          this.abortTimedOutTransfer(serverId, session);
+          reject(createTimeoutError(label, timeoutMs));
+        }, timeoutMs);
+      };
+
+      armTimer();
+      try {
+        executor({
+          step: () => {
+            if (!settled) {
+              armTimer();
+            }
+          }
+        }, (error) => {
+          if (error) {
+            rejectOnce(error);
+            return;
+          }
+          resolveOnce();
+        });
+      } catch (error) {
+        rejectOnce(error);
+      }
+    });
+  }
+
+  private abortTimedOutTransfer(serverId: string, session: SftpSession): void {
+    if (this.sessions.get(serverId) !== session) {
+      return;
+    }
+    try {
+      session.sftp.end();
+    } catch {
+      // Ignore teardown errors; the timeout is already terminal for this session.
+    }
+    try {
+      session.connection.dispose();
+    } catch {
+      // Ignore teardown errors; cleanup below still clears local session state.
+    }
+    this.cleanupSession(serverId);
   }
 
   private cleanupSession(serverId: string): void {
