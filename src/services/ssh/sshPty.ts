@@ -41,7 +41,10 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly outputObserver?: PtyOutputObserver,
     private readonly terminalType: string = "xterm-256color"
   ) {
-    this.highlighterStream = highlighter?.createStream((text) => this.writeEmitter.fire(text));
+    this.highlighterStream =
+      typeof (highlighter as { createStream?: unknown } | undefined)?.createStream === "function"
+        ? highlighter?.createStream((text) => this.writeEmitter.fire(text))
+        : undefined;
   }
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
@@ -214,7 +217,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
         if (this.highlighterStream) {
           this.highlighterStream.push(text);
         } else {
-          this.writeEmitter.fire(text);
+          this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(text) : text);
         }
       });
       stream.on("end", () => this.handleDisconnect(generation, "remote-closed"));

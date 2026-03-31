@@ -46,7 +46,10 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly highlighter?: TerminalHighlighter,
     private readonly outputObserver?: PtyOutputObserver
   ) {
-    this.highlighterStream = highlighter?.createStream((text) => this.writeEmitter.fire(text));
+    this.highlighterStream =
+      typeof (highlighter as { createStream?: unknown } | undefined)?.createStream === "function"
+        ? highlighter?.createStream((text) => this.writeEmitter.fire(text))
+        : undefined;
   }
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
@@ -182,7 +185,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         if (this.highlighterStream) {
           this.highlighterStream.push(output);
         } else {
-          this.writeEmitter.fire(output);
+          this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(output) : output);
         }
       });
       this.errorSubscription = this.transport.onDidReceiveError((eventSessionId, errorMessage) => {
