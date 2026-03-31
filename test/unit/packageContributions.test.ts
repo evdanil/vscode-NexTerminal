@@ -7,7 +7,7 @@ const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
   dependencies: Record<string, string>;
   configurationDefaults?: Record<string, unknown>;
   contributes: {
-    commands: Array<{ command: string; title: string }>;
+    commands: Array<{ command: string; title: string; enablement?: string }>;
     menus: Record<string, Array<{ command: string; when?: string; group?: string }>>;
     configuration?: { properties?: Record<string, any> };
   };
@@ -51,6 +51,12 @@ describe("package contributions", () => {
   it("contributes macro.editor command", () => {
     const commands = packageJson.contributes.commands.map((item) => item.command);
     expect(commands).toContain("nexus.macro.editor");
+  });
+
+  it("does not gate secret macro paste behind clipboard context state", () => {
+    const pasteSecret = packageJson.contributes.commands.find((item) => item.command === "nexus.macro.pasteSecret");
+    expect(pasteSecret).toBeDefined();
+    expect(pasteSecret?.enablement).toBeUndefined();
   });
 
   it("does not contribute the legacy macro.slot command", () => {

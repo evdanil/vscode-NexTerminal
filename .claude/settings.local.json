@@ -52,7 +52,10 @@
       "mcp__plugin_context7_context7__query-docs",
       "WebFetch(domain:www.cisco.com)",
       "WebFetch(domain:chrisjhart.com)",
-      "Bash(gh cache:*)"
+      "Bash(gh cache:*)",
+      "mcp__agent-memory__stats",
+      "mcp__agent-memory__store_batch",
+      "mcp__agent-memory__recall"
     ]
   }
 }

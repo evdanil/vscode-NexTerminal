@@ -117,6 +117,8 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - Add `triggerInterval` for polling-style macros. Once the prompt matches again, the macro is armed and can fire on this interval without extra user input.
 - Add `triggerInitiallyDisabled` when a macro should start paused until you manually resume it from the macros view. If the prompt already matched recently, resuming can fire immediately without extra terminal output.
 - Auto-trigger can be paused/resumed per macro from the macros view, and globally toggled with `nexus.terminal.macros.autoTrigger`.
+- Secret macros support **Copy Value** and **Paste Value** from the macros view context menu. Copying writes the macro value to the OS clipboard as plain text.
+- Pasting into a secret macro reads the current clipboard text and can optionally append a trailing newline before saving.
 - Legacy `slot` values are still read and auto-migrated to `keybinding` on startup.
 - Add, edit, remove, reorder, pause/resume auto-trigger, and assign shortcuts via the context menu.
 
@@ -243,6 +245,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - `nexus.macro.assignSlot` (assign/remove custom shortcut via context menu)
 - `nexus.macro.moveUp`, `nexus.macro.moveDown`
 - `nexus.macro.disableTrigger`, `nexus.macro.enableTrigger`
+- `nexus.macro.copySecret`, `nexus.macro.pasteSecret`
 
 **Files:**
 - `nexus.files.browse`, `nexus.files.open`

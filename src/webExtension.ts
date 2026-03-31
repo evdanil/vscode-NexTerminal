@@ -78,6 +78,8 @@ const unsupportedCommands = [
   "nexus.macro.runItem",
   "nexus.macro.disableTrigger",
   "nexus.macro.enableTrigger",
+  "nexus.macro.copySecret",
+  "nexus.macro.pasteSecret",
   "nexus.files.browse",
   "nexus.files.open",
   "nexus.files.upload",

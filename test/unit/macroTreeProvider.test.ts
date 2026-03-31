@@ -138,6 +138,23 @@ describe("MacroTreeItem", () => {
     expect(item.contextValue).toBe("nexus.macro");
   });
 
+  it("sets contextValue to nexus.macro.secret for secret macros", () => {
+    const item = new MacroTreeItem({ name: "Pwd", text: "pass", secret: true }, 0);
+    expect(item.contextValue).toBe("nexus.macro.secret");
+  });
+
+  it("sets contextValue to nexus.macro.secret.triggered for secret triggered macros", () => {
+    const macro = { name: "Auto", text: "pass\n", secret: true, triggerPattern: "Password:" };
+    const item = new MacroTreeItem(macro, 0, undefined, false);
+    expect(item.contextValue).toBe("nexus.macro.secret.triggered");
+  });
+
+  it("sets contextValue to nexus.macro.secret.triggered.disabled for secret disabled triggered macros", () => {
+    const macro = { name: "Auto", text: "pass\n", secret: true, triggerPattern: "Password:" };
+    const item = new MacroTreeItem(macro, 0, undefined, true);
+    expect(item.contextValue).toBe("nexus.macro.secret.triggered.disabled");
+  });
+
   it("wires click command to nexus.macro.runItem", () => {
     const item = new MacroTreeItem({ name: "Test", text: "test" }, 5, "alt+6");
     expect(item.command).toEqual({

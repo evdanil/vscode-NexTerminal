@@ -310,6 +310,49 @@ export function registerMacroCommands(): vscode.Disposable[] {
       }
       [macros[item.index], macros[item.index + 1]] = [macros[item.index + 1], macros[item.index]];
       await saveMacros(macros);
+    }),
+
+    vscode.commands.registerCommand("nexus.macro.copySecret", async (arg?: unknown) => {
+      const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
+      if (!item?.macro.secret) {
+        return;
+      }
+      await vscode.env.clipboard.writeText(item.macro.text);
+      void vscode.window.showInformationMessage(`Copied "${item.macro.name}" value to clipboard.`);
+    }),
+
+    vscode.commands.registerCommand("nexus.macro.pasteSecret", async (arg?: unknown) => {
+      const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
+      if (!item?.macro.secret) {
+        return;
+      }
+      const clipText = await vscode.env.clipboard.readText();
+      if (!clipText) {
+        void vscode.window.showInformationMessage("Clipboard is empty.");
+        return;
+      }
+      let text = clipText;
+      if (!text.endsWith("\n")) {
+        const choice = await vscode.window.showInformationMessage(
+          "Append newline (\\n) to the end of the pasted text?",
+          "Yes",
+          "No"
+        );
+        if (choice === undefined) {
+          return;
+        }
+        if (choice === "Yes") {
+          text += "\n";
+        }
+      }
+      const macros = getMacros();
+      const macro = macros[item.index];
+      if (!macro) {
+        return;
+      }
+      macro.text = text;
+      await saveMacros(macros);
+      void vscode.window.showInformationMessage(`Updated "${item.macro.name}" from clipboard.`);
     })
   ];
 }
