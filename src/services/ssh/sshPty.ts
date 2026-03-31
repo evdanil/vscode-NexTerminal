@@ -5,7 +5,7 @@ import type { ServerConfig } from "../../models/config";
 import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { SshConnection, SshFactory } from "./contracts";
-import type { TerminalHighlighter } from "../terminalHighlighter";
+import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 
 export interface SshPtyCallbacks {
@@ -29,6 +29,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   private lastDimensions?: vscode.TerminalDimensions;
   private connectionGeneration = 0;
   private activityIndicator = false;
+  private readonly highlighterStream?: TerminalHighlighterStream;
 
   public constructor(
     private readonly serverConfig: ServerConfig,
@@ -39,7 +40,9 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly highlighter?: TerminalHighlighter,
     private readonly outputObserver?: PtyOutputObserver,
     private readonly terminalType: string = "xterm-256color"
-  ) {}
+  ) {
+    this.highlighterStream = highlighter?.createStream((text) => this.writeEmitter.fire(text));
+  }
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
   public readonly onDidClose: vscode.Event<void> = this.closeEmitter.event;
@@ -96,6 +99,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.disposed = true;
+    this.highlighterStream?.dispose();
     this.stream?.destroy();
     this.connection?.dispose();
     this.outputObserver?.dispose();
@@ -118,6 +122,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
     this.outputObserver?.pauseIntervalMacros();
     this.disconnected = true;
+    this.highlighterStream?.flush();
     this.stream?.destroy();
     this.connection?.dispose();
     this.stream = undefined;
@@ -206,12 +211,17 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.transcript?.write(text);
         this.outputObserver?.onOutput(text);
         this.callbacks.onDataReceived?.(this.sessionId);
-        this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(text) : text);
+        if (this.highlighterStream) {
+          this.highlighterStream.push(text);
+        } else {
+          this.writeEmitter.fire(text);
+        }
       });
       stream.on("end", () => this.handleDisconnect(generation, "remote-closed"));
       stream.on("close", () => this.handleDisconnect(generation));
       stream.on("error", (error: Error) => {
         this.logger.log(`error ${error.message}`);
+        this.highlighterStream?.flush();
         this.writeEmitter.fire(`\r\n[Nexus SSH Error] ${error.message}\r\n`);
         this.handleDisconnect(generation);
       });

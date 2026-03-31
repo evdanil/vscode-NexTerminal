@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let mockConfig: Record<string, unknown> = {};
 
@@ -12,7 +12,7 @@ vi.mock("vscode", () => ({
   }
 }));
 
-import { TerminalHighlighter } from "../../src/services/terminalHighlighter";
+import { TerminalHighlighter, TerminalHighlighterStream } from "../../src/services/terminalHighlighter";
 
 function setConfig(enabled: boolean, rules: Array<Record<string, unknown>>): void {
   mockConfig = { enabled, rules };
@@ -21,6 +21,10 @@ function setConfig(enabled: boolean, rules: Array<Record<string, unknown>>): voi
 describe("TerminalHighlighter", () => {
   beforeEach(() => {
     mockConfig = {};
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("highlights ERROR in plain text with red bold", () => {
@@ -55,6 +59,85 @@ describe("TerminalHighlighter", () => {
     expect(result).toContain("\x1b[1m");
     expect(result).toContain("BOLD");
     expect(result).toContain("\x1b[0m");
+  });
+
+  it("buffers split chunks until a line boundary so cross-chunk matches still highlight", () => {
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    stream.push("ER");
+    expect(emitted).toEqual([]);
+
+    stream.push("ROR happened\r\n");
+    expect(emitted).toEqual(["\x1b[31mERROR\x1b[39m happened\r\n"]);
+  });
+
+  it("flushes partial no-newline output on a hard deadline without extending it forever", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    stream.push("ER");
+    vi.advanceTimersByTime(10);
+    stream.push("RO");
+    vi.advanceTimersByTime(9);
+    stream.push("R");
+    expect(emitted).toEqual([]);
+
+    vi.advanceTimersByTime(1);
+    expect(emitted).toEqual(["\x1b[31mERROR\x1b[39m"]);
+  });
+
+  it("starts a fresh flush deadline for a new trailing fragment after a completed line", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    stream.push("ER");
+    vi.advanceTimersByTime(19);
+    stream.push("ROR\r\nPR");
+    expect(emitted).toEqual(["\x1b[31mERROR\x1b[39m\r\n"]);
+
+    vi.advanceTimersByTime(19);
+    expect(emitted).toEqual(["\x1b[31mERROR\x1b[39m\r\n"]);
+
+    vi.advanceTimersByTime(1);
+    expect(emitted).toEqual(["\x1b[31mERROR\x1b[39m\r\n", "PR"]);
+  });
+
+  it("flushes incomplete buffered text after a short delay", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    stream.push("ERROR");
+    expect(emitted).toEqual([]);
+
+    vi.advanceTimersByTime(20);
+    expect(emitted).toEqual(["\x1b[31mERROR\x1b[39m"]);
+  });
+
+  it("flushes large partial output immediately once the pending buffer cap is reached", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "A+", color: "red", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+    const payload = "A".repeat(1100);
+
+    stream.push(payload);
+
+    expect(emitted).toEqual([`\x1b[31m${payload}\x1b[39m`]);
+    vi.advanceTimersByTime(20);
+    expect(emitted).toHaveLength(1);
   });
 
   it("skips highlighting inside color-active regions", () => {

@@ -256,4 +256,57 @@ describe("SerialPty", () => {
     pty.dispose();
     expect(closePort).toHaveBeenCalledWith("session-1");
   });
+
+  it("flushes buffered highlighted output before disconnect messaging", async () => {
+    const { transport, emitData, emitDisconnect } = createTransport();
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn()
+    };
+    const logger = {
+      log: vi.fn(),
+      close: vi.fn()
+    };
+    const writes: string[] = [];
+    let buffered = "";
+    const highlighterStream = {
+      push: vi.fn((text: string) => {
+        buffered += text;
+      }),
+      flush: vi.fn(() => {
+        if (buffered) {
+          writes.push(`[hl]${buffered}`);
+          buffered = "";
+        }
+      }),
+      dispose: vi.fn()
+    };
+    const highlighter = {
+      createStream: vi.fn(() => highlighterStream)
+    };
+
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      callbacks,
+      logger as any,
+      undefined,
+      highlighter as any
+    );
+    pty.onDidWrite((chunk) => writes.push(chunk));
+
+    pty.open();
+    await flushAsync();
+
+    emitData("session-1", "ERR");
+    expect(highlighterStream.push).toHaveBeenCalledWith("ERR");
+    expect(writes).toEqual(["\r\n[Nexus Serial] Connected COM9 @ 115200 (8N1)\r\n"]);
+
+    emitDisconnect("session-1", "Port closed");
+
+    expect(highlighter.createStream).toHaveBeenCalledTimes(1);
+    expect(highlighterStream.flush).toHaveBeenCalledTimes(1);
+    expect(writes[1]).toBe("[hl]ERR");
+    expect(writes.slice(2).join("")).toContain("Port disconnected");
+  });
 });

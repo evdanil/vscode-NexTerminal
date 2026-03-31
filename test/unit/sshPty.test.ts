@@ -224,6 +224,59 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
+  it("flushes buffered highlighted output before disconnect messaging", async () => {
+    const stream = new PassThrough();
+    const { connection, emitClose } = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => connection) };
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn(),
+      onDisconnected: vi.fn()
+    };
+    const logger = {
+      log: vi.fn(),
+      close: vi.fn()
+    };
+    const writes: string[] = [];
+    let buffered = "";
+    const highlighterStream = {
+      push: vi.fn((text: string) => {
+        buffered += text;
+      }),
+      flush: vi.fn(() => {
+        if (buffered) {
+          writes.push(`[hl]${buffered}`);
+          buffered = "";
+        }
+      }),
+      dispose: vi.fn()
+    };
+    const highlighter = {
+      createStream: vi.fn(() => highlighterStream)
+    };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any, undefined, highlighter as any);
+    pty.onDidWrite((text) => {
+      writes.push(text);
+    });
+
+    pty.open();
+    await flushAsync();
+
+    stream.push("ERR");
+    expect(highlighterStream.push).toHaveBeenCalledWith("ERR");
+    expect(writes).toEqual([]);
+
+    emitClose();
+    await flushAsync();
+
+    expect(highlighter.createStream).toHaveBeenCalledTimes(1);
+    expect(highlighterStream.flush).toHaveBeenCalledTimes(1);
+    expect(writes[0]).toBe("[hl]ERR");
+    expect(writes.slice(1).join("")).toContain("Connection lost");
+
+    pty.dispose();
+  });
+
   it("allows activity indicators to be restored as soon as a reconnect session opens", async () => {
     const stream1 = new PassThrough();
     const first = createConnection(stream1);

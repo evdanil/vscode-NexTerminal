@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
-import type { TerminalHighlighter } from "../terminalHighlighter";
+import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { toParityCode } from "../../utils/helpers";
 import type { OpenPortParams } from "./protocol";
@@ -35,6 +35,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   private disconnected = false;
   private failed = false;
   private activityIndicator = false;
+  private readonly highlighterStream?: TerminalHighlighterStream;
 
   public constructor(
     private readonly transport: SerialTransport,
@@ -44,7 +45,9 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly transcript?: SessionTranscript,
     private readonly highlighter?: TerminalHighlighter,
     private readonly outputObserver?: PtyOutputObserver
-  ) {}
+  ) {
+    this.highlighterStream = highlighter?.createStream((text) => this.writeEmitter.fire(text));
+  }
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
   public readonly onDidClose: vscode.Event<void> = this.closeEmitter.event;
@@ -94,6 +97,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.disposed = true;
+    this.highlighterStream?.dispose();
     this.outputObserver?.dispose();
 
     const sessionId = this.releaseSubscriptions();
@@ -134,6 +138,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
     this.outputObserver?.pauseIntervalMacros();
     this.disconnected = true;
+    this.highlighterStream?.flush();
 
     const sessionId = this.releaseSubscriptions();
 
@@ -174,13 +179,18 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.transcript?.write(output);
         this.outputObserver?.onOutput(output);
         this.callbacks.onDataReceived?.(eventSessionId);
-        this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(output) : output);
+        if (this.highlighterStream) {
+          this.highlighterStream.push(output);
+        } else {
+          this.writeEmitter.fire(output);
+        }
       });
       this.errorSubscription = this.transport.onDidReceiveError((eventSessionId, errorMessage) => {
         if (eventSessionId !== this.sidecarSessionId) {
           return;
         }
         this.logger.log(`serial port error ${errorMessage}`);
+        this.highlighterStream?.flush();
         this.writeEmitter.fire(`\r\n[Nexus Serial Error] ${errorMessage}\r\n`);
       });
       this.disconnectSubscription = this.transport.onDidDisconnect((eventSessionId, reason) => {

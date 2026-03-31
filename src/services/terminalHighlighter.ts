@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import { createAnsiRegex } from "../utils/ansi";
 
 const MAX_INPUT_LENGTH = 8192;
+const STREAM_FLUSH_DELAY_MS = 20;
+const STREAM_MAX_PENDING_LENGTH = 1024;
 
 const VALID_FLAGS_RE = /^[gi]*$/;
 
@@ -135,6 +137,12 @@ interface Match {
   ruleIndex: number;
 }
 
+function findStableBoundary(text: string): number {
+  const lastLf = text.lastIndexOf("\n");
+  const lastCr = text.lastIndexOf("\r");
+  return Math.max(lastLf, lastCr) + 1;
+}
+
 // Single-pass rule matching: find all matches against original text, resolve overlaps, build result
 function applyRulesToPlainText(text: string, rules: CompiledRule[]): string {
   // Collect all matches from all rules against the original text
@@ -255,5 +263,69 @@ export class TerminalHighlighter {
     }
 
     return parts.join("");
+  }
+
+  public createStream(emit: (text: string) => void, flushDelayMs = STREAM_FLUSH_DELAY_MS): TerminalHighlighterStream {
+    return new TerminalHighlighterStream(this, emit, flushDelayMs);
+  }
+}
+
+export class TerminalHighlighterStream implements vscode.Disposable {
+  private pending = "";
+  private flushTimer?: ReturnType<typeof setTimeout>;
+
+  public constructor(
+    private readonly highlighter: TerminalHighlighter,
+    private readonly emit: (text: string) => void,
+    private readonly flushDelayMs: number
+  ) {}
+
+  public push(text: string): void {
+    this.pending += text;
+    const boundary = findStableBoundary(this.pending);
+    if (boundary > 0) {
+      this.emit(this.highlighter.apply(this.pending.slice(0, boundary)));
+      this.pending = this.pending.slice(boundary);
+      this.clearFlushTimer();
+    }
+    if (this.pending.length >= STREAM_MAX_PENDING_LENGTH) {
+      this.flush();
+      return;
+    }
+    if (!this.pending) {
+      this.clearFlushTimer();
+      return;
+    }
+    this.scheduleFlush();
+  }
+
+  public flush(): void {
+    this.clearFlushTimer();
+    if (!this.pending) {
+      return;
+    }
+    this.emit(this.highlighter.apply(this.pending));
+    this.pending = "";
+  }
+
+  public dispose(): void {
+    this.flush();
+  }
+
+  private scheduleFlush(): void {
+    if (!this.pending || this.flushTimer !== undefined) {
+      return;
+    }
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined;
+      this.flush();
+    }, this.flushDelayMs);
+  }
+
+  private clearFlushTimer(): void {
+    if (this.flushTimer !== undefined) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
   }
 }
