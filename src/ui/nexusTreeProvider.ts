@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
-import type { ActiveSerialSession, ActiveSession, AuthProfile, ProxyConfig, SerialProfile, ServerConfig } from "../models/config";
+import { resolveSerialProfileMode, type ActiveSerialSession, type ActiveSession, type AuthProfile, type ProxyConfig, type SerialProfile, type ServerConfig } from "../models/config";
 import { getAncestorPaths, folderDisplayName, isDescendantOrSelf, parentPath as folderParentPath } from "../utils/folderPaths";
 import { toParityCode } from "../utils/helpers";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
@@ -81,14 +81,16 @@ export class SessionTreeItem extends vscode.TreeItem {
 export class SerialProfileTreeItem extends vscode.TreeItem {
   public constructor(public readonly profile: SerialProfile, connected: boolean, showDescription = true) {
     super(profile.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
+    const smartFollow = resolveSerialProfileMode(profile) === "smartFollow";
+    const connectionText = `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`;
     this.id = `serial:${profile.id}`;
-    this.tooltip = `${profile.path} @ ${profile.baudRate}`;
+    this.tooltip = smartFollow ? `Smart Follow\n${connectionText}` : `${profile.path} @ ${profile.baudRate}`;
     this.description = showDescription
-      ? `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`
+      ? (smartFollow ? `Smart Follow | ${connectionText}` : connectionText)
       : undefined;
     this.contextValue = connected ? "nexus.serialProfileConnected" : "nexus.serialProfile";
     this.iconPath = new vscode.ThemeIcon(
-      connected ? "plug" : "debug-disconnect",
+      smartFollow ? "sync" : connected ? "plug" : "debug-disconnect",
       new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
     );
   }

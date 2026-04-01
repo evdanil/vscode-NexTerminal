@@ -5,6 +5,7 @@ export type TunnelType = "local" | "reverse" | "dynamic";
 export type SerialParity = "none" | "even" | "odd" | "mark" | "space";
 export type SerialDataBits = 5 | 6 | 7 | 8;
 export type SerialStopBits = 1 | 2;
+export type SerialProfileMode = "standard" | "smartFollow";
 
 export interface SshJumpProxy {
   type: "ssh";
@@ -64,6 +65,13 @@ export interface TunnelProfile {
   browserUrl?: string;
 }
 
+export interface SerialDeviceHint {
+  manufacturer?: string;
+  serialNumber?: string;
+  vendorId?: string;
+  productId?: string;
+}
+
 export interface SerialProfile {
   id: string;
   name: string;
@@ -75,6 +83,8 @@ export interface SerialProfile {
   parity: SerialParity;
   rtscts: boolean;
   logSession?: boolean;
+  mode?: SerialProfileMode;
+  deviceHint?: SerialDeviceHint;
 }
 
 export interface ActiveSession {
@@ -128,4 +138,8 @@ export interface AuthProfile {
 
 export function resolveTunnelType(profile: TunnelProfile): TunnelType {
   return profile.tunnelType ?? "local";
+}
+
+export function resolveSerialProfileMode(profile: Pick<SerialProfile, "mode">): SerialProfileMode {
+  return profile.mode ?? "standard";
 }

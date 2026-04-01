@@ -406,6 +406,13 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(connected.id).toBe("serial:sp1");
     expect(disconnected.id).toBe(connected.id);
   });
+
+  it("marks smart-follow serial profiles in the description", () => {
+    const profile = makeSerial({ id: "sp-smart", mode: "smartFollow" });
+    const item = new SerialProfileTreeItem(profile, false);
+    expect(item.description).toContain("Smart Follow");
+    expect((item.iconPath as { id: string }).id).toBe("sync");
+  });
 });
 
 describe("NexusTreeProvider getParent", () => {

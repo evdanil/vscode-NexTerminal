@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import type { SerialDataBits, SerialParity, SerialProfile, SerialStopBits } from "../models/config";
+import { resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialStopBits } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SerialPty } from "../services/serial/serialPty";
+import { SmartSerialPty, type SmartSerialTransport } from "../services/serial/smartSerialPty";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
 import { serialFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
@@ -129,7 +130,42 @@ function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
 }
 
-export function formValuesToSerial(values: FormValues, existingId?: string): SerialProfile | undefined {
+function setSmartSerialLockContext(locked: boolean): void {
+  void vscode.commands.executeCommand("setContext", "nexus.smartSerialLocked", locked);
+}
+
+function setSmartSerialLock(
+  ctx: CommandContext,
+  lock: CommandContext["smartSerialLock"]
+): void {
+  ctx.smartSerialLock = lock;
+  setSmartSerialLockContext(Boolean(lock));
+}
+
+function serialTerminalName(profile: SerialProfile): string {
+  return resolveSerialProfileMode(profile) === "smartFollow"
+    ? `Nexus Serial: ${profile.name} [Smart Follow]`
+    : `Nexus Serial: ${profile.name}`;
+}
+
+function sameDeviceHint(left: SerialDeviceHint | undefined, right: SerialDeviceHint | undefined): boolean {
+  return (
+    left?.manufacturer === right?.manufacturer &&
+    left?.serialNumber === right?.serialNumber &&
+    left?.vendorId === right?.vendorId &&
+    left?.productId === right?.productId
+  );
+}
+
+async function disconnectSerialTerminals(ctx: CommandContext): Promise<number> {
+  const terminals = [...new Set([...ctx.serialTerminals.values()].map((entry) => entry.terminal))];
+  for (const terminal of terminals) {
+    terminal.dispose();
+  }
+  return terminals.length;
+}
+
+export function formValuesToSerial(values: FormValues, existing?: Partial<SerialProfile>): SerialProfile | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const portPath = typeof values.path === "string" ? values.path.trim() : "";
   const normalizedGroup = normalizeOptionalFolderPath(values.group);
@@ -142,8 +178,9 @@ export function formValuesToSerial(values: FormValues, existingId?: string): Ser
   const dataBits = typeof values.dataBits === "string" ? Number(values.dataBits) : 8;
   const stopBits = typeof values.stopBits === "string" ? Number(values.stopBits) : 1;
   const parity = typeof values.parity === "string" ? values.parity : "none";
+  const rawMode = typeof values.mode === "string" ? values.mode : existing?.mode;
   return {
-    id: existingId ?? randomUUID(),
+    id: existing?.id ?? randomUUID(),
     name,
     path: portPath,
     baudRate: typeof values.baudRate === "string" ? Number(values.baudRate) : 115200,
@@ -152,11 +189,185 @@ export function formValuesToSerial(values: FormValues, existingId?: string): Ser
     parity: VALID_PARITY.has(parity) ? (parity as SerialParity) : "none",
     rtscts: values.rtscts === true,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
-    group: normalizedGroup
+    group: normalizedGroup,
+    mode: rawMode === "smartFollow" ? "smartFollow" : "standard",
+    deviceHint: existing?.deviceHint
   };
 }
 
+async function connectStandardSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<void> {
+  const terminalName = serialTerminalName(profile);
+  let terminalRef: vscode.Terminal | undefined;
+  let ptyRef: SerialPty | undefined;
+  const triggerObserver = ctx.macroAutoTrigger.createObserver(
+    (text) => ptyRef?.handleInput(text),
+    () => ctx.focusedTerminal === terminalRef
+  );
+  const pty = new SerialPty(
+    ctx.serialSidecar,
+    {
+      path: profile.path,
+      baudRate: profile.baudRate,
+      dataBits: profile.dataBits,
+      stopBits: profile.stopBits,
+      parity: profile.parity,
+      rtscts: profile.rtscts
+    },
+    {
+      onSessionOpened: (sessionId) => {
+        if (terminalRef) {
+          ctx.serialTerminals.set(sessionId, { terminal: terminalRef, profileId: profile.id, transportSessionId: sessionId });
+        }
+        if (ptyRef) {
+          ctx.activityIndicators.set(sessionId, ptyRef);
+        }
+        ctx.core.registerSerialSession({
+          id: sessionId,
+          profileId: profile.id,
+          terminalName,
+          startedAt: Date.now()
+        });
+      },
+      onSessionClosed: (sessionId) => {
+        ctx.serialTerminals.delete(sessionId);
+        ctx.activityIndicators.delete(sessionId);
+        ctx.core.unregisterSerialSession(sessionId);
+      },
+      onDataReceived: (sessionId) => {
+        if (terminalRef && ctx.focusedTerminal !== terminalRef) {
+          ctx.core.markSessionActivity(sessionId);
+          ptyRef?.setActivityIndicator(true);
+        }
+      }
+    },
+    ctx.loggerFactory.create("terminal", `serial-${profile.id}`),
+    createSessionTranscript(
+      ctx.sessionLogDir,
+      profile.name,
+      profile.logSession ?? getDefaultSessionTranscriptsEnabled()
+    ),
+    ctx.highlighter,
+    triggerObserver
+  );
+  ptyRef = pty;
+
+  const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
+  const terminal = vscode.window.createTerminal({
+    name: terminalName,
+    pty,
+    location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+  });
+  terminalRef = terminal;
+  ctx.focusedTerminal = terminal;
+  terminal.show();
+}
+
+async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<void> {
+  if (ctx.smartSerialLock) {
+    if (ctx.smartSerialLock.profileId === profile.id) {
+      ctx.focusedTerminal = ctx.smartSerialLock.terminal;
+      ctx.smartSerialLock.terminal.show();
+      return;
+    }
+    void vscode.window.showWarningMessage(
+      "A Smart Follow serial profile is already active. Disconnect it before starting another serial session."
+    );
+    return;
+  }
+
+  const disconnectedCount = await disconnectSerialTerminals(ctx);
+  if (disconnectedCount > 0) {
+    void vscode.window.showWarningMessage(
+      `Smart Follow disconnected ${disconnectedCount} other serial session${disconnectedCount === 1 ? "" : "s"} and took exclusive control.`
+    );
+  }
+
+  const logicalSessionId = randomUUID();
+  const terminalName = serialTerminalName(profile);
+  let terminalRef: vscode.Terminal | undefined;
+  let ptyRef: SmartSerialPty | undefined;
+  let currentProfile = profile;
+  const triggerObserver = ctx.macroAutoTrigger.createObserver(
+    (text) => ptyRef?.handleInput(text),
+    () => ctx.focusedTerminal === terminalRef
+  );
+
+  const pty = new SmartSerialPty(
+    ctx.serialSidecar as SmartSerialTransport,
+    profile,
+    {
+      onClosed: () => {
+        ctx.serialTerminals.delete(logicalSessionId);
+        ctx.activityIndicators.delete(logicalSessionId);
+        ctx.core.unregisterSerialSession(logicalSessionId);
+        if (ctx.smartSerialLock?.sessionId === logicalSessionId) {
+          setSmartSerialLock(ctx, undefined);
+        }
+      },
+      onDataReceived: () => {
+        if (terminalRef && ctx.focusedTerminal !== terminalRef) {
+          ctx.core.markSessionActivity(logicalSessionId);
+          ptyRef?.setActivityIndicator(true);
+        }
+      },
+      onTransportSessionChanged: (transportSessionId) => {
+        const entry = ctx.serialTerminals.get(logicalSessionId);
+        if (entry) {
+          entry.transportSessionId = transportSessionId;
+        }
+      },
+      onResolvedPort: async (path, deviceHint) => {
+        const latest = ctx.core.getSerialProfile(currentProfile.id) ?? currentProfile;
+        if (latest.path === path && sameDeviceHint(latest.deviceHint, deviceHint)) {
+          currentProfile = latest;
+          return;
+        }
+        currentProfile = { ...latest, path, deviceHint };
+        await ctx.core.addOrUpdateSerialProfile(currentProfile);
+      }
+    },
+    ctx.loggerFactory.create("terminal", `smart-serial-${profile.id}`),
+    createSessionTranscript(
+      ctx.sessionLogDir,
+      profile.name,
+      profile.logSession ?? getDefaultSessionTranscriptsEnabled()
+    ),
+    ctx.highlighter,
+    triggerObserver
+  );
+  ptyRef = pty;
+
+  const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
+  const terminal = vscode.window.createTerminal({
+    name: terminalName,
+    pty,
+    location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+  });
+  terminalRef = terminal;
+  ctx.serialTerminals.set(logicalSessionId, {
+    terminal,
+    profileId: profile.id,
+    smartFollow: true
+  });
+  ctx.activityIndicators.set(logicalSessionId, pty);
+  ctx.core.registerSerialSession({
+    id: logicalSessionId,
+    profileId: profile.id,
+    terminalName,
+    startedAt: Date.now()
+  });
+  setSmartSerialLock(ctx, {
+    profileId: profile.id,
+    sessionId: logicalSessionId,
+    terminal
+  });
+  ctx.focusedTerminal = terminal;
+  terminal.show();
+}
+
 export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[] {
+  setSmartSerialLockContext(Boolean(ctx.smartSerialLock));
+
   return [
     vscode.commands.registerCommand("nexus.serial.add", () => {
       void vscode.commands.executeCommand("nexus.profile.add");
@@ -175,7 +386,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const updated = formValuesToSerial(values, existing.id);
+          const updated = formValuesToSerial(values, existing);
           if (!updated) {
             return;
           }
@@ -217,70 +428,17 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         if (!profile) {
           return;
         }
-        const terminalName = `Nexus Serial: ${profile.name}`;
-        let terminalRef: vscode.Terminal | undefined;
-        let ptyRef: SerialPty | undefined;
-        const triggerObserver = ctx.macroAutoTrigger.createObserver(
-          (text) => ptyRef?.handleInput(text),
-          () => ctx.focusedTerminal === terminalRef
-        );
-        const pty = new SerialPty(
-          ctx.serialSidecar,
-          {
-            path: profile.path,
-            baudRate: profile.baudRate,
-            dataBits: profile.dataBits,
-            stopBits: profile.stopBits,
-            parity: profile.parity,
-            rtscts: profile.rtscts
-          },
-          {
-            onSessionOpened: (sessionId) => {
-              if (terminalRef) {
-                ctx.serialTerminals.set(sessionId, { terminal: terminalRef, profileId: profile.id });
-              }
-              if (ptyRef) {
-                ctx.activityIndicators.set(sessionId, ptyRef);
-              }
-              ctx.core.registerSerialSession({
-                id: sessionId,
-                profileId: profile.id,
-                terminalName,
-                startedAt: Date.now()
-              });
-            },
-            onSessionClosed: (sessionId) => {
-              ctx.serialTerminals.delete(sessionId);
-              ctx.activityIndicators.delete(sessionId);
-              ctx.core.unregisterSerialSession(sessionId);
-            },
-            onDataReceived: (sessionId) => {
-              if (terminalRef && ctx.focusedTerminal !== terminalRef) {
-                ctx.core.markSessionActivity(sessionId);
-                ptyRef?.setActivityIndicator(true);
-              }
-            }
-          },
-          ctx.loggerFactory.create("terminal", `serial-${profile.id}`),
-          createSessionTranscript(
-            ctx.sessionLogDir,
-            profile.name,
-            profile.logSession ?? getDefaultSessionTranscriptsEnabled()
-          ),
-          ctx.highlighter,
-          triggerObserver
-        );
-        ptyRef = pty;
-
-        const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
-        const terminal = vscode.window.createTerminal({
-          name: terminalName,
-          pty,
-          location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-        });
-        terminalRef = terminal;
-        ctx.focusedTerminal = terminal;
-        terminal.show();
+        if (resolveSerialProfileMode(profile) === "smartFollow") {
+          await connectSmartSerialProfile(ctx, profile);
+        } else {
+          if (ctx.smartSerialLock) {
+            void vscode.window.showWarningMessage(
+              "A Smart Follow serial profile is active. Disconnect it before opening a standard serial session."
+            );
+            return;
+          }
+          await connectStandardSerialProfile(ctx, profile);
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown serial connection error";
         if (isSerialRuntimeMissingError(message)) {
@@ -377,8 +535,12 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       }
       for (const [sessionId, entry] of ctx.serialTerminals.entries()) {
         if (entry.terminal === activeTerminal) {
+          if (!entry.transportSessionId) {
+            void vscode.window.showWarningMessage("Smart Follow is waiting for a live serial port. Send Break is unavailable right now.");
+            return;
+          }
           try {
-            await ctx.serialSidecar.sendBreak(sessionId);
+            await ctx.serialSidecar.sendBreak(entry.transportSessionId ?? sessionId);
           } catch (error) {
             const message = error instanceof Error ? error.message : "unknown serial break error";
             void vscode.window.showErrorMessage(`Failed to send break: ${message}`);

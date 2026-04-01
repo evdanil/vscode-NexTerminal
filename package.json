@@ -749,7 +749,7 @@
         },
         {
           "command": "nexus.serial.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfile",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfile && !nexus.smartSerialLocked",
           "group": "inline"
         },
         {
@@ -764,7 +764,7 @@
         },
         {
           "command": "nexus.serial.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfile",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfile && !nexus.smartSerialLocked",
           "group": "0_connect"
         },
         {

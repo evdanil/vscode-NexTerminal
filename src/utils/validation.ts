@@ -8,6 +8,26 @@ function isValidPort(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
 }
 
+function isOptionalNonEmptyString(value: unknown): boolean {
+  return value === undefined || isNonEmptyString(value);
+}
+
+function validateSerialDeviceHint(value: unknown): boolean {
+  if (value === undefined) {
+    return true;
+  }
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  return (
+    isOptionalNonEmptyString(obj.manufacturer) &&
+    isOptionalNonEmptyString(obj.serialNumber) &&
+    isOptionalNonEmptyString(obj.vendorId) &&
+    isOptionalNonEmptyString(obj.productId)
+  );
+}
+
 export function validateProxyConfig(proxy: unknown): proxy is ProxyConfig {
   if (typeof proxy !== "object" || proxy === null) {
     return false;
@@ -79,7 +99,9 @@ export function validateSerialProfile(item: unknown): item is SerialProfile {
     isNonEmptyString(obj.id) &&
     isNonEmptyString(obj.name) &&
     isNonEmptyString(obj.path) &&
-    typeof obj.baudRate === "number"
+    typeof obj.baudRate === "number" &&
+    (obj.mode === undefined || obj.mode === "standard" || obj.mode === "smartFollow") &&
+    validateSerialDeviceHint(obj.deviceHint)
   );
 }
 

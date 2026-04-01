@@ -15,7 +15,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
   - **SOCKS5 Proxy** — Connect through a SOCKS5 proxy server with optional username/password authentication.
   - **HTTP CONNECT Proxy** — Connect through an HTTP proxy using the CONNECT method, common in corporate environments.
 - **SFTP File Explorer** — Browse, download, and manage remote files on connected servers. Drag-and-drop support for moving files between directories.
-- **Serial Terminal Sessions** — Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, parity, stop bits, and RTS/CTS flow control. Supports break signal and XON passthrough. Runs in an isolated sidecar process for crash safety.
+- **Serial Terminal Sessions** — Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, parity, stop bits, and RTS/CTS flow control. Supports break signal and XON passthrough. Includes **Smart Follow** mode for Windows COM-port renumbering: it retries the preferred port, safely follows a replacement port when only one match is available, updates the saved preferred port after a successful move, and keeps the terminal waiting for reattach when the device disappears. Runs in an isolated sidecar process for crash safety.
 - **Port Forwarding (TCP Tunnels)** — Three tunnel modes:
   - **Local (-L)** — Forward a local port to a remote host through SSH.
   - **Reverse (-R)** — Forward a remote port back to a local target.
@@ -68,8 +68,9 @@ If your target server is behind a firewall or bastion host:
 
 1. Click the serial icon in the Connectivity Hub title bar, or run `Nexus: Add Serial Profile`
 2. Use **Scan Serial Ports** to discover available ports
-3. Configure baud rate, data bits, parity, and stop bits
+3. Choose **Standard** or **Smart Follow** connection mode, then configure baud rate, data bits, parity, and stop bits
 4. Right-click the profile and select **Connect**
+5. Smart Follow profiles take exclusive control of serial sessions while active, print status updates in the terminal when they switch ports or wait for reattach, and automatically update the saved preferred COM port after a successful move
 
 ### Set Up Port Forwarding
 

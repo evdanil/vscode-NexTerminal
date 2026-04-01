@@ -46,7 +46,30 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDes
 }
 
 function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFieldDescriptor[] {
+  const smartFollowVw = vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "mode", value: "smartFollow" }] : { field: "mode", value: "smartFollow" };
   return [
+    {
+      type: "select",
+      key: "mode",
+      label: "Connection Mode",
+      options: [
+        { label: "Standard", value: "standard" },
+        { label: "Smart Follow", value: "smartFollow" }
+      ],
+      value: seed?.mode ?? "standard",
+      hint: "Smart Follow keeps one serial session attached across Windows COM port renumbering.",
+      visibleWhen: vw
+    },
+    {
+      type: "html",
+      content: [
+        "<div style=\"padding: 12px; border-left: 4px solid var(--vscode-inputValidation-warningBorder, #c08a00); background: var(--vscode-inputValidation-warningBackground, rgba(200, 150, 0, 0.15)); border-radius: 6px; line-height: 1.5;\">",
+        "<strong>Smart Follow warning</strong><br>",
+        "This mode takes an exclusive serial lock, can auto-switch to a newly detected port, updates the saved preferred port after a successful move, and keeps the terminal waiting for reattach when the device disappears.",
+        "</div>"
+      ].join(""),
+      visibleWhen: smartFollowVw
+    },
     { type: "text", key: "path", label: "Port Path", required: true, placeholder: "COM3 or /dev/ttyUSB0", value: seed?.path, scannable: true, visibleWhen: vw },
     {
       type: "select",
@@ -312,8 +335,8 @@ export function serialFormDefinition(
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
 
-  return {
-    title: isEdit ? "Edit Serial Profile" : "Add Serial Profile",
+    return {
+      title: isEdit ? "Edit Serial Profile" : "Add Serial Profile",
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "Arduino", value: seed?.name },
       ...serialFields(seed),

@@ -28,7 +28,7 @@ Nexus Terminal provides one operational surface in VS Code for:
 
 ## 3. Data Models
 - `ServerConfig` and `TunnelProfile` defined in `src/models/config.ts`.
-- `SerialProfile` defined in `src/models/config.ts` (`path`, `baudRate`, `dataBits`, `stopBits`, `parity`, `rtscts`, optional `group`).
+- `SerialProfile` defined in `src/models/config.ts` (`path`, `baudRate`, `dataBits`, `stopBits`, `parity`, `rtscts`, optional `group`, optional `mode`, optional `deviceHint`).
 - `AuthProfile` defined in `src/models/config.ts` for reusable username/auth method templates linked to multiple servers.
 - Persisted via `VscodeConfigRepository` into `globalState`.
 - Password secrets persisted via VS Code `SecretStorage` using key pattern `password-${serverId}`.
@@ -81,12 +81,15 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 
 ### 4.6 Serial Sidecar
 1. Create a serial profile with `Nexus: Add Serial Profile` (name + group + line settings).
-2. Profiles appear in **Connectivity Hub** and support right-click connect/edit/remove/duplicate/rename.
-3. Run `Nexus: Connect Serial Port` (or item context action) to open an interactive serial terminal.
-4. Active serial sessions are shown under the profile node in **Connectivity Hub**.
-5. Unread output marks both the sidebar session node and the terminal tab title until the terminal regains focus.
-6. Use `Nexus: Disconnect Serial Session` from profile/session context menu or command.
-7. `Nexus: List Serial Ports` reports detected ports and manufacturers for diagnostics.
+2. Select `Standard` or `Smart Follow` connection mode.
+3. Profiles appear in **Connectivity Hub** and support right-click connect/edit/remove/duplicate/rename.
+4. Run `Nexus: Connect Serial Port` (or item context action) to open an interactive serial terminal.
+5. Active serial sessions are shown under the profile node in **Connectivity Hub**.
+6. Unread output marks both the sidebar session node and the terminal tab title until the terminal regains focus.
+7. Smart Follow mode tries the saved preferred port first, then safely follows a replacement port when there is an unambiguous match, updates the saved preferred port after a successful move, and keeps the terminal waiting for automatic reattach if the device disappears.
+8. While a Smart Follow profile is active or waiting, other serial sessions are disconnected and new serial connects are blocked.
+9. Use `Nexus: Disconnect Serial Session` from profile/session context menu or command.
+10. `Nexus: List Serial Ports` reports detected ports and manufacturers for diagnostics.
 
 ### 4.7 Logging and Rotation
 1. Terminal and tunnel event logs are enabled automatically.

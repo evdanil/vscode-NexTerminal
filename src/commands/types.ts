@@ -12,7 +12,20 @@ import type { FileExplorerTreeProvider } from "../ui/fileExplorerTreeProvider";
 
 export type ServerTerminalMap = Map<string, Set<vscode.Terminal>>;
 export type SessionTerminalMap = Map<string, vscode.Terminal>;
-export type SerialTerminalMap = Map<string, { terminal: vscode.Terminal; profileId: string }>;
+export interface SerialTerminalEntry {
+  terminal: vscode.Terminal;
+  profileId: string;
+  transportSessionId?: string;
+  smartFollow?: boolean;
+}
+
+export type SerialTerminalMap = Map<string, SerialTerminalEntry>;
+
+export interface SmartSerialLock {
+  profileId: string;
+  sessionId: string;
+  terminal: vscode.Terminal;
+}
 
 export interface CommandContext {
   core: NexusCore;
@@ -33,4 +46,5 @@ export interface CommandContext {
   registrySync?: TunnelRegistrySync;
   focusedTerminal?: vscode.Terminal;
   activityIndicators: Map<string, { setActivityIndicator(active: boolean): void }>;
+  smartSerialLock?: SmartSerialLock;
 }

@@ -36,6 +36,13 @@ describe("package contributions", () => {
     expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.serialProfileConnected"))).toBe(true);
   });
 
+  it("hides serial connect actions while the smart-follow serial lock is active", () => {
+    const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+    const connectItems = menuItems.filter((item) => item.command === "nexus.serial.connect");
+    expect(connectItems.length).toBeGreaterThan(0);
+    expect(connectItems.every((item) => item.when?.includes("!nexus.smartSerialLocked"))).toBe(true);
+  });
+
   it("contributes unified profile.add, group.add, and group.remove commands", () => {
     const commands = packageJson.contributes.commands.map((item) => item.command);
     expect(commands).toContain("nexus.profile.add");
