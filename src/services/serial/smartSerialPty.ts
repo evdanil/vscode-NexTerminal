@@ -1,11 +1,12 @@
 import * as vscode from "vscode";
-import type { SerialDeviceHint, SerialProfile } from "../../models/config";
+import type { SerialDeviceHint, SerialProfile, SerialSessionStatus } from "../../models/config";
 import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { toParityCode } from "../../utils/helpers";
 import type { SerialTransport } from "./serialPty";
+import { isBusyOrPermissionSerialError, isMissingSerialPortError, isSerialRuntimeMissingError } from "./errorMatchers";
 import type { OpenPortParams, SerialPortInfo } from "./protocol";
 
 const SMART_FOLLOW_POLL_MS = 2000;
@@ -19,16 +20,8 @@ export interface SmartSerialPtyCallbacks {
   onDataReceived?(): void;
   onTransportSessionChanged?(sessionId?: string): void;
   onResolvedPort?(path: string, deviceHint?: SerialDeviceHint): Promise<void> | void;
-}
-
-function isMissingPortError(message: string): boolean {
-  const lower = message.toLowerCase();
-  return lower.includes("not found") || lower.includes("no such file") || lower.includes("cannot find");
-}
-
-function isBusyOrPermissionError(message: string): boolean {
-  const lower = message.toLowerCase();
-  return lower.includes("permission denied") || lower.includes("access denied") || lower.includes("busy");
+  onStateChanged?(status: SerialSessionStatus): void;
+  onFatalError?(message: string): void;
 }
 
 function mergeDeviceHint(existing: SerialDeviceHint | undefined, port: SerialPortInfo | undefined): SerialDeviceHint | undefined {
@@ -217,8 +210,6 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.connecting = true;
     try {
       const previousPreferredPath = this.preferredPath;
-      const ports = await this.listPortsSafe();
-
       const directOpen = await this.tryOpen(previousPreferredPath);
       if (this.disposed) {
         return;
@@ -228,15 +219,31 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
         return;
       }
 
-      if (!isMissingPortError(directOpen.message)) {
-        this.enterWaiting(
-          `Preferred port ${previousPreferredPath} is unavailable: ${directOpen.message}. Smart Follow will keep retrying that port.`,
-          `preferred:${directOpen.message}`
-        );
+      if (isSerialRuntimeMissingError(directOpen.message)) {
+        this.handleHardFailure(`Serial runtime missing or incompatible: ${directOpen.message}`);
         return;
       }
 
-      const resolved = this.resolveFallbackPort(ports, previousPreferredPath);
+      if (isBusyOrPermissionSerialError(directOpen.message)) {
+        this.handleHardFailure(`Preferred port ${previousPreferredPath} is not usable: ${directOpen.message}`);
+        return;
+      }
+
+      if (!isMissingSerialPortError(directOpen.message)) {
+        this.handleHardFailure(`Preferred port ${previousPreferredPath} failed: ${directOpen.message}`);
+        return;
+      }
+
+      const portResult = await this.listPortsResult();
+      if ("error" in portResult) {
+        if (isSerialRuntimeMissingError(portResult.error)) {
+          this.handleHardFailure(`Serial runtime missing or incompatible: ${portResult.error}`);
+          return;
+        }
+        return;
+      }
+
+      const resolved = this.resolveFallbackPort(portResult.ports, previousPreferredPath);
       if (resolved.type === "waiting") {
         this.enterWaiting(resolved.message, resolved.key);
         return;
@@ -251,22 +258,27 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
         return;
       }
 
-      const fallbackMessage = isBusyOrPermissionError(fallbackOpen.message)
-        ? `Candidate port ${resolved.path} is present but not usable: ${fallbackOpen.message}. Smart Follow will wait for the preferred port or a safe replacement.`
-        : `Candidate port ${resolved.path} could not be opened: ${fallbackOpen.message}. Smart Follow is waiting for a usable port.`;
-      this.enterWaiting(fallbackMessage, `candidate:${resolved.path}:${fallbackOpen.message}`);
+      if (isMissingSerialPortError(fallbackOpen.message)) {
+        this.enterWaiting(
+          `Candidate port ${resolved.path} disappeared before Smart Follow could attach. Waiting for the preferred port or another safe replacement.`,
+          `candidate-missing:${resolved.path}`
+        );
+        return;
+      }
+
+      this.handleHardFailure(`Candidate port ${resolved.path} is not usable: ${fallbackOpen.message}`);
     } finally {
       this.connecting = false;
     }
   }
 
-  private async listPortsSafe(): Promise<SerialPortInfo[]> {
+  private async listPortsResult(): Promise<{ ports: SerialPortInfo[] } | { error: string }> {
     try {
-      return await this.transport.listPorts();
+      return { ports: await this.transport.listPorts() };
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "unknown serial discovery error";
       this.logger.log(`smart serial listPorts failed ${message}`);
-      return [];
+      return { error: message };
     }
   }
 
@@ -360,6 +372,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       const message = error instanceof Error ? error.message : "unknown profile update error";
       this.logger.log(`smart serial profile update failed ${message}`);
     }
+    this.callbacks.onStateChanged?.("connected");
 
     if (path !== previousPreferredPath) {
       this.writeBanner(
@@ -391,10 +404,23 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     );
   }
 
+  private handleHardFailure(message: string): void {
+    if (this.disposed) {
+      return;
+    }
+    this.stopPolling();
+    this.highlighterStream?.flush();
+    this.logger.log(`smart serial hard failure ${message}`);
+    this.writeBanner(message);
+    this.callbacks.onFatalError?.(message);
+    this.dispose();
+  }
+
   private enterWaiting(message: string, key: string): void {
     this.waiting = true;
     this.currentPath = undefined;
     this.nameEmitter.fire(this.buildDisplayName());
+    this.callbacks.onStateChanged?.("waiting");
     this.startPolling();
     if (this.lastWaitingKey === key) {
       return;

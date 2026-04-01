@@ -216,4 +216,33 @@ describe("SmartSerialPty", () => {
 
     pty.dispose();
   });
+
+  it("treats a missing serial runtime as a hard failure instead of entering wait mode", async () => {
+    const { transport, openPort } = createTransport({
+      listPorts: async () => [{ path: "COM9" }],
+      openPort: async () => {
+        throw new Error("Cannot find module 'serialport'");
+      }
+    });
+    const callbacks = {
+      onClosed: vi.fn(),
+      onFatalError: vi.fn(),
+      onStateChanged: vi.fn()
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const writes: string[] = [];
+
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, logger as any);
+    pty.onDidWrite((chunk) => writes.push(chunk));
+
+    pty.open();
+    await flushAsync();
+
+    expect(openPort).toHaveBeenCalledTimes(1);
+    expect(transport.listPorts).not.toHaveBeenCalled();
+    expect(callbacks.onStateChanged).not.toHaveBeenCalledWith("waiting");
+    expect(callbacks.onFatalError).toHaveBeenCalledWith(expect.stringContaining("Serial runtime missing or incompatible"));
+    expect(callbacks.onClosed).toHaveBeenCalledTimes(1);
+    expect(writes.join("")).toContain("Serial runtime missing or incompatible");
+  });
 });

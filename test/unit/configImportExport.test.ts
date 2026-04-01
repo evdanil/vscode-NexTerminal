@@ -1119,7 +1119,7 @@ describe("sanitizeForSharing", () => {
   it("generates fresh IDs and sanitizes user fields", () => {
     const servers = [makeServer({ username: "alice", keyPath: "/home/alice/.ssh/id_rsa" })];
     const tunnels = [makeTunnel({ defaultServerId: "s1" })];
-    const serialProfiles = [makeSerialProfile()];
+    const serialProfiles = [makeSerialProfile({ deviceHint: { serialNumber: "ABC123", vendorId: "1111", productId: "2222" } })];
     const settings: Record<string, unknown> = {
       "nexus.terminal.macros": [
         { name: "public", text: "echo hi" },
@@ -1138,6 +1138,7 @@ describe("sanitizeForSharing", () => {
     expect(result.tunnels[0].defaultServerId).toBe(result.servers[0].id);
 
     expect(result.serialProfiles[0].id).not.toBe("sp1");
+    expect(result.serialProfiles[0].deviceHint).toBeUndefined();
 
     const macros = result.settings["nexus.terminal.macros"] as Array<{ name: string }>;
     expect(macros).toHaveLength(1);

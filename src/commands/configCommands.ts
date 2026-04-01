@@ -267,7 +267,7 @@ export function sanitizeForSharing(
   const newSerialProfiles = serialProfiles.map((p) => {
     const newId = randomUUID();
     idMap.set(p.id, newId);
-    return { ...p, id: newId };
+    return { ...p, id: newId, deviceHint: undefined };
   });
 
   // Strip secret macros entirely and sanitize paths

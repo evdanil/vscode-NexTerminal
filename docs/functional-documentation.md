@@ -126,7 +126,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - Add, edit, remove, reorder, pause/resume auto-trigger, and assign shortcuts via the context menu.
 
 ### 4.10 Configuration Export/Import
-- `Nexus: Export Configuration` creates a sanitized JSON export suitable for sharing (credentials stripped, IDs remapped).
+- `Nexus: Export Configuration` creates a sanitized JSON export suitable for sharing (credentials stripped, learned Smart Follow hardware identifiers removed, IDs remapped).
 - `Nexus: Export Backup` creates an encrypted backup that includes profiles, settings, and saved credentials.
 - `Nexus: Import Configuration` restores from either format with merge or replace options.
 - `Nexus: Import from MobaXterm` and `Nexus: Import from SecureCRT` migrate external SSH profiles while preserving folder hierarchy where possible.

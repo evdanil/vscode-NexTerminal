@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
-import { resolveSerialProfileMode, type ActiveSerialSession, type ActiveSession, type AuthProfile, type ProxyConfig, type SerialProfile, type ServerConfig } from "../models/config";
+import { resolveSerialProfileMode, type ActiveSerialSession, type ActiveSession, type AuthProfile, type ProxyConfig, type SerialProfile, type SerialSessionStatus, type ServerConfig } from "../models/config";
 import { getAncestorPaths, folderDisplayName, isDescendantOrSelf, parentPath as folderParentPath } from "../utils/folderPaths";
 import { toParityCode } from "../utils/helpers";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
@@ -78,17 +78,25 @@ export class SessionTreeItem extends vscode.TreeItem {
   }
 }
 
+type SerialProfileState = "disconnected" | "waiting" | "connected";
+
 export class SerialProfileTreeItem extends vscode.TreeItem {
-  public constructor(public readonly profile: SerialProfile, connected: boolean, showDescription = true) {
-    super(profile.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
+  public constructor(public readonly profile: SerialProfile, state: SerialProfileState, showDescription = true) {
+    super(profile.name, state === "disconnected" ? vscode.TreeItemCollapsibleState.None : vscode.TreeItemCollapsibleState.Expanded);
     const smartFollow = resolveSerialProfileMode(profile) === "smartFollow";
     const connectionText = `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`;
+    const waiting = state === "waiting";
+    const connected = state === "connected";
     this.id = `serial:${profile.id}`;
-    this.tooltip = smartFollow ? `Smart Follow\n${connectionText}` : `${profile.path} @ ${profile.baudRate}`;
+    this.tooltip = smartFollow
+      ? `Smart Follow${waiting ? "\nWaiting for port" : ""}\n${connectionText}`
+      : `${profile.path} @ ${profile.baudRate}`;
     this.description = showDescription
-      ? (smartFollow ? `Smart Follow | ${connectionText}` : connectionText)
+      ? (smartFollow
+          ? `${waiting ? "Smart Follow | Waiting for port | " : "Smart Follow | "}${connectionText}`
+          : connectionText)
       : undefined;
-    this.contextValue = connected ? "nexus.serialProfileConnected" : "nexus.serialProfile";
+    this.contextValue = connected ? "nexus.serialProfileConnected" : waiting ? "nexus.serialProfileWaiting" : "nexus.serialProfile";
     this.iconPath = new vscode.ThemeIcon(
       smartFollow ? "sync" : connected ? "plug" : "debug-disconnect",
       new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
@@ -99,9 +107,10 @@ export class SerialProfileTreeItem extends vscode.TreeItem {
 export class SerialSessionTreeItem extends vscode.TreeItem {
   public constructor(public readonly session: ActiveSerialSession, hasActivity = false) {
     super(session.terminalName, vscode.TreeItemCollapsibleState.None);
+    const status: SerialSessionStatus = session.status ?? "connected";
     this.id = `serial-session:${session.id}`;
     this.contextValue = "nexus.serialSessionNode";
-    this.description = "active";
+    this.description = status === "waiting" ? "waiting for port" : "active";
     this.iconPath = new vscode.ThemeIcon(
       "terminal",
       hasActivity ? new vscode.ThemeColor("terminal.ansiYellow") : undefined
@@ -457,8 +466,14 @@ export class NexusTreeProvider
   }
 
   private toSerialProfileItem(profile: SerialProfile): SerialProfileTreeItem {
-    const connected = this.snapshot.activeSerialSessions.some((session) => session.profileId === profile.id);
+    const sessions = this.snapshot.activeSerialSessions.filter((session) => session.profileId === profile.id);
+    const state: SerialProfileState =
+      sessions.some((session) => (session.status ?? "connected") === "connected")
+        ? "connected"
+        : sessions.length > 0
+          ? "waiting"
+          : "disconnected";
     const showDesc = vscode.workspace.getConfiguration("nexus.ui").get<boolean>("showTreeDescriptions", true);
-    return new SerialProfileTreeItem(profile, connected, showDesc);
+    return new SerialProfileTreeItem(profile, state, showDesc);
   }
 }

@@ -6,6 +6,7 @@ export type SerialParity = "none" | "even" | "odd" | "mark" | "space";
 export type SerialDataBits = 5 | 6 | 7 | 8;
 export type SerialStopBits = 1 | 2;
 export type SerialProfileMode = "standard" | "smartFollow";
+export type SerialSessionStatus = "connected" | "waiting";
 
 export interface SshJumpProxy {
   type: "ssh";
@@ -99,6 +100,7 @@ export interface ActiveSerialSession {
   profileId: string;
   terminalName: string;
   startedAt: number;
+  status?: SerialSessionStatus;
 }
 
 export interface TunnelRouteInfo {

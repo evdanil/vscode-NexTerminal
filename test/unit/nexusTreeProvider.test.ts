@@ -400,8 +400,8 @@ describe("NexusTreeProvider stable IDs", () => {
 
   it("SerialProfileTreeItem ID does not change with connection state", () => {
     const profile = makeSerial({ id: "sp1" });
-    const disconnected = new SerialProfileTreeItem(profile, false);
-    const connected = new SerialProfileTreeItem(profile, true);
+    const disconnected = new SerialProfileTreeItem(profile, "disconnected");
+    const connected = new SerialProfileTreeItem(profile, "connected");
     expect(disconnected.id).toBe("serial:sp1");
     expect(connected.id).toBe("serial:sp1");
     expect(disconnected.id).toBe(connected.id);
@@ -409,9 +409,17 @@ describe("NexusTreeProvider stable IDs", () => {
 
   it("marks smart-follow serial profiles in the description", () => {
     const profile = makeSerial({ id: "sp-smart", mode: "smartFollow" });
-    const item = new SerialProfileTreeItem(profile, false);
+    const item = new SerialProfileTreeItem(profile, "disconnected");
     expect(item.description).toContain("Smart Follow");
     expect((item.iconPath as { id: string }).id).toBe("sync");
+  });
+
+  it("marks waiting smart-follow serial profiles distinctly", () => {
+    const profile = makeSerial({ id: "sp-smart", mode: "smartFollow" });
+    const item = new SerialProfileTreeItem(profile, "waiting");
+    expect(item.contextValue).toBe("nexus.serialProfileWaiting");
+    expect(item.description).toContain("Waiting for port");
+    expect(item.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Expanded);
   });
 });
 
@@ -455,7 +463,7 @@ describe("NexusTreeProvider getParent", () => {
     const provider = new NexusTreeProvider(noopCallbacks);
     const profile = makeSerial({ id: "sp1", group: "Lab" });
     provider.setSnapshot({ ...emptySnapshot(), serialProfiles: [profile] });
-    const item = new SerialProfileTreeItem(profile, false);
+    const item = new SerialProfileTreeItem(profile, "disconnected");
     const parent = provider.getParent(item) as FolderTreeItem;
     expect(parent).toBeInstanceOf(FolderTreeItem);
     expect(parent.folderPath).toBe("Lab");
@@ -728,6 +736,20 @@ describe("NexusTreeProvider session activity indicators", () => {
     const icon = sessions[0].iconPath as { id: string; color?: unknown };
     expect(icon.id).toBe("terminal");
     expect(icon.color).toBeUndefined();
+  });
+
+  it("shows waiting serial sessions and profiles as waiting instead of connected", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      serialProfiles: [makeSerial({ mode: "smartFollow" })],
+      activeSerialSessions: [{ id: "ss-1", profileId: "sp-1", terminalName: "Nexus Serial: S1", startedAt: 0, status: "waiting" }],
+      activitySessionIds: new Set()
+    });
+    const profile = (provider.getChildren(undefined) as SerialProfileTreeItem[]).find((c) => c instanceof SerialProfileTreeItem)!;
+    expect(profile.contextValue).toBe("nexus.serialProfileWaiting");
+    const sessions = provider.getChildren(profile) as SerialSessionTreeItem[];
+    expect(sessions[0].description).toBe("waiting for port");
   });
 
   it("SerialSessionTreeItem focuses the matching serial terminal on click", () => {

@@ -94,7 +94,7 @@ You can also drag a tunnel profile onto a server in the Connectivity Hub to star
 ### Export / Import Configuration
 
 - **Encrypted Backup**: Run `Nexus: Export Backup` to create a master-password-protected backup including all profiles, settings, and saved credentials
-- **Share Export**: Run `Nexus: Export Configuration` to create a sanitized export safe for sharing (credentials stripped, IDs remapped)
+- **Share Export**: Run `Nexus: Export Configuration` to create a sanitized export safe for sharing (credentials stripped, learned hardware identifiers removed, IDs remapped)
 - **Import**: Run `Nexus: Import Configuration` to restore from either format (merge or replace)
 
 #### Import from MobaXterm or SecureCRT

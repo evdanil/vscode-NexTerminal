@@ -33,7 +33,7 @@ describe("package contributions", () => {
     expect(menuCommands).toContain("nexus.serial.edit");
     expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.sessionNode"))).toBe(true);
     expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.serverConnected"))).toBe(true);
-    expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.serialProfileConnected"))).toBe(true);
+    expect(menuItems.some((item) => item.when?.includes("viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/"))).toBe(true);
   });
 
   it("hides serial connect actions while the smart-follow serial lock is active", () => {

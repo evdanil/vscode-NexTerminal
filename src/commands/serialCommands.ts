@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import { resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialStopBits } from "../models/config";
+import { resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialSessionStatus, type SerialStopBits } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SerialPty } from "../services/serial/serialPty";
+import { isSerialRuntimeMissingError } from "../services/serial/errorMatchers";
 import { SmartSerialPty, type SmartSerialTransport } from "../services/serial/smartSerialPty";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
 import { serialFormDefinition } from "../ui/formDefinitions";
@@ -37,11 +38,6 @@ async function pickSerialProfile(
     { title: "Select Serial Profile" }
   );
   return pick?.profile;
-}
-
-function isSerialRuntimeMissingError(message: string): boolean {
-  const lower = message.toLowerCase();
-  return lower.includes("serialport module not installed") || lower.includes("cannot find module 'serialport'");
 }
 
 function toSerialProfileFromArg(
@@ -283,6 +279,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   }
 
   const logicalSessionId = randomUUID();
+  const startedAt = Date.now();
   const terminalName = serialTerminalName(profile);
   let terminalRef: vscode.Terminal | undefined;
   let ptyRef: SmartSerialPty | undefined;
@@ -324,6 +321,18 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
         }
         currentProfile = { ...latest, path, deviceHint };
         await ctx.core.addOrUpdateSerialProfile(currentProfile);
+      },
+      onStateChanged: (status: SerialSessionStatus) => {
+        ctx.core.registerSerialSession({
+          id: logicalSessionId,
+          profileId: profile.id,
+          terminalName,
+          startedAt,
+          status
+        });
+      },
+      onFatalError: (message) => {
+        void vscode.window.showErrorMessage(`Smart Follow stopped for ${profile.name}: ${message}`);
       }
     },
     ctx.loggerFactory.create("terminal", `smart-serial-${profile.id}`),
@@ -354,7 +363,8 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     id: logicalSessionId,
     profileId: profile.id,
     terminalName,
-    startedAt: Date.now()
+    startedAt,
+    status: "waiting"
   });
   setSmartSerialLock(ctx, {
     profileId: profile.id,
