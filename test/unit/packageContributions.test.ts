@@ -36,11 +36,11 @@ describe("package contributions", () => {
     expect(menuItems.some((item) => item.when?.includes("viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/"))).toBe(true);
   });
 
-  it("hides serial connect actions while the smart-follow serial lock is active", () => {
+  it("does not gate serial connect actions on the removed smart-follow lock", () => {
     const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
     const connectItems = menuItems.filter((item) => item.command === "nexus.serial.connect");
     expect(connectItems.length).toBeGreaterThan(0);
-    expect(connectItems.every((item) => item.when?.includes("!nexus.smartSerialLocked"))).toBe(true);
+    expect(connectItems.every((item) => !item.when?.includes("nexus.smartSerialLocked"))).toBe(true);
   });
 
   it("contributes unified profile.add, group.add, and group.remove commands", () => {

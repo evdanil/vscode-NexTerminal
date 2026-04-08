@@ -87,7 +87,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 5. Active serial sessions are shown under the profile node in **Connectivity Hub**.
 6. Unread output marks both the sidebar session node and the terminal tab title until the terminal regains focus.
 7. Smart Follow mode tries the saved preferred port first, silently reconnects only when a free replacement matches the saved device metadata, prompts before switching to unfamiliar free replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped if the device disappears or serial runtime errors occur.
-8. While a Smart Follow profile is active or waiting, other serial sessions are disconnected and new serial connects are blocked.
+8. Smart Follow sessions coexist with standard serial sessions as long as they target different ports. Starting any new serial session is blocked only when the target port is already held by another Nexus serial session; the warning toast names the existing session.
 9. Use `Nexus: Disconnect Serial Session` from profile/session context menu or command.
 10. `Nexus: List Serial Ports` reports detected ports and manufacturers for diagnostics.
 

@@ -112,13 +112,13 @@ describe("formValuesToSerial", () => {
   });
 });
 
-describe("registerSerialCommands smart-follow lock", () => {
+describe("registerSerialCommands port collision", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
   });
 
-  it("blocks standard serial connects while a smart-follow session is active", async () => {
+  it("blocks a new serial session when the target port is already held by another session", async () => {
     const profile = {
       id: "sp1",
       name: "USB Console",
@@ -130,6 +130,14 @@ describe("registerSerialCommands smart-follow lock", () => {
       rtscts: false,
       mode: "standard"
     };
+    const existingTerminal = { name: "Nexus Serial: Other", show: vi.fn(), dispose: vi.fn() } as any;
+    const serialTerminals = new Map();
+    serialTerminals.set("existing-session", {
+      terminal: existingTerminal,
+      profileId: "other-profile",
+      transportSessionId: "tsid-1",
+      activePath: "COM3"
+    });
     const ctx = {
       core: {
         getSerialProfile: vi.fn(() => profile)
@@ -138,15 +146,10 @@ describe("registerSerialCommands smart-follow lock", () => {
       loggerFactory: { create: vi.fn() } as any,
       macroAutoTrigger: { createObserver: vi.fn() } as any,
       sessionLogDir: "",
-      serialTerminals: new Map(),
+      serialTerminals,
       highlighter: {} as any,
       focusedTerminal: undefined,
-      activityIndicators: new Map(),
-      smartSerialLock: {
-        profileId: "smart-1",
-        sessionId: "session-1",
-        terminal: { show: vi.fn() } as any
-      }
+      activityIndicators: new Map()
     } as any;
 
     registerSerialCommands(ctx);
@@ -156,7 +159,55 @@ describe("registerSerialCommands smart-follow lock", () => {
     await connectCommand!("sp1");
 
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
-      "A Smart Follow serial profile is active. Disconnect it before opening a standard serial session."
+      expect.stringContaining("Serial port COM3 is already in use")
     );
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("Nexus Serial: Other")
+    );
+  });
+
+  it("refocuses the existing terminal when connecting a serial profile that already has a session", async () => {
+    const profile = {
+      id: "sp1",
+      name: "USB Console",
+      path: "COM7",
+      baudRate: 115200,
+      dataBits: 8,
+      stopBits: 1,
+      parity: "none",
+      rtscts: false,
+      mode: "standard"
+    };
+    const existingTerminal = { name: "Nexus Serial: USB Console", show: vi.fn(), dispose: vi.fn() } as any;
+    const serialTerminals = new Map();
+    serialTerminals.set("existing-session", {
+      terminal: existingTerminal,
+      profileId: "sp1",
+      transportSessionId: "tsid-1",
+      activePath: "COM7"
+    });
+    const ctx = {
+      core: {
+        getSerialProfile: vi.fn(() => profile)
+      },
+      serialSidecar: {} as any,
+      loggerFactory: { create: vi.fn() } as any,
+      macroAutoTrigger: { createObserver: vi.fn() } as any,
+      sessionLogDir: "",
+      serialTerminals,
+      highlighter: {} as any,
+      focusedTerminal: undefined,
+      activityIndicators: new Map()
+    } as any;
+
+    registerSerialCommands(ctx);
+    const connectCommand = registeredCommands.get("nexus.serial.connect");
+
+    await connectCommand!("sp1");
+
+    expect(existingTerminal.show).toHaveBeenCalledTimes(1);
+    expect(ctx.focusedTerminal).toBe(existingTerminal);
+    // No warning toast: refocus happens silently when the same profile is re-connected.
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 });

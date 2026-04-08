@@ -340,7 +340,7 @@ describe("SmartSerialPty", () => {
     expect(harness.spies.onFatalError).toHaveBeenCalledWith(expect.stringContaining("Serial runtime missing or incompatible"));
     expect(harness.spies.onActivePortChanged).toHaveBeenLastCalledWith(undefined);
     expect(writes.join("")).toContain("Serial runtime missing or incompatible");
-    expect(writes.join("")).toContain("Close this terminal to release the Smart Follow lock");
+    expect(writes.join("")).toContain("Close this terminal to exit");
 
     // Stopped state should not retry — advance the poll timer twice and assert no further work.
     const listCallsAfter = (transport.listPorts as ReturnType<typeof vi.fn>).mock.calls.length;

@@ -23,7 +23,7 @@ import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { toParityCode } from "../utils/helpers";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { collectGroups } from "./serverCommands";
-import type { CommandContext } from "./types";
+import type { CommandContext, SerialTerminalEntry } from "./types";
 
 async function pickSerialProfile(
   core: import("../core/nexusCore").NexusCore
@@ -219,18 +219,6 @@ function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
 }
 
-function setSmartSerialLockContext(locked: boolean): void {
-  void vscode.commands.executeCommand("setContext", "nexus.smartSerialLocked", locked);
-}
-
-function setSmartSerialLock(
-  ctx: CommandContext,
-  lock: CommandContext["smartSerialLock"]
-): void {
-  ctx.smartSerialLock = lock;
-  setSmartSerialLockContext(Boolean(lock));
-}
-
 function serialTerminalName(profile: SerialProfile): string {
   return resolveSerialProfileMode(profile) === "smartFollow"
     ? `Nexus Serial: ${profile.name} [Smart Follow]`
@@ -246,12 +234,63 @@ function sameDeviceHint(left: SerialDeviceHint | undefined, right: SerialDeviceH
   );
 }
 
-async function disconnectSerialTerminals(ctx: CommandContext): Promise<number> {
-  const terminals = [...new Set([...ctx.serialTerminals.values()].map((entry) => entry.terminal))];
-  for (const terminal of terminals) {
-    terminal.dispose();
+/**
+ * Look up an existing serial terminal entry for a profile so a second "Connect"
+ * click refocuses the existing terminal instead of creating a duplicate.
+ */
+function findSerialSessionForProfile(
+  ctx: CommandContext,
+  profileId: string
+): SerialTerminalEntry | undefined {
+  for (const entry of ctx.serialTerminals.values()) {
+    if (entry.profileId === profileId) {
+      return entry;
+    }
   }
-  return terminals.length;
+  return undefined;
+}
+
+/**
+ * Find a serial terminal entry whose session currently holds a specific COM path.
+ * Used to block a new session from opening a port another session owns and to
+ * name the offending session in the warning toast.
+ */
+function findSerialSessionHoldingPath(
+  ctx: CommandContext,
+  targetPath: string
+): SerialTerminalEntry | undefined {
+  const normalized = normalizePortPath(targetPath);
+  for (const entry of ctx.serialTerminals.values()) {
+    if (entry.activePath && normalizePortPath(entry.activePath) === normalized) {
+      return entry;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Apply the "same profile → refocus" and "port already held by another session →
+ * warn and bail" rules. Returns `true` if the connect should proceed; `false` if
+ * the caller must return early (because the rule handled the interaction).
+ */
+function enforceSerialConnectPreconditions(
+  ctx: CommandContext,
+  profile: SerialProfile
+): boolean {
+  const existing = findSerialSessionForProfile(ctx, profile.id);
+  if (existing) {
+    ctx.focusedTerminal = existing.terminal;
+    existing.terminal.show();
+    return false;
+  }
+  const conflict = findSerialSessionHoldingPath(ctx, profile.path);
+  if (conflict) {
+    void vscode.window.showWarningMessage(
+      `Serial port ${profile.path} is already in use by "${conflict.terminal.name}". Close that session or pick a different port.`
+    );
+    return false;
+  }
+  return true;
 }
 
 export function formValuesToSerial(values: FormValues, existing?: Partial<SerialProfile>): SerialProfile | undefined {
@@ -285,6 +324,9 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
 }
 
 async function connectStandardSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<void> {
+  if (!enforceSerialConnectPreconditions(ctx, profile)) {
+    return;
+  }
   const terminalName = serialTerminalName(profile);
   let terminalRef: vscode.Terminal | undefined;
   let ptyRef: SerialPty | undefined;
@@ -357,23 +399,8 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
 }
 
 async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<void> {
-  if (ctx.smartSerialLock) {
-    if (ctx.smartSerialLock.profileId === profile.id) {
-      ctx.focusedTerminal = ctx.smartSerialLock.terminal;
-      ctx.smartSerialLock.terminal.show();
-      return;
-    }
-    void vscode.window.showWarningMessage(
-      "A Smart Follow serial profile is already active. Disconnect it before starting another serial session."
-    );
+  if (!enforceSerialConnectPreconditions(ctx, profile)) {
     return;
-  }
-
-  const disconnectedCount = await disconnectSerialTerminals(ctx);
-  if (disconnectedCount > 0) {
-    void vscode.window.showWarningMessage(
-      `Smart Follow disconnected ${disconnectedCount} other serial session${disconnectedCount === 1 ? "" : "s"} and took exclusive control.`
-    );
   }
 
   const logicalSessionId = randomUUID();
@@ -395,9 +422,6 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
         ctx.serialTerminals.delete(logicalSessionId);
         ctx.activityIndicators.delete(logicalSessionId);
         ctx.core.unregisterSerialSession(logicalSessionId);
-        if (ctx.smartSerialLock?.sessionId === logicalSessionId) {
-          setSmartSerialLock(ctx, undefined);
-        }
       },
       onDataReceived: () => {
         if (terminalRef && ctx.focusedTerminal !== terminalRef) {
@@ -474,18 +498,11 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     startedAt,
     status: "waiting"
   });
-  setSmartSerialLock(ctx, {
-    profileId: profile.id,
-    sessionId: logicalSessionId,
-    terminal
-  });
   ctx.focusedTerminal = terminal;
   terminal.show();
 }
 
 export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[] {
-  setSmartSerialLockContext(Boolean(ctx.smartSerialLock));
-
   return [
     vscode.commands.registerCommand("nexus.serial.add", () => {
       void vscode.commands.executeCommand("nexus.profile.add");
@@ -549,12 +566,6 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         if (resolveSerialProfileMode(profile) === "smartFollow") {
           await connectSmartSerialProfile(ctx, profile);
         } else {
-          if (ctx.smartSerialLock) {
-            void vscode.window.showWarningMessage(
-              "A Smart Follow serial profile is active. Disconnect it before opening a standard serial session."
-            );
-            return;
-          }
           await connectStandardSerialProfile(ctx, profile);
         }
       } catch (error) {

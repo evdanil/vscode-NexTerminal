@@ -178,9 +178,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
   }
 
   public open(): void {
-    this.writeBanner(
-      `Smart Follow is active. Preferred port ${this.preferredPath}. Other serial profiles are blocked until this terminal closes.`
-    );
+    this.writeBanner(`Smart Follow is active. Preferred port ${this.preferredPath}.`);
     this.nameEmitter.fire(this.buildDisplayName());
     void this.ensureConnected("initial");
   }
@@ -567,7 +565,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.callbacks.onTransportSessionChanged?.(undefined);
     this.callbacks.onActivePortChanged?.(undefined);
     this.nameEmitter.fire(this.buildDisplayName());
-    this.writeBanner(`${message} Close this terminal to release the Smart Follow lock.`);
+    this.writeBanner(`${message} Close this terminal to exit.`);
     this.callbacks.onStateChanged?.("waiting");
     this.callbacks.onFatalError?.(message);
     // CRITICAL: do NOT call this.dispose() — the tab must persist per user requirement.

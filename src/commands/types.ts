@@ -27,12 +27,6 @@ export interface SerialTerminalEntry {
 
 export type SerialTerminalMap = Map<string, SerialTerminalEntry>;
 
-export interface SmartSerialLock {
-  profileId: string;
-  sessionId: string;
-  terminal: vscode.Terminal;
-}
-
 export interface CommandContext {
   core: NexusCore;
   tunnelManager: TunnelManager;
@@ -52,5 +46,4 @@ export interface CommandContext {
   registrySync?: TunnelRegistrySync;
   focusedTerminal?: vscode.Terminal;
   activityIndicators: Map<string, { setActivityIndicator(active: boolean): void }>;
-  smartSerialLock?: SmartSerialLock;
 }

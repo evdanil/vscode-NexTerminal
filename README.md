@@ -70,7 +70,7 @@ If your target server is behind a firewall or bastion host:
 2. Use **Scan Serial Ports** to discover available ports
 3. Choose **Standard** or **Smart Follow** connection mode, then configure baud rate, data bits, parity, and stop bits
 4. Right-click the profile and select **Connect**
-5. Smart Follow profiles take exclusive control of serial sessions while active, print status updates in the terminal when they switch ports or wait for reattach, silently reconnect only to the previously approved device, and prompt before switching to unfamiliar free ports
+5. Smart Follow profiles coexist with other serial sessions on different ports, print status updates in the terminal when they switch ports or wait for reattach, silently reconnect only to the previously approved device, and prompt before switching to unfamiliar free ports. Connecting any serial profile is blocked only when the target port is already held by another Nexus serial session.
 
 ### Set Up Port Forwarding
 
