@@ -41,6 +41,11 @@ describe("package contributions", () => {
     const connectItems = menuItems.filter((item) => item.command === "nexus.serial.connect");
     expect(connectItems.length).toBeGreaterThan(0);
     expect(connectItems.every((item) => !item.when?.includes("nexus.smartSerialLocked"))).toBe(true);
+    expect(
+      connectItems.every((item) =>
+        item.when?.includes("viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/")
+      )
+    ).toBe(true);
   });
 
   it("contributes unified profile.add, group.add, and group.remove commands", () => {

@@ -210,4 +210,49 @@ describe("registerSerialCommands port collision", () => {
     // No warning toast: refocus happens silently when the same profile is re-connected.
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
+
+  it("refocuses the existing terminal when reconnecting a smart-follow profile", async () => {
+    const profile = {
+      id: "sp1",
+      name: "USB Console",
+      path: "COM7",
+      baudRate: 115200,
+      dataBits: 8,
+      stopBits: 1,
+      parity: "none",
+      rtscts: false,
+      mode: "smartFollow"
+    };
+    const existingTerminal = { name: "Nexus Serial: USB Console [Smart Follow]", show: vi.fn(), dispose: vi.fn() } as any;
+    const serialTerminals = new Map();
+    serialTerminals.set("existing-session", {
+      terminal: existingTerminal,
+      profileId: "sp1",
+      transportSessionId: "tsid-1",
+      smartFollow: true,
+      activePath: "COM7"
+    });
+    const ctx = {
+      core: {
+        getSerialProfile: vi.fn(() => profile)
+      },
+      serialSidecar: {} as any,
+      loggerFactory: { create: vi.fn() } as any,
+      macroAutoTrigger: { createObserver: vi.fn() } as any,
+      sessionLogDir: "",
+      serialTerminals,
+      highlighter: {} as any,
+      focusedTerminal: undefined,
+      activityIndicators: new Map()
+    } as any;
+
+    registerSerialCommands(ctx);
+    const connectCommand = registeredCommands.get("nexus.serial.connect");
+
+    await connectCommand!("sp1");
+
+    expect(existingTerminal.show).toHaveBeenCalledTimes(1);
+    expect(ctx.focusedTerminal).toBe(existingTerminal);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
 });
