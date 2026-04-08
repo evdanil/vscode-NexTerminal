@@ -86,7 +86,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 4. Run `Nexus: Connect Serial Port` (or item context action) to open an interactive serial terminal.
 5. Active serial sessions are shown under the profile node in **Connectivity Hub**.
 6. Unread output marks both the sidebar session node and the terminal tab title until the terminal regains focus.
-7. Smart Follow mode tries the saved preferred port first, then safely follows a replacement port when there is an unambiguous match, updates the saved preferred port after a successful move, and keeps the terminal waiting for automatic reattach if the device disappears.
+7. Smart Follow mode tries the saved preferred port first, silently reconnects only when a free replacement matches the saved device metadata, prompts before switching to unfamiliar free replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped if the device disappears or serial runtime errors occur.
 8. While a Smart Follow profile is active or waiting, other serial sessions are disconnected and new serial connects are blocked.
 9. Use `Nexus: Disconnect Serial Session` from profile/session context menu or command.
 10. `Nexus: List Serial Ports` reports detected ports and manufacturers for diagnostics.

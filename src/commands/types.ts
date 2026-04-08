@@ -17,6 +17,12 @@ export interface SerialTerminalEntry {
   profileId: string;
   transportSessionId?: string;
   smartFollow?: boolean;
+  /**
+   * Path of the COM port currently held by this session. Set on connect, cleared
+   * while waiting/disconnected. Used by Smart Follow to filter out ports already
+   * owned by other Nexus serial sessions before opening or showing pickers.
+   */
+  activePath?: string;
 }
 
 export type SerialTerminalMap = Map<string, SerialTerminalEntry>;

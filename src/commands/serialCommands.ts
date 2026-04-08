@@ -4,7 +4,14 @@ import { resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, t
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import { SerialPty } from "../services/serial/serialPty";
 import { isSerialRuntimeMissingError } from "../services/serial/errorMatchers";
-import { SmartSerialPty, type SmartSerialTransport } from "../services/serial/smartSerialPty";
+import {
+  SmartSerialPty,
+  normalizePortPath,
+  type SmartFollowPromptInput,
+  type SmartFollowPromptResult,
+  type SmartSerialTransport
+} from "../services/serial/smartSerialPty";
+import type { SerialPortInfo } from "../services/serial/protocol";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
 import { serialFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
@@ -118,6 +125,92 @@ export async function scanForPort(ctx: CommandContext): Promise<string | undefin
   return pick?.label;
 }
 
+/**
+ * Collect normalized paths of serial ports currently held by other Nexus serial sessions.
+ * Used by Smart Follow to filter out ports another session owns before opening or showing pickers.
+ */
+function collectBusySerialPaths(
+  ctx: CommandContext,
+  excludeSessionKey?: string
+): Set<string> {
+  const busy = new Set<string>();
+  for (const [key, entry] of ctx.serialTerminals.entries()) {
+    if (key === excludeSessionKey) {
+      continue;
+    }
+    if (entry.activePath) {
+      busy.add(normalizePortPath(entry.activePath));
+    }
+  }
+  return busy;
+}
+
+function formatVidPid(port: SerialPortInfo): string | undefined {
+  if (port.vendorId && port.productId) {
+    return `VID:PID ${port.vendorId}:${port.productId}`;
+  }
+  return undefined;
+}
+
+/**
+ * QuickPick used by Smart Follow when the preferred port is missing/busy and the
+ * candidate set requires explicit user choice. Always includes a "Keep waiting" item.
+ */
+async function promptSmartSerialPortChoice(
+  input: SmartFollowPromptInput
+): Promise<SmartFollowPromptResult> {
+  type Item = vscode.QuickPickItem & { port?: SerialPortInfo; wait?: boolean };
+  const items: Item[] = [];
+
+  const sortedHints = [...input.hintMatches].sort((a, b) => a.path.localeCompare(b.path));
+  for (const port of sortedHints) {
+    items.push({
+      label: `$(plug) ${port.path}`,
+      description: port.manufacturer ?? formatVidPid(port) ?? "Unknown device",
+      detail: "Matches saved device (same vendor/serial)",
+      port
+    });
+  }
+
+  const sortedOthers = [...input.otherCandidates].sort((a, b) => a.path.localeCompare(b.path));
+  for (const port of sortedOthers) {
+    const detail = input.hasHint
+      ? "New device — does not match saved device"
+      : `Serial: ${port.serialNumber ?? "?"}  ${formatVidPid(port) ?? ""}`.trim();
+    items.push({
+      label: `$(plug) ${port.path}`,
+      description: port.manufacturer ?? formatVidPid(port) ?? "Unknown device",
+      detail,
+      port
+    });
+  }
+
+  items.push({
+    label: "$(clock) Keep waiting",
+    description: "",
+    detail: "Dismiss this picker; Smart Follow will keep polling and reappear when ports change",
+    wait: true
+  });
+
+  const placeholder =
+    input.preferredStatus === "busy"
+      ? `Preferred port ${input.preferredPath} is busy. Pick a replacement or keep waiting.`
+      : `Preferred port ${input.preferredPath} is missing. Pick a replacement or keep waiting.`;
+
+  const pick = await vscode.window.showQuickPick<Item>(items, {
+    title: `Smart Follow: choose port for ${input.profileName}`,
+    placeHolder: placeholder,
+    ignoreFocusOut: true,
+    matchOnDescription: true,
+    matchOnDetail: true
+  });
+
+  if (!pick || pick.wait || !pick.port) {
+    return { kind: "wait" };
+  }
+  return { kind: "connect", port: pick.port };
+}
+
 const VALID_DATA_BITS = new Set<number>([5, 6, 7, 8]);
 const VALID_STOP_BITS = new Set<number>([1, 2]);
 const VALID_PARITY = new Set<string>(["none", "even", "odd", "mark", "space"]);
@@ -212,7 +305,12 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
     {
       onSessionOpened: (sessionId) => {
         if (terminalRef) {
-          ctx.serialTerminals.set(sessionId, { terminal: terminalRef, profileId: profile.id, transportSessionId: sessionId });
+          ctx.serialTerminals.set(sessionId, {
+            terminal: terminalRef,
+            profileId: profile.id,
+            transportSessionId: sessionId,
+            activePath: profile.path
+          });
         }
         if (ptyRef) {
           ctx.activityIndicators.set(sessionId, ptyRef);
@@ -332,7 +430,16 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
         });
       },
       onFatalError: (message) => {
+        // Notification only — Smart Follow keeps the terminal tab open in a sticky stopped state.
         void vscode.window.showErrorMessage(`Smart Follow stopped for ${profile.name}: ${message}`);
+      },
+      getBusyPaths: () => collectBusySerialPaths(ctx, logicalSessionId),
+      promptPortChoice: (input) => promptSmartSerialPortChoice(input),
+      onActivePortChanged: (path) => {
+        const entry = ctx.serialTerminals.get(logicalSessionId);
+        if (entry) {
+          entry.activePath = path;
+        }
       }
     },
     ctx.loggerFactory.create("terminal", `smart-serial-${profile.id}`),
@@ -356,7 +463,8 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   ctx.serialTerminals.set(logicalSessionId, {
     terminal,
     profileId: profile.id,
-    smartFollow: true
+    smartFollow: true,
+    activePath: undefined
   });
   ctx.activityIndicators.set(logicalSessionId, pty);
   ctx.core.registerSerialSession({
