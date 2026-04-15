@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros with auto-trigger (expect/send), regex highlighting, unread activity indicators, color schemes, and configuration import/export.",
-  "version": "2.7.72",
+  "version": "2.8.8",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -72,6 +72,11 @@
           "visibility": "collapsed"
         },
         {
+          "id": "nexusScripts",
+          "name": "Scripts",
+          "visibility": "collapsed"
+        },
+        {
           "id": "nexusSettings",
           "name": "Settings",
           "visibility": "collapsed"
@@ -94,6 +99,10 @@
       {
         "view": "nexusMacros",
         "contents": "No macros defined.\n[Add Macro](command:nexus.macro.add)\nMacros send predefined text to the active terminal."
+      },
+      {
+        "view": "nexusScripts",
+        "contents": "Nexus scripts automate SSH and Serial sessions with expect/send style.\n[New Script](command:nexus.script.new)\n[Open scripting guide](command:nexus.script.openDocs)"
       }
     ],
     "commands": [
@@ -128,6 +137,12 @@
         "command": "nexus.server.disconnect",
         "title": "Disconnect",
         "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "nexus.server.runWithScript",
+        "title": "Connect and Run Script…",
+        "category": "Nexus",
+        "icon": "$(run-all)"
       },
       {
         "command": "nexus.server.copyInfo",
@@ -244,6 +259,12 @@
         "command": "nexus.serial.disconnect",
         "title": "Disconnect",
         "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "nexus.serial.runWithScript",
+        "title": "Connect and Run Script…",
+        "category": "Nexus",
+        "icon": "$(run-all)"
       },
       {
         "command": "nexus.serial.copyInfo",
@@ -516,6 +537,59 @@
         "command": "nexus.filter.clear",
         "title": "Clear Filter",
         "icon": "$(search-stop)"
+      },
+      {
+        "command": "nexus.script.run",
+        "title": "Run Nexus Script",
+        "category": "Nexus",
+        "icon": "$(play)"
+      },
+      {
+        "command": "nexus.script.runQuick",
+        "title": "Quick Run in Active Terminal",
+        "category": "Nexus",
+        "icon": "$(play)"
+      },
+      {
+        "command": "nexus.script.stop",
+        "title": "Stop Nexus Script",
+        "category": "Nexus",
+        "icon": "$(primitive-square)"
+      },
+      {
+        "command": "nexus.script.new",
+        "title": "New Nexus Script",
+        "category": "Nexus",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "nexus.script.openOutput",
+        "title": "Show Nexus Scripts Output",
+        "category": "Nexus",
+        "icon": "$(output)"
+      },
+      {
+        "command": "nexus.script.openDocs",
+        "title": "Open Scripting Guide",
+        "category": "Nexus",
+        "icon": "$(book)"
+      },
+      {
+        "command": "nexus.script.delete",
+        "title": "Delete Script",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "nexus.script.edit",
+        "title": "Edit Script",
+        "category": "Nexus",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.script.openScriptsFolder",
+        "title": "Open Scripts Folder",
+        "category": "Nexus",
+        "icon": "$(folder-opened)"
       }
     ],
     "menus": {
@@ -624,6 +698,16 @@
           "command": "nexus.files.disconnect",
           "when": "view == nexusFileExplorer",
           "group": "navigation@8"
+        },
+        {
+          "command": "nexus.script.new",
+          "when": "view == nexusScripts",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nexus.script.openScriptsFolder",
+          "when": "view == nexusScripts",
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [
@@ -651,6 +735,11 @@
           "command": "nexus.server.connect",
           "when": "view == nexusCommandCenter && viewItem == nexus.server",
           "group": "0_connect"
+        },
+        {
+          "command": "nexus.server.runWithScript",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "group": "0_connect@3"
         },
         {
           "command": "nexus.server.connect",
@@ -766,6 +855,11 @@
           "command": "nexus.serial.connect",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
           "group": "0_connect"
+        },
+        {
+          "command": "nexus.serial.runWithScript",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "group": "0_connect@3"
         },
         {
           "command": "nexus.serial.disconnect",
@@ -970,6 +1064,41 @@
         {
           "command": "nexus.files.delete",
           "when": "view == nexusFileExplorer && viewItem =~ /^nexus\\.fileExplorer\\.(file|dir)$/",
+          "group": "3_destructive"
+        },
+        {
+          "command": "nexus.script.runQuick",
+          "when": "view == nexusScripts && viewItem == nexus.script.file",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.script.stop",
+          "when": "view == nexusScripts && viewItem == nexus.script.running",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.script.run",
+          "when": "view == nexusScripts && viewItem == nexus.script.file",
+          "group": "0_run"
+        },
+        {
+          "command": "nexus.script.stop",
+          "when": "view == nexusScripts && viewItem == nexus.script.running",
+          "group": "0_run"
+        },
+        {
+          "command": "nexus.script.edit",
+          "when": "view == nexusScripts && viewItem =~ /^nexus\\.script\\.(file|running)$/",
+          "group": "1_manage@0"
+        },
+        {
+          "command": "revealInExplorer",
+          "when": "view == nexusScripts && viewItem =~ /^nexus\\.script\\.(file|running)$/",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "nexus.script.delete",
+          "when": "view == nexusScripts && viewItem =~ /^nexus\\.script\\.(file|running)$/",
           "group": "3_destructive"
         }
       ],
@@ -1276,6 +1405,14 @@
         },
         {
           "command": "nexus.files.disconnect",
+          "when": "true"
+        },
+        {
+          "command": "nexus.script.delete",
+          "when": "false"
+        },
+        {
+          "command": "nexus.script.openDocs",
           "when": "true"
         }
       ]
@@ -2253,6 +2390,18 @@
         },
         "key": "ctrl+shift+9",
         "when": "terminalFocus && nexus.macro.ctrlShift.9"
+      },
+      {
+        "command": "nexus.script.run",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r",
+        "when": "editorTextFocus && resourceExtname == .js"
+      },
+      {
+        "command": "nexus.script.stop",
+        "key": "ctrl+alt+s",
+        "mac": "cmd+alt+s",
+        "when": "nexusHasRunningScripts"
       }
     ],
     "configuration": {
@@ -2768,6 +2917,40 @@
           "maximum": 60,
           "order": 30,
           "markdownDescription": "Timeout in seconds for commands sent to the serial port sidecar process."
+        },
+        "nexus.scripts.path": {
+          "type": "string",
+          "default": ".nexus/scripts",
+          "order": 20,
+          "markdownDescription": "Workspace-relative directory where Nexus scripts live. Created on first script command if it does not exist."
+        },
+        "nexus.scripts.defaultTimeout": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 100,
+          "order": 21,
+          "markdownDescription": "Default per-wait timeout in milliseconds, used by `waitFor` / `expect` / `waitAny` when a script doesn't pass its own `timeout`. Override per script via the `@default-timeout` JSDoc tag, or per call via the `timeout` option."
+        },
+        "nexus.scripts.macroPolicy": {
+          "type": "string",
+          "enum": [
+            "suspend-all",
+            "keep-enabled"
+          ],
+          "enumDescriptions": [
+            "Suspend all auto-trigger macros on the script's bound session for the duration of the run (default).",
+            "Keep all macros enabled. Use only if you understand the risk of macros firing alongside script-driven input."
+          ],
+          "default": "suspend-all",
+          "order": 22,
+          "markdownDescription": "How the script runtime treats macro auto-triggers on the bound session while a script is running."
+        },
+        "nexus.scripts.maxRuntimeMs": {
+          "type": "number",
+          "default": 1800000,
+          "minimum": 10000,
+          "order": 23,
+          "markdownDescription": "Maximum total runtime for a script in milliseconds. 0 disables the cap. The script is stopped with code 'MaxRuntimeExceeded' if it exceeds this."
         }
       }
     }

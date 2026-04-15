@@ -3,7 +3,7 @@ export interface SettingMeta {
   section: string;
   label: string;
   type: "boolean" | "number" | "string" | "enum" | "directory" | "multi-checkbox";
-  category: "logging" | "ssh" | "tunnels" | "terminal" | "ui" | "sftp" | "serial";
+  category: "logging" | "ssh" | "tunnels" | "terminal" | "ui" | "sftp" | "serial" | "scripts";
   description?: string;
   badge?: string;
   badgeClass?: string;
@@ -401,10 +401,68 @@ export const SETTINGS_META: SettingMeta[] = [
     max: 60,
     unit: "seconds",
     default: 10
+  },
+  // --- Scripts ---
+  {
+    key: "path",
+    section: "nexus.scripts",
+    label: "Scripts Folder",
+    type: "string",
+    category: "scripts",
+    description:
+      "Workspace-relative directory for your .js scripts. Created on first run if missing. Changing this does not move existing files — copy them across manually.",
+    default: ".nexus/scripts"
+  },
+  {
+    key: "defaultTimeout",
+    section: "nexus.scripts",
+    label: "Default Wait Timeout",
+    type: "number",
+    category: "scripts",
+    description:
+      "Used by waitFor / expect / waitAny when the call site does not pass its own timeout. Override per-script with the @default-timeout JSDoc tag.",
+    min: 100,
+    unit: "ms",
+    default: 30000
+  },
+  {
+    key: "maxRuntimeMs",
+    section: "nexus.scripts",
+    label: "Max Script Runtime",
+    type: "number",
+    category: "scripts",
+    description:
+      "Overall cap per run. Set to 0 to disable. Scripts over the cap stop with reason max-runtime-exceeded.",
+    min: 0,
+    unit: "ms",
+    default: 1800000
+  },
+  {
+    key: "macroPolicy",
+    section: "nexus.scripts",
+    label: "Macro Behaviour During Runs",
+    type: "enum",
+    category: "scripts",
+    description:
+      "How macro auto-triggers on the bound session behave while a script is running. Applies to new runs only — in-flight scripts keep the policy they started with.",
+    enumOptions: [
+      {
+        label: "Suspend all macros",
+        value: "suspend-all",
+        description: "Block every macro trigger on this session for the run. The safe default.",
+        recommended: true
+      },
+      {
+        label: "Keep macros enabled",
+        value: "keep-enabled",
+        description: "Let every macro keep firing. Use with care — macros can race with script sends."
+      }
+    ],
+    default: "suspend-all"
   }
 ];
 
-export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial"] as const;
+export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"] as const;
 
 export const CATEGORY_LABELS: Record<string, string> = {
   logging: "Logging",
@@ -413,7 +471,8 @@ export const CATEGORY_LABELS: Record<string, string> = {
   terminal: "Terminal",
   ui: "Interface",
   sftp: "SFTP / File Explorer",
-  serial: "Serial"
+  serial: "Serial",
+  scripts: "Scripts"
 };
 
 export const CATEGORY_ICONS: Record<string, string> = {
@@ -423,7 +482,8 @@ export const CATEGORY_ICONS: Record<string, string> = {
   terminal: "terminal",
   ui: "layout",
   sftp: "folder-opened",
-  serial: "circuit-board"
+  serial: "circuit-board",
+  scripts: "play"
 };
 
 export function formatSettingValueForTree(meta: SettingMeta, rawValue: unknown): string {

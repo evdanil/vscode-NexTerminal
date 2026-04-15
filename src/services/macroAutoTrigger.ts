@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { createAnsiRegex } from "../utils/ansi";
 import { clamp } from "../utils/helpers";
 import type { TerminalMacro } from "../models/terminalMacro";
+import type { ScriptMacroFilter } from "./scripts/scriptMacroFilter";
 
 const MAX_INPUT_LENGTH = 8192;
 const MAX_BUFFER_LENGTH = 2048;
@@ -28,6 +29,7 @@ interface CompiledTriggerRule {
   cooldownMs: number;
   intervalMs?: number;
   macroIndex: number;
+  name: string;
 }
 
 interface ObserverState {
@@ -48,6 +50,8 @@ export class MacroAutoTrigger implements vscode.Disposable {
   private readonly enabledIndexes = new Set<number>();
   private readonly observers = new Set<ObserverState>();
   private readonly intervalOwners = new Map<number, ObserverState>();
+  private readonly observersBySession = new Map<string, ObserverState>();
+  private readonly filterStacks = new Map<string, ScriptMacroFilter[]>();
   private readonly onDidChangeEmitter = new vscode.EventEmitter<void>();
   private disposed = false;
 
@@ -100,7 +104,8 @@ export class MacroAutoTrigger implements vscode.Disposable {
             typeof macro.triggerInterval === "number" && macro.triggerInterval > 0
               ? macro.triggerInterval * 1000
               : undefined,
-          macroIndex
+          macroIndex,
+          name: macro.name
         };
         this.rules.push(rule);
         this.rulesByIndex.set(macroIndex, rule);
@@ -148,10 +153,46 @@ export class MacroAutoTrigger implements vscode.Disposable {
     return this.disabledIndexes.has(macroIndex);
   }
 
+  public pushFilter(sessionId: string, filter: ScriptMacroFilter): vscode.Disposable {
+    const stack = this.filterStacks.get(sessionId) ?? [];
+    stack.push(filter);
+    this.filterStacks.set(sessionId, stack);
+    return new vscode.Disposable(() => {
+      const current = this.filterStacks.get(sessionId);
+      if (!current) return;
+      const idx = current.lastIndexOf(filter);
+      if (idx === -1) return;
+      current.splice(idx, 1);
+      if (current.length === 0) this.filterStacks.delete(sessionId);
+    });
+  }
+
+  private isMacroAllowedForSession(sessionId: string | undefined, macroIndex: number): boolean {
+    if (!sessionId) return true;
+    const stack = this.filterStacks.get(sessionId);
+    if (!stack || stack.length === 0) return true;
+    const filter = stack[stack.length - 1];
+    const macroName = this.rulesByIndex.get(macroIndex)?.name;
+    if (macroName === undefined) return true;
+    return filter.isAllowed(macroName);
+  }
+
+  /**
+   * Retroactively associate an observer with a sessionId after the session opens.
+   * Enables session-scoped macro filters (pushFilter) for SSH / Serial sessions whose
+   * sessionIds are only known after the transport negotiates.
+   */
+  public bindObserverToSession(observer: PtyOutputObserver, sessionId: string): void {
+    const bindFn = (observer as PtyOutputObserver & { __bindSessionId?: (id: string) => void }).__bindSessionId;
+    bindFn?.(sessionId);
+  }
+
   public createObserver(
     writeBack: (text: string) => void,
-    isActive?: () => boolean
+    isActive?: () => boolean,
+    sessionId?: string
   ): PtyOutputObserver {
+    let boundSessionId = sessionId;
     let buffer = "";
     const lastFired = new Map<number, number>();
     const readyMatches = new Set<number>();
@@ -244,6 +285,9 @@ export class MacroAutoTrigger implements vscode.Disposable {
       const active = !isActive || isActive();
       const now = Date.now();
       for (const rule of this.rules) {
+        if (!this.isMacroAllowedForSession(boundSessionId, rule.macroIndex)) {
+          continue;
+        }
         if (this.isDisabled(rule.macroIndex)) {
           if (rule.intervalMs !== undefined) {
             clearIntervalState(rule.macroIndex);
@@ -335,11 +379,15 @@ export class MacroAutoTrigger implements vscode.Disposable {
         ownedIntervals.clear();
         clearAllTimers();
         this.observers.delete(observerState);
+        if (boundSessionId && this.observersBySession.get(boundSessionId) === observerState) {
+          this.observersBySession.delete(boundSessionId);
+        }
       }
     };
     this.observers.add(observerState);
+    if (boundSessionId) this.observersBySession.set(boundSessionId, observerState);
 
-    return {
+    const observer: PtyOutputObserver & { __bindSessionId?: (id: string) => void } = {
       onOutput: (text: string) => {
         if (disposed || !this.enabled || this.rules.length === 0) {
           return;
@@ -367,6 +415,14 @@ export class MacroAutoTrigger implements vscode.Disposable {
       },
       dispose: () => observerState.dispose()
     };
+    observer.__bindSessionId = (id: string) => {
+      if (boundSessionId && this.observersBySession.get(boundSessionId) === observerState) {
+        this.observersBySession.delete(boundSessionId);
+      }
+      boundSessionId = id;
+      this.observersBySession.set(id, observerState);
+    };
+    return observer;
   }
 
   private pruneState(macroCount: number): void {

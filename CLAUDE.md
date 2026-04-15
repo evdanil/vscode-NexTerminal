@@ -52,6 +52,21 @@ Observer pattern hub. Holds servers, tunnel profiles, serial profiles, and all a
 - **SSH terminals** (`SshPty`): Each terminal gets its own SSH connection via `SilentAuthSshFactory` → `Ssh2Connector`
 - **Tunnels** (`TunnelManager`): Local TCP listener forwards to remote via SSH. Two modes: `isolated` (new SSH connection per client) or `shared` (single SSH connection)
 - **Serial** (`SerialSidecarManager`): Spawns `serialSidecarWorker.js` child process. Communicates via JSON-RPC over stdio. Native `serialport` module runs outside extension host for crash isolation
+- **Scripts** (`ScriptRuntimeManager`): Each running script lives in its own `node:worker_threads` Worker (separate V8 isolate, same process). IPC is structured-clone `postMessage` with a pending-Promise map keyed by monotonic request id. Workers are killed via `worker.terminate()` — preempts tight JS loops at V8 safe points in single-digit ms. Three isolation tiers total now: in-process (SSH), worker-thread (Scripts — cheap, fast-kill), child-process (Serial — crash-isolates native addons)
+
+### Scripts subsystem (`src/services/scripts/`)
+- `scriptRuntimeManager.ts` — main-thread orchestrator. Holds `Map<sessionId, RunningScript>`, dispatches RPC from worker, manages lifecycle (starting → running → completed/stopped/failed/connection-lost → cleanup).
+- `scriptWorker.ts` — bundled separately to `dist/services/scripts/scriptWorker.js`. Loads user `.js` source via the `AsyncFunction` constructor and exposes the script API (`waitFor` / `expect` / `sendLine` / `poll` / `prompt` / etc.) as globals that post RPCs back to the main thread. MUST NOT import `vscode`.
+- `scriptOutputBuffer.ts` — rolling 64 KiB string buffer with forward-only cursor; ANSI stripped at write time via `createAnsiRegex()`.
+- `scriptHeader.ts` — JSDoc header parser (`@nexus-script`, `@name`, `@target-type`, `@default-timeout`, `@lock-input`, `@allow-macros`).
+- `scriptTarget.ts` — session picker. Filters by `@target-type`, auto-selects on `@target-profile` match.
+- `scriptMacroFilter.ts` — per-session policy that gates macro firing during a script run.
+- `scriptTypesGenerator.ts` — writes `nexus-scripts.d.ts` + `jsconfig.json` into the workspace's scripts directory on first script command so IntelliSense/hovers work.
+- `assets/` — bundled `nexus-scripts.d.ts` + `jsconfig.json` copied by the esbuild step into `dist/services/scripts/assets/`.
+- UI surfaces: `src/ui/scriptTreeProvider.ts` (Scripts sidebar entry), `src/ui/scriptCodeLensProvider.ts` (inline ▶ Run / ◼ Stop), status bar item in `extension.ts:activate()`. Output Channel: `"Nexus Scripts"`.
+- Macro coordination: `MacroAutoTrigger` gained `pushFilter(sessionId, filter)` / `bindObserverToSession(obs, id)` / extended `createObserver(..., sessionId?)` so scripts can suspend macros on their session without touching unrelated sessions.
+- PTY integration: `SshPty`, `SmartSerialPty`, `SerialPty` all implement `SessionPtyHandle` — `addOutputObserver(o): Disposable`, `setInputBlocked(bool)`, `writeProgrammatic(data)`. A first dropped keystroke during `setInputBlocked(true)` emits a one-shot `[Nexus] Terminal is locked…` line via the PTY's `writeEmitter`. The handle is exposed on `ActiveSession.pty` / `ActiveSerialSession.pty` (runtime-only; not persisted).
+- New settings: `nexus.scripts.path`, `nexus.scripts.defaultTimeout`, `nexus.scripts.macroPolicy`. Captured into each `RunningScript` at start — settings changes do not apply to in-flight runs.
 
 ### Auth flow: `SilentAuthSshFactory`
 Tries saved password from `VscodeSecretVault` → falls back to `VscodePasswordPrompt` → optionally saves to vault. On auth failure, invalidates cached password and re-prompts.
@@ -91,3 +106,10 @@ Graceful degradation — registers stub commands showing "not available in brows
 - Integration tests for `SerialSidecarManager` spawn real child processes
 - Integration tests for `TunnelManager` use real TCP sockets
 - Test fixtures in `test/fixtures/` (mock sidecar scripts)
+
+## Active Technologies
+- TypeScript strict, ES2022 target, CommonJS output (extension host); `node:worker_threads` Worker bundle is the same target — Node 20.x via VS Code's extension host runtime + `vscode` API; `node:worker_threads`; `AsyncFunction` constructor for user-code loading (no `node:vm` module use); no new npm dependencies (001-scripting-support)
+- User script files under workspace-relative directory (default `.nexus/scripts/`); generated IntelliSense scaffolding under `<scriptsDir>/types/nexus-scripts.d.ts` + `<scriptsDir>/jsconfig.json`; new VS Code settings keys `nexus.scripts.path`, `nexus.scripts.defaultTimeout`, `nexus.scripts.macroPolicy` (additive — no migration) (001-scripting-support)
+
+## Recent Changes
+- 001-scripting-support: Added TypeScript strict, ES2022 target, CommonJS output (extension host); `node:worker_threads` Worker bundle is the same target — Node 20.x via VS Code's extension host runtime + `vscode` API; `node:worker_threads`; `AsyncFunction` constructor for user-code loading (no `node:vm` module use); no new npm dependencies

@@ -1,3 +1,6 @@
+import type { PtyOutputObserver } from "../services/macroAutoTrigger";
+import type * as vscode from "vscode";
+
 export type AuthType = "password" | "key" | "agent";
 export type TunnelConnectionMode = "isolated" | "shared" | "ask";
 export type ResolvedTunnelConnectionMode = Exclude<TunnelConnectionMode, "ask">;
@@ -88,11 +91,24 @@ export interface SerialProfile {
   deviceHint?: SerialDeviceHint;
 }
 
+/** Narrow handle exposed by SshPty / SmartSerialPty / SerialPty for consumers that observe session I/O. */
+export interface SessionPtyHandle {
+  addOutputObserver(observer: PtyOutputObserver): vscode.Disposable;
+  setInputBlocked(blocked: boolean): void;
+  /**
+   * Write text to the underlying transport (SSH stream or serial port) on behalf of a script.
+   * Bypasses the user-input lock (scripts own the lock) but silently no-ops if the session is
+   * disconnected — the runtime's NexusCore.onDidChange subscription surfaces ConnectionLost.
+   */
+  writeProgrammatic(data: string): void;
+}
+
 export interface ActiveSession {
   id: string;
   serverId: string;
   terminalName: string;
   startedAt: number;
+  pty?: SessionPtyHandle;
 }
 
 export interface ActiveSerialSession {
@@ -101,6 +117,7 @@ export interface ActiveSerialSession {
   terminalName: string;
   startedAt: number;
   status?: SerialSessionStatus;
+  pty?: SessionPtyHandle;
 }
 
 export interface TunnelRouteInfo {

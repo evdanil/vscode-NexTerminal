@@ -9,6 +9,7 @@ import type { TerminalHighlighter } from "../services/terminalHighlighter";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
 import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
 import type { FileExplorerTreeProvider } from "../ui/fileExplorerTreeProvider";
+import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 
 export type ServerTerminalMap = Map<string, Set<vscode.Terminal>>;
 export type SessionTerminalMap = Map<string, vscode.Terminal>;
@@ -46,4 +47,5 @@ export interface CommandContext {
   registrySync?: TunnelRegistrySync;
   focusedTerminal?: vscode.Terminal;
   activityIndicators: Map<string, { setActivityIndicator(active: boolean): void }>;
+  scriptRuntimeManager?: ScriptRuntimeManager;
 }
