@@ -59,10 +59,16 @@ export class ScriptOutputBuffer {
     const window = this.text.slice(offsetInText);
     if (window.length === 0) return null;
 
+    // A global regex (`/…/g`) would make `String.prototype.match` return an
+    // array without `.index`, causing real matches to be reported as misses —
+    // strip the `g` flag for scanning. Nexus's scan always finds the first
+    // occurrence in the window; the global flag is meaningless here.
     const regex =
       typeof pattern === "string"
         ? new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-        : pattern;
+        : pattern.flags.includes("g")
+          ? new RegExp(pattern.source, pattern.flags.replace(/g/g, ""))
+          : pattern;
     const m = window.match(regex);
     if (!m || m.index === undefined) return null;
 

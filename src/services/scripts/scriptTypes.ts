@@ -80,9 +80,20 @@ export type ScriptRunEvent =
       stopReason?: StopReason;
     };
 
+/**
+ * Read-only metadata about the session a script is bound to. Exposed as the
+ * `session` global in user scripts — see contracts/script-api.d.ts.
+ */
+export interface ScriptSessionMetadata {
+  id: string;
+  type: "ssh" | "serial";
+  name: string;
+  targetId: string;
+}
+
 /** IPC frame sent from main → worker. */
 export type WorkerInbound =
-  | { kind: "load"; source: string }
+  | { kind: "load"; source: string; session: ScriptSessionMetadata }
   | { kind: "rpc-result"; id: number; ok: true; value: unknown }
   | { kind: "rpc-result"; id: number; ok: false; error: { code: string; message: string; extra?: Record<string, unknown> } };
 

@@ -84,6 +84,23 @@ describe("ScriptOutputBuffer", () => {
     expect(m?.before).toBe("noise noise ");
   });
 
+  it("finds matches even when the pattern has the global /g flag (P2 — Codex)", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("noise PROMPT# ");
+    // Global regexes are common in user code — scan must still find the first match.
+    const m = buf.scan(/PROMPT# /g);
+    expect(m).not.toBeNull();
+    expect(m?.text).toBe("PROMPT# ");
+    expect(m?.before).toBe("noise ");
+  });
+
+  it("respects capture groups on global regexes", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("user=admin");
+    const m = buf.scan(/user=(\w+)/g);
+    expect(m?.groups).toEqual(["admin"]);
+  });
+
   describe("tail()", () => {
     it("returns empty string for an empty buffer", () => {
       const buf = new ScriptOutputBuffer();

@@ -485,4 +485,44 @@ describe("ScriptRuntimeManager — unit fakes", () => {
     await h.manager.runScript(h.scriptUri as never, "test-session");
     expect(h.manager.getRuns()[0].inputLockHeld).toBe(false);
   });
+
+  it("Codex P1: load message carries session metadata so `session` global is defined in user code", async () => {
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    const load = h.worker.posted.find((m) => m.kind === "load") as unknown as {
+      kind: "load";
+      source: string;
+      session: { id: string; type: string; name: string; targetId: string };
+    };
+    expect(load).toBeDefined();
+    expect(load.session).toBeDefined();
+    expect(load.session.id).toBe("test-session");
+    expect(load.session.type).toBe("ssh");
+    expect(load.session.name).toBe("test-terminal");
+    expect(load.session.targetId).toBe("srv1");
+  });
+
+  it("Codex P1: readScriptFile prefers the live editor text over the filesystem (handles untitled + unsaved edits)", async () => {
+    // Stage an open document in vscode.workspace.textDocuments whose getText()
+    // returns source DIFFERENT from what's on disk — the runtime must honour
+    // the live buffer. Otherwise unsaved edits are ignored and untitled:
+    // URIs (which have no filesystem backing) can't run at all.
+    const vscode = await import("vscode");
+    const liveSource = `/**\n * @nexus-script\n * @name FromEditor\n */\n`;
+    const liveUri = { fsPath: "/tmp/nonexistent.js", scheme: "untitled", path: "/tmp/nonexistent.js", toString: () => "untitled:/tmp/nonexistent.js" };
+    (vscode.workspace as unknown as { textDocuments: unknown[] }).textDocuments = [
+      { uri: liveUri, getText: () => liveSource }
+    ];
+
+    const h = await createHarness(`/**\n * @nexus-script\n * @name OnDisk\n */\n`);
+    // Use the in-memory URI — not the fixture on disk.
+    await h.manager.runScript(liveUri as never, "test-session");
+    // The log line captures scriptName from the header; if the live buffer
+    // was used, the name is "FromEditor", not "OnDisk".
+    const startLine = h.output.find((l) => l.includes("start"));
+    expect(startLine).toBeDefined();
+    expect(startLine).toMatch(/FromEditor@/);
+
+    (vscode.workspace as unknown as { textDocuments: unknown[] }).textDocuments = [];
+  });
 });

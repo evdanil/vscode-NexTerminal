@@ -67,6 +67,11 @@ parentPort.on("message", (msg: WorkerInbound) => {
     return;
   }
   if (msg.kind === "load") {
+    // Populate the `session` global BEFORE the user code runs. The contract
+    // (contracts/script-api.d.ts) advertises this as always available inside
+    // the script body; leaving it undefined made every `session.id` / `.type`
+    // access throw at runtime.
+    globals.session = msg.session;
     void loadAndRun(msg.source);
     return;
   }
@@ -146,8 +151,8 @@ globals.macros = {
   restore: () => rpc("macros.restore", [])
 };
 
-// session metadata — populated once when the worker is loaded.
-// The main thread provides this via the first rpc-result for method `session.get`.
+// session metadata — populated by the main thread via the "load" message
+// before user code executes. See handler above.
 globals.session = undefined;
 
 // Tell the main thread we're ready to accept a `load` message.

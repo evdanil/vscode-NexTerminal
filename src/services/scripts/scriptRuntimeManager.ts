@@ -228,7 +228,21 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     record.state = "running";
     this.emit({ kind: "started", run: this.toSnapshot(record) });
     this.logEvent(record, `start (session: ${record.sessionName}, ${record.sessionType})`);
-    record.worker.postMessage({ kind: "load", source });
+    // Seed the worker's `session` global in the same message that loads the
+    // user source so it is defined before the script's first statement runs.
+    record.worker.postMessage({
+      kind: "load",
+      source,
+      session: {
+        id: target.session.id,
+        type: target.type,
+        name: target.session.terminalName,
+        targetId:
+          target.type === "ssh"
+            ? (target.session as ActiveSession).serverId
+            : (target.session as ActiveSerialSession).profileId
+      }
+    });
     return record.id;
   }
 
@@ -281,6 +295,19 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   }
 
   private async readScriptFile(uri: vscode.Uri): Promise<string> {
+    // Prefer the live document text: (a) so untitled:// scripts work at all
+    // (workspace.fs.readFile would reject), and (b) so we pick up unsaved
+    // edits when the user runs from the editor CodeLens. Fall back to the
+    // filesystem for scripts triggered from the tree view or palette where
+    // the file may not be open.
+    const openDocs = vscode.workspace.textDocuments ?? [];
+    const openDoc = openDocs.find((d) => d.uri.toString() === uri.toString());
+    if (openDoc) return openDoc.getText();
+    if (uri.scheme === "untitled") {
+      throw new Error(
+        `Cannot run untitled script "${uri.toString()}" — save it first, or keep the editor open.`
+      );
+    }
     const bytes = await vscode.workspace.fs.readFile(uri);
     return new TextDecoder("utf-8").decode(bytes);
   }
