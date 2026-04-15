@@ -8,6 +8,7 @@ import {
 } from "../../src/services/serial/smartSerialPty";
 import type { SerialProfile } from "../../src/models/config";
 import type { OpenPortParams, SerialPortInfo } from "../../src/services/serial/protocol";
+import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
 
 vi.mock("vscode", () => ({
   EventEmitter: class MockEventEmitter<T> {
@@ -728,6 +729,20 @@ describe("SmartSerialPty", () => {
       expect.stringContaining("Serial runtime missing or incompatible")
     );
 
+    pty.dispose();
+  });
+
+  it("resetTerminal() emits CLEAR_VISIBLE_SCREEN via writeEmitter", () => {
+    const { transport } = createTransport({
+      listPorts: async () => [{ path: "COM5" }],
+      openPort: async () => "session-1"
+    });
+    const harness = makeCallbacks();
+    const pty = new SmartSerialPty(transport, makeProfile(), harness.callbacks, noopLogger());
+    const writes: string[] = [];
+    pty.onDidWrite((s) => writes.push(s));
+    pty.resetTerminal();
+    expect(writes).toContain(CLEAR_VISIBLE_SCREEN);
     pty.dispose();
   });
 });

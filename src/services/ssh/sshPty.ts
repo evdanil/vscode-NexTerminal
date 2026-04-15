@@ -7,6 +7,7 @@ import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { SshConnection, SshFactory } from "./contracts";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
+import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
 
 export interface SshPtyCallbacks {
   onSessionOpened(sessionId: string): void;
@@ -67,6 +68,11 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   public writeProgrammatic(data: string): void {
     if (this.disposed || this.disconnected || this.connectFailed) return;
     this.stream?.write(data);
+  }
+
+  public resetTerminal(): void {
+    if (this.disposed) return;
+    this.writeEmitter.fire(CLEAR_VISIBLE_SCREEN);
   }
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;

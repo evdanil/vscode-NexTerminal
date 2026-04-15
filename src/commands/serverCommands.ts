@@ -652,6 +652,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
         location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
       });
       terminalRef = terminal;
+      ctx.terminalRegistry?.register(terminal, pty);
       addTerminal(server.id, terminal, ctx.terminalsByServer);
       ctx.focusedTerminal = terminal;
       terminal.show();

@@ -6,6 +6,8 @@ import { registerSerialCommands } from "./commands/serialCommands";
 import { registerServerCommands } from "./commands/serverCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
 import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
+import { TerminalRegistry } from "./services/terminal/terminalRegistry";
+import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory } from "./logging/terminalLogger";
@@ -434,8 +436,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registrySync,
     focusedTerminal: vscode.window.activeTerminal ?? undefined,
     activityIndicators: new Map(),
-    scriptRuntimeManager
+    scriptRuntimeManager,
+    terminalRegistry: undefined
   };
+  const terminalRegistry = new TerminalRegistry(core);
+  context.subscriptions.push(terminalRegistry);
+  ctx.terminalRegistry = terminalRegistry;
 
   const nexusTreeProvider = new NexusTreeProvider({
     async onTunnelDropped(serverId, tunnelProfileId) {
@@ -819,6 +825,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const serverDisposables = registerServerCommands(ctx);
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
+  registerTerminalTabCommands(context, terminalRegistry);
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);

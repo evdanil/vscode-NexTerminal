@@ -199,4 +199,80 @@ describe("package contributions", () => {
       expect(stopBinding?.when).toMatch(/nexusHasRunningScripts/);
     });
   });
+
+  describe("terminal tab commands (feature 002)", () => {
+    const terminalCommands = packageJson.contributes.commands.filter((c) =>
+      ["nexus.terminal.reset", "nexus.terminal.clearScrollback", "nexus.terminal.copyAll"].includes(c.command)
+    );
+    const titleMenu = packageJson.contributes.menus["terminal/title/context"] ?? [];
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    const bodyMenu = packageJson.contributes.menus["terminal/context"] ?? [];
+    const editorTitleMenu = packageJson.contributes.menus["editor/title/context"] ?? [];
+
+    it("bumps extension version to at least 2.8.9", () => {
+      const parts = ((packageJson as unknown as { version: string }).version ?? "0.0.0")
+        .split(".")
+        .map((x) => Number(x));
+      const [maj, min, pat] = parts;
+      const atLeast = maj > 2 || (maj === 2 && min > 8) || (maj === 2 && min === 8 && pat >= 9);
+      expect(atLeast).toBe(true);
+    });
+
+    it("exposes nexus.terminal.reset with correct title, category, and enablement", () => {
+      const cmd = terminalCommands.find((c) => c.command === "nexus.terminal.reset");
+      expect(cmd).toBeDefined();
+      expect(cmd?.title).toMatch(/reset terminal/i);
+      expect((cmd as unknown as { category?: string }).category).toBe("Nexus");
+      expect(cmd?.enablement).toBe("nexus.isNexusTerminalConnected");
+    });
+
+    it("exposes nexus.terminal.clearScrollback with enablement on connected-terminal key", () => {
+      const cmd = terminalCommands.find((c) => c.command === "nexus.terminal.clearScrollback");
+      expect(cmd).toBeDefined();
+      expect(cmd?.title).toMatch(/clear scrollback/i);
+      expect((cmd as unknown as { category?: string }).category).toBe("Nexus");
+      expect(cmd?.enablement).toBe("nexus.isNexusTerminalConnected");
+    });
+
+    it("exposes nexus.terminal.copyAll enabled on any Nexus terminal (even disconnected)", () => {
+      const cmd = terminalCommands.find((c) => c.command === "nexus.terminal.copyAll");
+      expect(cmd).toBeDefined();
+      expect(cmd?.title).toMatch(/copy all/i);
+      expect((cmd as unknown as { category?: string }).category).toBe("Nexus");
+      expect(cmd?.enablement).toBe("nexus.isNexusTerminal");
+    });
+
+    it("contributes terminal/title/context entries grouped nexus@1..3 in the correct order", () => {
+      const byCmd = (id: string) => titleMenu.find((m) => m.command === id);
+      const reset = byCmd("nexus.terminal.reset");
+      const clear = byCmd("nexus.terminal.clearScrollback");
+      const copy = byCmd("nexus.terminal.copyAll");
+      expect(reset?.group).toBe("nexus@1");
+      expect(clear?.group).toBe("nexus@2");
+      expect(copy?.group).toBe("nexus@3");
+      for (const m of [reset, clear, copy]) {
+        expect(m?.when).toBe("nexus.isNexusTerminal");
+      }
+    });
+
+    it("contributes commandPalette entries gated on nexus.isNexusTerminal", () => {
+      const ids = paletteMenu
+        .filter((m) => typeof m.command === "string" && m.command.startsWith("nexus.terminal."))
+        .map((m) => m.command);
+      expect(ids).toContain("nexus.terminal.reset");
+      expect(ids).toContain("nexus.terminal.clearScrollback");
+      expect(ids).toContain("nexus.terminal.copyAll");
+      const gated = paletteMenu.filter((m) => m.command?.startsWith("nexus.terminal."));
+      for (const m of gated) {
+        expect(m.when).toBe("nexus.isNexusTerminal");
+      }
+    });
+
+    it("does NOT contribute terminal/context or editor/title/context entries for these commands", () => {
+      const bodyHits = bodyMenu.filter((m) => m.command?.startsWith("nexus.terminal."));
+      expect(bodyHits).toEqual([]);
+      const editorHits = editorTitleMenu.filter((m) => m.command?.startsWith("nexus.terminal."));
+      expect(editorHits).toEqual([]);
+    });
+  });
 });

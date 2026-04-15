@@ -2,6 +2,7 @@ import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerConfig } from "../../src/models/config";
 import { SshPty } from "../../src/services/ssh/sshPty";
+import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
 
 const { mockShowErrorMessage } = vi.hoisted(() => ({
   mockShowErrorMessage: vi.fn()
@@ -373,6 +374,22 @@ describe("SshPty", () => {
     expect(writeSpy).toHaveBeenCalled();
     expect(callbacks.onDisconnected).toHaveBeenCalledTimes(1);
 
+    pty.dispose();
+  });
+
+  it("resetTerminal() emits CLEAR_VISIBLE_SCREEN via writeEmitter and does not write to the transport", () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => connection) };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    const writes: string[] = [];
+    pty.onDidWrite((s) => writes.push(s));
+    const transportSpy = vi.spyOn(stream, "write");
+    pty.resetTerminal();
+    expect(writes).toContain(CLEAR_VISIBLE_SCREEN);
+    expect(transportSpy).not.toHaveBeenCalled();
     pty.dispose();
   });
 });

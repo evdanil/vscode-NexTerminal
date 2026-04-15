@@ -55,7 +55,12 @@
       "Bash(gh cache:*)",
       "mcp__agent-memory__stats",
       "mcp__agent-memory__store_batch",
-      "mcp__agent-memory__recall"
+      "mcp__agent-memory__recall",
+      "Bash(.specify/extensions/git/scripts/bash/create-new-feature.sh *)",
+      "Bash(sed -i 's/^- \\\\[ \\\\] T0\\\\\\(3[0-9]\\\\|4[0-9]\\\\|5[0-9]\\\\\\) /- [X] T0\\\\1 /' specs/001-scripting-support/tasks.md)",
+      "Bash(sed -i 's/^- \\\\[ \\\\] T061 /- [X] T061 /' specs/001-scripting-support/tasks.md)",
+      "Bash(git config *)",
+      "Bash(git stash *)"
     ]
   }
 }

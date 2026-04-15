@@ -131,6 +131,21 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - `Nexus: Import Configuration` restores from either format with merge or replace options.
 - `Nexus: Import from MobaXterm` and `Nexus: Import from SecureCRT` migrate external SSH profiles while preserving folder hierarchy where possible.
 
+### 4.11 Terminal Tab Commands
+Right-click any Nexus terminal tab (SSH, Standard Serial, or Smart Follow Serial — docked in the panel or opened as an editor tab) to access three PuTTY-style commands:
+
+- **Reset Terminal** — clears the visible terminal screen while preserving scrollback. The noisy or scrambled output is pushed up into scrollback where it can still be reviewed. The underlying session and terminal modes are untouched; the remote shell receives nothing. Use this when stray output clutters the screen but you want your history intact.
+- **Clear Scrollback** — clears both the visible scrollback and the Nexus-maintained capture buffer. After running this command, *Copy All to Clipboard* returns only post-clear output. Note that clearing the terminal via VS Code's own built-in clear (from other surfaces) does NOT clear the Nexus capture buffer; only this command keeps them in sync.
+- **Copy All to Clipboard** — copies the ANSI-stripped transcript of the session to the system clipboard. A toast reports the number of lines copied; an empty buffer shows "Nothing to copy." instead. The capture buffer's size tracks your `terminal.integrated.scrollback` setting and updates when that setting changes.
+
+After a session disconnects but before the terminal tab is closed, *Reset Terminal* and *Clear Scrollback* grey out (nothing to act against), while *Copy All to Clipboard* remains enabled so you can still capture the full transcript for a ticket or chat. All three commands are also discoverable from the Command Palette, gated on an active Nexus terminal.
+
+**Capture-buffer semantics** (implementation notes that surface in edge cases):
+
+- The capture buffer is sized in **lines**, not bytes, matching the `terminal.integrated.scrollback` setting. A realistic interactive shell newline-terminates output promptly, so the retained size is well-bounded (~80 KB per session at the default 1000-line cap, 80-char average). A single never-terminated output (e.g., a raw binary paste with no `\n`) will accumulate in the pending-line fragment until a newline arrives or the terminal closes.
+- An unfinished line (no trailing `\n`) still counts as one line in the "Copied N lines" toast and is included in the copied text — so a prompt like `switch> ` with no Enter yet adds 1 to the reported count.
+- Setting `terminal.integrated.scrollback` to `0` does not disable Nexus capture; the buffer falls back to a 1000-line default so that *Copy All* and *Clear Scrollback* remain useful. If you need zero retention, close the terminal tab.
+
 ## 5. Settings Reference
 
 ### 5.1 SSH
