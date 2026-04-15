@@ -4,6 +4,7 @@ import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
+import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
 import { toParityCode } from "../../utils/helpers";
 import type { SerialTransport } from "./serialPty";
 import { isSerialRuntimeMissingError } from "./errorMatchers";
@@ -176,6 +177,11 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     void this.transport.writePort(this.transportSessionId, Buffer.from(data, "utf8")).catch(() => {
       /* best-effort; ConnectionLost surfaces via NexusCore.onDidChange */
     });
+  }
+
+  public resetTerminal(): void {
+    if (this.disposed) return;
+    this.writeEmitter.fire(CLEAR_VISIBLE_SCREEN);
   }
 
   private get terminalNameBase(): string {

@@ -397,6 +397,7 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
     location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
   });
   terminalRef = terminal;
+  ctx.terminalRegistry?.register(terminal, pty);
   ctx.focusedTerminal = terminal;
   terminal.show();
 }
@@ -488,6 +489,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
   });
   terminalRef = terminal;
+  ctx.terminalRegistry?.register(terminal, pty);
   ctx.serialTerminals.set(logicalSessionId, {
     terminal,
     profileId: profile.id,
