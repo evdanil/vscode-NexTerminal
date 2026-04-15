@@ -45,14 +45,10 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       return item;
     }
     const item = new vscode.TreeItem(node.name, vscode.TreeItemCollapsibleState.None);
-    // F8 — description fallback when the header doesn't supply one.
-    //   - Running: a badge so users can tell at a glance what's live.
-    //   - Idle: prefer the header description; else leave blank (the filename is already the label).
-    if (node.running) {
-      item.description = node.description ? `${node.description}   \u2022 running` : "\u25CF running";
-    } else {
-      item.description = node.description ?? "";
-    }
+    // Only the running badge appears inline — the description goes in the
+    // hover tooltip (set below) so the row doesn't get cluttered with
+    // "name — long description" text for every script.
+    item.description = node.running ? "\u25CF running" : "";
     item.tooltip = node.parseErrors.length > 0
       ? `Header errors:\n${node.parseErrors.join("\n")}`
       : node.description || node.uri.fsPath;
@@ -63,12 +59,10 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       : node.running
         ? new vscode.ThemeIcon("sync~spin")
         : new vscode.ThemeIcon("file-code");
-    // P7 — always allow clicking to open the file so users can fix header errors.
-    item.command = {
-      title: "Open",
-      command: "vscode.open",
-      arguments: [node.uri]
-    };
+    // No default click-to-open action — clicking a script used to pop the
+    // editor immediately, which users reported as noisy when they just
+    // wanted to Run / Stop from the sidebar. Open the file via the
+    // right-click "Edit" menu entry (nexus.script.edit) instead.
     return item;
   }
 

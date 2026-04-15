@@ -24,6 +24,7 @@ import { toParityCode } from "../utils/helpers";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { collectGroups } from "./serverCommands";
 import type { CommandContext, SerialTerminalEntry } from "./types";
+import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 
 async function pickSerialProfile(
   core: import("../core/nexusCore").NexusCore
@@ -581,6 +582,65 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
           );
           return;
         }
+        void vscode.window.showErrorMessage(`Failed to open serial terminal: ${message}`);
+      }
+    }),
+
+    // Connect to a serial profile and auto-run a picked Nexus script once the
+    // session is registered. Same pattern as nexus.server.runWithScript but for
+    // the serial active-session list.
+    vscode.commands.registerCommand("nexus.serial.runWithScript", async (arg?: unknown) => {
+      const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
+      if (!profile) return;
+      if (!ctx.scriptRuntimeManager) {
+        void vscode.window.showErrorMessage("Nexus script runtime is not available in this context.");
+        return;
+      }
+      const scriptUri = await pickScriptFromWorkspace("serial");
+      if (!scriptUri) return;
+
+      const preExisting = new Set(
+        ctx.core
+          .getSnapshot()
+          .activeSerialSessions.filter((s) => s.profileId === profile.id)
+          .map((s) => s.id)
+      );
+      const timeoutMs = 90_000;
+      let resolved = false;
+      const unsubscribe = ctx.core.onDidChange(() => {
+        if (resolved) return;
+        const newSession = ctx.core
+          .getSnapshot()
+          .activeSerialSessions.find((s) => s.profileId === profile.id && !preExisting.has(s.id));
+        if (!newSession) return;
+        resolved = true;
+        clearTimeout(timer);
+        unsubscribe();
+        void ctx.scriptRuntimeManager!.runScript(scriptUri, newSession.id).catch((err) => {
+          const message = err instanceof Error ? err.message : String(err);
+          void vscode.window.showErrorMessage(`Failed to start script after connect: ${message}`);
+        });
+      });
+      const timer = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        unsubscribe();
+        void vscode.window.showWarningMessage(
+          `Connected to ${profile.name} but the script did not start within ${timeoutMs / 1000}s.`
+        );
+      }, timeoutMs);
+
+      try {
+        if (resolveSerialProfileMode(profile) === "smartFollow") {
+          await connectSmartSerialProfile(ctx, profile);
+        } else {
+          await connectStandardSerialProfile(ctx, profile);
+        }
+      } catch (err) {
+        resolved = true;
+        clearTimeout(timer);
+        unsubscribe();
+        const message = err instanceof Error ? err.message : String(err);
         void vscode.window.showErrorMessage(`Failed to open serial terminal: ${message}`);
       }
     }),

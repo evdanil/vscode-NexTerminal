@@ -433,7 +433,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     secretVault,
     registrySync,
     focusedTerminal: vscode.window.activeTerminal ?? undefined,
-    activityIndicators: new Map()
+    activityIndicators: new Map(),
+    scriptRuntimeManager
   };
 
   const nexusTreeProvider = new NexusTreeProvider({

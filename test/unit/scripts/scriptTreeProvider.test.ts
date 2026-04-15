@@ -231,6 +231,22 @@ describe("ScriptTreeProvider", () => {
     expect(String(item.description ?? "")).toContain("running");
   });
 
+  it("does NOT echo header description next to the name — description lives in the tooltip only", async () => {
+    mockFsEntries.set("/workspace/.nexus/scripts", [["hasdesc.js", 1]]);
+    mockFiles.set(
+      "/workspace/.nexus/scripts/hasdesc.js",
+      "/**\n * @nexus-script\n * @name Labeled\n * @description A long description that would clutter the row\n */\n"
+    );
+    const provider = new ScriptTreeProvider(mockManager());
+    const children = await provider.getChildren();
+    const item = provider.getTreeItem(children[0]);
+    // Row label is just the name. Description column is empty for idle scripts.
+    expect(item.label).toBe("Labeled");
+    expect(String(item.description ?? "")).toBe("");
+    // But the hover tooltip DOES include the description so users who want it can see it.
+    expect(String(item.tooltip ?? "")).toContain("A long description that would clutter the row");
+  });
+
   it("does NOT refresh on log / operationBegin / operationEnd events (prevents panel-flashing)", async () => {
     type Listener = (e: { kind: string }) => void;
     const runListeners = new Set<Listener>();
@@ -270,7 +286,7 @@ describe("ScriptTreeProvider", () => {
     sub.dispose();
   });
 
-  it("keeps the open command even when the header has parse errors (P7)", async () => {
+  it("does not attach a click-open command — Edit lives in the right-click menu now", async () => {
     mockFsEntries.set("/workspace/.nexus/scripts", [["broken.js", 1]]);
     mockFiles.set(
       "/workspace/.nexus/scripts/broken.js",
@@ -282,9 +298,10 @@ describe("ScriptTreeProvider", () => {
       command?: { command: string };
       tooltip?: string;
     };
-    expect(item.command).toBeDefined();
-    expect(item.command?.command).toBe("vscode.open");
-    // Parse errors should still be surfaced via tooltip
+    // No click command — clicking a script used to be noisy. Edit is the
+    // right-click menu entry that opens the file.
+    expect(item.command).toBeUndefined();
+    // Parse errors must still be visible so the user has a reason to fix it.
     expect(String(item.tooltip ?? "")).toMatch(/error|@default-timeout/i);
   });
 });

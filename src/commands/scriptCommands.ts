@@ -315,6 +315,12 @@ export function registerScriptCommands(
       await deleteScript(uri);
     }),
 
+    vscode.commands.registerCommand("nexus.script.edit", async (arg?: unknown) => {
+      const uri = toScriptUri(arg);
+      if (!uri) return;
+      await vscode.commands.executeCommand("vscode.open", uri);
+    }),
+
     vscode.commands.registerCommand("nexus.script.openScriptsFolder", async () => {
       const folder = vscode.workspace.workspaceFolders?.[0];
       if (!folder) {

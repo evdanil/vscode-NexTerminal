@@ -584,8 +584,10 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | `Nexus: Quick Run in Active Terminal` | — | Bind the script to whichever Nexus terminal is currently focused — no picker. Falls back to the session picker if no terminal is focused or the focused terminal isn't a Nexus session. Wired to the sidebar's inline ▶ button. |
 | `Nexus: Stop Nexus Script` | `Ctrl+Alt+S` (macOS `⌘⌥S`) when a script is running | Stop a running script. Prompts if more than one is running. |
 | `Nexus: New Nexus Script` | — | Create a new script from a starter template in your configured scripts directory. |
+| `Nexus: Edit Script` | — | Right-click a script → Edit. Opens the file in the editor. (Clicking the row no longer auto-opens the editor — it would be noisy.) |
 | `Nexus: Delete Script` | — | Right-click a script in the sidebar. Asks for confirmation, then moves to Trash. |
 | `Nexus: Open Scripts Folder` | — | Reveal the configured scripts directory in the OS file manager. |
+| `Connect and Run Script…` (server / serial right-click) | — | Pick a Nexus script, connect to the profile, and run the script against the new session once it registers. Scripts are filtered to those whose `@target-type` is compatible with the profile. 90-second watchdog warns if the script never starts. |
 | `Nexus: Show Nexus Scripts Output` | — | Open the **Nexus Scripts** Output Channel. |
 | `Nexus: Open Scripting Guide` | — | Open this document in your browser. |
 | `Nexus: Run Nexus Script on Target` | — | Internal variant (hidden from the Command Palette) taking `(uri, sessionId)` — used by the sidebar menu. |

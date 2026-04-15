@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros with auto-trigger (expect/send), regex highlighting, unread activity indicators, color schemes, and configuration import/export.",
-  "version": "2.8.5",
+  "version": "2.8.6",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -139,6 +139,12 @@
         "icon": "$(debug-disconnect)"
       },
       {
+        "command": "nexus.server.runWithScript",
+        "title": "Connect and Run Script…",
+        "category": "Nexus",
+        "icon": "$(run-all)"
+      },
+      {
         "command": "nexus.server.copyInfo",
         "title": "Copy Connection Info",
         "icon": "$(clippy)"
@@ -253,6 +259,12 @@
         "command": "nexus.serial.disconnect",
         "title": "Disconnect",
         "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "nexus.serial.runWithScript",
+        "title": "Connect and Run Script…",
+        "category": "Nexus",
+        "icon": "$(run-all)"
       },
       {
         "command": "nexus.serial.copyInfo",
@@ -573,6 +585,12 @@
         "icon": "$(trash)"
       },
       {
+        "command": "nexus.script.edit",
+        "title": "Edit Script",
+        "category": "Nexus",
+        "icon": "$(edit)"
+      },
+      {
         "command": "nexus.script.openScriptsFolder",
         "title": "Open Scripts Folder",
         "category": "Nexus",
@@ -724,6 +742,11 @@
           "group": "0_connect"
         },
         {
+          "command": "nexus.server.runWithScript",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "group": "0_connect@3"
+        },
+        {
           "command": "nexus.server.connect",
           "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
           "group": "0_connect@1"
@@ -837,6 +860,11 @@
           "command": "nexus.serial.connect",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
           "group": "0_connect"
+        },
+        {
+          "command": "nexus.serial.runWithScript",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "group": "0_connect@3"
         },
         {
           "command": "nexus.serial.disconnect",
@@ -1062,6 +1090,11 @@
           "command": "nexus.script.stop",
           "when": "view == nexusScripts && viewItem == nexus.script.running",
           "group": "0_run"
+        },
+        {
+          "command": "nexus.script.edit",
+          "when": "view == nexusScripts && viewItem =~ /^nexus\\.script\\.(file|running)$/",
+          "group": "1_manage@0"
         },
         {
           "command": "revealInExplorer",
