@@ -14,7 +14,13 @@ export default defineConfig({
         extends: true,
         test: {
           name: "unit",
-          include: ["test/unit/**/*.test.ts"]
+          include: ["test/unit/**/*.test.ts"],
+          // `groupOrder: 0` runs before the integration group; unset/equal
+          // groupOrder values run in parallel per Vitest project-scheduling
+          // docs, which would reintroduce the worker_thread/CPU contention
+          // with integration tests. The two groups are disjoint file sets
+          // so running them serially costs nothing meaningful.
+          groupOrder: 0
         }
       },
       {
@@ -22,18 +28,20 @@ export default defineConfig({
         test: {
           name: "integration",
           include: ["test/integration/**/*.test.ts"],
-          // Integration tests spawn real node:worker_threads Workers and child
-          // processes; running them concurrently with each other (and with the
-          // 70+ unit test files) causes CPU/event-loop contention that makes
-          // their timing-based predicates time out under CI load. Force a
-          // single fork so they run one file at a time, and give each test
-          // more headroom than the unit default of 5s.
+          // Integration tests spawn real node:worker_threads Workers and
+          // child processes. Running them concurrently with each other (or
+          // with the unit project) causes CPU/event-loop contention that
+          // makes their timing-based predicates time out under CI load.
+          // Force a single fork so all integration files share one process
+          // and run one after the other, and give each test more headroom
+          // than the unit default of 5s.
           pool: "forks",
           poolOptions: {
             forks: { singleFork: true }
           },
           testTimeout: 30_000,
-          hookTimeout: 30_000
+          hookTimeout: 30_000,
+          groupOrder: 1
         }
       }
     ]
