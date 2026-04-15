@@ -8,7 +8,15 @@ export class ScriptCodeLensProvider implements vscode.CodeLensProvider {
   private readonly managerListener: vscode.Disposable;
 
   public constructor(private readonly manager: ScriptRuntimeManager) {
-    this.managerListener = this.manager.onDidChangeRun(() => this._onDidChangeCodeLenses.fire());
+    // Only re-emit the lens when the ▶ Run / ◼ Stop state actually changes.
+    // Firing on every operationBegin/operationEnd/log event (the default event
+    // stream) causes the editor to re-layout its CodeLens row many times per
+    // second during an active run.
+    this.managerListener = this.manager.onDidChangeRun((event) => {
+      if (event.kind === "started" || event.kind === "ended") {
+        this._onDidChangeCodeLenses.fire();
+      }
+    });
   }
 
   public dispose(): void {

@@ -237,6 +237,45 @@ describe("ScriptTreeProvider", () => {
     expect(String(item.description ?? "")).toContain("running");
   });
 
+  it("does NOT refresh on log / operationBegin / operationEnd events (prevents panel-flashing)", async () => {
+    type Listener = (e: { kind: string }) => void;
+    const runListeners = new Set<Listener>();
+    const fireTreeEvent: Array<void> = [];
+
+    const manager = {
+      getRuns: vi.fn(() => []),
+      getRunForSession: vi.fn(),
+      onDidChangeRun: Object.assign(
+        (l: Listener) => {
+          runListeners.add(l);
+          return { dispose: () => runListeners.delete(l) };
+        },
+        {}
+      )
+    } as unknown as ScriptRuntimeManager;
+
+    const provider = new ScriptTreeProvider(manager);
+    // Listen for onDidChangeTreeData emissions from the provider.
+    const sub = provider.onDidChangeTreeData(() => fireTreeEvent.push(undefined));
+
+    // Noisy events that should NOT re-render the tree.
+    const fire = (e: { kind: string }) => {
+      for (const l of runListeners) l(e);
+    };
+    fire({ kind: "log" });
+    fire({ kind: "operationBegin" });
+    fire({ kind: "operationEnd" });
+    fire({ kind: "log" });
+    expect(fireTreeEvent).toHaveLength(0);
+
+    // State-transition events SHOULD re-render.
+    fire({ kind: "started" });
+    fire({ kind: "ended" });
+    expect(fireTreeEvent.length).toBeGreaterThanOrEqual(2);
+
+    sub.dispose();
+  });
+
   it("keeps the open command even when the header has parse errors (P7)", async () => {
     mockFsEntries.set("/workspace/.nexus/scripts", [["broken.js", 1]]);
     mockFiles.set(

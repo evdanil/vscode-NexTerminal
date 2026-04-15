@@ -13,7 +13,16 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   private readonly managerListener: vscode.Disposable;
 
   public constructor(private readonly manager: ScriptRuntimeManager) {
-    this.managerListener = this.manager.onDidChangeRun(() => this.refresh());
+    // Only refresh on events that change the tree's visible state (running badge,
+    // context value). onDidChangeRun also fires on every log/operationBegin/
+    // operationEnd — refreshing on those would cause the sidebar to flash many
+    // times per second for a chatty script, which looks like the whole Nexus
+    // panel is reloading.
+    this.managerListener = this.manager.onDidChangeRun((event) => {
+      if (event.kind === "started" || event.kind === "ended") {
+        this.refresh();
+      }
+    });
     this.ensureWatcher();
   }
 
