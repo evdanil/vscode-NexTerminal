@@ -26,6 +26,13 @@ export function registerTerminalTabCommands(
       const entry = resolveEntry(registry, terminal);
       if (!entry || !registry.isConnected(entry)) return;
       entry.buffer.clear();
+      // `workbench.action.terminal.clear` has no terminal argument and always
+      // targets the active terminal. If the user right-clicked a non-active
+      // tab's title, focus the resolved terminal first so the visible-scrollback
+      // clear matches the buffer clear we just did.
+      if (vscode.window.activeTerminal !== entry.terminal) {
+        entry.terminal.show(true);
+      }
       await vscode.commands.executeCommand("workbench.action.terminal.clear");
     })
   );

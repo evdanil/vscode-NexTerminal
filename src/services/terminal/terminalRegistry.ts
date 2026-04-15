@@ -7,6 +7,7 @@ export const CONTEXT_KEY_IS_NEXUS = "nexus.isNexusTerminal";
 export const CONTEXT_KEY_IS_CONNECTED = "nexus.isNexusTerminalConnected";
 
 export interface RegistryEntry {
+  terminal: vscode.Terminal;
   pty: SessionPtyHandle;
   buffer: TerminalCaptureBuffer;
 }
@@ -17,7 +18,7 @@ interface InternalEntry extends RegistryEntry {
 
 interface CoreSnapshotLike {
   activeSessions: ReadonlyArray<Pick<ActiveSession, "pty">>;
-  activeSerialSessions: ReadonlyArray<Pick<ActiveSerialSession, "pty">>;
+  activeSerialSessions: ReadonlyArray<Pick<ActiveSerialSession, "pty" | "status">>;
 }
 
 export interface NexusCoreLike {
@@ -53,7 +54,7 @@ export class TerminalRegistry implements vscode.Disposable {
       dispose: () => {}
     };
     const observerDisposable = pty.addOutputObserver(observer);
-    this.entries.set(terminal, { pty, buffer, observerDisposable });
+    this.entries.set(terminal, { terminal, pty, buffer, observerDisposable });
     this.refreshContextKeys();
   }
 
@@ -80,7 +81,7 @@ export class TerminalRegistry implements vscode.Disposable {
       if (s.pty === entry.pty) return true;
     }
     for (const s of snap.activeSerialSessions) {
-      if (s.pty === entry.pty) return true;
+      if (s.pty === entry.pty && s.status !== "waiting") return true;
     }
     return false;
   }

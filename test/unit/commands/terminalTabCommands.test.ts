@@ -59,6 +59,10 @@ function fakeRegistry(entries: Map<unknown, RegistryEntry>, connectedEntries: Se
   };
 }
 
+function fakeTerminal() {
+  return { show: vi.fn() };
+}
+
 function fakePty() {
   return {
     addOutputObserver: vi.fn(() => ({ dispose: () => {} })),
@@ -95,11 +99,11 @@ describe("terminalTabCommands", () => {
 
   describe("nexus.terminal.reset", () => {
     it("menu path: calls pty.resetTerminal on the supplied terminal", () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const pty = fakePty();
       const buffer = fakeBuffer("");
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: pty as never, buffer: buffer as never };
+      const entry: RegistryEntry = { terminal, pty: pty as never, buffer: buffer as never };
       entries.set(terminal, entry);
       const connected = new Set([entry]);
       registerTerminalTabCommands(context as never, fakeRegistry(entries, connected) as never);
@@ -109,10 +113,10 @@ describe("terminalTabCommands", () => {
     });
 
     it("palette path: falls back to window.activeTerminal when no argument is supplied", () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const pty = fakePty();
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: pty as never, buffer: fakeBuffer("") as never };
+      const entry: RegistryEntry = { terminal, pty:pty as never, buffer: fakeBuffer("") as never };
       entries.set(terminal, entry);
       state.activeTerminal = terminal;
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
@@ -130,10 +134,10 @@ describe("terminalTabCommands", () => {
     });
 
     it("no-ops when session is disconnected", () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const pty = fakePty();
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: pty as never, buffer: fakeBuffer("") as never };
+      const entry: RegistryEntry = { terminal, pty:pty as never, buffer: fakeBuffer("") as never };
       entries.set(terminal, entry);
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set()) as never);
       const handler = state.registeredCommands.get("nexus.terminal.reset")!;
@@ -151,10 +155,10 @@ describe("terminalTabCommands", () => {
     });
 
     it("emits no toast on success", () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const pty = fakePty();
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: pty as never, buffer: fakeBuffer("") as never };
+      const entry: RegistryEntry = { terminal, pty:pty as never, buffer: fakeBuffer("") as never };
       entries.set(terminal, entry);
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
       const handler = state.registeredCommands.get("nexus.terminal.reset")!;
@@ -166,9 +170,9 @@ describe("terminalTabCommands", () => {
 
   describe("nexus.terminal.copyAll", () => {
     it("menu path: writes buffer text to clipboard and shows line-count toast", async () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: fakePty() as never, buffer: fakeBuffer("line1\nline2", 2) as never };
+      const entry: RegistryEntry = { terminal, pty:fakePty() as never, buffer: fakeBuffer("line1\nline2", 2) as never };
       entries.set(terminal, entry);
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
       const handler = state.registeredCommands.get("nexus.terminal.copyAll")!;
@@ -178,9 +182,9 @@ describe("terminalTabCommands", () => {
     });
 
     it("uses singular 'line' when exactly one line was copied", async () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: fakePty() as never, buffer: fakeBuffer("solo", 1) as never };
+      const entry: RegistryEntry = { terminal, pty:fakePty() as never, buffer: fakeBuffer("solo", 1) as never };
       entries.set(terminal, entry);
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
       const handler = state.registeredCommands.get("nexus.terminal.copyAll")!;
@@ -189,9 +193,9 @@ describe("terminalTabCommands", () => {
     });
 
     it("palette path: falls back to window.activeTerminal", async () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: fakePty() as never, buffer: fakeBuffer("hi", 1) as never };
+      const entry: RegistryEntry = { terminal, pty:fakePty() as never, buffer: fakeBuffer("hi", 1) as never };
       entries.set(terminal, entry);
       state.activeTerminal = terminal;
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
@@ -201,9 +205,9 @@ describe("terminalTabCommands", () => {
     });
 
     it("works post-disconnect (stays enabled when isConnected is false)", async () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: fakePty() as never, buffer: fakeBuffer("post", 1) as never };
+      const entry: RegistryEntry = { terminal, pty:fakePty() as never, buffer: fakeBuffer("post", 1) as never };
       entries.set(terminal, entry);
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set()) as never);
       const handler = state.registeredCommands.get("nexus.terminal.copyAll")!;
@@ -212,9 +216,9 @@ describe("terminalTabCommands", () => {
     });
 
     it("empty-buffer path: warns and does not touch clipboard", async () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: fakePty() as never, buffer: fakeBuffer("", 0) as never };
+      const entry: RegistryEntry = { terminal, pty:fakePty() as never, buffer: fakeBuffer("", 0) as never };
       entries.set(terminal, entry);
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
       const handler = state.registeredCommands.get("nexus.terminal.copyAll")!;
@@ -224,9 +228,9 @@ describe("terminalTabCommands", () => {
     });
 
     it("clipboard write error: shows error toast and no success toast", async () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: fakePty() as never, buffer: fakeBuffer("data", 1) as never };
+      const entry: RegistryEntry = { terminal, pty:fakePty() as never, buffer: fakeBuffer("data", 1) as never };
       entries.set(terminal, entry);
       state.clipboardWrite.mockImplementation(async () => {
         throw new Error("clipboard denied");
@@ -246,10 +250,10 @@ describe("terminalTabCommands", () => {
 
   describe("nexus.terminal.clearScrollback", () => {
     it("menu path: clears buffer before invoking workbench.action.terminal.clear", async () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const buffer = fakeBuffer("prev");
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: fakePty() as never, buffer: buffer as never };
+      const entry: RegistryEntry = { terminal, pty:fakePty() as never, buffer: buffer as never };
       entries.set(terminal, entry);
       const callOrder: string[] = [];
       (buffer.clear as ReturnType<typeof vi.fn>).mockImplementation(() => callOrder.push("buffer.clear"));
@@ -266,10 +270,10 @@ describe("terminalTabCommands", () => {
     });
 
     it("palette path: falls back to window.activeTerminal", async () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const buffer = fakeBuffer("old");
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: fakePty() as never, buffer: buffer as never };
+      const entry: RegistryEntry = { terminal, pty:fakePty() as never, buffer: buffer as never };
       entries.set(terminal, entry);
       state.activeTerminal = terminal;
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
@@ -287,10 +291,10 @@ describe("terminalTabCommands", () => {
     });
 
     it("no-op when session is disconnected", async () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const buffer = fakeBuffer("x");
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: fakePty() as never, buffer: buffer as never };
+      const entry: RegistryEntry = { terminal, pty:fakePty() as never, buffer: buffer as never };
       entries.set(terminal, entry);
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set()) as never);
       const handler = state.registeredCommands.get("nexus.terminal.clearScrollback")!;
@@ -299,15 +303,43 @@ describe("terminalTabCommands", () => {
     });
 
     it("emits no toast on success", async () => {
-      const terminal = {} as never;
+      const terminal = fakeTerminal() as never;
       const buffer = fakeBuffer("prev");
       const entries = new Map<unknown, RegistryEntry>();
-      const entry: RegistryEntry = { pty: fakePty() as never, buffer: buffer as never };
+      const entry: RegistryEntry = { terminal, pty:fakePty() as never, buffer: buffer as never };
       entries.set(terminal, entry);
       registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
       const handler = state.registeredCommands.get("nexus.terminal.clearScrollback")!;
       await handler(terminal);
       expect(state.showInfo).not.toHaveBeenCalled();
+    });
+
+    it("focuses the resolved terminal before executing the built-in clear when it is not active", async () => {
+      const targetTerminal = fakeTerminal();
+      const otherActiveTerminal = fakeTerminal();
+      const buffer = fakeBuffer("prev");
+      const entries = new Map<unknown, RegistryEntry>();
+      const entry: RegistryEntry = { terminal: targetTerminal as never, pty: fakePty() as never, buffer: buffer as never };
+      entries.set(targetTerminal, entry);
+      state.activeTerminal = otherActiveTerminal;
+      registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
+      const handler = state.registeredCommands.get("nexus.terminal.clearScrollback")!;
+      await handler(targetTerminal as never);
+      expect(targetTerminal.show).toHaveBeenCalledWith(true);
+      expect(state.executeCommandCalls.some((c) => c.cmd === "workbench.action.terminal.clear")).toBe(true);
+    });
+
+    it("does not re-focus the terminal when it is already the active one", async () => {
+      const terminal = fakeTerminal();
+      const buffer = fakeBuffer("prev");
+      const entries = new Map<unknown, RegistryEntry>();
+      const entry: RegistryEntry = { terminal: terminal as never, pty: fakePty() as never, buffer: buffer as never };
+      entries.set(terminal, entry);
+      state.activeTerminal = terminal;
+      registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
+      const handler = state.registeredCommands.get("nexus.terminal.clearScrollback")!;
+      await handler(terminal as never);
+      expect(terminal.show).not.toHaveBeenCalled();
     });
   });
 });

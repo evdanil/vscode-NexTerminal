@@ -216,6 +216,27 @@ describe("TerminalRegistry", () => {
     reg.dispose();
   });
 
+  it("treats Smart Follow 'waiting' serial sessions as disconnected", () => {
+    const core = makeCore();
+    const reg = new TerminalRegistry(core);
+    const terminal = {} as never;
+    const pty = makePty();
+    core.serialSessions.push({ id: "sf1", pty, status: "waiting" });
+    reg.register(terminal, pty);
+    fireActiveTerminal(terminal);
+    expect(latestContextKey("nexus.isNexusTerminal")).toBe(true);
+    expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(false);
+    // Transition to connected
+    core.serialSessions[0].status = "connected";
+    core.emit();
+    expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(true);
+    // Back to waiting (port dropped, Smart Follow retrying)
+    core.serialSessions[0].status = "waiting";
+    core.emit();
+    expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(false);
+    reg.dispose();
+  });
+
   it("unregister clears the entry and disposes the buffer observer", () => {
     const reg = new TerminalRegistry(makeCore());
     const terminal = {} as never;
