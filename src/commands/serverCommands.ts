@@ -580,7 +580,8 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
               id: sessionId,
               serverId: server.id,
               terminalName,
-              startedAt: Date.now()
+              startedAt: Date.now(),
+              pty: ptyRef
             });
             if (terminalRef) {
               ctx.sessionTerminals.set(sessionId, terminalRef);

@@ -361,7 +361,8 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
           id: sessionId,
           profileId: profile.id,
           terminalName,
-          startedAt: Date.now()
+          startedAt: Date.now(),
+          pty: ptyRef
         });
       },
       onSessionClosed: (sessionId) => {
@@ -450,7 +451,8 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
           profileId: profile.id,
           terminalName,
           startedAt,
-          status
+          status,
+          pty: ptyRef
         });
       },
       onFatalError: (message) => {
@@ -496,7 +498,8 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     profileId: profile.id,
     terminalName,
     startedAt,
-    status: "waiting"
+    status: "waiting",
+    pty
   });
   ctx.focusedTerminal = terminal;
   terminal.show();

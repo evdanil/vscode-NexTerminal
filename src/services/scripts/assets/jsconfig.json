@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "checkJs": true,
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Node",
+    "types": ["./types/nexus-scripts"]
+  },
+  "include": ["**/*.js"],
+  "exclude": ["node_modules"]
+}

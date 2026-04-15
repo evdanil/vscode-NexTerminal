@@ -75,6 +75,11 @@
           "id": "nexusSettings",
           "name": "Settings",
           "visibility": "collapsed"
+        },
+        {
+          "id": "nexusScripts",
+          "name": "Scripts",
+          "visibility": "collapsed"
         }
       ]
     },
@@ -516,6 +521,35 @@
         "command": "nexus.filter.clear",
         "title": "Clear Filter",
         "icon": "$(search-stop)"
+      },
+      {
+        "command": "nexus.script.run",
+        "title": "Run Nexus Script",
+        "category": "Nexus",
+        "icon": "$(play)"
+      },
+      {
+        "command": "nexus.script.runWithTarget",
+        "title": "Run Nexus Script on Target",
+        "category": "Nexus"
+      },
+      {
+        "command": "nexus.script.stop",
+        "title": "Stop Nexus Script",
+        "category": "Nexus",
+        "icon": "$(primitive-square)"
+      },
+      {
+        "command": "nexus.script.new",
+        "title": "New Nexus Script",
+        "category": "Nexus",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "nexus.script.openOutput",
+        "title": "Show Nexus Scripts Output",
+        "category": "Nexus",
+        "icon": "$(output)"
       }
     ],
     "menus": {
@@ -2768,6 +2802,33 @@
           "maximum": 60,
           "order": 30,
           "markdownDescription": "Timeout in seconds for commands sent to the serial port sidecar process."
+        },
+        "nexus.scripts.path": {
+          "type": "string",
+          "default": ".nexus/scripts",
+          "order": 20,
+          "markdownDescription": "Workspace-relative directory where Nexus scripts live. Created on first script command if it does not exist."
+        },
+        "nexus.scripts.defaultTimeout": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 100,
+          "order": 21,
+          "markdownDescription": "Default per-wait timeout in milliseconds, used by `waitFor` / `expect` / `waitAny` when a script doesn't pass its own `timeout`. Override per script via the `@default-timeout` JSDoc tag, or per call via the `timeout` option."
+        },
+        "nexus.scripts.macroPolicy": {
+          "type": "string",
+          "enum": [
+            "suspend-all",
+            "keep-enabled"
+          ],
+          "enumDescriptions": [
+            "Suspend all auto-trigger macros on the script's bound session for the duration of the run (default).",
+            "Keep all macros enabled. Use only if you understand the risk of macros firing alongside script-driven input."
+          ],
+          "default": "suspend-all",
+          "order": 22,
+          "markdownDescription": "How the script runtime treats macro auto-triggers on the bound session while a script is running."
         }
       }
     }
