@@ -101,6 +101,13 @@ export interface SessionPtyHandle {
    * disconnected — the runtime's NexusCore.onDidChange subscription surfaces ConnectionLost.
    */
   writeProgrammatic(data: string): void;
+  /**
+   * Clear the visible terminal screen while preserving scrollback history. Emits the
+   * clear-screen escape through the PTY's local `writeEmitter` only — never to the
+   * remote transport (SSH stream or serial port), so the remote shell state and any
+   * connected device remain untouched.
+   */
+  resetTerminal(): void;
 }
 
 export interface ActiveSession {

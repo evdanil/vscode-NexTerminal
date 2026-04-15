@@ -1,8 +1,6 @@
 import * as vscode from "vscode";
 import type { RegistryEntry, TerminalRegistry } from "../services/terminal/terminalRegistry";
 
-type ResetCapableEntry = RegistryEntry & { pty: RegistryEntry["pty"] & { resetTerminal?: () => void } };
-
 function resolveEntry(
   registry: TerminalRegistry,
   terminal: vscode.Terminal | undefined
@@ -17,9 +15,9 @@ export function registerTerminalTabCommands(
 ): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("nexus.terminal.reset", (terminal?: vscode.Terminal) => {
-      const entry = resolveEntry(registry, terminal) as ResetCapableEntry | undefined;
+      const entry = resolveEntry(registry, terminal);
       if (!entry || !registry.isConnected(entry)) return;
-      entry.pty.resetTerminal?.();
+      entry.pty.resetTerminal();
     })
   );
 
@@ -45,11 +43,12 @@ export function registerTerminalTabCommands(
         await vscode.env.clipboard.writeText(text);
       } catch (err) {
         const message = err instanceof Error ? err.message : "unknown clipboard error";
-        void vscode.window.showErrorMessage(`Copy All: failed to write to clipboard — ${message}`);
+        void vscode.window.showErrorMessage(`Failed to copy to clipboard: ${message}`);
         return;
       }
       const n = entry.buffer.lineCount();
-      void vscode.window.showInformationMessage(`Copied ${n} lines to clipboard.`);
+      const unit = n === 1 ? "line" : "lines";
+      void vscode.window.showInformationMessage(`Copied ${n} ${unit} to clipboard.`);
     })
   );
 }

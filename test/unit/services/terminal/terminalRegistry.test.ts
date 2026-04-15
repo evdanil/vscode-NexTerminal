@@ -120,6 +120,13 @@ describe("TerminalRegistry", () => {
     return hits.length === 0 ? undefined : hits[hits.length - 1].value;
   }
 
+  it("seeds both context keys to false at construction time (cold-start defense)", () => {
+    const reg = new TerminalRegistry(makeCore());
+    expect(latestContextKey("nexus.isNexusTerminal")).toBe(false);
+    expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(false);
+    reg.dispose();
+  });
+
   it("register/get/unregister is symmetric", () => {
     const reg = new TerminalRegistry(makeCore());
     const terminal = {} as never;

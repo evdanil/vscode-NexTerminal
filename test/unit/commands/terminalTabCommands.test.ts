@@ -177,6 +177,17 @@ describe("terminalTabCommands", () => {
       expect(state.showInfo).toHaveBeenCalledWith("Copied 2 lines to clipboard.");
     });
 
+    it("uses singular 'line' when exactly one line was copied", async () => {
+      const terminal = {} as never;
+      const entries = new Map<unknown, RegistryEntry>();
+      const entry: RegistryEntry = { pty: fakePty() as never, buffer: fakeBuffer("solo", 1) as never };
+      entries.set(terminal, entry);
+      registerTerminalTabCommands(context as never, fakeRegistry(entries, new Set([entry])) as never);
+      const handler = state.registeredCommands.get("nexus.terminal.copyAll")!;
+      await handler(terminal);
+      expect(state.showInfo).toHaveBeenCalledWith("Copied 1 line to clipboard.");
+    });
+
     it("palette path: falls back to window.activeTerminal", async () => {
       const terminal = {} as never;
       const entries = new Map<unknown, RegistryEntry>();
@@ -225,6 +236,9 @@ describe("terminalTabCommands", () => {
       await handler(terminal);
       expect(state.showError).toHaveBeenCalledWith(
         expect.stringContaining("clipboard denied")
+      );
+      expect(state.showError).toHaveBeenCalledWith(
+        expect.stringMatching(/^Failed to copy to clipboard:/)
       );
       expect(state.showInfo).not.toHaveBeenCalled();
     });

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { createAnsiRegex } from "../../utils/ansi";
 
+const ANSI_RE = createAnsiRegex();
 const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 const SCROLLBACK_SECTION = "terminal.integrated";
 const SCROLLBACK_KEY = "scrollback";
@@ -34,7 +35,9 @@ export class TerminalCaptureBuffer {
   }
 
   public append(data: string): void {
-    const stripped = data.replace(createAnsiRegex(), "").replace(CONTROL_CHAR_RE, "");
+    ANSI_RE.lastIndex = 0;
+    CONTROL_CHAR_RE.lastIndex = 0;
+    const stripped = data.replace(ANSI_RE, "").replace(CONTROL_CHAR_RE, "");
     if (stripped.length === 0) return;
     const combined = this.pending + stripped;
     const segments = combined.split("\n");

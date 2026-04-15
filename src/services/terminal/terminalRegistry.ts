@@ -41,6 +41,7 @@ export class TerminalRegistry implements vscode.Disposable {
     );
     const off = core.onDidChange(() => this.refreshContextKeys());
     this.subscriptions.push({ dispose: off });
+    this.refreshContextKeys();
   }
 
   public register(terminal: vscode.Terminal, pty: SessionPtyHandle): void {
@@ -64,10 +65,13 @@ export class TerminalRegistry implements vscode.Disposable {
   public unregister(terminal: vscode.Terminal): void {
     const entry = this.entries.get(terminal);
     if (!entry) return;
-    entry.observerDisposable.dispose();
-    entry.buffer.dispose();
-    this.entries.delete(terminal);
-    this.refreshContextKeys();
+    try {
+      entry.observerDisposable.dispose();
+      entry.buffer.dispose();
+    } finally {
+      this.entries.delete(terminal);
+      this.refreshContextKeys();
+    }
   }
 
   public isConnected(entry: RegistryEntry): boolean {
