@@ -243,17 +243,6 @@ export function registerScriptCommands(
       }
     }),
 
-    vscode.commands.registerCommand("nexus.script.runWithTarget", async (arg: unknown, sessionId: string) => {
-      const target = toScriptUri(arg);
-      if (!target || !sessionId) return;
-      try {
-        await manager.runScript(target, sessionId);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        void vscode.window.showErrorMessage(`Failed to start script: ${message}`);
-      }
-    }),
-
     vscode.commands.registerCommand("nexus.script.stop", async (arg?: unknown) => {
       // Stop can be invoked from (1) Palette — no arg; (2) tree view — passes ScriptNode;
       // (3) status bar tooltip / keybinding — passes the sessionId string directly.

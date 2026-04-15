@@ -88,7 +88,6 @@ function makeManager(overrides: Partial<Record<string, unknown>> = {}): ScriptRu
     runScript: vi.fn(async () => undefined),
     stopScript: vi.fn(async () => {}),
     getRuns: vi.fn(() => []),
-    getRunForSession: vi.fn(),
     onDidChangeRun: Object.assign(
       (_l: () => void) => ({ dispose: () => {} }),
       {}

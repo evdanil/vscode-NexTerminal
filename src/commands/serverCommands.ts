@@ -715,7 +715,18 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
     );
   }, timeoutMs);
 
-  await connectServer(ctx, server.id);
+  try {
+    await connectServer(ctx, server.id);
+  } catch (err) {
+    // connectServer can reject (auth failure, proxy error). Without this
+    // the subscription + timer would leak until the 90-second watchdog.
+    if (!resolved) {
+      resolved = true;
+      clearTimeout(timer);
+      unsubscribe();
+    }
+    throw err;
+  }
 }
 
 async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<void> {

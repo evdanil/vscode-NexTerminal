@@ -115,11 +115,6 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     return Array.from(this.runs.values(), (r) => this.toSnapshot(r));
   }
 
-  public getRunForSession(sessionId: string): RunningScriptSnapshot | undefined {
-    const r = this.runs.get(sessionId);
-    return r ? this.toSnapshot(r) : undefined;
-  }
-
   public async runScript(uri: vscode.Uri, sessionId?: string): Promise<string | undefined> {
     // US3: ensure IntelliSense scaffolding is in place in the workspace.
     await this.maybeSeedWorkspaceTypes();
@@ -488,25 +483,21 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     const opLabel = `waitFor ${patternLabel}`;
     this.beginOp(record, "wait", opLabel);
     const startedAt = Date.now();
-    try {
-      const m = await this.scanForMatch(record, pattern, opts?.lookback, timeoutMs);
-      if (m) {
-        record.outputBuffer.advanceCursor(m.endPosition);
-        this.endOp(record, "matched");
-        return m;
-      }
-      this.endOp(record, "timeout");
-      if (throwOnTimeout) {
-        throw makeError("Timeout", `expect timed out after ${Date.now() - startedAt}ms waiting for ${patternLabel}`, {
-          pattern: patternLabel,
-          timeoutMs,
-          elapsedMs: Date.now() - startedAt
-        });
-      }
-      return null;
-    } finally {
-      // op already ended above
+    const m = await this.scanForMatch(record, pattern, opts?.lookback, timeoutMs);
+    if (m) {
+      record.outputBuffer.advanceCursor(m.endPosition);
+      this.endOp(record, "matched");
+      return m;
     }
+    this.endOp(record, "timeout");
+    if (throwOnTimeout) {
+      throw makeError("Timeout", `expect timed out after ${Date.now() - startedAt}ms waiting for ${patternLabel}`, {
+        pattern: patternLabel,
+        timeoutMs,
+        elapsedMs: Date.now() - startedAt
+      });
+    }
+    return null;
   }
 
   private async doWaitAny(

@@ -22,6 +22,7 @@ Nexus Scripts let you automate multi-step terminal procedures in plain JavaScrip
 - [Settings](#settings)
 - [Commands and views](#commands-and-views)
 - [Troubleshooting](#troubleshooting)
+- [Security and trust](#security-and-trust)
 - [Limitations](#limitations)
 
 ---
@@ -61,12 +62,13 @@ A script is a regular `.js` file in your workspace. Writing one looks and feels 
    const out = await expect(/[$#] $/);
    log.info("kernel:", out.before.trim());
    ```
-4. **Run it** — any of three equivalent ways:
-   - `Cmd/Ctrl+Shift+P` → **Nexus: Run Nexus Script** and pick `hello.js`.
-   - In the **Nexus** sidebar, expand **Scripts** and click the file.
-   - Open `hello.js` in the editor and click the **▶ Run in Nexus** CodeLens above the header.
+4. **Run it** — any of several equivalent ways:
+   - `Cmd/Ctrl+Shift+P` → **Nexus: Run Nexus Script** (always shows the session picker).
+   - In the **Nexus** sidebar, expand **Scripts** and click the inline **▶** button. This "quick-run" binds to the terminal you currently have focused; if no Nexus terminal is focused it falls back to the picker.
+   - Open `hello.js` in the editor and click the **▶ Run in Nexus** CodeLens above the header — always shows the picker.
+   - Right-click a server or serial profile → **Connect and Run Script…** — picks a script, connects, and runs it against the new session.
 
-   If more than one SSH session is active, you'll be asked to pick one.
+   The session picker always renders — even when only one session is eligible — so you can see which terminal the script will drive before it starts. Auto-pick only happens when the script's `@target-profile` uniquely matches an active session.
 5. **Watch it run.** The **Nexus Scripts** Output Channel prints each event:
    ```text
    [12:01:33.221] Hello  start (session: web-1, ssh)
@@ -131,7 +133,7 @@ Every field except `@nexus-script` is optional.
 
 - Unknown `@<tag>` names produce a warning in the Output Channel — the script still loads.
 - Invalid values for `@target-type` (not `ssh` / `serial`) or `@default-timeout` (not `<n>ms|s|m`) block the run with a descriptive error.
-- Duplicate fields are tolerated; the first occurrence wins and a warning is logged.
+- Duplicate fields are tolerated: the first occurrence wins and a warning is logged — **except `@allow-macros`, which concatenates** so you can spread a long allow-list across multiple lines.
 - Only the first JSDoc block in the file is examined.
 
 ---
@@ -590,12 +592,13 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | `Connect and Run Script…` (server / serial right-click) | — | Pick a Nexus script, connect to the profile, and run the script against the new session once it registers. Scripts are filtered to those whose `@target-type` is compatible with the profile. 90-second watchdog warns if the script never starts. |
 | `Nexus: Show Nexus Scripts Output` | — | Open the **Nexus Scripts** Output Channel. |
 | `Nexus: Open Scripting Guide` | — | Open this document in your browser. |
-| `Nexus: Run Nexus Script on Target` | — | Internal variant (hidden from the Command Palette) taking `(uri, sessionId)` — used by the sidebar menu. |
 
 **UI surfaces:**
 
-- **Nexus sidebar → Scripts** — lists all `.js` files under the configured directory that carry the `@nexus-script` marker. Right-click any script for Run / Stop / Reveal / Delete. The view's title bar has a `+` button that runs `New Nexus Script`. Empty state (no folder / no scripts) shows inline help links.
-- **Editor CodeLens** — the inline `▶ Run in Nexus` action at the top of any script file. Flips to `◼ Stop` while a run is active on that file. Works on `file://`, `vscode-remote://`, and `untitled:` schemes.
+- **Nexus sidebar → Scripts** — lists all `.js` files under the configured directory that carry the `@nexus-script` marker. Clicking the row does **nothing by default** (prevents accidental editor churn); use the right-click menu for Edit / Run / Stop / Reveal / Delete, or the inline **▶** button for quick-run. The view's title bar has a `+` button (New Script) and a `📁` button (Open Scripts Folder in the OS file manager). Empty state (no folder / no scripts) shows inline help links — **New Script** and **Open Scripting Guide**.
+- **Editor CodeLens** — the inline `▶ Run in Nexus` action at the top of any script file. Flips to `◼ Stop` while a run is active on that file. Works on `file://`, `vscode-remote://`, and `untitled:` schemes. Always shows the session picker (the editor context is "I'm authoring" — deliberate target choice).
+- **Nexus Settings panel → Scripts** — the same four settings as in `Settings` below, surfaced in the Nexus Settings panel webview (no need to open `settings.json`).
+- **Connectivity Hub right-click → Connect and Run Script…** — available on both SSH and serial profile items. Picks a compatible script (filtered by `@target-type`), connects to the profile, then auto-runs the script once the session registers. 90-second watchdog warns if the script never starts.
 - **Status bar — run indicator** — when at least one script is running, the left status bar shows the current operation + elapsed time. Click to open the Output Channel. Tooltip contains a `◼ Stop` action per running script.
 - **Status bar — input-lock indicator** — when an `@lock-input` script is running, a second left-aligned status bar item renders `$(lock) Terminal locked — click to stop`. Clicking stops the locking script. If multiple locked scripts run at once it shows a count and offers a QuickPick on click.
 - **Output Channel** — the `Nexus Scripts` channel streams timestamped events. Lines are prefixed with `[hh:mm:ss.sss] ScriptName@SessionName` so you can correlate interleaved output when multiple scripts run at once.

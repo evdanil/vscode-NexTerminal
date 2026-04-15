@@ -80,7 +80,6 @@ import type { ScriptRuntimeManager } from "../../../src/services/scripts/scriptR
 function mockManager(): ScriptRuntimeManager {
   return {
     getRuns: vi.fn(() => []),
-    getRunForSession: vi.fn(),
     onDidChangeRun: Object.assign(
       (_listener: () => void) => ({ dispose: () => {} }),
       {}
@@ -184,7 +183,6 @@ describe("ScriptTreeProvider", () => {
           currentOperation: null
         }
       ]),
-      getRunForSession: vi.fn(),
       onDidChangeRun: Object.assign(
         (_l: () => void) => ({ dispose: () => {} }),
         {}
@@ -219,7 +217,6 @@ describe("ScriptTreeProvider", () => {
           currentOperation: null
         }
       ]),
-      getRunForSession: vi.fn(),
       onDidChangeRun: Object.assign(
         (_l: () => void) => ({ dispose: () => {} }),
         {}
@@ -254,7 +251,6 @@ describe("ScriptTreeProvider", () => {
 
     const manager = {
       getRuns: vi.fn(() => []),
-      getRunForSession: vi.fn(),
       onDidChangeRun: Object.assign(
         (l: Listener) => {
           runListeners.add(l);

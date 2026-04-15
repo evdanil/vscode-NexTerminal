@@ -174,13 +174,6 @@ describe("package contributions", () => {
       expect(inlineStop?.when).toContain("viewItem == nexus.script.running");
     });
 
-    it("hides nexus.script.runWithTarget from the command palette (F3)", () => {
-      const palette = packageJson.contributes.menus["commandPalette"] ?? [];
-      const entry = palette.find((p) => p.command === "nexus.script.runWithTarget");
-      expect(entry).toBeDefined();
-      expect(entry?.when).toBe("false");
-    });
-
     it("contributes nexus.scripts.maxRuntimeMs setting (S3)", () => {
       const prop = packageJson.contributes.configuration?.properties?.["nexus.scripts.maxRuntimeMs"];
       expect(prop).toBeDefined();
