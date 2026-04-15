@@ -142,9 +142,13 @@ function runtimeFixture(scriptFixture: string): {
   } as unknown as { appendLine: (s: string) => void };
 
   const workerPath = path.resolve(__dirname, "..", "..", "..", "dist", "services", "scripts", "scriptWorker.js");
+  const mockMacroAutoTrigger = {
+    pushFilter: () => ({ dispose: () => {} }),
+    bindObserverToSession: () => {}
+  };
   const manager = new ScriptRuntimeManager({
     core,
-    macroAutoTrigger: {} as never,
+    macroAutoTrigger: mockMacroAutoTrigger as never,
     outputChannel: outputChannel as never,
     workerPath
   });

@@ -28,6 +28,8 @@ import { TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
 import { createCollapsedFolderStatePersistence } from "./ui/collapsedFolderStatePersistence";
 import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
+import { ScriptCodeLensProvider } from "./ui/scriptCodeLensProvider";
+import { ScriptTreeProvider } from "./ui/scriptTreeProvider";
 import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
 import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
@@ -237,9 +239,61 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     core,
     macroAutoTrigger,
     outputChannel: scriptOutputChannel,
-    workerPath: path.join(context.extensionPath, "dist", "services", "scripts", "scriptWorker.js")
+    workerPath: path.join(context.extensionPath, "dist", "services", "scripts", "scriptWorker.js"),
+    assetsDir: vscode.Uri.file(path.join(context.extensionPath, "dist", "services", "scripts", "assets"))
   });
   const scriptCommandDisposables = registerScriptCommands(scriptRuntimeManager, scriptOutputChannel);
+  const scriptTreeProvider = new ScriptTreeProvider(scriptRuntimeManager);
+  const scriptCodeLensProvider = new ScriptCodeLensProvider(scriptRuntimeManager);
+  const scriptsView = vscode.window.createTreeView("nexusScripts", {
+    treeDataProvider: scriptTreeProvider,
+    showCollapseAll: false
+  });
+  const scriptCodeLensRegistration = vscode.languages.registerCodeLensProvider(
+    { language: "javascript", scheme: "file" },
+    scriptCodeLensProvider
+  );
+
+  // Script runtime status bar item — separate from the existing Nexus Command Center item.
+  const scriptStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 9);
+  scriptStatusBarItem.command = "nexus.script.openOutput";
+  scriptStatusBarItem.name = "Nexus Scripts";
+  let scriptStatusBarTick: ReturnType<typeof setInterval> | undefined;
+  const renderScriptStatusBar = (): void => {
+    const runs = scriptRuntimeManager.getRuns();
+    if (runs.length === 0) {
+      scriptStatusBarItem.hide();
+      if (scriptStatusBarTick) {
+        clearInterval(scriptStatusBarTick);
+        scriptStatusBarTick = undefined;
+      }
+      return;
+    }
+    if (runs.length > 1) {
+      scriptStatusBarItem.text = `$(sync~spin) ${runs.length} scripts running`;
+    } else {
+      const r = runs[0];
+      const op = r.currentOperation;
+      const elapsed = op ? Math.max(0, Math.floor((Date.now() - op.startedAt) / 1000)) : 0;
+      scriptStatusBarItem.text = op
+        ? `$(sync~spin) ${r.scriptName} — ${op.label} (${elapsed}s)`
+        : `$(sync~spin) ${r.scriptName}`;
+    }
+    const tooltip = new vscode.MarkdownString(undefined, true);
+    tooltip.isTrusted = true;
+    for (const r of runs) {
+      const stopArg = encodeURIComponent(JSON.stringify([r.sessionId]));
+      tooltip.appendMarkdown(
+        `**${r.scriptName}** on ${r.sessionName} — [◼ Stop](command:nexus.script.stop?${stopArg})\n\n`
+      );
+    }
+    scriptStatusBarItem.tooltip = tooltip;
+    scriptStatusBarItem.show();
+    if (!scriptStatusBarTick) {
+      scriptStatusBarTick = setInterval(renderScriptStatusBar, 1_000);
+    }
+  };
+  const scriptStatusBarListener = scriptRuntimeManager.onDidChangeRun(() => renderScriptStatusBar());
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
   const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
   const sftpService = new SftpService(pool, readSftpServiceConfig());
@@ -690,6 +744,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     macroAutoTriggerListener,
     scriptRuntimeManager,
     scriptOutputChannel,
+    scriptTreeProvider,
+    scriptCodeLensProvider,
+    scriptsView,
+    scriptCodeLensRegistration,
+    scriptStatusBarItem,
+    scriptStatusBarListener,
+    {
+      dispose: () => {
+        if (scriptStatusBarTick) clearInterval(scriptStatusBarTick);
+      }
+    },
     ...scriptCommandDisposables,
     fileExplorerView,
     fsRegistration,

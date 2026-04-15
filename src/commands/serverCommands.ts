@@ -583,6 +583,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
               startedAt: Date.now(),
               pty: ptyRef
             });
+            ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
             if (terminalRef) {
               ctx.sessionTerminals.set(sessionId, terminalRef);
             }

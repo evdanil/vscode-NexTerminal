@@ -5,6 +5,8 @@ import type { NexusCore } from "../../core/nexusCore";
 import type { ActiveSession, ActiveSerialSession } from "../../models/config";
 import type { MacroAutoTrigger, PtyOutputObserver } from "../macroAutoTrigger";
 import { parseScriptHeader, type ScriptHeader } from "./scriptHeader";
+import { ScriptMacroFilter } from "./scriptMacroFilter";
+import { ensureWorkspaceScriptTypes, type BundledAssets } from "./scriptTypesGenerator";
 import { ScriptOutputBuffer, type Match } from "./scriptOutputBuffer";
 import { pickTarget, type ScriptTargetDescriptor } from "./scriptTarget";
 import type {
@@ -23,6 +25,8 @@ export interface ScriptRuntimeManagerDependencies {
   outputChannel: vscode.OutputChannel;
   /** Absolute path to dist/services/scripts/scriptWorker.js. */
   workerPath: string;
+  /** Directory (absolute fsPath) containing bundled `nexus-scripts.d.ts` + `jsconfig.json`. */
+  assetsDir?: vscode.Uri;
   /** Injection point for tests — lets them swap in a lightweight worker shim. */
   createWorker?: (workerPath: string) => WorkerLike;
 }
@@ -58,6 +62,8 @@ interface RunningScriptRecord {
   worker: WorkerLike;
   pendingRpcs: Map<number, PendingRpc>;
   observerSubscription?: vscode.Disposable;
+  macroFilter?: ScriptMacroFilter;
+  macroFilterInitial?: { defaultAllow: boolean; allowList: string[]; denyList: string[] };
   macroFilterHandle?: vscode.Disposable;
   coreChangeSubscription?: vscode.Disposable;
   inputLockHeld: boolean;
@@ -96,6 +102,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   }
 
   public async runScript(uri: vscode.Uri, sessionId?: string): Promise<string | undefined> {
+    // US3: ensure IntelliSense scaffolding is in place in the workspace.
+    await this.maybeSeedWorkspaceTypes();
+
     const source = await this.readScriptFile(uri);
     const header = parseScriptHeader(source);
     if (!header.marker) {
@@ -163,6 +172,20 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       pauseIntervalMacros: () => {},
       dispose: () => {}
     });
+
+    // US4: install the macro filter for this session.
+    const macroPolicy = vscode.workspace
+      .getConfiguration("nexus.scripts")
+      .get<string>("macroPolicy", "suspend-all");
+    const defaultAllow = macroPolicy === "keep-enabled";
+    const filter = new ScriptMacroFilter({
+      defaultAllow,
+      allowList: header.allowMacros,
+      denyList: []
+    });
+    record.macroFilter = filter;
+    record.macroFilterInitial = { defaultAllow, allowList: [...header.allowMacros], denyList: [] };
+    record.macroFilterHandle = this.deps.macroAutoTrigger.pushFilter(target.session.id, filter);
 
     if (header.lockInput) {
       target.session.pty.setInputBlocked(true);
@@ -233,6 +256,32 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   private async readScriptFile(uri: vscode.Uri): Promise<string> {
     const bytes = await vscode.workspace.fs.readFile(uri);
     return new TextDecoder("utf-8").decode(bytes);
+  }
+
+  private async maybeSeedWorkspaceTypes(): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder || !this.deps.assetsDir) return;
+    const scriptsPath = vscode.workspace
+      .getConfiguration("nexus.scripts")
+      .get<string>("path", ".nexus/scripts");
+    try {
+      await ensureWorkspaceScriptTypes(folder.uri, scriptsPath, async () => {
+        const dtsUri = vscode.Uri.joinPath(this.deps.assetsDir!, "nexus-scripts.d.ts");
+        const jsconfigUri = vscode.Uri.joinPath(this.deps.assetsDir!, "jsconfig.json");
+        const [dtsBytes, jsconfigBytes] = await Promise.all([
+          vscode.workspace.fs.readFile(dtsUri),
+          vscode.workspace.fs.readFile(jsconfigUri)
+        ]);
+        return {
+          dts: new TextDecoder("utf-8").decode(dtsBytes),
+          jsconfig: new TextDecoder("utf-8").decode(jsconfigBytes)
+        } satisfies BundledAssets;
+      });
+    } catch (err) {
+      // Seeding failures are non-fatal — scripts can still run, IntelliSense just won't seed.
+      const message = err instanceof Error ? err.message : String(err);
+      this.deps.outputChannel.appendLine(`[warn] failed to seed workspace script types: ${message}`);
+    }
   }
 
   private basenameWithoutExt(fsPath: string): string {
@@ -352,13 +401,30 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       case "confirm":
       case "alert":
         return this.doUserInteraction(record, method, args);
-      case "macros.allow":
-      case "macros.deny":
-      case "macros.disableAll":
-      case "macros.restore":
-        // US4 hook — no-op for MVP. Logged so users know it's not wired yet.
-        this.logEvent(record, `${method}: no-op (macro coordination lands in US4)`);
+      case "macros.allow": {
+        if (!record.macroFilter) return undefined;
+        record.macroFilter.allow(args[0] as string | string[]);
         return undefined;
+      }
+      case "macros.deny": {
+        if (!record.macroFilter) return undefined;
+        record.macroFilter.deny(args[0] as string | string[]);
+        return undefined;
+      }
+      case "macros.disableAll": {
+        if (!record.macroFilter) return undefined;
+        record.macroFilter.defaultAllow = false;
+        record.macroFilter.clear();
+        return undefined;
+      }
+      case "macros.restore": {
+        if (!record.macroFilter || !record.macroFilterInitial) return undefined;
+        record.macroFilter.defaultAllow = record.macroFilterInitial.defaultAllow;
+        record.macroFilter.clear();
+        for (const n of record.macroFilterInitial.allowList) record.macroFilter.allow(n);
+        for (const n of record.macroFilterInitial.denyList) record.macroFilter.deny(n);
+        return undefined;
+      }
       default:
         throw makeError("UnknownMethod", `Unknown script RPC method: ${method}`);
     }

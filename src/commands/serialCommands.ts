@@ -364,6 +364,7 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
           startedAt: Date.now(),
           pty: ptyRef
         });
+        ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
       },
       onSessionClosed: (sessionId) => {
         ctx.serialTerminals.delete(sessionId);
@@ -501,6 +502,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     status: "waiting",
     pty
   });
+  ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, logicalSessionId);
   ctx.focusedTerminal = terminal;
   terminal.show();
 }

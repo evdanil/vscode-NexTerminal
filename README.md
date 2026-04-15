@@ -32,6 +32,18 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 - **Settings Panel** — View and edit all extension settings in a dedicated webview panel with search, grouped categories, and auto-save.
 - **Configuration Export/Import** — Full encrypted backup with master password protection, or sanitized share export (credentials stripped, IDs remapped). Proxy configurations are preserved across backup and restore.
 - **Import from MobaXterm / SecureCRT** — Migrate SSH session profiles directly from MobaXterm INI files or SecureCRT XML exports and session directories. Folder hierarchy is preserved.
+- **Scripts** — Author `.js` automation scripts under `.nexus/scripts/` and run them against any active SSH or Serial session. Scripts use an async expect/send API (`waitFor`, `expect`, `waitAny`, `send`, `sendLine`, `sendKey`, `poll`, `prompt`, `confirm`, `alert`, `sleep`, `log`) with IntelliSense auto-seeded on first run. Each script runs in an isolated `worker_threads` Worker so runaway loops can be stopped in &lt;100 ms. Macros on the script's session are suspended automatically (configurable via `nexus.scripts.macroPolicy` and the per-script `@allow-macros` header); macros on unrelated sessions keep firing normally. Minimal example:
+  ```js
+  /**
+   * @nexus-script
+   * @name Quick login check
+   * @target-type ssh
+   */
+  await expect(/[$#] $/, { timeout: 10_000 });
+  await sendLine("uname -a");
+  const out = await expect(/[$#] $/);
+  log.info("kernel:", out.before.trim());
+  ```
 - **Web Extension Fallback** — Graceful degradation in browser-based VS Code (SSH/serial features require desktop runtime).
 
 ## Getting Started

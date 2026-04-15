@@ -1,3 +1,4 @@
+// Nexus Scripts API types — v1
 /**
  * Nexus Terminal — Scripts API
  *
