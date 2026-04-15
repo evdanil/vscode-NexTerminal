@@ -23,6 +23,7 @@ import {
 } from "../utils/folderPaths";
 import { formatAuthProfileLabel, formatKeyPathDisplayName, normalizeKeyPathForComparison } from "../utils/authProfileLabel";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
+import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 
 async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -580,8 +581,10 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
               id: sessionId,
               serverId: server.id,
               terminalName,
-              startedAt: Date.now()
+              startedAt: Date.now(),
+              pty: ptyRef
             });
+            ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
             if (terminalRef) {
               ctx.sessionTerminals.set(sessionId, terminalRef);
             }
@@ -654,6 +657,76 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
       terminal.show();
     }
   );
+}
+
+/**
+ * Connect to a server (opening a fresh session) and auto-run a picked Nexus
+ * script against it the moment the session registers. Invoked from the server
+ * tree-item context menu entry "Run with script…".
+ *
+ * Implementation: captures the set of existing session ids for this server up
+ * front, subscribes to `core.onDidChange`, and fires the script the first time
+ * a new session for this server appears. Safety timeout (90s) unsubscribes if
+ * the connect never produces a session (auth failure, network timeout).
+ */
+async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<void> {
+  const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
+  if (!server) return;
+  if (!ctx.scriptRuntimeManager) {
+    void vscode.window.showErrorMessage("Nexus script runtime is not available in this context.");
+    return;
+  }
+  const scriptUri = await pickScriptFromWorkspace("ssh");
+  if (!scriptUri) return;
+
+  const preExisting = new Set(
+    ctx.core
+      .getSnapshot()
+      .activeSessions.filter((s) => s.serverId === server.id)
+      .map((s) => s.id)
+  );
+
+  const timeoutMs = 90_000;
+  let resolved = false;
+
+  const unsubscribe = ctx.core.onDidChange(() => {
+    if (resolved) return;
+    const newSession = ctx.core
+      .getSnapshot()
+      .activeSessions.find((s) => s.serverId === server.id && !preExisting.has(s.id));
+    if (!newSession) return;
+    resolved = true;
+    clearTimeout(timer);
+    unsubscribe();
+    // Fire the script — runScript itself logs to the Scripts output channel.
+    void ctx.scriptRuntimeManager!.runScript(scriptUri, newSession.id).catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Failed to start script after connect: ${message}`);
+    });
+  });
+
+  const timer = setTimeout(() => {
+    if (resolved) return;
+    resolved = true;
+    unsubscribe();
+    void vscode.window.showWarningMessage(
+      `Connected to ${server.name} but the script did not start within ${timeoutMs / 1000}s. ` +
+        `Run the script manually if the session is live.`
+    );
+  }, timeoutMs);
+
+  try {
+    await connectServer(ctx, server.id);
+  } catch (err) {
+    // connectServer can reject (auth failure, proxy error). Without this
+    // the subscription + timer would leak until the 90-second watchdog.
+    if (!resolved) {
+      resolved = true;
+      clearTimeout(timer);
+      unsubscribe();
+    }
+    throw err;
+  }
 }
 
 async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<void> {
@@ -763,6 +836,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
 
     vscode.commands.registerCommand("nexus.server.connect", (arg?: unknown) => connectServer(ctx, arg)),
     vscode.commands.registerCommand("nexus.server.disconnect", (arg?: unknown) => disconnectServer(ctx, arg)),
+    vscode.commands.registerCommand("nexus.server.runWithScript", (arg?: unknown) => connectAndRunScript(ctx, arg)),
 
     vscode.commands.registerCommand("nexus.server.copyInfo", async (arg?: unknown) => {
       const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));

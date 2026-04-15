@@ -37,6 +37,10 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   private activityIndicator = false;
   private readonly highlighterStream?: TerminalHighlighterStream;
 
+  private readonly outputObservers = new Set<PtyOutputObserver>();
+  private inputBlocked = false;
+  private inputBlockNoticeArmed = true;
+
   public constructor(
     private readonly transport: SerialTransport,
     private readonly options: SerialPtyOptions,
@@ -44,12 +48,32 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly logger: SessionLogger,
     private readonly transcript?: SessionTranscript,
     private readonly highlighter?: TerminalHighlighter,
-    private readonly outputObserver?: PtyOutputObserver
+    outputObserver?: PtyOutputObserver
   ) {
     this.highlighterStream =
       typeof (highlighter as { createStream?: unknown } | undefined)?.createStream === "function"
         ? highlighter?.createStream((text) => this.writeEmitter.fire(text))
         : undefined;
+    if (outputObserver) this.outputObservers.add(outputObserver);
+  }
+
+  public addOutputObserver(observer: PtyOutputObserver): vscode.Disposable {
+    this.outputObservers.add(observer);
+    return new vscode.Disposable(() => {
+      this.outputObservers.delete(observer);
+    });
+  }
+
+  public setInputBlocked(blocked: boolean): void {
+    this.inputBlocked = blocked;
+    if (blocked) this.inputBlockNoticeArmed = true;
+  }
+
+  public writeProgrammatic(data: string): void {
+    if (this.disposed || this.disconnected || this.failed || !this.sidecarSessionId) return;
+    void this.transport.writePort(this.sidecarSessionId, Buffer.from(data, "utf8")).catch(() => {
+      /* best-effort; ConnectionLost surfaces via NexusCore.onDidChange */
+    });
   }
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
@@ -77,6 +101,13 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   }
 
   public handleInput(data: string): void {
+    if (this.inputBlocked) {
+      if (this.inputBlockNoticeArmed) {
+        this.inputBlockNoticeArmed = false;
+        this.writeEmitter.fire("\r\n[Nexus] Terminal is locked while a script is running. Stop the script to send input.\r\n");
+      }
+      return;
+    }
     if (this.failed || this.disconnected) {
       this.dispose();
       return;
@@ -101,7 +132,14 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
     this.disposed = true;
     this.highlighterStream?.dispose();
-    this.outputObserver?.dispose();
+    this.outputObservers.forEach((o) => {
+      try {
+        o.dispose();
+      } catch {
+        /* tolerate misbehaving observer */
+      }
+    });
+    this.outputObservers.clear();
 
     const sessionId = this.releaseSubscriptions();
 
@@ -139,7 +177,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     if (this.disposed || this.disconnected) {
       return;
     }
-    this.outputObserver?.pauseIntervalMacros();
+    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
     this.disconnected = true;
     this.highlighterStream?.flush();
 
@@ -180,7 +218,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         const output = data.toString("utf8");
         this.logger.log(`serial stdout ${JSON.stringify(output)}`);
         this.transcript?.write(output);
-        this.outputObserver?.onOutput(output);
+        this.outputObservers.forEach((o) => o.onOutput(output));
         this.callbacks.onDataReceived?.(eventSessionId);
         if (this.highlighterStream) {
           this.highlighterStream.push(output);

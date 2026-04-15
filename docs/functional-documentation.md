@@ -307,3 +307,28 @@ Implemented (~90% target):
 
 Deferred (~10%):
 - Full browser-host feature parity for Node-dependent runtime features.
+
+## 9. Scripts
+
+Author-and-run automation on top of any active SSH or Serial session.
+
+### 9.1 Flow
+1. Create a `.js` file under `<workspaceRoot>/<nexus.scripts.path>` (default `.nexus/scripts/`). Tag the leading JSDoc block with `@nexus-script` and any of the optional fields `@name`, `@description`, `@target-type`, `@target-profile`, `@default-timeout`, `@lock-input`, `@allow-macros`.
+2. First time a Nexus script command runs in the workspace, `ScriptTypesGenerator` seeds `types/nexus-scripts.d.ts` + `jsconfig.json` so the editor gives autocomplete and JSDoc hovers for `expect`, `sendLine`, `poll`, `prompt`, etc.
+3. Invoke `nexus.script.run` from the Command Palette / sidebar / `▶ Run in Nexus` CodeLens. The runtime parses the header, resolves the target session (filter by `@target-type`; auto-select on `@target-profile` match; else QuickPick), and spawns a `node:worker_threads` Worker.
+4. While running, the script's status shows in the **Nexus Scripts** status-bar entry and the **Nexus Scripts** Output Channel logs timestamped events (`→ expect …`, `← matched`, `log info: …`, `end: completed (…ms)`).
+
+### 9.2 Macro coordination
+- When a script starts, macros on the script's bound session are suspended by default (`nexus.scripts.macroPolicy = "suspend-all"`). Macros on unrelated sessions keep firing.
+- `@allow-macros name1, name2` in the header whitelists specific macros.
+- Inside the script: `macros.allow("pw")`, `macros.deny("pw")`, `macros.disableAll()`, `macros.restore()` mutate the active policy for the rest of the run. The original policy restores on any exit path.
+
+### 9.3 Stopping / failure paths
+- User stops from the status bar, CodeLens, or `nexus.script.stop`. `worker.terminate()` kills tight loops in <100 ms.
+- Wait timeout: `expect` throws `{ code: "Timeout", pattern, timeoutMs, elapsedMs }`; `waitFor` returns `null`.
+- SSH drop / serial session close while a wait is pending: pending RPCs reject with `{ code: "ConnectionLost", sessionId }`; the runtime gives the script a 150 ms grace period to run `try/catch`/`finally` before force-termination.
+- Macros, input lock, and output-observer subscription are restored/disposed on every exit path (`finally` in `cleanupRun`).
+
+### 9.4 Isolation
+- The Worker has its own V8 isolate with `resourceLimits.maxOldGenerationSizeMb = 192` so a runaway allocation terminates the worker rather than bloating the extension host.
+- The Worker bundle (`dist/services/scripts/scriptWorker.js`) does NOT import `vscode`. All UI operations round-trip through the main thread via structured-clone `postMessage`.

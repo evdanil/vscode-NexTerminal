@@ -1,9 +1,11 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { registerFileCommands } from "./commands/fileCommands";
+import { registerScriptCommands } from "./commands/scriptCommands";
 import { registerSerialCommands } from "./commands/serialCommands";
 import { registerServerCommands } from "./commands/serverCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
+import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import type { CommandContext, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory } from "./logging/terminalLogger";
@@ -26,6 +28,8 @@ import { TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
 import { createCollapsedFolderStatePersistence } from "./ui/collapsedFolderStatePersistence";
 import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
+import { ScriptCodeLensProvider } from "./ui/scriptCodeLensProvider";
+import { ScriptTreeProvider } from "./ui/scriptTreeProvider";
 import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
 import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
@@ -229,6 +233,174 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const highlighter = new TerminalHighlighter();
   const macroAutoTrigger = new MacroAutoTrigger();
+
+  const scriptOutputChannel = vscode.window.createOutputChannel("Nexus Scripts");
+  const scriptRuntimeManager = new ScriptRuntimeManager({
+    core,
+    macroAutoTrigger,
+    outputChannel: scriptOutputChannel,
+    workerPath: path.join(context.extensionPath, "dist", "services", "scripts", "scriptWorker.js"),
+    assetsDir: vscode.Uri.file(path.join(context.extensionPath, "dist", "services", "scripts", "assets"))
+  });
+  // Reverse-lookup: given a VS Code Terminal, find the Nexus session id that owns
+  // it. Used by the `runQuick` flow to auto-pick the focused terminal when the
+  // user hits ▶ on a script in the sidebar.
+  const resolveSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined => {
+    if (!terminal) return undefined;
+    for (const [sid, term] of sessionTerminals) if (term === terminal) return sid;
+    for (const [sid, entry] of serialTerminals) if (entry.terminal === terminal) return sid;
+    return undefined;
+  };
+  const scriptCommandDisposables = registerScriptCommands(
+    scriptRuntimeManager,
+    scriptOutputChannel,
+    resolveSessionForTerminal
+  );
+  const scriptTreeProvider = new ScriptTreeProvider(scriptRuntimeManager);
+  const scriptCodeLensProvider = new ScriptCodeLensProvider(scriptRuntimeManager);
+  const scriptsView = vscode.window.createTreeView("nexusScripts", {
+    treeDataProvider: scriptTreeProvider,
+    showCollapseAll: false
+  });
+  // F11 — register CodeLens for file://, vscode-remote://, and untitled:// so the
+  // ▶ Run / ◼ Stop lens surfaces for scripts opened over Remote-SSH or as untitled drafts.
+  const scriptCodeLensRegistration = vscode.languages.registerCodeLensProvider(
+    [
+      { language: "javascript", scheme: "file" },
+      { language: "javascript", scheme: "vscode-remote" },
+      { language: "javascript", scheme: "untitled" }
+    ],
+    scriptCodeLensProvider
+  );
+
+  // Script runtime status bar item — separate from the existing Nexus Command Center item.
+  const scriptStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 9);
+  scriptStatusBarItem.command = "nexus.script.openOutput";
+  scriptStatusBarItem.name = "Nexus Scripts";
+  // F4 — persistent input-lock indicator. Placed slightly to the right of the run indicator.
+  const scriptLockStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 8);
+  scriptLockStatusBarItem.name = "Nexus Scripts — Input Lock";
+  let scriptStatusBarTick: ReturnType<typeof setInterval> | undefined;
+  // P1 — expose nexusHasRunningScripts context key so keybindings (ctrl+alt+s) can gate on it.
+  let hadRunningScripts = false;
+  const renderScriptStatusBar = (): void => {
+    const runs = scriptRuntimeManager.getRuns();
+    // --- Run indicator ---
+    if (runs.length === 0) {
+      scriptStatusBarItem.hide();
+      scriptLockStatusBarItem.hide();
+      if (scriptStatusBarTick) {
+        clearInterval(scriptStatusBarTick);
+        scriptStatusBarTick = undefined;
+      }
+      if (hadRunningScripts) {
+        hadRunningScripts = false;
+        void vscode.commands.executeCommand("setContext", "nexusHasRunningScripts", false);
+      }
+      return;
+    }
+    if (!hadRunningScripts) {
+      hadRunningScripts = true;
+      void vscode.commands.executeCommand("setContext", "nexusHasRunningScripts", true);
+    }
+    if (runs.length > 1) {
+      scriptStatusBarItem.text = `$(sync~spin) ${runs.length} scripts running`;
+    } else {
+      const r = runs[0];
+      const op = r.currentOperation;
+      const elapsed = op ? Math.max(0, Math.floor((Date.now() - op.startedAt) / 1000)) : 0;
+      scriptStatusBarItem.text = op
+        ? `$(sync~spin) ${r.scriptName} — ${op.label} (${elapsed}s)`
+        : `$(sync~spin) ${r.scriptName}`;
+    }
+    const tooltip = new vscode.MarkdownString(undefined, true);
+    tooltip.isTrusted = true;
+    for (const r of runs) {
+      const stopArg = encodeURIComponent(JSON.stringify([r.sessionId]));
+      tooltip.appendMarkdown(
+        `**${r.scriptName}** on ${r.sessionName} — [◼ Stop](command:nexus.script.stop?${stopArg})\n\n`
+      );
+    }
+    scriptStatusBarItem.tooltip = tooltip;
+    scriptStatusBarItem.show();
+    if (!scriptStatusBarTick) {
+      scriptStatusBarTick = setInterval(renderScriptStatusBar, 1_000);
+    }
+
+    // --- F4: persistent input-lock indicator ---
+    const lockedRuns = runs.filter((r) => r.inputLockHeld);
+    if (lockedRuns.length === 0) {
+      scriptLockStatusBarItem.hide();
+    } else if (lockedRuns.length === 1) {
+      const r = lockedRuns[0];
+      scriptLockStatusBarItem.text = "$(lock) Terminal locked — click to stop";
+      scriptLockStatusBarItem.tooltip = `Input is locked by "${r.scriptName}" on ${r.sessionName}. Click to stop.`;
+      scriptLockStatusBarItem.command = {
+        title: "Stop Nexus Script",
+        command: "nexus.script.stop",
+        arguments: [r.sessionId]
+      };
+      scriptLockStatusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+      scriptLockStatusBarItem.show();
+    } else {
+      scriptLockStatusBarItem.text = `$(lock) ${lockedRuns.length} terminals locked`;
+      scriptLockStatusBarItem.tooltip = "Input is locked by multiple scripts. Click to choose one to stop.";
+      // No argument → the command handler will quick-pick when multiple runs exist.
+      scriptLockStatusBarItem.command = "nexus.script.stop";
+      scriptLockStatusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+      scriptLockStatusBarItem.show();
+    }
+  };
+
+  // S3 — max-runtime watchdog. One timer per session; cleared on script end.
+  const scriptWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
+  const clearScriptWatchdog = (sessionId: string): void => {
+    const t = scriptWatchdogs.get(sessionId);
+    if (t) {
+      clearTimeout(t);
+      scriptWatchdogs.delete(sessionId);
+    }
+  };
+  const startScriptWatchdog = (sessionId: string, scriptName: string): void => {
+    const maxMs = vscode.workspace.getConfiguration("nexus.scripts").get<number>("maxRuntimeMs", 1_800_000);
+    if (typeof maxMs !== "number" || maxMs <= 0) return;
+    const capped = Math.max(10_000, Math.floor(maxMs));
+    clearScriptWatchdog(sessionId);
+    const timer = setTimeout(() => {
+      scriptWatchdogs.delete(sessionId);
+      scriptOutputChannel.appendLine(
+        `[watchdog] "${scriptName}" exceeded max runtime of ${capped}ms — stopping.`
+      );
+      void scriptRuntimeManager.stopScript(sessionId, "max-runtime-exceeded");
+    }, capped);
+    scriptWatchdogs.set(sessionId, timer);
+  };
+
+  const scriptStatusBarListener = scriptRuntimeManager.onDidChangeRun((event) => {
+    // S3 watchdog lifecycle + F6 error toasts. F4 lock indicator is driven from the
+    // `inputLockHeld` field on each run snapshot (no side cache needed).
+    if (event.kind === "started") {
+      startScriptWatchdog(event.run.sessionId, event.run.scriptName);
+    } else if (event.kind === "ended") {
+      clearScriptWatchdog(event.run.sessionId);
+      // F6 — toast on failures that *aren't* the documented user-error codes
+      // (Timeout / ConnectionLost / Stopped / Cancelled). Those are the error
+      // contract scripts ride on; toasting them would be noise.
+      if (event.finalState === "failed" && event.failureReason && event.failureReason !== "expected") {
+        const scriptName = event.run.scriptName;
+        void (async () => {
+          const picked = await vscode.window.showErrorMessage(
+            `Script ${scriptName} failed. See the Nexus Scripts output for details.`,
+            "Show Output"
+          );
+          if (picked === "Show Output") {
+            void vscode.commands.executeCommand("nexus.script.openOutput");
+          }
+        })();
+      }
+    }
+    renderScriptStatusBar();
+  });
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
   const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
   const sftpService = new SftpService(pool, readSftpServiceConfig());
@@ -261,7 +433,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     secretVault,
     registrySync,
     focusedTerminal: vscode.window.activeTerminal ?? undefined,
-    activityIndicators: new Map()
+    activityIndicators: new Map(),
+    scriptRuntimeManager
   };
 
   const nexusTreeProvider = new NexusTreeProvider({
@@ -677,6 +850,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     macroAutoTrigger,
     macroView,
     macroAutoTriggerListener,
+    scriptRuntimeManager,
+    scriptOutputChannel,
+    scriptTreeProvider,
+    scriptCodeLensProvider,
+    scriptsView,
+    scriptCodeLensRegistration,
+    scriptStatusBarItem,
+    scriptLockStatusBarItem,
+    scriptStatusBarListener,
+    {
+      dispose: () => {
+        if (scriptStatusBarTick) clearInterval(scriptStatusBarTick);
+        for (const t of scriptWatchdogs.values()) clearTimeout(t);
+        scriptWatchdogs.clear();
+      }
+    },
+    ...scriptCommandDisposables,
     fileExplorerView,
     fsRegistration,
     statusBarItem,

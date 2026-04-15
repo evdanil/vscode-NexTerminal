@@ -1,4 +1,5 @@
 import * as esbuild from "esbuild";
+import { cp, mkdir } from "node:fs/promises";
 
 const production = process.argv.includes("--production");
 
@@ -38,5 +39,19 @@ await esbuild.build({
   // serialport has native addons loaded via node-gyp-build — must stay in node_modules
   external: ["serialport"],
 });
+
+// Script runtime worker — runs in a node:worker_threads Worker spawned by ScriptRuntimeManager.
+// Isolated V8 isolate so user-authored scripts can be terminate()d without blocking the extension host.
+await esbuild.build({
+  ...common,
+  entryPoints: ["src/services/scripts/scriptWorker.ts"],
+  outfile: "dist/services/scripts/scriptWorker.js",
+  external: ["vscode"],
+});
+
+// Ship the IntelliSense .d.ts + jsconfig template alongside the worker so the
+// runtime can copy them into user workspaces on first script invocation.
+await mkdir("dist/services/scripts/assets", { recursive: true });
+await cp("src/services/scripts/assets", "dist/services/scripts/assets", { recursive: true });
 
 console.log("Build complete");

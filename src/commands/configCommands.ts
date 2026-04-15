@@ -82,7 +82,11 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.terminal.macros", key: "defaultCooldown" },
   { section: "nexus.terminal.macros", key: "bufferLength" },
   { section: "nexus.serial", key: "rpcTimeout" },
-  { section: "nexus.sftp", key: "remoteWatchMode" }
+  { section: "nexus.sftp", key: "remoteWatchMode" },
+  { section: "nexus.scripts", key: "path" },
+  { section: "nexus.scripts", key: "defaultTimeout" },
+  { section: "nexus.scripts", key: "macroPolicy" },
+  { section: "nexus.scripts", key: "maxRuntimeMs" }
 ];
 
 const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`));

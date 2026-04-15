@@ -104,6 +104,10 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
   private readonly unsubscribeError: () => void;
   private readonly unsubscribeDisconnect: () => void;
 
+  private readonly outputObservers = new Set<PtyOutputObserver>();
+  private inputBlocked = false;
+  private inputBlockNoticeArmed = true;
+
   public constructor(
     private readonly transport: SmartSerialTransport,
     private readonly profile: SerialProfile,
@@ -111,8 +115,9 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     private readonly logger: SessionLogger,
     private readonly transcript?: SessionTranscript,
     private readonly highlighter?: TerminalHighlighter,
-    private readonly outputObserver?: PtyOutputObserver
+    outputObserver?: PtyOutputObserver
   ) {
+    if (outputObserver) this.outputObservers.add(outputObserver);
     this.preferredPath = profile.path;
     this.deviceHint = profile.deviceHint;
     this.highlighterStream =
@@ -126,7 +131,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       const output = data.toString("utf8");
       this.logger.log(`smart serial stdout ${JSON.stringify(output)}`);
       this.transcript?.write(output);
-      this.outputObserver?.onOutput(output);
+      this.outputObservers.forEach((o) => o.onOutput(output));
       this.callbacks.onDataReceived?.();
       if (this.highlighterStream) {
         this.highlighterStream.push(output);
@@ -153,6 +158,25 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
   public readonly onDidClose: vscode.Event<void> = this.closeEmitter.event;
   public readonly onDidChangeName: vscode.Event<string> = this.nameEmitter.event;
+
+  public addOutputObserver(observer: PtyOutputObserver): vscode.Disposable {
+    this.outputObservers.add(observer);
+    return new vscode.Disposable(() => {
+      this.outputObservers.delete(observer);
+    });
+  }
+
+  public setInputBlocked(blocked: boolean): void {
+    this.inputBlocked = blocked;
+    if (blocked) this.inputBlockNoticeArmed = true;
+  }
+
+  public writeProgrammatic(data: string): void {
+    if (this.disposed || this.stopped || !this.transportSessionId) return;
+    void this.transport.writePort(this.transportSessionId, Buffer.from(data, "utf8")).catch(() => {
+      /* best-effort; ConnectionLost surfaces via NexusCore.onDidChange */
+    });
+  }
 
   private get terminalNameBase(): string {
     return `Nexus Serial: ${this.profile.name} [Smart Follow]`;
@@ -188,6 +212,13 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
   }
 
   public handleInput(data: string): void {
+    if (this.inputBlocked) {
+      if (this.inputBlockNoticeArmed) {
+        this.inputBlockNoticeArmed = false;
+        this.writeEmitter.fire("\r\n[Nexus] Terminal is locked while a script is running. Stop the script to send input.\r\n");
+      }
+      return;
+    }
     if (this.stopped) {
       const now = Date.now();
       if (now - this.lastStoppedHintAt >= STOPPED_INPUT_HINT_INTERVAL_MS) {
@@ -217,7 +248,14 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.disposed = true;
     this.stopPolling();
     this.highlighterStream?.dispose();
-    this.outputObserver?.dispose();
+    this.outputObservers.forEach((o) => {
+      try {
+        o.dispose();
+      } catch {
+        /* tolerate misbehaving observer */
+      }
+    });
+    this.outputObservers.clear();
     this.unsubscribeData();
     this.unsubscribeError();
     this.unsubscribeDisconnect();
@@ -530,7 +568,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     if (this.disposed || this.stopped) {
       return;
     }
-    this.outputObserver?.pauseIntervalMacros();
+    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
     this.highlighterStream?.flush();
     const lostPath = this.currentPath ?? this.preferredPath;
     this.logger.log(`smart serial port disconnected: ${reason}`);

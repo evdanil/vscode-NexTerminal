@@ -99,7 +99,18 @@ const unsupportedCommands = [
   "nexus.authProfile.add",
   "nexus.authProfile.manage",
   "nexus.authProfile.applyToFolder",
-  "nexus.authProfile.applyToServer"
+  "nexus.authProfile.applyToServer",
+  "nexus.script.run",
+  "nexus.script.runQuick",
+  "nexus.script.stop",
+  "nexus.script.new",
+  "nexus.script.openOutput",
+  "nexus.script.openDocs",
+  "nexus.script.delete",
+  "nexus.script.edit",
+  "nexus.script.openScriptsFolder",
+  "nexus.server.runWithScript",
+  "nexus.serial.runWithScript"
 ];
 
 export function activate(context: vscode.ExtensionContext): void {

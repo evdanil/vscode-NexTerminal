@@ -31,6 +31,10 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   private activityIndicator = false;
   private readonly highlighterStream?: TerminalHighlighterStream;
 
+  private readonly outputObservers = new Set<PtyOutputObserver>();
+  private inputBlocked = false;
+  private inputBlockNoticeArmed = true;
+
   public constructor(
     private readonly serverConfig: ServerConfig,
     private readonly sshFactory: SshFactory,
@@ -38,13 +42,31 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly logger: SessionLogger,
     private readonly transcript?: SessionTranscript,
     private readonly highlighter?: TerminalHighlighter,
-    private readonly outputObserver?: PtyOutputObserver,
+    outputObserver?: PtyOutputObserver,
     private readonly terminalType: string = "xterm-256color"
   ) {
     this.highlighterStream =
       typeof (highlighter as { createStream?: unknown } | undefined)?.createStream === "function"
         ? highlighter?.createStream((text) => this.writeEmitter.fire(text))
         : undefined;
+    if (outputObserver) this.outputObservers.add(outputObserver);
+  }
+
+  public addOutputObserver(observer: PtyOutputObserver): vscode.Disposable {
+    this.outputObservers.add(observer);
+    return new vscode.Disposable(() => {
+      this.outputObservers.delete(observer);
+    });
+  }
+
+  public setInputBlocked(blocked: boolean): void {
+    this.inputBlocked = blocked;
+    if (blocked) this.inputBlockNoticeArmed = true;
+  }
+
+  public writeProgrammatic(data: string): void {
+    if (this.disposed || this.disconnected || this.connectFailed) return;
+    this.stream?.write(data);
   }
 
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
@@ -73,6 +95,13 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   }
 
   public handleInput(data: string): void {
+    if (this.inputBlocked) {
+      if (this.inputBlockNoticeArmed) {
+        this.inputBlockNoticeArmed = false;
+        this.writeEmitter.fire("\r\n[Nexus] Terminal is locked while a script is running. Stop the script to send input.\r\n");
+      }
+      return;
+    }
     if (this.connectFailed) {
       this.dispose();
       return;
@@ -105,7 +134,14 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.highlighterStream?.dispose();
     this.stream?.destroy();
     this.connection?.dispose();
-    this.outputObserver?.dispose();
+    this.outputObservers.forEach((o) => {
+      try {
+        o.dispose();
+      } catch {
+        /* tolerate misbehaving observer */
+      }
+    });
+    this.outputObservers.clear();
     this.transcript?.close();
     this.logger.log("terminal closed");
     this.logger.close();
@@ -123,7 +159,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     if (this.disposed || this.disconnected || generation !== this.connectionGeneration) {
       return;
     }
-    this.outputObserver?.pauseIntervalMacros();
+    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
     this.disconnected = true;
     this.highlighterStream?.flush();
     this.stream?.destroy();
@@ -212,7 +248,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
         const text = typeof data === "string" ? data : data.toString("utf8");
         this.logger.log(`stdout ${JSON.stringify(text)}`);
         this.transcript?.write(text);
-        this.outputObserver?.onOutput(text);
+        this.outputObservers.forEach((o) => o.onOutput(text));
         this.callbacks.onDataReceived?.(this.sessionId);
         if (this.highlighterStream) {
           this.highlighterStream.push(text);

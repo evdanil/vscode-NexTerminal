@@ -188,6 +188,14 @@ export class NexusCore {
     this.emitChanged();
   }
 
+  /**
+   * Returns the active SSH or serial session with the given id.
+   * Callers use this to resolve the {@link SessionPtyHandle} for output observation / input locking.
+   */
+  public getActiveSessionById(sessionId: string): ActiveSession | ActiveSerialSession | undefined {
+    return this.activeSessions.get(sessionId) ?? this.activeSerialSessions.get(sessionId);
+  }
+
   public unregisterSerialSession(sessionId: string): void {
     this.activeSerialSessions.delete(sessionId);
     this.activitySessionIds.delete(sessionId);
