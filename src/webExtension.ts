@@ -104,7 +104,9 @@ const unsupportedCommands = [
   "nexus.script.runWithTarget",
   "nexus.script.stop",
   "nexus.script.new",
-  "nexus.script.openOutput"
+  "nexus.script.openOutput",
+  "nexus.script.openDocs",
+  "nexus.script.delete"
 ];
 
 export function activate(context: vscode.ExtensionContext): void {

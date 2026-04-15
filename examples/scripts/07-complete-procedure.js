@@ -11,12 +11,17 @@
 // This example walks through a realistic router procedure to demonstrate how the
 // API primitives fit together. Adapt the prompts/commands to your device family.
 //
+// Note: `@allow-macros hostname-prompt` assumes a macro named "hostname-prompt"
+// exists in your workspace — replace or remove this line if you don't have one.
+// The header is just a declarative allow-list; an unknown name is a no-op.
+//
 // Key patterns:
 //   - try/catch around every expect for graceful failure handling
 //   - waitAny to disambiguate devices with multiple prompt styles
 //   - poll for device reboots where a plain expect would time out
 //   - macros.disableAll() to suspend unrelated password/hostname macros
-//     that might fire on our input (re-enabled in the finally)
+//     that might fire on our input (the runtime auto-restores on exit,
+//     so no finally-block cleanup is needed)
 //   - `session` metadata so the same script can behave differently on
 //     production vs. lab devices
 //
@@ -80,16 +85,17 @@ try {
     await alert("Downgrade complete. Verify the version string above.");
   }
 } catch (err) {
-  // Report whichever failure mode fired.
+  // Report whichever failure mode fired. Include a tail of recent output for
+  // Timeout cases so the log actually shows what the device said last.
   if (err.code === "Timeout") {
     log.error(`timeout waiting for ${err.pattern} after ${err.elapsedMs}ms`);
+    log.error("recent output:", await tail(1024));
   } else if (err.code === "ConnectionLost") {
     log.error("lost the session mid-procedure — manual intervention required");
   } else {
     log.error("procedure failed:", err.message);
   }
   throw err;
-} finally {
-  // Always restore macros, regardless of success or failure.
-  macros.restore();
 }
+// No `finally { macros.restore() }` — the runtime auto-restores macros and
+// releases the input lock on every exit path (success, stop, crash, ConnectionLost).

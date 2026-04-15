@@ -7,9 +7,11 @@ const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
   dependencies: Record<string, string>;
   configurationDefaults?: Record<string, unknown>;
   contributes: {
-    commands: Array<{ command: string; title: string; enablement?: string }>;
+    commands: Array<{ command: string; title: string; enablement?: string; icon?: string }>;
     menus: Record<string, Array<{ command: string; when?: string; group?: string }>>;
     configuration?: { properties?: Record<string, any> };
+    viewsWelcome?: Array<{ view: string; contents: string }>;
+    keybindings?: Array<{ command: string; key: string; mac?: string; when?: string }>;
   };
 };
 
@@ -119,5 +121,88 @@ describe("package contributions", () => {
   it("only skips shell for live macro commands", () => {
     const commandsToSkipShell = packageJson.configurationDefaults?.["terminal.integrated.commandsToSkipShell"];
     expect(commandsToSkipShell).toEqual(["nexus.macro.run", "nexus.macro.runBinding"]);
+  });
+
+  describe("Scripts view contributions (S1/S2/S3/F3/P1)", () => {
+    it("contributes a viewsWelcome entry for nexusScripts with New Script and docs actions", () => {
+      const welcome = packageJson.contributes.viewsWelcome ?? [];
+      const entry = welcome.find((w) => w.view === "nexusScripts");
+      expect(entry).toBeDefined();
+      expect(entry?.contents).toContain("command:nexus.script.new");
+      expect(entry?.contents).toContain("command:nexus.script.openDocs");
+    });
+
+    it("contributes a nexus.script.openDocs command", () => {
+      const commands = packageJson.contributes.commands.map((item) => item.command);
+      expect(commands).toContain("nexus.script.openDocs");
+    });
+
+    it("contributes a nexus.script.delete command", () => {
+      const commands = packageJson.contributes.commands.map((item) => item.command);
+      expect(commands).toContain("nexus.script.delete");
+    });
+
+    it("adds a New Script button to the nexusScripts view title bar", () => {
+      const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+      const newScriptItem = titleMenuItems.find(
+        (item) => item.command === "nexus.script.new" && item.when === "view == nexusScripts"
+      );
+      expect(newScriptItem).toBeDefined();
+      expect(newScriptItem?.group).toMatch(/^navigation/);
+    });
+
+    it("adds run/stop/reveal/delete context menus for the nexusScripts view items", () => {
+      const items = packageJson.contributes.menus["view/item/context"] ?? [];
+      const scriptItems = items.filter((i) => i.when?.includes("view == nexusScripts"));
+      const commands = scriptItems.map((i) => i.command);
+      expect(commands).toContain("nexus.script.run");
+      expect(commands).toContain("nexus.script.stop");
+      expect(commands).toContain("revealInExplorer");
+      expect(commands).toContain("nexus.script.delete");
+
+      // Inline run appears on idle items only
+      const inlineRun = scriptItems.find(
+        (i) => i.command === "nexus.script.run" && i.group === "inline"
+      );
+      expect(inlineRun?.when).toContain("viewItem == nexus.script.file");
+
+      // Inline stop appears on running items only
+      const inlineStop = scriptItems.find(
+        (i) => i.command === "nexus.script.stop" && i.group === "inline"
+      );
+      expect(inlineStop?.when).toContain("viewItem == nexus.script.running");
+    });
+
+    it("hides nexus.script.runWithTarget from the command palette (F3)", () => {
+      const palette = packageJson.contributes.menus["commandPalette"] ?? [];
+      const entry = palette.find((p) => p.command === "nexus.script.runWithTarget");
+      expect(entry).toBeDefined();
+      expect(entry?.when).toBe("false");
+    });
+
+    it("contributes nexus.scripts.maxRuntimeMs setting (S3)", () => {
+      const prop = packageJson.contributes.configuration?.properties?.["nexus.scripts.maxRuntimeMs"];
+      expect(prop).toBeDefined();
+      expect(prop?.type).toBe("number");
+      expect(prop?.default).toBe(1_800_000);
+      expect(prop?.minimum).toBe(10_000);
+      expect(prop?.markdownDescription || prop?.description).toMatch(/runtime/i);
+    });
+
+    it("contributes optional keybindings for script run/stop (P1)", () => {
+      const kbs = packageJson.contributes.keybindings ?? [];
+      const runBinding = kbs.find((k) => k.command === "nexus.script.run");
+      expect(runBinding).toBeDefined();
+      expect(runBinding?.key.toLowerCase()).toContain("ctrl+alt+r");
+      expect(runBinding?.mac?.toLowerCase()).toContain("cmd+alt+r");
+      expect(runBinding?.when).toMatch(/editorTextFocus/);
+      expect(runBinding?.when).toMatch(/resourceExtname == .js|resourceExtname == \.js/);
+
+      const stopBinding = kbs.find((k) => k.command === "nexus.script.stop");
+      expect(stopBinding).toBeDefined();
+      expect(stopBinding?.key.toLowerCase()).toContain("ctrl+alt+s");
+      expect(stopBinding?.mac?.toLowerCase()).toContain("cmd+alt+s");
+      expect(stopBinding?.when).toMatch(/nexusHasRunningScripts/);
+    });
   });
 });

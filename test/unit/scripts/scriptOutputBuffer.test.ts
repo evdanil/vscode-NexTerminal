@@ -83,4 +83,36 @@ describe("ScriptOutputBuffer", () => {
     const m = buf.scan(/PROMPT# /);
     expect(m?.before).toBe("noise noise ");
   });
+
+  describe("tail()", () => {
+    it("returns empty string for an empty buffer", () => {
+      const buf = new ScriptOutputBuffer();
+      expect(buf.tail(100)).toBe("");
+    });
+
+    it("returns the last N chars of stripped output", () => {
+      const buf = new ScriptOutputBuffer();
+      buf.append("123456789");
+      expect(buf.tail(4)).toBe("6789");
+    });
+
+    it("caps at the buffer length when N exceeds what's been received", () => {
+      const buf = new ScriptOutputBuffer();
+      buf.append("short");
+      expect(buf.tail(9999)).toBe("short");
+    });
+
+    it("returns empty string for non-positive N", () => {
+      const buf = new ScriptOutputBuffer();
+      buf.append("abc");
+      expect(buf.tail(0)).toBe("");
+      expect(buf.tail(-1)).toBe("");
+    });
+
+    it("reflects ANSI-stripped content, not raw escape bytes", () => {
+      const buf = new ScriptOutputBuffer();
+      buf.append("\x1b[31merror\x1b[0m");
+      expect(buf.tail(5)).toBe("error");
+    });
+  });
 });

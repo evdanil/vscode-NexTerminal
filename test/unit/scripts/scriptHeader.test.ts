@@ -99,4 +99,20 @@ describe("scriptHeader / parseScriptHeader", () => {
     expect(h.name).toBe("First");
     expect(h.warnings.join("\n")).toMatch(/duplicate/i);
   });
+
+  it("concatenates and dedupes values across multiple @allow-macros lines", () => {
+    const h = parseScriptHeader(
+      base(
+        [
+          "@nexus-script",
+          "@allow-macros password",
+          "@allow-macros hostname-prompt, password",
+          "@allow-macros keep-alive"
+        ].join("\n")
+      )
+    );
+    expect(h.allowMacros).toEqual(["password", "hostname-prompt", "keep-alive"]);
+    // Dedup should not produce a "duplicate" warning for @allow-macros.
+    expect(h.warnings.join("\n")).not.toMatch(/allow-macros/);
+  });
 });

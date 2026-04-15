@@ -1,4 +1,4 @@
-// Nexus Scripts API types — v1
+// Nexus Scripts API types — v2
 /**
  * Nexus Terminal — Scripts API
  *
@@ -200,6 +200,20 @@ declare global {
    * Sleep for a fixed duration in milliseconds.
    */
   function sleep(ms: number): Promise<void>;
+
+  /**
+   * Return the last `n` characters of the stripped output buffer — useful inside `catch` blocks
+   * or after a `waitFor` returns `null`, where you need to inspect what the session has emitted
+   * without waiting for another match.
+   *
+   * The buffer is ANSI-stripped and capped at 64 KiB; values of `n` larger than that are clamped.
+   * Default `n` is 512. Returns an empty string if nothing has been received yet.
+   *
+   * @example
+   *   const m = await waitFor(/OK/, { timeout: 1000 });
+   *   if (!m) log.warn("no OK — recent output:", await tail());
+   */
+  function tail(n?: number): Promise<string>;
 
   /**
    * Logger writing to the "Nexus Scripts" Output Channel.

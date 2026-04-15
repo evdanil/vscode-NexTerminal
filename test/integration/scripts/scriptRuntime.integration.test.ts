@@ -265,4 +265,106 @@ describe("ScriptRuntimeManager — end-to-end integration", () => {
 
     await fs.unlink(tmpFile).catch(() => {});
   }, 10_000);
+
+  it("(e) output-channel log lines include both script name and session name (F9)", async () => {
+    // Use a throwaway fixture so we don't depend on a specific output pattern.
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const tmpFile = path.join(os.tmpdir(), `nexus-script-f9-${Date.now()}.js`);
+    await fs.writeFile(
+      tmpFile,
+      `/**\n * @nexus-script\n * @name F9ScriptName\n */\nlog.info("ping");\n`,
+      "utf8"
+    );
+
+    const pty = makeTestPty();
+    const session: ActiveSession = {
+      id: "test-session",
+      serverId: "srv1",
+      terminalName: "prod-router-7",
+      startedAt: Date.now(),
+      pty
+    };
+    const core = makeMockCore(session);
+    const appended: string[] = [];
+    const outputChannel = {
+      appendLine: vi.fn((s: string) => appended.push(s)),
+      append: vi.fn(),
+      show: vi.fn(),
+      dispose: vi.fn()
+    } as unknown as { appendLine: (s: string) => void };
+    const workerPath = path.resolve(__dirname, "..", "..", "..", "dist", "services", "scripts", "scriptWorker.js");
+    const manager = new ScriptRuntimeManager({
+      core,
+      macroAutoTrigger: { pushFilter: () => ({ dispose: () => {} }), bindObserverToSession: () => {} } as never,
+      outputChannel: outputChannel as never,
+      workerPath
+    });
+    const events: string[] = [];
+    manager.onDidChangeRun((e) => events.push(e.kind + (e.kind === "ended" ? `:${e.finalState}` : "")));
+    await manager.runScript({ fsPath: tmpFile } as never, "test-session");
+    await waitFor(() => events.includes("ended:completed"), 3_000);
+
+    const hasTaggedLine = appended.some((line) => line.includes("F9ScriptName@prod-router-7"));
+    expect(hasTaggedLine).toBe(true);
+    await fs.unlink(tmpFile).catch(() => {});
+  }, 10_000);
+
+  it("(f) ConnectionLost releases the input lock even after the session is deregistered (M1)", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const tmpFile = path.join(os.tmpdir(), `nexus-script-m1-${Date.now()}.js`);
+    await fs.writeFile(
+      tmpFile,
+      `/**\n * @nexus-script\n * @lock-input\n */\ntry { await expect("NEVER", { timeout: 60_000 }); } catch (e) { log.info("caught:" + e.code); throw e; }\n`,
+      "utf8"
+    );
+
+    const { manager, core, pty } = runtimeFixture("basic-expect-send.js");
+    const setInputBlockedMock = pty.setInputBlocked as ReturnType<typeof vi.fn>;
+    await manager.runScript({ fsPath: tmpFile } as never, "test-session");
+
+    // Wait for the script to reach the expect() — lock should be engaged.
+    await waitFor(() => setInputBlockedMock.mock.calls.some((c) => c[0] === true), 2_000);
+    expect(setInputBlockedMock.mock.calls.some((c) => c[0] === true)).toBe(true);
+
+    // Remove the session (simulating ConnectionLost) BEFORE the 60s timeout could fire.
+    core.removeSession();
+    core.emitChange();
+
+    // Cleanup should release the lock via the stored pty handle, not via core lookup.
+    await waitFor(() => setInputBlockedMock.mock.calls.some((c) => c[0] === false), 3_000);
+    expect(setInputBlockedMock.mock.calls.some((c) => c[0] === false)).toBe(true);
+    await fs.unlink(tmpFile).catch(() => {});
+  }, 10_000);
+
+  it("(g) waitAny with long timeout unblocks fast on ConnectionLost (H1)", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const tmpFile = path.join(os.tmpdir(), `nexus-script-h1-${Date.now()}.js`);
+    // 60-second waitAny on patterns that will never match; we expect this to abort fast.
+    await fs.writeFile(
+      tmpFile,
+      `/**\n * @nexus-script\n */\ntry { await waitAny([/NEVER_A/, /NEVER_B/], { timeout: 60_000 }); } catch (e) { log.info("caught:" + e.code); throw e; }\n`,
+      "utf8"
+    );
+
+    const { manager, core } = runtimeFixture("basic-expect-send.js");
+    const logs: string[] = [];
+    const endEvents: Array<{ finalState?: string }> = [];
+    manager.onDidChangeRun((e) => {
+      if (e.kind === "log") logs.push(e.text);
+      if (e.kind === "ended") endEvents.push(e as never);
+    });
+    await manager.runScript({ fsPath: tmpFile } as never, "test-session");
+    await new Promise((r) => setTimeout(r, 200)); // let waitAny register
+    const before = Date.now();
+    core.removeSession();
+    core.emitChange();
+    await waitFor(() => endEvents.length > 0, 5_000);
+    const elapsed = Date.now() - before;
+    expect(elapsed).toBeLessThan(1_000); // fast — not the 60s timeout
+    expect(logs.some((l) => l === "caught:ConnectionLost")).toBe(true);
+    await fs.unlink(tmpFile).catch(() => {});
+  }, 10_000);
 });

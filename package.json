@@ -99,6 +99,10 @@
       {
         "view": "nexusMacros",
         "contents": "No macros defined.\n[Add Macro](command:nexus.macro.add)\nMacros send predefined text to the active terminal."
+      },
+      {
+        "view": "nexusScripts",
+        "contents": "Nexus scripts automate SSH and Serial sessions with expect/send style.\n[New Script](command:nexus.script.new)\n[Open scripting guide](command:nexus.script.openDocs)"
       }
     ],
     "commands": [
@@ -550,6 +554,17 @@
         "title": "Show Nexus Scripts Output",
         "category": "Nexus",
         "icon": "$(output)"
+      },
+      {
+        "command": "nexus.script.openDocs",
+        "title": "Open Scripting Guide",
+        "category": "Nexus",
+        "icon": "$(book)"
+      },
+      {
+        "command": "nexus.script.delete",
+        "title": "Delete Script",
+        "icon": "$(trash)"
       }
     ],
     "menus": {
@@ -658,6 +673,11 @@
           "command": "nexus.files.disconnect",
           "when": "view == nexusFileExplorer",
           "group": "navigation@8"
+        },
+        {
+          "command": "nexus.script.new",
+          "when": "view == nexusScripts",
+          "group": "navigation@1"
         }
       ],
       "view/item/context": [
@@ -1005,6 +1025,36 @@
           "command": "nexus.files.delete",
           "when": "view == nexusFileExplorer && viewItem =~ /^nexus\\.fileExplorer\\.(file|dir)$/",
           "group": "3_destructive"
+        },
+        {
+          "command": "nexus.script.run",
+          "when": "view == nexusScripts && viewItem == nexus.script.file",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.script.stop",
+          "when": "view == nexusScripts && viewItem == nexus.script.running",
+          "group": "inline"
+        },
+        {
+          "command": "nexus.script.run",
+          "when": "view == nexusScripts && viewItem == nexus.script.file",
+          "group": "0_run"
+        },
+        {
+          "command": "nexus.script.stop",
+          "when": "view == nexusScripts && viewItem == nexus.script.running",
+          "group": "0_run"
+        },
+        {
+          "command": "revealInExplorer",
+          "when": "view == nexusScripts && viewItem =~ /^nexus\\.script\\.(file|running)$/",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "nexus.script.delete",
+          "when": "view == nexusScripts && viewItem =~ /^nexus\\.script\\.(file|running)$/",
+          "group": "3_destructive"
         }
       ],
       "commandPalette": [
@@ -1310,6 +1360,18 @@
         },
         {
           "command": "nexus.files.disconnect",
+          "when": "true"
+        },
+        {
+          "command": "nexus.script.runWithTarget",
+          "when": "false"
+        },
+        {
+          "command": "nexus.script.delete",
+          "when": "false"
+        },
+        {
+          "command": "nexus.script.openDocs",
           "when": "true"
         }
       ]
@@ -2287,6 +2349,18 @@
         },
         "key": "ctrl+shift+9",
         "when": "terminalFocus && nexus.macro.ctrlShift.9"
+      },
+      {
+        "command": "nexus.script.run",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r",
+        "when": "editorTextFocus && resourceExtname == .js"
+      },
+      {
+        "command": "nexus.script.stop",
+        "key": "ctrl+alt+s",
+        "mac": "cmd+alt+s",
+        "when": "nexusHasRunningScripts"
       }
     ],
     "configuration": {
@@ -2829,6 +2903,13 @@
           "default": "suspend-all",
           "order": 22,
           "markdownDescription": "How the script runtime treats macro auto-triggers on the bound session while a script is running."
+        },
+        "nexus.scripts.maxRuntimeMs": {
+          "type": "number",
+          "default": 1800000,
+          "minimum": 10000,
+          "order": 23,
+          "markdownDescription": "Maximum total runtime for a script in milliseconds. 0 disables the cap. The script is stopped with code 'MaxRuntimeExceeded' if it exceeds this."
         }
       }
     }

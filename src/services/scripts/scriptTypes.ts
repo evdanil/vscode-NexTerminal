@@ -30,7 +30,26 @@ export interface RunningScriptSnapshot {
   startedAt: number;
   state: RunState;
   currentOperation: ScriptRunOperation | null;
+  /** Whether the script requested `@lock-input` and the lock is currently held. */
+  inputLockHeld: boolean;
 }
+
+/**
+ * Categorises why a failed script ended, for UI filtering.
+ *   - "worker-crash"  — the Worker thread itself errored (native crash, allocation, etc.).
+ *   - "script-error"  — user code threw an uncaught exception that isn't a well-known
+ *                       runtime code (i.e. looks like a bug or syntax error).
+ *   - "expected"      — user code threw one of the well-known codes the API documents
+ *                       (Timeout / ConnectionLost / Stopped / Cancelled). Surfacing
+ *                       a toast for these would be noise.
+ */
+export type FailureReason = "worker-crash" | "script-error" | "expected";
+
+/**
+ * Reasons the host may pass to `stopScript(sessionId, reason?)` for logging /
+ * telemetry. Not part of the runtime state machine — scripts still end in `stopped`.
+ */
+export type StopReason = "user-requested" | "max-runtime-exceeded" | "extension-deactivating";
 
 export type ScriptRunEvent =
   | { kind: "started"; run: RunningScriptSnapshot }
@@ -50,7 +69,16 @@ export type ScriptRunEvent =
       level: "info" | "warn" | "error";
       text: string;
     }
-  | { kind: "ended"; run: RunningScriptSnapshot; finalState: FinalState; durationMs: number };
+  | {
+      kind: "ended";
+      run: RunningScriptSnapshot;
+      finalState: FinalState;
+      durationMs: number;
+      /** Only populated when `finalState === "failed"`. Lets the UI filter toasts. */
+      failureReason?: FailureReason;
+      /** Free-form context passed by the stop caller (e.g. "max-runtime-exceeded"). */
+      stopReason?: StopReason;
+    };
 
 /** IPC frame sent from main → worker. */
 export type WorkerInbound =

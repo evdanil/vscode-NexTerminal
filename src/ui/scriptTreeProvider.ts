@@ -36,7 +36,14 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       return item;
     }
     const item = new vscode.TreeItem(node.name, vscode.TreeItemCollapsibleState.None);
-    item.description = node.description;
+    // F8 — description fallback when the header doesn't supply one.
+    //   - Running: a badge so users can tell at a glance what's live.
+    //   - Idle: prefer the header description; else leave blank (the filename is already the label).
+    if (node.running) {
+      item.description = node.description ? `${node.description}   \u2022 running` : "\u25CF running";
+    } else {
+      item.description = node.description ?? "";
+    }
     item.tooltip = node.parseErrors.length > 0
       ? `Header errors:\n${node.parseErrors.join("\n")}`
       : node.description || node.uri.fsPath;
@@ -47,13 +54,12 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       : node.running
         ? new vscode.ThemeIcon("sync~spin")
         : new vscode.ThemeIcon("file-code");
-    if (node.parseErrors.length === 0) {
-      item.command = {
-        title: "Open",
-        command: "vscode.open",
-        arguments: [node.uri]
-      };
-    }
+    // P7 — always allow clicking to open the file so users can fix header errors.
+    item.command = {
+      title: "Open",
+      command: "vscode.open",
+      arguments: [node.uri]
+    };
     return item;
   }
 

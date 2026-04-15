@@ -169,6 +169,10 @@ npm run package:vsix
 | `nexus.sftp.deleteDepthLimit` | `100` | Safety limit for recursive delete directory depth |
 | `nexus.sftp.deleteOperationLimit` | `10000` | Safety limit for items removed by one recursive delete |
 | `nexus.serial.rpcTimeout` | `10` | Timeout for serial sidecar commands in seconds |
+| `nexus.scripts.path` | `.nexus/scripts` | Workspace-relative directory where Nexus scripts live |
+| `nexus.scripts.defaultTimeout` | `30000` | Default per-wait timeout in ms for `waitFor` / `expect` / `waitAny` when not specified |
+| `nexus.scripts.macroPolicy` | `suspend-all` | Macro policy while a script runs: `suspend-all` or `keep-enabled` |
+| `nexus.scripts.maxRuntimeMs` | `1800000` | Overall runtime cap in ms — exceeded runs are auto-stopped with reason `max-runtime-exceeded`. `0` disables the cap |
 
 ## Documentation
 

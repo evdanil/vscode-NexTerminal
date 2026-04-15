@@ -6,7 +6,7 @@ import * as vscode from "vscode";
  * Bump this string whenever contracts/script-api.d.ts changes shape in a way users
  * should pick up immediately.
  */
-export const BUNDLED_DTS_VERSION_HEADER = "// Nexus Scripts API types — v1";
+export const BUNDLED_DTS_VERSION_HEADER = "// Nexus Scripts API types — v2";
 
 export interface BundledAssets {
   dts: string;

@@ -282,7 +282,7 @@ const pw = await prompt("Enable password", { password: true });
 
 #### `confirm(message)` → `Promise<boolean>`
 
-Native modal with an **OK** button. Returns `true` on OK, `false` on dismiss.
+Native modal with **OK** and **Cancel** buttons. Resolves `true` when the user picks **OK**, `false` on **Cancel** or dismiss.
 
 ```js
 if (!(await confirm("Reboot device now?"))) {
@@ -308,6 +308,17 @@ Wait for a fixed duration.
 ```js
 await sleep(500);
 ```
+
+#### `tail(n?)` → `Promise<string>`
+
+Return the last `n` characters of the stripped output buffer (ANSI already removed). Defaults to 512, caps at the buffer length (64 KiB). Use this inside a `catch` block or after a `waitFor` that returned `null` to see what actually arrived:
+
+```js
+const m = await waitFor(/OK/, { timeout: 1_000 });
+if (!m) log.warn("no OK — recent output:", await tail());
+```
+
+`tail(0)` returns an empty string. The buffer is rolling, so very old output (>64 KiB ago) is not available.
 
 #### `log.info(...)` / `log.warn(...)` / `log.error(...)` → `void`
 
@@ -382,19 +393,24 @@ try {
   await poll({ send: "", until: /Press RETURN/, every: 5_000, timeout: 15 * 60_000 });
 } catch (err) {
   if (err.code === "Timeout") {
-    log.error(`timed out on ${err.pattern} after ${err.elapsedMs}ms`);
+    log.error(`timed out on ${err.pattern} after ${err.elapsedMs}ms`, "recent output:", await tail());
   } else if (err.code === "ConnectionLost") {
     log.error("session dropped — manual intervention required");
   } else {
     log.error("unexpected:", err.message);
   }
   throw err;                   // re-throw so the run ends with state=failed
-} finally {
-  macros.restore();            // always restore macros
 }
 ```
 
-Uncaught exceptions end the run with final state `failed`. The Output Channel logs the error message and stack. Macros, input lock, and output observers are always released regardless of how the run ends.
+Uncaught exceptions end the run with final state `failed`. The Output Channel logs the error message and stack. Macros, input lock, and output observers are **always released automatically** regardless of how the run ends — you do **not** need a `finally { macros.restore() }` block. `macros.restore()` exists so a mid-run script can revert a temporary allow/deny; if the script ends before it calls it, the runtime does the same thing on your behalf.
+
+Nexus distinguishes two flavours of failure and the UI treats them differently:
+
+- **Expected failures** — an uncaught `Timeout`, `ConnectionLost`, `Stopped`, or `Cancelled`. These are the documented error contract; the run ends quietly in `failed` and nothing pops up.
+- **Unexpected failures** — a syntax error, `TypeError`, module-load error, or a Worker crash. VS Code surfaces an error toast with a **Show Output** button so the stack is one click away.
+
+If you want to shut a script down from the host side (e.g. a deploy pipeline's watchdog), call the `Nexus: Stop Nexus Script` command or rely on the workspace setting `nexus.scripts.maxRuntimeMs` — a default 30-minute overall cap that force-stops runaway scripts.
 
 ---
 
@@ -552,6 +568,7 @@ if (session.type === "serial") {
 | `nexus.scripts.path` | string | `.nexus/scripts` | Workspace-relative directory where scripts live. Created automatically on first script command. |
 | `nexus.scripts.defaultTimeout` | number (ms) | `30000` | Default per-wait timeout when neither the script header nor the `opts.timeout` argument specifies one. |
 | `nexus.scripts.macroPolicy` | `"suspend-all"` \| `"keep-enabled"` | `"suspend-all"` | Default macro policy while a script runs. |
+| `nexus.scripts.maxRuntimeMs` | number (ms) | `1800000` (30 min) | Overall runtime cap. When a script exceeds this, it's stopped automatically and tagged with reason `max-runtime-exceeded`. Set `0` to disable. Minimum effective cap is 10 s. |
 
 Settings changes take effect on the **next** script run — they don't retroactively alter runs already in flight.
 
@@ -561,20 +578,24 @@ Settings changes take effect on the **next** script run — they don't retroacti
 
 Registered under the `nexus.script.*` namespace and available in the Command Palette:
 
-| Command | What it does |
-|---|---|
-| `Nexus: Run Nexus Script` | Pick a script from a file dialog (or pass a URI argument from a CodeLens) and run it against an active session. |
-| `Nexus: Run Nexus Script on Target` | Low-level variant that takes both a file URI and a specific session id — used by the sidebar and by hotkeys. |
-| `Nexus: Stop Nexus Script` | Stop a running script. Prompts if more than one is running. |
-| `Nexus: New Nexus Script` | Create a new script from a starter template in your configured scripts directory. |
-| `Nexus: Show Nexus Scripts Output` | Open the **Nexus Scripts** Output Channel. |
+| Command | Default keybinding | What it does |
+|---|---|---|
+| `Nexus: Run Nexus Script` | `Ctrl+Alt+R` (macOS `⌘⌥R`) when an editor is focused on a `.js` file | Pick a script from a file dialog (or pass a URI argument from a CodeLens) and run it against an active session. |
+| `Nexus: Stop Nexus Script` | `Ctrl+Alt+S` (macOS `⌘⌥S`) when a script is running | Stop a running script. Prompts if more than one is running. |
+| `Nexus: New Nexus Script` | — | Create a new script from a starter template in your configured scripts directory. |
+| `Nexus: Delete Script` | — | Right-click a script in the sidebar. Asks for confirmation, then moves to Trash. |
+| `Nexus: Show Nexus Scripts Output` | — | Open the **Nexus Scripts** Output Channel. |
+| `Nexus: Open Scripting Guide` | — | Open this document in your browser. |
+| `Nexus: Run Nexus Script on Target` | — | Internal variant (hidden from the Command Palette) taking `(uri, sessionId)` — used by the sidebar menu. |
 
 **UI surfaces:**
 
-- **Nexus sidebar → Scripts** — lists all `.js` files under the configured directory that carry the `@nexus-script` marker. Clicking a file opens it in the editor.
-- **Editor CodeLens** — the inline `▶ Run in Nexus` action at the top of any script file. Flips to `◼ Stop` while a run is active on that file.
-- **Status bar** — when at least one script is running, the left status bar shows the current operation + elapsed time. Click to open the Output Channel. Tooltip contains a `◼ Stop` action per running script.
-- **Output Channel** — the `Nexus Scripts` channel (accessible via the `Nexus: Show Nexus Scripts Output` command or the status bar) streams timestamped events: start, every wait begin/end, every log call, end with final state and duration.
+- **Nexus sidebar → Scripts** — lists all `.js` files under the configured directory that carry the `@nexus-script` marker. Right-click any script for Run / Stop / Reveal / Delete. The view's title bar has a `+` button that runs `New Nexus Script`. Empty state (no folder / no scripts) shows inline help links.
+- **Editor CodeLens** — the inline `▶ Run in Nexus` action at the top of any script file. Flips to `◼ Stop` while a run is active on that file. Works on `file://`, `vscode-remote://`, and `untitled:` schemes.
+- **Status bar — run indicator** — when at least one script is running, the left status bar shows the current operation + elapsed time. Click to open the Output Channel. Tooltip contains a `◼ Stop` action per running script.
+- **Status bar — input-lock indicator** — when an `@lock-input` script is running, a second left-aligned status bar item renders `$(lock) Terminal locked — click to stop`. Clicking stops the locking script. If multiple locked scripts run at once it shows a count and offers a QuickPick on click.
+- **Output Channel** — the `Nexus Scripts` channel streams timestamped events. Lines are prefixed with `[hh:mm:ss.sss] ScriptName@SessionName` so you can correlate interleaved output when multiple scripts run at once.
+- **Error toast** — if a script ends with an *unexpected* failure (syntax error, `TypeError`, worker crash — see **Error handling** above), VS Code surfaces an error toast with a **Show Output** button. Expected failures (`Timeout`, `ConnectionLost`, `Stopped`, `Cancelled`) don't toast.
 
 ---
 
@@ -582,14 +603,28 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| Script won't stop / runs forever | — | Open the Command Palette → `Nexus: Stop Nexus Script` (default `Ctrl+Alt+S` / `⌘⌥S`). The status bar tooltip also has a per-script ◼ Stop link. As a last resort, `nexus.scripts.maxRuntimeMs` (default 30 min) force-stops runaways automatically. |
 | "▶ Run in Nexus" CodeLens doesn't appear above my file | Missing `@nexus-script` marker in the leading JSDoc block | Add it |
-| Autocomplete is missing in my script | First-time scaffolding hasn't run yet | Trigger any Nexus script command once; reopen the file |
-| `expect` always times out | Pattern doesn't match the actual output (ANSI, anchors, banner noise) | `log.info(out.before)` to see what's there and tighten the pattern |
+| Autocomplete is missing in my script | First-time scaffolding hasn't run yet | Trigger any Nexus script command once; reopen the file. If you edited `<scriptsDir>/types/nexus-scripts.d.ts` by hand, delete it — Nexus will rewrite it from the bundled version on the next run. |
+| `expect` always times out | Pattern doesn't match the actual output (ANSI, anchors, banner noise) | Log `await tail()` in the `catch` to see what the session actually sent; tighten the pattern accordingly |
 | First wait misses a prompt that's already on screen | Default lookback is 1 KB; output scrolled past | Pass `lookback: 4096` (or higher) on the first wait |
 | A macro fires on top of my script and double-sends something | Default macro policy is `suspend-all`, but maybe `keep-enabled` was set | Check `nexus.scripts.macroPolicy` and any `@allow-macros` header |
 | Stop button feels slow (>1 sec) | A native call is blocking the worker (rare) | Reload the window; if reproducible, file an issue |
 | Web extension shows "not available in browser" | Expected — desktop-only for v1 | Use VS Code Desktop |
 | `vscode.workspace.workspaceFolders` not available for `nexus.script.new` | No folder is open | Open a folder first |
+| Error toast says the script "failed" on a normal `Timeout` | Shouldn't happen — expected codes are filtered | File an issue; include the Output Channel contents |
+
+---
+
+## Security and trust
+
+**Scripts run with the same privileges as the Nexus Terminal extension.** Treat a `.js` file you're about to run the same way you'd treat a shell script or a PowerShell script someone sent you — open it and read it first.
+
+- Scripts execute inside a `node:worker_threads` Worker thread (separate V8 isolate), **not** a full VS Code sandbox. They have full access to Node's `process` object, `globalThis`, and the Nexus script API. They cannot import `vscode`, read your workspace files, or spawn subprocesses — those capabilities are deliberately omitted from the global surface (see **Limitations**). But that isolation is a *convenience* for correctness and cheap termination, not a security boundary against hostile code.
+- Secret prompts (`prompt(msg, { password: true })`) are masked in the input box and the returned value is never written to the Output Channel by the runtime. Anything the script explicitly logs — via `log.info(value)`, for example — is written verbatim, so don't hand-log the result of a password prompt.
+- The runtime never reads your workspace outside the configured `nexus.scripts.path` directory (default `.nexus/scripts`). It does re-write the bundled `<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json` on first run and after version bumps. If you customise those files in place, your edits are preserved only until the bundled version string changes — then they're overwritten. Keep local customisations in separate files.
+
+Bottom line: author your own scripts, or review scripts from others the same way you'd review a Bash script before running it.
 
 ---
 

@@ -117,12 +117,19 @@ export function parseScriptHeader(source: string): ScriptHeader {
       case "@lock-input":
         header.lockInput = true;
         break;
-      case "@allow-macros":
-        header.allowMacros = value
+      case "@allow-macros": {
+        const incoming = value
           .split(",")
           .map((s) => s.trim())
           .filter((s) => s.length > 0);
+        // Concat semantics: duplicates of @allow-macros merge, deduped (keeps first occurrence order).
+        const merged: string[] = [...header.allowMacros];
+        for (const name of incoming) {
+          if (!merged.includes(name)) merged.push(name);
+        }
+        header.allowMacros = merged;
         break;
+      }
     }
   }
 

@@ -80,6 +80,17 @@ export class ScriptOutputBuffer {
     if (to > this.cursor) this.cursor = to;
   }
 
+  /**
+   * Return the last `n` characters of stripped buffered output (ANSI already removed).
+   * Caps at the live buffer length. Useful for error-diagnostic dumps when a
+   * `waitFor` returns null and the script wants to see what *did* arrive.
+   */
+  public tail(n: number): string {
+    if (n <= 0) return "";
+    if (n >= this.text.length) return this.text;
+    return this.text.slice(-n);
+  }
+
   public subscribe(cb: () => void): () => void {
     this.subscribers.add(cb);
     return () => {

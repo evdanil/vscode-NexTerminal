@@ -106,6 +106,7 @@ globals.sendLine = (text: unknown) => rpc("sendLine", [text]);
 globals.sendKey = (key: unknown) => rpc("sendKey", [key]);
 globals.poll = (opts: unknown) => rpc("poll", [opts]);
 globals.sleep = (ms: unknown) => rpc("sleep", [ms]);
+globals.tail = (n?: unknown) => rpc("tail", [n]);
 
 // Logger — each level posts both an rpc-style log event and, for main-thread telemetry,
 // an explicit "log" envelope. We keep log writes resolved locally (fire-and-forget)

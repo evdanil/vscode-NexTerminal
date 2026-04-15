@@ -206,6 +206,35 @@ describe("scriptUserInteraction — prompt / confirm / alert", () => {
     await fs.unlink(fixture).catch(() => {});
   }, 10_000);
 
+  it("confirm offers an explicit Cancel button and returns false on click (F7)", async () => {
+    const { manager, events } = runtimeFixture();
+    const os = await import("node:os");
+    const fs = await import("node:fs/promises");
+    const fixture = path.join(os.tmpdir(), `nexus-confirm-cancel-${Date.now()}.js`);
+    await fs.writeFile(
+      fixture,
+      `/**\n * @nexus-script\n */\nconst r = await confirm("Reboot?");\nlog.info("result:" + r);\n`
+    );
+
+    let capturedArgs: unknown[] | undefined;
+    (await import("vscode")).window.showInformationMessage = vi.fn(async (...args: unknown[]) => {
+      capturedArgs = args;
+      return "Cancel";
+    }) as never;
+
+    await manager.runScript({ fsPath: fixture } as never, "test-session");
+    await waitFor(() => events.some((e) => e.kind === "log" && e.text === "result:false"), 3_000);
+    expect(capturedArgs).toBeDefined();
+    // Signature: (message, { modal: true }, "OK", "Cancel")
+    expect(capturedArgs).toEqual([
+      "Reboot?",
+      expect.objectContaining({ modal: true }),
+      "OK",
+      "Cancel"
+    ]);
+    await fs.unlink(fixture).catch(() => {});
+  }, 10_000);
+
   it("alert resolves after the user dismisses the modal", async () => {
     mockConfirmResponse = "OK";
     const { manager, events } = runtimeFixture();

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import * as vscode from "vscode";
 import type { NexusCore } from "../../core/nexusCore";
-import type { ActiveSession, ActiveSerialSession } from "../../models/config";
+import type { ActiveSession, ActiveSerialSession, SessionPtyHandle } from "../../models/config";
 import type { MacroAutoTrigger, PtyOutputObserver } from "../macroAutoTrigger";
 import { parseScriptHeader, type ScriptHeader } from "./scriptHeader";
 import { ScriptMacroFilter } from "./scriptMacroFilter";
@@ -10,14 +10,23 @@ import { ensureWorkspaceScriptTypes, type BundledAssets } from "./scriptTypesGen
 import { ScriptOutputBuffer, type Match } from "./scriptOutputBuffer";
 import { pickTarget, type ScriptTargetDescriptor } from "./scriptTarget";
 import type {
+  FailureReason,
   FinalState,
   RunState,
   RunningScriptSnapshot,
   ScriptRunEvent,
   ScriptRunOperation,
+  StopReason,
   WorkerInbound,
   WorkerOutbound
 } from "./scriptTypes";
+
+/**
+ * Error `code` values produced by well-behaved user scripts via the documented
+ * runtime contract. These are *expected* errors and should not trigger a crash
+ * toast in the UI — they're the mechanism by which scripts signal failure.
+ */
+const EXPECTED_ERROR_CODES = new Set(["Timeout", "ConnectionLost", "Stopped", "Cancelled"]);
 
 export interface ScriptRuntimeManagerDependencies {
   core: NexusCore;
@@ -67,8 +76,18 @@ interface RunningScriptRecord {
   macroFilterHandle?: vscode.Disposable;
   coreChangeSubscription?: vscode.Disposable;
   inputLockHeld: boolean;
+  /** Direct PTY handle captured at run-start so cleanup can release the lock even
+   *  after the session is deregistered from NexusCore (e.g. on ConnectionLost). */
+  pty: SessionPtyHandle;
   writeBack: (data: string) => void;
   connectionLostSignaled: boolean;
+  /** Idempotency guard — cleanupRun flips this at the very top so a racing
+   *  "exit" event + ConnectionLost grace-timer can't double-dispose. */
+  cleanedUp: boolean;
+  /** Captured classification for the ended event (populated only on failure). */
+  failureReason?: FailureReason;
+  /** Context string passed to stopScript(); logged, surfaced on the ended event. */
+  stopReason?: StopReason;
   endedAt?: number;
 }
 
@@ -143,6 +162,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       );
       return undefined;
     }
+    const pty = target.session.pty;
 
     const defaultTimeoutMs =
       header.defaultTimeoutMs ??
@@ -163,11 +183,13 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       worker: this.createWorker(),
       pendingRpcs: new Map(),
       inputLockHeld: false,
+      pty,
       connectionLostSignaled: false,
-      writeBack: (data: string) => target.session.pty!.writeProgrammatic(data)
+      cleanedUp: false,
+      writeBack: (data: string) => pty.writeProgrammatic(data)
     };
 
-    record.observerSubscription = target.session.pty.addOutputObserver({
+    record.observerSubscription = pty.addOutputObserver({
       onOutput: (text) => record.outputBuffer.append(text),
       pauseIntervalMacros: () => {},
       dispose: () => {}
@@ -188,7 +210,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     record.macroFilterHandle = this.deps.macroAutoTrigger.pushFilter(target.session.id, filter);
 
     if (header.lockInput) {
-      target.session.pty.setInputBlocked(true);
+      pty.setInputBlocked(true);
       record.inputLockHeld = true;
     }
 
@@ -215,23 +237,33 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     return record.id;
   }
 
-  public async stopScript(sessionId: string): Promise<void> {
+  public async stopScript(sessionId: string, reason?: StopReason): Promise<void> {
     const record = this.runs.get(sessionId);
     if (!record) return;
+    record.stopReason = reason ?? "user-requested";
     const graceMs = 100;
     const terminated = await Promise.race([
       record.worker.terminate().then(() => true),
       new Promise<boolean>((resolve) => setTimeout(() => resolve(false), graceMs))
     ]);
-    this.rejectAllPending(record, { code: "Stopped", message: "Script stopped by user" });
+    this.rejectAllPending(record, {
+      code: "Stopped",
+      message: record.stopReason === "max-runtime-exceeded"
+        ? "Script stopped — max runtime exceeded"
+        : "Script stopped by user"
+    });
     if (!terminated) {
       this.logEvent(record, "warning: worker did not terminate within grace");
+    }
+    if (record.stopReason !== "user-requested") {
+      this.logEvent(record, `stop reason: ${record.stopReason}`);
     }
     this.cleanupRun(record, "stopped");
   }
 
   public dispose(): void {
     for (const run of Array.from(this.runs.values())) {
+      run.stopReason = "extension-deactivating";
       this.rejectAllPending(run, { code: "Stopped", message: "Extension deactivating" });
       void run.worker.terminate();
       this.cleanupRun(run, "stopped");
@@ -329,10 +361,18 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       case "complete":
         this.cleanupRun(record, record.connectionLostSignaled ? "connection-lost" : "completed");
         break;
-      case "failed":
+      case "failed": {
         this.logEvent(record, `failed: ${msg.error.message}${msg.error.stack ? `\n${msg.error.stack}` : ""}`);
+        // Classify for the UI — well-known runtime codes are the documented error
+        // contract and shouldn't trigger a crash toast; anything else likely indicates
+        // a bug in the script, a syntax error, or a module-load failure.
+        if (!record.connectionLostSignaled) {
+          record.failureReason =
+            msg.error.code && EXPECTED_ERROR_CODES.has(msg.error.code) ? "expected" : "script-error";
+        }
         this.cleanupRun(record, record.connectionLostSignaled ? "connection-lost" : "failed");
         break;
+      }
       case "rpc":
         void this.dispatchRpc(record, msg.id, msg.method, msg.args);
         break;
@@ -341,6 +381,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
 
   private handleWorkerError(record: RunningScriptRecord, err: Error): void {
     this.logEvent(record, `worker error: ${err.message}`);
+    record.failureReason = "worker-crash";
     this.cleanupRun(record, "failed");
   }
 
@@ -395,6 +436,12 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       }
       case "sleep":
         return new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, Number(args[0] ?? 0))));
+      case "tail": {
+        // Default 512 chars; cap negative input at 0 and huge input at the buffer's own cap.
+        const requested = args[0] === undefined ? 512 : Number(args[0]);
+        const n = Number.isFinite(requested) ? Math.max(0, Math.floor(requested)) : 512;
+        return record.outputBuffer.tail(n);
+      }
       case "poll":
         return this.doPoll(record, args[0] as PollOpts);
       case "prompt":
@@ -442,7 +489,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     this.beginOp(record, "wait", opLabel);
     const startedAt = Date.now();
     try {
-      const m = await this.scanWithSubscription(record, pattern, opts?.lookback, timeoutMs);
+      const m = await this.scanForMatch(record, pattern, opts?.lookback, timeoutMs);
       if (m) {
         record.outputBuffer.advanceCursor(m.endPosition);
         this.endOp(record, "matched");
@@ -471,18 +518,19 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     const patternLabel = patterns.map(patternToLabel).join(" | ");
     const opLabel = `waitAny ${patternLabel}`;
     this.beginOp(record, "wait", opLabel);
-    const deadline = Date.now() + timeoutMs;
     const buffer = record.outputBuffer;
-    while (Date.now() < deadline) {
+    const attemptAny = (): { index: number; match: Match } | null => {
       for (let i = 0; i < patterns.length; i++) {
         const m = buffer.scan(patterns[i], { lookback: opts?.lookback });
-        if (m) {
-          buffer.advanceCursor(m.endPosition);
-          this.endOp(record, "matched");
-          return { index: i, match: m };
-        }
+        if (m) return { index: i, match: m };
       }
-      await this.waitForNewOutputOrTimeout(buffer, deadline - Date.now());
+      return null;
+    };
+    const hit = await this.scanForMatchGeneric(record, attemptAny, timeoutMs);
+    if (hit) {
+      buffer.advanceCursor(hit.match.endPosition);
+      this.endOp(record, "matched");
+      return hit;
     }
     this.endOp(record, "timeout");
     throw makeError("Timeout", `waitAny timed out after ${timeoutMs}ms waiting for ${patternLabel}`, {
@@ -508,7 +556,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     while (Date.now() < deadline) {
       await sendOnTick();
       const waitUntil = Math.min(every, deadline - Date.now());
-      const m = await this.scanWithSubscription(record.outputBuffer, pattern, undefined, waitUntil, record);
+      const m = await this.scanForMatch(record, pattern, undefined, waitUntil);
       if (m) {
         record.outputBuffer.advanceCursor(m.endPosition);
         this.endOp(record, "matched");
@@ -545,7 +593,8 @@ export class ScriptRuntimeManager implements vscode.Disposable {
         const picked = await vscode.window.showInformationMessage(
           message,
           { modal: true },
-          "OK"
+          "OK",
+          "Cancel"
         );
         this.endOp(record, "user-input");
         return picked === "OK";
@@ -560,32 +609,48 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     }
   }
 
-  private scanWithSubscription(
-    recordOrBuffer: RunningScriptRecord | ScriptOutputBuffer,
+  /**
+   * Scan a record's output buffer for a single pattern with a timeout, subscribing
+   * for new output and registering in `pendingRpcs` so that Stopped / ConnectionLost
+   * can cancel the wait (rather than letting the timer leak until its deadline).
+   */
+  private scanForMatch(
+    record: RunningScriptRecord,
     pattern: string | RegExp,
     lookback: number | undefined,
-    timeoutMs: number,
-    record?: RunningScriptRecord
+    timeoutMs: number
   ): Promise<Match | null> {
-    const buffer: ScriptOutputBuffer =
-      recordOrBuffer instanceof ScriptOutputBuffer ? recordOrBuffer : recordOrBuffer.outputBuffer;
-    const ownerRecord: RunningScriptRecord =
-      recordOrBuffer instanceof ScriptOutputBuffer ? (record as RunningScriptRecord) : recordOrBuffer;
+    const buffer = record.outputBuffer;
+    return this.scanForMatchGeneric(
+      record,
+      () => buffer.scan(pattern, { lookback }),
+      timeoutMs
+    );
+  }
 
-    return new Promise<Match | null>((resolve, reject) => {
-      const attempt = (): Match | null => buffer.scan(pattern, { lookback });
+  /**
+   * Shared scan-with-cancellation helper: runs `attempt` immediately, then re-runs
+   * it on each new output event until it returns non-null, the timeout expires, or
+   * the record is cancelled via `pendingRpcs` (Stop / ConnectionLost).
+   */
+  private scanForMatchGeneric<T>(
+    record: RunningScriptRecord,
+    attempt: () => T | null,
+    timeoutMs: number
+  ): Promise<T | null> {
+    return new Promise<T | null>((resolve, reject) => {
       const immediate = attempt();
-      if (immediate) {
+      if (immediate !== null && immediate !== undefined) {
         resolve(immediate);
         return;
       }
       let resolved = false;
-      const doResolve = (v: Match | null): void => {
+      const doResolve = (v: T | null): void => {
         if (resolved) return;
         resolved = true;
         clearTimeout(timer);
         unsub();
-        ownerRecord.pendingRpcs.delete(rpcKey);
+        record.pendingRpcs.delete(rpcKey);
         resolve(v);
       };
       const doReject = (e: { code: string; message: string; extra?: Record<string, unknown> }): void => {
@@ -593,34 +658,19 @@ export class ScriptRuntimeManager implements vscode.Disposable {
         resolved = true;
         clearTimeout(timer);
         unsub();
-        ownerRecord.pendingRpcs.delete(rpcKey);
+        record.pendingRpcs.delete(rpcKey);
         reject(e);
       };
       const timer = setTimeout(() => doResolve(null), Math.max(0, timeoutMs));
-      const unsub = buffer.subscribe(() => {
+      const unsub = record.outputBuffer.subscribe(() => {
         const m = attempt();
-        if (m) doResolve(m);
+        if (m !== null && m !== undefined) doResolve(m);
       });
-      // Register so ConnectionLost / Stopped can cancel the wait.
       const rpcKey = ++pendingIdCounter;
-      ownerRecord.pendingRpcs.set(rpcKey, {
-        resolve: (v) => doResolve(v as Match | null),
+      record.pendingRpcs.set(rpcKey, {
+        resolve: (v) => doResolve(v as T | null),
         reject: doReject,
         cancel: () => doResolve(null)
-      });
-    });
-  }
-
-  private waitForNewOutputOrTimeout(buffer: ScriptOutputBuffer, timeoutMs: number): Promise<void> {
-    return new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        unsub();
-        resolve();
-      }, Math.max(0, timeoutMs));
-      const unsub = buffer.subscribe(() => {
-        clearTimeout(timer);
-        unsub();
-        resolve();
       });
     });
   }
@@ -673,19 +723,32 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   }
 
   private cleanupRun(record: RunningScriptRecord, finalState: FinalState): void {
-    if (record.state === finalState) return;
+    if (record.cleanedUp) return;
+    record.cleanedUp = true;
     record.coreChangeSubscription?.dispose();
     record.observerSubscription?.dispose();
     record.macroFilterHandle?.dispose();
     if (record.inputLockHeld) {
-      const session = this.deps.core.getActiveSessionById(record.sessionId);
-      session?.pty?.setInputBlocked(false);
+      // Release directly via the captured PTY handle — works even after the
+      // session has been deregistered from NexusCore (ConnectionLost path).
+      try {
+        record.pty.setInputBlocked(false);
+      } catch {
+        // PTY may already be torn down — safe to ignore.
+      }
       record.inputLockHeld = false;
     }
     record.state = finalState;
     record.endedAt = Date.now();
     const snap = this.toSnapshot(record);
-    this.emit({ kind: "ended", run: snap, finalState, durationMs: record.endedAt - record.startedAt });
+    this.emit({
+      kind: "ended",
+      run: snap,
+      finalState,
+      durationMs: record.endedAt - record.startedAt,
+      failureReason: finalState === "failed" ? record.failureReason : undefined,
+      stopReason: finalState === "stopped" ? record.stopReason : undefined
+    });
     this.logEvent(record, `end: ${finalState} (${record.endedAt - record.startedAt}ms)`);
     this.runs.delete(record.sessionId);
   }
@@ -700,7 +763,8 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       sessionType: r.sessionType,
       startedAt: r.startedAt,
       state: r.state,
-      currentOperation: r.currentOperation
+      currentOperation: r.currentOperation,
+      inputLockHeld: r.inputLockHeld
     };
   }
 
@@ -710,7 +774,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
 
   private logEvent(record: RunningScriptRecord, text: string): void {
     const stamp = new Date().toISOString().slice(11, 23);
-    this.deps.outputChannel.appendLine(`[${stamp}] ${record.scriptName}  ${text}`);
+    this.deps.outputChannel.appendLine(
+      `[${stamp}] ${record.scriptName}@${record.sessionName}  ${text}`
+    );
   }
 }
 

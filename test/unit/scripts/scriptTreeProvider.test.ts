@@ -95,6 +95,10 @@ describe("ScriptTreeProvider", () => {
     (vscode.workspace as unknown as { workspaceFolders: unknown[] }).workspaceFolders = [
       { uri: { fsPath: "/workspace", scheme: "file", path: "/workspace" }, name: "ws", index: 0 }
     ];
+    // Restore the standard mock for fs.readDirectory in case a prior test stubbed it.
+    (vscode.workspace.fs as unknown as { readDirectory: (u: { fsPath: string }) => Promise<Array<[string, number]>> }).readDirectory = vi.fn(
+      async (uri: { fsPath: string }) => mockFsEntries.get(uri.fsPath) ?? []
+    );
   });
 
   it("lists .js files whose leading JSDoc contains @nexus-script", async () => {
@@ -156,5 +160,98 @@ describe("ScriptTreeProvider", () => {
     expect(children).toHaveLength(1);
     const item = provider.getTreeItem(children[0]);
     expect(String(item.label).toLowerCase()).toContain("no scripts");
+  });
+
+  it("sets contextValue to nexus.script.file for idle scripts and nexus.script.running when running (S2)", async () => {
+    mockFsEntries.set("/workspace/.nexus/scripts", [
+      ["idle.js", 1],
+      ["active.js", 1]
+    ]);
+    mockFiles.set(
+      "/workspace/.nexus/scripts/idle.js",
+      "/**\n * @nexus-script\n */\n"
+    );
+    mockFiles.set(
+      "/workspace/.nexus/scripts/active.js",
+      "/**\n * @nexus-script\n */\n"
+    );
+
+    const manager = {
+      getRuns: vi.fn(() => [
+        {
+          id: "r1",
+          scriptName: "active",
+          scriptPath: "/workspace/.nexus/scripts/active.js",
+          sessionId: "s1",
+          sessionName: "sess",
+          sessionType: "ssh" as const,
+          startedAt: 0,
+          state: "running" as const,
+          currentOperation: null
+        }
+      ]),
+      getRunForSession: vi.fn(),
+      onDidChangeRun: Object.assign(
+        (_l: () => void) => ({ dispose: () => {} }),
+        {}
+      )
+    } as unknown as ScriptRuntimeManager;
+
+    const provider = new ScriptTreeProvider(manager);
+    const children = await provider.getChildren();
+    const items = children.map((c) => provider.getTreeItem(c));
+    const byLabel = new Map(items.map((it) => [String(it.label), it]));
+    expect(byLabel.get("idle")?.contextValue).toBe("nexus.script.file");
+    expect(byLabel.get("active")?.contextValue).toBe("nexus.script.running");
+  });
+
+  it("shows a running badge description when a script is running (F8)", async () => {
+    mockFsEntries.set("/workspace/.nexus/scripts", [["active.js", 1]]);
+    mockFiles.set(
+      "/workspace/.nexus/scripts/active.js",
+      "/**\n * @nexus-script\n */\n"
+    );
+    const manager = {
+      getRuns: vi.fn(() => [
+        {
+          id: "r1",
+          scriptName: "active",
+          scriptPath: "/workspace/.nexus/scripts/active.js",
+          sessionId: "s1",
+          sessionName: "sess",
+          sessionType: "ssh" as const,
+          startedAt: 0,
+          state: "running" as const,
+          currentOperation: null
+        }
+      ]),
+      getRunForSession: vi.fn(),
+      onDidChangeRun: Object.assign(
+        (_l: () => void) => ({ dispose: () => {} }),
+        {}
+      )
+    } as unknown as ScriptRuntimeManager;
+    const provider = new ScriptTreeProvider(manager);
+    const children = await provider.getChildren();
+    const item = provider.getTreeItem(children[0]);
+    expect(String(item.description ?? "")).toContain("running");
+  });
+
+  it("keeps the open command even when the header has parse errors (P7)", async () => {
+    mockFsEntries.set("/workspace/.nexus/scripts", [["broken.js", 1]]);
+    mockFiles.set(
+      "/workspace/.nexus/scripts/broken.js",
+      "/**\n * @nexus-script\n * @default-timeout nope\n */\n"
+    );
+    const provider = new ScriptTreeProvider(mockManager());
+    const children = await provider.getChildren();
+    const item = provider.getTreeItem(children[0]) as unknown as {
+      command?: { command: string };
+      tooltip?: string;
+    };
+    expect(item.command).toBeDefined();
+    expect(item.command?.command).toBe("vscode.open");
+    // Parse errors should still be surfaced via tooltip
+    expect(String(item.tooltip ?? "")).toMatch(/error|@default-timeout/i);
   });
 });

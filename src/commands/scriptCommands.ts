@@ -25,18 +25,29 @@ const STARTER_SCRIPT_TEMPLATE = `/**
  * @nexus-script
  * @name {{NAME}}
  * @description A new Nexus automation script.
+ * @target-type ssh
  */
 
-// Write to the terminal with send / sendLine; wait for output with expect / waitFor.
 // Full API reference: ./types/nexus-scripts.d.ts
+// Uncomment to let a specific macro fire during this run:
+// @allow-macros password
 
-const prompt = await expect(/[$#] $/, { timeout: 10_000 });
-log.info("shell ready:", prompt.text);
+try {
+  const prompt = await expect(/[$#] $/, { timeout: 10_000 });
+  log.info("shell ready:", prompt.text);
 
-await sendLine("uname -a");
-const out = await expect(/[$#] $/, { timeout: 5_000 });
-log.info("uname:", out.before.trim());
+  await sendLine("uname -a");
+  const out = await expect(/[$#] $/, { timeout: 5_000 });
+  log.info("uname:", out.before.trim());
+} catch (err) {
+  log.error("script failed:", err?.message ?? err);
+  throw err;
+}
 `;
+
+function stripJsExtension(raw: string): string {
+  return raw.replace(/\.js$/i, "");
+}
 
 async function createNewScript(): Promise<void> {
   const folder = vscode.workspace.workspaceFolders?.[0];
@@ -44,15 +55,18 @@ async function createNewScript(): Promise<void> {
     void vscode.window.showInformationMessage("Open a folder to author and run Nexus scripts.");
     return;
   }
-  const name = await vscode.window.showInputBox({
+  const input = await vscode.window.showInputBox({
     prompt: "Name for the new Nexus script",
     placeHolder: "my-procedure",
     validateInput: (value) => {
-      if (!value) return "Name is required";
-      if (!/^[A-Za-z0-9._-]+$/.test(value)) return "Use letters, digits, '.', '_', or '-' only";
+      const stripped = stripJsExtension(value ?? "");
+      if (!stripped) return "Name is required";
+      if (!/^[A-Za-z0-9._-]+$/.test(stripped)) return "Use letters, digits, '.', '_', or '-' only";
       return undefined;
     }
   });
+  if (!input) return;
+  const name = stripJsExtension(input);
   if (!name) return;
   const scriptsPath = vscode.workspace.getConfiguration("nexus.scripts").get<string>("path", ".nexus/scripts");
   const target = vscode.Uri.joinPath(folder.uri, scriptsPath, `${name}.js`);
@@ -70,6 +84,41 @@ async function createNewScript(): Promise<void> {
   }
   const doc = await vscode.workspace.openTextDocument(target);
   await vscode.window.showTextDocument(doc);
+}
+
+function readRepositoryUrl(): string {
+  // Resolve once from package.json; bundler inlines this via require at build time.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pkg = require("../../package.json") as { repository?: { url?: string } };
+    const raw = pkg.repository?.url ?? "";
+    // git+https://... → https://..., strip .git suffix
+    return raw.replace(/^git\+/, "").replace(/\.git$/, "");
+  } catch {
+    return "https://github.com/evdanil/vscode-NexTerminal";
+  }
+}
+
+function scriptingDocsUrl(): string {
+  const base = readRepositoryUrl();
+  return `${base.replace(/\/+$/, "")}/blob/main/docs/scripting.md`;
+}
+
+async function deleteScript(uri: vscode.Uri): Promise<void> {
+  if (!uri?.fsPath) return;
+  const base = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+  const picked = await vscode.window.showWarningMessage(
+    `Delete ${base}? This cannot be undone.`,
+    { modal: true },
+    "Delete"
+  );
+  if (picked !== "Delete") return;
+  try {
+    await vscode.workspace.fs.delete(uri, { useTrash: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    void vscode.window.showErrorMessage(`Failed to delete script: ${message}`);
+  }
 }
 
 export function registerScriptCommands(
@@ -138,6 +187,16 @@ export function registerScriptCommands(
 
     vscode.commands.registerCommand("nexus.script.new", async () => {
       await createNewScript();
+    }),
+
+    vscode.commands.registerCommand("nexus.script.openDocs", async () => {
+      const url = scriptingDocsUrl();
+      await vscode.env.openExternal(vscode.Uri.parse(url));
+    }),
+
+    vscode.commands.registerCommand("nexus.script.delete", async (uri?: vscode.Uri) => {
+      if (!uri) return;
+      await deleteScript(uri);
     })
   ];
 }

@@ -153,4 +153,77 @@ describe("scriptTarget / pickTarget", () => {
     await pickTarget(makeDescriptor({ targetType: undefined }), core);
     expect(quickPickCalls[0].items).toHaveLength(2);
   });
+
+  it("matches @target-profile by server id before falling back to name", async () => {
+    resetPicker();
+    const core = makeCore({
+      activeSessions: [
+        { id: "ssh1", serverId: "srv-alpha", terminalName: "t1" },
+        { id: "ssh2", serverId: "srv-bravo", terminalName: "t2" }
+      ],
+      activeSerialSessions: [],
+      servers: [
+        { id: "srv-alpha", name: "shared-name" },
+        { id: "srv-bravo", name: "shared-name" }
+      ],
+      serialProfiles: []
+    });
+    // `srv-bravo` is an exact id match — should auto-pick without QuickPick even though two
+    // sessions share the same name "shared-name".
+    const result = await pickTarget(
+      makeDescriptor({ targetType: "ssh", targetProfile: "srv-bravo" }),
+      core
+    );
+    expect(result?.id).toBe("ssh2");
+    expect(quickPickCalls).toHaveLength(0);
+  });
+
+  it("surfaces QuickPick when @target-profile name matches multiple active sessions", async () => {
+    resetPicker();
+    pickBySessionId = "ssh2";
+    const core = makeCore({
+      activeSessions: [
+        { id: "ssh1", serverId: "srv1", terminalName: "edge-a" },
+        { id: "ssh2", serverId: "srv2", terminalName: "edge-b" }
+      ],
+      activeSerialSessions: [],
+      // Two servers share the exact same `name`. Script says @target-profile "router"
+      // → ambiguous — show the picker narrowed to the two matches.
+      servers: [
+        { id: "srv1", name: "router" },
+        { id: "srv2", name: "router" }
+      ],
+      serialProfiles: []
+    });
+    const result = await pickTarget(
+      makeDescriptor({ targetType: "ssh", targetProfile: "router" }),
+      core
+    );
+    expect(result?.id).toBe("ssh2");
+    expect(quickPickCalls).toHaveLength(1);
+    // The picker should only contain the ambiguous matches, not all sessions.
+    expect(quickPickCalls[0].items).toHaveLength(2);
+  });
+
+  it("still auto-picks a single name match when there are multiple eligible sessions overall", async () => {
+    resetPicker();
+    const core = makeCore({
+      activeSessions: [
+        { id: "ssh1", serverId: "srv1", terminalName: "t1" },
+        { id: "ssh2", serverId: "srv2", terminalName: "t2" }
+      ],
+      activeSerialSessions: [],
+      servers: [
+        { id: "srv1", name: "unique-name" },
+        { id: "srv2", name: "other" }
+      ],
+      serialProfiles: []
+    });
+    const result = await pickTarget(
+      makeDescriptor({ targetType: "ssh", targetProfile: "unique-name" }),
+      core
+    );
+    expect(result?.id).toBe("ssh1");
+    expect(quickPickCalls).toHaveLength(0);
+  });
 });
