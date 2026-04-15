@@ -281,6 +281,27 @@ export function registerScriptCommands(
       const uri = toScriptUri(arg);
       if (!uri) return;
       await deleteScript(uri);
+    }),
+
+    vscode.commands.registerCommand("nexus.script.openScriptsFolder", async () => {
+      const folder = vscode.workspace.workspaceFolders?.[0];
+      if (!folder) {
+        void vscode.window.showInformationMessage(
+          "Open a folder to see the Nexus scripts directory — it lives at <workspace>/" +
+            vscode.workspace.getConfiguration("nexus.scripts").get<string>("path", ".nexus/scripts")
+        );
+        return;
+      }
+      const scriptsPath = vscode.workspace
+        .getConfiguration("nexus.scripts")
+        .get<string>("path", ".nexus/scripts");
+      const target = vscode.Uri.joinPath(folder.uri, scriptsPath);
+      try {
+        await vscode.workspace.fs.createDirectory(target);
+      } catch {
+        // Already exists — that's the normal case.
+      }
+      await vscode.env.openExternal(target);
     })
   ];
 }

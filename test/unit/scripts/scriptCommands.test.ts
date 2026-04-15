@@ -309,6 +309,30 @@ describe("scriptCommands", () => {
     });
   });
 
+  describe("openScriptsFolder command", () => {
+    it("registers nexus.script.openScriptsFolder and reveals the configured scripts dir", async () => {
+      registerScriptCommands(makeManager(), outputChannel);
+      const handler = state.registeredCommands.get("nexus.script.openScriptsFolder");
+      expect(handler).toBeDefined();
+      await handler!();
+      expect(state.mockOpenExternal).toHaveBeenCalled();
+      const arg = state.mockOpenExternal.mock.calls[0][0] as { fsPath: string };
+      expect(arg.fsPath).toBe("/ws/.nexus/scripts");
+    });
+
+    it("informs the user and does nothing when there is no workspace", async () => {
+      const prevFolders = (await import("vscode")).workspace.workspaceFolders;
+      (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
+
+      registerScriptCommands(makeManager(), outputChannel);
+      await state.registeredCommands.get("nexus.script.openScriptsFolder")!();
+      expect(state.mockShowInformationMessage).toHaveBeenCalled();
+      expect(state.mockOpenExternal).not.toHaveBeenCalled();
+
+      (await import("vscode")).workspace.workspaceFolders = prevFolders;
+    });
+  });
+
   describe("S2 — delete command", () => {
     it("registers nexus.script.delete which confirms and deletes", async () => {
       state.warningReturn = "Delete";

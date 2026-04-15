@@ -88,19 +88,19 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 11 root items", () => {
+    it("returns 12 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(11);
+      expect(roots).toHaveLength(12);
     });
 
-    it("has 7 category items first", () => {
+    it("has 8 category items first (Scripts sits after Serial)", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const categories = roots.filter((r) => r instanceof SettingsCategoryItem);
-      expect(categories).toHaveLength(7);
+      expect(categories).toHaveLength(8);
       expect(categories.map((c) => (c as SettingsCategoryItem).categoryKey))
-        .toEqual(["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial"]);
+        .toEqual(["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"]);
     });
 
     it("has 3 link items for Appearance, Macros, and Auth Profiles", () => {
