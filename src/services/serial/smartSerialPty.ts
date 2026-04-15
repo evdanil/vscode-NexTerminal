@@ -171,6 +171,13 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     if (blocked) this.inputBlockNoticeArmed = true;
   }
 
+  public writeProgrammatic(data: string): void {
+    if (this.disposed || this.stopped || !this.transportSessionId) return;
+    void this.transport.writePort(this.transportSessionId, Buffer.from(data, "utf8")).catch(() => {
+      /* best-effort; ConnectionLost surfaces via NexusCore.onDidChange */
+    });
+  }
+
   private get terminalNameBase(): string {
     return `Nexus Serial: ${this.profile.name} [Smart Follow]`;
   }

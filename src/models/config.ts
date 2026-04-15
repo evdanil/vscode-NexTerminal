@@ -95,6 +95,12 @@ export interface SerialProfile {
 export interface SessionPtyHandle {
   addOutputObserver(observer: PtyOutputObserver): vscode.Disposable;
   setInputBlocked(blocked: boolean): void;
+  /**
+   * Write text to the underlying transport (SSH stream or serial port) on behalf of a script.
+   * Bypasses the user-input lock (scripts own the lock) but silently no-ops if the session is
+   * disconnected — the runtime's NexusCore.onDidChange subscription surfaces ConnectionLost.
+   */
+  writeProgrammatic(data: string): void;
 }
 
 export interface ActiveSession {

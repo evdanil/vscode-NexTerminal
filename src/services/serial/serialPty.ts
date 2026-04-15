@@ -69,6 +69,13 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     if (blocked) this.inputBlockNoticeArmed = true;
   }
 
+  public writeProgrammatic(data: string): void {
+    if (this.disposed || this.disconnected || this.failed || !this.sidecarSessionId) return;
+    void this.transport.writePort(this.sidecarSessionId, Buffer.from(data, "utf8")).catch(() => {
+      /* best-effort; ConnectionLost surfaces via NexusCore.onDidChange */
+    });
+  }
+
   public readonly onDidWrite: vscode.Event<string> = this.writeEmitter.event;
   public readonly onDidClose: vscode.Event<void> = this.closeEmitter.event;
   public readonly onDidChangeName: vscode.Event<string> = this.nameEmitter.event;

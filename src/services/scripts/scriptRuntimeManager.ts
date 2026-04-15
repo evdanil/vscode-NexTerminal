@@ -1,28 +1,49 @@
+import { randomUUID } from "node:crypto";
+import { Worker } from "node:worker_threads";
 import * as vscode from "vscode";
 import type { NexusCore } from "../../core/nexusCore";
-import type { MacroAutoTrigger } from "../macroAutoTrigger";
-import { ScriptOutputBuffer } from "./scriptOutputBuffer";
+import type { ActiveSession, ActiveSerialSession } from "../../models/config";
+import type { MacroAutoTrigger, PtyOutputObserver } from "../macroAutoTrigger";
+import { parseScriptHeader, type ScriptHeader } from "./scriptHeader";
+import { ScriptOutputBuffer, type Match } from "./scriptOutputBuffer";
+import { pickTarget, type ScriptTargetDescriptor } from "./scriptTarget";
 import type {
   FinalState,
   RunState,
   RunningScriptSnapshot,
   ScriptRunEvent,
-  ScriptRunOperation
+  ScriptRunOperation,
+  WorkerInbound,
+  WorkerOutbound
 } from "./scriptTypes";
 
 export interface ScriptRuntimeManagerDependencies {
   core: NexusCore;
   macroAutoTrigger: MacroAutoTrigger;
   outputChannel: vscode.OutputChannel;
-  /** Absolute path to dist/services/scripts/scriptWorker.js. Injected so tests can swap it out. */
+  /** Absolute path to dist/services/scripts/scriptWorker.js. */
   workerPath: string;
+  /** Injection point for tests — lets them swap in a lightweight worker shim. */
+  createWorker?: (workerPath: string) => WorkerLike;
 }
 
-/**
- * Internal record for a running script. Filled in during T023 / T024.
- * The skeleton lives here so downstream US1 tasks have a stable type to reference.
- */
-export interface RunningScriptRecord {
+/** Minimal surface the manager uses from the Worker — lets tests substitute. */
+export interface WorkerLike {
+  on(event: "message", listener: (msg: WorkerOutbound) => void): void;
+  on(event: "error", listener: (err: Error) => void): void;
+  on(event: "exit", listener: (code: number) => void): void;
+  postMessage(msg: WorkerInbound): void;
+  terminate(): Promise<number>;
+  unref(): void;
+}
+
+interface PendingRpc {
+  resolve: (value: unknown) => void;
+  reject: (reason: { code: string; message: string; extra?: Record<string, unknown> }) => void;
+  cancel(): void;
+}
+
+interface RunningScriptRecord {
   id: string;
   scriptName: string;
   scriptPath: string;
@@ -33,57 +54,577 @@ export interface RunningScriptRecord {
   state: RunState;
   currentOperation: ScriptRunOperation | null;
   outputBuffer: ScriptOutputBuffer;
-  /** Disposable returned by pty.addOutputObserver — cleared on cleanup. */
+  defaultTimeoutMs: number;
+  worker: WorkerLike;
+  pendingRpcs: Map<number, PendingRpc>;
   observerSubscription?: vscode.Disposable;
-  /** True if @lock-input was honored for this run. */
-  inputLockHeld: boolean;
-  /** Disposable returned by macroAutoTrigger.pushFilter in US4. */
   macroFilterHandle?: vscode.Disposable;
+  coreChangeSubscription?: vscode.Disposable;
+  inputLockHeld: boolean;
+  writeBack: (data: string) => void;
+  connectionLostSignaled: boolean;
   endedAt?: number;
 }
+
+const CONTROL_KEY_BYTES: Record<string, string> = {
+  "ctrl-a": "\x01", "ctrl-b": "\x02", "ctrl-c": "\x03", "ctrl-d": "\x04",
+  "ctrl-e": "\x05", "ctrl-k": "\x0b", "ctrl-l": "\x0c", "ctrl-n": "\x0e",
+  "ctrl-p": "\x10", "ctrl-r": "\x12", "ctrl-u": "\x15", "ctrl-w": "\x17",
+  "ctrl-z": "\x1a",
+  enter: "\r", esc: "\x1b", tab: "\t", space: " ", backspace: "\x7f",
+  up: "\x1b[A", down: "\x1b[B", left: "\x1b[D", right: "\x1b[C",
+  home: "\x1b[H", end: "\x1b[F", "page-up": "\x1b[5~", "page-down": "\x1b[6~",
+  f1: "\x1bOP", f2: "\x1bOQ", f3: "\x1bOR", f4: "\x1bOS",
+  f5: "\x1b[15~", f6: "\x1b[17~", f7: "\x1b[18~", f8: "\x1b[19~",
+  f9: "\x1b[20~", f10: "\x1b[21~", f11: "\x1b[23~", f12: "\x1b[24~"
+};
 
 export class ScriptRuntimeManager implements vscode.Disposable {
   private readonly runs = new Map<string, RunningScriptRecord>();
   private readonly _onDidChangeRun = new vscode.EventEmitter<ScriptRunEvent>();
   public readonly onDidChangeRun: vscode.Event<ScriptRunEvent> = this._onDidChangeRun.event;
 
-  public constructor(protected readonly deps: ScriptRuntimeManagerDependencies) {}
+  public constructor(private readonly deps: ScriptRuntimeManagerDependencies) {}
 
-  /**
-   * Start a script run against a session.
-   *
-   * Implementation lives in T023 (US1). This skeleton is intentionally incomplete —
-   * any caller invoking it before US1 implementation lands will receive a clear error.
-   */
-  public runScript(_uri: vscode.Uri, _sessionId?: string): Promise<string> {
-    throw new Error("ScriptRuntimeManager.runScript is not implemented yet (wired in US1 / T023).");
-  }
-
-  /**
-   * Stop the running script bound to `sessionId`. Implementation in T024 (US1).
-   */
-  public stopScript(_sessionId: string): Promise<void> {
-    throw new Error("ScriptRuntimeManager.stopScript is not implemented yet (wired in US1 / T024).");
-  }
-
-  /**
-   * Current snapshot of all runs for UI consumers (tree / status bar / codelens).
-   */
   public getRuns(): RunningScriptSnapshot[] {
     return Array.from(this.runs.values(), (r) => this.toSnapshot(r));
   }
 
-  /** Get a specific running script's descriptor, keyed by sessionId. */
-  public getRunForSession(sessionId: string): RunningScriptRecord | undefined {
-    return this.runs.get(sessionId);
+  public getRunForSession(sessionId: string): RunningScriptSnapshot | undefined {
+    const r = this.runs.get(sessionId);
+    return r ? this.toSnapshot(r) : undefined;
   }
 
-  /** Public accessor used by tests and UI components to fire events from the runtime. */
-  protected emit(event: ScriptRunEvent): void {
-    this._onDidChangeRun.fire(event);
+  public async runScript(uri: vscode.Uri, sessionId?: string): Promise<string | undefined> {
+    const source = await this.readScriptFile(uri);
+    const header = parseScriptHeader(source);
+    if (!header.marker) {
+      void vscode.window.showErrorMessage(
+        `${uri.fsPath} is not a Nexus script (missing @nexus-script marker in the leading JSDoc block).`
+      );
+      return undefined;
+    }
+    if (header.parseErrors.length > 0) {
+      void vscode.window.showErrorMessage(
+        `Script header has errors: ${header.parseErrors.join("; ")}`
+      );
+      return undefined;
+    }
+    const displayName = header.name ?? this.basenameWithoutExt(uri.fsPath);
+
+    const target = sessionId
+      ? this.resolveSession(sessionId)
+      : await this.pickTargetForScript(displayName, header);
+    if (!target) return undefined;
+
+    if (this.runs.has(target.session.id)) {
+      const existing = this.runs.get(target.session.id)!;
+      const picked = await vscode.window.showWarningMessage(
+        `"${existing.scriptName}" is running on ${target.session.terminalName}. Stop it and run "${displayName}"?`,
+        { modal: true },
+        "Stop & run"
+      );
+      if (picked !== "Stop & run") return undefined;
+      await this.stopScript(target.session.id);
+    }
+
+    if (!target.session.pty) {
+      void vscode.window.showErrorMessage(
+        `Session ${target.session.terminalName} is not script-capable (no PTY handle).`
+      );
+      return undefined;
+    }
+
+    const defaultTimeoutMs =
+      header.defaultTimeoutMs ??
+      (vscode.workspace.getConfiguration("nexus.scripts").get<number>("defaultTimeout") ?? 30_000);
+
+    const record: RunningScriptRecord = {
+      id: randomUUID(),
+      scriptName: displayName,
+      scriptPath: uri.fsPath,
+      sessionId: target.session.id,
+      sessionName: target.session.terminalName,
+      sessionType: target.type,
+      startedAt: Date.now(),
+      state: "starting",
+      currentOperation: null,
+      outputBuffer: new ScriptOutputBuffer(),
+      defaultTimeoutMs,
+      worker: this.createWorker(),
+      pendingRpcs: new Map(),
+      inputLockHeld: false,
+      connectionLostSignaled: false,
+      writeBack: (data: string) => target.session.pty!.writeProgrammatic(data)
+    };
+
+    record.observerSubscription = target.session.pty.addOutputObserver({
+      onOutput: (text) => record.outputBuffer.append(text),
+      pauseIntervalMacros: () => {},
+      dispose: () => {}
+    });
+
+    if (header.lockInput) {
+      target.session.pty.setInputBlocked(true);
+      record.inputLockHeld = true;
+    }
+
+    const unsubscribeCore = this.deps.core.onDidChange(() => {
+      if (!this.deps.core.getActiveSessionById(target.session.id)) {
+        this.handleConnectionLost(record);
+      }
+    });
+    record.coreChangeSubscription = new vscode.Disposable(unsubscribeCore);
+
+    record.worker.on("message", (msg: WorkerOutbound) => this.handleWorkerMessage(record, msg));
+    record.worker.on("error", (err: Error) => this.handleWorkerError(record, err));
+    record.worker.on("exit", (_code: number) => {
+      if (record.state === "starting" || record.state === "running") {
+        this.cleanupRun(record, "failed");
+      }
+    });
+
+    this.runs.set(record.sessionId, record);
+    record.state = "running";
+    this.emit({ kind: "started", run: this.toSnapshot(record) });
+    this.logEvent(record, `start (session: ${record.sessionName}, ${record.sessionType})`);
+    record.worker.postMessage({ kind: "load", source });
+    return record.id;
   }
 
-  protected toSnapshot(r: RunningScriptRecord): RunningScriptSnapshot {
+  public async stopScript(sessionId: string): Promise<void> {
+    const record = this.runs.get(sessionId);
+    if (!record) return;
+    const graceMs = 100;
+    const terminated = await Promise.race([
+      record.worker.terminate().then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), graceMs))
+    ]);
+    this.rejectAllPending(record, { code: "Stopped", message: "Script stopped by user" });
+    if (!terminated) {
+      this.logEvent(record, "warning: worker did not terminate within grace");
+    }
+    this.cleanupRun(record, "stopped");
+  }
+
+  public dispose(): void {
+    for (const run of Array.from(this.runs.values())) {
+      this.rejectAllPending(run, { code: "Stopped", message: "Extension deactivating" });
+      void run.worker.terminate();
+      this.cleanupRun(run, "stopped");
+    }
+    this.runs.clear();
+    this._onDidChangeRun.dispose();
+  }
+
+  // ──────────────────────────── internals ────────────────────────────
+
+  private createWorker(): WorkerLike {
+    if (this.deps.createWorker) return this.deps.createWorker(this.deps.workerPath);
+    const w = new Worker(this.deps.workerPath, {
+      resourceLimits: { maxOldGenerationSizeMb: 192, stackSizeMb: 4 },
+      stdout: true,
+      stderr: true
+    });
+    w.unref();
+    return w as unknown as WorkerLike;
+  }
+
+  private async readScriptFile(uri: vscode.Uri): Promise<string> {
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+
+  private basenameWithoutExt(fsPath: string): string {
+    const name = fsPath.split(/[\\/]/).pop() ?? fsPath;
+    return name.replace(/\.[^.]+$/, "");
+  }
+
+  private resolveSession(
+    sessionId: string
+  ): { type: "ssh" | "serial"; session: (ActiveSession | ActiveSerialSession) } | undefined {
+    const snapshot = this.deps.core.getSnapshot();
+    const ssh = snapshot.activeSessions.find((s) => s.id === sessionId);
+    if (ssh) return { type: "ssh", session: ssh };
+    const serial = snapshot.activeSerialSessions.find((s) => s.id === sessionId);
+    if (serial) return { type: "serial", session: serial };
+    return undefined;
+  }
+
+  private async pickTargetForScript(
+    displayName: string,
+    header: ScriptHeader
+  ): Promise<{ type: "ssh" | "serial"; session: ActiveSession | ActiveSerialSession } | undefined> {
+    const descriptor: ScriptTargetDescriptor = {
+      displayName,
+      targetType: header.targetType,
+      targetProfile: header.targetProfile
+    };
+    const session = await pickTarget(descriptor, this.deps.core);
+    if (!session) return undefined;
+    // Classify by whether the session is in activeSessions or activeSerialSessions
+    const snapshot = this.deps.core.getSnapshot();
+    const kind: "ssh" | "serial" = snapshot.activeSessions.some((s) => s.id === session.id) ? "ssh" : "serial";
+    return { type: kind, session };
+  }
+
+  private handleWorkerMessage(record: RunningScriptRecord, msg: WorkerOutbound): void {
+    switch (msg.kind) {
+      case "ready":
+        // Worker ready; `load` was already sent.
+        break;
+      case "log":
+        this.emit({ kind: "log", run: this.toSnapshot(record), level: msg.level, text: msg.text });
+        this.logEvent(record, `log ${msg.level}: ${msg.text}`);
+        break;
+      case "complete":
+        this.cleanupRun(record, record.connectionLostSignaled ? "connection-lost" : "completed");
+        break;
+      case "failed":
+        this.logEvent(record, `failed: ${msg.error.message}${msg.error.stack ? `\n${msg.error.stack}` : ""}`);
+        this.cleanupRun(record, record.connectionLostSignaled ? "connection-lost" : "failed");
+        break;
+      case "rpc":
+        void this.dispatchRpc(record, msg.id, msg.method, msg.args);
+        break;
+    }
+  }
+
+  private handleWorkerError(record: RunningScriptRecord, err: Error): void {
+    this.logEvent(record, `worker error: ${err.message}`);
+    this.cleanupRun(record, "failed");
+  }
+
+  private async dispatchRpc(
+    record: RunningScriptRecord,
+    id: number,
+    method: string,
+    args: unknown[]
+  ): Promise<void> {
+    try {
+      const value = await this.invokeMethod(record, method, args);
+      record.worker.postMessage({ kind: "rpc-result", id, ok: true, value });
+    } catch (err) {
+      const e = err as { code?: string; message?: string };
+      record.worker.postMessage({
+        kind: "rpc-result",
+        id,
+        ok: false,
+        error: {
+          code: e?.code ?? "UnknownError",
+          message: e?.message ?? String(err),
+          extra: extraFieldsOf(err)
+        }
+      });
+    }
+  }
+
+  private async invokeMethod(
+    record: RunningScriptRecord,
+    method: string,
+    args: unknown[]
+  ): Promise<unknown> {
+    switch (method) {
+      case "waitFor":
+        return this.doWait(record, args[0] as string | RegExp, args[1] as WaitOpts | undefined, /*throwOnTimeout*/ false);
+      case "expect":
+        return this.doWait(record, args[0] as string | RegExp, args[1] as WaitOpts | undefined, /*throwOnTimeout*/ true);
+      case "waitAny":
+        return this.doWaitAny(record, args[0] as Array<string | RegExp>, args[1] as WaitOpts | undefined);
+      case "send":
+        record.writeBack(String(args[0] ?? ""));
+        return undefined;
+      case "sendLine":
+        record.writeBack(String(args[0] ?? "") + "\r");
+        return undefined;
+      case "sendKey": {
+        const key = String(args[0] ?? "").toLowerCase();
+        const bytes = CONTROL_KEY_BYTES[key];
+        if (!bytes) throw makeError("InvalidKey", `Unknown control key: ${key}`);
+        record.writeBack(bytes);
+        return undefined;
+      }
+      case "sleep":
+        return new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, Number(args[0] ?? 0))));
+      case "poll":
+        return this.doPoll(record, args[0] as PollOpts);
+      case "prompt":
+      case "confirm":
+      case "alert":
+        return this.doUserInteraction(record, method, args);
+      case "macros.allow":
+      case "macros.deny":
+      case "macros.disableAll":
+      case "macros.restore":
+        // US4 hook — no-op for MVP. Logged so users know it's not wired yet.
+        this.logEvent(record, `${method}: no-op (macro coordination lands in US4)`);
+        return undefined;
+      default:
+        throw makeError("UnknownMethod", `Unknown script RPC method: ${method}`);
+    }
+  }
+
+  private async doWait(
+    record: RunningScriptRecord,
+    pattern: string | RegExp,
+    opts: WaitOpts | undefined,
+    throwOnTimeout: boolean
+  ): Promise<Match | null> {
+    const timeoutMs = opts?.timeout ?? record.defaultTimeoutMs;
+    const patternLabel = patternToLabel(pattern);
+    const opLabel = `waitFor ${patternLabel}`;
+    this.beginOp(record, "wait", opLabel);
+    const startedAt = Date.now();
+    try {
+      const m = await this.scanWithSubscription(record, pattern, opts?.lookback, timeoutMs);
+      if (m) {
+        record.outputBuffer.advanceCursor(m.endPosition);
+        this.endOp(record, "matched");
+        return m;
+      }
+      this.endOp(record, "timeout");
+      if (throwOnTimeout) {
+        throw makeError("Timeout", `expect timed out after ${Date.now() - startedAt}ms waiting for ${patternLabel}`, {
+          pattern: patternLabel,
+          timeoutMs,
+          elapsedMs: Date.now() - startedAt
+        });
+      }
+      return null;
+    } finally {
+      // op already ended above
+    }
+  }
+
+  private async doWaitAny(
+    record: RunningScriptRecord,
+    patterns: Array<string | RegExp>,
+    opts: WaitOpts | undefined
+  ): Promise<{ index: number; match: Match }> {
+    const timeoutMs = opts?.timeout ?? record.defaultTimeoutMs;
+    const patternLabel = patterns.map(patternToLabel).join(" | ");
+    const opLabel = `waitAny ${patternLabel}`;
+    this.beginOp(record, "wait", opLabel);
+    const deadline = Date.now() + timeoutMs;
+    const buffer = record.outputBuffer;
+    while (Date.now() < deadline) {
+      for (let i = 0; i < patterns.length; i++) {
+        const m = buffer.scan(patterns[i], { lookback: opts?.lookback });
+        if (m) {
+          buffer.advanceCursor(m.endPosition);
+          this.endOp(record, "matched");
+          return { index: i, match: m };
+        }
+      }
+      await this.waitForNewOutputOrTimeout(buffer, deadline - Date.now());
+    }
+    this.endOp(record, "timeout");
+    throw makeError("Timeout", `waitAny timed out after ${timeoutMs}ms waiting for ${patternLabel}`, {
+      pattern: patternLabel,
+      timeoutMs,
+      elapsedMs: timeoutMs
+    });
+  }
+
+  private async doPoll(record: RunningScriptRecord, opts: PollOpts): Promise<Match> {
+    const every = Math.max(50, Number(opts?.every ?? 1000));
+    const timeout = Math.max(every, Number(opts?.timeout ?? record.defaultTimeoutMs));
+    const pattern = opts?.until;
+    if (!pattern) throw makeError("InvalidArgs", "poll requires `until` pattern");
+    const label = `poll every=${every}ms until ${patternToLabel(pattern)}`;
+    this.beginOp(record, "poll", label);
+    const deadline = Date.now() + timeout;
+    const sendOnTick = async (): Promise<void> => {
+      const s = opts?.send;
+      if (typeof s === "string") record.writeBack(s);
+      // Function-form for `send` is worker-side; not reachable via structured clone.
+    };
+    while (Date.now() < deadline) {
+      await sendOnTick();
+      const waitUntil = Math.min(every, deadline - Date.now());
+      const m = await this.scanWithSubscription(record.outputBuffer, pattern, undefined, waitUntil, record);
+      if (m) {
+        record.outputBuffer.advanceCursor(m.endPosition);
+        this.endOp(record, "matched");
+        return m;
+      }
+    }
+    this.endOp(record, "timeout");
+    throw makeError("Timeout", `poll timed out after ${timeout}ms waiting for ${patternToLabel(pattern)}`, {
+      pattern: patternToLabel(pattern),
+      timeoutMs: timeout,
+      elapsedMs: timeout
+    });
+  }
+
+  private async doUserInteraction(
+    record: RunningScriptRecord,
+    method: string,
+    args: unknown[]
+  ): Promise<unknown> {
+    const message = String(args[0] ?? "");
+    this.beginOp(record, "prompt", `${method}: ${message}`);
+    try {
+      if (method === "prompt") {
+        const opts = (args[1] ?? {}) as { default?: string; password?: boolean };
+        const value = await vscode.window.showInputBox({
+          prompt: message,
+          value: opts.default,
+          password: !!opts.password
+        });
+        this.endOp(record, "user-input");
+        return value ?? "";
+      }
+      if (method === "confirm") {
+        const picked = await vscode.window.showInformationMessage(
+          message,
+          { modal: true },
+          "OK"
+        );
+        this.endOp(record, "user-input");
+        return picked === "OK";
+      }
+      // alert
+      await vscode.window.showInformationMessage(message, { modal: true }, "OK");
+      this.endOp(record, "user-input");
+      return undefined;
+    } catch (err) {
+      this.endOp(record, "timeout");
+      throw err;
+    }
+  }
+
+  private scanWithSubscription(
+    recordOrBuffer: RunningScriptRecord | ScriptOutputBuffer,
+    pattern: string | RegExp,
+    lookback: number | undefined,
+    timeoutMs: number,
+    record?: RunningScriptRecord
+  ): Promise<Match | null> {
+    const buffer: ScriptOutputBuffer =
+      recordOrBuffer instanceof ScriptOutputBuffer ? recordOrBuffer : recordOrBuffer.outputBuffer;
+    const ownerRecord: RunningScriptRecord =
+      recordOrBuffer instanceof ScriptOutputBuffer ? (record as RunningScriptRecord) : recordOrBuffer;
+
+    return new Promise<Match | null>((resolve, reject) => {
+      const attempt = (): Match | null => buffer.scan(pattern, { lookback });
+      const immediate = attempt();
+      if (immediate) {
+        resolve(immediate);
+        return;
+      }
+      let resolved = false;
+      const doResolve = (v: Match | null): void => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        unsub();
+        ownerRecord.pendingRpcs.delete(rpcKey);
+        resolve(v);
+      };
+      const doReject = (e: { code: string; message: string; extra?: Record<string, unknown> }): void => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        unsub();
+        ownerRecord.pendingRpcs.delete(rpcKey);
+        reject(e);
+      };
+      const timer = setTimeout(() => doResolve(null), Math.max(0, timeoutMs));
+      const unsub = buffer.subscribe(() => {
+        const m = attempt();
+        if (m) doResolve(m);
+      });
+      // Register so ConnectionLost / Stopped can cancel the wait.
+      const rpcKey = ++pendingIdCounter;
+      ownerRecord.pendingRpcs.set(rpcKey, {
+        resolve: (v) => doResolve(v as Match | null),
+        reject: doReject,
+        cancel: () => doResolve(null)
+      });
+    });
+  }
+
+  private waitForNewOutputOrTimeout(buffer: ScriptOutputBuffer, timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        unsub();
+        resolve();
+      }, Math.max(0, timeoutMs));
+      const unsub = buffer.subscribe(() => {
+        clearTimeout(timer);
+        unsub();
+        resolve();
+      });
+    });
+  }
+
+  private beginOp(record: RunningScriptRecord, kind: ScriptRunOperation["kind"], label: string): void {
+    record.currentOperation = { kind, label, startedAt: Date.now() };
+    this.emit({
+      kind: "operationBegin",
+      run: this.toSnapshot(record),
+      op: { kind, label }
+    });
+    this.logEvent(record, `→ ${label}`);
+  }
+
+  private endOp(record: RunningScriptRecord, result: "matched" | "timeout" | "user-input" | "tick" | "elapsed"): void {
+    this.emit({ kind: "operationEnd", run: this.toSnapshot(record), result });
+    this.logEvent(record, `← ${result}`);
+    record.currentOperation = null;
+  }
+
+  private handleConnectionLost(record: RunningScriptRecord): void {
+    if (record.connectionLostSignaled) return;
+    if (record.state === "completed" || record.state === "stopped" || record.state === "failed" || record.state === "connection-lost") {
+      return;
+    }
+    record.connectionLostSignaled = true;
+    this.rejectAllPending(record, {
+      code: "ConnectionLost",
+      message: "Session disconnected",
+      extra: { sessionId: record.sessionId }
+    });
+    // Give the user script a brief grace period to run its catch/finally block
+    // and emit any final log messages before we force-terminate.
+    const graceMs = 150;
+    setTimeout(() => {
+      if (!this.runs.has(record.sessionId)) return; // already cleaned up by worker "complete" / "failed"
+      void record.worker.terminate();
+      this.cleanupRun(record, "connection-lost");
+    }, graceMs);
+  }
+
+  private rejectAllPending(
+    record: RunningScriptRecord,
+    error: { code: string; message: string; extra?: Record<string, unknown> }
+  ): void {
+    for (const entry of record.pendingRpcs.values()) {
+      entry.reject(error);
+    }
+    record.pendingRpcs.clear();
+  }
+
+  private cleanupRun(record: RunningScriptRecord, finalState: FinalState): void {
+    if (record.state === finalState) return;
+    record.coreChangeSubscription?.dispose();
+    record.observerSubscription?.dispose();
+    record.macroFilterHandle?.dispose();
+    if (record.inputLockHeld) {
+      const session = this.deps.core.getActiveSessionById(record.sessionId);
+      session?.pty?.setInputBlocked(false);
+      record.inputLockHeld = false;
+    }
+    record.state = finalState;
+    record.endedAt = Date.now();
+    const snap = this.toSnapshot(record);
+    this.emit({ kind: "ended", run: snap, finalState, durationMs: record.endedAt - record.startedAt });
+    this.logEvent(record, `end: ${finalState} (${record.endedAt - record.startedAt}ms)`);
+    this.runs.delete(record.sessionId);
+  }
+
+  private toSnapshot(r: RunningScriptRecord): RunningScriptSnapshot {
     return {
       id: r.id,
       scriptName: r.scriptName,
@@ -97,33 +638,56 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     };
   }
 
-  /** Protected helper for US1 cleanup — disposes observer + macro filter + input lock in order. */
-  protected cleanupRun(record: RunningScriptRecord, finalState: FinalState): void {
-    record.macroFilterHandle?.dispose();
-    record.macroFilterHandle = undefined;
-    record.observerSubscription?.dispose();
-    record.observerSubscription = undefined;
-    if (record.inputLockHeld) {
-      const session = this.deps.core.getActiveSessionById(record.sessionId);
-      session?.pty?.setInputBlocked(false);
-      record.inputLockHeld = false;
-    }
-    record.state = finalState;
-    record.endedAt = Date.now();
-    this.emit({
-      kind: "ended",
-      run: this.toSnapshot(record),
-      finalState,
-      durationMs: record.endedAt - record.startedAt
-    });
-    this.runs.delete(record.sessionId);
+  private emit(event: ScriptRunEvent): void {
+    this._onDidChangeRun.fire(event);
   }
 
-  public dispose(): void {
-    for (const run of this.runs.values()) {
-      this.cleanupRun(run, "stopped");
-    }
-    this.runs.clear();
-    this._onDidChangeRun.dispose();
+  private logEvent(record: RunningScriptRecord, text: string): void {
+    const stamp = new Date().toISOString().slice(11, 23);
+    this.deps.outputChannel.appendLine(`[${stamp}] ${record.scriptName}  ${text}`);
   }
+}
+
+// ─── local helpers ───────────────────────────────────────────────────
+
+interface WaitOpts {
+  timeout?: number;
+  lookback?: number;
+}
+
+interface PollOpts {
+  send?: string;
+  until?: string | RegExp;
+  every?: number;
+  timeout?: number;
+}
+
+let pendingIdCounter = 0;
+
+function patternToLabel(p: string | RegExp): string {
+  return typeof p === "string" ? JSON.stringify(p) : p.toString();
+}
+
+function makeError(
+  code: string,
+  message: string,
+  extra?: Record<string, unknown>
+): { code: string; message: string; extra?: Record<string, unknown> } & Error {
+  return Object.assign(new Error(message), { code, extra });
+}
+
+function extraFieldsOf(err: unknown): Record<string, unknown> | undefined {
+  if (err && typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    const extra: Record<string, unknown> = {};
+    let any = false;
+    for (const k of Object.keys(e)) {
+      if (k === "code" || k === "message" || k === "stack" || k === "name") continue;
+      extra[k] = e[k];
+      any = true;
+    }
+    if (any) return extra;
+    if (e.extra && typeof e.extra === "object") return e.extra as Record<string, unknown>;
+  }
+  return undefined;
 }

@@ -1,9 +1,11 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { registerFileCommands } from "./commands/fileCommands";
+import { registerScriptCommands } from "./commands/scriptCommands";
 import { registerSerialCommands } from "./commands/serialCommands";
 import { registerServerCommands } from "./commands/serverCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
+import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import type { CommandContext, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory } from "./logging/terminalLogger";
@@ -229,6 +231,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const highlighter = new TerminalHighlighter();
   const macroAutoTrigger = new MacroAutoTrigger();
+
+  const scriptOutputChannel = vscode.window.createOutputChannel("Nexus Scripts");
+  const scriptRuntimeManager = new ScriptRuntimeManager({
+    core,
+    macroAutoTrigger,
+    outputChannel: scriptOutputChannel,
+    workerPath: path.join(context.extensionPath, "dist", "services", "scripts", "scriptWorker.js")
+  });
+  const scriptCommandDisposables = registerScriptCommands(scriptRuntimeManager, scriptOutputChannel);
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
   const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
   const sftpService = new SftpService(pool, readSftpServiceConfig());
@@ -677,6 +688,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     macroAutoTrigger,
     macroView,
     macroAutoTriggerListener,
+    scriptRuntimeManager,
+    scriptOutputChannel,
+    ...scriptCommandDisposables,
     fileExplorerView,
     fsRegistration,
     statusBarItem,
