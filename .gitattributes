@@ -1,0 +1,6 @@
+# Normalize all text files to LF in the repo and working tree.
+* text=auto eol=lf
+
+# Explicit binary files (no EOL conversion).
+*.png binary
+*.vsix binary
