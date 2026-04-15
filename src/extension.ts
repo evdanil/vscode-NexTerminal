@@ -242,7 +242,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     workerPath: path.join(context.extensionPath, "dist", "services", "scripts", "scriptWorker.js"),
     assetsDir: vscode.Uri.file(path.join(context.extensionPath, "dist", "services", "scripts", "assets"))
   });
-  const scriptCommandDisposables = registerScriptCommands(scriptRuntimeManager, scriptOutputChannel);
+  // Reverse-lookup: given a VS Code Terminal, find the Nexus session id that owns
+  // it. Used by the `runQuick` flow to auto-pick the focused terminal when the
+  // user hits ▶ on a script in the sidebar.
+  const resolveSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined => {
+    if (!terminal) return undefined;
+    for (const [sid, term] of sessionTerminals) if (term === terminal) return sid;
+    for (const [sid, entry] of serialTerminals) if (entry.terminal === terminal) return sid;
+    return undefined;
+  };
+  const scriptCommandDisposables = registerScriptCommands(
+    scriptRuntimeManager,
+    scriptOutputChannel,
+    resolveSessionForTerminal
+  );
   const scriptTreeProvider = new ScriptTreeProvider(scriptRuntimeManager);
   const scriptCodeLensProvider = new ScriptCodeLensProvider(scriptRuntimeManager);
   const scriptsView = vscode.window.createTreeView("nexusScripts", {

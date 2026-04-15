@@ -193,9 +193,22 @@ async function deleteScript(uri: vscode.Uri): Promise<void> {
   }
 }
 
+/**
+ * Resolve the Nexus session id for a given VS Code `Terminal`, or undefined
+ * if the terminal isn't a Nexus-managed session (could be a plain shell, the
+ * serial sidecar host's stdio, etc.). Used by `nexus.script.runQuick` to
+ * auto-pick the currently focused terminal when the user hits the tree view's
+ * inline ▶ play button. Passed in from extension.ts where the two terminal
+ * maps live.
+ */
+export type TerminalToSessionResolver = (
+  terminal: vscode.Terminal | undefined
+) => string | undefined;
+
 export function registerScriptCommands(
   manager: ScriptRuntimeManager,
-  outputChannel: vscode.OutputChannel
+  outputChannel: vscode.OutputChannel,
+  resolveSessionForTerminal?: TerminalToSessionResolver
 ): vscode.Disposable[] {
   return [
     // Running a script does NOT require an open workspace — users can open a .js
@@ -205,6 +218,25 @@ export function registerScriptCommands(
       if (!target) return;
       try {
         await manager.runScript(target);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        void vscode.window.showErrorMessage(`Failed to start script: ${message}`);
+      }
+    }),
+
+    // Quick-run: if the user has a Nexus terminal focused, bind the script to that
+    // session without the picker. Falls back to the normal picker flow when no
+    // terminal is focused, or when the focused terminal isn't a Nexus session
+    // (plain shell, etc.). This is wired to the Scripts tree view's inline
+    // ▶ play button; the CodeLens / Palette / right-click menu keep the
+    // explicit picker behaviour because those contexts aren't a user telling us
+    // "the terminal I'm looking at is where I want this to run".
+    vscode.commands.registerCommand("nexus.script.runQuick", async (arg?: unknown) => {
+      const target = toScriptUri(arg) ?? (await pickScriptFile());
+      if (!target) return;
+      const sessionId = resolveSessionForTerminal?.(vscode.window.activeTerminal);
+      try {
+        await manager.runScript(target, sessionId);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         void vscode.window.showErrorMessage(`Failed to start script: ${message}`);

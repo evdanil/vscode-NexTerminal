@@ -101,6 +101,7 @@ const unsupportedCommands = [
   "nexus.authProfile.applyToFolder",
   "nexus.authProfile.applyToServer",
   "nexus.script.run",
+  "nexus.script.runQuick",
   "nexus.script.runWithTarget",
   "nexus.script.stop",
   "nexus.script.new",

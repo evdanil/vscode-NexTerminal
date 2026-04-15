@@ -580,10 +580,12 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 
 | Command | Default keybinding | What it does |
 |---|---|---|
-| `Nexus: Run Nexus Script` | `Ctrl+Alt+R` (macOS `⌘⌥R`) when an editor is focused on a `.js` file | Pick a script from a file dialog (or pass a URI argument from a CodeLens) and run it against an active session. |
+| `Nexus: Run Nexus Script` | `Ctrl+Alt+R` (macOS `⌘⌥R`) when an editor is focused on a `.js` file | Pick a script from a file dialog (or pass a URI argument from a CodeLens) and always show the session picker. |
+| `Nexus: Quick Run in Active Terminal` | — | Bind the script to whichever Nexus terminal is currently focused — no picker. Falls back to the session picker if no terminal is focused or the focused terminal isn't a Nexus session. Wired to the sidebar's inline ▶ button. |
 | `Nexus: Stop Nexus Script` | `Ctrl+Alt+S` (macOS `⌘⌥S`) when a script is running | Stop a running script. Prompts if more than one is running. |
 | `Nexus: New Nexus Script` | — | Create a new script from a starter template in your configured scripts directory. |
 | `Nexus: Delete Script` | — | Right-click a script in the sidebar. Asks for confirmation, then moves to Trash. |
+| `Nexus: Open Scripts Folder` | — | Reveal the configured scripts directory in the OS file manager. |
 | `Nexus: Show Nexus Scripts Output` | — | Open the **Nexus Scripts** Output Channel. |
 | `Nexus: Open Scripting Guide` | — | Open this document in your browser. |
 | `Nexus: Run Nexus Script on Target` | — | Internal variant (hidden from the Command Palette) taking `(uri, sessionId)` — used by the sidebar menu. |

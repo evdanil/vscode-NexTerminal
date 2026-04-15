@@ -23,6 +23,8 @@ vi.mock("vscode", () => ({
     executeCommand: vi.fn()
   },
   window: {
+    activeTextEditor: undefined,
+    activeTerminal: undefined as unknown,
     showInputBox: (opts: { validateInput?: (v: string) => string | undefined }) => {
       state.inputBoxValidator = opts?.validateInput;
       return Promise.resolve(state.inputBoxReturn);
@@ -306,6 +308,71 @@ describe("scriptCommands", () => {
       const stop = state.registeredCommands.get("nexus.script.stop")!;
       await stop("sess-z");
       expect(mgr.stopScript).toHaveBeenCalledWith("sess-z");
+    });
+  });
+
+  describe("runQuick command (tree view inline ▶ — uses active terminal)", () => {
+    it("binds to the focused Nexus terminal when one is active (no picker shown)", async () => {
+      const mgr = makeManager();
+      const fakeTerminal = { name: "web-1" } as unknown as import("vscode").Terminal;
+      (await import("vscode")).window.activeTerminal = fakeTerminal;
+      const resolver = vi.fn((t: unknown) => (t === fakeTerminal ? "sess-a" : undefined));
+
+      registerScriptCommands(mgr, outputChannel, resolver as never);
+      const runQuick = state.registeredCommands.get("nexus.script.runQuick")!;
+      const uri = { fsPath: "/ws/.nexus/scripts/x.js", scheme: "file", path: "/ws/.nexus/scripts/x.js", toString: () => "" };
+      await runQuick(uri);
+
+      expect(resolver).toHaveBeenCalledWith(fakeTerminal);
+      expect(mgr.runScript).toHaveBeenCalledWith(uri, "sess-a");
+
+      (await import("vscode")).window.activeTerminal = undefined;
+    });
+
+    it("falls back to the picker (manager.runScript(uri)) when no terminal is focused", async () => {
+      const mgr = makeManager();
+      (await import("vscode")).window.activeTerminal = undefined;
+      const resolver = vi.fn(() => undefined);
+
+      registerScriptCommands(mgr, outputChannel, resolver as never);
+      const runQuick = state.registeredCommands.get("nexus.script.runQuick")!;
+      const uri = { fsPath: "/ws/.nexus/scripts/x.js", scheme: "file", path: "/ws/.nexus/scripts/x.js", toString: () => "" };
+      await runQuick(uri);
+
+      // manager.runScript called WITHOUT sessionId — picker path inside the runtime.
+      expect(mgr.runScript).toHaveBeenCalledWith(uri, undefined);
+    });
+
+    it("falls back to the picker when the focused terminal isn't a Nexus session", async () => {
+      const mgr = makeManager();
+      const nonNexusTerminal = { name: "bash" } as unknown as import("vscode").Terminal;
+      (await import("vscode")).window.activeTerminal = nonNexusTerminal;
+      const resolver = vi.fn(() => undefined); // not a Nexus session
+
+      registerScriptCommands(mgr, outputChannel, resolver as never);
+      const runQuick = state.registeredCommands.get("nexus.script.runQuick")!;
+      const uri = { fsPath: "/ws/.nexus/scripts/x.js", scheme: "file", path: "/ws/.nexus/scripts/x.js", toString: () => "" };
+      await runQuick(uri);
+
+      expect(mgr.runScript).toHaveBeenCalledWith(uri, undefined);
+
+      (await import("vscode")).window.activeTerminal = undefined;
+    });
+
+    it("unwraps ScriptNode like the other handlers do", async () => {
+      const mgr = makeManager();
+      const fakeTerminal = { name: "web-1" } as unknown as import("vscode").Terminal;
+      (await import("vscode")).window.activeTerminal = fakeTerminal;
+      const resolver = vi.fn(() => "sess-a");
+
+      registerScriptCommands(mgr, outputChannel, resolver as never);
+      const runQuick = state.registeredCommands.get("nexus.script.runQuick")!;
+      const innerUri = { fsPath: "/ws/.nexus/scripts/x.js", scheme: "file", path: "/ws/.nexus/scripts/x.js", toString: () => "" };
+      await runQuick({ kind: "script", uri: innerUri, name: "x", description: "", running: false, parseErrors: [] });
+
+      expect(mgr.runScript).toHaveBeenCalledWith(innerUri, "sess-a");
+
+      (await import("vscode")).window.activeTerminal = undefined;
     });
   });
 

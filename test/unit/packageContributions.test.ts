@@ -160,9 +160,10 @@ describe("package contributions", () => {
       expect(commands).toContain("revealInExplorer");
       expect(commands).toContain("nexus.script.delete");
 
-      // Inline run appears on idle items only
+      // Inline ▶ run is bound to runQuick so it auto-picks the focused terminal;
+      // the context-menu "Run" entry keeps the explicit picker flow.
       const inlineRun = scriptItems.find(
-        (i) => i.command === "nexus.script.run" && i.group === "inline"
+        (i) => i.command === "nexus.script.runQuick" && i.group === "inline"
       );
       expect(inlineRun?.when).toContain("viewItem == nexus.script.file");
 
