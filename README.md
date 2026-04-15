@@ -44,6 +44,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
   const out = await expect(/[$#] $/);
   log.info("kernel:", out.before.trim());
   ```
+  See the **[full scripting guide](docs/scripting.md)** for the complete API reference, header fields, match-window semantics, error-handling patterns, macro coordination, and [`examples/scripts/`](examples/scripts/) for seven runnable scripts demonstrating `if` / `while` / `for` loops, retries, polling, user interaction, and complete multi-step procedures.
 - **Web Extension Fallback** — Graceful degradation in browser-based VS Code (SSH/serial features require desktop runtime).
 
 ## Getting Started
