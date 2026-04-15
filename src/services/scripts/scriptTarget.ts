@@ -18,7 +18,10 @@ interface SessionPickItem extends vscode.QuickPickItem {
  *
  * Order of resolution:
  *   1. Filter candidates by `descriptor.targetType` (ssh | serial | undefined = both).
- *   2. If `descriptor.targetProfile` is set:
+ *   2. If **no candidates match** after filtering, show an informative error message
+ *      (prior behaviour was a silent `undefined` return, which made "Run" appear to
+ *      do nothing at all).
+ *   3. If `descriptor.targetProfile` is set:
  *        a. Match by profile/server **id** first (exact match → auto-pick).
  *        b. Then match by profile/server **name**.
  *           - If exactly one session matches the name → auto-pick it.
@@ -26,8 +29,11 @@ interface SessionPickItem extends vscode.QuickPickItem {
  *             show the QuickPick narrowed to those ambiguous matches rather than silently
  *             picking the first. This avoids the "wrong router" surprise.
  *           - If no sessions match the name → fall through to the full candidate picker.
- *   3. If exactly one candidate remains, auto-pick it.
- *   4. Otherwise present a QuickPick over every filtered candidate.
+ *   4. Otherwise present a QuickPick — always, even with a single candidate. Showing
+ *      the picker confirms to the user WHICH terminal the script will drive, which is
+ *      the overwhelming UX complaint when multiple are open. When exactly one session
+ *      is available, the picker renders a single pre-selected row and one Enter
+ *      confirms the choice.
  *   5. Returns `undefined` if no candidates exist or the user cancels.
  */
 export async function pickTarget(
@@ -129,8 +135,14 @@ export async function pickTarget(
     }))
   ];
 
-  if (combined.length === 0) return undefined;
-  if (combined.length === 1) return combined[0].session;
+  if (combined.length === 0) {
+    const kind = descriptor.targetType ?? "SSH or Serial";
+    const friendly = descriptor.targetType === "ssh" ? "SSH" : descriptor.targetType === "serial" ? "Serial" : kind;
+    void vscode.window.showErrorMessage(
+      `No active ${friendly} sessions. Connect to one from the Connectivity Hub, then run the script again.`
+    );
+    return undefined;
+  }
 
   const picked = (await vscode.window.showQuickPick(combined, {
     placeHolder: `Run "${descriptor.displayName}" against which session?`,

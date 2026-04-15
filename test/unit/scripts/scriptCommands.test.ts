@@ -182,6 +182,104 @@ describe("scriptCommands", () => {
     });
   });
 
+  describe("tree-view argument unwrap (bug: 'Unable to resolve filesystem provider …')", () => {
+    it("run accepts a real Uri from the CodeLens path", async () => {
+      const mgr = makeManager();
+      registerScriptCommands(mgr, outputChannel);
+      const run = state.registeredCommands.get("nexus.script.run")!;
+      const uri = { fsPath: "/ws/.nexus/scripts/test.js", scheme: "file", path: "/ws/.nexus/scripts/test.js", toString: () => "" };
+      await run(uri);
+      expect(mgr.runScript).toHaveBeenCalledWith(uri);
+    });
+
+    it("run accepts a ScriptNode { uri } from the tree view menu", async () => {
+      const mgr = makeManager();
+      registerScriptCommands(mgr, outputChannel);
+      const run = state.registeredCommands.get("nexus.script.run")!;
+      const innerUri = {
+        fsPath: "/ws/.nexus/scripts/test.js",
+        scheme: "file",
+        path: "/ws/.nexus/scripts/test.js",
+        toString: () => ""
+      };
+      // Simulate the ScriptNode object the tree view passes.
+      const scriptNode = {
+        kind: "script",
+        uri: innerUri,
+        name: "test",
+        description: "",
+        running: false,
+        parseErrors: []
+      };
+      await run(scriptNode);
+      // Must unwrap to the inner URI.
+      expect(mgr.runScript).toHaveBeenCalledWith(innerUri);
+    });
+
+    it("run accepts a TreeItem-like object with resourceUri (explorer or nested case)", async () => {
+      const mgr = makeManager();
+      registerScriptCommands(mgr, outputChannel);
+      const run = state.registeredCommands.get("nexus.script.run")!;
+      const innerUri = {
+        fsPath: "/ws/.nexus/scripts/test.js",
+        scheme: "file",
+        path: "/ws/.nexus/scripts/test.js",
+        toString: () => ""
+      };
+      await run({ resourceUri: innerUri, label: "test.js" });
+      expect(mgr.runScript).toHaveBeenCalledWith(innerUri);
+    });
+
+    it("run falls back to file picker when given an unrecognisable argument", async () => {
+      const mgr = makeManager();
+      registerScriptCommands(mgr, outputChannel);
+      const run = state.registeredCommands.get("nexus.script.run")!;
+      // ShowOpenDialog is mocked to return undefined → no run initiated.
+      await run({ someUnrelatedShape: true });
+      expect(mgr.runScript).not.toHaveBeenCalled();
+    });
+
+    it("delete unwraps a ScriptNode rather than silently no-op-ing", async () => {
+      state.warningReturn = "Delete";
+      registerScriptCommands(makeManager(), outputChannel);
+      const del = state.registeredCommands.get("nexus.script.delete")!;
+      const innerUri = { fsPath: "/ws/.nexus/scripts/foo.js", scheme: "file", path: "/ws/.nexus/scripts/foo.js", toString: () => "" };
+      await del({ kind: "script", uri: innerUri, name: "foo", description: "", running: false, parseErrors: [] });
+      expect(state.mockFsDelete).toHaveBeenCalled();
+    });
+
+    it("stop from tree view unwraps ScriptNode and maps it to the matching run", async () => {
+      const runsSnapshot = [
+        {
+          id: "r1",
+          scriptName: "foo",
+          scriptPath: "/ws/.nexus/scripts/foo.js",
+          sessionId: "sess-a",
+          sessionName: "term",
+          sessionType: "ssh",
+          startedAt: 0,
+          state: "running",
+          currentOperation: null,
+          inputLockHeld: false
+        }
+      ];
+      const mgr = makeManager({ getRuns: () => runsSnapshot });
+      registerScriptCommands(mgr, outputChannel);
+      const stop = state.registeredCommands.get("nexus.script.stop")!;
+      const innerUri = { fsPath: "/ws/.nexus/scripts/foo.js", scheme: "file", path: "/ws/.nexus/scripts/foo.js", toString: () => "" };
+      await stop({ kind: "script", uri: innerUri, name: "foo", description: "", running: true, parseErrors: [] });
+      expect(mgr.stopScript).toHaveBeenCalledWith("sess-a");
+    });
+
+    it("stop still accepts a bare sessionId string (status-bar tooltip path)", async () => {
+      const mgr = makeManager({ getRuns: () => [] });
+      registerScriptCommands(mgr, outputChannel);
+      const stop = state.registeredCommands.get("nexus.script.stop")!;
+      await stop("sess-z");
+      expect(mgr.stopScript).toHaveBeenCalledWith("sess-z");
+    });
+  });
+
   describe("S2 — delete command", () => {
     it("registers nexus.script.delete which confirms and deletes", async () => {
       state.warningReturn = "Delete";

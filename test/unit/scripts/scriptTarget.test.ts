@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 const quickPickCalls: Array<{ items: Array<{ label: string; sessionId?: string }>; placeHolder?: string }> = [];
 let pickBySessionId: string | undefined;
 
+const errorMessages: string[] = [];
+
 vi.mock("vscode", () => ({
   EventEmitter: class {
     public event = () => ({ dispose() {} });
@@ -17,7 +19,11 @@ vi.mock("vscode", () => ({
         const found = items.find((i) => i.sessionId === pickBySessionId);
         return Promise.resolve(found);
       }
-    )
+    ),
+    showErrorMessage: vi.fn((msg: string) => {
+      errorMessages.push(msg);
+      return Promise.resolve(undefined);
+    })
   }
 }));
 
@@ -27,6 +33,7 @@ import type { ScriptTargetDescriptor } from "../../../src/services/scripts/scrip
 function resetPicker(): void {
   quickPickCalls.length = 0;
   pickBySessionId = undefined;
+  errorMessages.length = 0;
 }
 
 function makeDescriptor(overrides: Partial<ScriptTargetDescriptor> = {}): ScriptTargetDescriptor {
@@ -52,7 +59,7 @@ function makeCore(snapshot: MockSnapshot): Parameters<typeof pickTarget>[1] {
 }
 
 describe("scriptTarget / pickTarget", () => {
-  it("returns undefined when no sessions match the targetType", async () => {
+  it("returns undefined AND surfaces a user-visible error when no sessions match the targetType", async () => {
     resetPicker();
     const core = makeCore({
       activeSessions: [],
@@ -62,10 +69,13 @@ describe("scriptTarget / pickTarget", () => {
     });
     const result = await pickTarget(makeDescriptor({ targetType: "ssh" }), core);
     expect(result).toBeUndefined();
+    expect(errorMessages).toHaveLength(1);
+    expect(errorMessages[0]).toMatch(/no active ssh sessions/i);
   });
 
-  it("auto-picks when exactly one session matches (ssh)", async () => {
+  it("shows the QuickPick even when exactly one session matches — so the user knows what they're binding to", async () => {
     resetPicker();
+    pickBySessionId = "ssh1";
     const core = makeCore({
       activeSessions: [{ id: "ssh1", serverId: "srv1", terminalName: "web-server-1" }],
       activeSerialSessions: [],
@@ -74,7 +84,10 @@ describe("scriptTarget / pickTarget", () => {
     });
     const result = await pickTarget(makeDescriptor({ targetType: "ssh" }), core);
     expect(result?.id).toBe("ssh1");
-    expect(quickPickCalls).toHaveLength(0);
+    // Picker IS shown (prior behaviour auto-picked silently — confusing when the
+    // terminal the script drives isn't visible to the user).
+    expect(quickPickCalls).toHaveLength(1);
+    expect(quickPickCalls[0].items).toHaveLength(1);
   });
 
   it("filters by targetType serial", async () => {

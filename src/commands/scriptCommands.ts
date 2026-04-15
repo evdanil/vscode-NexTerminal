@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
+import { parseScriptHeader } from "../services/scripts/scriptHeader";
 
 function requireWorkspaceOrNotify(): boolean {
   if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) return true;
@@ -7,7 +8,67 @@ function requireWorkspaceOrNotify(): boolean {
   return false;
 }
 
+/**
+ * Structural check for a URI — `instanceof vscode.Uri` is unreliable across module
+ * boundaries (the Uri emitted by the tree view provider may not be the same class
+ * as the one re-exported into a command callback), so we use duck-typing instead.
+ */
+function isUriLike(x: unknown): x is vscode.Uri {
+  return (
+    !!x &&
+    typeof x === "object" &&
+    typeof (x as { fsPath?: unknown }).fsPath === "string" &&
+    typeof (x as { scheme?: unknown }).scheme === "string"
+  );
+}
+
+/**
+ * Unwrap whatever VS Code handed to a script command's first argument into a Uri.
+ *
+ * Call sites we have to tolerate:
+ *   - Command Palette → no argument (returns undefined, caller should prompt).
+ *   - CodeLens → passes `document.uri` (a real Uri).
+ *   - Tree view inline / context menu → passes the tree element, i.e. our
+ *     `ScriptNode { kind, uri, name, … }`. The `uri` field is where the real Uri is.
+ *   - Explorer right-click (future) → passes a Uri-like with `resourceUri`.
+ *   - External automation → may pass a string path (handle as `Uri.file`).
+ */
+function toScriptUri(arg: unknown): vscode.Uri | undefined {
+  if (!arg) return undefined;
+  if (isUriLike(arg)) return arg;
+  if (typeof arg === "string" && arg.length > 0) {
+    try {
+      return vscode.Uri.file(arg);
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof arg === "object") {
+    const maybe = arg as { uri?: unknown; resourceUri?: unknown };
+    if (isUriLike(maybe.uri)) return maybe.uri;
+    if (isUriLike(maybe.resourceUri)) return maybe.resourceUri;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a script URI for the Palette "Run" flow.
+ *
+ * Order: (1) if the user's active editor is a JS file that *is* a Nexus script
+ * (has `@nexus-script` marker), use that — this matches the user's intent when
+ * they just hit "Run" with the script open in front of them. (2) Otherwise
+ * fall back to an open-file dialog pointed at the configured scripts directory.
+ */
 async function pickScriptFile(): Promise<vscode.Uri | undefined> {
+  const active = vscode.window.activeTextEditor;
+  if (active && active.document.languageId === "javascript") {
+    try {
+      const header = parseScriptHeader(active.document.getText());
+      if (header.marker) return active.document.uri;
+    } catch {
+      // Fall through to the dialog.
+    }
+  }
   const root = vscode.workspace.workspaceFolders?.[0]?.uri;
   const configuredDir = vscode.workspace.getConfiguration("nexus.scripts").get<string>("path", ".nexus/scripts");
   const defaultUri = root ? vscode.Uri.joinPath(root, configuredDir) : undefined;
@@ -126,9 +187,9 @@ export function registerScriptCommands(
   outputChannel: vscode.OutputChannel
 ): vscode.Disposable[] {
   return [
-    vscode.commands.registerCommand("nexus.script.run", async (uri?: vscode.Uri) => {
+    vscode.commands.registerCommand("nexus.script.run", async (arg?: unknown) => {
       if (!requireWorkspaceOrNotify()) return;
-      const target = uri ?? (await pickScriptFile());
+      const target = toScriptUri(arg) ?? (await pickScriptFile());
       if (!target) return;
       try {
         await manager.runScript(target);
@@ -138,20 +199,32 @@ export function registerScriptCommands(
       }
     }),
 
-    vscode.commands.registerCommand("nexus.script.runWithTarget", async (uri: vscode.Uri, sessionId: string) => {
+    vscode.commands.registerCommand("nexus.script.runWithTarget", async (arg: unknown, sessionId: string) => {
       if (!requireWorkspaceOrNotify()) return;
-      if (!uri || !sessionId) return;
+      const target = toScriptUri(arg);
+      if (!target || !sessionId) return;
       try {
-        await manager.runScript(uri, sessionId);
+        await manager.runScript(target, sessionId);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         void vscode.window.showErrorMessage(`Failed to start script: ${message}`);
       }
     }),
 
-    vscode.commands.registerCommand("nexus.script.stop", async (sessionId?: string) => {
+    vscode.commands.registerCommand("nexus.script.stop", async (arg?: unknown) => {
       if (!requireWorkspaceOrNotify()) return;
-      let target = sessionId;
+      // Stop can be invoked from (1) Palette — no arg; (2) tree view — passes ScriptNode;
+      // (3) status bar tooltip / keybinding — passes the sessionId string directly.
+      let target: string | undefined;
+      if (typeof arg === "string") {
+        target = arg;
+      } else {
+        const nodeUri = toScriptUri(arg);
+        if (nodeUri) {
+          const match = manager.getRuns().find((r) => r.scriptPath === nodeUri.fsPath);
+          target = match?.sessionId;
+        }
+      }
       if (!target) {
         const runs = manager.getRuns();
         if (runs.length === 0) {
@@ -194,7 +267,8 @@ export function registerScriptCommands(
       await vscode.env.openExternal(vscode.Uri.parse(url));
     }),
 
-    vscode.commands.registerCommand("nexus.script.delete", async (uri?: vscode.Uri) => {
+    vscode.commands.registerCommand("nexus.script.delete", async (arg?: unknown) => {
+      const uri = toScriptUri(arg);
       if (!uri) return;
       await deleteScript(uri);
     })
