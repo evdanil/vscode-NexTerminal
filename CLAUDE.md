@@ -91,3 +91,10 @@ Graceful degradation — registers stub commands showing "not available in brows
 - Integration tests for `SerialSidecarManager` spawn real child processes
 - Integration tests for `TunnelManager` use real TCP sockets
 - Test fixtures in `test/fixtures/` (mock sidecar scripts)
+
+## Active Technologies
+- TypeScript strict, ES2022 target, CommonJS output (extension host); `node:worker_threads` Worker bundle is the same target — Node 20.x via VS Code's extension host runtime + `vscode` API; `node:worker_threads`; `AsyncFunction` constructor for user-code loading (no `node:vm` module use); no new npm dependencies (001-scripting-support)
+- User script files under workspace-relative directory (default `.nexus/scripts/`); generated IntelliSense scaffolding under `<scriptsDir>/types/nexus-scripts.d.ts` + `<scriptsDir>/jsconfig.json`; new VS Code settings keys `nexus.scripts.path`, `nexus.scripts.defaultTimeout`, `nexus.scripts.macroPolicy` (additive — no migration) (001-scripting-support)
+
+## Recent Changes
+- 001-scripting-support: Added TypeScript strict, ES2022 target, CommonJS output (extension host); `node:worker_threads` Worker bundle is the same target — Node 20.x via VS Code's extension host runtime + `vscode` API; `node:worker_threads`; `AsyncFunction` constructor for user-code loading (no `node:vm` module use); no new npm dependencies
