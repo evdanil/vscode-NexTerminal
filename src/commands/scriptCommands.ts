@@ -2,6 +2,12 @@ import * as vscode from "vscode";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 import { parseScriptHeader } from "../services/scripts/scriptHeader";
 
+/**
+ * Gate for authoring commands (New Script, anything that writes inside the
+ * workspace). Running an existing .js script does NOT need a workspace — users
+ * can open a script file directly and run it. Only the authoring surfaces need
+ * somewhere to put new files / jsconfig scaffolding.
+ */
 function requireWorkspaceOrNotify(): boolean {
   if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) return true;
   void vscode.window.showInformationMessage("Open a folder to author and run Nexus scripts.");
@@ -101,7 +107,12 @@ try {
   const out = await expect(/[$#] $/, { timeout: 5_000 });
   log.info("uname:", out.before.trim());
 } catch (err) {
-  log.error("script failed:", err?.message ?? err);
+  // Prefer the "instanceof Error" narrowing so the editor gives you full
+  // access to .message / .stack without complaining under checkJs.
+  // Documented codes (Timeout / ConnectionLost / Stopped / Cancelled) live
+  // on the thrown object — see docs/scripting.md "Error handling".
+  const message = err instanceof Error ? err.message : String(err);
+  log.error("script failed:", message);
   throw err;
 }
 `;
@@ -187,8 +198,9 @@ export function registerScriptCommands(
   outputChannel: vscode.OutputChannel
 ): vscode.Disposable[] {
   return [
+    // Running a script does NOT require an open workspace — users can open a .js
+    // file directly (from disk, from an editor draft, over SSH-Remote) and run it.
     vscode.commands.registerCommand("nexus.script.run", async (arg?: unknown) => {
-      if (!requireWorkspaceOrNotify()) return;
       const target = toScriptUri(arg) ?? (await pickScriptFile());
       if (!target) return;
       try {
@@ -200,7 +212,6 @@ export function registerScriptCommands(
     }),
 
     vscode.commands.registerCommand("nexus.script.runWithTarget", async (arg: unknown, sessionId: string) => {
-      if (!requireWorkspaceOrNotify()) return;
       const target = toScriptUri(arg);
       if (!target || !sessionId) return;
       try {
@@ -212,7 +223,6 @@ export function registerScriptCommands(
     }),
 
     vscode.commands.registerCommand("nexus.script.stop", async (arg?: unknown) => {
-      if (!requireWorkspaceOrNotify()) return;
       // Stop can be invoked from (1) Palette — no arg; (2) tree view — passes ScriptNode;
       // (3) status bar tooltip / keybinding — passes the sessionId string directly.
       let target: string | undefined;

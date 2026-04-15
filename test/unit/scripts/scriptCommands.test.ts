@@ -182,6 +182,35 @@ describe("scriptCommands", () => {
     });
   });
 
+  describe("workspace gating", () => {
+    it("run works without an open workspace folder (user can open a .js directly)", async () => {
+      const prevFolders = (await import("vscode")).workspace.workspaceFolders;
+      (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
+
+      const mgr = makeManager();
+      registerScriptCommands(mgr, outputChannel);
+      const run = state.registeredCommands.get("nexus.script.run")!;
+      const uri = { fsPath: "/tmp/adhoc.js", scheme: "file", path: "/tmp/adhoc.js", toString: () => "" };
+      await run(uri);
+      expect(mgr.runScript).toHaveBeenCalledWith(uri);
+      expect(state.mockShowInformationMessage).not.toHaveBeenCalled(); // no "open a folder" nag
+
+      (await import("vscode")).workspace.workspaceFolders = prevFolders;
+    });
+
+    it("new still requires a workspace folder (has to know where to write)", async () => {
+      const prevFolders = (await import("vscode")).workspace.workspaceFolders;
+      (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
+
+      registerScriptCommands(makeManager(), outputChannel);
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler();
+      expect(state.mockShowInformationMessage).toHaveBeenCalled();
+
+      (await import("vscode")).workspace.workspaceFolders = prevFolders;
+    });
+  });
+
   describe("tree-view argument unwrap (bug: 'Unable to resolve filesystem provider …')", () => {
     it("run accepts a real Uri from the CodeLens path", async () => {
       const mgr = makeManager();

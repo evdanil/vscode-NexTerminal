@@ -130,25 +130,21 @@ describe("ScriptTreeProvider", () => {
     expect(item.label).toBe("foo");
   });
 
-  it("renders the 'open a folder' message when no workspace is open", async () => {
+  it("returns empty array when no workspace is open (lets viewsWelcome render the 'New Script' button)", async () => {
     (vscode.workspace as unknown as { workspaceFolders: unknown[] | undefined }).workspaceFolders = undefined;
     const provider = new ScriptTreeProvider(mockManager());
     const children = await provider.getChildren();
-    expect(children).toHaveLength(1);
-    const item = provider.getTreeItem(children[0]);
-    expect(String(item.label).toLowerCase()).toContain("open a folder");
+    expect(children).toHaveLength(0);
   });
 
-  it("renders the 'no scripts found' message when the directory is empty", async () => {
+  it("returns empty array when the scripts directory is empty (lets viewsWelcome render)", async () => {
     mockFsEntries.set("/workspace/.nexus/scripts", []);
     const provider = new ScriptTreeProvider(mockManager());
     const children = await provider.getChildren();
-    expect(children).toHaveLength(1);
-    const item = provider.getTreeItem(children[0]);
-    expect(String(item.label).toLowerCase()).toContain("no scripts");
+    expect(children).toHaveLength(0);
   });
 
-  it("treats a missing scripts directory as 'no scripts found' rather than an error", async () => {
+  it("returns empty array on missing scripts directory (welcome view stays visible)", async () => {
     // Don't set mockFsEntries for /workspace/.nexus/scripts — readDirectory will throw ENOENT.
     (vscode.workspace.fs as unknown as { readDirectory: typeof vscode.workspace.fs.readDirectory }).readDirectory = vi.fn(
       async () => {
@@ -157,9 +153,7 @@ describe("ScriptTreeProvider", () => {
     );
     const provider = new ScriptTreeProvider(mockManager());
     const children = await provider.getChildren();
-    expect(children).toHaveLength(1);
-    const item = provider.getTreeItem(children[0]);
-    expect(String(item.label).toLowerCase()).toContain("no scripts");
+    expect(children).toHaveLength(0);
   });
 
   it("sets contextValue to nexus.script.file for idle scripts and nexus.script.running when running (S2)", async () => {

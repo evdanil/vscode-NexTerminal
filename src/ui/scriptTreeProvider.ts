@@ -73,10 +73,14 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   }
 
   public async getChildren(): Promise<ScriptNode[]> {
+    // Returning an empty array tells VS Code to render the `viewsWelcome`
+    // content contributed for this view — i.e. the "New Script" / "Open
+    // scripting guide" buttons. A placeholder TreeItem (non-empty return)
+    // suppresses that welcome view, which is why prior versions hid the
+    // buttons the moment the provider finished initialising.
     const folders = vscode.workspace.workspaceFolders;
-    if (!folders || folders.length === 0) {
-      return [{ kind: "placeholder", label: "Open a folder to author scripts" }];
-    }
+    if (!folders || folders.length === 0) return [];
+
     const scriptsPath = vscode.workspace
       .getConfiguration("nexus.scripts")
       .get<string>("path", ".nexus/scripts");
@@ -87,7 +91,7 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
     try {
       entries = await vscode.workspace.fs.readDirectory(dir);
     } catch {
-      return [{ kind: "placeholder", label: "No scripts found", detail: scriptsPath }];
+      return [];
     }
 
     const runningPaths = new Set(this.manager.getRuns().map((r) => r.scriptPath));
@@ -116,9 +120,6 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       });
     }
 
-    if (nodes.length === 0) {
-      return [{ kind: "placeholder", label: "No scripts found", detail: scriptsPath }];
-    }
     return nodes;
   }
 

@@ -611,7 +611,7 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | A macro fires on top of my script and double-sends something | Default macro policy is `suspend-all`, but maybe `keep-enabled` was set | Check `nexus.scripts.macroPolicy` and any `@allow-macros` header |
 | Stop button feels slow (>1 sec) | A native call is blocking the worker (rare) | Reload the window; if reproducible, file an issue |
 | Web extension shows "not available in browser" | Expected — desktop-only for v1 | Use VS Code Desktop |
-| `vscode.workspace.workspaceFolders` not available for `nexus.script.new` | No folder is open | Open a folder first |
+| `Nexus: New Nexus Script` says "open a folder" | No folder is open | Open a folder first — Nexus needs somewhere to create the file. (Running an *existing* script does not require an open folder.) |
 | Error toast says the script "failed" on a normal `Timeout` | Shouldn't happen — expected codes are filtered | File an issue; include the Output Channel contents |
 
 ---
