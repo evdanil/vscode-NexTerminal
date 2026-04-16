@@ -887,17 +887,17 @@
         {
           "command": "nexus.terminal.reset",
           "when": "view == nexusCommandCenter && viewItem == nexus.serialProfileConnected",
-          "group": "0_connect@5"
+          "group": "1_terminal@1"
         },
         {
           "command": "nexus.terminal.clearScrollback",
           "when": "view == nexusCommandCenter && viewItem == nexus.serialProfileConnected",
-          "group": "0_connect@6"
+          "group": "1_terminal@2"
         },
         {
           "command": "nexus.terminal.copyAll",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)$/",
-          "group": "0_connect@7"
+          "group": "1_terminal@3"
         },
         {
           "command": "nexus.serial.connect",

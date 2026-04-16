@@ -153,6 +153,56 @@ describe("terminalTabCommands", () => {
       expect(pty.resetTerminal).not.toHaveBeenCalled();
     });
 
+    it("tree-item path: resolves SSH SessionTreeItem via session.id → sessionTerminals", () => {
+      const terminal = fakeTerminal() as never;
+      const pty = fakePty();
+      const entries = new Map<unknown, RegistryEntry>();
+      const entry: RegistryEntry = { terminal, pty: pty as never, buffer: fakeBuffer("") as never };
+      entries.set(terminal, entry);
+      const deps = fakeDeps(entries, new Set([entry]));
+      deps.sessionTerminals.set("sess-1", terminal as never);
+      registerTerminalTabCommands(context as never, deps as never);
+      const handler = state.registeredCommands.get("nexus.terminal.reset")!;
+      handler({ session: { id: "sess-1" } });
+      expect(pty.resetTerminal).toHaveBeenCalledTimes(1);
+    });
+
+    it("tree-item path: resolves SerialProfileTreeItem via profile.id → serialTerminals", () => {
+      const terminal = fakeTerminal() as never;
+      const pty = fakePty();
+      const entries = new Map<unknown, RegistryEntry>();
+      const entry: RegistryEntry = { terminal, pty: pty as never, buffer: fakeBuffer("") as never };
+      entries.set(terminal, entry);
+      const deps = fakeDeps(entries, new Set([entry]));
+      deps.serialTerminals.set("serial-sess-1", { terminal: terminal as never, profileId: "prof-1" } as never);
+      registerTerminalTabCommands(context as never, deps as never);
+      const handler = state.registeredCommands.get("nexus.terminal.reset")!;
+      handler({ profile: { id: "prof-1" } });
+      expect(pty.resetTerminal).toHaveBeenCalledTimes(1);
+    });
+
+    it("tree-item path: resolves serial SessionTreeItem via session.id → serialTerminals", () => {
+      const terminal = fakeTerminal() as never;
+      const pty = fakePty();
+      const entries = new Map<unknown, RegistryEntry>();
+      const entry: RegistryEntry = { terminal, pty: pty as never, buffer: fakeBuffer("") as never };
+      entries.set(terminal, entry);
+      const deps = fakeDeps(entries, new Set([entry]));
+      deps.serialTerminals.set("serial-sess-1", { terminal: terminal as never, profileId: "prof-1" } as never);
+      registerTerminalTabCommands(context as never, deps as never);
+      const handler = state.registeredCommands.get("nexus.terminal.reset")!;
+      handler({ session: { id: "serial-sess-1" } });
+      expect(pty.resetTerminal).toHaveBeenCalledTimes(1);
+    });
+
+    it("tree-item path: returns undefined for unknown session ID (no-op)", () => {
+      const pty = fakePty();
+      registerTerminalTabCommands(context as never, fakeDeps(new Map(), new Set()) as never);
+      const handler = state.registeredCommands.get("nexus.terminal.reset")!;
+      handler({ session: { id: "nonexistent" } });
+      expect(pty.resetTerminal).not.toHaveBeenCalled();
+    });
+
     it("emits no toast on success", () => {
       const terminal = fakeTerminal() as never;
       const pty = fakePty();

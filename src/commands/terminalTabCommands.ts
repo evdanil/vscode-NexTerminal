@@ -20,9 +20,8 @@ function resolveTerminal(
     const sessionId = (asAny.session as { id: string }).id;
     const ssh = deps.sessionTerminals.get(sessionId);
     if (ssh) return ssh;
-    for (const entry of deps.serialTerminals.values()) {
-      if (entry.terminal) return entry.terminal;
-    }
+    const serial = deps.serialTerminals.get(sessionId);
+    if (serial) return serial.terminal;
   }
   if (asAny?.profile && typeof (asAny.profile as Record<string, unknown>).id === "string") {
     const profileId = (asAny.profile as { id: string }).id;
