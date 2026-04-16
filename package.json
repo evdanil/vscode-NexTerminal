@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros with auto-trigger (expect/send), regex highlighting, unread activity indicators, color schemes, and configuration import/export.",
-  "version": "2.8.11",
+  "version": "2.8.12",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -750,6 +750,21 @@
           "group": "inline"
         },
         {
+          "command": "nexus.terminal.reset",
+          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
+          "group": "1_terminal@1"
+        },
+        {
+          "command": "nexus.terminal.clearScrollback",
+          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
+          "group": "1_terminal@2"
+        },
+        {
+          "command": "nexus.terminal.copyAll",
+          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
+          "group": "1_terminal@3"
+        },
+        {
           "command": "nexus.server.connect",
           "when": "view == nexusCommandCenter && viewItem == nexus.server",
           "group": "0_connect"
@@ -868,6 +883,21 @@
           "command": "nexus.serial.disconnect",
           "when": "view == nexusCommandCenter && viewItem == nexus.serialSessionNode",
           "group": "inline"
+        },
+        {
+          "command": "nexus.terminal.reset",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfileConnected",
+          "group": "0_connect@5"
+        },
+        {
+          "command": "nexus.terminal.clearScrollback",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfileConnected",
+          "group": "0_connect@6"
+        },
+        {
+          "command": "nexus.terminal.copyAll",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)$/",
+          "group": "0_connect@7"
         },
         {
           "command": "nexus.serial.connect",
@@ -1449,17 +1479,14 @@
       "terminal/title/context": [
         {
           "command": "nexus.terminal.reset",
-          "when": "nexus.isNexusTerminal",
           "group": "nexus@1"
         },
         {
           "command": "nexus.terminal.clearScrollback",
-          "when": "nexus.isNexusTerminal",
           "group": "nexus@2"
         },
         {
           "command": "nexus.terminal.copyAll",
-          "when": "nexus.isNexusTerminal",
           "group": "nexus@3"
         }
       ]

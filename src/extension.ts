@@ -825,7 +825,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const serverDisposables = registerServerCommands(ctx);
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
-  registerTerminalTabCommands(context, terminalRegistry);
+  registerTerminalTabCommands(context, {
+    registry: terminalRegistry,
+    sessionTerminals: ctx.sessionTerminals,
+    serialTerminals: ctx.serialTerminals
+  });
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);
