@@ -2996,7 +2996,7 @@
           "type": "string",
           "default": ".nexus/scripts",
           "order": 20,
-          "markdownDescription": "Workspace-relative directory where Nexus scripts live. Created on first script command if it does not exist."
+          "markdownDescription": "Directory where Nexus scripts live. Relative paths are resolved against the workspace root. When no workspace is open, scripts are stored in the extension's global storage regardless of this setting. An absolute path is used as-is in both cases."
         },
         "nexus.scripts.defaultTimeout": {
           "type": "number",

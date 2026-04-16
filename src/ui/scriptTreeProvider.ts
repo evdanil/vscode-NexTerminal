@@ -111,12 +111,8 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
 
   private ensureWatcher(): void {
     if (this.watcher) return;
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders || folders.length === 0) return;
-    const scriptsPath = vscode.workspace
-      .getConfiguration("nexus.scripts")
-      .get<string>("path", ".nexus/scripts");
-    const pattern = new vscode.RelativePattern(folders[0], `${scriptsPath}/**/*.js`);
+    const dir = resolveScriptsDir(this.globalStoragePath);
+    const pattern = new vscode.RelativePattern(dir, "**/*.js");
     this.watcher = vscode.workspace.createFileSystemWatcher(pattern);
     this.watcher.onDidCreate(() => this._onDidChangeTreeData.fire());
     this.watcher.onDidChange(() => this._onDidChangeTreeData.fire());

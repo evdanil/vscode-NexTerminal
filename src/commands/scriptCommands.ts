@@ -298,7 +298,13 @@ export function registerScriptCommands(
       } catch {
         // Already exists — that's the normal case.
       }
-      await vscode.env.openExternal(target);
+      try {
+        await vscode.commands.executeCommand("revealFileInOS", target);
+      } catch {
+        // revealFileInOS can fail on some platforms (e.g. remote); fall back
+        // to openExternal which may open a browser or the OS default handler.
+        await vscode.env.openExternal(target);
+      }
     })
   ];
 }

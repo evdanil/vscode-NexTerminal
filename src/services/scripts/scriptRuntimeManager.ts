@@ -38,7 +38,7 @@ export interface ScriptRuntimeManagerDependencies {
   /** Directory (absolute fsPath) containing bundled `nexus-scripts.d.ts` + `jsconfig.json`. */
   assetsDir?: vscode.Uri;
   /** Absolute fsPath to VS Code's per-extension globalStorage. Used as fallback when no workspace is open. */
-  globalStoragePath?: string;
+  globalStoragePath: string;
   /** Injection point for tests — lets them swap in a lightweight worker shim. */
   createWorker?: (workerPath: string) => WorkerLike;
 }
@@ -317,7 +317,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
 
   private async maybeSeedWorkspaceTypes(): Promise<void> {
     if (!this.deps.assetsDir) return;
-    const scriptsDir = resolveScriptsDir(this.deps.globalStoragePath ?? "");
+    const scriptsDir = resolveScriptsDir(this.deps.globalStoragePath);
     try {
       await ensureWorkspaceScriptTypes(scriptsDir, async () => {
         const dtsUri = vscode.Uri.joinPath(this.deps.assetsDir!, "nexus-scripts.d.ts");

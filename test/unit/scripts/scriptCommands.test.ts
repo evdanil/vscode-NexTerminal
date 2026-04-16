@@ -80,6 +80,7 @@ vi.mock("vscode", () => ({
   }
 }));
 
+import * as vscode from "vscode";
 import { registerScriptCommands } from "../../../src/commands/scriptCommands";
 import type { ScriptRuntimeManager } from "../../../src/services/scripts/scriptRuntimeManager";
 
@@ -118,6 +119,7 @@ describe("scriptCommands", () => {
     state.mockShowInformationMessage.mockClear();
     state.mockShowErrorMessage.mockClear();
     state.mockOpenExternal.mockClear();
+    vi.mocked(vscode.commands.executeCommand).mockClear();
     state.mockFsDelete.mockClear();
     state.mockFsStatThrows = true;
   });
@@ -380,14 +382,16 @@ describe("scriptCommands", () => {
   });
 
   describe("openScriptsFolder command", () => {
-    it("registers nexus.script.openScriptsFolder and reveals the configured scripts dir", async () => {
+    it("reveals the configured scripts dir via revealFileInOS", async () => {
       registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.openScriptsFolder");
       expect(handler).toBeDefined();
       await handler!();
-      expect(state.mockOpenExternal).toHaveBeenCalled();
-      const arg = state.mockOpenExternal.mock.calls[0][0] as { fsPath: string };
-      expect(arg.fsPath).toBe("/ws/.nexus/scripts");
+      const revealCall = vi.mocked(vscode.commands.executeCommand).mock.calls.find(
+        (c) => c[0] === "revealFileInOS"
+      );
+      expect(revealCall).toBeDefined();
+      expect((revealCall![1] as { fsPath: string }).fsPath).toBe("/ws/.nexus/scripts");
     });
 
     it("falls back to globalStoragePath when no workspace is open", async () => {
@@ -396,9 +400,11 @@ describe("scriptCommands", () => {
         (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
         registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
         await state.registeredCommands.get("nexus.script.openScriptsFolder")!();
-        expect(state.mockOpenExternal).toHaveBeenCalled();
-        const arg = state.mockOpenExternal.mock.calls[0][0] as { fsPath: string };
-        expect(arg.fsPath).toBe("/tmp/fake-gs/scripts");
+        const revealCall = vi.mocked(vscode.commands.executeCommand).mock.calls.find(
+          (c) => c[0] === "revealFileInOS"
+        );
+        expect(revealCall).toBeDefined();
+        expect((revealCall![1] as { fsPath: string }).fsPath).toBe("/tmp/fake-gs/scripts");
       } finally {
         (await import("vscode")).workspace.workspaceFolders = prevFolders;
       }

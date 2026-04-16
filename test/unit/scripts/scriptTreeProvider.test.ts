@@ -189,7 +189,7 @@ describe("ScriptTreeProvider", () => {
       )
     } as unknown as ScriptRuntimeManager;
 
-    const provider = new ScriptTreeProvider(manager);
+    const provider = new ScriptTreeProvider(manager, "/tmp/fake-gs");
     const children = await provider.getChildren();
     const items = children.map((c) => provider.getTreeItem(c));
     const byLabel = new Map(items.map((it) => [String(it.label), it]));
@@ -222,7 +222,7 @@ describe("ScriptTreeProvider", () => {
         {}
       )
     } as unknown as ScriptRuntimeManager;
-    const provider = new ScriptTreeProvider(manager);
+    const provider = new ScriptTreeProvider(manager, "/tmp/fake-gs");
     const children = await provider.getChildren();
     const item = provider.getTreeItem(children[0]);
     expect(String(item.description ?? "")).toContain("running");
@@ -260,7 +260,7 @@ describe("ScriptTreeProvider", () => {
       )
     } as unknown as ScriptRuntimeManager;
 
-    const provider = new ScriptTreeProvider(manager);
+    const provider = new ScriptTreeProvider(manager, "/tmp/fake-gs");
     // Listen for onDidChangeTreeData emissions from the provider.
     const sub = provider.onDidChangeTreeData(() => fireTreeEvent.push(undefined));
 
