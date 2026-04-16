@@ -1,35 +1,63 @@
 import * as vscode from "vscode";
 import type { RegistryEntry, TerminalRegistry } from "../services/terminal/terminalRegistry";
+import type { SessionTerminalMap, SerialTerminalMap } from "./types";
+
+export interface TerminalTabCommandsDeps {
+  registry: TerminalRegistry;
+  sessionTerminals: SessionTerminalMap;
+  serialTerminals: SerialTerminalMap;
+}
+
+function resolveTerminal(
+  arg: unknown,
+  deps: TerminalTabCommandsDeps
+): vscode.Terminal | undefined {
+  if (arg && typeof (arg as vscode.Terminal).creationOptions === "object") {
+    return arg as vscode.Terminal;
+  }
+  const asAny = arg as Record<string, unknown> | undefined;
+  if (asAny?.session && typeof (asAny.session as Record<string, unknown>).id === "string") {
+    const sessionId = (asAny.session as { id: string }).id;
+    const ssh = deps.sessionTerminals.get(sessionId);
+    if (ssh) return ssh;
+    for (const entry of deps.serialTerminals.values()) {
+      if (entry.terminal) return entry.terminal;
+    }
+  }
+  if (asAny?.profile && typeof (asAny.profile as Record<string, unknown>).id === "string") {
+    const profileId = (asAny.profile as { id: string }).id;
+    for (const entry of deps.serialTerminals.values()) {
+      if (entry.profileId === profileId) return entry.terminal;
+    }
+  }
+  return vscode.window.activeTerminal ?? undefined;
+}
 
 function resolveEntry(
-  registry: TerminalRegistry,
-  terminal: vscode.Terminal | undefined
+  arg: unknown,
+  deps: TerminalTabCommandsDeps
 ): RegistryEntry | undefined {
-  const target = terminal ?? vscode.window.activeTerminal;
-  return target ? registry.get(target) : undefined;
+  const terminal = resolveTerminal(arg, deps);
+  return terminal ? deps.registry.get(terminal) : undefined;
 }
 
 export function registerTerminalTabCommands(
   context: vscode.ExtensionContext,
-  registry: TerminalRegistry
+  deps: TerminalTabCommandsDeps
 ): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand("nexus.terminal.reset", (terminal?: vscode.Terminal) => {
-      const entry = resolveEntry(registry, terminal);
-      if (!entry || !registry.isConnected(entry)) return;
+    vscode.commands.registerCommand("nexus.terminal.reset", (arg?: unknown) => {
+      const entry = resolveEntry(arg, deps);
+      if (!entry || !deps.registry.isConnected(entry)) return;
       entry.pty.resetTerminal();
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("nexus.terminal.clearScrollback", async (terminal?: vscode.Terminal) => {
-      const entry = resolveEntry(registry, terminal);
-      if (!entry || !registry.isConnected(entry)) return;
+    vscode.commands.registerCommand("nexus.terminal.clearScrollback", async (arg?: unknown) => {
+      const entry = resolveEntry(arg, deps);
+      if (!entry || !deps.registry.isConnected(entry)) return;
       entry.buffer.clear();
-      // `workbench.action.terminal.clear` has no terminal argument and always
-      // targets the active terminal. If the user right-clicked a non-active
-      // tab's title, focus the resolved terminal first so the visible-scrollback
-      // clear matches the buffer clear we just did.
       if (vscode.window.activeTerminal !== entry.terminal) {
         entry.terminal.show(true);
       }
@@ -38,8 +66,8 @@ export function registerTerminalTabCommands(
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("nexus.terminal.copyAll", async (terminal?: vscode.Terminal) => {
-      const entry = resolveEntry(registry, terminal);
+    vscode.commands.registerCommand("nexus.terminal.copyAll", async (arg?: unknown) => {
+      const entry = resolveEntry(arg, deps);
       if (!entry) return;
       const text = entry.buffer.getText();
       if (text.length === 0) {

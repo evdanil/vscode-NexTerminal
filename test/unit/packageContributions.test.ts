@@ -251,7 +251,7 @@ describe("package contributions", () => {
       expect(clear?.group).toBe("nexus@2");
       expect(copy?.group).toBe("nexus@3");
       for (const m of [reset, clear, copy]) {
-        expect(m?.when).toBe("nexus.isNexusTerminal");
+        expect(m?.when).toBeUndefined();
       }
     });
 
