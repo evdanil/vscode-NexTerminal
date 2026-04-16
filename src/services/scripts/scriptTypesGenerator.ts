@@ -24,14 +24,11 @@ export type BundledAssetLoader = () => Promise<BundledAssets>;
  * the .d.ts) or the file is missing entirely.
  */
 export async function ensureWorkspaceScriptTypes(
-  workspaceRoot: vscode.Uri | undefined,
-  scriptsPath: string,
+  scriptsDir: vscode.Uri,
   loadAssets: BundledAssetLoader
 ): Promise<void> {
-  if (!workspaceRoot) return;
   const { dts, jsconfig } = await loadAssets();
 
-  const scriptsDir = vscode.Uri.joinPath(workspaceRoot, scriptsPath);
   const typesDir = vscode.Uri.joinPath(scriptsDir, "types");
   const dtsUri = vscode.Uri.joinPath(typesDir, "nexus-scripts.d.ts");
   const jsconfigUri = vscode.Uri.joinPath(scriptsDir, "jsconfig.json");

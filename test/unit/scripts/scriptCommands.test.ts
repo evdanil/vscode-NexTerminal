@@ -125,7 +125,7 @@ describe("scriptCommands", () => {
   describe("F1/F2 — starter template", () => {
     it("writes a starter script that includes @target-type ssh", async () => {
       state.inputBoxReturn = "my-procedure";
-      registerScriptCommands(makeManager(), outputChannel);
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.new")!;
       await handler();
       const body = state.writtenFiles.get("/ws/.nexus/scripts/my-procedure.js");
@@ -135,7 +135,7 @@ describe("scriptCommands", () => {
 
     it("includes @allow-macros escape-hatch comment and try/catch scaffold", async () => {
       state.inputBoxReturn = "login";
-      registerScriptCommands(makeManager(), outputChannel);
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.new")!;
       await handler();
       const body = state.writtenFiles.get("/ws/.nexus/scripts/login.js");
@@ -149,7 +149,7 @@ describe("scriptCommands", () => {
   describe("P3 — strip trailing .js", () => {
     it("strips trailing .js from the user-typed filename", async () => {
       state.inputBoxReturn = "login.js";
-      registerScriptCommands(makeManager(), outputChannel);
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.new")!;
       await handler();
       // Should not produce login.js.js
@@ -159,7 +159,7 @@ describe("scriptCommands", () => {
 
     it("validator rejects empty after strip and accepts .js suffix inputs", async () => {
       state.inputBoxReturn = "my-procedure.js";
-      registerScriptCommands(makeManager(), outputChannel);
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.new")!;
       await handler();
       expect(state.inputBoxValidator).toBeDefined();
@@ -172,7 +172,7 @@ describe("scriptCommands", () => {
 
   describe("S1 — openDocs command", () => {
     it("registers nexus.script.openDocs which calls env.openExternal", async () => {
-      registerScriptCommands(makeManager(), outputChannel);
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.openDocs");
       expect(handler).toBeDefined();
       await handler!();
@@ -189,7 +189,7 @@ describe("scriptCommands", () => {
       (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
 
       const mgr = makeManager();
-      registerScriptCommands(mgr, outputChannel);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs");
       const run = state.registeredCommands.get("nexus.script.run")!;
       const uri = { fsPath: "/tmp/adhoc.js", scheme: "file", path: "/tmp/adhoc.js", toString: () => "" };
       await run(uri);
@@ -199,23 +199,27 @@ describe("scriptCommands", () => {
       (await import("vscode")).workspace.workspaceFolders = prevFolders;
     });
 
-    it("new still requires a workspace folder (has to know where to write)", async () => {
+    it("new works without a workspace by falling back to globalStoragePath", async () => {
       const prevFolders = (await import("vscode")).workspace.workspaceFolders;
-      (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
-
-      registerScriptCommands(makeManager(), outputChannel);
-      const handler = state.registeredCommands.get("nexus.script.new")!;
-      await handler();
-      expect(state.mockShowInformationMessage).toHaveBeenCalled();
-
-      (await import("vscode")).workspace.workspaceFolders = prevFolders;
+      try {
+        (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
+        state.inputBoxReturn = "my-procedure";
+        registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+        const handler = state.registeredCommands.get("nexus.script.new")!;
+        await handler();
+        const body = state.writtenFiles.get("/tmp/fake-gs/scripts/my-procedure.js");
+        expect(body).toBeDefined();
+        expect(body!).toMatch(/@nexus-script/);
+      } finally {
+        (await import("vscode")).workspace.workspaceFolders = prevFolders;
+      }
     });
   });
 
   describe("tree-view argument unwrap (bug: 'Unable to resolve filesystem provider …')", () => {
     it("run accepts a real Uri from the CodeLens path", async () => {
       const mgr = makeManager();
-      registerScriptCommands(mgr, outputChannel);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs");
       const run = state.registeredCommands.get("nexus.script.run")!;
       const uri = { fsPath: "/ws/.nexus/scripts/test.js", scheme: "file", path: "/ws/.nexus/scripts/test.js", toString: () => "" };
       await run(uri);
@@ -224,7 +228,7 @@ describe("scriptCommands", () => {
 
     it("run accepts a ScriptNode { uri } from the tree view menu", async () => {
       const mgr = makeManager();
-      registerScriptCommands(mgr, outputChannel);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs");
       const run = state.registeredCommands.get("nexus.script.run")!;
       const innerUri = {
         fsPath: "/ws/.nexus/scripts/test.js",
@@ -248,7 +252,7 @@ describe("scriptCommands", () => {
 
     it("run accepts a TreeItem-like object with resourceUri (explorer or nested case)", async () => {
       const mgr = makeManager();
-      registerScriptCommands(mgr, outputChannel);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs");
       const run = state.registeredCommands.get("nexus.script.run")!;
       const innerUri = {
         fsPath: "/ws/.nexus/scripts/test.js",
@@ -262,7 +266,7 @@ describe("scriptCommands", () => {
 
     it("run falls back to file picker when given an unrecognisable argument", async () => {
       const mgr = makeManager();
-      registerScriptCommands(mgr, outputChannel);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs");
       const run = state.registeredCommands.get("nexus.script.run")!;
       // ShowOpenDialog is mocked to return undefined → no run initiated.
       await run({ someUnrelatedShape: true });
@@ -271,7 +275,7 @@ describe("scriptCommands", () => {
 
     it("delete unwraps a ScriptNode rather than silently no-op-ing", async () => {
       state.warningReturn = "Delete";
-      registerScriptCommands(makeManager(), outputChannel);
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const del = state.registeredCommands.get("nexus.script.delete")!;
       const innerUri = { fsPath: "/ws/.nexus/scripts/foo.js", scheme: "file", path: "/ws/.nexus/scripts/foo.js", toString: () => "" };
       await del({ kind: "script", uri: innerUri, name: "foo", description: "", running: false, parseErrors: [] });
@@ -294,7 +298,7 @@ describe("scriptCommands", () => {
         }
       ];
       const mgr = makeManager({ getRuns: () => runsSnapshot });
-      registerScriptCommands(mgr, outputChannel);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs");
       const stop = state.registeredCommands.get("nexus.script.stop")!;
       const innerUri = { fsPath: "/ws/.nexus/scripts/foo.js", scheme: "file", path: "/ws/.nexus/scripts/foo.js", toString: () => "" };
       await stop({ kind: "script", uri: innerUri, name: "foo", description: "", running: true, parseErrors: [] });
@@ -303,7 +307,7 @@ describe("scriptCommands", () => {
 
     it("stop still accepts a bare sessionId string (status-bar tooltip path)", async () => {
       const mgr = makeManager({ getRuns: () => [] });
-      registerScriptCommands(mgr, outputChannel);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs");
       const stop = state.registeredCommands.get("nexus.script.stop")!;
       await stop("sess-z");
       expect(mgr.stopScript).toHaveBeenCalledWith("sess-z");
@@ -317,7 +321,7 @@ describe("scriptCommands", () => {
       (await import("vscode")).window.activeTerminal = fakeTerminal;
       const resolver = vi.fn((t: unknown) => (t === fakeTerminal ? "sess-a" : undefined));
 
-      registerScriptCommands(mgr, outputChannel, resolver as never);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs", resolver as never);
       const runQuick = state.registeredCommands.get("nexus.script.runQuick")!;
       const uri = { fsPath: "/ws/.nexus/scripts/x.js", scheme: "file", path: "/ws/.nexus/scripts/x.js", toString: () => "" };
       await runQuick(uri);
@@ -333,7 +337,7 @@ describe("scriptCommands", () => {
       (await import("vscode")).window.activeTerminal = undefined;
       const resolver = vi.fn(() => undefined);
 
-      registerScriptCommands(mgr, outputChannel, resolver as never);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs", resolver as never);
       const runQuick = state.registeredCommands.get("nexus.script.runQuick")!;
       const uri = { fsPath: "/ws/.nexus/scripts/x.js", scheme: "file", path: "/ws/.nexus/scripts/x.js", toString: () => "" };
       await runQuick(uri);
@@ -348,7 +352,7 @@ describe("scriptCommands", () => {
       (await import("vscode")).window.activeTerminal = nonNexusTerminal;
       const resolver = vi.fn(() => undefined); // not a Nexus session
 
-      registerScriptCommands(mgr, outputChannel, resolver as never);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs", resolver as never);
       const runQuick = state.registeredCommands.get("nexus.script.runQuick")!;
       const uri = { fsPath: "/ws/.nexus/scripts/x.js", scheme: "file", path: "/ws/.nexus/scripts/x.js", toString: () => "" };
       await runQuick(uri);
@@ -364,7 +368,7 @@ describe("scriptCommands", () => {
       (await import("vscode")).window.activeTerminal = fakeTerminal;
       const resolver = vi.fn(() => "sess-a");
 
-      registerScriptCommands(mgr, outputChannel, resolver as never);
+      registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs", resolver as never);
       const runQuick = state.registeredCommands.get("nexus.script.runQuick")!;
       const innerUri = { fsPath: "/ws/.nexus/scripts/x.js", scheme: "file", path: "/ws/.nexus/scripts/x.js", toString: () => "" };
       await runQuick({ kind: "script", uri: innerUri, name: "x", description: "", running: false, parseErrors: [] });
@@ -377,7 +381,7 @@ describe("scriptCommands", () => {
 
   describe("openScriptsFolder command", () => {
     it("registers nexus.script.openScriptsFolder and reveals the configured scripts dir", async () => {
-      registerScriptCommands(makeManager(), outputChannel);
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.openScriptsFolder");
       expect(handler).toBeDefined();
       await handler!();
@@ -386,23 +390,25 @@ describe("scriptCommands", () => {
       expect(arg.fsPath).toBe("/ws/.nexus/scripts");
     });
 
-    it("informs the user and does nothing when there is no workspace", async () => {
+    it("falls back to globalStoragePath when no workspace is open", async () => {
       const prevFolders = (await import("vscode")).workspace.workspaceFolders;
-      (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
-
-      registerScriptCommands(makeManager(), outputChannel);
-      await state.registeredCommands.get("nexus.script.openScriptsFolder")!();
-      expect(state.mockShowInformationMessage).toHaveBeenCalled();
-      expect(state.mockOpenExternal).not.toHaveBeenCalled();
-
-      (await import("vscode")).workspace.workspaceFolders = prevFolders;
+      try {
+        (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
+        registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+        await state.registeredCommands.get("nexus.script.openScriptsFolder")!();
+        expect(state.mockOpenExternal).toHaveBeenCalled();
+        const arg = state.mockOpenExternal.mock.calls[0][0] as { fsPath: string };
+        expect(arg.fsPath).toBe("/tmp/fake-gs/scripts");
+      } finally {
+        (await import("vscode")).workspace.workspaceFolders = prevFolders;
+      }
     });
   });
 
   describe("S2 — delete command", () => {
     it("registers nexus.script.delete which confirms and deletes", async () => {
       state.warningReturn = "Delete";
-      registerScriptCommands(makeManager(), outputChannel);
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.delete");
       expect(handler).toBeDefined();
       const uri = { fsPath: "/ws/.nexus/scripts/foo.js", scheme: "file", toString: () => "/ws/.nexus/scripts/foo.js" };
@@ -413,7 +419,7 @@ describe("scriptCommands", () => {
 
     it("does not delete when the user cancels", async () => {
       state.warningReturn = undefined; // cancelled
-      registerScriptCommands(makeManager(), outputChannel);
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.delete")!;
       const uri = { fsPath: "/ws/.nexus/scripts/foo.js", scheme: "file", toString: () => "/ws/.nexus/scripts/foo.js" };
       await handler(uri);

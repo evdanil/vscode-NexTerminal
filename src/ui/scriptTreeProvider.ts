@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { parseScriptHeader } from "../services/scripts/scriptHeader";
+import { resolveScriptsDir } from "../services/scripts/resolveScriptsDir";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 
 export type ScriptNode =
@@ -12,7 +13,10 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   private watcher?: vscode.FileSystemWatcher;
   private readonly managerListener: vscode.Disposable;
 
-  public constructor(private readonly manager: ScriptRuntimeManager) {
+  public constructor(
+    private readonly manager: ScriptRuntimeManager,
+    private readonly globalStoragePath: string
+  ) {
     // Only refresh on events that change the tree's visible state (running badge,
     // context value). onDidChangeRun also fires on every log/operationBegin/
     // operationEnd — refreshing on those would cause the sidebar to flash many
@@ -67,19 +71,7 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   }
 
   public async getChildren(): Promise<ScriptNode[]> {
-    // Returning an empty array tells VS Code to render the `viewsWelcome`
-    // content contributed for this view — i.e. the "New Script" / "Open
-    // scripting guide" buttons. A placeholder TreeItem (non-empty return)
-    // suppresses that welcome view, which is why prior versions hid the
-    // buttons the moment the provider finished initialising.
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders || folders.length === 0) return [];
-
-    const scriptsPath = vscode.workspace
-      .getConfiguration("nexus.scripts")
-      .get<string>("path", ".nexus/scripts");
-    const root = folders[0].uri;
-    const dir = vscode.Uri.joinPath(root, scriptsPath);
+    const dir = resolveScriptsDir(this.globalStoragePath);
 
     let entries: Array<[string, vscode.FileType]>;
     try {

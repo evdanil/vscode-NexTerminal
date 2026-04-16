@@ -57,7 +57,9 @@ async function getAssets(): Promise<{ dts: string; jsconfig: string }> {
   return { dts: BUNDLED_DTS, jsconfig: BUNDLED_JSCONFIG };
 }
 
-const workspaceRoot = { fsPath: "/workspace", scheme: "file", path: "/workspace", toString: () => "/workspace" };
+function scriptsDir(dir: string) {
+  return { fsPath: dir, scheme: "file", path: dir, toString: () => dir } as vscode.Uri;
+}
 
 describe("scriptTypesGenerator.ensureWorkspaceScriptTypes", () => {
   beforeEach(() => {
@@ -67,7 +69,7 @@ describe("scriptTypesGenerator.ensureWorkspaceScriptTypes", () => {
   });
 
   it("writes .d.ts and jsconfig.json when neither exists, creating parent directories", async () => {
-    await ensureWorkspaceScriptTypes(workspaceRoot as never, ".nexus/scripts", getAssets);
+    await ensureWorkspaceScriptTypes(scriptsDir("/workspace/.nexus/scripts"), getAssets);
     expect(fsState.dirs.has("/workspace/.nexus/scripts")).toBe(true);
     expect(fsState.dirs.has("/workspace/.nexus/scripts/types")).toBe(true);
     const dts = new TextDecoder().decode(fsState.files.get("/workspace/.nexus/scripts/types/nexus-scripts.d.ts")!);
@@ -84,7 +86,7 @@ describe("scriptTypesGenerator.ensureWorkspaceScriptTypes", () => {
       new TextEncoder().encode(BUNDLED_DTS)
     );
     fsState.files.set("/workspace/.nexus/scripts/jsconfig.json", new TextEncoder().encode(BUNDLED_JSCONFIG));
-    await ensureWorkspaceScriptTypes(workspaceRoot as never, ".nexus/scripts", getAssets);
+    await ensureWorkspaceScriptTypes(scriptsDir("/workspace/.nexus/scripts"), getAssets);
     expect((vscode.workspace.fs.writeFile as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(0);
   });
 
@@ -96,19 +98,14 @@ describe("scriptTypesGenerator.ensureWorkspaceScriptTypes", () => {
       new TextEncoder().encode("// older version\nold content\n")
     );
     fsState.files.set("/workspace/.nexus/scripts/jsconfig.json", new TextEncoder().encode(BUNDLED_JSCONFIG));
-    await ensureWorkspaceScriptTypes(workspaceRoot as never, ".nexus/scripts", getAssets);
+    await ensureWorkspaceScriptTypes(scriptsDir("/workspace/.nexus/scripts"), getAssets);
     const dts = new TextDecoder().decode(fsState.files.get("/workspace/.nexus/scripts/types/nexus-scripts.d.ts")!);
     expect(dts).toBe(BUNDLED_DTS);
   });
 
-  it("does nothing when the workspace root is undefined", async () => {
-    await ensureWorkspaceScriptTypes(undefined as never, ".nexus/scripts", getAssets);
-    expect(fsState.files.size).toBe(0);
-  });
-
-  it("resolves relative scriptsPath against the workspace root", async () => {
-    await ensureWorkspaceScriptTypes(workspaceRoot as never, "custom/scripts", getAssets);
-    expect(fsState.dirs.has("/workspace/custom/scripts")).toBe(true);
-    expect(fsState.files.has("/workspace/custom/scripts/types/nexus-scripts.d.ts")).toBe(true);
+  it("works with a globalStorage-based scripts directory", async () => {
+    await ensureWorkspaceScriptTypes(scriptsDir("/globalStorage/scripts"), getAssets);
+    expect(fsState.dirs.has("/globalStorage/scripts")).toBe(true);
+    expect(fsState.files.has("/globalStorage/scripts/types/nexus-scripts.d.ts")).toBe(true);
   });
 });

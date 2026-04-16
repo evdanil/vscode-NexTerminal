@@ -111,7 +111,7 @@ describe("ScriptTreeProvider", () => {
     );
     mockFiles.set("/workspace/.nexus/scripts/notAScript.js", "console.log('hi');\n");
 
-    const provider = new ScriptTreeProvider(mockManager());
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
     const children = await provider.getChildren();
     expect(children).toHaveLength(1);
     const item = provider.getTreeItem(children[0]);
@@ -122,7 +122,7 @@ describe("ScriptTreeProvider", () => {
     mockFsEntries.set("/workspace/.nexus/scripts", [["foo.js", 1]]);
     mockFiles.set("/workspace/.nexus/scripts/foo.js", "/**\n * @nexus-script\n */\n");
 
-    const provider = new ScriptTreeProvider(mockManager());
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
     const children = await provider.getChildren();
     expect(children).toHaveLength(1);
     const item = provider.getTreeItem(children[0]);
@@ -131,14 +131,14 @@ describe("ScriptTreeProvider", () => {
 
   it("returns empty array when no workspace is open (lets viewsWelcome render the 'New Script' button)", async () => {
     (vscode.workspace as unknown as { workspaceFolders: unknown[] | undefined }).workspaceFolders = undefined;
-    const provider = new ScriptTreeProvider(mockManager());
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
     const children = await provider.getChildren();
     expect(children).toHaveLength(0);
   });
 
   it("returns empty array when the scripts directory is empty (lets viewsWelcome render)", async () => {
     mockFsEntries.set("/workspace/.nexus/scripts", []);
-    const provider = new ScriptTreeProvider(mockManager());
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
     const children = await provider.getChildren();
     expect(children).toHaveLength(0);
   });
@@ -150,7 +150,7 @@ describe("ScriptTreeProvider", () => {
         throw new Error("ENOENT");
       }
     );
-    const provider = new ScriptTreeProvider(mockManager());
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
     const children = await provider.getChildren();
     expect(children).toHaveLength(0);
   });
@@ -234,7 +234,7 @@ describe("ScriptTreeProvider", () => {
       "/workspace/.nexus/scripts/hasdesc.js",
       "/**\n * @nexus-script\n * @name Labeled\n * @description A long description that would clutter the row\n */\n"
     );
-    const provider = new ScriptTreeProvider(mockManager());
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
     const children = await provider.getChildren();
     const item = provider.getTreeItem(children[0]);
     // Row label is just the name. Description column is empty for idle scripts.
@@ -288,7 +288,7 @@ describe("ScriptTreeProvider", () => {
       "/workspace/.nexus/scripts/broken.js",
       "/**\n * @nexus-script\n * @default-timeout nope\n */\n"
     );
-    const provider = new ScriptTreeProvider(mockManager());
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
     const children = await provider.getChildren();
     const item = provider.getTreeItem(children[0]) as unknown as {
       command?: { command: string };

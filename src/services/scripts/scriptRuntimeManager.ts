@@ -6,6 +6,7 @@ import type { ActiveSession, ActiveSerialSession, SessionPtyHandle } from "../..
 import type { MacroAutoTrigger, PtyOutputObserver } from "../macroAutoTrigger";
 import { parseScriptHeader, type ScriptHeader } from "./scriptHeader";
 import { ScriptMacroFilter } from "./scriptMacroFilter";
+import { resolveScriptsDir } from "./resolveScriptsDir";
 import { ensureWorkspaceScriptTypes, type BundledAssets } from "./scriptTypesGenerator";
 import { ScriptOutputBuffer, type Match } from "./scriptOutputBuffer";
 import { pickTarget, type ScriptTargetDescriptor } from "./scriptTarget";
@@ -36,6 +37,8 @@ export interface ScriptRuntimeManagerDependencies {
   workerPath: string;
   /** Directory (absolute fsPath) containing bundled `nexus-scripts.d.ts` + `jsconfig.json`. */
   assetsDir?: vscode.Uri;
+  /** Absolute fsPath to VS Code's per-extension globalStorage. Used as fallback when no workspace is open. */
+  globalStoragePath?: string;
   /** Injection point for tests — lets them swap in a lightweight worker shim. */
   createWorker?: (workerPath: string) => WorkerLike;
 }
@@ -313,13 +316,10 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   }
 
   private async maybeSeedWorkspaceTypes(): Promise<void> {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder || !this.deps.assetsDir) return;
-    const scriptsPath = vscode.workspace
-      .getConfiguration("nexus.scripts")
-      .get<string>("path", ".nexus/scripts");
+    if (!this.deps.assetsDir) return;
+    const scriptsDir = resolveScriptsDir(this.deps.globalStoragePath ?? "");
     try {
-      await ensureWorkspaceScriptTypes(folder.uri, scriptsPath, async () => {
+      await ensureWorkspaceScriptTypes(scriptsDir, async () => {
         const dtsUri = vscode.Uri.joinPath(this.deps.assetsDir!, "nexus-scripts.d.ts");
         const jsconfigUri = vscode.Uri.joinPath(this.deps.assetsDir!, "jsconfig.json");
         const [dtsBytes, jsconfigBytes] = await Promise.all([

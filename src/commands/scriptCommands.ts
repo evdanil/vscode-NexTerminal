@@ -1,18 +1,7 @@
 import * as vscode from "vscode";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 import { parseScriptHeader } from "../services/scripts/scriptHeader";
-
-/**
- * Gate for authoring commands (New Script, anything that writes inside the
- * workspace). Running an existing .js script does NOT need a workspace — users
- * can open a script file directly and run it. Only the authoring surfaces need
- * somewhere to put new files / jsconfig scaffolding.
- */
-function requireWorkspaceOrNotify(): boolean {
-  if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) return true;
-  void vscode.window.showInformationMessage("Open a folder to author and run Nexus scripts.");
-  return false;
-}
+import { resolveScriptsDir } from "../services/scripts/resolveScriptsDir";
 
 /**
  * Structural check for a URI — `instanceof vscode.Uri` is unreliable across module
@@ -65,7 +54,7 @@ function toScriptUri(arg: unknown): vscode.Uri | undefined {
  * they just hit "Run" with the script open in front of them. (2) Otherwise
  * fall back to an open-file dialog pointed at the configured scripts directory.
  */
-async function pickScriptFile(): Promise<vscode.Uri | undefined> {
+async function pickScriptFile(globalStoragePath: string): Promise<vscode.Uri | undefined> {
   const active = vscode.window.activeTextEditor;
   if (active && active.document.languageId === "javascript") {
     try {
@@ -75,9 +64,7 @@ async function pickScriptFile(): Promise<vscode.Uri | undefined> {
       // Fall through to the dialog.
     }
   }
-  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-  const configuredDir = vscode.workspace.getConfiguration("nexus.scripts").get<string>("path", ".nexus/scripts");
-  const defaultUri = root ? vscode.Uri.joinPath(root, configuredDir) : undefined;
+  const defaultUri = resolveScriptsDir(globalStoragePath);
   const picked = await vscode.window.showOpenDialog({
     canSelectFiles: true,
     canSelectMany: false,
@@ -121,12 +108,7 @@ function stripJsExtension(raw: string): string {
   return raw.replace(/\.js$/i, "");
 }
 
-async function createNewScript(): Promise<void> {
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) {
-    void vscode.window.showInformationMessage("Open a folder to author and run Nexus scripts.");
-    return;
-  }
+async function createNewScript(globalStoragePath: string): Promise<void> {
   const input = await vscode.window.showInputBox({
     prompt: "Name for the new Nexus script",
     placeHolder: "my-procedure",
@@ -140,10 +122,10 @@ async function createNewScript(): Promise<void> {
   if (!input) return;
   const name = stripJsExtension(input);
   if (!name) return;
-  const scriptsPath = vscode.workspace.getConfiguration("nexus.scripts").get<string>("path", ".nexus/scripts");
-  const target = vscode.Uri.joinPath(folder.uri, scriptsPath, `${name}.js`);
+  const scriptsDir = resolveScriptsDir(globalStoragePath);
+  const target = vscode.Uri.joinPath(scriptsDir, `${name}.js`);
   try {
-    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder.uri, scriptsPath));
+    await vscode.workspace.fs.createDirectory(scriptsDir);
   } catch {
     /* idempotent */
   }
@@ -208,13 +190,12 @@ export type TerminalToSessionResolver = (
 export function registerScriptCommands(
   manager: ScriptRuntimeManager,
   outputChannel: vscode.OutputChannel,
+  globalStoragePath: string,
   resolveSessionForTerminal?: TerminalToSessionResolver
 ): vscode.Disposable[] {
   return [
-    // Running a script does NOT require an open workspace — users can open a .js
-    // file directly (from disk, from an editor draft, over SSH-Remote) and run it.
     vscode.commands.registerCommand("nexus.script.run", async (arg?: unknown) => {
-      const target = toScriptUri(arg) ?? (await pickScriptFile());
+      const target = toScriptUri(arg) ?? (await pickScriptFile(globalStoragePath));
       if (!target) return;
       try {
         await manager.runScript(target);
@@ -232,7 +213,7 @@ export function registerScriptCommands(
     // explicit picker behaviour because those contexts aren't a user telling us
     // "the terminal I'm looking at is where I want this to run".
     vscode.commands.registerCommand("nexus.script.runQuick", async (arg?: unknown) => {
-      const target = toScriptUri(arg) ?? (await pickScriptFile());
+      const target = toScriptUri(arg) ?? (await pickScriptFile(globalStoragePath));
       if (!target) return;
       const sessionId = resolveSessionForTerminal?.(vscode.window.activeTerminal);
       try {
@@ -290,7 +271,7 @@ export function registerScriptCommands(
     }),
 
     vscode.commands.registerCommand("nexus.script.new", async () => {
-      await createNewScript();
+      await createNewScript(globalStoragePath);
     }),
 
     vscode.commands.registerCommand("nexus.script.openDocs", async () => {
@@ -311,18 +292,7 @@ export function registerScriptCommands(
     }),
 
     vscode.commands.registerCommand("nexus.script.openScriptsFolder", async () => {
-      const folder = vscode.workspace.workspaceFolders?.[0];
-      if (!folder) {
-        void vscode.window.showInformationMessage(
-          "Open a folder to see the Nexus scripts directory — it lives at <workspace>/" +
-            vscode.workspace.getConfiguration("nexus.scripts").get<string>("path", ".nexus/scripts")
-        );
-        return;
-      }
-      const scriptsPath = vscode.workspace
-        .getConfiguration("nexus.scripts")
-        .get<string>("path", ".nexus/scripts");
-      const target = vscode.Uri.joinPath(folder.uri, scriptsPath);
+      const target = resolveScriptsDir(globalStoragePath);
       try {
         await vscode.workspace.fs.createDirectory(target);
       } catch {
