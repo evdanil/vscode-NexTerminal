@@ -16,8 +16,15 @@ function extractWebExtensionCommands(source: string): string[] {
 }
 
 describe("web extension fallback command coverage", () => {
-  it("covers all contributed commands", () => {
-    const contributed = packageJson.contributes.commands.map((item) => item.command).sort();
+  it("covers all Nexus-owned contributed commands", () => {
+    // Only our own `nexus.*` commands need desktop-only fallback stubs; a
+    // built-in VS Code command declared in `contributes.commands` purely to
+    // give a menu item a label (e.g. `revealInExplorer`) is provided by the
+    // host on both desktop and web and must not be stubbed.
+    const contributed = packageJson.contributes.commands
+      .map((item) => item.command)
+      .filter((id) => id.startsWith("nexus."))
+      .sort();
     const source = readFileSync(webExtensionPath, "utf8");
     const fallback = extractWebExtensionCommands(source).sort();
 

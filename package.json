@@ -592,6 +592,10 @@
         "icon": "$(folder-opened)"
       },
       {
+        "command": "revealInExplorer",
+        "title": "Reveal in Explorer View"
+      },
+      {
         "command": "nexus.terminal.reset",
         "title": "Reset Terminal",
         "category": "Nexus",
@@ -1462,6 +1466,10 @@
         {
           "command": "nexus.script.openDocs",
           "when": "true"
+        },
+        {
+          "command": "revealInExplorer",
+          "when": "false"
         },
         {
           "command": "nexus.terminal.reset",
