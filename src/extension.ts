@@ -440,7 +440,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     focusedTerminal: vscode.window.activeTerminal ?? undefined,
     activityIndicators: new Map(),
     scriptRuntimeManager,
-    terminalRegistry: undefined
+    terminalRegistry: undefined,
+    globalStoragePath
   };
   const terminalRegistry = new TerminalRegistry(core);
   context.subscriptions.push(terminalRegistry);

@@ -39,15 +39,15 @@ Scripts exist for the work that macros can't express:
 - **Human-in-the-loop steps.** "Pause, ask the user to insert a USB stick and click OK, then continue."
 - **Polling.** "Send a carriage return every 2 seconds for up to 15 minutes until the device comes back."
 
-A script is a regular `.js` file in your workspace. Writing one looks and feels exactly like writing any other async JavaScript — except the globals `waitFor`, `expect`, `sendLine`, `poll`, `prompt`, etc. talk to the terminal for you.
+A script is a regular `.js` file — kept either in your workspace (under version control) or in Nexus's global storage when no folder is open. Writing one looks and feels exactly like writing any other async JavaScript — except the globals `waitFor`, `expect`, `sendLine`, `poll`, `prompt`, etc. talk to the terminal for you.
 
 ---
 
 ## Quickstart
 
-1. **Open a folder in VS Code.** Scripts live in the workspace and are managed like any other source file (so they can live under version control).
+1. **(Optional) Open a folder in VS Code.** When a folder is open, scripts live under `<workspace>/.nexus/scripts/` so they can travel with your repo. With no folder open, Nexus transparently stores scripts in its extension global-storage folder instead — every script command (run, new, edit, "Connect and Run Script…") still works.
 2. **Open at least one SSH or Serial session** through the Nexus sidebar.
-3. **Create a script** at `.nexus/scripts/hello.js`:
+3. **Create a script** at `.nexus/scripts/hello.js` (or simply run `Nexus: New Nexus Script` — it writes to the resolved scripts directory wherever it lives):
    ```js
    /**
     * @nexus-script
@@ -618,7 +618,7 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | A macro fires on top of my script and double-sends something | Default macro policy is `suspend-all`, but maybe `keep-enabled` was set | Check `nexus.scripts.macroPolicy` and any `@allow-macros` header |
 | Stop button feels slow (>1 sec) | A native call is blocking the worker (rare) | Reload the window; if reproducible, file an issue |
 | Web extension shows "not available in browser" | Expected — desktop-only for v1 | Use VS Code Desktop |
-| `Nexus: New Nexus Script` says "open a folder" | No folder is open | Open a folder first — Nexus needs somewhere to create the file. (Running an *existing* script does not require an open folder.) |
+| Can't find where my scripts are stored without a workspace | No folder is open — Nexus uses the extension's global-storage folder | Run `Nexus: Open Scripts Folder` (or check `nexus.scripts.path` — absolute paths always win). |
 | Error toast says the script "failed" on a normal `Timeout` | Shouldn't happen — expected codes are filtered | File an issue; include the Output Channel contents |
 
 ---

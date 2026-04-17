@@ -677,7 +677,7 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
     void vscode.window.showErrorMessage("Nexus script runtime is not available in this context.");
     return;
   }
-  const scriptUri = await pickScriptFromWorkspace("ssh");
+  const scriptUri = await pickScriptFromWorkspace(ctx.globalStoragePath, "ssh");
   if (!scriptUri) return;
 
   const preExisting = new Set(

@@ -1,12 +1,13 @@
 import * as vscode from "vscode";
 import { parseScriptHeader } from "./scriptHeader";
+import { resolveScriptsDir } from "./resolveScriptsDir";
 
 interface ScriptPickItem extends vscode.QuickPickItem {
   uri: vscode.Uri;
 }
 
 /**
- * Present a QuickPick over the workspace's Nexus scripts, optionally filtered by
+ * Present a QuickPick over the user's Nexus scripts, optionally filtered by
  * the `@target-type` JSDoc tag. Used by the "Run with script…" actions on server
  * and serial profile items.
  *
@@ -17,32 +18,24 @@ interface ScriptPickItem extends vscode.QuickPickItem {
  *     — no point offering an SSH-only script when the user is trying to run
  *     something against a serial profile.
  *
- * Returns `undefined` when there are no scripts, the workspace isn't open, or
- * the user dismisses the picker. Surface the "no scripts" case to the user with
- * an informational message so they know where to put scripts.
+ * Returns `undefined` when there are no scripts or the user dismisses the picker.
+ * Surface the "no scripts" case to the user with an informational message so
+ * they know where to put scripts. Delegates directory resolution to
+ * `resolveScriptsDir()` so the no-workspace global-storage fallback works here
+ * too.
  */
 export async function pickScriptFromWorkspace(
+  globalStoragePath: string,
   targetType?: "ssh" | "serial"
 ): Promise<vscode.Uri | undefined> {
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) {
-    void vscode.window.showInformationMessage(
-      "Open a folder to store your Nexus scripts, then try again."
-    );
-    return undefined;
-  }
-
-  const scriptsPath = vscode.workspace
-    .getConfiguration("nexus.scripts")
-    .get<string>("path", ".nexus/scripts");
-  const dir = vscode.Uri.joinPath(folder.uri, scriptsPath);
+  const dir = resolveScriptsDir(globalStoragePath);
 
   let entries: Array<[string, vscode.FileType]>;
   try {
     entries = await vscode.workspace.fs.readDirectory(dir);
   } catch {
     void vscode.window.showInformationMessage(
-      `No Nexus scripts folder at ${scriptsPath}. Create one with "Nexus: New Nexus Script".`
+      `No Nexus scripts folder at ${dir.fsPath}. Create one with "Nexus: New Nexus Script".`
     );
     return undefined;
   }
@@ -74,8 +67,8 @@ export async function pickScriptFromWorkspace(
   if (items.length === 0) {
     void vscode.window.showInformationMessage(
       targetType
-        ? `No Nexus scripts compatible with ${targetType.toUpperCase()} profiles. Add one in ${scriptsPath}.`
-        : `No Nexus scripts found in ${scriptsPath}.`
+        ? `No Nexus scripts compatible with ${targetType.toUpperCase()} profiles. Add one in ${dir.fsPath}.`
+        : `No Nexus scripts found in ${dir.fsPath}.`
     );
     return undefined;
   }

@@ -598,7 +598,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         void vscode.window.showErrorMessage("Nexus script runtime is not available in this context.");
         return;
       }
-      const scriptUri = await pickScriptFromWorkspace("serial");
+      const scriptUri = await pickScriptFromWorkspace(ctx.globalStoragePath, "serial");
       if (!scriptUri) return;
 
       const preExisting = new Set(

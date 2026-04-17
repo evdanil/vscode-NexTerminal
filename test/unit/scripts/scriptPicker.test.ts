@@ -9,6 +9,7 @@ const shownInfo: string[] = [];
 vi.mock("vscode", () => ({
   FileType: { File: 1, Directory: 2 },
   Uri: {
+    file: (p: string) => ({ fsPath: p, scheme: "file", path: p, toString: () => p }),
     joinPath: (base: { fsPath: string }, ...parts: string[]) => ({
       fsPath: [base.fsPath, ...parts].join("/"),
       scheme: "file",
@@ -43,6 +44,8 @@ vi.mock("vscode", () => ({
 import * as vscode from "vscode";
 import { pickScriptFromWorkspace } from "../../../src/services/scripts/scriptPicker";
 
+const GLOBAL_STORAGE = "/gs";
+
 describe("scriptPicker / pickScriptFromWorkspace", () => {
   beforeEach(() => {
     mockFsEntries.clear();
@@ -60,11 +63,15 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     );
   });
 
-  it("returns undefined and informs the user when no workspace is open", async () => {
+  it("falls back to global-storage scripts directory when no workspace is open", async () => {
     (vscode.workspace as unknown as { workspaceFolders: unknown[] | undefined }).workspaceFolders = undefined;
-    const result = await pickScriptFromWorkspace();
-    expect(result).toBeUndefined();
-    expect(shownInfo.some((m) => /open a folder/i.test(m))).toBe(true);
+    mockFsEntries.set("/gs/scripts", [["any.js", 1]]);
+    mockFiles.set("/gs/scripts/any.js", "/**\n * @nexus-script\n * @name Any\n */\n");
+    await pickScriptFromWorkspace(GLOBAL_STORAGE);
+    const labels = (quickPickItems as Array<{ label: string }>)?.map((i) => i.label) ?? [];
+    expect(labels).toEqual(["Any"]);
+    // No "open a folder" prompt — the no-workspace case is a supported flow now.
+    expect(shownInfo.some((m) => /open a folder/i.test(m))).toBe(false);
   });
 
   it("returns undefined and informs when the scripts directory does not exist", async () => {
@@ -74,7 +81,7 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
         throw new Error("ENOENT");
       }
     );
-    const result = await pickScriptFromWorkspace();
+    const result = await pickScriptFromWorkspace(GLOBAL_STORAGE);
     expect(result).toBeUndefined();
     expect(shownInfo.some((m) => /no nexus scripts folder/i.test(m))).toBe(true);
   });
@@ -83,7 +90,7 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     mockFsEntries.set("/ws/.nexus/scripts", [["good.js", 1], ["bad.js", 1]]);
     mockFiles.set("/ws/.nexus/scripts/good.js", "/**\n * @nexus-script\n * @name Good\n */\n");
     mockFiles.set("/ws/.nexus/scripts/bad.js", "console.log('not a nexus script');\n");
-    await pickScriptFromWorkspace();
+    await pickScriptFromWorkspace(GLOBAL_STORAGE);
     const labels = (quickPickItems as Array<{ label: string }>)?.map((i) => i.label) ?? [];
     expect(labels).toEqual(["Good"]);
   });
@@ -101,7 +108,7 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     );
     mockFiles.set("/ws/.nexus/scripts/unrestricted.js", "/**\n * @nexus-script\n * @name Any\n */\n");
 
-    await pickScriptFromWorkspace("serial");
+    await pickScriptFromWorkspace(GLOBAL_STORAGE, "serial");
     const labels = (quickPickItems as Array<{ label: string }>)?.map((i) => i.label) ?? [];
     expect(labels.sort()).toEqual(["Any", "SerialOnly"]);
   });
@@ -110,12 +117,12 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     mockFsEntries.set("/ws/.nexus/scripts", [["a.js", 1]]);
     mockFiles.set("/ws/.nexus/scripts/a.js", "/**\n * @nexus-script\n * @name Any\n */\n");
 
-    await pickScriptFromWorkspace("ssh");
+    await pickScriptFromWorkspace(GLOBAL_STORAGE, "ssh");
     const sshLabels = (quickPickItems as Array<{ label: string }>)?.map((i) => i.label) ?? [];
     expect(sshLabels).toEqual(["Any"]);
 
     quickPickItems = undefined;
-    await pickScriptFromWorkspace("serial");
+    await pickScriptFromWorkspace(GLOBAL_STORAGE, "serial");
     const serialLabels = (quickPickItems as Array<{ label: string }>)?.map((i) => i.label) ?? [];
     expect(serialLabels).toEqual(["Any"]);
   });
@@ -123,7 +130,7 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
   it("surfaces a helpful message when no compatible scripts exist", async () => {
     mockFsEntries.set("/ws/.nexus/scripts", [["ssh-only.js", 1]]);
     mockFiles.set("/ws/.nexus/scripts/ssh-only.js", "/**\n * @nexus-script\n * @target-type ssh\n */\n");
-    const result = await pickScriptFromWorkspace("serial");
+    const result = await pickScriptFromWorkspace(GLOBAL_STORAGE, "serial");
     expect(result).toBeUndefined();
     expect(shownInfo.some((m) => /no nexus scripts compatible with serial/i.test(m))).toBe(true);
   });
@@ -132,7 +139,7 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     mockFsEntries.set("/ws/.nexus/scripts", [["ok.js", 1]]);
     mockFiles.set("/ws/.nexus/scripts/ok.js", "/**\n * @nexus-script\n * @name Ok\n */\n");
     quickPickReturn = { label: "Ok", uri: { fsPath: "/ws/.nexus/scripts/ok.js", scheme: "file", path: "/ws/.nexus/scripts/ok.js", toString: () => "" } };
-    const result = await pickScriptFromWorkspace();
+    const result = await pickScriptFromWorkspace(GLOBAL_STORAGE);
     expect(result?.fsPath).toBe("/ws/.nexus/scripts/ok.js");
   });
 
@@ -140,7 +147,7 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     mockFsEntries.set("/ws/.nexus/scripts", [["ok.js", 1]]);
     mockFiles.set("/ws/.nexus/scripts/ok.js", "/**\n * @nexus-script\n */\n");
     quickPickReturn = undefined;
-    const result = await pickScriptFromWorkspace();
+    const result = await pickScriptFromWorkspace(GLOBAL_STORAGE);
     expect(result).toBeUndefined();
   });
 });

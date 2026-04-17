@@ -50,4 +50,5 @@ export interface CommandContext {
   activityIndicators: Map<string, { setActivityIndicator(active: boolean): void }>;
   scriptRuntimeManager?: ScriptRuntimeManager;
   terminalRegistry?: TerminalRegistry;
+  globalStoragePath: string;
 }
