@@ -158,52 +158,6 @@ function scriptingDocsUrl(): string {
   return `${base.replace(/\/+$/, "")}/blob/main/docs/scripting.md`;
 }
 
-/**
- * Let the user pick a folder for `nexus.scripts.path` via the native OS folder
- * dialog, then persist that absolute path into the global User setting. Fixes
- * the ergonomic gap where the setting UI only renders a text input — users had
- * to type the full path by hand. Seed the dialog from whatever's currently set:
- * an absolute `nexus.scripts.path` → that directory; otherwise a workspace root
- * if one is open; otherwise the extension's global-storage scripts dir so the
- * user lands somewhere sensible rather than at `/` or the user home.
- */
-async function chooseScriptsFolder(globalStoragePath: string): Promise<void> {
-  const cfg = vscode.workspace.getConfiguration("nexus.scripts");
-  const current = cfg.get<string>("path", "");
-  let defaultUri: vscode.Uri | undefined;
-  if (current && /^(?:[A-Za-z]:[\\/]|[\\/])/.test(current)) {
-    // Absolute — seed the dialog at it so the user can tweak one level up if
-    // they want, rather than navigating from scratch.
-    defaultUri = vscode.Uri.file(current);
-  } else if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-    defaultUri = vscode.workspace.workspaceFolders[0].uri;
-  } else {
-    defaultUri = resolveScriptsDir(globalStoragePath);
-  }
-  const picked = await vscode.window.showOpenDialog({
-    canSelectFiles: false,
-    canSelectFolders: true,
-    canSelectMany: false,
-    defaultUri,
-    openLabel: "Use this folder for Nexus scripts",
-    title: "Pick Nexus scripts folder"
-  });
-  if (!picked || picked.length === 0) return;
-  const chosen = picked[0].fsPath;
-  await cfg.update("path", chosen, vscode.ConfigurationTarget.Global);
-  const action = await vscode.window.showInformationMessage(
-    `Nexus scripts folder set to ${chosen}.`,
-    "Open Folder"
-  );
-  if (action === "Open Folder") {
-    try {
-      await vscode.commands.executeCommand("revealFileInOS", picked[0]);
-    } catch {
-      await vscode.env.openExternal(picked[0]);
-    }
-  }
-}
-
 async function deleteScript(uri: vscode.Uri): Promise<void> {
   if (!uri?.fsPath) return;
   const base = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
@@ -335,10 +289,6 @@ export function registerScriptCommands(
       const uri = toScriptUri(arg);
       if (!uri) return;
       await vscode.commands.executeCommand("vscode.open", uri);
-    }),
-
-    vscode.commands.registerCommand("nexus.script.chooseScriptsFolder", async () => {
-      await chooseScriptsFolder(globalStoragePath);
     }),
 
     vscode.commands.registerCommand("nexus.script.openScriptsFolder", async () => {

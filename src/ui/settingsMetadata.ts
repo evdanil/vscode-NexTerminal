@@ -407,10 +407,10 @@ export const SETTINGS_META: SettingMeta[] = [
     key: "path",
     section: "nexus.scripts",
     label: "Scripts Folder",
-    type: "string",
+    type: "directory",
     category: "scripts",
     description:
-      "Workspace-relative directory for your .js scripts. Created on first run if missing. Changing this does not move existing files — copy them across manually.",
+      "Directory for your .js scripts. Absolute paths are used as-is. A relative path is resolved against the workspace root when a folder is open; otherwise scripts live in Nexus's extension storage. Leave empty for the default.",
     default: ".nexus/scripts"
   },
   {

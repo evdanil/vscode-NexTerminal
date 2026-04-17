@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros with auto-trigger (expect/send), regex highlighting, unread activity indicators, color schemes, and configuration import/export.",
-  "version": "2.8.16",
+  "version": "2.8.17",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -590,12 +590,6 @@
         "title": "Open Scripts Folder",
         "category": "Nexus",
         "icon": "$(folder-opened)"
-      },
-      {
-        "command": "nexus.script.chooseScriptsFolder",
-        "title": "Choose Scripts Folder…",
-        "category": "Nexus",
-        "icon": "$(folder-active)"
       },
       {
         "command": "nexus.terminal.reset",
@@ -3002,7 +2996,7 @@
           "type": "string",
           "default": ".nexus/scripts",
           "order": 20,
-          "markdownDescription": "Directory where Nexus scripts live. Relative paths are resolved against the workspace root. When no workspace is open, scripts are stored in the extension's global storage regardless of this setting. An absolute path is used as-is in both cases.\n\n[Pick a folder…](command:nexus.script.chooseScriptsFolder) — opens a native folder dialog and writes the absolute path here for you."
+          "markdownDescription": "Directory where Nexus scripts live. Relative paths are resolved against the workspace root. When no workspace is open, scripts are stored in the extension's global storage regardless of this setting. An absolute path is used as-is in both cases. Use the Nexus Settings page (Command Center → Settings) for a folder picker."
         },
         "nexus.scripts.defaultTimeout": {
           "type": "number",

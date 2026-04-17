@@ -109,7 +109,6 @@ const unsupportedCommands = [
   "nexus.script.delete",
   "nexus.script.edit",
   "nexus.script.openScriptsFolder",
-  "nexus.script.chooseScriptsFolder",
   "nexus.server.runWithScript",
   "nexus.serial.runWithScript",
   "nexus.terminal.reset",
