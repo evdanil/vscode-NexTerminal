@@ -64,6 +64,7 @@ vi.mock("vscode", () => ({
       })
     },
     getConfiguration: vi.fn(() => ({ get: vi.fn((_k: string, d?: unknown) => d) })),
+    onDidChangeConfiguration: vi.fn(() => ({ dispose: vi.fn() })),
     createFileSystemWatcher: vi.fn(() => ({
       onDidCreate: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChange: vi.fn(() => ({ dispose: vi.fn() })),

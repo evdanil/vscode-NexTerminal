@@ -11,7 +11,9 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
   public readonly onDidChangeTreeData: vscode.Event<void> = this._onDidChangeTreeData.event;
   private watcher?: vscode.FileSystemWatcher;
+  private watchedDir?: string;
   private readonly managerListener: vscode.Disposable;
+  private readonly configListener: vscode.Disposable;
 
   public constructor(
     private readonly manager: ScriptRuntimeManager,
@@ -27,12 +29,21 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
         this.refresh();
       }
     });
+    // Re-read the scripts directory whenever the user changes the setting —
+    // otherwise the tree keeps listing files from the previous folder and the
+    // watcher stays bound to it.
+    this.configListener = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("nexus.scripts.path")) {
+        this.refresh();
+      }
+    });
     this.ensureWatcher();
   }
 
   public dispose(): void {
     this.watcher?.dispose();
     this.managerListener.dispose();
+    this.configListener.dispose();
     this._onDidChangeTreeData.dispose();
   }
 
@@ -110,8 +121,14 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   }
 
   private ensureWatcher(): void {
-    if (this.watcher) return;
     const dir = resolveScriptsDir(this.globalStoragePath);
+    // Rebuild when the target directory changes — the setting may have been
+    // updated mid-session, in which case the existing watcher is still bound
+    // to the old folder and will never fire for the new one.
+    if (this.watcher && this.watchedDir === dir.fsPath) return;
+    this.watcher?.dispose();
+    this.watcher = undefined;
+    this.watchedDir = dir.fsPath;
     const pattern = new vscode.RelativePattern(dir, "**/*.js");
     this.watcher = vscode.workspace.createFileSystemWatcher(pattern);
     this.watcher.onDidCreate(() => this._onDidChangeTreeData.fire());

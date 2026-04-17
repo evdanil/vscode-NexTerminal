@@ -764,6 +764,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const refreshCommand = vscode.commands.registerCommand("nexus.refresh", async () => {
     await core.initialize();
     viewSync.flush();
+    scriptTreeProvider.refresh();
   });
 
   const windowFocusListener = vscode.window.onDidChangeWindowState((state) => {

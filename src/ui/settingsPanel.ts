@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import * as path from "node:path";
 import * as vscode from "vscode";
 import { renderSettingsHtml } from "./settingsHtml";
 import { SETTINGS_META, CATEGORY_LABELS } from "./settingsMetadata";
@@ -108,6 +109,42 @@ export class SettingsPanel {
     });
   }
 
+  /**
+   * Turn whatever is currently in the setting's text field into a dialog seed.
+   * Resolution order:
+   *   1. Absolute path that currently exists as a directory → seed there.
+   *   2. Relative path resolved against the first workspace folder, if that
+   *      exists as a directory → seed there.
+   *   3. First workspace folder as a bare fallback, if any.
+   *   4. Undefined — VS Code picks (last-visited / home).
+   * We intentionally don't seed at non-existent paths; showOpenDialog's
+   * behaviour for missing defaultUri varies by platform.
+   */
+  private async resolveBrowseDefaultUri(current: string): Promise<vscode.Uri | undefined> {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
+
+    const tryCandidate = async (uri: vscode.Uri): Promise<vscode.Uri | undefined> => {
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        return stat.type === vscode.FileType.Directory ? uri : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+
+    if (current) {
+      if (path.isAbsolute(current)) {
+        const seed = await tryCandidate(vscode.Uri.file(current));
+        if (seed) return seed;
+      } else if (workspaceRoot) {
+        const seed = await tryCandidate(vscode.Uri.joinPath(workspaceRoot, current));
+        if (seed) return seed;
+      }
+    }
+
+    return workspaceRoot;
+  }
+
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
     switch (msg.type) {
       case "saveSetting": {
@@ -119,10 +156,14 @@ export class SettingsPanel {
         break;
       }
       case "browse": {
+        const defaultUri = await this.resolveBrowseDefaultUri(
+          typeof msg.current === "string" ? msg.current.trim() : ""
+        );
         const uris = await vscode.window.showOpenDialog({
           canSelectFiles: false,
           canSelectFolders: true,
           canSelectMany: false,
+          defaultUri,
           title: "Select Directory",
           openLabel: "Select Folder"
         });

@@ -448,7 +448,19 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       for (var bi = 0; bi < browseBtns.length; bi++) {
         (function(btn) {
           btn.addEventListener("click", function() {
-            vscode.postMessage({ type: "browse", section: btn.dataset.section, key: btn.dataset.key });
+            // Read whatever's in the paired text field so the host can seed
+            // the folder dialog at the currently-configured directory instead
+            // of wherever the OS picker defaults to.
+            var input = btn.parentElement
+              ? btn.parentElement.querySelector('input[type="text"]')
+              : null;
+            var current = input ? input.value : "";
+            vscode.postMessage({
+              type: "browse",
+              section: btn.dataset.section,
+              key: btn.dataset.key,
+              current: current
+            });
           });
         })(browseBtns[bi]);
       }
