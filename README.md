@@ -33,7 +33,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 - **Settings Panel** — View and edit all extension settings in a dedicated webview panel with search, grouped categories, and auto-save.
 - **Configuration Export/Import** — Full encrypted backup with master password protection, or sanitized share export (credentials stripped, IDs remapped). Proxy configurations are preserved across backup and restore.
 - **Import from MobaXterm / SecureCRT** — Migrate SSH session profiles directly from MobaXterm INI files or SecureCRT XML exports and session directories. Folder hierarchy is preserved.
-- **Scripts** — Author `.js` automation scripts under `.nexus/scripts/` and run them against any active SSH or Serial session. Scripts use an async expect/send API (`waitFor`, `expect`, `waitAny`, `send`, `sendLine`, `sendKey`, `poll`, `prompt`, `confirm`, `alert`, `sleep`, `log`) with IntelliSense auto-seeded on first run. Each script runs in an isolated `worker_threads` Worker so runaway loops can be stopped in &lt;100 ms. Macros on the script's session are suspended automatically (configurable via `nexus.scripts.macroPolicy` and the per-script `@allow-macros` header); macros on unrelated sessions keep firing normally. Minimal example:
+- **Scripts** — Author `.js` automation scripts under `.nexus/scripts/` (or the folder of your choice via *Nexus Settings → Scripts → Scripts Folder*, which exposes a native folder picker; works with or without an open workspace — when none is open, scripts live in the extension's global storage) and run them against any active SSH or Serial session. Scripts use an async expect/send API (`waitFor`, `expect`, `waitAny`, `send`, `sendLine`, `sendKey`, `poll`, `prompt`, `confirm`, `alert`, `sleep`, `log`) with IntelliSense auto-seeded on first run. Each script runs in an isolated `worker_threads` Worker so runaway loops can be stopped in &lt;100 ms. Macros on the script's session are suspended automatically (configurable via `nexus.scripts.macroPolicy` and the per-script `@allow-macros` header); macros on unrelated sessions keep firing normally. Minimal example:
   ```js
   /**
    * @nexus-script
@@ -170,7 +170,7 @@ npm run package:vsix
 | `nexus.sftp.deleteDepthLimit` | `100` | Safety limit for recursive delete directory depth |
 | `nexus.sftp.deleteOperationLimit` | `10000` | Safety limit for items removed by one recursive delete |
 | `nexus.serial.rpcTimeout` | `10` | Timeout for serial sidecar commands in seconds |
-| `nexus.scripts.path` | `.nexus/scripts` | Workspace-relative directory where Nexus scripts live |
+| `nexus.scripts.path` | `.nexus/scripts` | Directory where Nexus scripts live. Absolute paths are used as-is. Relative paths resolve against the workspace root when a folder is open, otherwise the extension's global storage. Pick a folder via *Nexus Settings → Scripts → Scripts Folder* |
 | `nexus.scripts.defaultTimeout` | `30000` | Default per-wait timeout in ms for `waitFor` / `expect` / `waitAny` when not specified |
 | `nexus.scripts.macroPolicy` | `suspend-all` | Macro policy while a script runs: `suspend-all` or `keep-enabled` |
 | `nexus.scripts.maxRuntimeMs` | `1800000` | Overall runtime cap in ms — exceeded runs are auto-stopped with reason `max-runtime-exceeded`. `0` disables the cap |
