@@ -3,6 +3,18 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 const mockFsEntries = new Map<string, Array<[string, number]>>();
 const mockFiles = new Map<string, string>();
 
+// Captured by the mock's onDidChangeConfiguration so tests can drive config-
+// change events through the provider.
+const configChangeListeners = new Set<(e: { affectsConfiguration: (section: string) => boolean }) => void>();
+
+// Resettable per-test pretend scripts path — lets tests simulate the setting
+// moving between directories to exercise the watcher-rebuild path.
+let mockScriptsPath = ".nexus/scripts";
+
+// Count of createFileSystemWatcher calls so tests can assert the watcher was
+// rebuilt when the target directory changed.
+let createWatcherCalls = 0;
+
 vi.mock("vscode", () => ({
   EventEmitter: class MockEventEmitter<T> {
     private listeners = new Set<(v: T) => void>();
@@ -63,14 +75,25 @@ vi.mock("vscode", () => ({
         return new TextEncoder().encode(content);
       })
     },
-    getConfiguration: vi.fn(() => ({ get: vi.fn((_k: string, d?: unknown) => d) })),
-    onDidChangeConfiguration: vi.fn(() => ({ dispose: vi.fn() })),
-    createFileSystemWatcher: vi.fn(() => ({
-      onDidCreate: vi.fn(() => ({ dispose: vi.fn() })),
-      onDidChange: vi.fn(() => ({ dispose: vi.fn() })),
-      onDidDelete: vi.fn(() => ({ dispose: vi.fn() })),
-      dispose: vi.fn()
-    }))
+    getConfiguration: vi.fn(() => ({
+      // Return the pretend scripts path for `nexus.scripts.path`, fall through
+      // to the provided default for anything else so existing tests still see
+      // `.nexus/scripts` via resolveScriptsDir's default.
+      get: vi.fn((k: string, d?: unknown) => (k === "path" ? mockScriptsPath : d))
+    })),
+    onDidChangeConfiguration: vi.fn((listener: (e: { affectsConfiguration: (section: string) => boolean }) => void) => {
+      configChangeListeners.add(listener);
+      return { dispose: () => configChangeListeners.delete(listener) };
+    }),
+    createFileSystemWatcher: vi.fn(() => {
+      createWatcherCalls += 1;
+      return {
+        onDidCreate: vi.fn(() => ({ dispose: vi.fn() })),
+        onDidChange: vi.fn(() => ({ dispose: vi.fn() })),
+        onDidDelete: vi.fn(() => ({ dispose: vi.fn() })),
+        dispose: vi.fn()
+      };
+    })
   }
 }));
 
@@ -92,6 +115,9 @@ describe("ScriptTreeProvider", () => {
   beforeEach(() => {
     mockFsEntries.clear();
     mockFiles.clear();
+    configChangeListeners.clear();
+    createWatcherCalls = 0;
+    mockScriptsPath = ".nexus/scripts";
     (vscode.workspace as unknown as { workspaceFolders: unknown[] }).workspaceFolders = [
       { uri: { fsPath: "/workspace", scheme: "file", path: "/workspace" }, name: "ws", index: 0 }
     ];
@@ -300,5 +326,54 @@ describe("ScriptTreeProvider", () => {
     expect(item.command).toBeUndefined();
     // Parse errors must still be visible so the user has a reason to fix it.
     expect(String(item.tooltip ?? "")).toMatch(/error|@default-timeout/i);
+  });
+
+  it("refreshes the tree when nexus.scripts.path configuration changes", async () => {
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+    const events: Array<void> = [];
+    const sub = provider.onDidChangeTreeData(() => events.push(undefined));
+
+    // Verify the config listener was registered during construction.
+    expect(configChangeListeners.size).toBe(1);
+
+    // Fire a config change that matches nexus.scripts.path — tree should refire.
+    for (const listener of configChangeListeners) {
+      listener({ affectsConfiguration: (section: string) => section === "nexus.scripts.path" });
+    }
+    expect(events.length).toBeGreaterThanOrEqual(1);
+
+    // Unrelated config change should NOT refresh — saves a full tree redraw on
+    // every unrelated setting toggle.
+    events.length = 0;
+    for (const listener of configChangeListeners) {
+      listener({ affectsConfiguration: () => false });
+    }
+    expect(events).toHaveLength(0);
+
+    sub.dispose();
+  });
+
+  it("rebuilds the file watcher when the configured scripts directory changes", async () => {
+    // First construction creates watcher #1 pointing at the default location.
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+    expect(createWatcherCalls).toBe(1);
+
+    // Simulate the user changing the setting and the config listener firing.
+    mockScriptsPath = "/elsewhere/my-scripts";
+    for (const listener of configChangeListeners) {
+      listener({ affectsConfiguration: (section: string) => section === "nexus.scripts.path" });
+    }
+
+    // refresh() → ensureWatcher() must notice the dir changed and rebuild.
+    expect(createWatcherCalls).toBe(2);
+
+    // Firing another config change with the same dir must NOT rebuild —
+    // otherwise chatty settings events would churn watchers for nothing.
+    for (const listener of configChangeListeners) {
+      listener({ affectsConfiguration: (section: string) => section === "nexus.scripts.path" });
+    }
+    expect(createWatcherCalls).toBe(2);
+
+    provider.dispose();
   });
 });

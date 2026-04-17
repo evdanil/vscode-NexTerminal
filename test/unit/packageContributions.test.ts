@@ -157,7 +157,7 @@ describe("package contributions", () => {
       const commands = scriptItems.map((i) => i.command);
       expect(commands).toContain("nexus.script.run");
       expect(commands).toContain("nexus.script.stop");
-      expect(commands).toContain("revealInExplorer");
+      expect(commands).toContain("nexus.script.revealInExplorer");
       expect(commands).toContain("nexus.script.delete");
 
       // Inline ▶ run is bound to runQuick so it auto-picks the focused terminal;

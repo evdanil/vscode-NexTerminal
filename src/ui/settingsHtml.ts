@@ -450,9 +450,14 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
           btn.addEventListener("click", function() {
             // Read whatever's in the paired text field so the host can seed
             // the folder dialog at the currently-configured directory instead
-            // of wherever the OS picker defaults to.
+            // of wherever the OS picker defaults to. Match by data-key rather
+            // than positional lookup so adding a second input to the row
+            // (e.g. a resolved-path hint) in the future wouldn't silently
+            // break browsing.
             var input = btn.parentElement
-              ? btn.parentElement.querySelector('input[type="text"]')
+              ? btn.parentElement.querySelector(
+                  'input[type="text"][data-section="' + btn.dataset.section + '"][data-key="' + btn.dataset.key + '"]'
+                )
               : null;
             var current = input ? input.value : "";
             vscode.postMessage({

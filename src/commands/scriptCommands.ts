@@ -285,6 +285,17 @@ export function registerScriptCommands(
       await deleteScript(uri);
     }),
 
+    // Namespaced wrapper around the built-in `revealInExplorer`. Registering
+    // directly under `revealInExplorer` in the manifest silenced the validator
+    // warning but risked colliding with VS Code's own palette declaration.
+    // Owning a `nexus.*` id + delegating keeps the menu label under our
+    // control and avoids any ambiguity.
+    vscode.commands.registerCommand("nexus.script.revealInExplorer", async (arg?: unknown) => {
+      const uri = toScriptUri(arg);
+      if (!uri) return;
+      await vscode.commands.executeCommand("revealInExplorer", uri);
+    }),
+
     vscode.commands.registerCommand("nexus.script.edit", async (arg?: unknown) => {
       const uri = toScriptUri(arg);
       if (!uri) return;

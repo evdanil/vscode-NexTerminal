@@ -4,13 +4,84 @@ import * as vscode from "vscode";
 import { renderSettingsHtml } from "./settingsHtml";
 import { SETTINGS_META, CATEGORY_LABELS } from "./settingsMetadata";
 
+/**
+ * Pick a sensible `defaultUri` for `vscode.window.showOpenDialog` when the
+ * user clicks Browse on a directory-type setting.
+ *
+ * `current` is the **webview DOM value** forwarded by the `browse` message,
+ * not the persisted setting — debounced saves may not have flown yet when the
+ * button is clicked. Seeding from the DOM matches what the user sees on screen.
+ *
+ * Resolution order — only existing directories seed the dialog; missing paths
+ * would cause VS Code to pick an unpredictable fallback location, defeating
+ * the purpose of seeding at all:
+ *
+ *   1. `current` is absolute and exists as a directory → seed there.
+ *   2. `current` is relative, workspace is open, and `<workspace>/<current>`
+ *      exists as a directory → seed there.
+ *   3. `current` is relative, NO workspace, but `globalStoragePath` was
+ *      injected, and `<globalStoragePath>/<current>` exists → seed there.
+ *      This covers the Scripts Folder no-workspace case where scripts live
+ *      under the extension's global storage.
+ *   4. Workspace root, if any.
+ *   5. `globalStoragePath` itself, if any (better than nothing in no-ws mode).
+ *   6. Undefined — VS Code uses its own last-visited fallback.
+ *
+ * Exported purely so the four branches are testable in isolation; the
+ * production method in `SettingsPanel` just wires up the real `stat` call.
+ */
+export async function resolveBrowseDefaultUri(
+  current: string,
+  workspaceRoot: vscode.Uri | undefined,
+  globalStoragePath: string | undefined,
+  isDirectory: (uri: vscode.Uri) => Promise<boolean>
+): Promise<vscode.Uri | undefined> {
+  if (current) {
+    if (path.isAbsolute(current)) {
+      const candidate = vscode.Uri.file(current);
+      if (await isDirectory(candidate)) return candidate;
+    } else if (workspaceRoot) {
+      const candidate = vscode.Uri.joinPath(workspaceRoot, current);
+      if (await isDirectory(candidate)) return candidate;
+    } else if (globalStoragePath) {
+      const candidate = vscode.Uri.file(path.join(globalStoragePath, current));
+      if (await isDirectory(candidate)) return candidate;
+    }
+  }
+
+  if (workspaceRoot) return workspaceRoot;
+  if (globalStoragePath) return vscode.Uri.file(globalStoragePath);
+  return undefined;
+}
+
+async function isExistingDirectory(uri: vscode.Uri): Promise<boolean> {
+  try {
+    const stat = await vscode.workspace.fs.stat(uri);
+    return stat.type === vscode.FileType.Directory;
+  } catch {
+    return false;
+  }
+}
+
 export class SettingsPanel {
   private static instance: SettingsPanel | undefined;
+  private static globalStoragePath: string | undefined;
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
   private pendingScrollTo: string | undefined;
   private currentCategory: string | undefined;
   private readonly configListener: vscode.Disposable;
+
+  /**
+   * Called once at extension activation so `resolveBrowseDefaultUri` can seed
+   * the folder dialog at the extension's global storage when no workspace is
+   * open (relevant for settings like `nexus.scripts.path`). Static-injection
+   * rather than constructor-threading avoids widening the singleton's public
+   * `open()` surface for a purely environmental dependency.
+   */
+  public static setGlobalStoragePath(storagePath: string): void {
+    SettingsPanel.globalStoragePath = storagePath;
+  }
 
   private constructor(category?: string) {
     this.currentCategory = category;
@@ -109,41 +180,6 @@ export class SettingsPanel {
     });
   }
 
-  /**
-   * Turn whatever is currently in the setting's text field into a dialog seed.
-   * Resolution order:
-   *   1. Absolute path that currently exists as a directory → seed there.
-   *   2. Relative path resolved against the first workspace folder, if that
-   *      exists as a directory → seed there.
-   *   3. First workspace folder as a bare fallback, if any.
-   *   4. Undefined — VS Code picks (last-visited / home).
-   * We intentionally don't seed at non-existent paths; showOpenDialog's
-   * behaviour for missing defaultUri varies by platform.
-   */
-  private async resolveBrowseDefaultUri(current: string): Promise<vscode.Uri | undefined> {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
-
-    const tryCandidate = async (uri: vscode.Uri): Promise<vscode.Uri | undefined> => {
-      try {
-        const stat = await vscode.workspace.fs.stat(uri);
-        return stat.type === vscode.FileType.Directory ? uri : undefined;
-      } catch {
-        return undefined;
-      }
-    };
-
-    if (current) {
-      if (path.isAbsolute(current)) {
-        const seed = await tryCandidate(vscode.Uri.file(current));
-        if (seed) return seed;
-      } else if (workspaceRoot) {
-        const seed = await tryCandidate(vscode.Uri.joinPath(workspaceRoot, current));
-        if (seed) return seed;
-      }
-    }
-
-    return workspaceRoot;
-  }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
     switch (msg.type) {
@@ -156,8 +192,11 @@ export class SettingsPanel {
         break;
       }
       case "browse": {
-        const defaultUri = await this.resolveBrowseDefaultUri(
-          typeof msg.current === "string" ? msg.current.trim() : ""
+        const defaultUri = await resolveBrowseDefaultUri(
+          typeof msg.current === "string" ? msg.current.trim() : "",
+          vscode.workspace.workspaceFolders?.[0]?.uri,
+          SettingsPanel.globalStoragePath,
+          isExistingDirectory
         );
         const uris = await vscode.window.showOpenDialog({
           canSelectFiles: false,

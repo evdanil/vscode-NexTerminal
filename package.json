@@ -592,8 +592,9 @@
         "icon": "$(folder-opened)"
       },
       {
-        "command": "revealInExplorer",
-        "title": "Reveal in Explorer View"
+        "command": "nexus.script.revealInExplorer",
+        "title": "Reveal in Explorer View",
+        "category": "Nexus"
       },
       {
         "command": "nexus.terminal.reset",
@@ -1144,7 +1145,7 @@
           "group": "1_manage@0"
         },
         {
-          "command": "revealInExplorer",
+          "command": "nexus.script.revealInExplorer",
           "when": "view == nexusScripts && viewItem =~ /^nexus\\.script\\.(file|running)$/",
           "group": "1_manage@1"
         },
@@ -1468,7 +1469,7 @@
           "when": "true"
         },
         {
-          "command": "revealInExplorer",
+          "command": "nexus.script.revealInExplorer",
           "when": "false"
         },
         {

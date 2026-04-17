@@ -38,6 +38,7 @@ import { clamp } from "./utils/helpers";
 import { createCoalescedInvoker } from "./utils/coalescedInvoker";
 import { clearTrackedSessionActivity, focusSessionTerminal } from "./utils/sessionTerminalFocus";
 import { registerSettingsCommands } from "./commands/settingsCommands";
+import { SettingsPanel } from "./ui/settingsPanel";
 import { registerConfigCommands } from "./commands/configCommands";
 import { registerMacroCommands, updateMacroContext, migrateMacroSlots } from "./commands/macroCommands";
 import { registerProfileCommands } from "./commands/profileCommands";
@@ -255,6 +256,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return undefined;
   };
   const globalStoragePath = context.globalStorageUri.fsPath;
+  SettingsPanel.setGlobalStoragePath(globalStoragePath);
   const scriptCommandDisposables = registerScriptCommands(
     scriptRuntimeManager,
     scriptOutputChannel,
