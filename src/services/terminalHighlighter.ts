@@ -1,9 +1,14 @@
 import * as vscode from "vscode";
 import { createAnsiRegex } from "../utils/ansi";
 
-const MAX_INPUT_LENGTH = 8192;
-const STREAM_FLUSH_DELAY_MS = 20;
-const STREAM_MAX_PENDING_LENGTH = 1024;
+const MAX_INPUT_LENGTH = 65536;
+const STREAM_FLUSH_DELAY_MS = 100;
+const STREAM_MAX_PENDING_LENGTH = 16384;
+// Bytes retained at the tail on non-newline flushes so cross-chunk matches
+// (IPs, MACs, UUIDs, etc.) still see enough context to identify the full token
+// when the next chunk arrives. Covers every built-in rule; user patterns whose
+// matches can exceed this length may still split at chunk boundaries.
+const STREAM_RETAIN_MARGIN = 256;
 
 const VALID_FLAGS_RE = /^[gi]*$/;
 
@@ -289,8 +294,8 @@ export class TerminalHighlighterStream implements vscode.Disposable {
       this.clearFlushTimer();
     }
     if (this.pending.length >= STREAM_MAX_PENDING_LENGTH) {
-      this.flush();
-      return;
+      this.emitWithRetention();
+      this.clearFlushTimer();
     }
     if (!this.pending) {
       this.clearFlushTimer();
@@ -312,14 +317,39 @@ export class TerminalHighlighterStream implements vscode.Disposable {
     this.flush();
   }
 
+  private emitWithRetention(): void {
+    if (this.pending.length <= STREAM_RETAIN_MARGIN) {
+      return;
+    }
+    const emitUpTo = this.pending.length - STREAM_RETAIN_MARGIN;
+    this.emit(this.highlighter.apply(this.pending.slice(0, emitUpTo)));
+    this.pending = this.pending.slice(emitUpTo);
+  }
+
   private scheduleFlush(): void {
     if (!this.pending || this.flushTimer !== undefined) {
       return;
     }
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
-      this.flush();
+      this.onIdleFlush();
     }, this.flushDelayMs);
+  }
+
+  private onIdleFlush(): void {
+    if (!this.pending) {
+      return;
+    }
+    if (this.pending.length > STREAM_RETAIN_MARGIN) {
+      // Keep a trailing margin so cross-chunk matches can still resolve if
+      // more data arrives. Re-schedule so the retained tail eventually flushes
+      // even if the stream stays quiet.
+      this.emitWithRetention();
+      this.scheduleFlush();
+      return;
+    }
+    this.emit(this.highlighter.apply(this.pending));
+    this.pending = "";
   }
 
   private clearFlushTimer(): void {

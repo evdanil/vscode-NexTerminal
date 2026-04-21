@@ -125,19 +125,75 @@ describe("TerminalHighlighter", () => {
     expect(emitted).toEqual(["\x1b[31mERROR\x1b[39m"]);
   });
 
-  it("flushes large partial output immediately once the pending buffer cap is reached", () => {
+  it("flushes large partial output with margin retention once the pending buffer cap is reached", () => {
     vi.useFakeTimers();
     setConfig(true, [{ pattern: "A+", color: "red", flags: "g" }]);
     const h = new TerminalHighlighter();
     const emitted: string[] = [];
     const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
-    const payload = "A".repeat(1100);
+    // Exceed the 16384-byte pending cap so the hard-cap flush path triggers
+    const payload = "A".repeat(17000);
 
     stream.push(payload);
 
-    expect(emitted).toEqual([`\x1b[31m${payload}\x1b[39m`]);
+    // Hard-cap flush emits everything except the trailing 256-byte retention margin
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toBe(`\x1b[31m${"A".repeat(17000 - 256)}\x1b[39m`);
+
+    // Idle timer then flushes the retained tail
+    vi.advanceTimersByTime(20);
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]).toBe(`\x1b[31m${"A".repeat(256)}\x1b[39m`);
+  });
+
+  it("retains trailing bytes on idle flush so cross-chunk IP matches still highlight", () => {
+    vi.useFakeTimers();
+    setConfig(true, [
+      { pattern: "\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b", color: "magenta", flags: "g" }
+    ]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    // First chunk: padding past the retention margin, ending mid-IP, no newline
+    const padding = "x".repeat(300);
+    stream.push(padding + " 110.");
+
+    // Idle timer fires — emits everything except the last 256 bytes, which are retained
     vi.advanceTimersByTime(20);
     expect(emitted).toHaveLength(1);
+    // The "110." prefix must stay in the retained tail, NOT in the emitted slice
+    expect(emitted[0]).not.toContain("110.");
+
+    // Second chunk completes the IP on the same line
+    stream.push("231.10.231\r\n");
+
+    // Retained tail + continuation emits as one unit with the full IP matched
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]).toContain("\x1b[35m110.231.10.231\x1b[39m");
+  });
+
+  it("preserves match context across hard-cap flush for cross-chunk matches", () => {
+    vi.useFakeTimers();
+    setConfig(true, [
+      { pattern: "\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b", color: "magenta", flags: "g" }
+    ]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    // Force the hard-cap flush path by pushing past STREAM_MAX_PENDING_LENGTH
+    const padding = "x".repeat(17000);
+    stream.push(padding + " 110.");
+
+    expect(emitted).toHaveLength(1);
+    // " 110." must sit in the retention margin, not in the hard-cap emission
+    expect(emitted[0]).not.toContain("110.");
+
+    stream.push("231.10.231\r\n");
+
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]).toContain("\x1b[35m110.231.10.231\x1b[39m");
   });
 
   it("skips highlighting inside color-active regions", () => {
@@ -411,10 +467,10 @@ describe("TerminalHighlighter", () => {
     expect(result).toContain("\x1b[31;1mERROR\x1b[39;22m");
   });
 
-  it("input longer than 8192 chars passes through unchanged", () => {
+  it("input longer than 65536 chars passes through unchanged", () => {
     setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi", bold: true }]);
     const h = new TerminalHighlighter();
-    const longInput = "ERROR " + "x".repeat(8200);
+    const longInput = "ERROR " + "x".repeat(65540);
     expect(h.apply(longInput)).toBe(longInput);
   });
 
