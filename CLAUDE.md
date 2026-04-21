@@ -106,6 +106,7 @@ Graceful degradation — registers stub commands showing "not available in brows
 ## Development Workflow
 
 - Feature development uses git worktrees in the `.worktrees/` directory for isolation from the main working tree
+- **Coding delegation:** Delegate implementation work (fixes, features, refactors) to a Sonnet-based expert sub-agent (`Agent` tool with `model: "sonnet"`) unless the user explicitly requests otherwise. Research, planning, and code-review agents may use their default models.
 
 ## Testing Patterns
 
