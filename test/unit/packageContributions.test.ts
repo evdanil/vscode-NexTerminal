@@ -268,11 +268,22 @@ describe("package contributions", () => {
       }
     });
 
-    it("does NOT contribute terminal/context or editor/title/context entries for these commands", () => {
+    it("does NOT contribute terminal/context entries for these commands", () => {
       const bodyHits = bodyMenu.filter((m) => m.command?.startsWith("nexus.terminal."));
       expect(bodyHits).toEqual([]);
-      const editorHits = editorTitleMenu.filter((m) => m.command?.startsWith("nexus.terminal."));
-      expect(editorHits).toEqual([]);
+    });
+
+    it("contributes editor/title/context entries for editor-tab right-click with vscode-terminal scheme gate", () => {
+      const byCmd = (id: string) => editorTitleMenu.find((m) => m.command === id);
+      const reset = byCmd("nexus.terminal.reset");
+      const clear = byCmd("nexus.terminal.clearScrollback");
+      const copy = byCmd("nexus.terminal.copyAll");
+      expect(reset?.group).toBe("nexus@1");
+      expect(clear?.group).toBe("nexus@2");
+      expect(copy?.group).toBe("nexus@3");
+      for (const m of [reset, clear, copy]) {
+        expect(m?.when).toBe("resourceScheme == 'vscode-terminal'");
+      }
     });
   });
 });

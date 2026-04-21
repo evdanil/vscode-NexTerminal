@@ -1498,6 +1498,23 @@
           "command": "nexus.terminal.copyAll",
           "group": "nexus@3"
         }
+      ],
+      "editor/title/context": [
+        {
+          "command": "nexus.terminal.reset",
+          "when": "resourceScheme == 'vscode-terminal'",
+          "group": "nexus@1"
+        },
+        {
+          "command": "nexus.terminal.clearScrollback",
+          "when": "resourceScheme == 'vscode-terminal'",
+          "group": "nexus@2"
+        },
+        {
+          "command": "nexus.terminal.copyAll",
+          "when": "resourceScheme == 'vscode-terminal'",
+          "group": "nexus@3"
+        }
       ]
     },
     "keybindings": [
