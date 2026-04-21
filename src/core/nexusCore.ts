@@ -22,6 +22,7 @@ export class NexusCore {
   private readonly activeSerialSessions = new Map<string, ActiveSerialSession>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
   private readonly activitySessionIds = new Set<string>();
+  private focusedSessionId: string | undefined = undefined;
   private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
   private readonly authProfiles = new Map<string, AuthProfile>();
@@ -70,7 +71,8 @@ export class NexusCore {
       remoteTunnels: [...this.remoteTunnels],
       explicitGroups: [...this.explicitGroups],
       authProfiles: [...this.authProfiles.values()],
-      activitySessionIds: new Set(this.activitySessionIds)
+      activitySessionIds: new Set(this.activitySessionIds),
+      focusedSessionId: this.focusedSessionId
     };
   }
 
@@ -197,12 +199,18 @@ export class NexusCore {
   }
 
   public unregisterSerialSession(sessionId: string): void {
+    if (this.focusedSessionId === sessionId) {
+      this.focusedSessionId = undefined;
+    }
     this.activeSerialSessions.delete(sessionId);
     this.activitySessionIds.delete(sessionId);
     this.emitChanged();
   }
 
   public unregisterSession(sessionId: string): void {
+    if (this.focusedSessionId === sessionId) {
+      this.focusedSessionId = undefined;
+    }
     this.activeSessions.delete(sessionId);
     this.activitySessionIds.delete(sessionId);
     this.emitChanged();
@@ -244,6 +252,14 @@ export class NexusCore {
       return;
     }
     this.activitySessionIds.delete(sessionId);
+    this.emitChanged();
+  }
+
+  public setFocusedSession(sessionId: string | undefined): void {
+    if (this.focusedSessionId === sessionId) {
+      return;
+    }
+    this.focusedSessionId = sessionId;
     this.emitChanged();
   }
 
@@ -428,6 +444,9 @@ export class NexusCore {
   private removeServerSessions(serverId: string): void {
     for (const [sessionId, session] of this.activeSessions.entries()) {
       if (session.serverId === serverId) {
+        if (this.focusedSessionId === sessionId) {
+          this.focusedSessionId = undefined;
+        }
         this.activeSessions.delete(sessionId);
         this.activitySessionIds.delete(sessionId);
       }
@@ -437,6 +456,9 @@ export class NexusCore {
   private removeSerialProfileSessions(profileId: string): void {
     for (const [sessionId, session] of this.activeSerialSessions.entries()) {
       if (session.profileId === profileId) {
+        if (this.focusedSessionId === sessionId) {
+          this.focusedSessionId = undefined;
+        }
         this.activeSerialSessions.delete(sessionId);
         this.activitySessionIds.delete(sessionId);
       }

@@ -137,7 +137,8 @@ describe("server terminal focus tracking", () => {
         remoteTunnels: [],
         explicitGroups: [],
         authProfiles: [],
-        activitySessionIds: new Set<string>()
+        activitySessionIds: new Set<string>(),
+        focusedSessionId: undefined
       })),
       registerSession: vi.fn(),
       unregisterSession: vi.fn(),

@@ -147,7 +147,8 @@ function setupHarness(options: {
     remoteTunnels: [],
     explicitGroups: [],
     authProfiles: options.authProfiles ?? [],
-    activitySessionIds: new Set()
+    activitySessionIds: new Set(),
+    focusedSessionId: undefined
   };
 
   const stopTunnel = vi.fn(async (activeTunnelId: string) => {

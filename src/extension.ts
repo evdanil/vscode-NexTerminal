@@ -627,20 +627,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const terminalActivityListener = vscode.window.onDidChangeActiveTerminal((terminal) => {
     ctx.focusedTerminal = terminal ?? undefined;
-    if (!terminal) {
-      return;
-    }
-    for (const [sessionId, t] of sessionTerminals) {
-      if (t === terminal) {
-        clearTrackedSessionActivity({ core, activityIndicators: ctx.activityIndicators }, sessionId);
-        return;
-      }
-    }
-    for (const [sessionId, entry] of serialTerminals) {
-      if (entry.terminal === terminal) {
-        clearTrackedSessionActivity({ core, activityIndicators: ctx.activityIndicators }, sessionId);
-        return;
-      }
+    const sessionId = resolveSessionForTerminal(terminal);
+    core.setFocusedSession(sessionId);
+    if (sessionId) {
+      clearTrackedSessionActivity({ core, activityIndicators: ctx.activityIndicators }, sessionId);
     }
   });
 
@@ -756,6 +746,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         activityIndicators: ctx.activityIndicators,
         onTerminalFocused: (terminal) => {
           ctx.focusedTerminal = terminal;
+          core.setFocusedSession(sessionId);
         }
       },
       sessionId,

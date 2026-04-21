@@ -150,7 +150,8 @@ describe("serial terminal focus tracking", () => {
         remoteTunnels: [],
         explicitGroups: [],
         authProfiles: [],
-        activitySessionIds: new Set<string>()
+        activitySessionIds: new Set<string>(),
+        focusedSessionId: undefined
       })),
       registerSerialSession: vi.fn(),
       unregisterSerialSession: vi.fn(),

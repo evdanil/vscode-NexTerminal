@@ -112,7 +112,8 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
-      activitySessionIds: new Set()
+      activitySessionIds: new Set(),
+      focusedSessionId: undefined
     });
 
     const target = new ServerTreeItem(makeServer(), false);
@@ -139,7 +140,8 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
-      activitySessionIds: new Set()
+      activitySessionIds: new Set(),
+      focusedSessionId: undefined
     });
 
     const target = new ServerTreeItem(makeServer(), false);
@@ -165,7 +167,8 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
-      activitySessionIds: new Set()
+      activitySessionIds: new Set(),
+      focusedSessionId: undefined
     });
 
     const target = new ServerTreeItem(makeServer(), false);
@@ -197,7 +200,8 @@ describe("NexusTreeProvider folder collapse state", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
-      activitySessionIds: new Set()
+      activitySessionIds: new Set(),
+      focusedSessionId: undefined
     });
     return provider;
   }
@@ -275,7 +279,8 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
-      activitySessionIds: new Set()
+      activitySessionIds: new Set(),
+      focusedSessionId: undefined
     });
 
     const rootChildren = provider.getChildren(undefined) as FolderTreeItem[];
@@ -311,7 +316,8 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
-      activitySessionIds: new Set()
+      activitySessionIds: new Set(),
+      focusedSessionId: undefined
     });
 
     const rootChildren = provider.getChildren(undefined) as FolderTreeItem[];
@@ -335,7 +341,8 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
-      activitySessionIds: new Set()
+      activitySessionIds: new Set(),
+      focusedSessionId: undefined
     });
 
     provider.setFilter("prod");
@@ -378,7 +385,8 @@ function emptySnapshot() {
     remoteTunnels: [] as any[],
     explicitGroups: [] as string[],
     authProfiles: [] as any[],
-    activitySessionIds: new Set()
+    activitySessionIds: new Set(),
+    focusedSessionId: undefined as string | undefined
   };
 }
 
@@ -761,5 +769,81 @@ describe("NexusTreeProvider session activity indicators", () => {
       title: "Focus Terminal",
       arguments: ["ss-1", "serial"]
     });
+  });
+
+  it("SessionTreeItem description is '▶ active' when isFocused is true", () => {
+    const session = { id: "sess-focused", serverId: "srv-1", terminalName: "bash", startedAt: 0 };
+    const item = new SessionTreeItem(session, false, true);
+    expect(item.description).toBe("▶ active");
+  });
+
+  it("SessionTreeItem description is 'active' when isFocused is false", () => {
+    const session = { id: "sess-1", serverId: "srv-1", terminalName: "bash", startedAt: 0 };
+    const item = new SessionTreeItem(session, false, false);
+    expect(item.description).toBe("active");
+  });
+
+  it("SerialSessionTreeItem description is '▶ active' when isFocused is true and connected", () => {
+    const session = { id: "ss-focused", profileId: "sp-1", terminalName: "serial", startedAt: 0 };
+    const item = new SerialSessionTreeItem(session, false, true);
+    expect(item.description).toBe("▶ active");
+  });
+
+  it("SerialSessionTreeItem description is '▶ waiting for port' when isFocused is true and waiting", () => {
+    const session = { id: "ss-focused", profileId: "sp-1", terminalName: "serial", startedAt: 0, status: "waiting" as const };
+    const item = new SerialSessionTreeItem(session, false, true);
+    expect(item.description).toBe("▶ waiting for port");
+  });
+
+  it("getChildren sets isFocused=true on the matching session", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer()],
+      activeSessions: [{ id: "sess-1", serverId: "srv-1", terminalName: "bash", startedAt: 0 }],
+      focusedSessionId: "sess-1"
+    });
+    const server = (provider.getChildren(undefined) as ServerTreeItem[]).find((c) => c instanceof ServerTreeItem)!;
+    const sessions = provider.getChildren(server) as SessionTreeItem[];
+    expect(sessions[0].description).toBe("▶ active");
+  });
+
+  it("getChildren sets isFocused=false on a non-focused session", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer()],
+      activeSessions: [{ id: "sess-1", serverId: "srv-1", terminalName: "bash", startedAt: 0 }],
+      focusedSessionId: "other-session"
+    });
+    const server = (provider.getChildren(undefined) as ServerTreeItem[]).find((c) => c instanceof ServerTreeItem)!;
+    const sessions = provider.getChildren(server) as SessionTreeItem[];
+    expect(sessions[0].description).toBe("active");
+  });
+
+  it("getChildren sets isFocused=true on the matching serial session", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      serialProfiles: [makeSerial()],
+      activeSerialSessions: [{ id: "ss-1", profileId: "sp-1", terminalName: "serial", startedAt: 0 }],
+      focusedSessionId: "ss-1"
+    });
+    const profile = (provider.getChildren(undefined) as SerialProfileTreeItem[]).find((c) => c instanceof SerialProfileTreeItem)!;
+    const sessions = provider.getChildren(profile) as SerialSessionTreeItem[];
+    expect(sessions[0].description).toBe("▶ active");
+  });
+
+  it("getChildren sets isFocused=false on a non-focused serial session", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      serialProfiles: [makeSerial()],
+      activeSerialSessions: [{ id: "ss-1", profileId: "sp-1", terminalName: "serial", startedAt: 0 }],
+      focusedSessionId: "other-session"
+    });
+    const profile = (provider.getChildren(undefined) as SerialProfileTreeItem[]).find((c) => c instanceof SerialProfileTreeItem)!;
+    const sessions = provider.getChildren(profile) as SerialSessionTreeItem[];
+    expect(sessions[0].description).toBe("active");
   });
 });

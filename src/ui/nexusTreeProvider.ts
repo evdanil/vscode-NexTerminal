@@ -61,11 +61,11 @@ export class ServerTreeItem extends vscode.TreeItem {
 }
 
 export class SessionTreeItem extends vscode.TreeItem {
-  public constructor(public readonly session: ActiveSession, hasActivity = false) {
+  public constructor(public readonly session: ActiveSession, hasActivity = false, isFocused = false) {
     super(session.terminalName, vscode.TreeItemCollapsibleState.None);
     this.id = `session:${session.id}`;
     this.contextValue = "nexus.sessionNode";
-    this.description = "active";
+    this.description = isFocused ? "▶ active" : "active";
     this.iconPath = new vscode.ThemeIcon(
       "terminal",
       hasActivity ? new vscode.ThemeColor("terminal.ansiYellow") : undefined
@@ -105,12 +105,14 @@ export class SerialProfileTreeItem extends vscode.TreeItem {
 }
 
 export class SerialSessionTreeItem extends vscode.TreeItem {
-  public constructor(public readonly session: ActiveSerialSession, hasActivity = false) {
+  public constructor(public readonly session: ActiveSerialSession, hasActivity = false, isFocused = false) {
     super(session.terminalName, vscode.TreeItemCollapsibleState.None);
     const status: SerialSessionStatus = session.status ?? "connected";
     this.id = `serial-session:${session.id}`;
     this.contextValue = "nexus.serialSessionNode";
-    this.description = status === "waiting" ? "waiting for port" : "active";
+    this.description = status === "waiting"
+      ? (isFocused ? "▶ waiting for port" : "waiting for port")
+      : (isFocused ? "▶ active" : "active");
     this.iconPath = new vscode.ThemeIcon(
       "terminal",
       hasActivity ? new vscode.ThemeColor("terminal.ansiYellow") : undefined
@@ -149,7 +151,8 @@ export class NexusTreeProvider
     remoteTunnels: [],
     explicitGroups: [],
     authProfiles: [],
-    activitySessionIds: new Set()
+    activitySessionIds: new Set(),
+    focusedSessionId: undefined
   };
 
   public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME];
@@ -242,12 +245,12 @@ export class NexusTreeProvider
     if (element instanceof ServerTreeItem) {
       return this.snapshot.activeSessions
         .filter((session) => session.serverId === element.server.id)
-        .map((session) => new SessionTreeItem(session, this.snapshot.activitySessionIds.has(session.id)));
+        .map((session) => new SessionTreeItem(session, this.snapshot.activitySessionIds.has(session.id), this.snapshot.focusedSessionId === session.id));
     }
     if (element instanceof SerialProfileTreeItem) {
       return this.snapshot.activeSerialSessions
         .filter((session) => session.profileId === element.profile.id)
-        .map((session) => new SerialSessionTreeItem(session, this.snapshot.activitySessionIds.has(session.id)));
+        .map((session) => new SerialSessionTreeItem(session, this.snapshot.activitySessionIds.has(session.id), this.snapshot.focusedSessionId === session.id));
     }
     return [];
   }

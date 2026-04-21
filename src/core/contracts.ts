@@ -33,6 +33,7 @@ export interface SessionSnapshot {
   explicitGroups: string[];
   authProfiles: AuthProfile[];
   activitySessionIds: ReadonlySet<string>;
+  focusedSessionId: string | undefined;
 }
 
 export interface TunnelRegistryStore {
