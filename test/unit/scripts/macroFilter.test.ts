@@ -35,21 +35,30 @@ vi.mock("vscode", () => ({
 
 import { MacroAutoTrigger } from "../../../src/services/macroAutoTrigger";
 import { ScriptMacroFilter } from "../../../src/services/scripts/scriptMacroFilter";
+import { InMemoryMacroStore } from "../../../src/storage/inMemoryMacroStore";
+import { setActiveMacroStore } from "../../../src/macroSettings";
+import type { TerminalMacro } from "../../../src/models/terminalMacro";
+
+let store: InMemoryMacroStore;
 
 function setConfig(macros: Array<Record<string, unknown>>): void {
   mockConfig = {
-    "nexus.terminal": { macros },
     "nexus.terminal.macros": { autoTrigger: true }
   };
+  void store.save(macros as TerminalMacro[]);
 }
 
 describe("MacroAutoTrigger + ScriptMacroFilter", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockConfig = {};
+    store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
     vi.useFakeTimers();
   });
 
   afterEach(() => {
+    setActiveMacroStore(undefined);
     vi.useRealTimers();
   });
 
