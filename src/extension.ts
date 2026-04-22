@@ -195,7 +195,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const noticeShown = context.globalState.get<boolean>("nexus.macros.migrationNoticeShown", false);
   if (absorbedCount > 0 && !noticeShown) {
     void vscode.window.showInformationMessage(
-      `Nexus moved ${absorbedCount} macro${absorbedCount === 1 ? "" : "s"} to secure storage. Any remaining nexus.terminal.macros blocks in your synced or shared settings.json can be deleted — they will be absorbed automatically on import.`,
+      `Nexus moved ${absorbedCount} macro${absorbedCount === 1 ? "" : "s"} to secure storage. Any remaining nexus.terminal.macros blocks in your synced or shared settings.json can be deleted — they will be absorbed automatically on next launch.`,
       "Dismiss",
       "Don't show again"
     ).then((choice) => {

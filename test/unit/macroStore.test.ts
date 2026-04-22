@@ -154,12 +154,13 @@ describe("VscodeMacroStore", () => {
     expect(secretBag.has("macro-secret-text-b")).toBe(false);
   });
 
-  it("clearAll clears globalState before secret vault entries", async () => {
-    const { context, stateBag, secretBag } = makeFakeContext();
+  it("clearAll order: MACROS_KEY first, then vault entries, then SECRET_IDS_KEY", async () => {
+    const { context } = makeFakeContext();
     const ops: string[] = [];
     const origUpdate = context.globalState.update.bind(context.globalState);
     context.globalState.update = async (k: string, v: unknown) => {
       if (k === "nexus.macros" && v === undefined) ops.push("state");
+      if (k === "nexus.macros.secretIds" && v === undefined) ops.push("secretIds");
       return origUpdate(k, v);
     };
     const origDelete = context.secrets.delete.bind(context.secrets);
@@ -174,10 +175,8 @@ describe("VscodeMacroStore", () => {
     ops.length = 0;
     await store.clearAll();
     expect(ops[0]).toBe("state");
-    expect(ops.slice(1)).toEqual(["secret"]);
-
-    void stateBag;
-    void secretBag;
+    expect(ops[1]).toBe("secret");
+    expect(ops[ops.length - 1]).toBe("secretIds");
   });
 
   it("clearAll sweeps orphan secret ids tracked in the index", async () => {
