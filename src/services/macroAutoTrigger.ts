@@ -3,6 +3,7 @@ import { createAnsiRegex } from "../utils/ansi";
 import { clamp } from "../utils/helpers";
 import type { TerminalMacro } from "../models/terminalMacro";
 import type { ScriptMacroFilter } from "./scripts/scriptMacroFilter";
+import { getMacros } from "../macroSettings";
 
 const MAX_INPUT_LENGTH = 8192;
 const MAX_BUFFER_LENGTH = 2048;
@@ -65,8 +66,7 @@ export class MacroAutoTrigger implements vscode.Disposable {
     const previousIntervalIndexes = new Set(
       this.rules.filter((rule) => rule.intervalMs !== undefined).map((rule) => rule.macroIndex)
     );
-    const macroConfig = vscode.workspace.getConfiguration("nexus.terminal");
-    const macros = macroConfig.get<TerminalMacro[]>("macros", []);
+    const macros = getMacros();
     const macrosConfig = vscode.workspace.getConfiguration("nexus.terminal.macros");
     this.enabled = macrosConfig.get<boolean>("autoTrigger", true);
     this.defaultCooldownMs = clampSeconds(

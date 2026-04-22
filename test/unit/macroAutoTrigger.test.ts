@@ -1,6 +1,10 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
+import { setActiveMacroStore } from "../../src/macroSettings";
+import type { TerminalMacro } from "../../src/models/terminalMacro";
 
 let mockConfig: Record<string, Record<string, unknown>> = {};
+let activeStore: InMemoryMacroStore;
 
 vi.mock("vscode", () => ({
   EventEmitter: class MockEventEmitter<T> {
@@ -44,9 +48,10 @@ function setConfig(
   macroSettings: Record<string, unknown> = {}
 ): void {
   mockConfig = {
-    "nexus.terminal": { macros },
     "nexus.terminal.macros": { autoTrigger, ...macroSettings }
   };
+  // Feed macros into the store synchronously (save is async but InMemoryMacroStore resolves immediately)
+  void activeStore.save(macros as TerminalMacro[]);
 }
 
 /** Flush deferred writeBack calls (setTimeout(fn, 0)). */
@@ -55,8 +60,11 @@ function flush(): void {
 }
 
 describe("MacroAutoTrigger", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockConfig = {};
+    activeStore = new InMemoryMacroStore();
+    await activeStore.initialize();
+    setActiveMacroStore(activeStore);
     vi.useFakeTimers();
   });
 
