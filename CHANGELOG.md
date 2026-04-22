@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.22] — 2026-04-22
+
+### Changed
+
+- **Connectivity-hub folder nesting raised from 4 to 10 levels.** Lets you mirror deeper organizational hierarchies (e.g. imports from MobaXterm / SecureCRT that previously got flattened). No data-model change; existing configs are unaffected. Note: at the deepest levels, indentation may crowd folder labels on narrow sidebars.
+
 ## [2.8.21] — 2026-04-22
 
 ### Security
