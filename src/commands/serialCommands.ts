@@ -394,6 +394,8 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
   const terminal = vscode.window.createTerminal({
     name: terminalName,
     pty,
+    iconPath: new vscode.ThemeIcon("plug"),
+    color: new vscode.ThemeColor("terminal.ansiCyan"),
     location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
   });
   terminalRef = terminal;
@@ -486,6 +488,8 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   const terminal = vscode.window.createTerminal({
     name: terminalName,
     pty,
+    iconPath: new vscode.ThemeIcon("sync"),
+    color: new vscode.ThemeColor("terminal.ansiCyan"),
     location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
   });
   terminalRef = terminal;

@@ -15,7 +15,8 @@ vi.mock("vscode", () => ({
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showQuickPick: vi.fn(),
     showInformationMessage: vi.fn(),
-    showErrorMessage: vi.fn()
+    showErrorMessage: vi.fn(),
+    createTerminal: vi.fn(() => ({ show: vi.fn(), dispose: vi.fn() }))
   },
   workspace: {
     getConfiguration: vi.fn(() => ({
@@ -56,6 +57,20 @@ vi.mock("vscode", () => ({
   }
 }));
 
+vi.mock("../../src/services/serial/serialPty", () => ({
+  SerialPty: vi.fn(() => ({}))
+}));
+
+vi.mock("../../src/services/serial/smartSerialPty", () => ({
+  SmartSerialPty: vi.fn(() => ({})),
+  normalizePortPath: vi.fn((p: string) => p)
+}));
+
+vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
+  createSessionTranscript: vi.fn(() => undefined)
+}));
+
+import * as vscode from "vscode";
 import { formValuesToSerial, registerSerialCommands } from "../../src/commands/serialCommands";
 
 describe("formValuesToSerial", () => {
@@ -254,5 +269,63 @@ describe("registerSerialCommands port collision", () => {
     expect(existingTerminal.show).toHaveBeenCalledTimes(1);
     expect(ctx.focusedTerminal).toBe(existingTerminal);
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("serial terminal tab visual differentiation", () => {
+  const baseProfile = {
+    id: "sp1",
+    name: "USB Console",
+    path: "COM3",
+    baudRate: 115200,
+    dataBits: 8,
+    stopBits: 1,
+    parity: "none",
+    rtscts: false
+  };
+
+  function makeSerialCtx() {
+    return {
+      core: { getSerialProfile: vi.fn(() => ({ ...baseProfile, mode: "standard" })), registerSerialSession: vi.fn(), markSessionActivity: vi.fn() },
+      serialSidecar: {} as any,
+      loggerFactory: { create: vi.fn() } as any,
+      macroAutoTrigger: { createObserver: vi.fn(() => ({})), bindObserverToSession: vi.fn() } as any,
+      sessionLogDir: "",
+      serialTerminals: new Map(),
+      highlighter: {} as any,
+      focusedTerminal: undefined,
+      activityIndicators: new Map(),
+      terminalRegistry: undefined
+    } as any;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it("creates standard serial terminal with plug icon and cyan color", async () => {
+    const ctx = makeSerialCtx();
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.connect")!("sp1");
+    expect(vscode.window.createTerminal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        iconPath: expect.objectContaining({ id: "plug" }),
+        color: expect.objectContaining({ id: "terminal.ansiCyan" })
+      })
+    );
+  });
+
+  it("creates smart-follow serial terminal with sync icon and cyan color", async () => {
+    const ctx = makeSerialCtx();
+    ctx.core.getSerialProfile = vi.fn(() => ({ ...baseProfile, mode: "smartFollow" }));
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.connect")!("sp1");
+    expect(vscode.window.createTerminal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        iconPath: expect.objectContaining({ id: "sync" }),
+        color: expect.objectContaining({ id: "terminal.ansiCyan" })
+      })
+    );
   });
 });

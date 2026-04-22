@@ -649,6 +649,8 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
       const terminal = vscode.window.createTerminal({
         name: terminalName,
         pty,
+        iconPath: new vscode.ThemeIcon("server"),
+        color: new vscode.ThemeColor("terminal.ansiCyan"),
         location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
       });
       terminalRef = terminal;

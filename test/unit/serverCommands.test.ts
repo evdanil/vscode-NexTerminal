@@ -25,6 +25,14 @@ vi.mock("../../src/services/ssh/deploySshKey", () => ({
   deployPublicKeyToRemote: vi.fn(async () => ({ alreadyDeployed: false }))
 }));
 
+vi.mock("../../src/services/ssh/sshPty", () => ({
+  SshPty: vi.fn(() => ({}))
+}));
+
+vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
+  createSessionTranscript: vi.fn(() => undefined)
+}));
+
 vi.mock("vscode", () => ({
   commands: {
     registerCommand: vi.fn((id: string, handler: (...args: unknown[]) => unknown) => {
@@ -39,7 +47,8 @@ vi.mock("vscode", () => ({
     showInformationMessage: vi.fn(),
     showInputBox: vi.fn(),
     showOpenDialog: vi.fn(),
-    withProgress: vi.fn()
+    withProgress: vi.fn(),
+    createTerminal: vi.fn(() => ({ show: vi.fn(), dispose: vi.fn() }))
   },
   workspace: {
     getConfiguration: vi.fn(() => ({
@@ -991,6 +1000,36 @@ describe("deploy key command", () => {
         id: "srv-1",
         authType: "key",
         keyPath: "/home/user/.ssh/id_custom"
+      })
+    );
+  });
+});
+
+describe("SSH terminal tab visual differentiation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  it("creates SSH terminal with server icon and cyan color", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+    (ctx as any).macroAutoTrigger = { createObserver: vi.fn(() => ({})), bindObserverToSession: vi.fn() };
+    (ctx as any).activityIndicators = new Map();
+    ctx.core.registerSession = vi.fn();
+
+    registerServerCommands(ctx);
+    const connectCmd = registeredCommands.get("nexus.server.connect");
+    expect(connectCmd).toBeDefined();
+
+    await connectCmd!("srv-1");
+
+    expect(vscode.window.createTerminal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        iconPath: expect.objectContaining({ id: "server" }),
+        color: expect.objectContaining({ id: "terminal.ansiCyan" })
       })
     );
   });
