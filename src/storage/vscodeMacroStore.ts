@@ -79,13 +79,18 @@ export class VscodeMacroStore implements MacroStore {
   }
 
   public async clearAll(): Promise<void> {
-    for (const m of this.resolved) {
-      if (m.id) {
-        await this.context.secrets.delete(macroSecretKey(m.id));
-      }
-    }
+    // Snapshot ids before wiping state — once globalState is cleared, `this.resolved`
+    // is authoritative and will not survive a reload.
+    const ids = this.resolved.map((m) => m.id).filter((v): v is string => Boolean(v));
+
+    // Clear state FIRST so a crash mid-sweep leaves nothing referencing the vault keys.
     await this.context.globalState.update(MACROS_KEY, undefined);
     this.resolved = [];
+
+    for (const id of ids) {
+      await this.context.secrets.delete(macroSecretKey(id));
+    }
+
     this.emit();
   }
 

@@ -153,4 +153,30 @@ describe("VscodeMacroStore", () => {
     expect(stateBag.has("nexus.macros")).toBe(false);
     expect(secretBag.has("macro-secret-text-b")).toBe(false);
   });
+
+  it("clearAll clears globalState before secret vault entries", async () => {
+    const { context, stateBag, secretBag } = makeFakeContext();
+    const ops: string[] = [];
+    const origUpdate = context.globalState.update.bind(context.globalState);
+    context.globalState.update = async (k: string, v: unknown) => {
+      if (k === "nexus.macros" && v === undefined) ops.push("state");
+      return origUpdate(k, v);
+    };
+    const origDelete = context.secrets.delete.bind(context.secrets);
+    context.secrets.delete = async (k: string) => {
+      if (k.startsWith("macro-secret-text-")) ops.push("secret");
+      return origDelete(k);
+    };
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+    await store.save([{ id: "x", name: "s", text: "v", secret: true }]);
+    ops.length = 0;
+    await store.clearAll();
+    expect(ops[0]).toBe("state");
+    expect(ops.slice(1)).toEqual(["secret"]);
+
+    void stateBag;
+    void secretBag;
+  });
 });
