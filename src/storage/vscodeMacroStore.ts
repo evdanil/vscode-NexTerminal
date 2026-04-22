@@ -96,18 +96,21 @@ export class VscodeMacroStore implements MacroStore {
     // is authoritative and will not survive a reload.
     const ids = this.resolved.map((m) => m.id).filter((v): v is string => Boolean(v));
 
-    // Clear state FIRST so a crash mid-sweep leaves nothing referencing the vault keys.
+    // Clear MACROS_KEY first so stale entries don't show as broken macros after crash.
     await this.context.globalState.update(MACROS_KEY, undefined);
     this.resolved = [];
 
     // Also read the persisted index to sweep any orphaned vault entries that
     // were left by a prior crash between vault-store and globalState-update.
     const indexedIds = this.context.globalState.get<string[]>(SECRET_IDS_KEY, []);
-    await this.context.globalState.update(SECRET_IDS_KEY, undefined);
+
+    // Delete vault entries FIRST (before clearing the index) so a crash between
+    // these two awaits leaves the index intact — next clearAll can still find orphans.
     const allIds = new Set([...ids, ...indexedIds]);
     for (const id of allIds) {
       await this.context.secrets.delete(macroSecretKey(id));
     }
+    await this.context.globalState.update(SECRET_IDS_KEY, undefined);
 
     this.emit();
   }
