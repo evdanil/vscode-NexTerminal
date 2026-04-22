@@ -23,6 +23,8 @@ import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
 import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
 import { MacroAutoTrigger } from "./services/macroAutoTrigger";
 import { TerminalHighlighter } from "./services/terminalHighlighter";
+import { VscodeMacroStore } from "./storage/vscodeMacroStore";
+import { setActiveMacroStore } from "./macroSettings";
 import { TunnelManager } from "./services/tunnel/tunnelManager";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { VscodeTunnelRegistryStore } from "./storage/vscodeTunnelRegistryStore";
@@ -182,6 +184,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     maxRotatedFiles
   });
   const secretVault = new VscodeSecretVault(context);
+
+  const macroStore = new VscodeMacroStore(context);
+  await macroStore.initialize();
+  setActiveMacroStore(macroStore);
+  context.subscriptions.push({ dispose: () => setActiveMacroStore(undefined) });
+
   const hostKeyVerifier = new VscodeHostKeyVerifier(context.globalState);
   const sshConnector = new Ssh2Connector(hostKeyVerifier, readSshConnectionOptions());
   const sshFactory = new SilentAuthSshFactory(
@@ -576,6 +584,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const macroAutoTriggerListener = macroAutoTrigger.onDidChange(() => {
     macroTreeProvider.refresh();
   });
+  const macroStoreSubscription = macroStore.onDidChange(() => {
+    macroAutoTrigger.reload();
+    updateMacroContext();
+    macroTreeProvider.refresh();
+  });
+  context.subscriptions.push({ dispose: macroStoreSubscription });
   await migrateMacroSlots();
   updateMacroContext();
   updatePassthroughContext();
@@ -767,10 +781,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   const configChangeListener = vscode.workspace.onDidChangeConfiguration((event) => {
-    if (event.affectsConfiguration("nexus.terminal.macros")) {
+    if (
+      event.affectsConfiguration("nexus.terminal.macros.autoTrigger") ||
+      event.affectsConfiguration("nexus.terminal.macros.defaultCooldown") ||
+      event.affectsConfiguration("nexus.terminal.macros.bufferLength")
+    ) {
       macroAutoTrigger.reload();
-      updateMacroContext();
-      macroTreeProvider.refresh();
     }
     if (event.affectsConfiguration("nexus.terminal.keyboardPassthrough") || event.affectsConfiguration("nexus.terminal.passthroughKeys")) {
       updatePassthroughContext();
