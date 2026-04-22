@@ -300,7 +300,7 @@ function keyOf(m: TerminalMacro): string {
  * and legacy (settings + name-matched secret blob) formats. Secret text is resolved from
  * `encryptedSecrets.secretMacros` when present.
  */
-function collectIncomingMacros(
+export function collectIncomingMacros(
   data: NexusConfigExport,
   decryptedSecrets?: Record<string, unknown>
 ): { macros: TerminalMacro[]; unresolvedCount: number } | undefined {

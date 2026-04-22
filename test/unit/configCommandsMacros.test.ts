@@ -23,11 +23,11 @@ vi.mock("vscode", () => ({
   Uri: { file: vi.fn((p: string) => ({ fsPath: p })) }
 }));
 
-import { sanitizeForSharing } from "../../src/commands/configCommands";
+import { sanitizeForSharing, collectIncomingMacros } from "../../src/commands/configCommands";
 import { encrypt } from "../../src/utils/configCrypto";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
-import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
+import { setActiveMacroStore } from "../../src/macroSettings";
 
 beforeEach(async () => {
   const store = new InMemoryMacroStore();
@@ -57,89 +57,83 @@ describe("sanitizeForSharing — macros", () => {
   });
 });
 
-describe("collectIncomingMacros (via import round-trips)", () => {
-  it("version 2 backup — import restores macros with secret text from id-keyed blobs", async () => {
-    const destStore = new InMemoryMacroStore();
-    await destStore.initialize();
-    setActiveMacroStore(destStore);
-
+describe("collectIncomingMacros (direct)", () => {
+  it("v2 with resolved secret — returns macro with text filled from id-keyed blob", () => {
     const secretId = "macro-sec-1";
-    const secrets = {
-      passwords: {},
-      passphrases: {},
+    const decryptedSecrets = {
       secretMacros: [{ id: secretId, text: "real-secret" }]
     };
-    const encryptedSecrets = encrypt(JSON.stringify(secrets), "pw");
-
-    // Simulate a version 2 backup payload that would be produced by exportBackup
     const payload = {
-      version: 2,
+      version: 2 as const,
+      exportedAt: "",
       macros: [
         { id: "m1", name: "Public", text: "echo hi" },
         { id: secretId, name: "Secret", text: "", secret: true }
-      ],
-      encryptedSecrets
+      ] as TerminalMacro[]
     };
 
-    // Manually invoke collectIncomingMacros logic by importing a version-2 payload
-    // through the macro handling code path. We test via the store interface.
-    // (Direct call is not exported, so we verify behavior via getMacros after import)
-    const { decrypt } = await import("../../src/utils/configCrypto");
-    const decryptedSecrets = JSON.parse(decrypt(encryptedSecrets, "pw")) as Record<string, unknown>;
-    const secretBlobs = (decryptedSecrets.secretMacros as Array<{ id?: string; text?: string }>);
-    const byId = new Map(secretBlobs.filter(b => b.id && b.text).map(b => [b.id!, b.text!]));
-    const resolved = (payload.macros as TerminalMacro[]).map<TerminalMacro>((m) => {
-      if (m.secret && m.id) {
-        return { ...m, text: byId.get(m.id) ?? "" };
-      }
-      return { ...m };
-    });
-    await destStore.save(resolved);
-
-    const stored = getMacros();
-    expect(stored.find(m => m.name === "Public")?.text).toBe("echo hi");
-    expect(stored.find(m => m.name === "Secret")?.text).toBe("real-secret");
+    const result = collectIncomingMacros(payload, decryptedSecrets);
+    expect(result).toBeDefined();
+    expect(result!.unresolvedCount).toBe(0);
+    expect(result!.macros.find(m => m.name === "Public")?.text).toBe("echo hi");
+    expect(result!.macros.find(m => m.name === "Secret")?.text).toBe("real-secret");
   });
 
-  it("version 1 backup — import reassembles secret text by name", async () => {
-    const destStore = new InMemoryMacroStore();
-    await destStore.initialize();
-    setActiveMacroStore(destStore);
-
-    const secrets = {
-      secretMacros: [{ name: "Legacy", text: "old-secret", secret: true }]
+  it("v2 with missing-id secret — increments unresolvedCount", () => {
+    const payload = {
+      version: 2 as const,
+      exportedAt: "",
+      macros: [
+        { id: "no-blob-id", name: "Ghost", text: "", secret: true }
+      ] as TerminalMacro[]
     };
-    const legacy: TerminalMacro[] = [
-      { name: "Public", text: "echo hello" },
-      { name: "Legacy", text: "", secret: true }
-    ];
-    // Simulate version 1 import: macros in settings + name-matched secret blob
-    const byName = new Map(
-      (secrets.secretMacros as Array<{ name?: string; text?: string }>)
-        .filter(b => b.name && b.text)
-        .map(b => [b.name!, b.text!])
-    );
-    const resolved = legacy.map<TerminalMacro>((m) => {
-      if (m.secret && m.name && byName.has(m.name)) {
-        return { ...m, text: byName.get(m.name)! };
-      }
-      return { ...m };
-    });
-    await destStore.save(resolved);
 
-    const stored = getMacros();
-    expect(stored.find(m => m.name === "Legacy")?.text).toBe("old-secret");
-    expect(stored.find(m => m.name === "Public")?.text).toBe("echo hello");
+    const result = collectIncomingMacros(payload, { secretMacros: [] });
+    expect(result).toBeDefined();
+    expect(result!.unresolvedCount).toBe(1);
+    expect(result!.macros[0].text).toBe("");
   });
 
-  it("secret text from version 2 backup reaches MacroStore correctly", async () => {
-    const destStore = new InMemoryMacroStore();
-    await destStore.initialize();
-    setActiveMacroStore(destStore);
+  it("v1 with name-matched secret blob — resolves text", () => {
+    const decryptedSecrets = {
+      secretMacros: [{ name: "Legacy", text: "old-secret" }]
+    };
+    const payload = {
+      version: 1 as const,
+      exportedAt: "",
+      servers: [] as import("../../src/models/config").ServerConfig[],
+      settings: {
+        "nexus.terminal.macros": [
+          { name: "Public", text: "echo hello" },
+          { name: "Legacy", text: "", secret: true }
+        ]
+      }
+    };
 
-    await destStore.save([{ id: "sec-id", name: "Pwd", text: "the-real-text", secret: true }]);
-    const stored = getMacros();
-    expect(stored[0].text).toBe("the-real-text");
-    expect(stored[0].secret).toBe(true);
+    const result = collectIncomingMacros(payload as Parameters<typeof collectIncomingMacros>[0], decryptedSecrets);
+    expect(result).toBeDefined();
+    expect(result!.unresolvedCount).toBe(0);
+    expect(result!.macros.find(m => m.name === "Legacy")?.text).toBe("old-secret");
+    expect(result!.macros.find(m => m.name === "Public")?.text).toBe("echo hello");
+  });
+
+  it("v1 with pre-strip cleartext — not counted as unresolved", () => {
+    // Pre-2.7.0 backups may carry cleartext in m.text even for secret macros.
+    // The best-effort resolution falls back to m.text, so unresolvedCount stays 0.
+    const payload = {
+      version: 1 as const,
+      exportedAt: "",
+      servers: [] as import("../../src/models/config").ServerConfig[],
+      settings: {
+        "nexus.terminal.macros": [
+          { name: "OldSecret", text: "cleartext-was-here", secret: true }
+        ]
+      }
+    };
+
+    const result = collectIncomingMacros(payload as Parameters<typeof collectIncomingMacros>[0], { secretMacros: [] });
+    expect(result).toBeDefined();
+    expect(result!.unresolvedCount).toBe(0);
+    expect(result!.macros[0].text).toBe("cleartext-was-here");
   });
 });
