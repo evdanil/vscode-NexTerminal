@@ -1,4 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
+import { setActiveMacroStore } from "../../src/macroSettings";
 
 vi.mock("vscode", () => {
   const EventEmitter = vi.fn().mockImplementation(() => {
@@ -35,6 +37,8 @@ vi.mock("vscode", () => {
 
 import { MacroTreeProvider, MacroTreeItem } from "../../src/ui/macroTreeProvider";
 import * as vscode from "vscode";
+
+let testStore: InMemoryMacroStore;
 
 describe("MacroTreeItem", () => {
   it("shows binding label when displayBinding is provided", () => {
@@ -168,28 +172,25 @@ describe("MacroTreeItem", () => {
 describe("MacroTreeProvider", () => {
   let provider: MacroTreeProvider;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    testStore = new InMemoryMacroStore();
+    await testStore.initialize();
+    setActiveMacroStore(testStore);
     provider = new MacroTreeProvider();
   });
 
   it("returns empty array when no macros configured", () => {
-    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-      get: vi.fn().mockReturnValue([])
-    } as unknown as vscode.WorkspaceConfiguration);
-
     const children = provider.getChildren();
     expect(children).toHaveLength(0);
   });
 
-  it("displays keybinding when macro has keybinding property", () => {
+  it("displays keybinding when macro has keybinding property", async () => {
     const macros = [
       { name: "Hello", text: "echo hello", keybinding: "alt+m" },
       { name: "World", text: "echo world" }
     ];
-    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-      get: vi.fn().mockReturnValue(macros)
-    } as unknown as vscode.WorkspaceConfiguration);
+    await testStore.save(macros);
 
     const children = provider.getChildren();
     expect(children).toHaveLength(2);
@@ -197,14 +198,12 @@ describe("MacroTreeProvider", () => {
     expect(children[1].label).toBe("World");
   });
 
-  it("displays legacy slot as alt+N binding", () => {
+  it("displays legacy slot as alt+N binding", async () => {
     const macros = [
       { name: "Hello", text: "echo hello", slot: 5 },
       { name: "World", text: "echo world" }
     ];
-    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-      get: vi.fn().mockReturnValue(macros)
-    } as unknown as vscode.WorkspaceConfiguration);
+    await testStore.save(macros);
 
     const children = provider.getChildren();
     expect(children).toHaveLength(2);
@@ -212,14 +211,12 @@ describe("MacroTreeProvider", () => {
     expect(children[1].label).toBe("World");
   });
 
-  it("shows no prefix when macros have no assigned shortcut", () => {
+  it("shows no prefix when macros have no assigned shortcut", async () => {
     const macros = [
       { name: "Hello", text: "echo hello" },
       { name: "World", text: "echo world" }
     ];
-    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-      get: vi.fn().mockReturnValue(macros)
-    } as unknown as vscode.WorkspaceConfiguration);
+    await testStore.save(macros);
 
     const children = provider.getChildren();
     expect(children).toHaveLength(2);
@@ -227,15 +224,13 @@ describe("MacroTreeProvider", () => {
     expect(children[1].label).toBe("World");
   });
 
-  it("mixed: once any macro has a keybinding, unassigned ones show no prefix", () => {
+  it("mixed: once any macro has a keybinding, unassigned ones show no prefix", async () => {
     const macros = [
       { name: "A", text: "a" },
       { name: "B", text: "b", keybinding: "alt+shift+3" },
       { name: "C", text: "c" }
     ];
-    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-      get: vi.fn().mockReturnValue(macros)
-    } as unknown as vscode.WorkspaceConfiguration);
+    await testStore.save(macros);
 
     const children = provider.getChildren();
     expect(children[0].label).toBe("A");
@@ -243,11 +238,9 @@ describe("MacroTreeProvider", () => {
     expect(children[2].label).toBe("C");
   });
 
-  it("unbound macros stay unprefixed even beyond ten entries", () => {
+  it("unbound macros stay unprefixed even beyond ten entries", async () => {
     const macros = Array.from({ length: 12 }, (_, i) => ({ name: `M${i}`, text: `t${i}` }));
-    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-      get: vi.fn().mockReturnValue(macros)
-    } as unknown as vscode.WorkspaceConfiguration);
+    await testStore.save(macros);
 
     const children = provider.getChildren();
     expect(children[0].label).toBe("M0");

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { bindingToDisplayLabel } from "../macroBindings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { TerminalMacro } from "../models/terminalMacro";
+import { getMacros } from "../macroSettings";
 
 export class MacroTreeItem extends vscode.TreeItem {
   public constructor(
@@ -61,9 +62,7 @@ export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem>
   }
 
   public getChildren(): MacroTreeItem[] {
-    const macros = vscode.workspace
-      .getConfiguration("nexus.terminal")
-      .get<TerminalMacro[]>("macros", []);
+    const macros = getMacros();
 
     return macros.map((macro, index) => {
       const displayBinding = getAssignedBinding(macro);
