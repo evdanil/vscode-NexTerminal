@@ -829,6 +829,34 @@ describe("share import", () => {
     // The tunnel's defaultServerId should point to the newly generated server ID
     expect(importedTunnel.defaultServerId).toBe(importedServer.id);
   });
+
+  it("v1 share import reads legacy macros from settings key", async () => {
+    const v1ShareData = {
+      version: 1,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [makeServer()],
+      tunnels: [],
+      serialProfiles: [],
+      settings: {
+        "nexus.terminal.macros": [{ name: "hello", text: "hi" }]
+      }
+    };
+
+    const shareImportStore = new InMemoryMacroStore();
+    await shareImportStore.initialize();
+    setActiveMacroStore(shareImportStore);
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/v1share.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(v1ShareData), "utf8"));
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const macros = shareImportStore.getAll();
+    expect(macros.map(m => m.name)).toContain("hello");
+    expect(macros.find(m => m.name === "hello")?.text).toBe("hi");
+  });
 });
 
 describe("import from MobaXterm command", () => {

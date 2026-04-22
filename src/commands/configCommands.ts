@@ -633,8 +633,15 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     }
 
     // Apply macros (share = non-secret only)
-    if (Array.isArray(data.macros) && data.macros.length > 0) {
-      const incoming = data.macros.filter((m) => !m.secret);
+    // v2 shape: top-level `data.macros` array
+    // v1 shape: macros under `data.settings["nexus.terminal.macros"]`
+    const rawMacros: TerminalMacro[] = Array.isArray(data.macros)
+      ? data.macros
+      : Array.isArray(data.settings?.["nexus.terminal.macros"])
+        ? (data.settings!["nexus.terminal.macros"] as TerminalMacro[])
+        : [];
+    if (rawMacros.length > 0) {
+      const incoming = rawMacros.filter((m) => !m.secret);
       const existing = getMacros();
       const existingByKey = new Set(existing.map(keyOf));
       const merged = [...existing];
