@@ -179,4 +179,21 @@ describe("VscodeMacroStore", () => {
     void stateBag;
     void secretBag;
   });
+
+  it("clearAll sweeps orphan secret ids tracked in the index", async () => {
+    const { context, secretBag } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+    await store.save([{ id: "live", name: "m", text: "v", secret: true }]);
+
+    // Simulate orphan from a crash: index has an extra id, vault has a stale entry
+    const index = [...(context.globalState.get<string[]>("nexus.macros.secretIds", []))];
+    index.push("orphan");
+    await context.globalState.update("nexus.macros.secretIds", index);
+    await context.secrets.store("macro-secret-text-orphan", "zombie");
+
+    await store.clearAll();
+    expect(secretBag.has("macro-secret-text-live")).toBe(false);
+    expect(secretBag.has("macro-secret-text-orphan")).toBe(false);
+  });
 });

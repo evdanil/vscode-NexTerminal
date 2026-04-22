@@ -5,6 +5,7 @@ import type { MacroStore, MacroStoreChangeListener } from "./macroStore";
 
 const MACROS_KEY = "nexus.macros";
 const MIGRATED_KEY = "nexus.macros.migrated";
+const SECRET_IDS_KEY = "nexus.macros.secretIds";
 const SECRET_PREFIX = "macro-secret-text-";
 
 export interface VscodeMacroStoreOptions {
@@ -69,6 +70,9 @@ export class VscodeMacroStore implements MacroStore {
     }
 
     await this.context.globalState.update(MACROS_KEY, onDisk);
+    // Maintain the persistent secret-id index alongside every save
+    const secretIds = normalized.filter((m) => m.secret && m.id).map((m) => m.id!);
+    await this.context.globalState.update(SECRET_IDS_KEY, secretIds);
     this.resolved = normalized;
     this.emit();
   }
@@ -87,7 +91,12 @@ export class VscodeMacroStore implements MacroStore {
     await this.context.globalState.update(MACROS_KEY, undefined);
     this.resolved = [];
 
-    for (const id of ids) {
+    // Also read the persisted index to sweep any orphaned vault entries that
+    // were left by a prior crash between vault-store and globalState-update.
+    const indexedIds = this.context.globalState.get<string[]>(SECRET_IDS_KEY, []);
+    await this.context.globalState.update(SECRET_IDS_KEY, undefined);
+    const allIds = new Set([...ids, ...indexedIds]);
+    for (const id of allIds) {
       await this.context.secrets.delete(macroSecretKey(id));
     }
 
@@ -112,6 +121,9 @@ export class VscodeMacroStore implements MacroStore {
       }
     }
     this.resolved = resolved;
+    // Rebuild the secret-id index from the resolved list to keep it consistent
+    const secretIds = resolved.filter((m) => m.secret && m.id).map((m) => m.id!);
+    await this.context.globalState.update(SECRET_IDS_KEY, secretIds.length > 0 ? secretIds : undefined);
   }
 
   /**
@@ -176,6 +188,9 @@ export class VscodeMacroStore implements MacroStore {
       }
     }
     await this.context.globalState.update(MACROS_KEY, onDisk);
+    // Keep the secret-id index in sync
+    const secretIds = assigned.filter((m) => m.secret && m.id).map((m) => m.id!);
+    await this.context.globalState.update(SECRET_IDS_KEY, secretIds);
   }
 }
 
