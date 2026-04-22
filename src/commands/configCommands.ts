@@ -463,7 +463,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     await vscode.workspace.fs.writeFile(uri, Buffer.from(json, "utf8"));
 
     const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + sanitized.authProfiles.length;
-    void vscode.window.showInformationMessage(`Exported ${count} profiles for sharing to ${uri.fsPath}`);
+    const excludedSecretCount = allMacros.filter((m) => m.secret).length;
+    const base = `Exported ${count} profiles for sharing to ${uri.fsPath}`;
+    const suffix = excludedSecretCount > 0
+      ? ` (${excludedSecretCount} secret macro${excludedSecretCount === 1 ? "" : "s"} excluded)`
+      : "";
+    void vscode.window.showInformationMessage(`${base}${suffix}.`);
   }
 
   async function importConfig(): Promise<void> {
