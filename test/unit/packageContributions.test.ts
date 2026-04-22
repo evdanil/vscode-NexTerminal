@@ -78,16 +78,12 @@ describe("package contributions", () => {
     expect(commands).not.toContain("nexus.macro.slot");
   });
 
-  it("includes secret property in macro schema", () => {
+  it("does not include nexus.terminal.macros in configuration schema (migrated to globalState)", () => {
     const cfg = packageJson.contributes.configuration;
-    const macroSchema = cfg?.properties?.["nexus.terminal.macros"];
-    expect(macroSchema).toBeDefined();
-    expect(macroSchema?.items?.properties?.secret).toBeDefined();
-    expect(macroSchema?.items?.properties?.secret?.type).toBe("boolean");
-    expect(macroSchema?.items?.properties?.triggerInitiallyDisabled).toBeDefined();
-    expect(macroSchema?.items?.properties?.triggerInitiallyDisabled?.type).toBe("boolean");
-    expect(macroSchema?.items?.properties?.triggerInterval).toBeDefined();
-    expect(macroSchema?.items?.properties?.triggerInterval?.type).toBe("number");
+    // macros are now stored in context.globalState + SecretStorage; no longer in settings.json
+    expect(cfg?.properties?.["nexus.terminal.macros"]).toBeUndefined();
+    // sub-key settings that control auto-trigger behaviour must still be present
+    expect(cfg?.properties?.["nexus.terminal.macros.autoTrigger"]).toBeDefined();
   });
 
   it("uses nexus.folder contextValue in folder menu when clauses", () => {
