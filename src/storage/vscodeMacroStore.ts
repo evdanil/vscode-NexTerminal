@@ -4,7 +4,6 @@ import type { TerminalMacro } from "../models/terminalMacro";
 import type { MacroStore, MacroStoreChangeListener } from "./macroStore";
 
 const MACROS_KEY = "nexus.macros";
-const MIGRATED_KEY = "nexus.macros.migrated";
 const SECRET_IDS_KEY = "nexus.macros.secretIds";
 const SECRET_PREFIX = "macro-secret-text-";
 
@@ -21,6 +20,7 @@ export class VscodeMacroStore implements MacroStore {
   private resolved: TerminalMacro[] = [];
   private readonly listeners = new Set<MacroStoreChangeListener>();
   private readonly runMigration: boolean;
+  private _lastAbsorbedCount = 0;
 
   public constructor(
     private readonly context: vscode.ExtensionContext,
@@ -30,10 +30,19 @@ export class VscodeMacroStore implements MacroStore {
   }
 
   public async initialize(): Promise<void> {
+    this._lastAbsorbedCount = 0;
     if (this.runMigration) {
-      await this.migrateFromSettingsIfNeeded();
+      await this.absorbLegacySettingsIfPresent();
     }
     await this.reloadFromState();
+  }
+
+  /**
+   * Returns the count of macros absorbed from legacy settings during the most recent
+   * `initialize()` call. Resets to 0 at the start of each `initialize()`.
+   */
+  public getLastAbsorbedCount(): number {
+    return this._lastAbsorbedCount;
   }
 
   public getAll(): TerminalMacro[] {
@@ -127,38 +136,46 @@ export class VscodeMacroStore implements MacroStore {
   }
 
   /**
-   * Absorb any `nexus.terminal.macros` present in VS Code settings (global / workspace / workspaceFolder)
-   * into the store, splitting secret text into the vault, and clear the legacy setting from every scope.
-   * Runs once per install (guarded by MIGRATED_KEY). Silent — no user prompts.
+   * On every activation, absorb any `nexus.terminal.macros` present in VS Code settings
+   * (global / workspace / workspaceFolder) into the store, splitting secret text into the
+   * vault, then clear the legacy setting from every scope.
+   *
+   * Naturally idempotent: dedupe by name|text|triggerPattern|keybinding, so a second run
+   * with the same values adds nothing. Handles Settings Sync replay — if the old setting
+   * syncs back with new entries, they get absorbed on next activation.
    *
    * Why: pre-migration, secret macros stored their `text` in cleartext in settings.json.
    */
-  private async migrateFromSettingsIfNeeded(): Promise<void> {
-    if (this.context.globalState.get<boolean>(MIGRATED_KEY, false)) return;
-
+  private async absorbLegacySettingsIfPresent(): Promise<void> {
     const config = vscode.workspace.getConfiguration("nexus.terminal");
     const inspect = config.inspect<TerminalMacro[]>("macros");
+    if (!inspect) return;
+
     const collected: TerminalMacro[] = [];
     const scopesToClear: vscode.ConfigurationTarget[] = [];
 
-    if (Array.isArray(inspect?.globalValue) && inspect.globalValue.length > 0) {
+    if (Array.isArray(inspect.globalValue) && inspect.globalValue.length > 0) {
       collected.push(...inspect.globalValue);
       scopesToClear.push(vscode.ConfigurationTarget.Global);
     }
-    if (Array.isArray(inspect?.workspaceValue) && inspect.workspaceValue.length > 0) {
+    if (Array.isArray(inspect.workspaceValue) && inspect.workspaceValue.length > 0) {
       collected.push(...inspect.workspaceValue);
       scopesToClear.push(vscode.ConfigurationTarget.Workspace);
     }
-    if (Array.isArray(inspect?.workspaceFolderValue) && inspect.workspaceFolderValue.length > 0) {
+    if (Array.isArray(inspect.workspaceFolderValue) && inspect.workspaceFolderValue.length > 0) {
       collected.push(...inspect.workspaceFolderValue);
       scopesToClear.push(vscode.ConfigurationTarget.WorkspaceFolder);
     }
 
-    if (collected.length > 0) {
-      const deduped = dedupeLegacyMacros(collected);
-      const existing = this.context.globalState.get<TerminalMacro[]>(MACROS_KEY, []);
-      const merged = [...existing, ...deduped];
-      await this.persistLegacyMigration(merged);
+    if (collected.length === 0) return; // Nothing to absorb
+
+    const deduped = dedupeLegacyMacros(collected);
+    const existing = this.context.globalState.get<TerminalMacro[]>(MACROS_KEY, []);
+    const existingKeys = new Set(existing.map(keyOfLegacy));
+    const toAdd = deduped.filter((m) => !existingKeys.has(keyOfLegacy(m)));
+    if (toAdd.length > 0) {
+      this._lastAbsorbedCount += toAdd.length;
+      await this.persistLegacyMigration([...existing, ...toAdd]);
     }
 
     for (const target of scopesToClear) {
@@ -168,8 +185,6 @@ export class VscodeMacroStore implements MacroStore {
         // Scope unavailable (e.g. no workspace open) — ignore.
       }
     }
-
-    await this.context.globalState.update(MIGRATED_KEY, true);
   }
 
   private async persistLegacyMigration(macros: TerminalMacro[]): Promise<void> {
@@ -194,12 +209,16 @@ export class VscodeMacroStore implements MacroStore {
   }
 }
 
+function keyOfLegacy(m: TerminalMacro): string {
+  return `${m.name ?? ""}|${m.text ?? ""}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}`;
+}
+
 /** Dedupe legacy macros by `name|text|triggerPattern|keybinding`. First occurrence wins. */
 function dedupeLegacyMacros(macros: TerminalMacro[]): TerminalMacro[] {
   const seen = new Set<string>();
   const out: TerminalMacro[] = [];
   for (const m of macros) {
-    const key = `${m.name ?? ""}|${m.text ?? ""}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}`;
+    const key = keyOfLegacy(m);
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(m);

@@ -92,7 +92,6 @@ describe("MacroStore legacy migration", () => {
     // Legacy setting cleared
     const legacy = (vscode.__getConfig("nexus.terminal") as { global: unknown }).global;
     expect(legacy).toBeUndefined();
-    expect(state.get("nexus.macros.migrated")).toBe(true);
   });
 
   it("merges macros from all three scopes with dedupe", async () => {
@@ -111,27 +110,30 @@ describe("MacroStore legacy migration", () => {
     expect(names).toEqual(["dup", "g-only", "w-only", "wf-only"]);
   });
 
-  it("is idempotent — second initialize does not re-migrate", async () => {
-    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
-    vscode.__setConfig("nexus.terminal", { global: [{ name: "a", text: "1" }] });
+  it("re-absorbs when legacy settings reappear after first migration", async () => {
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void; __getConfig: (s: string) => unknown };
+    vscode.__setConfig("nexus.terminal", { global: [{ name: "first", text: "a" }] });
     const { ctx } = makeCtx();
-    const store1 = new VscodeMacroStore(ctx);
-    await store1.initialize();
-    await store1.save([...store1.getAll(), { name: "manual", text: "2" }]);
+    let store = new VscodeMacroStore(ctx);
+    await store.initialize();
+    expect(store.getAll().map((m) => m.name)).toEqual(["first"]);
 
-    vscode.__setConfig("nexus.terminal", { global: [{ name: "zombie", text: "should-not-reappear" }] });
-    const store2 = new VscodeMacroStore(ctx);
-    await store2.initialize();
-    const names = store2.getAll().map((m) => m.name);
-    expect(names).toEqual(expect.arrayContaining(["a", "manual"]));
-    expect(names).not.toContain("zombie");
+    // Simulate Settings Sync replay bringing the old setting back with a NEW entry
+    vscode.__setConfig("nexus.terminal", { global: [{ name: "first", text: "a" }, { name: "synced-back", text: "b" }] });
+    store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    const names = store.getAll().map((m) => m.name).sort();
+    expect(names).toEqual(["first", "synced-back"]);
+
+    // And the legacy scope is cleared again
+    expect((vscode.__getConfig("nexus.terminal") as { global: unknown }).global).toBeUndefined();
   });
 
-  it("no legacy entries → migration is a no-op but marks the flag", async () => {
-    const { ctx, state } = makeCtx();
+  it("no legacy entries → migration is a no-op", async () => {
+    const { ctx } = makeCtx();
     const store = new VscodeMacroStore(ctx);
     await store.initialize();
     expect(store.getAll()).toEqual([]);
-    expect(state.get("nexus.macros.migrated")).toBe(true);
   });
 });
