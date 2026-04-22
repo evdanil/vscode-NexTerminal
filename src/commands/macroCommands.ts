@@ -353,6 +353,17 @@ export function registerMacroCommands(): vscode.Disposable[] {
       macro.text = text;
       await saveMacros(macros);
       void vscode.window.showInformationMessage(`Updated "${item.macro.name}" from clipboard.`);
+    }),
+
+    vscode.commands.registerCommand("nexus.macro.copyAllAsJson", async () => {
+      const macros = getMacros();
+      const sanitized = macros.map((m) => m.secret ? { ...m, text: "" } : m);
+      await vscode.env.clipboard.writeText(JSON.stringify(sanitized, null, 2));
+      const secretCount = macros.filter((m) => m.secret).length;
+      const suffix = secretCount > 0
+        ? ` (${secretCount} secret value${secretCount === 1 ? "" : "s"} redacted)`
+        : "";
+      void vscode.window.showInformationMessage(`Copied ${macros.length} macro${macros.length === 1 ? "" : "s"} to clipboard${suffix}.`);
     })
   ];
 }

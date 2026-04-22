@@ -458,6 +458,11 @@
         "icon": "$(clippy)"
       },
       {
+        "command": "nexus.macro.copyAllAsJson",
+        "title": "Nexus: Copy All Macros as JSON",
+        "category": "Nexus"
+      },
+      {
         "command": "nexus.files.browse",
         "title": "Browse Files",
         "icon": "$(remote-explorer)"
