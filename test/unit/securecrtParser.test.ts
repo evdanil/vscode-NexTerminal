@@ -4,6 +4,7 @@ import {
   parseSecureCrtDirectory,
   parseSecureCrtXmlExport
 } from "../../src/utils/securecrtParser";
+import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 
 describe("parseSecureCrtSessionFile", () => {
   it("parses a standard SSH2 session", () => {
@@ -139,7 +140,8 @@ D:"[SSH2] Port"=00000016
 S:"Hostname"=host.test
 D:"[SSH2] Port"=00000016
 `;
-    const result = parseSecureCrtSessionFile(content, "Test", "A/B/C/D/E");
+    const tooDeep = Array.from({ length: MAX_FOLDER_DEPTH + 1 }, (_, i) => `L${i}`).join("/");
+    const result = parseSecureCrtSessionFile(content, "Test", tooDeep);
     expect(result!.folder).toBe("");
   });
 

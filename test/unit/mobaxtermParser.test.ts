@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseIniSections, parseMobaxtermSessions } from "../../src/utils/mobaxtermParser";
+import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 
 describe("parseIniSections", () => {
   it("parses sections with entries", () => {
@@ -156,8 +157,9 @@ HugePort=#109#0%host.example.com%70000%user%%-1%
   });
 
   it("truncates folder deeper than max depth", () => {
+    const tooDeep = Array.from({ length: MAX_FOLDER_DEPTH + 1 }, (_, i) => `L${i}`).join("\\");
     const text = `[Bookmarks_1]
-SubRep=A\\B\\C\\D\\E
+SubRep=${tooDeep}
 ImgNum=42
 Deep=#109#0%deep.example.com%22%user%%-1%
 `;
