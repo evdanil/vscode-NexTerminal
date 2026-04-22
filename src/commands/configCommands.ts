@@ -303,7 +303,7 @@ function keyOf(m: TerminalMacro): string {
 function collectIncomingMacros(
   data: NexusConfigExport,
   decryptedSecrets?: Record<string, unknown>
-): TerminalMacro[] | undefined {
+): { macros: TerminalMacro[]; unresolvedCount: number } | undefined {
   // New format (version 2): top-level `macros` + id-keyed secret blobs
   if (Array.isArray(data.macros)) {
     const secretBlobs = (decryptedSecrets?.secretMacros as Array<{ id?: string; name?: string; text?: string }> | undefined) ?? [];
@@ -313,13 +313,16 @@ function collectIncomingMacros(
       if (blob.id && typeof blob.text === "string") byId.set(blob.id, blob.text);
       if (blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
     }
-    return data.macros.map<TerminalMacro>((m) => {
+    let unresolvedCount = 0;
+    const macros = data.macros.map<TerminalMacro>((m) => {
       if (m.secret) {
         const plain = (m.id && byId.get(m.id)) ?? (m.name && byName.get(m.name)) ?? "";
+        if (!plain) unresolvedCount++;
         return { ...m, text: plain };
       }
       return { ...m };
     });
+    return { macros, unresolvedCount };
   }
 
   // Legacy format (version 1): macros under `settings.nexus.terminal.macros`;
@@ -331,12 +334,15 @@ function collectIncomingMacros(
     for (const blob of secretBlobs) {
       if (blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
     }
-    return legacy.map<TerminalMacro>((m) => {
+    let unresolvedCount = 0;
+    const macros = legacy.map<TerminalMacro>((m) => {
       if (m.secret && m.name && byName.has(m.name)) {
         return { ...m, text: byName.get(m.name)! };
       }
+      if (m.secret) unresolvedCount++;
       return { ...m };
     });
+    return { macros, unresolvedCount };
   }
 
   return undefined;
@@ -748,8 +754,9 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     }
 
     // Apply macros from import payload
-    const incomingMacros = collectIncomingMacros(data, decryptedSecrets);
-    if (incomingMacros !== undefined) {
+    const incomingResult = collectIncomingMacros(data, decryptedSecrets);
+    if (incomingResult !== undefined) {
+      const { macros: incomingMacros, unresolvedCount } = incomingResult;
       if (mode === "replace") {
         await saveMacros(incomingMacros);
       } else {
@@ -761,6 +768,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           merged.push({ ...m, id: m.id ?? randomUUID() });
         }
         await saveMacros(merged);
+      }
+      if (unresolvedCount > 0) {
+        void vscode.window.showWarningMessage(
+          `${unresolvedCount} secret macro${unresolvedCount === 1 ? "" : "s"} could not be decrypted from this backup. Their entries were imported but the secret text is missing — edit them to restore the value.`
+        );
       }
     }
 
