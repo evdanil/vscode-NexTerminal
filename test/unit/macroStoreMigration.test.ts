@@ -136,4 +136,19 @@ describe("MacroStore legacy migration", () => {
     await store.initialize();
     expect(store.getAll()).toEqual([]);
   });
+
+  it("does not duplicate secret macros when Settings Sync replays cleartext", async () => {
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    vscode.__setConfig("nexus.terminal", { global: [{ name: "pw", text: "hunter2", secret: true }] });
+    const { ctx } = makeCtx();
+    let store = new VscodeMacroStore(ctx);
+    await store.initialize();
+    expect(store.getAll().map((m) => m.name)).toEqual(["pw"]);
+
+    // Settings Sync replays the ORIGINAL cleartext back into settings (same name+secret)
+    vscode.__setConfig("nexus.terminal", { global: [{ name: "pw", text: "hunter2", secret: true }] });
+    store = new VscodeMacroStore(ctx);
+    await store.initialize();
+    expect(store.getAll().map((m) => m.name)).toEqual(["pw"]); // no duplicate
+  });
 });

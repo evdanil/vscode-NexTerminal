@@ -210,7 +210,8 @@ export class VscodeMacroStore implements MacroStore {
 }
 
 function keyOfLegacy(m: TerminalMacro): string {
-  return `${m.name ?? ""}|${m.text ?? ""}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}`;
+  const textKey = m.secret ? "__SECRET__" : (m.text ?? "");
+  return `${m.name ?? ""}|${textKey}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}`;
 }
 
 /** Dedupe legacy macros by `name|text|triggerPattern|keybinding`. First occurrence wins. */
