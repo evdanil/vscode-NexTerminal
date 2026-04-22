@@ -73,6 +73,8 @@ vi.mock("vscode", () => ({
 import { registerConfigCommands, isValidExport, SETTINGS_KEYS, sanitizeForSharing } from "../../src/commands/configCommands";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
+import { setActiveMacroStore } from "../../src/macroSettings";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 
@@ -156,6 +158,15 @@ function makeExportData(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// Set up a shared macro store for all tests in this file. The store must be
+// initialized before any test that triggers exportBackup or importMergeReplace,
+// both of which call getMacros()/saveMacros().
+beforeEach(async () => {
+  const store = new InMemoryMacroStore();
+  await store.initialize();
+  setActiveMacroStore(store);
+});
+
 describe("isValidExport", () => {
   it("accepts valid export data", () => {
     expect(isValidExport(makeExportData())).toBe(true);
@@ -175,7 +186,11 @@ describe("isValidExport", () => {
   });
 
   it("rejects wrong version", () => {
-    expect(isValidExport(makeExportData({ version: 2 }))).toBe(false);
+    expect(isValidExport(makeExportData({ version: 3 }))).toBe(false);
+  });
+
+  it("accepts version 2 exports", () => {
+    expect(isValidExport(makeExportData({ version: 2 }))).toBe(true);
   });
 
   it("rejects when no arrays are present", () => {
@@ -209,10 +224,12 @@ describe("isValidExport", () => {
 });
 
 describe("SETTINGS_KEYS", () => {
-  it("covers every contributed Nexus setting", () => {
+  it("covers every contributed Nexus setting (except macros array, which moved to MacroStore)", () => {
     const keys = new Set(SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`));
+    // nexus.terminal.macros (the array) is intentionally excluded — it now lives in MacroStore, not settings.
+    const INTENTIONALLY_EXCLUDED = new Set(["nexus.terminal.macros"]);
     const contributedKeys = Object.keys(packageJson.contributes?.configuration?.properties ?? {})
-      .filter((key) => key.startsWith("nexus."));
+      .filter((key) => key.startsWith("nexus.") && !INTENTIONALLY_EXCLUDED.has(key));
     expect(contributedKeys.filter((key) => !keys.has(key))).toEqual([]);
   });
 
@@ -221,7 +238,8 @@ describe("SETTINGS_KEYS", () => {
     expect(keys).toContain("nexus.terminal.openLocation");
     expect(keys).toContain("nexus.terminal.keyboardPassthrough");
     expect(keys).toContain("nexus.terminal.passthroughKeys");
-    expect(keys).toContain("nexus.terminal.macros");
+    // nexus.terminal.macros (array) intentionally not in SETTINGS_KEYS — moved to MacroStore
+    expect(keys).not.toContain("nexus.terminal.macros");
     expect(keys).toContain("nexus.terminal.highlighting.enabled");
     expect(keys).toContain("nexus.terminal.highlighting.rules");
   });
@@ -493,10 +511,14 @@ describe("share export command", () => {
     await core.addOrUpdateSerialProfile(makeSerialProfile());
     await core.addOrUpdateAuthProfile(makeAuthProfile({ authType: "key", keyPath: "/home/alice/.ssh/id_ed25519" }));
 
-    configStore.set("nexus.terminal.macros", [
+    // Set macros via MacroStore (not configStore)
+    const shareStore = new InMemoryMacroStore();
+    await shareStore.initialize();
+    await shareStore.save([
       { name: "Hello", text: "echo hi", secret: false, triggerPattern: "router#", triggerInterval: 10, triggerInitiallyDisabled: true },
       { name: "Secret", text: "super-secret", secret: true }
     ]);
+    setActiveMacroStore(shareStore);
     configStore.set("nexus.logging.sessionLogDirectory", "/home/alice/logs");
 
     const savedUri = { fsPath: "/fake/export.json", scheme: "file" };
@@ -510,6 +532,7 @@ describe("share export command", () => {
     const writtenData = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
 
     expect(writtenData.exportType).toBe("share");
+    expect(writtenData.version).toBe(2);
     expect(writtenData.servers).toHaveLength(1);
     expect(writtenData.servers[0].id).not.toBe("s1");
     expect(writtenData.servers[0].username).toBe("user");
@@ -526,12 +549,13 @@ describe("share export command", () => {
     // Auth profiles should NOT be in share exports
     expect(writtenData.authProfiles).toBeUndefined();
 
-    // Secret macros stripped
-    const macros = writtenData.settings["nexus.terminal.macros"];
-    expect(macros).toHaveLength(1);
-    expect(macros[0].name).toBe("Hello");
-    expect(macros[0].triggerInterval).toBe(10);
-    expect(macros[0].triggerInitiallyDisabled).toBe(true);
+    // Secret macros stripped — non-secret macros are in top-level macros array
+    expect(writtenData.macros).toHaveLength(1);
+    expect(writtenData.macros[0].name).toBe("Hello");
+    expect(writtenData.macros[0].triggerInterval).toBe(10);
+    expect(writtenData.macros[0].triggerInitiallyDisabled).toBe(true);
+    // Old settings key must not appear
+    expect(writtenData.settings?.["nexus.terminal.macros"]).toBeUndefined();
 
     // Session log dir stripped
     expect(writtenData.settings["nexus.logging.sessionLogDirectory"]).toBe("");
@@ -562,7 +586,7 @@ describe("backup export command", () => {
     registerConfigCommands(core, vault);
   });
 
-  it("exports with encrypted secrets and strips secret macro text from settings", async () => {
+  it("exports with encrypted secrets and strips secret macro text from top-level macros", async () => {
     await core.addOrUpdateServer(makeServer());
     await core.addOrUpdateAuthProfile(makeAuthProfile());
     await vault.store("password-s1", "mypassword");
@@ -570,10 +594,14 @@ describe("backup export command", () => {
     await vault.store("auth-profile-password-ap1", "profile-secret");
     await vault.store("auth-profile-passphrase-ap1", "profile-passphrase");
 
-    configStore.set("nexus.terminal.macros", [
+    // Set macros via MacroStore (not configStore)
+    const backupExportStore = new InMemoryMacroStore();
+    await backupExportStore.initialize();
+    await backupExportStore.save([
       { name: "Hello", text: "echo hi", secret: false },
       { name: "Secret", text: "super-secret", secret: true }
     ]);
+    setActiveMacroStore(backupExportStore);
 
     // First call: password entry, second: confirmation
     mockShowInputBox
@@ -591,6 +619,7 @@ describe("backup export command", () => {
     const writtenData = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
 
     expect(writtenData.exportType).toBe("backup");
+    expect(writtenData.version).toBe(2);
     expect(writtenData.encryptedSecrets).toBeDefined();
     expect(writtenData.encryptedSecrets.cipher).toBe("aes-256-gcm");
     expect(writtenData.authProfiles).toHaveLength(1);
@@ -601,14 +630,20 @@ describe("backup export command", () => {
     expect(decrypted.authProfilePasswords).toEqual({ ap1: "profile-secret" });
     expect(decrypted.authProfilePassphrases).toEqual({ ap1: "profile-passphrase" });
 
-    // Secret macro text should be stripped in the settings block
-    const macros = writtenData.settings["nexus.terminal.macros"];
-    const secretMacro = macros.find((m: { name: string }) => m.name === "Secret");
+    // Macros are in the top-level macros array; secret text stripped, real text in encryptedSecrets
+    expect(Array.isArray(writtenData.macros)).toBe(true);
+    const secretMacro = writtenData.macros.find((m: { name: string }) => m.name === "Secret");
     expect(secretMacro.text).toBe("");
 
     // Non-secret macros keep their text
-    const normalMacro = macros.find((m: { name: string }) => m.name === "Hello");
+    const normalMacro = writtenData.macros.find((m: { name: string }) => m.name === "Hello");
     expect(normalMacro.text).toBe("echo hi");
+
+    // Secret text in encrypted blob
+    const secretBlob = (decrypted.secretMacros as Array<{ id?: string; text?: string }>).find(
+      (b) => b.id === (secretMacro as { id?: string }).id
+    );
+    expect(secretBlob?.text).toBe("super-secret");
 
     // Original IDs preserved in backup
     expect(writtenData.servers[0].id).toBe("s1");
@@ -632,26 +667,39 @@ describe("backup import", () => {
 
   it("decrypts and restores passwords, passphrases, and secret macros", async () => {
     const { encrypt } = await import("../../src/utils/configCrypto");
+    // Use version 2 backup format: top-level macros array + id-keyed secret blobs
+    const helloId = "macro-hello-id";
+    const secretId = "macro-secret-id";
     const secrets = {
       passwords: { s1: "restored-pw" },
       passphrases: { s1: "restored-pp" },
       authProfilePasswords: { ap1: "restored-auth-pw" },
       authProfilePassphrases: { ap1: "restored-auth-pp" },
-      secretMacros: [{ name: "Secret", text: "super-secret", secret: true }]
+      secretMacros: [{ id: secretId, text: "super-secret" }]
     };
     const encrypted = encrypt(JSON.stringify(secrets), "testpass");
 
-    const exportData = makeExportData({
+    // Version 2 backup: macros at top level
+    const exportData = {
+      version: 2,
       exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [makeServer()],
+      tunnels: [makeTunnel()],
+      serialProfiles: [makeSerialProfile()],
       authProfiles: [makeAuthProfile()],
-      encryptedSecrets: encrypted,
-      settings: {
-        "nexus.terminal.macros": [
-          { name: "Hello", text: "echo hi", secret: false },
-          { name: "Secret", text: "", secret: true }
-        ]
-      }
-    });
+      macros: [
+        { id: helloId, name: "Hello", text: "echo hi", secret: false },
+        { id: secretId, name: "Secret", text: "", secret: true }
+      ],
+      settings: {},
+      encryptedSecrets: encrypted
+    };
+
+    // Backup import needs a fresh store
+    const importStore = new InMemoryMacroStore();
+    await importStore.initialize();
+    setActiveMacroStore(importStore);
 
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
     mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
@@ -667,8 +715,8 @@ describe("backup import", () => {
     expect(await vault.get("auth-profile-password-ap1")).toBe("restored-auth-pw");
     expect(await vault.get("auth-profile-passphrase-ap1")).toBe("restored-auth-pp");
 
-    // Secret macros merged back
-    const macros = configStore.get("nexus.terminal.macros") as Array<{ name: string; text: string; secret?: boolean }>;
+    // Secret macros restored via MacroStore
+    const macros = importStore.getAll();
     expect(macros).toBeDefined();
     const secretMacro = macros.find(m => m.name === "Secret");
     expect(secretMacro?.text).toBe("super-secret");
@@ -1121,14 +1169,14 @@ describe("sanitizeForSharing", () => {
     const tunnels = [makeTunnel({ defaultServerId: "s1" })];
     const serialProfiles = [makeSerialProfile({ deviceHint: { serialNumber: "ABC123", vendorId: "1111", productId: "2222" } })];
     const settings: Record<string, unknown> = {
-      "nexus.terminal.macros": [
-        { name: "public", text: "echo hi" },
-        { name: "secret", text: "password123", secret: true }
-      ],
       "nexus.logging.sessionLogDirectory": "/home/alice/logs"
     };
+    const macrosArg = [
+      { id: "m1", name: "public", text: "echo hi" },
+      { id: "m2", name: "secret", text: "password123", secret: true }
+    ];
 
-    const result = sanitizeForSharing(servers, tunnels, serialProfiles, settings);
+    const result = sanitizeForSharing(servers, tunnels, serialProfiles, settings, [], macrosArg);
 
     expect(result.servers[0].id).not.toBe("s1");
     expect(result.servers[0].username).toBe("user");
@@ -1140,9 +1188,11 @@ describe("sanitizeForSharing", () => {
     expect(result.serialProfiles[0].id).not.toBe("sp1");
     expect(result.serialProfiles[0].deviceHint).toBeUndefined();
 
-    const macros = result.settings["nexus.terminal.macros"] as Array<{ name: string }>;
-    expect(macros).toHaveLength(1);
-    expect(macros[0].name).toBe("public");
+    // Secret macros excluded from share; non-secret macros are in result.macros
+    expect(result.macros).toHaveLength(1);
+    expect(result.macros[0].name).toBe("public");
+    // The old settings key no longer carries macros
+    expect(result.settings["nexus.terminal.macros"]).toBeUndefined();
 
     expect(result.settings["nexus.logging.sessionLogDirectory"]).toBe("");
   });
@@ -1408,10 +1458,14 @@ describe("backup export round-trip", () => {
     await vault.store("auth-profile-password-ap1", "authpw");
     await vault.store("auth-profile-passphrase-ap1", "authpp");
 
-    configStore.set("nexus.terminal.macros", [
+    // Set macros in the active MacroStore (store is set up in top-level beforeEach)
+    const sourceStore = new InMemoryMacroStore();
+    await sourceStore.initialize();
+    await sourceStore.save([
       { name: "Public", text: "echo hi", triggerPattern: "[Pp]assword:\\s*$", triggerCooldown: 5, triggerInterval: 10, triggerInitiallyDisabled: true },
       { name: "Secret", text: "hidden", secret: true }
     ]);
+    setActiveMacroStore(sourceStore);
 
     registerConfigCommands(sourceCore, vault);
 
@@ -1430,10 +1484,19 @@ describe("backup export round-trip", () => {
     await backupCmd();
     expect(exportedJson).not.toBe("");
 
-    // Clear vault and config to simulate fresh install
+    // Parse exported JSON and verify macros are in top-level macros array
+    const exportedParsed = JSON.parse(exportedJson);
+    expect(exportedParsed.version).toBe(2);
+    expect(Array.isArray(exportedParsed.macros)).toBe(true);
+
+    // Clear vault, config, and macro store to simulate fresh install
     vault.clear();
     configStore.clear();
     registeredCommands.clear();
+
+    const destStore = new InMemoryMacroStore();
+    await destStore.initialize();
+    setActiveMacroStore(destStore);
 
     const destRepo = new InMemoryConfigRepository();
     const destCore = new NexusCore(destRepo);
@@ -1456,9 +1519,8 @@ describe("backup export round-trip", () => {
     expect(await vault.get("auth-profile-password-ap1")).toBe("authpw");
     expect(await vault.get("auth-profile-passphrase-ap1")).toBe("authpp");
 
-    // Secret macros restored
-    const macros = configStore.get("nexus.terminal.macros") as Array<{ name: string; text: string; secret?: boolean }>;
-    expect(macros).toBeDefined();
+    // Secret macros restored via MacroStore
+    const macros = destStore.getAll();
     expect(macros.find(m => m.name === "Secret")?.text).toBe("hidden");
     expect(macros.find(m => m.name === "Public")?.text).toBe("echo hi");
     expect(macros.find(m => m.name === "Public")?.triggerPattern).toBe("[Pp]assword:\\s*$");

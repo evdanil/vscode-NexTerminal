@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
+import type { TerminalMacro } from "../models/terminalMacro";
 import type { SecretVault } from "../services/ssh/contracts";
 import {
   passwordSecretKey,
@@ -21,6 +22,7 @@ import {
 } from "../utils/securecrtParser";
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
+import { getMacros, saveMacros, getActiveMacroStore } from "../macroSettings";
 
 interface MacroEntry {
   name?: string;
@@ -35,7 +37,7 @@ interface MacroEntry {
 }
 
 interface NexusConfigExport {
-  version: 1;
+  version: 1 | 2;
   exportType?: "backup" | "share";
   exportedAt: string;
   servers?: ServerConfig[];
@@ -43,6 +45,7 @@ interface NexusConfigExport {
   serialProfiles?: SerialProfile[];
   authProfiles?: AuthProfile[];
   groups?: string[];
+  macros?: TerminalMacro[]; // Non-secret fields; secret macros carry `text: ""`
   settings?: Record<string, unknown>;
   encryptedSecrets?: EncryptedPayload;
 }
@@ -58,7 +61,6 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.terminal", key: "openLocation" },
   { section: "nexus.terminal", key: "keyboardPassthrough" },
   { section: "nexus.terminal", key: "passthroughKeys" },
-  { section: "nexus.terminal", key: "macros" },
   { section: "nexus.terminal.macros", key: "autoTrigger" },
   { section: "nexus.terminal.highlighting", key: "enabled" },
   { section: "nexus.terminal.highlighting", key: "rules" },
@@ -103,15 +105,6 @@ function readSettings(): Record<string, unknown> {
   return result;
 }
 
-/** Strip secret macro text from settings to prevent plaintext leaks. */
-function stripSecretMacroText(settings: Record<string, unknown>): Record<string, unknown> {
-  const macros = settings["nexus.terminal.macros"];
-  if (!Array.isArray(macros)) return settings;
-  const cleaned = macros.map((m: MacroEntry) =>
-    m.secret ? { ...m, text: "" } : m
-  );
-  return { ...settings, "nexus.terminal.macros": cleaned };
-}
 
 async function applySettings(settings: Record<string, unknown>): Promise<void> {
   const allowedSettings: Record<string, unknown> = {};
@@ -172,7 +165,7 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
     return false;
   }
   const obj = data as Record<string, unknown>;
-  const profileArrayKeys = ["servers", "tunnels", "serialProfiles", "authProfiles"] as const;
+  const profileArrayKeys = ["servers", "tunnels", "serialProfiles", "authProfiles", "macros"] as const;
   for (const key of profileArrayKeys) {
     const value = obj[key];
     if (value !== undefined && !Array.isArray(value)) {
@@ -189,7 +182,7 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
     return false;
   }
   const hasProfileArrays = profileArrayKeys.some((key) => Array.isArray(obj[key]));
-  return obj.version === 1 && hasProfileArrays;
+  return (obj.version === 1 || obj.version === 2) && hasProfileArrays;
 }
 
 function ensureId(item: Record<string, unknown>): void {
@@ -203,6 +196,7 @@ interface SanitizedSnapshot {
   tunnels: TunnelProfile[];
   serialProfiles: SerialProfile[];
   authProfiles: AuthProfile[];
+  macros: TerminalMacro[];
   settings: Record<string, unknown>;
 }
 
@@ -227,7 +221,8 @@ export function sanitizeForSharing(
   tunnels: TunnelProfile[],
   serialProfiles: SerialProfile[],
   settings: Record<string, unknown>,
-  authProfiles: AuthProfile[] = []
+  authProfiles: AuthProfile[] = [],
+  macros: TerminalMacro[] = []
 ): SanitizedSnapshot {
   const idMap = new Map<string, string>();
 
@@ -274,14 +269,13 @@ export function sanitizeForSharing(
     return { ...p, id: newId, deviceHint: undefined };
   });
 
-  // Strip secret macros entirely and sanitize paths
+  const sanitizedMacros = macros
+    .filter((m) => !m.secret)
+    .map((m) => ({ ...m, id: randomUUID() })); // fresh ids for share exports
+
+  // Sanitize paths; strip any legacy nexus.terminal.macros key if present
   const sanitizedSettings = { ...settings };
-  const macros = sanitizedSettings["nexus.terminal.macros"];
-  if (Array.isArray(macros)) {
-    sanitizedSettings["nexus.terminal.macros"] = macros.filter(
-      (m: MacroEntry) => !m.secret
-    );
-  }
+  delete sanitizedSettings["nexus.terminal.macros"];
   if (sanitizedSettings["nexus.logging.sessionLogDirectory"]) {
     sanitizedSettings["nexus.logging.sessionLogDirectory"] = "";
   }
@@ -291,6 +285,7 @@ export function sanitizeForSharing(
     tunnels: newTunnels,
     serialProfiles: newSerialProfiles,
     authProfiles: newAuthProfiles,
+    macros: sanitizedMacros,
     settings: sanitizedSettings
   };
 }
@@ -367,16 +362,21 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
           if (pp) authProfilePassphrases[profile.id] = pp;
         }
 
-        // Collect secret macros
-        const macros = settings["nexus.terminal.macros"];
-        if (Array.isArray(macros)) {
-          secrets.secretMacros = macros.filter((m: MacroEntry) => m.secret);
-        }
+        // Collect all macros from the store
+        const allMacros = getMacros(); // resolved — secret text included
+        const nonSecretForTopLevel: TerminalMacro[] = allMacros.map((m) =>
+          m.secret ? { ...m, text: "" } : { ...m }
+        );
+        const secretMacroBlobs = allMacros
+          .filter((m) => m.secret && m.id)
+          .map((m) => ({ id: m.id!, text: m.text }));
+
+        secrets.secretMacros = secretMacroBlobs;
 
         const encryptedSecrets = encrypt(JSON.stringify(secrets), masterPassword);
 
         const exportData: NexusConfigExport = {
-          version: 1,
+          version: 2,
           exportType: "backup",
           exportedAt: new Date().toISOString(),
           servers: snapshot.servers,
@@ -384,7 +384,8 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
           serialProfiles: snapshot.serialProfiles,
           authProfiles: snapshot.authProfiles,
           groups: snapshot.explicitGroups,
-          settings: stripSecretMacroText(settings),
+          macros: nonSecretForTopLevel,
+          settings, // no longer contains nexus.terminal.macros
           encryptedSecrets
         };
 
@@ -407,17 +408,19 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
   async function exportShare(): Promise<void> {
     const snapshot = core.getSnapshot();
     const settings = readSettings();
+    const allMacros = getMacros();
 
     const sanitized = sanitizeForSharing(
       snapshot.servers,
       snapshot.tunnels,
       snapshot.serialProfiles,
       settings,
-      snapshot.authProfiles
+      snapshot.authProfiles,
+      allMacros
     );
 
     const exportData: NexusConfigExport = {
-      version: 1,
+      version: 2,
       exportType: "share",
       exportedAt: new Date().toISOString(),
       servers: sanitized.servers,
@@ -425,6 +428,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       serialProfiles: sanitized.serialProfiles,
       authProfiles: sanitized.authProfiles.length > 0 ? sanitized.authProfiles : undefined,
       groups: snapshot.explicitGroups,
+      macros: sanitized.macros.length > 0 ? sanitized.macros : undefined,
       settings: sanitized.settings
     };
 
