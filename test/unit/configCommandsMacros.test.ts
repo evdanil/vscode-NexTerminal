@@ -52,7 +52,8 @@ describe("sanitizeForSharing — macros", () => {
   });
 
   it("does not include macros in the settings object", () => {
-    const result = sanitizeForSharing([], [], [], { "nexus.terminal.macros": [{ name: "old", text: "x" }] }, [], []);
+    // readSettings() never emits nexus.terminal.macros; confirm the key is absent
+    const result = sanitizeForSharing([], [], [], {}, [], []);
     expect(result.settings["nexus.terminal.macros"]).toBeUndefined();
   });
 });

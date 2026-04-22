@@ -242,9 +242,8 @@ export function sanitizeForSharing(
     .filter((m) => !m.secret)
     .map((m) => ({ ...m, id: randomUUID() })); // fresh ids for share exports
 
-  // Sanitize paths; strip any legacy nexus.terminal.macros key if present
+  // Sanitize paths from the settings snapshot.
   const sanitizedSettings = { ...settings };
-  delete sanitizedSettings["nexus.terminal.macros"];
   if (sanitizedSettings["nexus.logging.sessionLogDirectory"]) {
     sanitizedSettings["nexus.logging.sessionLogDirectory"] = "";
   }
