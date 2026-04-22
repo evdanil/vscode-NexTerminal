@@ -336,10 +336,11 @@ export function collectIncomingMacros(
     }
     let unresolvedCount = 0;
     const macros = legacy.map<TerminalMacro>((m) => {
-      if (m.secret && m.name && byName.has(m.name)) {
-        return { ...m, text: byName.get(m.name)! };
+      if (m.secret) {
+        const plain = byName.get(m.name ?? "") ?? m.text ?? "";
+        if (plain === "") unresolvedCount++;
+        return { ...m, text: plain };
       }
-      if (m.secret) unresolvedCount++;
       return { ...m };
     });
     return { macros, unresolvedCount };
@@ -883,7 +884,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // Clear macros (globalState + vault entries)
     await getActiveMacroStore().clearAll();
     if (context) {
-      await context.globalState.update("nexus.macros.migrated", undefined);
+      await context.globalState.update("nexus.macros.migrationNoticeShown", undefined);
     }
 
     // Reset all settings to defaults
