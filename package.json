@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros with auto-trigger (expect/send), regex highlighting, unread activity indicators, color schemes, and configuration import/export.",
-  "version": "2.8.20",
+  "version": "2.8.21",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -2633,67 +2633,6 @@
           },
           "uniqueItems": true,
           "markdownDescription": "Which Ctrl+ key combinations to pass through when `#nexus.terminal.keyboardPassthrough#` is enabled. Each entry is a letter (e.g. `b` for Ctrl+B)."
-        },
-        "nexus.terminal.macros": {
-          "type": "array",
-          "default": [],
-          "order": 9,
-          "items": {
-            "type": "object",
-            "required": [
-              "name",
-              "text"
-            ],
-            "properties": {
-              "name": {
-                "type": "string",
-                "description": "Display name for the macro"
-              },
-              "text": {
-                "type": "string",
-                "description": "Text to send (use \\n for Enter)"
-              },
-              "keybinding": {
-                "type": "string",
-                "description": "Keyboard shortcut binding (e.g., \"alt+m\", \"alt+shift+5\", \"ctrl+shift+a\")."
-              },
-              "slot": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 9,
-                "description": "Deprecated. Use keybinding instead. Legacy slot (0-9) auto-migrates to keybinding on first load.",
-                "deprecationMessage": "Use keybinding instead. Slots are auto-migrated to keybinding on first load."
-              },
-              "secret": {
-                "type": "boolean",
-                "default": false,
-                "description": "Hide macro value in sidebar/pickers. Note: if the remote side echoes input, it can still appear in terminal output and transcripts."
-              },
-              "triggerPattern": {
-                "type": "string",
-                "description": "Regex to match against terminal output. When matched, this macro's text is auto-sent."
-              },
-              "triggerCooldown": {
-                "type": "number",
-                "default": 3,
-                "minimum": 0,
-                "maximum": 300,
-                "description": "Seconds between auto-triggers on the same terminal (default 3)."
-              },
-              "triggerInterval": {
-                "type": "number",
-                "minimum": 1,
-                "maximum": 86400,
-                "description": "Optional polling interval in seconds. Once the prompt matches again, the macro is armed and fires on this schedule without extra user input."
-              },
-              "triggerInitiallyDisabled": {
-                "type": "boolean",
-                "default": false,
-                "description": "Start this macro's auto-trigger paused until manually resumed from the Macros view."
-              }
-            }
-          },
-          "markdownDescription": "Terminal macros — predefined text sequences sent to the active terminal. Access via `Alt+S` quick pick or assign a `keybinding` (e.g., `alt+m`, `alt+shift+5`, `ctrl+shift+a`) to trigger directly. Supports Alt, Alt+Shift, and Ctrl+Shift modifier groups with A-Z and 0-9 keys. Add a `triggerPattern` to auto-send when terminal output matches (expect/send), and use `triggerInitiallyDisabled` to start a trigger paused until you enable it."
         },
         "nexus.terminal.macros.autoTrigger": {
           "type": "boolean",
