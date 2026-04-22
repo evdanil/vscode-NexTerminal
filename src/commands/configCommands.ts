@@ -113,40 +113,9 @@ async function applySettings(settings: Record<string, unknown>): Promise<void> {
       allowedSettings[fullKey] = value;
     }
   }
-
-  // Sanitize imported macro keybinding values
-  const macros = allowedSettings["nexus.terminal.macros"];
-  if (Array.isArray(macros)) {
-    allowedSettings["nexus.terminal.macros"] = (macros as MacroEntry[]).map((macro) => {
-      if (!macro || typeof macro !== "object") {
-        return macro;
-      }
-      const safeMacro = { ...macro };
-      if (safeMacro.keybinding && (typeof safeMacro.keybinding !== "string" || !isValidBinding(safeMacro.keybinding))) {
-        delete safeMacro.keybinding;
-      }
-      if (safeMacro.triggerPattern) {
-        try {
-          const re = new RegExp(safeMacro.triggerPattern);
-          if (re.test("")) delete safeMacro.triggerPattern;
-        } catch { delete safeMacro.triggerPattern; }
-      }
-      if (safeMacro.triggerCooldown !== undefined) {
-        if (typeof safeMacro.triggerCooldown !== "number" || safeMacro.triggerCooldown < 0 || safeMacro.triggerCooldown > 300) {
-          delete safeMacro.triggerCooldown;
-        }
-      }
-      if (safeMacro.triggerInterval !== undefined) {
-        if (typeof safeMacro.triggerInterval !== "number" || safeMacro.triggerInterval < 1 || safeMacro.triggerInterval > 86400) {
-          delete safeMacro.triggerInterval;
-        }
-      }
-      if (safeMacro.triggerInitiallyDisabled !== undefined && typeof safeMacro.triggerInitiallyDisabled !== "boolean") {
-        delete safeMacro.triggerInitiallyDisabled;
-      }
-      return safeMacro;
-    });
-  }
+  // nexus.terminal.macros (the array) is intentionally excluded from SETTINGS_KEYS
+  // — macros now live in MacroStore, not settings. The allowedSettings filter above
+  // will already exclude it, but delete explicitly in case any stale reference slips through.
 
   for (const [fullKey, value] of Object.entries(allowedSettings)) {
     const lastDot = fullKey.lastIndexOf(".");
@@ -322,7 +291,58 @@ async function promptDecryptPassword(): Promise<string | undefined> {
   });
 }
 
-export function registerConfigCommands(core: NexusCore, vault: SecretVault): vscode.Disposable[] {
+function keyOf(m: TerminalMacro): string {
+  return `${m.name}|${m.text}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}`;
+}
+
+/**
+ * Extract macros from an import payload, supporting both the new (top-level `macros`)
+ * and legacy (settings + name-matched secret blob) formats. Secret text is resolved from
+ * `encryptedSecrets.secretMacros` when present.
+ */
+function collectIncomingMacros(
+  data: NexusConfigExport,
+  decryptedSecrets?: Record<string, unknown>
+): TerminalMacro[] | undefined {
+  // New format (version 2): top-level `macros` + id-keyed secret blobs
+  if (Array.isArray(data.macros)) {
+    const secretBlobs = (decryptedSecrets?.secretMacros as Array<{ id?: string; name?: string; text?: string }> | undefined) ?? [];
+    const byId = new Map<string, string>();
+    const byName = new Map<string, string>();
+    for (const blob of secretBlobs) {
+      if (blob.id && typeof blob.text === "string") byId.set(blob.id, blob.text);
+      if (blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
+    }
+    return data.macros.map<TerminalMacro>((m) => {
+      if (m.secret) {
+        const plain = (m.id && byId.get(m.id)) ?? (m.name && byName.get(m.name)) ?? "";
+        return { ...m, text: plain };
+      }
+      return { ...m };
+    });
+  }
+
+  // Legacy format (version 1): macros under `settings.nexus.terminal.macros`;
+  // secret text carried separately by name.
+  const legacy = (data.settings?.["nexus.terminal.macros"] as TerminalMacro[] | undefined);
+  if (Array.isArray(legacy)) {
+    const secretBlobs = (decryptedSecrets?.secretMacros as Array<{ name?: string; text?: string; secret?: boolean }> | undefined) ?? [];
+    const byName = new Map<string, string>();
+    for (const blob of secretBlobs) {
+      if (blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
+    }
+    return legacy.map<TerminalMacro>((m) => {
+      if (m.secret && m.name && byName.has(m.name)) {
+        return { ...m, text: byName.get(m.name)! };
+      }
+      return { ...m };
+    });
+  }
+
+  return undefined;
+}
+
+export function registerConfigCommands(core: NexusCore, vault: SecretVault, context?: import("vscode").ExtensionContext): vscode.Disposable[] {
   async function exportBackup(): Promise<void> {
     const masterPassword = await promptMasterPassword();
     if (!masterPassword) return;
@@ -601,6 +621,21 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       await applySettings(data.settings);
     }
 
+    // Apply macros (share = non-secret only)
+    if (Array.isArray(data.macros) && data.macros.length > 0) {
+      const incoming = data.macros.filter((m) => !m.secret);
+      const existing = getMacros();
+      const existingByKey = new Set(existing.map(keyOf));
+      const merged = [...existing];
+      for (const m of incoming) {
+        const remapped: TerminalMacro = { ...m, id: randomUUID() };
+        if (!existingByKey.has(keyOf(remapped))) {
+          merged.push(remapped);
+        }
+      }
+      await saveMacros(merged);
+    }
+
     const skipNote = skipped > 0 ? ` (${skipped} skipped)` : "";
     void vscode.window.showInformationMessage(`Imported ${imported} profiles${skipNote}.`);
   }
@@ -707,34 +742,26 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       }
     }
 
+    // Apply macros from import payload
+    const incomingMacros = collectIncomingMacros(data, decryptedSecrets);
+    if (incomingMacros !== undefined) {
+      if (mode === "replace") {
+        await saveMacros(incomingMacros);
+      } else {
+        const existing = getMacros();
+        const existingIds = new Set(existing.map((m) => m.id).filter(Boolean) as string[]);
+        const merged = [...existing];
+        for (const m of incomingMacros) {
+          if (m.id && existingIds.has(m.id)) continue;
+          merged.push({ ...m, id: m.id ?? randomUUID() });
+        }
+        await saveMacros(merged);
+      }
+    }
+
     // Apply settings
     if (data.settings && typeof data.settings === "object") {
-      const settingsToApply = { ...data.settings };
-
-      // Merge secret macros from decrypted secrets back into settings
-      // Replace the stripped placeholder entries with the real secret macros
-      if (decryptedSecrets) {
-        const secretMacros = decryptedSecrets.secretMacros as MacroEntry[] | undefined;
-        if (Array.isArray(secretMacros) && secretMacros.length > 0) {
-          const currentMacros = (settingsToApply["nexus.terminal.macros"] as MacroEntry[] | undefined) ?? [];
-          const secretByName = new Map(secretMacros.map(m => [m.name, m]));
-          const merged = currentMacros.map(m => {
-            if (m.secret && m.name && secretByName.has(m.name)) {
-              const restored = secretByName.get(m.name)!;
-              secretByName.delete(m.name);
-              return restored;
-            }
-            return m;
-          });
-          // Append any secret macros not found in the settings block
-          for (const remaining of secretByName.values()) {
-            merged.push(remaining);
-          }
-          settingsToApply["nexus.terminal.macros"] = merged;
-        }
-      }
-
-      await applySettings(settingsToApply);
+      await applySettings(data.settings);
     }
 
     // Restore passwords/passphrases from decrypted secrets
@@ -829,9 +856,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault): vsc
       await core.removeExplicitGroup(group);
     }
 
-    // Clear macros
-    const termConfig = vscode.workspace.getConfiguration("nexus.terminal");
-    await termConfig.update("macros", undefined, vscode.ConfigurationTarget.Global);
+    // Clear macros (globalState + vault entries)
+    await getActiveMacroStore().clearAll();
+    if (context) {
+      await context.globalState.update("nexus.macros.migrated", undefined);
+    }
 
     // Reset all settings to defaults
     for (const { section, key } of SETTINGS_KEYS) {

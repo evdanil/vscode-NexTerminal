@@ -847,7 +847,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);
-  const configDisposables = registerConfigCommands(core, secretVault);
+  const configDisposables = registerConfigCommands(core, secretVault, context);
   const macroDisposables = registerMacroCommands();
   const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
