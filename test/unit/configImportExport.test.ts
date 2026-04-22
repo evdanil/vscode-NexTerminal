@@ -74,7 +74,8 @@ import { registerConfigCommands, isValidExport, SETTINGS_KEYS, sanitizeForSharin
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
-import { setActiveMacroStore } from "../../src/macroSettings";
+import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
+import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 
@@ -1365,6 +1366,55 @@ describe("complete reset", () => {
     await resetCmd();
 
     expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+
+  it("clears macro store and vault entries on reset", async () => {
+    // Use a VscodeMacroStore so we can verify vault cleanup
+    const stateMap = new Map<string, unknown>();
+    const secretMap = new Map<string, string>();
+    const fakeCtx = {
+      globalState: {
+        get<T>(k: string, fb: T): T { return (stateMap.get(k) as T) ?? fb; },
+        async update(k: string, v: unknown): Promise<void> {
+          if (v === undefined) stateMap.delete(k); else stateMap.set(k, v);
+        },
+        keys(): readonly string[] { return [...stateMap.keys()]; }
+      },
+      secrets: {
+        async get(k: string): Promise<string | undefined> { return secretMap.get(k); },
+        async store(k: string, v: string): Promise<void> { secretMap.set(k, v); },
+        async delete(k: string): Promise<void> { secretMap.delete(k); }
+      }
+    } as unknown as import("vscode").ExtensionContext;
+
+    const macroStore = new VscodeMacroStore(fakeCtx, { runLegacyMigration: false });
+    await macroStore.initialize();
+    await macroStore.save([{ id: "sec-id", name: "MySecret", text: "s3cr3t", secret: true }]);
+
+    // Confirm setup: macro is present and vault entry exists
+    expect(getMacros()).toHaveLength(0); // active store is still InMemoryMacroStore from beforeEach
+
+    // Switch the active store to our VscodeMacroStore
+    setActiveMacroStore(macroStore);
+    expect(getMacros().map(m => m.name)).toEqual(["MySecret"]);
+    expect(secretMap.has(macroSecretKey("sec-id"))).toBe(true);
+
+    // Wire up reset command with the context so migrationNoticeShown gets reset too
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    const resetRepo = new InMemoryConfigRepository();
+    const resetCore = new NexusCore(resetRepo);
+    await resetCore.initialize();
+    registerConfigCommands(resetCore, new MockVault(), fakeCtx);
+
+    mockShowWarningMessage.mockResolvedValue("Delete Everything");
+    mockShowInputBox.mockResolvedValue("DELETE");
+
+    const resetCmd = registeredCommands.get("nexus.config.completeReset")!;
+    await resetCmd();
+
+    expect(getMacros()).toEqual([]);
+    expect(secretMap.has(macroSecretKey("sec-id"))).toBe(false);
   });
 });
 
