@@ -190,6 +190,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   setActiveMacroStore(macroStore);
   context.subscriptions.push({ dispose: () => setActiveMacroStore(undefined) });
 
+  // One-time non-modal toast after the first legacy absorption (Settings Sync replay, etc.)
+  const absorbedCount = macroStore.getLastAbsorbedCount();
+  const noticeShown = context.globalState.get<boolean>("nexus.macros.migrationNoticeShown", false);
+  if (absorbedCount > 0 && !noticeShown) {
+    void vscode.window.showInformationMessage(
+      `Nexus moved ${absorbedCount} macro${absorbedCount === 1 ? "" : "s"} to secure storage. Any remaining nexus.terminal.macros blocks in your synced or shared settings.json can be deleted — they will be absorbed automatically on import.`,
+      "Dismiss",
+      "Don't show again"
+    ).then((choice) => {
+      if (choice === "Don't show again") {
+        void context.globalState.update("nexus.macros.migrationNoticeShown", true);
+      }
+    });
+  }
+
   const hostKeyVerifier = new VscodeHostKeyVerifier(context.globalState);
   const sshConnector = new Ssh2Connector(hostKeyVerifier, readSshConnectionOptions());
   const sshFactory = new SilentAuthSshFactory(
