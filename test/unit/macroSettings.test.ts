@@ -1,9 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const updateMock = vi.fn();
-let inspectValue: Record<string, unknown> | undefined;
-let macrosValue: unknown[] = [];
-
 vi.mock("vscode", () => ({
   ConfigurationTarget: {
     Global: "global",
@@ -11,32 +7,30 @@ vi.mock("vscode", () => ({
     WorkspaceFolder: "workspaceFolder"
   },
   workspace: {
-    getConfiguration: vi.fn(() => ({
-      get: vi.fn((_key: string, defaultValue?: unknown) => macrosValue ?? defaultValue),
-      inspect: vi.fn(() => inspectValue),
-      update: updateMock
-    }))
+    getConfiguration: vi.fn()
   },
   window: {
     showWarningMessage: vi.fn()
   }
 }));
 
-import * as vscode from "vscode";
 import {
-  saveMacros
+  saveMacros,
+  getMacros,
+  setActiveMacroStore
 } from "../../src/macroSettings";
 import {
   assignBinding,
   getAssignedBinding
 } from "../../src/macroBindingHelpers";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
+import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 
 describe("macroSettings", () => {
-  beforeEach(() => {
-    inspectValue = undefined;
-    macrosValue = [];
-    updateMock.mockReset();
+  beforeEach(async () => {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
   });
 
   it("prefers normalized keybinding over legacy slot", () => {
@@ -61,19 +55,19 @@ describe("macroSettings", () => {
     expect(macros[2].keybinding).toBe("alt+3");
   });
 
-  it("saveMacros preserves workspace scope when macros are defined there", async () => {
-    inspectValue = { workspaceValue: [{ name: "ws", text: "echo" }] };
-
+  it("saveMacros persists through MacroStore and getMacros retrieves them", async () => {
     await saveMacros([{ name: "new", text: "echo" }]);
-
-    expect(updateMock).toHaveBeenCalledWith("macros", [{ name: "new", text: "echo" }], vscode.ConfigurationTarget.Workspace);
+    const result = getMacros();
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe("new");
+    expect(result[0].text).toBe("echo");
   });
 
-  it("saveMacros defaults to global scope when no narrower value exists", async () => {
-    inspectValue = { globalValue: [{ name: "user", text: "echo" }] };
-
-    await saveMacros([{ name: "new", text: "echo" }]);
-
-    expect(updateMock).toHaveBeenCalledWith("macros", [{ name: "new", text: "echo" }], vscode.ConfigurationTarget.Global);
+  it("saveMacros with secret macro — secret text is preserved via store", async () => {
+    await saveMacros([{ name: "pwd", text: "classified", secret: true }]);
+    const result = getMacros();
+    expect(result).toHaveLength(1);
+    expect(result[0].text).toBe("classified");
+    expect(result[0].secret).toBe(true);
   });
 });

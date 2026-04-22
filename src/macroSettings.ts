@@ -6,28 +6,32 @@ import {
 } from "./macroBindings";
 import { normalizeBinding } from "./macroBindingHelpers";
 import type { TerminalMacro } from "./models/terminalMacro";
+import type { MacroStore } from "./storage/macroStore";
 
-function getMacroConfiguration(resource?: vscode.Uri): vscode.WorkspaceConfiguration {
-  return vscode.workspace.getConfiguration("nexus.terminal", resource);
+let activeStore: MacroStore | undefined;
+
+export function setActiveMacroStore(store: MacroStore | undefined): void {
+  activeStore = store;
 }
 
-export function getMacros(resource?: vscode.Uri): TerminalMacro[] {
-  return getMacroConfiguration(resource).get<TerminalMacro[]>("macros", []);
+export function getActiveMacroStore(): MacroStore {
+  if (!activeStore) {
+    throw new Error("MacroStore not initialized. Call setActiveMacroStore() during activation.");
+  }
+  return activeStore;
 }
 
-export function getMacroSettingsTarget(resource?: vscode.Uri): vscode.ConfigurationTarget {
-  const inspect = getMacroConfiguration(resource).inspect<TerminalMacro[]>("macros");
-  if (inspect?.workspaceFolderValue !== undefined) {
-    return vscode.ConfigurationTarget.WorkspaceFolder;
-  }
-  if (inspect?.workspaceValue !== undefined) {
-    return vscode.ConfigurationTarget.Workspace;
-  }
+export function getMacros(_resource?: vscode.Uri): TerminalMacro[] {
+  return getActiveMacroStore().getAll();
+}
+
+/** @deprecated Macros no longer live in settings.json — kept for signature compat with callers. */
+export function getMacroSettingsTarget(_resource?: vscode.Uri): vscode.ConfigurationTarget {
   return vscode.ConfigurationTarget.Global;
 }
 
-export async function saveMacros(macros: TerminalMacro[], resource?: vscode.Uri): Promise<void> {
-  await getMacroConfiguration(resource).update("macros", macros, getMacroSettingsTarget(resource));
+export async function saveMacros(macros: TerminalMacro[], _resource?: vscode.Uri): Promise<void> {
+  await getActiveMacroStore().save(macros);
 }
 
 export async function confirmBindingWarnings(binding: string): Promise<boolean> {
