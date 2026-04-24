@@ -7,7 +7,7 @@ import { registerServerCommands } from "./commands/serverCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
 import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import { TerminalRegistry } from "./services/terminal/terminalRegistry";
-import { sweepOrphanNexusTerminals } from "./services/terminal/orphanSweep";
+import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
@@ -173,18 +173,19 @@ function readSftpServiceConfig(): SftpServiceConfig {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  // Close tabs left behind by a previous extension host (window reload, update,
+  // Detect tabs left behind by a previous extension host (window reload, update,
   // disable-then-enable). The old host's PTY link to each tab is already dead;
-  // its `writeEmitter` events from deactivate would have lost the IPC flush
-  // race (microsoft/vscode#122825, #140697), so the tab is a frozen husk. Close
-  // them at the earliest possible point on the new host and surface a
-  // notification so the user knows why their sessions went away.
-  const orphans = sweepOrphanNexusTerminals(vscode.window.terminals);
+  // `writeEmitter` events from deactivate lose the IPC flush race
+  // (microsoft/vscode#122825, #140697), so the tab is a frozen husk. We do NOT
+  // close these tabs — the last-rendered content is often worth reviewing — but
+  // we do surface a one-time notification so the user knows the tabs will not
+  // respond to input and can close them at their leisure.
+  const orphans = detectOrphanNexusTerminals(vscode.window.terminals);
   if (orphans.count > 0) {
     const message =
       orphans.count === 1
-        ? "Nexus: 1 session was closed due to an extension reload or restart. Reconnect from the Connectivity Hub when ready."
-        : `Nexus: ${orphans.count} sessions were closed due to an extension reload or restart. Reconnect from the Connectivity Hub when ready.`;
+        ? "Nexus: 1 session disconnected after an extension reload or restart. The tab is frozen on its last output — close it manually when you are done reviewing. Reconnect from the Connectivity Hub when ready."
+        : `Nexus: ${orphans.count} sessions disconnected after an extension reload or restart. The tabs are frozen on their last output — close them manually when you are done reviewing. Reconnect from the Connectivity Hub when ready.`;
     void vscode.window.showInformationMessage(message);
   }
 
