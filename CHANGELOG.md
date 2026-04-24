@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.23] — 2026-04-24
+
+### Changed
+
+- **Live terminal tabs now print a farewell banner on extension reload / disable / update.** Previously SSH sessions silently hung in a dead tab and serial sessions were silently disposed when the extension host tore down. Every active SSH, Standard Serial, and Smart Follow tab now receives a final `[Nexus …] Nexus extension is shutting down. This session has been closed.` message, stays visible for transcript capture, and is marked `[Disconnected]` / `[Stopped]` in the tab title. Close the tab and reconnect from the Connectivity Hub to start a new session.
+
 ## [2.8.22] — 2026-04-22
 
 ### Changed
