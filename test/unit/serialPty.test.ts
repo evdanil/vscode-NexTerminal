@@ -327,4 +327,61 @@ describe("SerialPty", () => {
     expect(writes).toContain(CLEAR_VISIBLE_SCREEN);
     expect(writePort).not.toHaveBeenCalled();
   });
+
+  it("markShuttingDown() writes a farewell banner, keeps the tab open, and locks input", async () => {
+    const { transport, writePort, closePort } = createTransport();
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      callbacks,
+      logger as any
+    );
+    const writes: string[] = [];
+    pty.onDidWrite((s) => writes.push(s));
+    const closes: void[] = [];
+    pty.onDidClose(() => closes.push());
+    const nameChanges: string[] = [];
+    pty.onDidChangeName((n) => nameChanges.push(n));
+
+    pty.open();
+    await flushAsync();
+    writes.length = 0;
+
+    pty.markShuttingDown("Nexus extension is shutting down. This session has been closed.");
+
+    expect(writes.join("")).toContain("Nexus extension is shutting down");
+    expect(writes.join("")).toContain("Close this terminal and reopen the serial profile to reconnect.");
+    expect(nameChanges.at(-1)).toBe("Nexus Serial: COM9 [Disconnected]");
+    expect(closes).toHaveLength(0);
+    expect(callbacks.onSessionClosed).not.toHaveBeenCalled();
+
+    // Input after shutdown must not dispose or write to the transport.
+    pty.handleInput("x");
+    expect(closes).toHaveLength(0);
+    expect(writePort).not.toHaveBeenCalled();
+    expect(closePort).not.toHaveBeenCalled();
+  });
+
+  it("markShuttingDown() is idempotent", async () => {
+    const { transport } = createTransport();
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      callbacks,
+      logger as any
+    );
+    pty.open();
+    await flushAsync();
+    const writes: string[] = [];
+    pty.onDidWrite((s) => writes.push(s));
+
+    pty.markShuttingDown("reason");
+    const firstLen = writes.length;
+    pty.markShuttingDown("reason");
+    expect(writes.length).toBe(firstLen);
+  });
 });

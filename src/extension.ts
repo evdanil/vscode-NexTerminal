@@ -940,8 +940,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       dispose: () => {
         unsubscribeCore();
         unsubscribeTunnel();
-        for (const [, entry] of serialTerminals.entries()) {
-          entry.terminal.dispose();
+        const shutdownReason = "Nexus extension is shutting down. This session has been closed.";
+        const snapshot = core.getSnapshot();
+        for (const session of snapshot.activeSessions) {
+          try {
+            session.pty?.markShuttingDown(shutdownReason);
+          } catch (err) {
+            // One misbehaving PTY must not block the others from getting a banner.
+            console.error("[Nexus] markShuttingDown failed for SSH session", session.id, err);
+          }
+        }
+        for (const session of snapshot.activeSerialSessions) {
+          try {
+            session.pty?.markShuttingDown(shutdownReason);
+          } catch (err) {
+            console.error("[Nexus] markShuttingDown failed for serial session", session.id, err);
+          }
         }
         serialTerminals.clear();
         serialSidecar.dispose();

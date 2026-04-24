@@ -745,4 +745,54 @@ describe("SmartSerialPty", () => {
     expect(writes).toContain(CLEAR_VISIBLE_SCREEN);
     pty.dispose();
   });
+
+  it("markShuttingDown() keeps the tab open, stops polling, and suppresses onFatalError", async () => {
+    vi.useFakeTimers();
+    const { transport } = createTransport({
+      listPorts: async () => [{ path: "COM5", serialNumber: "ABC123" }],
+      openPort: async () => "session-1"
+    });
+    const harness = makeCallbacks();
+    const pty = new SmartSerialPty(transport, makeProfile(), harness.callbacks, noopLogger());
+    const writes: string[] = [];
+    pty.onDidWrite((s) => writes.push(s));
+    const closes: void[] = [];
+    pty.onDidClose(() => closes.push());
+
+    pty.open();
+    await flushAsync();
+    writes.length = 0;
+
+    pty.markShuttingDown("Nexus extension is shutting down. This session has been closed.");
+
+    expect(writes.join("")).toContain("Nexus extension is shutting down");
+    expect(writes.join("")).toContain("Close this terminal and reopen Smart Follow to reconnect.");
+    expect(closes).toHaveLength(0);
+    expect(harness.spies.onFatalError).not.toHaveBeenCalled();
+    expect(harness.spies.onTransportSessionChanged).toHaveBeenLastCalledWith(undefined);
+    expect(harness.spies.onActivePortChanged).toHaveBeenLastCalledWith(undefined);
+
+    // Polling must be halted — no further listPorts calls after shutdown.
+    const listCountBefore = (transport.listPorts as ReturnType<typeof vi.fn>).mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect((transport.listPorts as ReturnType<typeof vi.fn>).mock.calls.length).toBe(listCountBefore);
+  });
+
+  it("markShuttingDown() is idempotent", async () => {
+    const { transport } = createTransport({
+      listPorts: async () => [{ path: "COM5" }],
+      openPort: async () => "session-1"
+    });
+    const harness = makeCallbacks();
+    const pty = new SmartSerialPty(transport, makeProfile(), harness.callbacks, noopLogger());
+    pty.open();
+    await flushAsync();
+    const writes: string[] = [];
+    pty.onDidWrite((s) => writes.push(s));
+
+    pty.markShuttingDown("reason");
+    const firstLen = writes.length;
+    pty.markShuttingDown("reason");
+    expect(writes.length).toBe(firstLen);
+  });
 });

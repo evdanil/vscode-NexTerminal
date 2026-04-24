@@ -392,4 +392,65 @@ describe("SshPty", () => {
     expect(transportSpy).not.toHaveBeenCalled();
     pty.dispose();
   });
+
+  it("markShuttingDown() writes a farewell banner, tears down transport, and keeps the tab open", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => connection) };
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn(),
+      onDisconnected: vi.fn()
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    const writes: string[] = [];
+    pty.onDidWrite((s) => writes.push(s));
+    const closes: void[] = [];
+    pty.onDidClose(() => closes.push());
+    const nameChanges: string[] = [];
+    pty.onDidChangeName((n) => nameChanges.push(n));
+    const streamDestroySpy = vi.spyOn(stream, "destroy");
+
+    pty.open();
+    await flushAsync();
+    writes.length = 0;
+
+    pty.markShuttingDown("Nexus extension is shutting down. This session has been closed.");
+
+    expect(writes.join("")).toContain("Nexus extension is shutting down");
+    expect(writes.join("")).toContain("Close this terminal and start a new session to reconnect.");
+    expect(nameChanges.at(-1)).toBe("Nexus SSH: Server 1 [Disconnected]");
+    expect(streamDestroySpy).toHaveBeenCalled();
+    expect(connection.dispose).toHaveBeenCalled();
+    expect(closes).toHaveLength(0);
+    expect(callbacks.onSessionClosed).not.toHaveBeenCalled();
+
+    // Input after shutdown must not re-dispose the pty (would close the tab).
+    const writeSpyAfter = vi.spyOn(stream, "write");
+    pty.handleInput("R");
+    pty.handleInput("\r");
+    expect(writeSpyAfter).not.toHaveBeenCalled();
+    expect(closes).toHaveLength(0);
+  });
+
+  it("markShuttingDown() is idempotent and safe to call twice", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => connection) };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onDisconnected: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+
+    pty.open();
+    await flushAsync();
+
+    const writes: string[] = [];
+    pty.onDidWrite((s) => writes.push(s));
+
+    pty.markShuttingDown("shutdown reason");
+    const firstRoundLen = writes.length;
+    pty.markShuttingDown("shutdown reason");
+    expect(writes.length).toBe(firstRoundLen);
+  });
 });

@@ -91,7 +91,12 @@ export interface SerialProfile {
   deviceHint?: SerialDeviceHint;
 }
 
-/** Narrow handle exposed by SshPty / SmartSerialPty / SerialPty for consumers that observe session I/O. */
+/**
+ * Narrow runtime handle exposed by SshPty / SmartSerialPty / SerialPty. Consumers
+ * include the script runtime (observe I/O, write programmatically, lock input),
+ * terminal tab commands (reset screen), and the extension deactivate hook
+ * (flush a farewell banner before the host tears down).
+ */
 export interface SessionPtyHandle {
   addOutputObserver(observer: PtyOutputObserver): vscode.Disposable;
   setInputBlocked(blocked: boolean): void;
@@ -108,6 +113,13 @@ export interface SessionPtyHandle {
    * connected device remain untouched.
    */
   resetTerminal(): void;
+  /**
+   * Write a final farewell banner and tear down the transport while keeping the
+   * terminal tab visible. Used when the extension host is shutting down (reload,
+   * disable, update) so the user sees a clear message instead of a silently hung
+   * tab. Implementations MUST NOT fire `closeEmitter` or call `dispose()`.
+   */
+  markShuttingDown(reason: string): void;
 }
 
 export interface ActiveSession {

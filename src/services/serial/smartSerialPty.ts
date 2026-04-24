@@ -247,6 +247,33 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     });
   }
 
+  /**
+   * Mirrors most of {@link enterStopped} (sticky terminal, polling halted, state
+   * cleared) but diverges intentionally: no {@link SmartSerialPtyCallbacks.onFatalError}
+   * call — a modal error is noise while the extension is tearing down — and the
+   * banner text is shutdown-specific. Keep these two methods in sync when the
+   * sticky-stopped contract changes.
+   */
+  public markShuttingDown(reason: string): void {
+    if (this.disposed || this.stopped) {
+      return;
+    }
+    this.stopped = true;
+    this.stopPolling();
+    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
+    this.highlighterStream?.flush();
+    this.waiting = false;
+    this.currentPath = undefined;
+    this.transportSessionId = undefined;
+    this.activityIndicator = false;
+    this.callbacks.onTransportSessionChanged?.(undefined);
+    this.callbacks.onActivePortChanged?.(undefined);
+    this.nameEmitter.fire(this.buildDisplayName());
+    this.writeEmitter.fire(`\r\n\r\n[Nexus Smart Follow] ${reason}\r\n`);
+    this.writeEmitter.fire("[Nexus Smart Follow] Close this terminal and reopen Smart Follow to reconnect.\r\n");
+    this.logger.log(`marked shutting down: ${reason}`);
+  }
+
   public dispose(): void {
     if (this.disposed) {
       return;

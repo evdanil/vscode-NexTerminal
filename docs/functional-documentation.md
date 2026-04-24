@@ -140,6 +140,8 @@ Right-click any Nexus terminal tab (SSH, Standard Serial, or Smart Follow Serial
 
 After a session disconnects but before the terminal tab is closed, *Reset Terminal* and *Clear Scrollback* grey out (nothing to act against), while *Copy All to Clipboard* remains enabled so you can still capture the full transcript for a ticket or chat. All three commands are also discoverable from the Command Palette, gated on an active Nexus terminal.
 
+**Extension reload / disable / update.** When the VS Code window reloads, the extension is disabled, or Nexus is updated, every live SSH and serial tab stays visible and prints a final banner — `[Nexus SSH] Nexus extension is shutting down. This session has been closed.` (or the equivalent `[Nexus Serial]` / `[Nexus Smart Follow]` prefix) — with a hint to close the tab and reconnect. The tab becomes read-only: keystrokes and all three tab commands above no longer apply, because after reload a fresh extension instance does not own those zombie tabs. Close them to dismiss, then reconnect from the Connectivity Hub.
+
 **Capture-buffer semantics** (implementation notes that surface in edge cases):
 
 - The capture buffer is sized in **lines**, not bytes, matching the `terminal.integrated.scrollback` setting. A realistic interactive shell newline-terminates output promptly, so the retained size is well-bounded (~80 KB per session at the default 1000-line cap, 80-char average). A single never-terminated output (e.g., a raw binary paste with no `\n`) will accumulate in the pending-line fragment until a newline arrives or the terminal closes.

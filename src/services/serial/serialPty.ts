@@ -35,6 +35,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   private disposed = false;
   private disconnected = false;
   private failed = false;
+  private shuttingDown = false;
   private activityIndicator = false;
   private readonly highlighterStream?: TerminalHighlighterStream;
 
@@ -107,6 +108,9 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   }
 
   public handleInput(data: string): void {
+    if (this.shuttingDown) {
+      return;
+    }
     if (this.inputBlocked) {
       if (this.inputBlockNoticeArmed) {
         this.inputBlockNoticeArmed = false;
@@ -130,6 +134,22 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.writeEmitter.fire(`\r\n[Nexus Serial Error] ${message}\r\n`);
       }
     });
+  }
+
+  public markShuttingDown(reason: string): void {
+    if (this.disposed || this.shuttingDown) {
+      return;
+    }
+    this.shuttingDown = true;
+    this.disconnected = true;
+    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
+    this.highlighterStream?.flush();
+    this.releaseSubscriptions();
+    this.activityIndicator = false;
+    this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
+    this.writeEmitter.fire(`\r\n\r\n[Nexus Serial] ${reason}\r\n`);
+    this.writeEmitter.fire("[Nexus Serial] Close this terminal and reopen the serial profile to reconnect.\r\n");
+    this.logger.log(`marked shutting down: ${reason}`);
   }
 
   public dispose(): void {
