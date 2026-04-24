@@ -7,6 +7,7 @@ import { registerServerCommands } from "./commands/serverCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
 import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import { TerminalRegistry } from "./services/terminal/terminalRegistry";
+import { sweepOrphanNexusTerminals } from "./services/terminal/orphanSweep";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
@@ -172,6 +173,21 @@ function readSftpServiceConfig(): SftpServiceConfig {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // Close tabs left behind by a previous extension host (window reload, update,
+  // disable-then-enable). The old host's PTY link to each tab is already dead;
+  // its `writeEmitter` events from deactivate would have lost the IPC flush
+  // race (microsoft/vscode#122825, #140697), so the tab is a frozen husk. Close
+  // them at the earliest possible point on the new host and surface a
+  // notification so the user knows why their sessions went away.
+  const orphans = sweepOrphanNexusTerminals(vscode.window.terminals);
+  if (orphans.count > 0) {
+    const message =
+      orphans.count === 1
+        ? "Nexus: 1 session was closed due to an extension reload or restart. Reconnect from the Connectivity Hub when ready."
+        : `Nexus: ${orphans.count} sessions were closed due to an extension reload or restart. Reconnect from the Connectivity Hub when ready.`;
+    void vscode.window.showInformationMessage(message);
+  }
+
   const repository = new VscodeConfigRepository(context);
   const core = new NexusCore(repository);
   await core.initialize();
