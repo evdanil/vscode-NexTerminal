@@ -83,25 +83,20 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     this.assertNoCircularProxyChain(jumpServer, nextVisited);
     const jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited);
 
-    // Open a TCP tunnel through the jump host to the target
-    let tunnelStream: Duplex;
-    try {
-      tunnelStream = await jumpConnection.openDirectTcp(target.host, target.port);
-
+    // Each auth attempt gets its own TCP tunnel through the jump host.
+    const sockFactory = async (): Promise<Duplex> => {
+      const s = await jumpConnection.openDirectTcp(target.host, target.port);
       // Pause the tunnel stream to prevent the target's SSH banner from being
       // lost during the async gap before ssh2 attaches its data listeners
       // (vault password lookup, buildConnectConfig, etc.).
       // Same banner-loss issue as the SOCKS5 fix below (see connectViaSocks5).
-      tunnelStream.pause();
-    } catch (error) {
-      jumpConnection.dispose();
-      throw error;
-    }
+      s.pause();
+      return s;
+    };
 
-    // Connect to the target through the tunnel stream
     let targetConnection: SshConnection;
     try {
-      targetConnection = await this.authFactory.connect(target, { sock: tunnelStream });
+      targetConnection = await this.authFactory.connect(target, { sockFactory });
     } catch (error) {
       jumpConnection.dispose();
       throw error;
@@ -122,34 +117,46 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       ? await this.vault.get(proxyPasswordSecretKey(target.id))
       : undefined;
 
-    const { socket } = await SocksClient.createConnection({
-      proxy: {
-        host: proxy.host,
-        port: proxy.port,
-        type: 5,
-        ...(proxy.username && {
-          userId: proxy.username,
-          password: proxyPassword ?? ""
-        })
-      },
-      command: "connect",
-      destination: {
-        host: target.host,
-        port: target.port
-      },
-      timeout: this.proxyTimeoutMs
-    });
+    // Track the most recently opened socket so the ProxiedSshConnection wrapper
+    // can relay close events from whichever socket backed the successful attempt.
+    let lastSock: net.Socket | undefined;
 
-    // The socks library schedules setImmediate(() => socket.resume()) after the
-    // SOCKS5 handshake completes. If there's any async gap before ssh2 takes the
-    // socket (e.g., password lookup from SecretStorage), the premature resume causes
-    // the SSH server's banner data to be lost — no data listeners are attached yet,
-    // so flowing data is discarded, leading to "Timed out while waiting for handshake".
-    // Fix: wait for the deferred resume to fire, then re-pause so ssh2 can take over.
-    await new Promise<void>((r) => setImmediate(r));
-    socket.pause();
+    const sockFactory = async (): Promise<net.Socket> => {
+      const { socket } = await SocksClient.createConnection({
+        proxy: {
+          host: proxy.host,
+          port: proxy.port,
+          type: 5,
+          ...(proxy.username && {
+            userId: proxy.username,
+            password: proxyPassword ?? ""
+          })
+        },
+        command: "connect",
+        destination: {
+          host: target.host,
+          port: target.port
+        },
+        timeout: this.proxyTimeoutMs
+      });
 
-    return this.connectThroughSocket(target, socket);
+      // The socks library schedules setImmediate(() => socket.resume()) after the
+      // SOCKS5 handshake completes. If there's any async gap before ssh2 takes the
+      // socket (e.g., password lookup from SecretStorage), the premature resume causes
+      // the SSH server's banner data to be lost — no data listeners are attached yet,
+      // so flowing data is discarded, leading to "Timed out while waiting for handshake".
+      // Fix: wait for the deferred resume to fire, then re-pause so ssh2 can take over.
+      await new Promise<void>((r) => setImmediate(r));
+      socket.pause();
+
+      lastSock = socket;
+      return socket;
+    };
+
+    const connection = await this.authFactory.connect(target, { sockFactory });
+    // lastSock is guaranteed to be defined here: a successful authFactory.connect
+    // means sockFactory was called and resolved at least once.
+    return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
   }
 
   private async connectViaHttpConnect(
@@ -160,30 +167,27 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       ? await this.vault.get(proxyPasswordSecretKey(target.id))
       : undefined;
 
-    const socket = await this.httpConnectHandshake(
-      proxy.host,
-      proxy.port,
-      target.host,
-      target.port,
-      proxy.username,
-      proxyPassword
-    );
+    // Track the most recently opened socket so the ProxiedSshConnection wrapper
+    // can relay close events from whichever socket backed the successful attempt.
+    let lastSock: net.Socket | undefined;
 
-    return this.connectThroughSocket(target, socket);
-  }
+    const sockFactory = async (): Promise<net.Socket> => {
+      const socket = await this.httpConnectHandshake(
+        proxy.host,
+        proxy.port,
+        target.host,
+        target.port,
+        proxy.username,
+        proxyPassword
+      );
+      lastSock = socket;
+      return socket;
+    };
 
-  private async connectThroughSocket(
-    target: ServerConfig,
-    socket: net.Socket
-  ): Promise<SshConnection> {
-    let connection: SshConnection;
-    try {
-      connection = await this.authFactory.connect(target, { sock: socket });
-    } catch (error) {
-      socket.destroy();
-      throw error;
-    }
-    return new ProxiedSshConnection(connection, socketCleanup(socket), socketCloseRelay(socket));
+    const connection = await this.authFactory.connect(target, { sockFactory });
+    // lastSock is guaranteed to be defined here: a successful authFactory.connect
+    // means sockFactory was called and resolved at least once.
+    return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
   }
 
   private addToVisited(visited: ReadonlySet<string>, server: ServerConfig): Set<string> {

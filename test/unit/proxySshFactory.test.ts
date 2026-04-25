@@ -261,8 +261,13 @@ describe("ProxySshFactory", () => {
     servers = new Map();
     vault = createVault();
 
+    // The real SilentAuthSshFactory calls sockFactory() before each connect attempt.
+    // This minimal mock does the same so proxy tests exercise the full sockFactory path.
     authFactory = {
-      connect: vi.fn(async () => makeFakeConnection())
+      connect: vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+        await opts?.sockFactory?.();
+        return makeFakeConnection();
+      })
     };
   });
 
@@ -304,21 +309,23 @@ describe("ProxySshFactory", () => {
 
     const targetConn = makeFakeConnection();
 
-    authFactory.connect = vi.fn()
-      .mockResolvedValueOnce(jumpConn) // Connect to jump host
-      .mockResolvedValueOnce(targetConn); // Connect to target via tunnel
+    const results = [jumpConn, targetConn];
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return results.shift()!;
+    });
 
     const factory = await createFactory();
     const connection = await factory.connect(targetServer);
 
     // Should have connected to jump host first
     expect(authFactory.connect).toHaveBeenCalledWith(jumpServer);
-    // Then opened a TCP tunnel
+    // Then opened a TCP tunnel (via the sockFactory the mock called)
     expect(jumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
     // Stream should be paused to prevent banner data loss
     expect(tunnelStream.pause).toHaveBeenCalled();
-    // Then connected to target with sock
-    expect(authFactory.connect).toHaveBeenCalledWith(targetServer, { sock: tunnelStream });
+    // Then connected to target with a sockFactory (not a raw sock)
+    expect(authFactory.connect).toHaveBeenCalledWith(targetServer, { sockFactory: expect.any(Function) });
     // Result should be a ProxiedSshConnection
     expect(connection).toBeInstanceOf(ProxiedSshConnection);
   });
@@ -389,10 +396,13 @@ describe("ProxySshFactory", () => {
 
     const connA = makeFakeConnection();
 
-    authFactory.connect = vi.fn()
-      .mockResolvedValueOnce(connC)  // Connect to C (no proxy)
-      .mockResolvedValueOnce(connB)  // Connect to B via C
-      .mockResolvedValueOnce(connA); // Connect to A via B
+    // Each chained call also invokes sockFactory() to mirror real SilentAuthSshFactory
+    // behaviour — guards against a regression where a code path forgets to call the factory.
+    const results = [connC, connB, connA];
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return results.shift()!;
+    });
 
     const factory = await createFactory();
     const connection = await factory.connect(serverA);
@@ -413,9 +423,11 @@ describe("ProxySshFactory", () => {
     jumpConn.openDirectTcp = vi.fn(async () => tunnelStream);
     const targetConn = makeFakeConnection();
 
-    authFactory.connect = vi.fn()
-      .mockResolvedValueOnce(jumpConn)   // Pre-warm jump host pool entry
-      .mockResolvedValueOnce(targetConn); // Final target auth over tunnel
+    const results = [jumpConn, targetConn];
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return results.shift()!;
+    });
 
     const { pool } = await createPooledFactory();
     const jumpLease = await pool.connect(jumpServer);
@@ -423,7 +435,7 @@ describe("ProxySshFactory", () => {
 
     expect(authFactory.connect).toHaveBeenCalledTimes(2);
     expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, { sock: tunnelStream });
+    expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, { sockFactory: expect.any(Function) });
     expect(jumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
     targetLease.dispose();
@@ -459,10 +471,11 @@ describe("ProxySshFactory", () => {
 
     const connA = makeFakeConnection();
 
-    authFactory.connect = vi.fn()
-      .mockResolvedValueOnce(connC) // B pre-warm: connect to C
-      .mockResolvedValueOnce(connB) // B pre-warm: connect to B via C
-      .mockResolvedValueOnce(connA); // A connect: final target auth via B
+    const results = [connC, connB, connA];
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return results.shift()!;
+    });
 
     const { pool } = await createPooledFactory();
     const leaseB = await pool.connect(serverB);
@@ -496,9 +509,16 @@ describe("ProxySshFactory", () => {
     const jumpConn = makeFakeConnection();
     jumpConn.openDirectTcp = vi.fn(async () => ({ pause: vi.fn() } as unknown as Duplex));
 
-    authFactory.connect = vi.fn()
-      .mockResolvedValueOnce(jumpConn)
-      .mockRejectedValueOnce(new Error("Auth failed"));
+    let callCount = 0;
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      callCount++;
+      if (callCount === 1) {
+        return jumpConn; // jump host connection
+      }
+      // target connection: call sockFactory then throw auth error
+      await opts?.sockFactory?.();
+      throw new Error("Auth failed");
+    });
 
     const factory = await createFactory();
     await expect(factory.connect(targetServer)).rejects.toThrow("Auth failed");
@@ -515,7 +535,16 @@ describe("ProxySshFactory", () => {
     const jumpConn = makeFakeConnection();
     jumpConn.openDirectTcp = vi.fn(async () => { throw new Error("Connection refused"); });
 
-    authFactory.connect = vi.fn().mockResolvedValueOnce(jumpConn);
+    let callCount = 0;
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      callCount++;
+      if (callCount === 1) {
+        return jumpConn; // jump host connection
+      }
+      // target connection: sockFactory calls openDirectTcp which throws
+      await opts?.sockFactory?.();
+      return makeFakeConnection();
+    });
 
     const factory = await createFactory();
     await expect(factory.connect(targetServer)).rejects.toThrow("Connection refused");
@@ -560,10 +589,11 @@ describe("ProxySshFactory", () => {
     proxiedJumpConn.openDirectTcp = vi.fn(async () => tunnelStream);
     const targetConn = makeFakeConnection();
 
-    authFactory.connect = vi.fn()
-      .mockResolvedValueOnce(activeJumpConn)
-      .mockResolvedValueOnce(proxiedJumpConn)
-      .mockResolvedValueOnce(targetConn);
+    const results = [activeJumpConn, proxiedJumpConn, targetConn];
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return results.shift()!;
+    });
 
     const { pool } = await createPooledFactory();
     const activeJumpLease = await pool.connect(jumpServer);
@@ -572,7 +602,8 @@ describe("ProxySshFactory", () => {
     expect(authFactory.connect).toHaveBeenCalledTimes(3);
     expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
     expect(authFactory.connect).toHaveBeenNthCalledWith(2, jumpServer);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(3, targetServer, { sock: tunnelStream });
+    expect(authFactory.connect).toHaveBeenNthCalledWith(3, targetServer, { sockFactory: expect.any(Function) });
+    expect(proxiedJumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
     targetLease.dispose();
     activeJumpLease.dispose();
@@ -596,19 +627,33 @@ describe("ProxySshFactory", () => {
 
     const targetConn = makeFakeConnection();
 
-    authFactory.connect = vi.fn()
-      .mockResolvedValueOnce(pooledJumpConn)
-      .mockResolvedValueOnce(fallbackJumpConn)
-      .mockResolvedValueOnce(targetConn);
+    // The mock must assign connections by server, not by call order, because
+    // the fallback jump-host auth now happens INSIDE the sockFactory invocation
+    // triggered by the targetServer call — so call order is:
+    //   #1  authFactory.connect(jumpServer)        — initial pool warm-up → pooledJumpConn
+    //   #2  authFactory.connect(targetServer, {sockFactory})  — target auth begins
+    //         sockFactory() fires → openDirectTcp fails → fallback:
+    //   #3    authFactory.connect(jumpServer)       — fallback jump auth → fallbackJumpConn
+    //         sockFactory() resolves (uses fallbackJumpConn.openDirectTcp)
+    //   #2  resolves with targetConn
+    const connectionsByServer: Record<string, SshConnection[]> = {
+      "srv-jump": [pooledJumpConn, fallbackJumpConn],
+      "srv-target": [targetConn]
+    };
+    authFactory.connect = vi.fn(async (server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      const queue = connectionsByServer[server.id];
+      if (!queue || queue.length === 0) throw new Error(`Unexpected connect for ${server.id}`);
+      return queue.shift()!;
+    });
 
     const { pool } = await createPooledFactory();
     const jumpLease = await pool.connect(jumpServer);
     const targetLease = await pool.connect(targetServer);
 
     expect(authFactory.connect).toHaveBeenCalledTimes(3);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(2, jumpServer);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(3, targetServer, { sock: tunnelStream });
+    expect(authFactory.connect).toHaveBeenCalledWith(jumpServer);
+    expect(authFactory.connect).toHaveBeenCalledWith(targetServer, { sockFactory: expect.any(Function) });
     expect(fallbackJumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
     targetLease.dispose();
@@ -659,7 +704,9 @@ describe("ProxySshFactory", () => {
 
     await expect(promise).rejects.toThrow("HTTP CONNECT proxy response too large");
     expect(socket.destroy).toHaveBeenCalled();
-    expect(authFactory.connect).not.toHaveBeenCalled();
+    // authFactory.connect is called with sockFactory; the failure propagates through
+    // sockFactory() when the HTTP handshake inside it fails.
+    expect(authFactory.connect).toHaveBeenCalledTimes(1);
   });
 
   it("pushes back trailing HTTP CONNECT data so SSH banner is preserved", async () => {
@@ -687,7 +734,11 @@ describe("ProxySshFactory", () => {
     const socket = createMockHttpSocket();
     await mockNetCreateConnectionWithSocket(socket);
     const targetConn = makeFakeConnection();
-    authFactory.connect = vi.fn().mockResolvedValueOnce(targetConn);
+    // This mock must call sockFactory so the HTTP handshake fires and lastSock is set.
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return targetConn;
+    });
 
     const factory = await createFactory();
     const connection = await (async () => {
@@ -768,7 +819,11 @@ describe("ProxySshFactory", () => {
       }
     };
     const targetConn = makeFakeConnection();
-    authFactory.connect = vi.fn().mockResolvedValueOnce(targetConn);
+    // This mock must call sockFactory so the SOCKS5 handshake fires and lastSock is set.
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return targetConn;
+    });
 
     const socksMod = await import("socks");
     (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);

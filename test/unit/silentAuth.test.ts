@@ -272,3 +272,135 @@ describe("SilentAuthSshFactory", () => {
     );
   });
 });
+
+// Helper: a minimal Duplex mock with a destroy spy.
+function makeMockStream(): { destroy: ReturnType<typeof vi.fn> } & object {
+  return { destroy: vi.fn() };
+}
+
+describe("SilentAuthSshFactory sockFactory (proxy path)", () => {
+  // Test 1: password auth, saved password fails, prompted password succeeds.
+  // sockFactory called twice; first sock is destroyed, second is not.
+  it("password auth: saved pw fails, prompted pw succeeds — sockFactory called twice, first sock destroyed", async () => {
+    const firstSock = makeMockStream();
+    const secondSock = makeMockStream();
+    const socks = [firstSock, secondSock];
+    const sockFactory = vi.fn(async () => socks.shift() as any);
+
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("All configured authentication methods failed"))
+        .mockResolvedValueOnce(fakeConnection)
+    };
+    const vault = createVault({ [passwordSecretKey(baseServer.id)]: "bad-password" });
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "good-password", save: false }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+    const connection = await factory.connect(baseServer, { sockFactory });
+
+    expect(connection).toBe(fakeConnection);
+    expect(sockFactory).toHaveBeenCalledTimes(2);
+    // First sock should be destroyed after the failed attempt
+    expect(firstSock.destroy).toHaveBeenCalledOnce();
+    // Second sock backs the successful connection — must NOT be destroyed
+    expect(secondSock.destroy).not.toHaveBeenCalled();
+  });
+
+  // Test 2: password auth, saved password fails, prompted password also fails.
+  // sockFactory called twice; both socks are destroyed.
+  it("password auth: saved pw fails, prompted pw also fails — both socks destroyed", async () => {
+    const firstSock = makeMockStream();
+    const secondSock = makeMockStream();
+    const socks = [firstSock, secondSock];
+    const sockFactory = vi.fn(async () => socks.shift() as any);
+
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("All configured authentication methods failed"))
+        .mockRejectedValueOnce(new Error("authentication failed"))
+    };
+    const vault = createVault({ [passwordSecretKey(baseServer.id)]: "bad-password" });
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "also-bad", save: false }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+    await expect(factory.connect(baseServer, { sockFactory })).rejects.toThrow("authentication failed");
+
+    expect(sockFactory).toHaveBeenCalledTimes(2);
+    expect(firstSock.destroy).toHaveBeenCalledOnce();
+    expect(secondSock.destroy).toHaveBeenCalledOnce();
+  });
+
+  // Test 3: password auth, no saved password, prompted succeeds first try.
+  // sockFactory called exactly once; sock not destroyed.
+  it("password auth: no saved pw, prompted succeeds first try — sockFactory called once, sock kept", async () => {
+    const sock = makeMockStream();
+    const sockFactory = vi.fn(async () => sock as any);
+
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const vault = createVault(); // no saved password
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "first-try", save: false }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+    const connection = await factory.connect(baseServer, { sockFactory });
+
+    expect(connection).toBe(fakeConnection);
+    expect(sockFactory).toHaveBeenCalledTimes(1);
+    expect(sock.destroy).not.toHaveBeenCalled();
+  });
+
+  // Test 4: key auth, saved passphrase fails, prompted passphrase succeeds.
+  // sockFactory called twice; first sock destroyed, second kept.
+  it("key auth: saved passphrase fails, prompted passphrase succeeds — sockFactory called twice, first sock destroyed", async () => {
+    const keyServer: ServerConfig = { ...baseServer, authType: "key", keyPath: "/home/user/.ssh/id_rsa" };
+    const firstSock = makeMockStream();
+    const secondSock = makeMockStream();
+    const socks = [firstSock, secondSock];
+    const sockFactory = vi.fn(async () => socks.shift() as any);
+
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("Encrypted private key requires passphrase"))
+        .mockResolvedValueOnce(fakeConnection)
+    };
+    const vault = createVault({ [passphraseSecretKey(keyServer.id)]: "wrong-passphrase" });
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "correct-passphrase", save: false }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+    const connection = await factory.connect(keyServer, { sockFactory });
+
+    expect(connection).toBe(fakeConnection);
+    expect(sockFactory).toHaveBeenCalledTimes(2);
+    expect(firstSock.destroy).toHaveBeenCalledOnce();
+    expect(secondSock.destroy).not.toHaveBeenCalled();
+  });
+
+  // Test 5: no sockFactory provided (direct connection, no proxy).
+  // Connector is called without a sock; happy path unchanged.
+  it("no sockFactory provided — connector called without sock, happy path unchanged", async () => {
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const vault = createVault({ [passwordSecretKey(baseServer.id)]: "saved-pw" });
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+    const connection = await factory.connect(baseServer);
+
+    expect(connection).toBe(fakeConnection);
+    expect(connector.connect).toHaveBeenCalledWith(
+      baseServer,
+      expect.not.objectContaining({ sock: expect.anything() })
+    );
+    expect(prompt.prompt).not.toHaveBeenCalled();
+  });
+});
