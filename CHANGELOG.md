@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.26] — 2026-04-25
+
+### Fixed
+
+- **Password-expired retry through a jump host no longer hangs for 60 seconds.** When an SSH profile used a key-authenticated jump host with a password-authenticated end device, and the saved end-device password was wrong (e.g. expired), the prompted retry would silently hang for the full `ssh2.readyTimeout` (~60s) and any concurrent re-click would hang on the same promise. Root cause was reusing one tunnel stream across both the saved-credential and the prompted-retry SSH handshake — a stream can carry exactly one handshake before it's consumed. `SilentAuthSshFactory` now takes a `sockFactory: () => Promise<Duplex>` instead of a single `sock`, so every internal handshake attempt opens a fresh tunnel / SOCKS5 socket / HTTP CONNECT socket. Failed-attempt socks are explicitly destroyed. Same fix applies to SOCKS5 and HTTP CONNECT proxy paths.
+- **A transient credential-vault failure no longer tears down a successfully authenticated SSH session.** In the prompted-retry paths, `connector.connect()` and the post-success `vault.store` / `vault.delete` calls used to share a single try/catch whose catch destroyed the underlying socket. If `SecretStorage` glitched (locked OS keychain, race with another VS Code window) after the SSH handshake had already succeeded, the catch destroyed the sock that backed the live connection. The two stages are now split: connection establishment owns the sock-destroy-on-failure semantics; credential persistence is best-effort and logs failures to `console.error` while returning the live connection. The natural fallback for a missed save is being re-prompted next time, which is strictly better than dropping the session.
+
 ## [2.8.25] — 2026-04-24
 
 ### Fixed
