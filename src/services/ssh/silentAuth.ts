@@ -160,12 +160,29 @@ export class SilentAuthSshFactory implements SshFactory {
       }
 
       const secondSock = await options?.sockFactory?.();
+
+      // Stage A — establish connection. Narrow try scope so vault ops cannot
+      // trigger the catch that destroys the live sock.
+      let connection: SshConnection;
       try {
-        const connection = await this.connector.connect(resolved, {
+        connection = await this.connector.connect(resolved, {
           passphrase: promptResult.password,
           ...(handler && { onKeyboardInteractive: handler }),
           ...(secondSock && { sock: secondSock })
         });
+      } catch (error) {
+        secondSock?.destroy();
+        throw error;
+      }
+
+      // Stage B — persist credentials, best-effort. A transient SecretStorage
+      // failure must not destroy the live SSH connection the user just
+      // authenticated; the natural fallback is being re-prompted next time.
+      // Note: if the legacy vault.delete throws after the primary vault.store
+      // succeeded, the entire catch fires and Stage B is abandoned. That is
+      // acceptable — the legacy delete is cleanup of a stale key and missing
+      // it is not security-relevant.
+      try {
         if (promptResult.save) {
           await this.vault.store(passphraseKey, promptResult.password);
           if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
@@ -174,11 +191,15 @@ export class SilentAuthSshFactory implements SshFactory {
         } else {
           await this.vault.delete(passphraseKey);
         }
-        return connection;
-      } catch (error) {
-        secondSock?.destroy();
-        throw error;
+      } catch (vaultErr) {
+        console.error(
+          `[Nexus SSH] Could not ${promptResult.save ? "save" : "clear"} passphrase for ${server.name}; ` +
+            "the session is connected but credentials may not be persisted.",
+          vaultErr
+        );
       }
+
+      return connection;
     }
 
     if (resolved.authType !== "password") {
@@ -221,22 +242,39 @@ export class SilentAuthSshFactory implements SshFactory {
 
     const handler = this.buildKeyboardInteractiveHandler(promptResult.password);
     const secondSock = await options?.sockFactory?.();
+
+    // Stage A — establish connection. Narrow try scope so vault ops cannot
+    // trigger the catch that destroys the live sock.
+    let connection: SshConnection;
     try {
-      const connection = await this.connector.connect(resolved, {
+      connection = await this.connector.connect(resolved, {
         password: promptResult.password,
         ...(handler && { onKeyboardInteractive: handler }),
         ...(secondSock && { sock: secondSock })
       });
+    } catch (error) {
+      secondSock?.destroy();
+      throw error;
+    }
+
+    // Stage B — persist credentials, best-effort. A transient SecretStorage
+    // failure must not destroy the live SSH connection the user just
+    // authenticated; the natural fallback is being re-prompted next time.
+    try {
       if (promptResult.save) {
         await this.vault.store(passwordKey, promptResult.password);
       } else {
         await this.vault.delete(passwordKey);
       }
-      return connection;
-    } catch (error) {
-      secondSock?.destroy();
-      throw error;
+    } catch (vaultErr) {
+      console.error(
+        `[Nexus SSH] Could not ${promptResult.save ? "save" : "clear"} password for ${server.name}; ` +
+          "the session is connected but credentials may not be persisted.",
+        vaultErr
+      );
     }
+
+    return connection;
   }
 
 }

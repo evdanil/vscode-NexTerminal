@@ -404,3 +404,223 @@ describe("SilentAuthSshFactory sockFactory (proxy path)", () => {
     expect(prompt.prompt).not.toHaveBeenCalled();
   });
 });
+
+describe("SilentAuthSshFactory vault-failure isolation (Stage B)", () => {
+  // Each test drives a flow where the saved-credential first attempt returns an
+  // auth error so the prompted-retry path (Stage A + Stage B) actually fires.
+  // Stage A must succeed and Stage B's vault op must throw — the connection
+  // must still be returned and the sock must NOT be destroyed.
+
+  // Case 1: password + save=true, vault.store throws.
+  it("password + save: vault.store throws after connect — connection returned, sock not destroyed", async () => {
+    const secondSock = makeMockStream();
+    const socks = [makeMockStream(), secondSock]; // first=bad-pw attempt, second=prompted
+    const sockFactory = vi.fn(async () => socks.shift() as any);
+
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("All configured authentication methods failed"))
+        .mockResolvedValueOnce(fakeConnection)
+    };
+    const vault = createVault({ [passwordSecretKey(baseServer.id)]: "bad-pw" });
+    // Override store to throw after connect succeeds
+    (vault.store as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("vault locked"));
+
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "prompted-pw", save: true }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const connection = await factory.connect(baseServer, { sockFactory });
+
+      expect(connection).toBe(fakeConnection);
+      expect(secondSock.destroy).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledOnce();
+      const [msg] = consoleSpy.mock.calls[0] as [string, ...unknown[]];
+      expect(msg).toContain(baseServer.name);
+      expect(msg).toContain("password");
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
+  // Case 2: password + save=false, vault.delete throws.
+  it("password + no-save: vault.delete throws after connect — connection returned, sock not destroyed", async () => {
+    const secondSock = makeMockStream();
+    const socks = [makeMockStream(), secondSock];
+    const sockFactory = vi.fn(async () => socks.shift() as any);
+
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("All configured authentication methods failed"))
+        .mockResolvedValueOnce(fakeConnection)
+    };
+    const vault = createVault({ [passwordSecretKey(baseServer.id)]: "bad-pw" });
+    // delete is called first to clear bad-pw (on auth error), then again in Stage B (save=false).
+    // We want the Stage B delete (second call) to throw.
+    (vault.delete as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(undefined)    // first call: clear bad-pw after auth error
+      .mockRejectedValueOnce(new Error("vault locked")); // second call: Stage B
+
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "prompted-pw", save: false }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const connection = await factory.connect(baseServer, { sockFactory });
+
+      expect(connection).toBe(fakeConnection);
+      expect(secondSock.destroy).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledOnce();
+      const [msg] = consoleSpy.mock.calls[0] as [string, ...unknown[]];
+      expect(msg).toContain(baseServer.name);
+      expect(msg).toContain("password");
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
+  // Case 3: key + save=true, primary vault.store(passphraseKey) throws.
+  it("key + save: primary vault.store(passphraseKey) throws after connect — connection returned, sock not destroyed", async () => {
+    const keyServer: ServerConfig = { ...baseServer, authType: "key", keyPath: "/home/user/.ssh/id_rsa" };
+    const secondSock = makeMockStream();
+    const socks = [makeMockStream(), secondSock];
+    const sockFactory = vi.fn(async () => socks.shift() as any);
+
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("Encrypted private key requires passphrase"))
+        .mockResolvedValueOnce(fakeConnection)
+    };
+    // Saved (wrong) passphrase triggers the first failure.
+    const vault = createVault({ [passphraseSecretKey(keyServer.id)]: "wrong-passphrase" });
+    // vault.delete is called first to clear wrong passphrase, then vault.store throws in Stage B.
+    (vault.store as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("vault locked"));
+
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "correct-passphrase", save: true }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const connection = await factory.connect(keyServer, { sockFactory });
+
+      expect(connection).toBe(fakeConnection);
+      expect(secondSock.destroy).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledOnce();
+      const [msg] = consoleSpy.mock.calls[0] as [string, ...unknown[]];
+      expect(msg).toContain(keyServer.name);
+      expect(msg).toContain("passphrase");
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
+  // Case 4: key + save=true, primary vault.store succeeds but legacy
+  // vault.delete(legacyServerPassphraseKey) throws.
+  // Uses an auth profile so legacyServerPassphraseKey !== passphraseKey.
+  it("key + save: primary vault.store succeeds, legacy vault.delete throws — connection returned, sock not destroyed", async () => {
+    const profile: AuthProfile = {
+      id: "prof-key-2",
+      name: "Shared Key 2",
+      username: "root",
+      authType: "key",
+      keyPath: "/keys/id_ed25519"
+    };
+    const serverWithProfile: ServerConfig = {
+      ...baseServer,
+      authProfileId: "prof-key-2"
+    };
+    // passphraseKey = authProfilePassphraseSecretKey(profile.id)
+    // legacyServerPassphraseKey = passphraseSecretKey(server.id)  ← different
+    const profilePassKey = authProfilePassphraseSecretKey("prof-key-2");
+    const legacyKey = passphraseSecretKey(serverWithProfile.id);
+
+    const secondSock = makeMockStream();
+    const socks = [makeMockStream(), secondSock];
+    const sockFactory = vi.fn(async () => socks.shift() as any);
+
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("Encrypted private key requires passphrase"))
+        .mockResolvedValueOnce(fakeConnection)
+    };
+    // Seed the vault with an old profile passphrase (wrong) so the first attempt fails.
+    const vault = createVault({ [profilePassKey]: "old-passphrase" });
+    // vault.delete is called first to clear old profile passphrase, then in Stage B:
+    //   - vault.store(profilePassKey) succeeds (default mock)
+    //   - vault.delete(legacyKey) throws
+    (vault.delete as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(undefined)          // clear old profile passphrase on auth error
+      .mockRejectedValueOnce(new Error("vault locked")); // Stage B: legacy delete
+
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "new-passphrase", save: true }))
+    };
+    const lookup = (id: string) => id === "prof-key-2" ? profile : undefined;
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const connection = await factory.connect(serverWithProfile, { sockFactory });
+
+      expect(connection).toBe(fakeConnection);
+      expect(secondSock.destroy).not.toHaveBeenCalled();
+      // The legacy delete threw — console.error should have fired once.
+      expect(consoleSpy).toHaveBeenCalledOnce();
+      const [msg] = consoleSpy.mock.calls[0] as [string, ...unknown[]];
+      expect(msg).toContain(serverWithProfile.name);
+      expect(msg).toContain("passphrase");
+      // Primary store should have been called with the profile key.
+      expect(vault.store).toHaveBeenCalledWith(profilePassKey, "new-passphrase");
+      // Legacy key involved.
+      expect(legacyKey).not.toBe(profilePassKey);
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
+  // Case 5: key + save=false, vault.delete(passphraseKey) throws in Stage B.
+  it("key + no-save: vault.delete throws after connect — connection returned, sock not destroyed", async () => {
+    const keyServer: ServerConfig = { ...baseServer, authType: "key", keyPath: "/home/user/.ssh/id_rsa" };
+    const secondSock = makeMockStream();
+    const socks = [makeMockStream(), secondSock];
+    const sockFactory = vi.fn(async () => socks.shift() as any);
+
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("Encrypted private key requires passphrase"))
+        .mockResolvedValueOnce(fakeConnection)
+    };
+    const vault = createVault({ [passphraseSecretKey(keyServer.id)]: "wrong-passphrase" });
+    // vault.delete is called first to clear wrong passphrase (on passphrase error),
+    // then again in Stage B (save=false). We want Stage B delete to throw.
+    (vault.delete as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(undefined)    // first call: clear wrong passphrase
+      .mockRejectedValueOnce(new Error("vault locked")); // Stage B
+
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "correct-passphrase", save: false }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const connection = await factory.connect(keyServer, { sockFactory });
+
+      expect(connection).toBe(fakeConnection);
+      expect(secondSock.destroy).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledOnce();
+      const [msg] = consoleSpy.mock.calls[0] as [string, ...unknown[]];
+      expect(msg).toContain(keyServer.name);
+      expect(msg).toContain("passphrase");
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+});
