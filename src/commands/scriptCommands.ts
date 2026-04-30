@@ -158,6 +158,11 @@ function scriptingDocsUrl(): string {
   return `${base.replace(/\/+$/, "")}/blob/main/docs/scripting.md`;
 }
 
+function scriptExamplesUrl(): string {
+  const base = readRepositoryUrl();
+  return `${base.replace(/\/+$/, "")}/tree/main/examples/scripts`;
+}
+
 async function deleteScript(uri: vscode.Uri): Promise<void> {
   if (!uri?.fsPath) return;
   const base = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
@@ -276,6 +281,11 @@ export function registerScriptCommands(
 
     vscode.commands.registerCommand("nexus.script.openDocs", async () => {
       const url = scriptingDocsUrl();
+      await vscode.env.openExternal(vscode.Uri.parse(url));
+    }),
+
+    vscode.commands.registerCommand("nexus.script.openExamples", async () => {
+      const url = scriptExamplesUrl();
       await vscode.env.openExternal(vscode.Uri.parse(url));
     }),
 

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { chmod } from "node:fs/promises";
+import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
@@ -14,6 +16,7 @@ import {
 import { validateAuthProfile } from "../utils/validation";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
+import { defaultSshDir } from "../services/ssh/deploySshKey";
 import {
   parseSecureCrtDirectory,
   parseSecureCrtXmlExport,
@@ -49,6 +52,26 @@ interface NexusConfigExport {
   settings?: Record<string, unknown>;
   encryptedSecrets?: EncryptedPayload;
 }
+
+interface BackupFileEntry {
+  relativePath: string;
+  contentsBase64: string;
+}
+
+interface BackupFolderPayload {
+  id: "ssh" | "scripts";
+  label: string;
+  configuredPath?: string;
+  directories: string[];
+  files: BackupFileEntry[];
+}
+
+interface RestoreBackupFoldersResult {
+  restoredFiles: number;
+  skippedExistingFiles: number;
+}
+
+const DEFAULT_SCRIPTS_RELATIVE_PATH = ".nexus/scripts";
 
 export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.logging", key: "sessionTranscripts" },
@@ -127,6 +150,223 @@ async function applySettings(settings: Record<string, unknown>): Promise<void> {
     const config = vscode.workspace.getConfiguration(section);
     await config.update(key, value, vscode.ConfigurationTarget.Global);
   }
+}
+
+function isFile(type: vscode.FileType): boolean {
+  return (type & vscode.FileType.File) === vscode.FileType.File;
+}
+
+function isDirectory(type: vscode.FileType): boolean {
+  return (type & vscode.FileType.Directory) === vscode.FileType.Directory;
+}
+
+function isSymlink(type: vscode.FileType): boolean {
+  return (type & vscode.FileType.SymbolicLink) === vscode.FileType.SymbolicLink;
+}
+
+async function safeStat(uri: vscode.Uri): Promise<vscode.FileStat | undefined> {
+  try {
+    const stat = await vscode.workspace.fs.stat(uri);
+    return stat && typeof stat.type === "number" ? stat : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function collectFolderBackup(
+  id: BackupFolderPayload["id"],
+  label: string,
+  root: vscode.Uri,
+  configuredPath?: string
+): Promise<BackupFolderPayload | undefined> {
+  const rootStat = await safeStat(root);
+  if (!rootStat || !isDirectory(rootStat.type) || isSymlink(rootStat.type)) {
+    return undefined;
+  }
+
+  const payload: BackupFolderPayload = { id, label, configuredPath, directories: [], files: [] };
+
+  async function walk(dir: vscode.Uri, relativeDir: string): Promise<void> {
+    let entries: Array<[string, vscode.FileType]>;
+    try {
+      entries = await vscode.workspace.fs.readDirectory(dir);
+    } catch {
+      return;
+    }
+
+    for (const [name, type] of entries) {
+      if (isSymlink(type)) continue;
+      const relativePath = relativeDir ? `${relativeDir}/${name}` : name;
+      const child = vscode.Uri.joinPath(dir, name);
+
+      if (isDirectory(type)) {
+        payload.directories.push(relativePath);
+        await walk(child, relativePath);
+      } else if (isFile(type)) {
+        try {
+          const bytes = await vscode.workspace.fs.readFile(child);
+          payload.files.push({
+            relativePath,
+            contentsBase64: Buffer.from(bytes).toString("base64")
+          });
+        } catch {
+          // Files can disappear while the backup is being collected.
+        }
+      }
+    }
+  }
+
+  await walk(root, "");
+  return payload;
+}
+
+function readScriptsPathSetting(): string {
+  const configured = vscode.workspace
+    .getConfiguration("nexus.scripts")
+    .get<string>("path", DEFAULT_SCRIPTS_RELATIVE_PATH);
+  return typeof configured === "string" && configured.trim() ? configured : DEFAULT_SCRIPTS_RELATIVE_PATH;
+}
+
+function resolveScriptsDirFromConfiguredPath(globalStoragePath: string, configuredPath: string): vscode.Uri {
+  if (path.isAbsolute(configuredPath)) {
+    return vscode.Uri.file(configuredPath);
+  }
+
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (root) {
+    return vscode.Uri.joinPath(root, configuredPath);
+  }
+
+  return vscode.Uri.file(path.join(globalStoragePath, "scripts"));
+}
+
+async function collectBackupFolders(context?: vscode.ExtensionContext): Promise<BackupFolderPayload[]> {
+  const folders: BackupFolderPayload[] = [];
+  const sshBackup = await collectFolderBackup("ssh", "SSH user folder", vscode.Uri.file(defaultSshDir()));
+  if (sshBackup) folders.push(sshBackup);
+
+  const globalStoragePath = context?.globalStorageUri.fsPath;
+  if (globalStoragePath) {
+    const configuredPath = readScriptsPathSetting();
+    const scriptsBackup = await collectFolderBackup(
+      "scripts",
+      "Nexus scripts folder",
+      resolveScriptsDirFromConfiguredPath(globalStoragePath, configuredPath),
+      configuredPath
+    );
+    if (scriptsBackup) folders.push(scriptsBackup);
+  }
+
+  return folders;
+}
+
+function safeRelativeSegments(value: unknown): string[] | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/\\/g, "/");
+  if (!normalized || normalized.includes("\0")) return undefined;
+  if (path.posix.isAbsolute(normalized) || path.win32.isAbsolute(normalized)) return undefined;
+
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.length === 0) return undefined;
+  if (segments.some((segment) => segment === "." || segment === "..")) return undefined;
+  return segments;
+}
+
+function backupRootFor(
+  id: unknown,
+  context?: vscode.ExtensionContext,
+  configuredPath?: unknown
+): vscode.Uri | undefined {
+  if (id === "ssh") return vscode.Uri.file(defaultSshDir());
+  if (id === "scripts" && context?.globalStorageUri.fsPath) {
+    const pathSetting = typeof configuredPath === "string" && configuredPath.trim()
+      ? configuredPath
+      : DEFAULT_SCRIPTS_RELATIVE_PATH;
+    return resolveScriptsDirFromConfiguredPath(context.globalStorageUri.fsPath, pathSetting);
+  }
+  return undefined;
+}
+
+async function chmodFileUri(uri: vscode.Uri, mode: number): Promise<void> {
+  if (uri.scheme !== "file") return;
+  try {
+    await chmod(uri.fsPath, mode);
+  } catch {
+    // Not all platforms or filesystem providers support POSIX modes.
+  }
+}
+
+async function ensureParentDirectory(root: vscode.Uri, segments: string[]): Promise<void> {
+  if (segments.length <= 1) {
+    await vscode.workspace.fs.createDirectory(root);
+    return;
+  }
+  const parent = vscode.Uri.joinPath(root, ...segments.slice(0, -1));
+  await vscode.workspace.fs.createDirectory(parent);
+}
+
+async function restoreBackupFolders(
+  decryptedSecrets: Record<string, unknown> | undefined,
+  mode: "merge" | "replace",
+  context?: vscode.ExtensionContext
+): Promise<RestoreBackupFoldersResult> {
+  const result: RestoreBackupFoldersResult = { restoredFiles: 0, skippedExistingFiles: 0 };
+  const fileBackups = decryptedSecrets?.fileBackups;
+  if (!Array.isArray(fileBackups)) return result;
+
+  for (const backup of fileBackups) {
+    if (typeof backup !== "object" || backup === null) continue;
+    const obj = backup as Partial<BackupFolderPayload>;
+    const root = backupRootFor(obj.id, context, obj.configuredPath);
+    if (!root) continue;
+    const isSshBackup = obj.id === "ssh";
+
+    try {
+      await vscode.workspace.fs.createDirectory(root);
+      if (isSshBackup) await chmodFileUri(root, 0o700);
+    } catch {
+      continue;
+    }
+
+    const directories = Array.isArray(obj.directories) ? obj.directories : [];
+    for (const relativePath of directories) {
+      const segments = safeRelativeSegments(relativePath);
+      if (!segments) continue;
+      try {
+        const directory = vscode.Uri.joinPath(root, ...segments);
+        await vscode.workspace.fs.createDirectory(directory);
+        if (isSshBackup) await chmodFileUri(directory, 0o700);
+      } catch {
+        // Keep restoring other entries.
+      }
+    }
+
+    const files = Array.isArray(obj.files) ? obj.files : [];
+    for (const file of files) {
+      if (typeof file !== "object" || file === null) continue;
+      const entry = file as Partial<BackupFileEntry>;
+      const segments = safeRelativeSegments(entry.relativePath);
+      if (!segments || typeof entry.contentsBase64 !== "string") continue;
+      const target = vscode.Uri.joinPath(root, ...segments);
+      if (mode === "merge" && await safeStat(target)) {
+        result.skippedExistingFiles++;
+        continue;
+      }
+      try {
+        await ensureParentDirectory(root, segments);
+        if (isSshBackup && segments.length > 1) {
+          await chmodFileUri(vscode.Uri.joinPath(root, ...segments.slice(0, -1)), 0o700);
+        }
+        await vscode.workspace.fs.writeFile(target, Buffer.from(entry.contentsBase64, "base64"));
+        if (isSshBackup) await chmodFileUri(target, 0o600);
+        result.restoredFiles++;
+      } catch {
+        // A single unreadable target should not block the rest of the import.
+      }
+    }
+  }
+
+  return result;
 }
 
 export function isValidExport(data: unknown): data is NexusConfigExport {
@@ -261,7 +501,7 @@ export function sanitizeForSharing(
 async function promptMasterPassword(): Promise<string | undefined> {
   const password = await vscode.window.showInputBox({
     title: "Backup Master Password",
-    prompt: "Enter a master password to encrypt your backup",
+    prompt: "Enter a master password to encrypt profiles, settings, saved credentials, ~/.ssh, and Nexus scripts",
     password: true,
     ignoreFocusOut: true,
     validateInput: (value) =>
@@ -292,6 +532,10 @@ async function promptDecryptPassword(): Promise<string | undefined> {
 
 function keyOf(m: TerminalMacro): string {
   return `${m.name}|${m.text}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}`;
+}
+
+function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
 /**
@@ -366,7 +610,8 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           proxyPasswords: {},
           authProfilePasswords: {},
           authProfilePassphrases: {},
-          secretMacros: []
+          secretMacros: [],
+          fileBackups: []
         };
         const passwords = secrets.passwords as Record<string, string>;
         const passphrases = secrets.passphrases as Record<string, string>;
@@ -397,7 +642,9 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           .filter((m) => m.secret && m.id)
           .map((m) => ({ id: m.id!, text: m.text }));
 
+        const fileBackups = await collectBackupFolders(context);
         secrets.secretMacros = secretMacroBlobs;
+        secrets.fileBackups = fileBackups;
 
         const encryptedSecrets = encrypt(JSON.stringify(secrets), masterPassword);
 
@@ -426,7 +673,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         await vscode.workspace.fs.writeFile(uri, Buffer.from(json, "utf8"));
 
         const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + snapshot.authProfiles.length;
-        void vscode.window.showInformationMessage(`Backup saved with ${count} profiles to ${uri.fsPath}`);
+        const fileCount = fileBackups.reduce((sum, folder) => sum + folder.files.length, 0);
+        const fileNote = fileCount > 0
+          ? ` and ${plural(fileCount, "encrypted .ssh/script file")}`
+          : "";
+        void vscode.window.showInformationMessage(`Backup saved with ${plural(count, "profile")}${fileNote} to ${uri.fsPath}`);
       }
     );
   }
@@ -511,8 +762,18 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // For backup or legacy: ask merge/replace
     const mode = await vscode.window.showQuickPick(
       [
-        { label: "Merge", description: "Add imported profiles, skip existing IDs", value: "merge" as const },
-        { label: "Replace", description: "Clear all existing profiles and import", value: "replace" as const }
+        {
+          label: "Merge",
+          description: "Add profiles; restore only missing .ssh and script files",
+          detail: "Existing local files are left unchanged.",
+          value: "merge" as const
+        },
+        {
+          label: "Replace",
+          description: "Replace profiles; overwrite backed-up .ssh and script files",
+          detail: "Extra local files are not deleted.",
+          value: "replace" as const
+        }
       ],
       { title: "Import Mode" }
     );
@@ -789,6 +1050,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     }
 
     // Restore passwords/passphrases from decrypted secrets
+    let fileRestoreResult: RestoreBackupFoldersResult = { restoredFiles: 0, skippedExistingFiles: 0 };
     if (decryptedSecrets) {
       const passwords = decryptedSecrets.passwords as Record<string, string> | undefined;
       const passphrases = decryptedSecrets.passphrases as Record<string, string> | undefined;
@@ -820,11 +1082,15 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           await vault.store(authProfilePassphraseSecretKey(profileId), passphrase);
         }
       }
+      fileRestoreResult = await restoreBackupFolders(decryptedSecrets, mode, context);
     }
 
     const skipNote = skipped > 0 ? ` (${skipped} skipped)` : "";
+    const restoredFileNote = fileRestoreResult.restoredFiles > 0 || fileRestoreResult.skippedExistingFiles > 0
+      ? `; restored ${plural(fileRestoreResult.restoredFiles, "backup file")}${fileRestoreResult.skippedExistingFiles > 0 ? `, skipped ${plural(fileRestoreResult.skippedExistingFiles, "existing file")}` : ""}`
+      : "";
     void vscode.window.showInformationMessage(
-      `Imported ${imported} profiles${mode === "replace" ? " (replaced existing)" : ""}${skipNote}.`
+      `Imported ${plural(imported, "profile")}${mode === "replace" ? " (replaced existing)" : ""}${skipNote}${restoredFileNote}.`
     );
   }
 

@@ -183,6 +183,17 @@ describe("scriptCommands", () => {
       expect(String(arg)).toMatch(/github\.com/);
       expect(String(arg)).toMatch(/docs\/scripting\.md/);
     });
+
+    it("registers nexus.script.openExamples which opens bundled script examples", async () => {
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.openExamples");
+      expect(handler).toBeDefined();
+      await handler!();
+      expect(state.mockOpenExternal).toHaveBeenCalled();
+      const arg = state.mockOpenExternal.mock.calls[0][0] as { toString: () => string };
+      expect(String(arg)).toMatch(/github\.com/);
+      expect(String(arg)).toMatch(/examples\/scripts/);
+    });
   });
 
   describe("workspace gating", () => {

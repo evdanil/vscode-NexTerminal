@@ -5,7 +5,33 @@ import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeMana
 
 export type ScriptNode =
   | { kind: "script"; uri: vscode.Uri; name: string; description: string; running: boolean; parseErrors: string[] }
-  | { kind: "placeholder"; label: string; detail?: string };
+  | { kind: "placeholder"; label: string; detail?: string; command: vscode.Command; icon: string };
+
+function scriptPlaceholders(): ScriptNode[] {
+  return [
+    {
+      kind: "placeholder",
+      label: "New Script",
+      detail: "Create a starter automation script",
+      command: { command: "nexus.script.new", title: "New Script" },
+      icon: "new-file"
+    },
+    {
+      kind: "placeholder",
+      label: "Open Scripting Guide",
+      detail: "Read the Nexus script API guide",
+      command: { command: "nexus.script.openDocs", title: "Open Scripting Guide" },
+      icon: "book"
+    },
+    {
+      kind: "placeholder",
+      label: "Open Script Examples",
+      detail: "Browse runnable script examples",
+      command: { command: "nexus.script.openExamples", title: "Open Script Examples" },
+      icon: "file-code"
+    }
+  ];
+}
 
 export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
@@ -57,6 +83,8 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       const item = new vscode.TreeItem(node.label, vscode.TreeItemCollapsibleState.None);
       item.description = node.detail;
       item.contextValue = "nexus.script.placeholder";
+      item.command = node.command;
+      item.iconPath = new vscode.ThemeIcon(node.icon);
       return item;
     }
     const item = new vscode.TreeItem(node.name, vscode.TreeItemCollapsibleState.None);
@@ -88,7 +116,7 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
     try {
       entries = await vscode.workspace.fs.readDirectory(dir);
     } catch {
-      return [];
+      return scriptPlaceholders();
     }
 
     const runningPaths = new Set(this.manager.getRuns().map((r) => r.scriptPath));
@@ -117,7 +145,7 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       });
     }
 
-    return nodes;
+    return nodes.length > 0 ? nodes : scriptPlaceholders();
   }
 
   private ensureWatcher(): void {

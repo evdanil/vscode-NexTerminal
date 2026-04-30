@@ -156,21 +156,30 @@ describe("ScriptTreeProvider", () => {
     expect(item.label).toBe("foo");
   });
 
-  it("returns empty array when no workspace is open (lets viewsWelcome render the 'New Script' button)", async () => {
+  it("shows placeholder actions when no workspace is open and no scripts exist", async () => {
     (vscode.workspace as unknown as { workspaceFolders: unknown[] | undefined }).workspaceFolders = undefined;
     const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
     const children = await provider.getChildren();
-    expect(children).toHaveLength(0);
+    expect(children.map((child) => child.kind)).toEqual(["placeholder", "placeholder", "placeholder"]);
+    const items = children.map((child) => provider.getTreeItem(child) as unknown as { command?: { command: string }; iconPath?: { id: string } });
+    expect(items.map((item) => item.command?.command)).toEqual([
+      "nexus.script.new",
+      "nexus.script.openDocs",
+      "nexus.script.openExamples"
+    ]);
+    expect(items.map((item) => item.iconPath?.id)).toEqual(["new-file", "book", "file-code"]);
   });
 
-  it("returns empty array when the scripts directory is empty (lets viewsWelcome render)", async () => {
+  it("shows placeholder actions when the scripts directory is empty", async () => {
     mockFsEntries.set("/workspace/.nexus/scripts", []);
     const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
     const children = await provider.getChildren();
-    expect(children).toHaveLength(0);
+    expect(children).toHaveLength(3);
+    const labels = children.map((child) => provider.getTreeItem(child).label);
+    expect(labels).toEqual(["New Script", "Open Scripting Guide", "Open Script Examples"]);
   });
 
-  it("returns empty array on missing scripts directory (welcome view stays visible)", async () => {
+  it("shows placeholder actions on missing scripts directory", async () => {
     // Don't set mockFsEntries for /workspace/.nexus/scripts — readDirectory will throw ENOENT.
     (vscode.workspace.fs as unknown as { readDirectory: typeof vscode.workspace.fs.readDirectory }).readDirectory = vi.fn(
       async () => {
@@ -179,7 +188,7 @@ describe("ScriptTreeProvider", () => {
     );
     const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
     const children = await provider.getChildren();
-    expect(children).toHaveLength(0);
+    expect(children).toHaveLength(3);
   });
 
   it("sets contextValue to nexus.script.file for idle scripts and nexus.script.running when running (S2)", async () => {

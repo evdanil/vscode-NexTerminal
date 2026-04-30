@@ -127,8 +127,8 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 
 ### 4.10 Configuration Export/Import
 - `Nexus: Export Configuration` creates a sanitized JSON export suitable for sharing (credentials stripped, learned Smart Follow hardware identifiers removed, IDs remapped).
-- `Nexus: Export Backup` creates an encrypted backup that includes profiles, settings, and saved credentials.
-- `Nexus: Import Configuration` restores from either format with merge or replace options.
+- `Nexus: Export Backup` creates an encrypted backup that includes profiles, settings, saved credentials, the user `.ssh` folder, and the configured Nexus scripts folder.
+- `Nexus: Import Configuration` restores from either format with merge or replace options. For encrypted folder payloads, merge skips existing local `.ssh` / script files; replace overwrites files present in the backup but does not delete extra local files.
 - `Nexus: Import from MobaXterm` and `Nexus: Import from SecureCRT` migrate external SSH profiles while preserving folder hierarchy where possible.
 
 ### 4.11 Terminal Tab Commands

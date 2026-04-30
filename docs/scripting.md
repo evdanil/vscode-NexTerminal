@@ -4,6 +4,7 @@ Nexus Scripts let you automate multi-step terminal procedures in plain JavaScrip
 
 - [When to use a script (vs. a macro)](#when-to-use-a-script-vs-a-macro)
 - [Quickstart](#quickstart)
+- [Script examples](#script-examples)
 - [Anatomy of a script](#anatomy-of-a-script)
 - [Header fields](#header-fields)
 - [Script API reference](#script-api-reference)
@@ -83,6 +84,12 @@ A script is a regular `.js` file — kept either in your workspace (under versio
    ```
 
 The first time you run any script command in this workspace, Nexus writes `types/nexus-scripts.d.ts` + `jsconfig.json` next to your scripts so the editor gives autocomplete, JSDoc hovers, and inline type-checking for every primitive.
+
+---
+
+## Script examples
+
+Browse [`examples/scripts/`](../examples/scripts/) for runnable scripts that demonstrate branching, loops, retries, polling, user interaction, and complete multi-step procedures. In VS Code, use **Nexus: Open Script Examples** or the examples icon in the **Scripts** view title bar.
 
 ---
 
@@ -592,10 +599,11 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | `Connect and Run Script…` (server / serial right-click) | — | Pick a Nexus script, connect to the profile, and run the script against the new session once it registers. Scripts are filtered to those whose `@target-type` is compatible with the profile. 90-second watchdog warns if the script never starts. |
 | `Nexus: Show Nexus Scripts Output` | — | Open the **Nexus Scripts** Output Channel. |
 | `Nexus: Open Scripting Guide` | — | Open this document in your browser. |
+| `Nexus: Open Script Examples` | — | Open the bundled script examples in your browser. |
 
 **UI surfaces:**
 
-- **Nexus sidebar → Scripts** — lists all `.js` files under the configured directory that carry the `@nexus-script` marker. Clicking the row does **nothing by default** (prevents accidental editor churn); use the right-click menu for Edit / Run / Stop / Reveal / Delete, or the inline **▶** button for quick-run. The view's title bar has a `+` button (New Script) and a `📁` button (Open Scripts Folder in the OS file manager). Empty state (no folder / no scripts) shows inline help links — **New Script** and **Open Scripting Guide**.
+- **Nexus sidebar → Scripts** — lists all `.js` files under the configured directory that carry the `@nexus-script` marker. Clicking the row does **nothing by default** (prevents accidental editor churn); use the right-click menu for Edit / Run / Stop / Reveal / Delete, or the inline **▶** button for quick-run. The view's title bar has buttons for New Script, Open Scripts Folder, Open Scripting Guide, and Open Script Examples. Empty state (no folder / no scripts) shows inline help links for those same getting-started actions.
 - **Editor CodeLens** — the inline `▶ Run in Nexus` action at the top of any script file. Flips to `◼ Stop` while a run is active on that file. Works on `file://`, `vscode-remote://`, and `untitled:` schemes. Always shows the session picker (the editor context is "I'm authoring" — deliberate target choice).
 - **Nexus Settings panel → Scripts** — the same four settings as in `Settings` below, surfaced in the Nexus Settings panel webview (no need to open `settings.json`).
 - **Connectivity Hub right-click → Connect and Run Script…** — available on both SSH and serial profile items. Picks a compatible script (filtered by `@target-type`), connects to the profile, then auto-runs the script once the session registers. 90-second watchdog warns if the script never starts.

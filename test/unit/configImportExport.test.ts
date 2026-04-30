@@ -1,6 +1,9 @@
 import { readFileSync } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi, beforeEach } from "vitest";
+
+const mockChmod = vi.hoisted(() => vi.fn(async () => {}));
 
 // Capture registered command handlers
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
@@ -15,6 +18,7 @@ const mockWriteFile = vi.fn();
 const mockReadFile = vi.fn();
 const mockReadDirectory = vi.fn();
 const mockStat = vi.fn();
+const mockCreateDirectory = vi.fn();
 const mockWithProgress = vi.fn();
 const mockConfigUpdate = vi.fn();
 const configStore = new Map<string, unknown>();
@@ -44,8 +48,12 @@ vi.mock("vscode", () => ({
       writeFile: (...args: unknown[]) => mockWriteFile(...args),
       readFile: (...args: unknown[]) => mockReadFile(...args),
       readDirectory: (...args: unknown[]) => mockReadDirectory(...args),
-      stat: (...args: unknown[]) => mockStat(...args)
+      stat: (...args: unknown[]) => mockStat(...args),
+      createDirectory: (...args: unknown[]) => mockCreateDirectory(...args)
     },
+    workspaceFolders: [
+      { uri: { fsPath: "/workspace", scheme: "file", path: "/workspace" }, name: "workspace", index: 0 }
+    ],
     getConfiguration: vi.fn((section: string) => ({
       get: (key: string) => configStore.get(`${section}.${key}`),
       update: (key: string, value: unknown) => {
@@ -69,6 +77,14 @@ vi.mock("vscode", () => ({
   ConfigurationTarget: { Global: 1 },
   ProgressLocation: { Notification: 15 }
 }));
+
+vi.mock("node:fs/promises", async () => {
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  return {
+    ...actual,
+    chmod: mockChmod
+  };
+});
 
 import { registerConfigCommands, isValidExport, SETTINGS_KEYS, sanitizeForSharing } from "../../src/commands/configCommands";
 import { NexusCore } from "../../src/core/nexusCore";
@@ -331,7 +347,7 @@ describe("config import command (legacy)", () => {
 
     const snapshot = core.getSnapshot();
     expect(snapshot.servers).toHaveLength(2);
-    expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profiles (1 skipped).");
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profile (1 skipped).");
   });
 
   it("replace mode clears existing and imports new", async () => {
@@ -392,7 +408,7 @@ describe("config import command (legacy)", () => {
     const snapshot = core.getSnapshot();
     expect(snapshot.servers).toHaveLength(1);
     expect(snapshot.tunnels).toHaveLength(0);
-    expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profiles (2 skipped).");
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profile (2 skipped).");
   });
 
   it("rejects invalid JSON", async () => {
@@ -487,7 +503,7 @@ describe("config import command (legacy)", () => {
     expect(snapshot.servers[0].id).toBe("s1");
     expect(snapshot.tunnels).toHaveLength(0);
     expect(snapshot.serialProfiles).toHaveLength(0);
-    expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profiles.");
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profile.");
   });
 });
 
@@ -649,6 +665,60 @@ describe("backup export command", () => {
     // Original IDs preserved in backup
     expect(writtenData.servers[0].id).toBe("s1");
   });
+
+  it("exports the user .ssh folder and resolved scripts folder inside encrypted secrets", async () => {
+    const sshDir = path.join(os.homedir(), ".ssh");
+    const scriptsDir = "/workspace/.nexus/scripts";
+    const fakeContext = {
+      globalStorageUri: { fsPath: "/global-storage", scheme: "file", path: "/global-storage" }
+    } as unknown as import("vscode").ExtensionContext;
+
+    registeredCommands.clear();
+    configStore.set("nexus.scripts.path", ".nexus/scripts");
+    registerConfigCommands(core, vault, fakeContext);
+
+    mockStat.mockImplementation(async (uri: { fsPath: string }) => {
+      if ([sshDir, scriptsDir].includes(uri.fsPath)) return { type: 2 };
+      if ([path.join(sshDir, "config"), path.join(sshDir, "keys"), path.join(sshDir, "keys/id_ed25519"), `${scriptsDir}/hello.js`].includes(uri.fsPath)) {
+        return { type: uri.fsPath.endsWith("keys") ? 2 : 1 };
+      }
+      throw new Error(`ENOENT: ${uri.fsPath}`);
+    });
+    mockReadDirectory.mockImplementation(async (uri: { fsPath: string }) => {
+      if (uri.fsPath === sshDir) return [["config", 1], ["keys", 2]];
+      if (uri.fsPath === path.join(sshDir, "keys")) return [["id_ed25519", 1]];
+      if (uri.fsPath === scriptsDir) return [["hello.js", 1]];
+      return [];
+    });
+    mockReadFile.mockImplementation(async (uri: { fsPath: string }) => {
+      if (uri.fsPath === path.join(sshDir, "config")) return Buffer.from("Host lab\n");
+      if (uri.fsPath === path.join(sshDir, "keys/id_ed25519")) return Buffer.from("PRIVATE KEY");
+      if (uri.fsPath === `${scriptsDir}/hello.js`) return Buffer.from("/** @nexus-script */\n");
+      throw new Error(`ENOENT: ${uri.fsPath}`);
+    });
+
+    mockShowInputBox
+      .mockResolvedValueOnce("testpass123")
+      .mockResolvedValueOnce("testpass123");
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+
+    const backupCmd = registeredCommands.get("nexus.config.export.backup")!;
+    await backupCmd();
+
+    const writtenData = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+    const { decrypt } = await import("../../src/utils/configCrypto");
+    const decrypted = JSON.parse(decrypt(writtenData.encryptedSecrets, "testpass123"));
+
+    const fileBackups = decrypted.fileBackups as Array<{ id: string; files: Array<{ relativePath: string; contentsBase64: string }> }>;
+    expect(fileBackups.map((b) => b.id)).toEqual(["ssh", "scripts"]);
+    expect(fileBackups.find((b) => b.id === "ssh")?.files.map((f) => f.relativePath).sort()).toEqual([
+      "config",
+      "keys/id_ed25519"
+    ]);
+    expect(Buffer.from(fileBackups.find((b) => b.id === "ssh")!.files[0].contentsBase64, "base64").toString("utf8")).toBe("Host lab\n");
+    expect(fileBackups.find((b) => b.id === "scripts")?.configuredPath).toBe(".nexus/scripts");
+    expect(fileBackups.find((b) => b.id === "scripts")?.files[0].relativePath).toBe("hello.js");
+  });
 });
 
 describe("backup import", () => {
@@ -767,6 +837,146 @@ describe("backup import", () => {
     expect(snapshot.servers).toHaveLength(0);
     expect(snapshot.tunnels).toHaveLength(0);
     expect(snapshot.serialProfiles).toHaveLength(0);
+  });
+
+  it("merge import restores backed-up folder files only when missing", async () => {
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const sshDir = path.join(os.homedir(), ".ssh");
+    const secrets = {
+      passwords: {},
+      passphrases: {},
+      secretMacros: [],
+      fileBackups: [
+        {
+          id: "ssh",
+          label: "SSH user folder",
+          directories: [],
+          files: [
+            { relativePath: "config", contentsBase64: Buffer.from("existing should win").toString("base64") },
+            { relativePath: "known_hosts", contentsBase64: Buffer.from("missing restored").toString("base64") }
+          ]
+        }
+      ]
+    };
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      encryptedSecrets: encrypt(JSON.stringify(secrets), "testpass")
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Merge", value: "merge" });
+    mockShowInputBox.mockResolvedValueOnce("testpass");
+    mockStat.mockImplementation(async (uri: { fsPath: string }) => {
+      if (uri.fsPath === path.join(sshDir, "config")) return { type: 1 };
+      throw new Error(`ENOENT: ${uri.fsPath}`);
+    });
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const restoredPaths = mockWriteFile.mock.calls.map((call) => (call[0] as { fsPath: string }).fsPath);
+    expect(restoredPaths).toEqual([path.join(sshDir, "known_hosts")]);
+    expect(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8")).toBe("missing restored");
+    expect(mockChmod).toHaveBeenCalledWith(sshDir, 0o700);
+    expect(mockChmod).toHaveBeenCalledWith(path.join(sshDir, "known_hosts"), 0o600);
+  });
+
+  it("replace import overwrites backed-up folder files without deleting extra files", async () => {
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const sshDir = path.join(os.homedir(), ".ssh");
+    const secrets = {
+      passwords: {},
+      passphrases: {},
+      secretMacros: [],
+      fileBackups: [
+        {
+          id: "ssh",
+          label: "SSH user folder",
+          directories: [],
+          files: [
+            { relativePath: "config", contentsBase64: Buffer.from("restored").toString("base64") }
+          ]
+        }
+      ]
+    };
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      encryptedSecrets: encrypt(JSON.stringify(secrets), "testpass")
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowInputBox.mockResolvedValueOnce("testpass");
+    mockStat.mockResolvedValue({ type: 1 });
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockWriteFile).toHaveBeenCalledTimes(1);
+    expect((mockWriteFile.mock.calls[0][0] as { fsPath: string }).fsPath).toBe(path.join(sshDir, "config"));
+    expect(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8")).toBe("restored");
+  });
+
+  it("uses encrypted scripts path metadata instead of mutable imported settings when restoring scripts", async () => {
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const fakeContext = {
+      globalStorageUri: { fsPath: "/global-storage", scheme: "file", path: "/global-storage" }
+    } as unknown as import("vscode").ExtensionContext;
+    const secrets = {
+      passwords: {},
+      passphrases: {},
+      secretMacros: [],
+      fileBackups: [
+        {
+          id: "scripts",
+          label: "Nexus scripts folder",
+          configuredPath: ".nexus/scripts",
+          directories: [],
+          files: [
+            { relativePath: "hello.js", contentsBase64: Buffer.from("/** @nexus-script */\n").toString("base64") }
+          ]
+        }
+      ]
+    };
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      settings: {
+        "nexus.scripts.path": "/tmp/redirected-scripts"
+      },
+      encryptedSecrets: encrypt(JSON.stringify(secrets), "testpass")
+    };
+
+    registeredCommands.clear();
+    registerConfigCommands(core, vault, fakeContext);
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowInputBox.mockResolvedValueOnce("testpass");
+    mockStat.mockResolvedValue(undefined);
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(configStore.get("nexus.scripts.path")).toBe("/tmp/redirected-scripts");
+    expect((mockWriteFile.mock.calls[0][0] as { fsPath: string }).fsPath).toBe("/workspace/.nexus/scripts/hello.js");
   });
 });
 

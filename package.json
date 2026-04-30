@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros with auto-trigger (expect/send), regex highlighting, unread activity indicators, color schemes, and configuration import/export.",
-  "version": "2.8.26",
+  "version": "2.8.27",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -102,7 +102,7 @@
       },
       {
         "view": "nexusScripts",
-        "contents": "Nexus scripts automate SSH and Serial sessions with expect/send style.\n[New Script](command:nexus.script.new)\n[Open scripting guide](command:nexus.script.openDocs)"
+        "contents": "Nexus scripts automate SSH and Serial sessions with expect/send style.\n[New Script](command:nexus.script.new)\n[Open scripting guide](command:nexus.script.openDocs)\n[Open script examples](command:nexus.script.openExamples)"
       }
     ],
     "commands": [
@@ -580,6 +580,12 @@
         "icon": "$(book)"
       },
       {
+        "command": "nexus.script.openExamples",
+        "title": "Open Script Examples",
+        "category": "Nexus",
+        "icon": "$(file-code)"
+      },
+      {
         "command": "nexus.script.delete",
         "title": "Delete Script",
         "icon": "$(trash)"
@@ -736,6 +742,16 @@
           "command": "nexus.script.openScriptsFolder",
           "when": "view == nexusScripts",
           "group": "navigation@2"
+        },
+        {
+          "command": "nexus.script.openDocs",
+          "when": "view == nexusScripts",
+          "group": "navigation@3"
+        },
+        {
+          "command": "nexus.script.openExamples",
+          "when": "view == nexusScripts",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -1471,6 +1487,10 @@
         },
         {
           "command": "nexus.script.openDocs",
+          "when": "true"
+        },
+        {
+          "command": "nexus.script.openExamples",
           "when": "true"
         },
         {

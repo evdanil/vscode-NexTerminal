@@ -126,11 +126,17 @@ describe("package contributions", () => {
       expect(entry).toBeDefined();
       expect(entry?.contents).toContain("command:nexus.script.new");
       expect(entry?.contents).toContain("command:nexus.script.openDocs");
+      expect(entry?.contents).toContain("command:nexus.script.openExamples");
     });
 
     it("contributes a nexus.script.openDocs command", () => {
       const commands = packageJson.contributes.commands.map((item) => item.command);
       expect(commands).toContain("nexus.script.openDocs");
+    });
+
+    it("contributes a nexus.script.openExamples command", () => {
+      const commands = packageJson.contributes.commands.map((item) => item.command);
+      expect(commands).toContain("nexus.script.openExamples");
     });
 
     it("contributes a nexus.script.delete command", () => {
@@ -145,6 +151,16 @@ describe("package contributions", () => {
       );
       expect(newScriptItem).toBeDefined();
       expect(newScriptItem?.group).toMatch(/^navigation/);
+    });
+
+    it("adds scripts folder, docs, and examples buttons to the nexusScripts view title bar", () => {
+      const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+      const commands = titleMenuItems
+        .filter((item) => item.when === "view == nexusScripts")
+        .map((item) => item.command);
+      expect(commands).toContain("nexus.script.openScriptsFolder");
+      expect(commands).toContain("nexus.script.openDocs");
+      expect(commands).toContain("nexus.script.openExamples");
     });
 
     it("adds run/stop/reveal/delete context menus for the nexusScripts view items", () => {
