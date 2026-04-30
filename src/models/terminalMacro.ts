@@ -1,3 +1,5 @@
+export type MacroTriggerScope = "all-terminals" | "active-session" | "profile";
+
 export interface TerminalMacro {
   /**
    * Stable UUID assigned on creation/migration. Optional in the type to allow
@@ -14,4 +16,6 @@ export interface TerminalMacro {
   triggerCooldown?: number;
   triggerInterval?: number;
   triggerInitiallyDisabled?: boolean;
+  triggerScope?: MacroTriggerScope;
+  triggerProfileId?: string;
 }

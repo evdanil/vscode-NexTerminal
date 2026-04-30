@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros with auto-trigger (expect/send), regex highlighting, unread activity indicators, color schemes, and configuration import/export.",
-  "version": "2.8.27",
+  "version": "2.8.28",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -382,6 +382,11 @@
       {
         "command": "nexus.config.completeReset",
         "title": "Delete All Data",
+        "category": "Nexus"
+      },
+      {
+        "command": "nexus.settings.fixMacroKeybindings",
+        "title": "Fix Macro Keybindings",
         "category": "Nexus"
       },
       {
@@ -2853,7 +2858,10 @@
         },
         "nexus.sftp.remoteWatchMode": {
           "type": "string",
-          "enum": ["auto", "polling"],
+          "enum": [
+            "auto",
+            "polling"
+          ],
           "default": "auto",
           "order": 23,
           "markdownDescription": "How the File Explorer detects remote filesystem changes. `auto` prefers recursive `inotifywait` watching when available and otherwise keeps polling enabled as the safety net. `polling` disables remote watch probes and uses only the interval set by `autoRefreshInterval`."
@@ -2988,12 +2996,13 @@
           "order": 20,
           "markdownDescription": "Directory where Nexus scripts live. Relative paths are resolved against the workspace root. When no workspace is open, scripts are stored in the extension's global storage regardless of this setting. An absolute path is used as-is in both cases. Use the Nexus Settings page (Command Center → Settings) for a folder picker."
         },
-        "nexus.scripts.defaultTimeout": {
+        "nexus.scripts.defaultTimeoutSeconds": {
           "type": "number",
-          "default": 30000,
-          "minimum": 100,
+          "default": 30,
+          "minimum": 1,
+          "maximum": 2147483,
           "order": 21,
-          "markdownDescription": "Default per-wait timeout in milliseconds, used by `waitFor` / `expect` / `waitAny` when a script doesn't pass its own `timeout`. Override per script via the `@default-timeout` JSDoc tag, or per call via the `timeout` option."
+          "markdownDescription": "Default per-wait timeout in seconds, used by `waitFor` / `expect` / `waitAny` when a script doesn't pass its own `timeout`. Override per script via the `@default-timeout` JSDoc tag, or per call via the `timeout` option."
         },
         "nexus.scripts.macroPolicy": {
           "type": "string",
@@ -3009,12 +3018,21 @@
           "order": 22,
           "markdownDescription": "How the script runtime treats macro auto-triggers on the bound session while a script is running."
         },
+        "nexus.scripts.maxRuntimeSeconds": {
+          "type": "number",
+          "default": 1800,
+          "minimum": 0,
+          "maximum": 2147483,
+          "order": 23,
+          "markdownDescription": "Maximum total runtime for a script in seconds. 0 disables the cap. The script is stopped with reason `max-runtime-exceeded` if it exceeds this. Values are capped at 2147483 seconds, the largest safe VS Code/Node timer delay."
+        },
         "nexus.scripts.maxRuntimeMs": {
           "type": "number",
           "default": 1800000,
-          "minimum": 10000,
-          "order": 23,
-          "markdownDescription": "Maximum total runtime for a script in milliseconds. 0 disables the cap. The script is stopped with code 'MaxRuntimeExceeded' if it exceeds this."
+          "minimum": 0,
+          "maximum": 2147483647,
+          "order": 24,
+          "markdownDescription": "Legacy maximum total runtime for a script in milliseconds. Prefer `nexus.scripts.maxRuntimeSeconds`. 0 disables the cap."
         }
       }
     }

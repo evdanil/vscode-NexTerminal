@@ -941,4 +941,80 @@ describe("MacroAutoTrigger", () => {
     expect(sent).toEqual(["secret123\n"]);
     obs.dispose();
   });
+
+  it("keeps missing triggerScope compatible with all-terminal matching", () => {
+    setConfig([
+      { name: "legacy", text: "legacy\n", triggerPattern: "Prompt:" }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sentA: string[] = [];
+    const sentB: string[] = [];
+    const obsA = trigger.createObserver((text) => sentA.push(text), () => true, "a");
+    const obsB = trigger.createObserver((text) => sentB.push(text), () => false, "b");
+
+    obsB.onOutput("Prompt:");
+    flush();
+
+    expect(sentA).toEqual([]);
+    expect(sentB).toEqual(["legacy\n"]);
+    obsA.dispose();
+    obsB.dispose();
+  });
+
+  it("limits active-session scoped macros to the active observer", () => {
+    setConfig([
+      { name: "scoped", text: "scoped\n", triggerPattern: "Prompt:", triggerScope: "active-session" }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sentA: string[] = [];
+    const sentB: string[] = [];
+    const obsA = trigger.createObserver((text) => sentA.push(text), () => true, "a");
+    const obsB = trigger.createObserver((text) => sentB.push(text), () => false, "b");
+
+    obsB.onOutput("Prompt:");
+    flush();
+    obsA.onOutput("Prompt:");
+    flush();
+
+    expect(sentA).toEqual(["scoped\n"]);
+    expect(sentB).toEqual([]);
+    obsA.dispose();
+    obsB.dispose();
+  });
+
+  it("limits profile scoped macros to matching observer profile ids", () => {
+    setConfig([
+      { name: "profile", text: "profile\n", triggerPattern: "Prompt:", triggerScope: "profile", triggerProfileId: "router" }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sentA: string[] = [];
+    const sentB: string[] = [];
+    const obsA = trigger.createObserver((text) => sentA.push(text), () => true, "a", "router");
+    const obsB = trigger.createObserver((text) => sentB.push(text), () => true, "b", "switch");
+
+    obsB.onOutput("Prompt:");
+    flush();
+    obsA.onOutput("Prompt:");
+    flush();
+
+    expect(sentA).toEqual(["profile\n"]);
+    expect(sentB).toEqual([]);
+    obsA.dispose();
+    obsB.dispose();
+  });
+
+  it("fails closed for unknown trigger scopes", () => {
+    setConfig([
+      { name: "bad-scope", text: "secret\n", triggerPattern: "Prompt:", triggerScope: "typo" }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text), () => true, "a");
+
+    obs.onOutput("Prompt:");
+    flush();
+
+    expect(sent).toEqual([]);
+    obs.dispose();
+  });
 });

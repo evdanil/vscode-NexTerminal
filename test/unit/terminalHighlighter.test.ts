@@ -293,6 +293,12 @@ describe("TerminalHighlighter", () => {
     expect(result).toContain("\x1b[31merror\x1b[39m");
   });
 
+  it("applies non-global rules only to the first match without hanging", () => {
+    setConfig(true, [{ pattern: "\\b0\\b", color: "red", flags: "i" }]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("0 0 0")).toBe("\x1b[31m0\x1b[39m 0 0");
+  });
+
   it("does not highlight inside extended foreground color (38;5;N)", () => {
     setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi", bold: true }]);
     const h = new TerminalHighlighter();
@@ -479,6 +485,23 @@ describe("TerminalHighlighter", () => {
     setConfig(true, [{ pattern: "\\b", color: "red", flags: "g" }]);
     const h = new TerminalHighlighter();
     expect(h.apply("hello")).toBe("hello");
+  });
+
+  it("rejects unsafe nested-quantifier highlight patterns", () => {
+    setConfig(true, [
+      { pattern: "(a+)+$", color: "red", flags: "g" },
+      { pattern: "OK", color: "green", flags: "g" }
+    ]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("OK")).toBe("\x1b[32mOK\x1b[39m");
+    expect(h.apply("aaaa")).toBe("aaaa");
+  });
+
+  it("ignores malformed persisted rule arrays without throwing", () => {
+    mockConfig = { enabled: true, rules: [null, { pattern: "OK", color: "green", flags: "g" }] };
+    const h = new TerminalHighlighter();
+    expect(() => h.reload()).not.toThrow();
+    expect(h.apply("OK")).toBe("\x1b[32mOK\x1b[39m");
   });
 
   it("raw SGR code outside foreground range is rejected", () => {

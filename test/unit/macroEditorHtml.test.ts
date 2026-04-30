@@ -81,6 +81,24 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("checked");
   });
 
+  it("labels secret macro all-terminal scope as the compatibility default", () => {
+    const macros: TerminalMacro[] = [
+      { name: "Secret", text: "password", secret: true, triggerPattern: "Password:" }
+    ];
+    const html = render(macros, 0);
+    expect(html).toContain("macro-trigger-scope");
+    expect(html).toContain("All terminals (compatibility default)");
+    expect(html).toContain("Recommended for secrets");
+  });
+
+  it("renders auto-trigger scope with the themed custom select", () => {
+    const html = render([], null);
+    expect(html).toContain('id="macro-trigger-scope-wrapper"');
+    expect(html).toContain('input type="hidden" id="macro-trigger-scope"');
+    expect(html).not.toContain('<select id="macro-trigger-scope">');
+    expect(html).not.toContain("<option ");
+  });
+
   it("renders binding input field", () => {
     const html = render([], null);
     expect(html).toContain("macro-binding");
@@ -157,6 +175,7 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("error-name");
     expect(html).toContain("error-text");
     expect(html).toContain("error-binding");
+    expect(html).toContain("error-trigger-profile");
   });
 
   it("renders textarea with hint about newlines", () => {
@@ -169,5 +188,27 @@ describe("renderMacroEditorHtml", () => {
     const html = render([], null);
     expect(html).toContain("isValidBinding");
     expect(html).toContain("VALID_PATTERN");
+  });
+
+  it("includes client-side scope and regex safety validation", () => {
+    const html = render([], null);
+    expect(html).toContain("updateTriggerProfileState");
+    expect(html).toContain('triggerVal && triggerScope === "profile" && !triggerProfileId');
+    expect(html).toContain("validateRegexSafety");
+    expect(html).not.toContain("NESTED_QUANTIFIER_RE");
+  });
+
+  it("renders matching profile choices by display name instead of raw ids", () => {
+    const html = renderMacroEditorHtml([], null, nonce, [
+      { id: "52a3b610-f871-462c-9541-20d13c0f7e56", name: "Core Router", kind: "server" },
+      { id: "61a3b610-f871-462c-9541-20d13c0f7e57", name: "Core Router", kind: "serial" },
+      { id: "console-1", name: "Lab Console", kind: "serial" }
+    ]);
+
+    expect(html).toContain("Core Router (Server, 52a3b610)");
+    expect(html).toContain("Core Router (Serial, 61a3b610)");
+    expect(html).toContain("Lab Console (Serial)");
+    expect(html).not.toContain('placeholder="Server or serial profile id"');
+    expect(html).not.toContain('type="text" id="macro-trigger-profile"');
   });
 });

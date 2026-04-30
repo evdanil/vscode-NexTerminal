@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { MacroTreeItem } from "../ui/macroTreeProvider";
 import { MacroEditorPanel } from "../ui/macroEditorPanel";
+import type { MacroProfileOptionInput } from "../ui/macroProfileOptions";
 import {
   bindingToContextKey,
   bindingToDisplayLabel,
@@ -123,7 +124,11 @@ async function promptForBinding(
   return normalized;
 }
 
-export function registerMacroCommands(): vscode.Disposable[] {
+export function registerMacroCommands(profileProvider?: () => MacroProfileOptionInput[]): vscode.Disposable[] {
+  if (profileProvider) {
+    MacroEditorPanel.setProfileProvider(profileProvider);
+  }
+
   return [
     vscode.commands.registerCommand("nexus.macro.add", () => {
       MacroEditorPanel.openNew();

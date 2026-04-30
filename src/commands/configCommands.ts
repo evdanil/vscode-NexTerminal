@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
-import type { TerminalMacro } from "../models/terminalMacro";
+import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
 import type { SecretVault } from "../services/ssh/contracts";
 import {
   passwordSecretKey,
@@ -26,6 +26,11 @@ import {
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import { getMacros, saveMacros, getActiveMacroStore } from "../macroSettings";
+import { validateSettingUpdate } from "../ui/settingsValidation";
+import { validateAndSanitizeHighlightRules } from "../utils/highlightRuleValidation";
+import { validateRegexSafety } from "../utils/regexSafety";
+import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
+import { MAX_SCRIPT_WAIT_TIMEOUT_MS } from "../services/scripts/defaultTimeout";
 
 interface MacroEntry {
   name?: string;
@@ -109,8 +114,10 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.serial", key: "rpcTimeout" },
   { section: "nexus.sftp", key: "remoteWatchMode" },
   { section: "nexus.scripts", key: "path" },
+  { section: "nexus.scripts", key: "defaultTimeoutSeconds" },
   { section: "nexus.scripts", key: "defaultTimeout" },
   { section: "nexus.scripts", key: "macroPolicy" },
+  { section: "nexus.scripts", key: "maxRuntimeSeconds" },
   { section: "nexus.scripts", key: "maxRuntimeMs" }
 ];
 
@@ -131,6 +138,7 @@ function readSettings(): Record<string, unknown> {
 
 async function applySettings(settings: Record<string, unknown>): Promise<void> {
   const allowedSettings: Record<string, unknown> = {};
+  let invalidCount = 0;
   for (const [fullKey, value] of Object.entries(settings)) {
     if (SETTINGS_KEY_SET.has(fullKey)) {
       allowedSettings[fullKey] = value;
@@ -147,8 +155,41 @@ async function applySettings(settings: Record<string, unknown>): Promise<void> {
     }
     const section = fullKey.substring(0, lastDot);
     const key = fullKey.substring(lastDot + 1);
+    let updateValue = value;
+    if (fullKey === "nexus.terminal.highlighting.rules") {
+      const rules = validateAndSanitizeHighlightRules(value);
+      if (!rules) {
+        invalidCount++;
+        continue;
+      }
+      updateValue = rules;
+    } else if (fullKey === "nexus.scripts.maxRuntimeMs") {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > MAX_SCRIPT_RUNTIME_MS) {
+        invalidCount++;
+        continue;
+      }
+    } else if (fullKey === "nexus.scripts.defaultTimeout") {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 100 || value > MAX_SCRIPT_WAIT_TIMEOUT_MS) {
+        invalidCount++;
+        continue;
+      }
+    } else {
+      const validation = validateSettingUpdate(section, key, value);
+      if (!validation.ok) {
+        invalidCount++;
+        continue;
+      }
+      updateValue = validation.value;
+    }
     const config = vscode.workspace.getConfiguration(section);
-    await config.update(key, value, vscode.ConfigurationTarget.Global);
+    await config.update(key, updateValue, vscode.ConfigurationTarget.Global);
+  }
+  if (invalidCount > 0) {
+    void vscode.window.showWarningMessage(
+      invalidCount === 1
+        ? "1 imported Nexus setting had an invalid value and was skipped."
+        : `${invalidCount} imported Nexus settings had invalid values and were skipped.`
+    );
   }
 }
 
@@ -538,6 +579,70 @@ function plural(count: number, singular: string, pluralForm = `${singular}s`): s
   return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
+const VALID_MACRO_TRIGGER_SCOPES = new Set<MacroTriggerScope>(["all-terminals", "active-session", "profile"]);
+
+function stripMacroTrigger(macro: TerminalMacro): void {
+  delete macro.triggerPattern;
+  delete macro.triggerCooldown;
+  delete macro.triggerInterval;
+  delete macro.triggerInitiallyDisabled;
+  delete macro.triggerScope;
+  delete macro.triggerProfileId;
+}
+
+function isSafeMacroTriggerPattern(pattern: string): boolean {
+  const safety = validateRegexSafety(pattern);
+  if (!safety.ok) return false;
+  try {
+    const regex = new RegExp(pattern);
+    return !regex.test("");
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
+  const macro: TerminalMacro = { ...raw };
+  if (typeof macro.keybinding === "string" && !isValidBinding(macro.keybinding)) {
+    delete macro.keybinding;
+  }
+
+  const triggerPattern = typeof macro.triggerPattern === "string" ? macro.triggerPattern.trim() : "";
+  if (!triggerPattern || !isSafeMacroTriggerPattern(triggerPattern)) {
+    stripMacroTrigger(macro);
+    return macro;
+  }
+  macro.triggerPattern = triggerPattern;
+
+  if (macro.triggerScope !== undefined && !VALID_MACRO_TRIGGER_SCOPES.has(macro.triggerScope)) {
+    stripMacroTrigger(macro);
+    return macro;
+  }
+
+  if (macro.triggerScope === "profile") {
+    const profileId = typeof macro.triggerProfileId === "string" ? macro.triggerProfileId.trim() : "";
+    if (!profileId) {
+      stripMacroTrigger(macro);
+      return macro;
+    }
+    macro.triggerProfileId = profileId;
+  } else {
+    delete macro.triggerProfileId;
+  }
+
+  if (typeof macro.triggerCooldown !== "number" || !Number.isFinite(macro.triggerCooldown) || macro.triggerCooldown < 0 || macro.triggerCooldown > 300) {
+    delete macro.triggerCooldown;
+  }
+  if (typeof macro.triggerInterval !== "number" || !Number.isFinite(macro.triggerInterval) || macro.triggerInterval < 1 || macro.triggerInterval > 86400) {
+    delete macro.triggerInterval;
+  }
+  if (typeof macro.triggerInitiallyDisabled !== "boolean") {
+    delete macro.triggerInitiallyDisabled;
+  }
+
+  return macro;
+}
+
 /**
  * Extract macros from an import payload, supporting both the new (top-level `macros`)
  * and legacy (settings + name-matched secret blob) formats. Secret text is resolved from
@@ -561,9 +666,9 @@ export function collectIncomingMacros(
       if (m.secret) {
         const plain = (m.id && byId.get(m.id)) ?? (m.name && byName.get(m.name)) ?? "";
         if (!plain) unresolvedCount++;
-        return { ...m, text: plain };
+        return sanitizeImportedMacro({ ...m, text: plain });
       }
-      return { ...m };
+      return sanitizeImportedMacro({ ...m });
     });
     return { macros, unresolvedCount };
   }
@@ -582,9 +687,9 @@ export function collectIncomingMacros(
       if (m.secret) {
         const plain = byName.get(m.name ?? "") ?? m.text ?? "";
         if (plain === "") unresolvedCount++;
-        return { ...m, text: plain };
+        return sanitizeImportedMacro({ ...m, text: plain });
       }
-      return { ...m };
+      return sanitizeImportedMacro({ ...m });
     });
     return { macros, unresolvedCount };
   }

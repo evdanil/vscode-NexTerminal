@@ -19,6 +19,10 @@ package-lock.json
 **/.idea/**
 .github/**
 .claude/**
+.codex
+AGENTS.md
+.specify/**
+specs/**
 .worktrees/**
 CLAUDE.md
 

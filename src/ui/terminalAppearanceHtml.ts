@@ -2,6 +2,7 @@ import type { ColorScheme, TerminalFontConfig } from "../models/colorScheme";
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
+import { serializeForInlineScript } from "./shared/inlineScriptData";
 
 interface SwatchDef {
   key: string;
@@ -86,6 +87,7 @@ export function renderTerminalAppearanceHtml(
   nonce: string
 ): string {
   const activeScheme = schemes.find((s) => s.id === activeSchemeId);
+  const activeSchemeJson = activeScheme ? serializeForInlineScript(activeScheme) : "null";
   const deleteDisabled = !activeScheme || activeScheme.builtIn;
 
   const fontFamily = fontConfig?.family ?? "";
@@ -386,7 +388,7 @@ export function renderTerminalAppearanceHtml(
       }
 
       // Apply initial preview from server-rendered data (inline styles blocked by CSP)
-      var initialScheme = ${activeScheme ? JSON.stringify(activeScheme) : "null"};
+      var initialScheme = ${activeSchemeJson};
       updatePreview(initialScheme);
     })();
   </script>

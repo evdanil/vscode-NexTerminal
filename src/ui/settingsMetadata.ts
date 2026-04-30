@@ -197,8 +197,8 @@ export const SETTINGS_META: SettingMeta[] = [
     category: "terminal",
     subgroup: "General",
     enumOptions: [
-      { label: "Panel", value: "panel", recommended: true },
-      { label: "Editor Tab", value: "editor" }
+      { label: "Panel", value: "panel" },
+      { label: "Editor Tab", value: "editor", recommended: true }
     ]
   },
   // --- UI ---
@@ -364,6 +364,16 @@ export const SETTINGS_META: SettingMeta[] = [
   },
   // --- Terminal > Macro Auto-Trigger ---
   {
+    key: "autoTrigger",
+    section: "nexus.terminal.macros",
+    label: "Macro Auto-Trigger",
+    type: "boolean",
+    category: "terminal",
+    subgroup: "Macro Auto-Trigger",
+    description: "Enable auto-trigger for macros with a trigger pattern. Secret macros default to all terminals for compatibility; use per-macro scope for safer matching.",
+    default: true
+  },
+  {
     key: "defaultCooldown",
     section: "nexus.terminal.macros",
     label: "Default Trigger Cooldown",
@@ -414,28 +424,30 @@ export const SETTINGS_META: SettingMeta[] = [
     default: ".nexus/scripts"
   },
   {
-    key: "defaultTimeout",
+    key: "defaultTimeoutSeconds",
     section: "nexus.scripts",
     label: "Default Wait Timeout",
     type: "number",
     category: "scripts",
     description:
       "Used by waitFor / expect / waitAny when the call site does not pass its own timeout. Override per-script with the @default-timeout JSDoc tag.",
-    min: 100,
-    unit: "ms",
-    default: 30000
+    min: 1,
+    max: 2147483,
+    unit: "seconds",
+    default: 30
   },
   {
-    key: "maxRuntimeMs",
+    key: "maxRuntimeSeconds",
     section: "nexus.scripts",
     label: "Max Script Runtime",
     type: "number",
     category: "scripts",
     description:
-      "Overall cap per run. Set to 0 to disable. Scripts over the cap stop with reason max-runtime-exceeded.",
+      "Overall cap per run in seconds. Set to 0 to disable. Scripts over the cap stop with reason max-runtime-exceeded.",
     min: 0,
-    unit: "ms",
-    default: 1800000
+    max: 2147483,
+    unit: "seconds",
+    default: 1800
   },
   {
     key: "macroPolicy",

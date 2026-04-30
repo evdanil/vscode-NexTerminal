@@ -457,6 +457,22 @@ describe("config import command (legacy)", () => {
     expect(configStore.has("badkey")).toBe(false);
   });
 
+  it("skips unsafe imported highlighting rules", async () => {
+    const exportData = makeExportData({
+      settings: {
+        "nexus.terminal.highlighting.rules": [
+          { pattern: "^(?:a+)+$", color: "red", flags: "g" }
+        ]
+      }
+    });
+    await runImport(exportData);
+
+    expect(configStore.has("nexus.terminal.highlighting.rules")).toBe(false);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
+  });
+
   it("generates IDs for items with missing IDs", async () => {
     const exportData = makeExportData({
       servers: [{ ...makeServer(), id: "" }],

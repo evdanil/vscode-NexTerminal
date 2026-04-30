@@ -12,13 +12,22 @@ import {
 } from "../macroSettings";
 import type { TerminalMacro } from "../models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
+import { validateRegexSafety } from "../utils/regexSafety";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
+import type { MacroProfileOptionInput } from "./macroProfileOptions";
+
+type MacroProfileProvider = () => MacroProfileOptionInput[];
 
 export class MacroEditorPanel {
   private static instance: MacroEditorPanel | undefined;
+  private static profileProvider: MacroProfileProvider = () => [];
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
   private selectedIndex: number | null = null;
+
+  public static setProfileProvider(provider: MacroProfileProvider): void {
+    MacroEditorPanel.profileProvider = provider;
+  }
 
   private constructor(initialIndex: number | null) {
     this.selectedIndex = initialIndex;
@@ -67,7 +76,7 @@ export class MacroEditorPanel {
     if (this.selectedIndex !== null && this.selectedIndex >= macros.length) {
       this.selectedIndex = macros.length > 0 ? macros.length - 1 : null;
     }
-    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce);
+    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider());
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
@@ -113,10 +122,75 @@ export class MacroEditorPanel {
         const macros = getMacros();
         const triggerInitiallyDisabled = msg.triggerInitiallyDisabled as boolean | undefined;
         const triggerInterval = msg.triggerInterval as number | undefined | null;
-
-        const macro: TerminalMacro = { name, text };
-        if (secret) macro.secret = true;
+        const triggerScope = msg.triggerScope as TerminalMacro["triggerScope"] | undefined;
+        const triggerProfileId = msg.triggerProfileId as string | null | undefined;
         const triggerPattern = ((msg.triggerPattern as string | null) ?? "").trim();
+        const safeScope = triggerScope && ["all-terminals", "active-session", "profile"].includes(triggerScope)
+          ? triggerScope
+          : undefined;
+
+        if (triggerPattern) {
+          const safety = validateRegexSafety(triggerPattern);
+          if (!safety.ok) {
+            void this.panel.webview.postMessage({
+              type: "saveError",
+              field: "trigger",
+              message: safety.message
+            });
+            return;
+          }
+          try {
+            const regex = new RegExp(triggerPattern);
+            if (regex.test("")) {
+              void this.panel.webview.postMessage({
+                type: "saveError",
+                field: "trigger",
+                message: "Pattern must not match empty strings."
+              });
+              return;
+            }
+          } catch (error) {
+            void this.panel.webview.postMessage({
+              type: "saveError",
+              field: "trigger",
+              message: error instanceof Error ? error.message : "Invalid regex."
+            });
+            return;
+          }
+        }
+        if (triggerPattern && safeScope === "profile") {
+          const profileId = typeof triggerProfileId === "string" ? triggerProfileId.trim() : "";
+          const knownProfileIds = new Set(MacroEditorPanel.profileProvider().map((profile) =>
+            typeof profile === "string" ? profile : profile.id
+          ));
+          if (!profileId) {
+            void this.panel.webview.postMessage({
+              type: "saveError",
+              field: "trigger-profile",
+              message: "Matching profile scope requires a profile id."
+            });
+            return;
+          }
+          if (knownProfileIds.size > 0 && !knownProfileIds.has(profileId)) {
+            void this.panel.webview.postMessage({
+              type: "saveError",
+              field: "trigger-profile",
+              message: "Unknown profile id."
+            });
+            return;
+          }
+        }
+
+        const existingMacro = index !== null && index < macros.length ? macros[index] : undefined;
+        const macro: TerminalMacro = { ...existingMacro, name, text };
+        delete macro.keybinding;
+        delete macro.slot;
+        delete macro.triggerPattern;
+        delete macro.triggerInitiallyDisabled;
+        delete macro.triggerInterval;
+        delete macro.triggerProfileId;
+        if (secret) macro.secret = true;
+        else delete macro.secret;
         const triggerCooldown = msg.triggerCooldown as number | undefined;
         if (triggerPattern) {
           macro.triggerPattern = triggerPattern;
@@ -128,6 +202,17 @@ export class MacroEditorPanel {
           }
         }
         if (triggerCooldown !== undefined && triggerCooldown !== DEFAULT_TRIGGER_COOLDOWN) macro.triggerCooldown = triggerCooldown;
+        else delete macro.triggerCooldown;
+        if (triggerPattern && safeScope) {
+          macro.triggerScope = safeScope;
+        } else {
+          delete macro.triggerScope;
+        }
+        if (triggerPattern && macro.triggerScope === "profile" && typeof triggerProfileId === "string" && triggerProfileId.trim()) {
+          macro.triggerProfileId = triggerProfileId.trim();
+        } else {
+          delete macro.triggerProfileId;
+        }
         const normalizedBinding = normalizeBinding(bindingRaw);
         if (normalizedBinding) {
           if (!isValidBinding(normalizedBinding)) {

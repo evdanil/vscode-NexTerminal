@@ -132,7 +132,7 @@ Every field except `@nexus-script` is optional.
 | `@description` | single-line string | empty | Shown as tooltip in the sidebar. |
 | `@target-type` | `ssh` or `serial` | unrestricted | Filters the session picker so only matching sessions are offered. |
 | `@target-profile` | server name or serial profile name | none | When a session of this profile is active, it's auto-selected without showing the picker. |
-| `@default-timeout` | duration: `1500ms`, `30s`, `5m` | `nexus.scripts.defaultTimeout` (30s) | Used by `waitFor`/`expect`/`waitAny` when no per-call `timeout` is provided. |
+| `@default-timeout` | duration: `1500ms`, `30s`, `5m` | `nexus.scripts.defaultTimeoutSeconds` (30s) | Used by `waitFor`/`expect`/`waitAny` when no per-call `timeout` is provided. |
 | `@lock-input` | flag — no value | absent (terminal stays interactive) | Makes the bound terminal read-only for the run. User keystrokes are discarded with a one-shot notice line. |
 | `@allow-macros` | comma-separated macro names | `[]` | Names of macros to keep enabled on the bound session while the script runs. Default policy (suspend-all) suspends everything else. |
 
@@ -208,7 +208,7 @@ switch (r.index) {
 
 | Option | Type | Default | Notes |
 |---|---|---|---|
-| `timeout` | `number` (ms) | `@default-timeout` header or `nexus.scripts.defaultTimeout` setting | Upper bound on the wait. |
+| `timeout` | `number` (ms) | `@default-timeout` header or `nexus.scripts.defaultTimeoutSeconds` setting | Upper bound on the wait. |
 | `lookback` | `number` | `1024` on the first wait of the script, `0` afterwards | Bytes of recent output to scan before waiting for new bytes. See [match window semantics](#match-window-semantics). |
 
 ### Sending input
@@ -419,7 +419,7 @@ Nexus distinguishes two flavours of failure and the UI treats them differently:
 - **Expected failures** — an uncaught `Timeout`, `ConnectionLost`, `Stopped`, or `Cancelled`. These are the documented error contract; the run ends quietly in `failed` and nothing pops up.
 - **Unexpected failures** — a syntax error, `TypeError`, module-load error, or a Worker crash. VS Code surfaces an error toast with a **Show Output** button so the stack is one click away.
 
-If you want to shut a script down from the host side (e.g. a deploy pipeline's watchdog), call the `Nexus: Stop Nexus Script` command or rely on the workspace setting `nexus.scripts.maxRuntimeMs` — a default 30-minute overall cap that force-stops runaway scripts.
+If you want to shut a script down from the host side (e.g. a deploy pipeline's watchdog), call the `Nexus: Stop Nexus Script` command or rely on the workspace setting `nexus.scripts.maxRuntimeSeconds` — a default 30-minute overall cap that force-stops runaway scripts. Set it to `0` to disable the cap. The legacy `nexus.scripts.maxRuntimeMs` setting is still read when the seconds setting is absent.
 
 ---
 
@@ -575,9 +575,10 @@ if (session.type === "serial") {
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `nexus.scripts.path` | string | `.nexus/scripts` | Workspace-relative directory where scripts live. Created automatically on first script command. |
-| `nexus.scripts.defaultTimeout` | number (ms) | `30000` | Default per-wait timeout when neither the script header nor the `opts.timeout` argument specifies one. |
+| `nexus.scripts.defaultTimeoutSeconds` | number (seconds) | `30` | Default per-wait timeout when neither the script header nor the `opts.timeout` argument specifies one. The legacy `nexus.scripts.defaultTimeout` millisecond key is still read when the seconds setting is absent. |
 | `nexus.scripts.macroPolicy` | `"suspend-all"` \| `"keep-enabled"` | `"suspend-all"` | Default macro policy while a script runs. |
-| `nexus.scripts.maxRuntimeMs` | number (ms) | `1800000` (30 min) | Overall runtime cap. When a script exceeds this, it's stopped automatically and tagged with reason `max-runtime-exceeded`. Set `0` to disable. Minimum effective cap is 10 s. |
+| `nexus.scripts.maxRuntimeSeconds` | number (seconds) | `1800` (30 min) | Overall runtime cap. When a script exceeds this, it's stopped automatically and tagged with reason `max-runtime-exceeded`. Set `0` to disable. Positive values below 10 s are raised to the minimum effective cap; values above `2147483` are clamped to the largest safe timer delay. |
+| `nexus.scripts.maxRuntimeMs` | number (ms) | `1800000` (30 min) | Legacy compatibility setting read only when `maxRuntimeSeconds` is absent. Values above `2147483647` are rejected/clamped. |
 
 Settings changes take effect on the **next** script run — they don't retroactively alter runs already in flight.
 
@@ -618,7 +619,7 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Script won't stop / runs forever | — | Open the Command Palette → `Nexus: Stop Nexus Script` (default `Ctrl+Alt+S` / `⌘⌥S`). The status bar tooltip also has a per-script ◼ Stop link. As a last resort, `nexus.scripts.maxRuntimeMs` (default 30 min) force-stops runaways automatically. |
+| Script won't stop / runs forever | — | Open the Command Palette → `Nexus: Stop Nexus Script` (default `Ctrl+Alt+S` / `⌘⌥S`). The status bar tooltip also has a per-script ◼ Stop link. As a last resort, `nexus.scripts.maxRuntimeSeconds` (default 30 min, `0` disables) force-stops runaways automatically. The legacy `nexus.scripts.maxRuntimeMs` setting is still honored when seconds is not configured. |
 | "▶ Run in Nexus" CodeLens doesn't appear above my file | Missing `@nexus-script` marker in the leading JSDoc block | Add it |
 | Autocomplete is missing in my script | First-time scaffolding hasn't run yet | Trigger any Nexus script command once; reopen the file. If you edited `<scriptsDir>/types/nexus-scripts.d.ts` by hand, delete it — Nexus will rewrite it from the bundled version on the next run. |
 | `expect` always times out | Pattern doesn't match the actual output (ANSI, anchors, banner noise) | Log `await tail()` in the `catch` to see what the session actually sent; tighten the pattern accordingly |
@@ -635,7 +636,7 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 
 **Scripts run with the same privileges as the Nexus Terminal extension.** Treat a `.js` file you're about to run the same way you'd treat a shell script or a PowerShell script someone sent you — open it and read it first.
 
-- Scripts execute inside a `node:worker_threads` Worker thread (separate V8 isolate), **not** a full VS Code sandbox. They have full access to Node's `process` object, `globalThis`, and the Nexus script API. They cannot import `vscode`, read your workspace files, or spawn subprocesses — those capabilities are deliberately omitted from the global surface (see **Limitations**). But that isolation is a *convenience* for correctness and cheap termination, not a security boundary against hostile code.
+- Scripts execute as local Node code inside a `node:worker_threads` Worker thread (separate V8 isolate), **not** a full VS Code sandbox. They have full access to Node's `process` object, `globalThis`, and the Nexus script API. They cannot import `vscode`, read your workspace files, or spawn subprocesses — those capabilities are deliberately omitted from the global surface (see **Limitations**). But that isolation is a *convenience* for correctness and cheap termination, not a security boundary against hostile code.
 - Secret prompts (`prompt(msg, { password: true })`) are masked in the input box and the returned value is never written to the Output Channel by the runtime. Anything the script explicitly logs — via `log.info(value)`, for example — is written verbatim, so don't hand-log the result of a password prompt.
 - The runtime never reads your workspace outside the configured `nexus.scripts.path` directory (default `.nexus/scripts`). It does re-write the bundled `<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json` on first run and after version bumps. If you customise those files in place, your edits are preserved only until the bundled version string changes — then they're overwritten. Keep local customisations in separate files.
 

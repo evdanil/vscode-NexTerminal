@@ -1,57 +1,11 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
-import { renderHighlightRuleEditorHtml, type HighlightRule } from "./highlightRuleEditorHtml";
-
-const VALID_COLORS = new Set([
-  "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
-  "brightBlack", "brightRed", "brightGreen", "brightYellow", "brightBlue", "brightMagenta", "brightCyan", "brightWhite"
-]);
-
-const VALID_FLAGS_RE = /^[gi]*$/;
-const REDOS_RE = /(\+|\*|\{[^}]*\})\)(\+|\*|\{)/;
-const MAX_RULES = 100;
-const MAX_PATTERN_LENGTH = 500;
-
-function isForegroundCode(code: number): boolean {
-  return (code >= 30 && code <= 37) || (code >= 90 && code <= 97);
-}
-
-function validateAndSanitizeRules(raw: unknown): HighlightRule[] | undefined {
-  if (!Array.isArray(raw)) return undefined;
-  if (raw.length > MAX_RULES) return undefined;
-
-  const result: HighlightRule[] = [];
-  for (const item of raw) {
-    if (typeof item !== "object" || item === null) return undefined;
-    const obj = item as Record<string, unknown>;
-    if (typeof obj.pattern !== "string" || obj.pattern.length === 0) return undefined;
-    if (obj.pattern.length > MAX_PATTERN_LENGTH) return undefined;
-    if (typeof obj.color !== "string") return undefined;
-
-    // Validate color against named colors (case-sensitive match) or SGR range
-    if (!VALID_COLORS.has(obj.color)) {
-      const code = Number(obj.color);
-      if (!Number.isFinite(code) || !isForegroundCode(code)) return undefined;
-    }
-
-    // Check for ReDoS
-    if (REDOS_RE.test(obj.pattern)) {
-      continue; // skip this rule silently
-    }
-
-    // Validate optional fields
-    const flags = typeof obj.flags === "string" && VALID_FLAGS_RE.test(obj.flags) ? obj.flags : undefined;
-    const bold = typeof obj.bold === "boolean" ? obj.bold : undefined;
-    const underline = typeof obj.underline === "boolean" ? obj.underline : undefined;
-
-    const rule: HighlightRule = { pattern: obj.pattern, color: obj.color };
-    if (flags !== undefined) rule.flags = flags;
-    if (bold !== undefined) rule.bold = bold;
-    if (underline !== undefined) rule.underline = underline;
-    result.push(rule);
-  }
-  return result;
-}
+import { renderHighlightRuleEditorHtml } from "./highlightRuleEditorHtml";
+import {
+  validateAndSanitizeHighlightRules,
+  validateAndSanitizeHighlightRulesWithError,
+  type HighlightRule
+} from "../utils/highlightRuleValidation";
 
 export class HighlightRuleEditorPanel {
   private static instance: HighlightRuleEditorPanel | undefined;
@@ -98,7 +52,7 @@ export class HighlightRuleEditorPanel {
 
   private readRules(): HighlightRule[] {
     const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
-    return config.get<HighlightRule[]>("rules", []);
+    return validateAndSanitizeHighlightRules(config.get<unknown>("rules", [])) ?? [];
   }
 
   private pushRulesUpdate(): void {
@@ -112,13 +66,26 @@ export class HighlightRuleEditorPanel {
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
     switch (msg.type) {
       case "saveRules": {
-        const validated = validateAndSanitizeRules(msg.rules);
-        if (!validated) {
-          void vscode.window.showErrorMessage("Invalid highlighting rules data.");
+        const validation = validateAndSanitizeHighlightRulesWithError(msg.rules);
+        if (!validation.ok) {
+          void this.panel.webview.postMessage({
+            type: "saveResult",
+            ok: false,
+            message: validation.message
+          });
           return;
         }
-        const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
-        await config.update("rules", validated, vscode.ConfigurationTarget.Global);
+        try {
+          const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
+          await config.update("rules", validation.rules, vscode.ConfigurationTarget.Global);
+          void this.panel.webview.postMessage({ type: "saveResult", ok: true });
+        } catch {
+          void this.panel.webview.postMessage({
+            type: "saveResult",
+            ok: false,
+            message: "Could not save highlighting rules."
+          });
+        }
         break;
       }
       case "resetDefaults": {

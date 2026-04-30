@@ -54,18 +54,19 @@ import { TerminalAppearancePanel } from "./ui/terminalAppearancePanel";
 import { tryRegisterResourceLabelFormatter } from "./services/sftp/resourceLabelFormatter";
 import type { SftpServiceConfig } from "./services/sftp/sftpService";
 import type { SshConnectionOptions } from "./services/ssh/ssh2Connector";
+import { resolveScriptMaxRuntimeMs } from "./services/scripts/maxRuntime";
 
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
 const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
 
 /**
- * Ensure VS Code settings allow macro shortcuts to reach the extension.
+ * Repair VS Code settings so macro shortcuts reach the extension.
  * Three settings are patched:
  *  1. terminal.integrated.commandsToSkipShell — our commands must be in the list
  *  2. terminal.integrated.sendKeybindingsToShell — must be false so the shell doesn't swallow shortcuts
  *  3. window.enableMenuBarMnemonics — must be false so Alt+letter shortcuts don't open menus (Linux/Windows)
  */
-function ensureMacroKeybindingsWork(): void {
+function repairMacroKeybindings(): void {
   // --- 1. commandsToSkipShell ---
   const termConfig = vscode.workspace.getConfiguration("terminal.integrated");
   const inspect = termConfig.inspect<string[]>("commandsToSkipShell");
@@ -117,6 +118,17 @@ function ensureMacroKeybindingsWork(): void {
   } else if (mnemonicInspect?.globalValue === undefined && winConfig.get<boolean>("enableMenuBarMnemonics") === true) {
     void winConfig.update("enableMenuBarMnemonics", false, vscode.ConfigurationTarget.Global);
   }
+}
+
+async function confirmAndRepairMacroKeybindings(): Promise<void> {
+  const picked = await vscode.window.showWarningMessage(
+    "Update global VS Code terminal/menu settings so Nexus macro keybindings reach the extension?",
+    { modal: true },
+    "Fix Keybindings"
+  );
+  if (picked !== "Fix Keybindings") return;
+  repairMacroKeybindings();
+  void vscode.window.showInformationMessage("Nexus macro keybinding settings were updated.");
 }
 
 const ALL_PASSTHROUGH_KEYS = ["b", "e", "g", "j", "k", "n", "o", "p", "r", "w"] as const;
@@ -409,7 +421,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
   const startScriptWatchdog = (sessionId: string, scriptName: string): void => {
-    const maxMs = vscode.workspace.getConfiguration("nexus.scripts").get<number>("maxRuntimeMs", 1_800_000);
+    const scriptsConfig = vscode.workspace.getConfiguration("nexus.scripts");
+    const maxMs = resolveScriptMaxRuntimeMs(scriptsConfig);
     if (typeof maxMs !== "number" || maxMs <= 0) return;
     const capped = Math.max(10_000, Math.floor(maxMs));
     clearScriptWatchdog(sessionId);
@@ -625,7 +638,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await migrateMacroSlots();
   updateMacroContext();
   updatePassthroughContext();
-  ensureMacroKeybindingsWork();
 
   const sftpConfig = vscode.workspace.getConfiguration("nexus.sftp");
   const autoRefreshInterval = sftpConfig.get<number>("autoRefreshInterval", 10);
@@ -880,7 +892,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);
   const configDisposables = registerConfigCommands(core, secretVault, context);
-  const macroDisposables = registerMacroCommands();
+  const macroDisposables = registerMacroCommands(() => {
+    const snapshot = core.getSnapshot();
+    return [
+      ...snapshot.servers.map((server) => ({ id: server.id, name: server.name, kind: "server" as const })),
+      ...snapshot.serialProfiles.map((profile) => ({ id: profile.id, name: profile.name, kind: "serial" as const }))
+    ];
+  });
   const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
       macroAutoTrigger.setDisabled(item.index, true);
@@ -896,6 +914,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const appearanceCommand = vscode.commands.registerCommand("nexus.terminal.appearance", () => {
     TerminalAppearancePanel.open(colorSchemeService);
   });
+  const fixMacroKeybindingsCommand = vscode.commands.registerCommand(
+    "nexus.settings.fixMacroKeybindings",
+    () => confirmAndRepairMacroKeybindings()
+  );
 
   context.subscriptions.push(
     commandCenterView,
@@ -928,6 +950,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     fsRegistration,
     statusBarItem,
     refreshCommand,
+    fixMacroKeybindingsCommand,
     focusSessionCommand,
     filterCommand,
     filterClearCommand,

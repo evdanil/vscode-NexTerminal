@@ -3,6 +3,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { renderSettingsHtml } from "./settingsHtml";
 import { SETTINGS_META, CATEGORY_LABELS } from "./settingsMetadata";
+import { validateSettingUpdate } from "./settingsValidation";
 
 /**
  * Pick a sensible `defaultUri` for `vscode.window.showOpenDialog` when the
@@ -184,11 +185,35 @@ export class SettingsPanel {
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
     switch (msg.type) {
       case "saveSetting": {
-        const section = msg.section as string;
-        const key = msg.key as string;
-        const value = msg.value;
-        const config = vscode.workspace.getConfiguration(section);
-        await config.update(key, value, vscode.ConfigurationTarget.Global);
+        const validation = validateSettingUpdate(msg.section, msg.key, msg.value);
+        if (!validation.ok) {
+          void this.panel.webview.postMessage({
+            type: "saveResult",
+            section: msg.section,
+            key: msg.key,
+            ok: false,
+            message: validation.message
+          });
+          break;
+        }
+        try {
+          const config = vscode.workspace.getConfiguration(validation.meta.section);
+          await config.update(validation.meta.key, validation.value, vscode.ConfigurationTarget.Global);
+          void this.panel.webview.postMessage({
+            type: "saveResult",
+            section: validation.meta.section,
+            key: validation.meta.key,
+            ok: true
+          });
+        } catch {
+          void this.panel.webview.postMessage({
+            type: "saveResult",
+            section: validation.meta.section,
+            key: validation.meta.key,
+            ok: false,
+            message: "Could not save this setting."
+          });
+        }
         break;
       }
       case "browse": {
@@ -257,6 +282,9 @@ export class SettingsPanel {
         break;
       case "openHighlightRuleEditor":
         void vscode.commands.executeCommand("nexus.openHighlightRuleEditor");
+        break;
+      case "openAllSettings":
+        this.switchCategory(undefined);
         break;
       case "reloadWindow": {
         const action = await vscode.window.showInformationMessage(

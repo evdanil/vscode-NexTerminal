@@ -41,7 +41,7 @@ declare global {
   interface WaitOptions {
     /**
      * Maximum wait duration in milliseconds. Defaults to the script header's
-     * `@default-timeout` or the `nexus.scripts.defaultTimeout` setting.
+     * `@default-timeout` or the `nexus.scripts.defaultTimeoutSeconds` setting.
      */
     timeout?: number;
     /**

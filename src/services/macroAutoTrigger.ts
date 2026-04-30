@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import { createAnsiRegex } from "../utils/ansi";
 import { clamp } from "../utils/helpers";
-import type { TerminalMacro } from "../models/terminalMacro";
+import { validateRegexSafety } from "../utils/regexSafety";
+import type { MacroTriggerScope } from "../models/terminalMacro";
 import type { ScriptMacroFilter } from "./scripts/scriptMacroFilter";
 import { getMacros } from "../macroSettings";
 
@@ -9,6 +10,7 @@ const MAX_INPUT_LENGTH = 8192;
 const MAX_BUFFER_LENGTH = 2048;
 export const DEFAULT_TRIGGER_COOLDOWN = 3;
 const CONTROL_CHARS_RE = /[\x00-\x08\x0b-\x1f\x7f]/g;
+const VALID_TRIGGER_SCOPES = new Set<MacroTriggerScope>(["all-terminals", "active-session", "profile"]);
 
 export interface PtyOutputObserver {
   onOutput(text: string): void;
@@ -31,6 +33,8 @@ interface CompiledTriggerRule {
   intervalMs?: number;
   macroIndex: number;
   name: string;
+  triggerScope?: MacroTriggerScope;
+  triggerProfileId?: string;
 }
 
 interface ObserverState {
@@ -88,10 +92,14 @@ export class MacroAutoTrigger implements vscode.Disposable {
     const activeRules = new Map<number, CompiledTriggerRule>();
     for (const [macroIndex, macro] of macros.entries()) {
       if (!macro.triggerPattern) continue;
+      if (macro.triggerScope !== undefined && !VALID_TRIGGER_SCOPES.has(macro.triggerScope)) continue;
       if (macro.triggerInitiallyDisabled) {
         this.defaultDisabledIndexes.add(macroIndex);
       }
       try {
+        if (!validateRegexSafety(macro.triggerPattern).ok) {
+          continue;
+        }
         const regex = new RegExp(macro.triggerPattern);
         if (regex.test("")) continue;
         const rule: CompiledTriggerRule = {
@@ -105,7 +113,9 @@ export class MacroAutoTrigger implements vscode.Disposable {
               ? macro.triggerInterval * 1000
               : undefined,
           macroIndex,
-          name: macro.name
+          name: macro.name,
+          triggerScope: macro.triggerScope,
+          triggerProfileId: macro.triggerProfileId
         };
         this.rules.push(rule);
         this.rulesByIndex.set(macroIndex, rule);
@@ -190,7 +200,8 @@ export class MacroAutoTrigger implements vscode.Disposable {
   public createObserver(
     writeBack: (text: string) => void,
     isActive?: () => boolean,
-    sessionId?: string
+    sessionId?: string,
+    profileId?: string
   ): PtyOutputObserver {
     let boundSessionId = sessionId;
     let buffer = "";
@@ -285,6 +296,12 @@ export class MacroAutoTrigger implements vscode.Disposable {
       const active = !isActive || isActive();
       const now = Date.now();
       for (const rule of this.rules) {
+        if (rule.triggerScope === "active-session" && !active) {
+          continue;
+        }
+        if (rule.triggerScope === "profile" && (!rule.triggerProfileId || rule.triggerProfileId !== profileId)) {
+          continue;
+        }
         if (!this.isMacroAllowedForSession(boundSessionId, rule.macroIndex)) {
           continue;
         }

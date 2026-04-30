@@ -26,6 +26,29 @@ describe("SETTINGS_META", () => {
     expect(meta?.type).toBe("enum");
     expect(meta?.enumOptions?.map((option) => option.value)).toEqual(["auto", "polling"]);
   });
+
+  it("includes macro auto-trigger and seconds-facing script timeout settings", () => {
+    expect(SETTINGS_META.find((item) => item.section === "nexus.terminal.macros" && item.key === "autoTrigger")).toBeDefined();
+
+    const waitTimeout = SETTINGS_META.find((item) => item.section === "nexus.scripts" && item.key === "defaultTimeoutSeconds");
+    expect(waitTimeout).toBeDefined();
+    expect(waitTimeout?.min).toBe(1);
+    expect(waitTimeout?.unit).toBe("seconds");
+    expect(waitTimeout?.default).toBe(30);
+    expect(SETTINGS_META.find((item) => item.section === "nexus.scripts" && item.key === "defaultTimeout")).toBeUndefined();
+
+    const runtime = SETTINGS_META.find((item) => item.section === "nexus.scripts" && item.key === "maxRuntimeSeconds");
+    expect(runtime).toBeDefined();
+    expect(runtime?.min).toBe(0);
+    expect(runtime?.max).toBe(2147483);
+    expect(runtime?.unit).toBe("seconds");
+    expect(runtime?.default).toBe(1800);
+  });
+
+  it("recommends editor tabs for terminal open location to match the package default", () => {
+    const openLocation = SETTINGS_META.find((item) => item.section === "nexus.terminal" && item.key === "openLocation");
+    expect(openLocation?.enumOptions?.find((option) => option.value === "editor")?.recommended).toBe(true);
+  });
 });
 
 describe("formatSettingValueForTree", () => {

@@ -137,4 +137,31 @@ describe("collectIncomingMacros (direct)", () => {
     expect(result!.unresolvedCount).toBe(0);
     expect(result!.macros[0].text).toBe("cleartext-was-here");
   });
+
+  it("sanitizes unsafe imported macro trigger metadata", () => {
+    const payload = {
+      version: 2 as const,
+      exportedAt: "",
+      macros: [
+        {
+          name: "BadScope",
+          text: "secret\n",
+          triggerPattern: "Prompt:",
+          triggerScope: "typo"
+        },
+        {
+          name: "BadRegex",
+          text: "secret\n",
+          triggerPattern: "^(a{1,})+$",
+          triggerScope: "all-terminals"
+        }
+      ] as TerminalMacro[]
+    };
+
+    const result = collectIncomingMacros(payload);
+
+    expect(result?.macros[0].triggerPattern).toBeUndefined();
+    expect(result?.macros[0].triggerScope).toBeUndefined();
+    expect(result?.macros[1].triggerPattern).toBeUndefined();
+  });
 });

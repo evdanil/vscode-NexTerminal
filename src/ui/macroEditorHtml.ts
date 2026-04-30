@@ -1,13 +1,17 @@
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
+import { serializeForInlineScript } from "./shared/inlineScriptData";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { TerminalMacro } from "../models/terminalMacro";
+import { regexSafetyWebviewJs } from "../utils/regexSafety";
+import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./macroProfileOptions";
 
 export function renderMacroEditorHtml(
   macros: TerminalMacro[],
   selectedIndex: number | null,
-  nonce: string
+  nonce: string,
+  profiles: MacroProfileOptionInput[] = []
 ): string {
   const macro = selectedIndex !== null ? macros[selectedIndex] : undefined;
 
@@ -29,6 +33,18 @@ export function renderMacroEditorHtml(
   const cooldownValue = macro?.triggerCooldown ?? 3;
   const intervalValue = macro?.triggerInterval ?? "";
   const triggerInitiallyDisabled = macro?.triggerInitiallyDisabled ?? false;
+  const triggerScope = macro?.triggerScope ?? "all-terminals";
+  const triggerScopeOptions = [
+    { value: "all-terminals", label: "All terminals (compatibility default)" },
+    { value: "active-session", label: "Active terminal only - Recommended for secrets" },
+    { value: "profile", label: "Matching profile only - Recommended for secrets" }
+  ];
+  const selectedScopeLabel = triggerScopeOptions.find((option) => option.value === triggerScope)?.label
+    ?? triggerScopeOptions[0].label;
+  const triggerScopeOptionsHtml = triggerScopeOptions.map((option) =>
+    `<div class="custom-select-option${option.value === triggerScope ? " selected" : ""}" data-value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</div>`
+  ).join("\n        ");
+  const triggerProfileId = macro?.triggerProfileId ?? "";
 
   const nameValue = macro?.name ?? "";
   const textValue = macro?.text?.replace(/\n/g, "\n") ?? "";
@@ -36,6 +52,15 @@ export function renderMacroEditorHtml(
   const isNew = selectedIndex === null;
   const saveLabel = isNew ? "Create" : "Save";
   const deleteDisabled = isNew ? " disabled" : "";
+  const profileOptions = buildMacroProfileSelectOptions(profiles, triggerProfileId);
+  const profileIdsJson = serializeForInlineScript(profileOptions.map((profile) => profile.id));
+  const selectedProfileLabel = profileOptions.find((profile) => profile.id === triggerProfileId)?.label
+    ?? (profileOptions.length > 0 ? "Select a profile\u2026" : "No server or serial profiles");
+  const triggerProfileOptionsHtml = profileOptions.length > 0
+    ? profileOptions.map((profile) =>
+      `<div class="custom-select-option${profile.id === triggerProfileId ? " selected" : ""}" data-value="${escapeHtml(profile.id)}">${escapeHtml(profile.label)}</div>`
+    ).join("\n        ")
+    : '<div class="custom-select-option selected" data-value="">No server or serial profiles</div>';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -118,6 +143,35 @@ export function renderMacroEditorHtml(
   </div>
 
   <div class="form-group">
+    <label for="macro-trigger-scope-wrapper">Auto-Trigger Scope</label>
+    <div class="custom-select" id="macro-trigger-scope-wrapper">
+      <input type="hidden" id="macro-trigger-scope" value="${escapeHtml(triggerScope)}" />
+      <div class="custom-select-trigger" tabindex="0">
+        <span class="custom-select-text">${escapeHtml(selectedScopeLabel)}</span>
+      </div>
+      <div class="custom-select-dropdown">
+        ${triggerScopeOptionsHtml}
+      </div>
+    </div>
+    <div class="hint">Existing macros with no saved scope still run on all terminals. For secret prompts, prefer active terminal or matching profile.</div>
+  </div>
+
+  <div class="form-group" id="trigger-profile-group">
+    <label for="macro-trigger-profile-wrapper">Trigger Profile</label>
+    <div class="custom-select" id="macro-trigger-profile-wrapper">
+      <input type="hidden" id="macro-trigger-profile" value="${escapeHtml(triggerProfileId)}" />
+      <div class="custom-select-trigger" tabindex="0">
+        <span class="custom-select-text">${escapeHtml(selectedProfileLabel)}</span>
+      </div>
+      <div class="custom-select-dropdown">
+        ${triggerProfileOptionsHtml}
+      </div>
+    </div>
+    <div class="hint">Used only when scope is Matching profile. The saved value remains the underlying profile id.</div>
+    <div class="field-error" id="error-trigger-profile"></div>
+  </div>
+
+  <div class="form-group">
     <label for="macro-cooldown">Trigger Cooldown (seconds)</label>
     <input type="number" id="macro-cooldown" value="${escapeHtml(String(cooldownValue))}" min="0" max="300" step="1" />
     <div class="hint">Seconds between auto-triggers on the same terminal. Prevents echo-loops where server re-prompts after each response.</div>
@@ -157,11 +211,40 @@ export function renderMacroEditorHtml(
       var vscode = acquireVsCodeApi();
       var dirty = false;
       var currentIndex = ${selectedIndex !== null ? selectedIndex : "null"};
+      var KNOWN_PROFILE_IDS = ${profileIdsJson};
 
       var VALID_PATTERN = /^(alt\\+[a-z0-9]|alt\\+shift\\+[a-z0-9]|ctrl\\+shift\\+[a-z0-9])$/;
+      ${regexSafetyWebviewJs()}
 
       function isValidBinding(value) {
         return VALID_PATTERN.test(value.trim().toLowerCase());
+      }
+
+      function validateTriggerPattern(value) {
+        if (!value) return "";
+        var safetyError = validateRegexSafety(value);
+        if (safetyError) return safetyError;
+        try {
+          var re = new RegExp(value);
+          if (re.test("")) {
+            return "Pattern must not match empty strings.";
+          }
+        } catch(e) {
+          return e.message || "Invalid regex.";
+        }
+        return "";
+      }
+
+      function updateTriggerProfileState() {
+        var scope = document.getElementById("macro-trigger-scope").value;
+        var group = document.getElementById("trigger-profile-group");
+        var input = document.getElementById("macro-trigger-profile");
+        var isProfile = scope === "profile";
+        group.style.display = isProfile ? "" : "none";
+        input.disabled = !isProfile;
+        if (!isProfile) {
+          document.getElementById("error-trigger-profile").textContent = "";
+        }
       }
 
       function markDirty() {
@@ -184,19 +267,21 @@ export function renderMacroEditorHtml(
         markDirty();
         var val = this.value.trim();
         var errorEl = document.getElementById("error-trigger");
-        if (val) {
-          try {
-            var re = new RegExp(val);
-            if (re.test("")) {
-              errorEl.textContent = "Pattern must not match empty strings.";
-            } else {
-              errorEl.textContent = "";
-            }
-          } catch(e) {
-            errorEl.textContent = e.message || "Invalid regex.";
-          }
+        errorEl.textContent = validateTriggerPattern(val);
+      });
+      document.getElementById("macro-trigger-scope").addEventListener("change", function() {
+        markDirty();
+        updateTriggerProfileState();
+      });
+      document.getElementById("macro-trigger-profile").addEventListener("input", function() {
+        markDirty();
+        var triggerValue = document.getElementById("macro-trigger").value.trim();
+        if (triggerValue && document.getElementById("macro-trigger-scope").value === "profile" && !this.value.trim()) {
+          document.getElementById("error-trigger-profile").textContent = "Matching profile scope requires a profile id.";
+        } else if (triggerValue && KNOWN_PROFILE_IDS.length > 0 && this.value.trim() && KNOWN_PROFILE_IDS.indexOf(this.value.trim()) === -1) {
+          document.getElementById("error-trigger-profile").textContent = "Unknown profile id.";
         } else {
-          errorEl.textContent = "";
+          document.getElementById("error-trigger-profile").textContent = "";
         }
       });
       document.getElementById("macro-cooldown").addEventListener("input", markDirty);
@@ -225,6 +310,7 @@ export function renderMacroEditorHtml(
           wrapper.classList.remove("open");
           return;
         }
+        selectCustomOption(wrapper, value);
       });
 
       // Save
@@ -237,6 +323,8 @@ export function renderMacroEditorHtml(
         var cooldownVal = parseInt(document.getElementById("macro-cooldown").value, 10);
         var intervalVal = parseInt(document.getElementById("macro-interval").value, 10);
         var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
+        var triggerScope = document.getElementById("macro-trigger-scope").value;
+        var triggerProfileId = document.getElementById("macro-trigger-profile").value.trim();
 
         // Validate
         var valid = true;
@@ -259,20 +347,24 @@ export function renderMacroEditorHtml(
           document.getElementById("error-binding").textContent = "";
         }
         if (triggerVal) {
-          try {
-            var re = new RegExp(triggerVal);
-            if (re.test("")) {
-              document.getElementById("error-trigger").textContent = "Pattern must not match empty strings.";
-              valid = false;
-            } else {
-              document.getElementById("error-trigger").textContent = "";
-            }
-          } catch(e) {
-            document.getElementById("error-trigger").textContent = e.message || "Invalid regex.";
+          var triggerError = validateTriggerPattern(triggerVal);
+          if (triggerError) {
+            document.getElementById("error-trigger").textContent = triggerError;
             valid = false;
+          } else {
+            document.getElementById("error-trigger").textContent = "";
           }
         } else {
           document.getElementById("error-trigger").textContent = "";
+        }
+        if (triggerVal && triggerScope === "profile" && !triggerProfileId) {
+          document.getElementById("error-trigger-profile").textContent = "Matching profile scope requires a profile id.";
+          valid = false;
+        } else if (triggerVal && triggerScope === "profile" && KNOWN_PROFILE_IDS.length > 0 && KNOWN_PROFILE_IDS.indexOf(triggerProfileId) === -1) {
+          document.getElementById("error-trigger-profile").textContent = "Unknown profile id.";
+          valid = false;
+        } else {
+          document.getElementById("error-trigger-profile").textContent = "";
         }
         if (!valid) return;
 
@@ -286,7 +378,9 @@ export function renderMacroEditorHtml(
           triggerPattern: triggerVal || null,
           triggerCooldown: isNaN(cooldownVal) ? 3 : cooldownVal,
           triggerInterval: isNaN(intervalVal) || intervalVal < 1 ? null : intervalVal,
-          triggerInitiallyDisabled: triggerInitiallyDisabled
+          triggerInitiallyDisabled: triggerInitiallyDisabled,
+          triggerScope: triggerScope,
+          triggerProfileId: triggerProfileId || null
         });
       });
 
@@ -311,7 +405,15 @@ export function renderMacroEditorHtml(
         if (msg.type === "saved") {
           clearDirty();
         }
+        if (msg.type === "saveError") {
+          var field = msg.field || "trigger";
+          var errEl = document.getElementById("error-" + field);
+          if (errEl) {
+            errEl.textContent = msg.message || "Could not save macro.";
+          }
+        }
       });
+      updateTriggerProfileState();
     })();
   </script>
 </body>

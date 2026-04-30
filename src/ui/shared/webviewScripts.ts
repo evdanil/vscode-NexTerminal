@@ -18,24 +18,32 @@ export function baseWebviewJs(): string {
       var options = wrapper.querySelectorAll('.custom-select-option');
       for (var i = 0; i < options.length; i++) {
         options[i].classList.remove('selected');
+        options[i].setAttribute('aria-selected', 'false');
         if (options[i].dataset.value === value) {
           options[i].classList.add('selected');
+          options[i].setAttribute('aria-selected', 'true');
           textEl.textContent = options[i].textContent;
         }
       }
       hiddenInput.value = value;
-      wrapper.classList.remove('open');
+      setCustomSelectOpen(wrapper, false);
       var triggerEl = wrapper.querySelector('.custom-select-trigger');
       if (triggerEl) triggerEl.focus();
       hiddenInput.dispatchEvent(new Event('change', { bubbles: true }));
       hiddenInput.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
+    function setCustomSelectOpen(wrapper, open) {
+      wrapper.classList.toggle('open', !!open);
+      var trigger = wrapper.querySelector('.custom-select-trigger');
+      if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+
     document.addEventListener('click', function(e) {
       if (!e.target.closest('.custom-select')) {
         var openSelects = document.querySelectorAll('.custom-select.open');
         for (var i = 0; i < openSelects.length; i++) {
-          openSelects[i].classList.remove('open');
+          setCustomSelectOpen(openSelects[i], false);
         }
       }
       if (!e.target.closest('.custom-combobox')) {
@@ -55,20 +63,20 @@ export function baseWebviewJs(): string {
             e.stopPropagation();
             var openSelects = document.querySelectorAll('.custom-select.open');
             for (var j = 0; j < openSelects.length; j++) {
-              if (openSelects[j] !== wrapper) openSelects[j].classList.remove('open');
+              if (openSelects[j] !== wrapper) setCustomSelectOpen(openSelects[j], false);
             }
-            wrapper.classList.toggle('open');
+            setCustomSelectOpen(wrapper, !wrapper.classList.contains('open'));
           });
           trigger.addEventListener('keydown', function(e) {
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
-              wrapper.classList.toggle('open');
+              setCustomSelectOpen(wrapper, !wrapper.classList.contains('open'));
             } else if (e.key === 'Escape') {
-              wrapper.classList.remove('open');
+              setCustomSelectOpen(wrapper, false);
             } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
               e.preventDefault();
               if (!wrapper.classList.contains('open')) {
-                wrapper.classList.add('open');
+                setCustomSelectOpen(wrapper, true);
                 return;
               }
               var opts = wrapper.querySelectorAll('.custom-select-option');

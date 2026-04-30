@@ -569,7 +569,9 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
       let ptyRef: SshPty | undefined;
       const triggerObserver = ctx.macroAutoTrigger.createObserver(
         (text) => ptyRef?.handleInput(text),
-        () => ctx.focusedTerminal === terminalRef
+        () => ctx.focusedTerminal === terminalRef,
+        undefined,
+        server.id
       );
       const terminalType = vscode.workspace.getConfiguration("nexus.ssh").get<string>("terminalType", "xterm-256color");
       const pty = new SshPty(

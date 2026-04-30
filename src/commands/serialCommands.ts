@@ -333,7 +333,9 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
   let ptyRef: SerialPty | undefined;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
     (text) => ptyRef?.handleInput(text),
-    () => ctx.focusedTerminal === terminalRef
+    () => ctx.focusedTerminal === terminalRef,
+    undefined,
+    profile.id
   );
   const pty = new SerialPty(
     ctx.serialSidecar,
@@ -417,7 +419,9 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   let currentProfile = profile;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
     (text) => ptyRef?.handleInput(text),
-    () => ctx.focusedTerminal === terminalRef
+    () => ctx.focusedTerminal === terminalRef,
+    logicalSessionId,
+    profile.id
   );
 
   const pty = new SmartSerialPty(

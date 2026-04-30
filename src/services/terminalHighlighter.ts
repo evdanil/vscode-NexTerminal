@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import { createAnsiRegex } from "../utils/ansi";
+import { validateRegexSafety } from "../utils/regexSafety";
+import { validateAndSanitizeHighlightRules, type HighlightRule } from "../utils/highlightRuleValidation";
 
 const MAX_INPUT_LENGTH = 65536;
 const STREAM_FLUSH_DELAY_MS = 100;
@@ -78,16 +80,11 @@ interface CompiledRule {
   closeCode: string;
 }
 
-interface HighlightRule {
-  pattern: string;
-  color: string;
-  flags?: string;
-  bold?: boolean;
-  underline?: boolean;
-}
-
 function compileRule(rule: HighlightRule): CompiledRule | undefined {
   try {
+    if (!validateRegexSafety(rule.pattern).ok) {
+      return undefined;
+    }
     const rawFlags = typeof rule.flags === "string" ? rule.flags : "gi";
     const flags = VALID_FLAGS_RE.test(rawFlags) ? rawFlags : "gi";
     const regex = new RegExp(rule.pattern, flags);
@@ -162,6 +159,7 @@ function applyRulesToPlainText(text: string, rules: CompiledRule[]): string {
       }
       // Avoid infinite loop on zero-length matches (should not happen due to compileRule guard)
       if (m[0].length === 0) { regex.lastIndex++; }
+      if (!regex.global) break;
     }
   }
 
@@ -209,9 +207,11 @@ export class TerminalHighlighter {
   public reload(): void {
     const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
     this.enabled = config.get<boolean>("enabled", true);
-    const rawRules = config.get<HighlightRule[]>("rules", []);
+    const rawRules = config.get<unknown>("rules", []);
+    const rawRulesArray = Array.isArray(rawRules) ? rawRules : [];
+    const rules = rawRulesArray.flatMap((rule) => validateAndSanitizeHighlightRules([rule]) ?? []);
     this.rules = [];
-    for (const rule of rawRules) {
+    for (const rule of rules) {
       if (!rule.pattern || !rule.color) { continue; }
       const compiled = compileRule(rule);
       if (compiled) {

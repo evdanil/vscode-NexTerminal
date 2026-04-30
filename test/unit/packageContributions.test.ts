@@ -62,6 +62,11 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.settings.openPanel");
   });
 
+  it("contributes explicit macro keybinding repair command", () => {
+    const commands = packageJson.contributes.commands.map((item) => item.command);
+    expect(commands).toContain("nexus.settings.fixMacroKeybindings");
+  });
+
   it("contributes macro.editor command", () => {
     const commands = packageJson.contributes.commands.map((item) => item.command);
     expect(commands).toContain("nexus.macro.editor");
@@ -186,13 +191,32 @@ describe("package contributions", () => {
       expect(inlineStop?.when).toContain("viewItem == nexus.script.running");
     });
 
-    it("contributes nexus.scripts.maxRuntimeMs setting (S3)", () => {
-      const prop = packageJson.contributes.configuration?.properties?.["nexus.scripts.maxRuntimeMs"];
+    it("contributes seconds-facing script max runtime setting that allows disabling", () => {
+      const prop = packageJson.contributes.configuration?.properties?.["nexus.scripts.maxRuntimeSeconds"];
       expect(prop).toBeDefined();
       expect(prop?.type).toBe("number");
-      expect(prop?.default).toBe(1_800_000);
-      expect(prop?.minimum).toBe(10_000);
+      expect(prop?.default).toBe(1800);
+      expect(prop?.minimum).toBe(0);
+      expect(prop?.maximum).toBe(2147483);
       expect(prop?.markdownDescription || prop?.description).toMatch(/runtime/i);
+      expect(prop?.markdownDescription || prop?.description).toMatch(/0 disables/i);
+    });
+
+    it("contributes seconds-facing default wait timeout and hides the legacy millisecond key", () => {
+      const prop = packageJson.contributes.configuration?.properties?.["nexus.scripts.defaultTimeoutSeconds"];
+      expect(prop).toBeDefined();
+      expect(prop?.type).toBe("number");
+      expect(prop?.default).toBe(30);
+      expect(prop?.minimum).toBe(1);
+      expect(prop?.markdownDescription || prop?.description).toMatch(/seconds/i);
+      expect(packageJson.contributes.configuration?.properties?.["nexus.scripts.defaultTimeout"]).toBeUndefined();
+    });
+
+    it("keeps legacy maxRuntimeMs compatible and allows 0", () => {
+      const prop = packageJson.contributes.configuration?.properties?.["nexus.scripts.maxRuntimeMs"];
+      expect(prop).toBeDefined();
+      expect(prop?.minimum).toBe(0);
+      expect(prop?.maximum).toBe(2147483647);
     });
 
     it("contributes optional keybindings for script run/stop (P1)", () => {

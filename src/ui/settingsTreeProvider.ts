@@ -121,7 +121,7 @@ export class SettingsTreeProvider
     this.configListener = vscode.workspace.onDidChangeConfiguration((event) => {
       const affected = SETTINGS_META.some(
         (m) => event.affectsConfiguration(`${m.section}.${m.key}`)
-      );
+      ) || event.affectsConfiguration("nexus.terminal.highlighting.rules");
       if (affected) {
         this.onDidChangeTreeDataEmitter.fire(undefined);
       }
@@ -162,10 +162,6 @@ export class SettingsTreeProvider
       items.push(new SettingsCategoryItem(cat));
     }
 
-    // 3 link items
-    items.push(
-      new SettingsLinkItem("Terminal Appearance", "nexus.terminal.appearance", "paintcan", "Customize terminal colors and fonts")
-    );
     items.push(
       new SettingsLinkItem("Macros", "nexus.macro.editor", "record-keys", "Open the macro editor")
     );

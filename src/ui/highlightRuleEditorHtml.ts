@@ -1,14 +1,9 @@
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
-
-export interface HighlightRule {
-  pattern: string;
-  color: string;
-  flags?: string;
-  bold?: boolean;
-  underline?: boolean;
-}
+import { serializeForInlineScript } from "./shared/inlineScriptData";
+import { regexSafetyWebviewJs } from "../utils/regexSafety";
+import type { HighlightRule } from "../utils/highlightRuleValidation";
 
 const COLOR_NAMES = [
   "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
@@ -23,13 +18,23 @@ const COLOR_CSS: Record<string, string> = {
 };
 
 function renderColorOptions(selected: string): string {
-  return COLOR_NAMES.map(name => {
+  const options = COLOR_NAMES.map(name => {
     const css = COLOR_CSS[name] ?? "";
     return `<div class="custom-select-option${name === selected ? " selected" : ""}" data-value="${escapeHtml(name)}"><span class="color-dot" style="background:${escapeHtml(css)};"></span> ${escapeHtml(name)}</div>`;
-  }).join("\n        ");
+  });
+  if (/^(3[0-7]|9[0-7])$/.test(selected)) {
+    options.push(`<div class="custom-select-option selected" data-value="${escapeHtml(selected)}">Custom SGR code ${escapeHtml(selected)}</div>`);
+  } else {
+    options.push('<div class="custom-select-option" data-value="91">Custom SGR code 91</div>');
+  }
+  return options.join("\n        ");
 }
 
 export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: string): string {
+  const colorsJson = serializeForInlineScript(COLOR_NAMES);
+  const colorCssJson = serializeForInlineScript(COLOR_CSS);
+  const rulesJson = serializeForInlineScript(rules);
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -137,8 +142,16 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
       margin-top: 4px;
       min-height: 16px;
     }
-    #rules-list:empty::after {
-      content: "No rules defined. Click \\\"+ Add Rule\\\" to get started.";
+    .rules-dirty-indicator {
+      display: none;
+      align-self: center;
+      color: var(--vscode-editorWarning-foreground, #cca700);
+      font-size: 12px;
+    }
+    .rules-dirty-indicator.visible {
+      display: inline;
+    }
+    .rules-empty-state {
       color: var(--vscode-descriptionForeground);
       font-style: italic;
       font-size: 12px;
@@ -147,13 +160,19 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
 </head>
 <body>
   <h3>Highlighting Rules</h3>
+  <div class="setting-desc">Rules use first-match precedence. Move specific rules above broader rules.</div>
 
   <div id="rules-list"></div>
+  <div id="rules-empty-state" class="rules-empty-state">No highlighting rules defined.</div>
 
   <div class="button-row" style="margin-top: 12px;">
     <button type="button" class="btn-secondary" id="add-rule-btn">+ Add Rule</button>
+    <button type="button" class="btn-primary" id="apply-rules-btn" disabled>Apply</button>
+    <button type="button" class="btn-secondary" id="cancel-rules-btn">Cancel</button>
+    <span class="rules-dirty-indicator" id="rules-dirty-indicator" aria-live="polite">Unsaved changes</span>
     <button type="button" class="btn-secondary" id="reset-defaults-btn" style="margin-left: auto;">Reset to Defaults</button>
   </div>
+  <div class="editor-error" id="save-error" aria-live="polite"></div>
 
   <div class="editor-section" id="editor-section">
     <h4 id="editor-title">Edit Rule</h4>
@@ -195,7 +214,7 @@ INFO: session started for user admin
 DEBUG: packet sent 1024 bytes</div>
 
     <div class="button-row" style="margin-top: 12px;">
-      <button type="button" class="btn-primary" id="save-rule-btn">Save Rule</button>
+      <button type="button" class="btn-primary" id="save-rule-btn">Stage Rule</button>
       <button type="button" class="btn-secondary" id="cancel-edit-btn">Cancel</button>
       <button type="button" class="btn-danger" id="delete-rule-btn" style="margin-left: auto; display: none;">Delete</button>
     </div>
@@ -205,22 +224,32 @@ DEBUG: packet sent 1024 bytes</div>
     ${baseWebviewJs()}
     (function() {
       var vscode = acquireVsCodeApi();
-      var VALID_COLORS = ${JSON.stringify(COLOR_NAMES)};
-      var COLOR_CSS_MAP = ${JSON.stringify(COLOR_CSS)};
+      var VALID_COLORS = ${colorsJson};
+      var COLOR_CSS_MAP = ${colorCssJson};
       var SAMPLE_TEXT = "eth0: <BROADCAST,MULTICAST,UP> state UP\\nERROR: connection refused on port 443\\nWARNING: disk usage at 90%\\nINFO: session started for user admin\\n192.168.1.100 - ESTABLISHED\\nsshd: ACCEPTED publickey for root\\n5 input errors, 0 CRC, 0 frame, 3 overruns, 0 ignored";
-      var REDOS_RE = /(\\+|\\*|\\{[^}]*\\})\\)(\\+|\\*|\\{)/;
+      ${regexSafetyWebviewJs()}
 
-      var rules = ${JSON.stringify(rules)};
+      var rules = ${rulesJson};
+      var originalRules = JSON.parse(JSON.stringify(rules));
       var editingIndex = -1;
       var previewTimer = null;
       var regexCache = {};
 
       initCustomSelects();
       renderRulesList();
+      setDirty(false);
+
+      function setDirty(value) {
+        var indicator = document.getElementById("rules-dirty-indicator");
+        var applyBtn = document.getElementById("apply-rules-btn");
+        indicator.classList.toggle("visible", !!value);
+        applyBtn.disabled = !value;
+      }
 
       function renderRulesList() {
         var list = document.getElementById("rules-list");
         list.innerHTML = "";
+        document.getElementById("rules-empty-state").style.display = rules.length === 0 ? "" : "none";
         for (var i = 0; i < rules.length; i++) {
           var r = rules[i];
           var row = document.createElement("div");
@@ -239,9 +268,23 @@ DEBUG: packet sent 1024 bytes</div>
           var flagsSpan = document.createElement("span");
           flagsSpan.className = "rule-flags";
           var styleFlags = [];
+          styleFlags.push("#" + (i + 1));
+          if (r.flags) styleFlags.push(r.flags);
           if (r.bold) styleFlags.push("B");
           if (r.underline) styleFlags.push("U");
           flagsSpan.textContent = styleFlags.join(" ");
+
+          var upBtn = document.createElement("button");
+          upBtn.type = "button";
+          upBtn.className = "btn-secondary rule-up-btn";
+          upBtn.dataset.index = String(i);
+          upBtn.textContent = "Up";
+
+          var downBtn = document.createElement("button");
+          downBtn.type = "button";
+          downBtn.className = "btn-secondary rule-down-btn";
+          downBtn.dataset.index = String(i);
+          downBtn.textContent = "Down";
 
           var editBtn = document.createElement("button");
           editBtn.type = "button";
@@ -258,6 +301,8 @@ DEBUG: packet sent 1024 bytes</div>
           row.appendChild(patSpan);
           row.appendChild(colorSwatch);
           row.appendChild(flagsSpan);
+          row.appendChild(upBtn);
+          row.appendChild(downBtn);
           row.appendChild(editBtn);
           row.appendChild(delBtn);
           list.appendChild(row);
@@ -274,10 +319,32 @@ DEBUG: packet sent 1024 bytes</div>
         if (delBtn) {
           var idx = parseInt(delBtn.dataset.index, 10);
           rules.splice(idx, 1);
-          saveRules();
           renderRulesList();
+          setDirty(true);
           if (editingIndex === idx) closeEditor();
           else if (editingIndex > idx) editingIndex--;
+          return;
+        }
+        var upBtn = e.target.closest(".rule-up-btn");
+        if (upBtn) {
+          var upIdx = parseInt(upBtn.dataset.index, 10);
+          if (upIdx > 0) {
+            var item = rules.splice(upIdx, 1)[0];
+            rules.splice(upIdx - 1, 0, item);
+            renderRulesList();
+            setDirty(true);
+          }
+          return;
+        }
+        var downBtn = e.target.closest(".rule-down-btn");
+        if (downBtn) {
+          var downIdx = parseInt(downBtn.dataset.index, 10);
+          if (downIdx >= 0 && downIdx < rules.length - 1) {
+            var item2 = rules.splice(downIdx, 1)[0];
+            rules.splice(downIdx + 1, 0, item2);
+            renderRulesList();
+            setDirty(true);
+          }
         }
       });
 
@@ -295,8 +362,9 @@ DEBUG: packet sent 1024 bytes</div>
           showPatternError("Pattern too long (max 500 chars).");
           return;
         }
-        if (REDOS_RE.test(pattern)) {
-          showPatternError("Pattern rejected: potential ReDoS (nested quantifiers).");
+        var safetyError = validateRegexSafety(pattern);
+        if (safetyError) {
+          showPatternError(safetyError);
           return;
         }
         var flags = buildFlags();
@@ -311,7 +379,7 @@ DEBUG: packet sent 1024 bytes</div>
           return;
         }
         var color = document.getElementById("edit-color").value;
-        if (VALID_COLORS.indexOf(color) === -1) {
+        if (VALID_COLORS.indexOf(color) === -1 && !isValidSgrColor(color)) {
           showPatternError("Invalid color.");
           return;
         }
@@ -324,8 +392,8 @@ DEBUG: packet sent 1024 bytes</div>
         } else {
           rules.push(rule);
         }
-        saveRules();
         renderRulesList();
+        setDirty(true);
         closeEditor();
       });
 
@@ -336,10 +404,22 @@ DEBUG: packet sent 1024 bytes</div>
       document.getElementById("delete-rule-btn").addEventListener("click", function() {
         if (editingIndex >= 0 && editingIndex < rules.length) {
           rules.splice(editingIndex, 1);
-          saveRules();
           renderRulesList();
+          setDirty(true);
           closeEditor();
         }
+      });
+
+      document.getElementById("apply-rules-btn").addEventListener("click", function() {
+        saveRules();
+      });
+
+      document.getElementById("cancel-rules-btn").addEventListener("click", function() {
+        rules = JSON.parse(JSON.stringify(originalRules));
+        renderRulesList();
+        setDirty(false);
+        closeEditor();
+        document.getElementById("save-error").textContent = "";
       });
 
       document.getElementById("reset-defaults-btn").addEventListener("click", function() {
@@ -372,6 +452,10 @@ DEBUG: packet sent 1024 bytes</div>
         return f;
       }
 
+      function isValidSgrColor(value) {
+        return /^(3[0-7]|9[0-7])$/.test(String(value));
+      }
+
       function updatePreview() {
         var box = document.getElementById("preview-box");
         var pattern = patternInput.value.trim();
@@ -380,9 +464,10 @@ DEBUG: packet sent 1024 bytes</div>
           showPatternError("");
           return;
         }
-        if (REDOS_RE.test(pattern)) {
+        var safetyError = validateRegexSafety(pattern);
+        if (safetyError) {
           box.textContent = SAMPLE_TEXT;
-          showPatternError("Potential ReDoS: nested quantifiers.");
+          showPatternError(safetyError);
           return;
         }
         var flags = buildFlags();
@@ -405,7 +490,7 @@ DEBUG: packet sent 1024 bytes</div>
         }
         showPatternError("");
         var color = colorInput.value;
-        if (VALID_COLORS.indexOf(color) === -1) color = "red";
+        if (VALID_COLORS.indexOf(color) === -1 && !isValidSgrColor(color)) color = "red";
         var isBold = boldCb.checked;
         var isUnderline = underlineCb.checked;
 
@@ -421,11 +506,11 @@ DEBUG: packet sent 1024 bytes</div>
           if (match.index > lastIdx) {
             html += escapeHtml(text.slice(lastIdx, match.index));
           }
-          var cls = "hl-" + escapeHtml(color);
+          var cls = VALID_COLORS.indexOf(color) !== -1 ? "hl-" + escapeHtml(color) : "hl-brightRed";
           if (isBold) cls += " hl-bold";
           if (isUnderline) cls += " hl-underline";
           html += '<span class="' + cls + '">' + escapeHtml(match[0]) + '</span>';
-          lastIdx = regex.lastIndex;
+          lastIdx = match.index + match[0].length;
           if (!flags.includes("g")) break;
         }
         if (lastIdx < text.length) {
@@ -454,7 +539,7 @@ DEBUG: packet sent 1024 bytes</div>
           flagI.checked = f.indexOf("i") !== -1;
           boldCb.checked = !!r.bold;
           underlineCb.checked = !!r.underline;
-          var color = VALID_COLORS.indexOf(r.color) !== -1 ? r.color : "red";
+          var color = VALID_COLORS.indexOf(r.color) !== -1 || isValidSgrColor(r.color) ? r.color : "red";
           selectCustomOption(document.getElementById("color-select-wrapper"), color);
           deleteBtn.style.display = "";
         } else {
@@ -479,6 +564,7 @@ DEBUG: packet sent 1024 bytes</div>
       }
 
       function saveRules() {
+        document.getElementById("save-error").textContent = "";
         vscode.postMessage({ type: "saveRules", rules: rules });
       }
 
@@ -486,8 +572,19 @@ DEBUG: packet sent 1024 bytes</div>
         var msg = event.data;
         if (msg.type === "rulesUpdated") {
           rules = msg.rules;
+          originalRules = JSON.parse(JSON.stringify(rules));
           renderRulesList();
+          setDirty(false);
           if (editingIndex >= 0) closeEditor();
+        }
+        if (msg.type === "saveResult") {
+          if (msg.ok) {
+            originalRules = JSON.parse(JSON.stringify(rules));
+            setDirty(false);
+            document.getElementById("save-error").textContent = "";
+          } else {
+            document.getElementById("save-error").textContent = msg.message || "Could not save highlighting rules.";
+          }
         }
       });
     })();

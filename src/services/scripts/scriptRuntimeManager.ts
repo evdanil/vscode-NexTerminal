@@ -7,6 +7,7 @@ import type { MacroAutoTrigger, PtyOutputObserver } from "../macroAutoTrigger";
 import { parseScriptHeader, type ScriptHeader } from "./scriptHeader";
 import { ScriptMacroFilter } from "./scriptMacroFilter";
 import { resolveScriptsDir } from "./resolveScriptsDir";
+import { resolveScriptDefaultTimeoutMs } from "./defaultTimeout";
 import { ensureWorkspaceScriptTypes, type BundledAssets } from "./scriptTypesGenerator";
 import { ScriptOutputBuffer, type Match } from "./scriptOutputBuffer";
 import { pickTarget, type ScriptTargetDescriptor } from "./scriptTarget";
@@ -164,7 +165,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
 
     const defaultTimeoutMs =
       header.defaultTimeoutMs ??
-      (vscode.workspace.getConfiguration("nexus.scripts").get<number>("defaultTimeout") ?? 30_000);
+      resolveScriptDefaultTimeoutMs(vscode.workspace.getConfiguration("nexus.scripts"));
 
     const record: RunningScriptRecord = {
       id: randomUUID(),

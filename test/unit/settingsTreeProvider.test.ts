@@ -88,10 +88,10 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 12 root items", () => {
+    it("returns 11 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(12);
+      expect(roots).toHaveLength(11);
     });
 
     it("has 8 category items first (Scripts sits after Serial)", () => {
@@ -103,14 +103,12 @@ describe("SettingsTreeProvider", () => {
         .toEqual(["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"]);
     });
 
-    it("has 3 link items for Appearance, Macros, and Auth Profiles", () => {
+    it("has 2 root link items for Macros and Auth Profiles", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const links = roots.filter((r) => r instanceof SettingsLinkItem);
-      expect(links).toHaveLength(3);
-      expect(links[0].label).toBe("Terminal Appearance");
-      expect(links[1].label).toBe("Macros");
-      expect(links[2].label).toBe("Auth Profiles");
+      expect(links).toHaveLength(2);
+      expect(links.map((link) => link.label)).toEqual(["Macros", "Auth Profiles"]);
     });
 
     it("has 1 Data Management group", () => {
@@ -144,14 +142,14 @@ describe("SettingsTreeProvider", () => {
       expect(children).toHaveLength(3);
     });
 
-    it("returns 6 children for terminal when passthrough ON", () => {
+    it("returns 7 children for terminal when passthrough ON", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("terminal");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(6);
+      expect(children).toHaveLength(7);
     });
 
-    it("returns 5 children for terminal when passthrough OFF (visibleWhen filtering)", () => {
+    it("returns 6 children for terminal when passthrough OFF (visibleWhen filtering)", () => {
       mockGetConfiguration.mockImplementation(() => ({
         get: (key: string) => {
           if (key === "keyboardPassthrough") return false;
@@ -162,7 +160,7 @@ describe("SettingsTreeProvider", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("terminal");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(5);
+      expect(children).toHaveLength(6);
     });
 
     it("returns 9 children for sftp", () => {
@@ -234,5 +232,18 @@ describe("SettingsTreeProvider", () => {
       const provider = createProvider();
       expect(() => provider.dispose()).not.toThrow();
     });
+  });
+
+  it("refreshes when highlighting rules change", () => {
+    const provider = createProvider();
+    const listener = vi.fn();
+    provider.onDidChangeTreeData(listener);
+
+    const configListener = mockOnDidChangeConfiguration.mock.calls[0][0] as (event: { affectsConfiguration: (key: string) => boolean }) => void;
+    configListener({
+      affectsConfiguration: (key: string) => key === "nexus.terminal.highlighting.rules"
+    });
+
+    expect(listener).toHaveBeenCalledWith(undefined);
   });
 });

@@ -78,6 +78,10 @@ export class TerminalAppearancePanel {
   }
 
   private async applyScheme(schemeId: string): Promise<void> {
+    if (schemeId && !this.service.getSchemeById(schemeId)) {
+      void vscode.window.showErrorMessage("Unknown terminal color scheme.");
+      return;
+    }
     await this.service.setActiveSchemeId(schemeId);
     const scheme = schemeId ? this.service.getSchemeById(schemeId) ?? null : null;
     const config = vscode.workspace.getConfiguration("workbench");
@@ -155,10 +159,18 @@ export class TerminalAppearancePanel {
   }
 
   private async applyFont(msg: { family: string; size: number; weight: string }): Promise<void> {
+    const allowedWeights = new Set(["normal", "bold", "100", "200", "300", "400", "500", "600", "700", "800", "900"]);
+    const family = typeof msg.family === "string" ? msg.family.trim() : "";
+    const size = typeof msg.size === "number" && Number.isFinite(msg.size) ? Math.floor(msg.size) : 0;
+    const weight = typeof msg.weight === "string" ? msg.weight.trim() : "";
+    if (family.length > 200 || size < 6 || size > 72 || (weight && !allowedWeights.has(weight))) {
+      void vscode.window.showErrorMessage("Invalid terminal font settings.");
+      return;
+    }
     const config: TerminalFontConfig = {
-      family: msg.family,
-      size: msg.size,
-      weight: msg.weight
+      family,
+      size,
+      weight
     };
     await this.service.saveFontConfig(config);
     const termConfig = vscode.workspace.getConfiguration("terminal.integrated");

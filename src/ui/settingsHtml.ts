@@ -7,19 +7,25 @@ interface SettingValues {
   [sectionDotKey: string]: unknown;
 }
 
+function controlId(meta: SettingMeta): string {
+  return `setting-${meta.section.replace(/[^a-z0-9_-]/gi, "-")}-${meta.key.replace(/[^a-z0-9_-]/gi, "-")}`;
+}
+
 function renderToggle(meta: SettingMeta, value: boolean): string {
+  const id = controlId(meta);
   return `<div class="form-group form-group-checkbox"${visibleWhenAttrs(meta)}>
-  <label>
-    <input type="checkbox" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}"${value ? " checked" : ""} />
+  <label for="${escapeHtml(id)}">
+    <input type="checkbox" id="${escapeHtml(id)}" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}"${value ? " checked" : ""} />
     ${escapeHtml(meta.label)}
   </label>
   ${meta.badge ? `<span class="setting-badge">${escapeHtml(meta.badge)}</span>` : ""}
   ${meta.description ? `<div class="setting-desc">${escapeHtml(meta.description)}</div>` : ""}
-  <span class="save-indicator" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
+  <span class="save-indicator" aria-live="polite" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
 </div>`;
 }
 
 function renderNumber(meta: SettingMeta, value: number): string {
+  const id = controlId(meta);
   const unitHtml = meta.unit ? `<span class="unit-suffix">${escapeHtml(meta.unit)}</span>` : "";
   const defaultSuffix = meta.default != null ? `, default: ${meta.default}` : "";
   const rangeHtml = (meta.min != null || meta.max != null)
@@ -29,56 +35,59 @@ function renderNumber(meta: SettingMeta, value: number): string {
     ? ` <span class="setting-badge${meta.badgeClass ? ` ${meta.badgeClass}` : ""}">${escapeHtml(meta.badge)}</span>`
     : "";
   return `<div class="form-group"${visibleWhenAttrs(meta)}>
-  <label>${escapeHtml(meta.label)}${badgeHtml}</label>
+  <label for="${escapeHtml(id)}">${escapeHtml(meta.label)}${badgeHtml}</label>
   ${meta.description ? `<div class="setting-desc">${escapeHtml(meta.description)}</div>` : ""}
   <div class="number-with-unit">
-    <input type="number" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}" value="${value}" min="${meta.min ?? ""}" max="${meta.max ?? ""}" />
+    <input type="number" id="${escapeHtml(id)}" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}" value="${value}" min="${meta.min ?? ""}" max="${meta.max ?? ""}" />
     ${unitHtml}
     ${rangeHtml}
   </div>
   <span class="validation-error" data-for="${meta.section}.${meta.key}"></span>
-  <span class="save-indicator" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
+  <span class="save-indicator" aria-live="polite" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
 </div>`;
 }
 
 function renderDirectory(meta: SettingMeta, value: string): string {
+  const id = controlId(meta);
   return `<div class="form-group"${visibleWhenAttrs(meta)}>
-  <label>${escapeHtml(meta.label)}</label>
+  <label for="${escapeHtml(id)}">${escapeHtml(meta.label)}</label>
   ${meta.description ? `<div class="setting-desc">${escapeHtml(meta.description)}</div>` : ""}
   <div class="file-input-row">
-    <input type="text" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}" value="${escapeHtml(value)}" />
+    <input type="text" id="${escapeHtml(id)}" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}" value="${escapeHtml(value)}" />
     <button type="button" class="browse-btn" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}">Browse</button>
   </div>
-  <span class="save-indicator" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
+  <span class="save-indicator" aria-live="polite" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
 </div>`;
 }
 
 function renderEnum(meta: SettingMeta, value: string): string {
+  const id = controlId(meta);
   const options = meta.enumOptions ?? [];
   const selected = options.find((o) => o.value === value) ?? options[0];
   const optionsHtml = options
     .map(
       (opt) =>
-        `<div class="custom-select-option${opt.value === value ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}${opt.recommended ? ' <span class="recommended-badge">recommended</span>' : ""}</div>`
+        `<div class="custom-select-option${opt.value === value ? " selected" : ""}" data-value="${escapeHtml(opt.value)}" role="option" aria-selected="${opt.value === value ? "true" : "false"}">${escapeHtml(opt.label)}${opt.recommended ? ' <span class="recommended-badge">recommended</span>' : ""}</div>`
     )
     .join("\n        ");
   return `<div class="form-group"${visibleWhenAttrs(meta)}>
-  <label>${escapeHtml(meta.label)}</label>
+  <label id="${escapeHtml(id)}-label">${escapeHtml(meta.label)}</label>
   ${meta.description ? `<div class="setting-desc">${escapeHtml(meta.description)}</div>` : ""}
   <div class="custom-select" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}">
-    <input type="hidden" value="${escapeHtml(selected?.value ?? "")}" />
-    <div class="custom-select-trigger" tabindex="0">
+    <input type="hidden" id="${escapeHtml(id)}" value="${escapeHtml(selected?.value ?? "")}" />
+    <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-labelledby="${escapeHtml(id)}-label" aria-expanded="false">
       <span class="custom-select-text">${escapeHtml(selected?.label ?? "")}</span>
     </div>
-    <div class="custom-select-dropdown">
+    <div class="custom-select-dropdown" role="listbox" aria-labelledby="${escapeHtml(id)}-label">
       ${optionsHtml}
     </div>
   </div>
-  <span class="save-indicator" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
+  <span class="save-indicator" aria-live="polite" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
 </div>`;
 }
 
 function renderMultiCheckbox(meta: SettingMeta, values: string[]): string {
+  const id = controlId(meta);
   const options = meta.checkboxOptions ?? [];
   const set = new Set(values);
   const checksHtml = options
@@ -91,11 +100,11 @@ function renderMultiCheckbox(meta: SettingMeta, values: string[]): string {
     )
     .join("\n    ");
   return `<div class="form-group"${visibleWhenAttrs(meta)}>
-  <label>${escapeHtml(meta.label)}</label>
-  <div class="multi-checkbox-group" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}">
+  <label id="${escapeHtml(id)}-label">${escapeHtml(meta.label)}</label>
+  <div class="multi-checkbox-group" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}" role="group" aria-labelledby="${escapeHtml(id)}-label">
     ${checksHtml}
   </div>
-  <span class="save-indicator" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
+  <span class="save-indicator" aria-live="polite" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
 </div>`;
 }
 
@@ -113,11 +122,12 @@ function renderSetting(meta: SettingMeta, values: SettingValues): string {
     case "number":
       return renderNumber(meta, typeof raw === "number" ? raw : (meta.min ?? 0));
     case "string":
+      const id = controlId(meta);
       return `<div class="form-group"${visibleWhenAttrs(meta)}>
-  <label>${escapeHtml(meta.label)}</label>
+  <label for="${escapeHtml(id)}">${escapeHtml(meta.label)}</label>
   ${meta.description ? `<div class="setting-desc">${escapeHtml(meta.description)}</div>` : ""}
-  <input type="text" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}" value="${escapeHtml(typeof raw === "string" ? raw : "")}" />
-  <span class="save-indicator" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
+  <input type="text" id="${escapeHtml(id)}" data-section="${escapeHtml(meta.section)}" data-key="${escapeHtml(meta.key)}" value="${escapeHtml(typeof raw === "string" ? raw : "")}" />
+  <span class="save-indicator" aria-live="polite" data-for="${escapeHtml(meta.section)}.${escapeHtml(meta.key)}"></span>
 </div>`;
     case "enum":
       return renderEnum(meta, typeof raw === "string" ? raw : (meta.enumOptions?.[0]?.value ?? ""));
@@ -140,9 +150,20 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
   }
 
   let sectionsHtml = "";
+  const terminalActionsHtml = `
+  <div class="terminal-actions button-row">
+    <button type="button" class="btn-secondary" id="open-appearance-btn">Terminal Appearance\u2026</button>
+    <button type="button" class="btn-secondary" id="open-highlight-editor-btn">Highlighting Rules\u2026</button>
+    <button type="button" class="btn-secondary" id="open-macros-btn">Macros\u2026</button>
+  </div>`;
 
   if (categoryFilter) {
     // Focused mode: render only the target category
+    sectionsHtml += `
+  <div class="button-row" style="margin-bottom: 16px;">
+    <button type="button" class="btn-secondary" id="open-all-settings-btn">All Settings</button>
+  </div>`;
+
     const metas = grouped.get(categoryFilter);
     if (metas && metas.length > 0) {
       let currentSubgroup: string | undefined;
@@ -157,10 +178,7 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
 
     // Show highlighting rule editor button for terminal category
     if (categoryFilter === "terminal") {
-      sectionsHtml += `
-  <div class="button-row" style="margin-top: 8px;">
-    <button type="button" class="btn-secondary" id="open-highlight-editor-btn">Edit Rules\u2026</button>
-  </div>`;
+      sectionsHtml += terminalActionsHtml;
     }
 
     // Per-category reset button
@@ -183,15 +201,10 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
         }
         sectionsHtml += `  ${renderSetting(meta, values)}\n`;
       }
+      if (cat === "terminal") {
+        sectionsHtml += terminalActionsHtml;
+      }
     }
-
-    // Cross-link buttons after Terminal section
-    sectionsHtml += `
-  <div class="button-row">
-    <button type="button" class="btn-secondary" id="open-appearance-btn">Terminal Appearance\u2026</button>
-    <button type="button" class="btn-secondary" id="open-macros-btn">Edit Macros\u2026</button>
-    <button type="button" class="btn-secondary" id="open-highlight-editor-btn">Edit Rules\u2026</button>
-  </div>`;
 
     // Import / Export section
     sectionsHtml += `
@@ -313,6 +326,9 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
     .save-indicator.visible {
       display: inline;
     }
+    .save-indicator.error {
+      color: var(--vscode-errorForeground, #f48771);
+    }
     .form-group[data-visible-when-setting] { display: none; }
     .form-group[data-visible-when-setting].field-visible { display: block; }
     .danger-zone {
@@ -368,17 +384,20 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
 
       initCustomSelects();
 
-      function showSaved(sectionKey) {
+      function showSaveStatus(sectionKey, text, isError) {
         var indicator = document.querySelector('.save-indicator[data-for="' + sectionKey + '"]');
         if (!indicator) return;
-        indicator.textContent = "\\u2713 Saved";
+        indicator.textContent = text;
+        indicator.classList.toggle("error", !!isError);
         indicator.classList.add("visible");
-        setTimeout(function() { indicator.classList.remove("visible"); }, 1200);
+        if (!isError) {
+          setTimeout(function() { indicator.classList.remove("visible"); }, 1200);
+        }
       }
 
       function saveSetting(section, key, value) {
         vscode.postMessage({ type: "saveSetting", section: section, key: key, value: value });
-        showSaved(section + "." + key);
+        showSaveStatus(section + "." + key, "Saving...", false);
       }
 
       // Toggle (checkbox) handlers
@@ -502,6 +521,9 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       bindClick("open-highlight-editor-btn", function() {
         vscode.postMessage({ type: "openHighlightRuleEditor" });
       });
+      bindClick("open-all-settings-btn", function() {
+        vscode.postMessage({ type: "openAllSettings" });
+      });
       bindClick("reset-all-btn", function() {
         vscode.postMessage({ type: "resetAll" });
       });
@@ -584,10 +606,18 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
               var wrapper = el.closest(".custom-select");
               if (wrapper) selectCustomOption(wrapper, String(vals[fullKey]));
             } else {
-              el.value = String(vals[fullKey] || "");
+              el.value = vals[fullKey] == null ? "" : String(vals[fullKey]);
             }
           }
           updateVisibility();
+        }
+        if (msg.type === "saveResult") {
+          var sectionKey = msg.section + "." + msg.key;
+          if (msg.ok) {
+            showSaveStatus(sectionKey, "\\u2713 Saved", false);
+          } else {
+            showSaveStatus(sectionKey, msg.message || "Could not save.", true);
+          }
         }
       });
     })();

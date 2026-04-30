@@ -54,6 +54,11 @@ describe("renderSettingsHtml", () => {
   it("renders enum settings with custom-select", () => {
     const html = renderWithDefaults();
     expect(html).toContain("custom-select");
+    expect(html).toContain('role="combobox"');
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).toContain('role="listbox"');
+    expect(html).toContain('role="option"');
+    expect(html).not.toContain('aria-hidden="true"');
     expect(html).toContain("Shared");
     expect(html).toContain("Isolated");
   });
@@ -123,6 +128,11 @@ describe("renderSettingsHtml", () => {
     expect(html).toContain("save-indicator");
   });
 
+  it("preserves zero values when refreshing config updates", () => {
+    const html = renderWithDefaults();
+    expect(html).toContain('vals[fullKey] == null ? "" : String(vals[fullKey])');
+  });
+
   describe("categoryFilter", () => {
     it("renders only target category settings when filter is set", () => {
       const values = buildDefaultValues();
@@ -171,6 +181,13 @@ describe("renderSettingsHtml", () => {
       const html = renderSettingsHtml(values, "test-nonce-123", "logging");
       expect(html).toContain("reset-category-btn");
       expect(html).toContain('data-category="logging"');
+    });
+
+    it("includes a route back to all settings in focused mode", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "logging");
+      expect(html).toContain("open-all-settings-btn");
+      expect(html).toContain('type: "openAllSettings"');
     });
 
     it("wraps settings in .settings-card in focused mode", () => {

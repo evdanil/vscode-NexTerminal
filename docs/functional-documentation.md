@@ -109,14 +109,16 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - Groups can be created from the `+` menu or inline while editing a profile.
 
 ### 4.9 Terminal Macros
-- Define named macros in `nexus.terminal.macros` settings (name + text + optional `keybinding`).
+- Define named macros in the Macro Editor. Macro metadata is stored in VS Code globalState; secret macro text is stored in VS Code SecretStorage.
 - Macros appear in the **Terminal Macros** sidebar view (`nexusMacros`).
 - Click the play button or the label to send macro text to the active terminal.
 - Press `Alt+S` to open a quick pick of all macros.
 - Each macro can have an explicit `keybinding` such as `alt+m`, `alt+shift+5`, or `ctrl+shift+a`. Right-click a macro and select **Assign Shortcut** to edit it.
 - Conflict resolution: assigning a shortcut already taken by another macro clears the old assignment.
 - Macros without a shortcut remain available via the `Alt+S` quick pick.
+- If VS Code terminal/menu settings intercept macro shortcuts, run **Nexus: Fix Macro Keybindings** explicitly. Nexus no longer mutates those global settings during activation.
 - Add `triggerPattern` to enable auto-trigger (expect/send). Matching terminal output sends the macro text automatically, with optional per-macro `triggerCooldown`.
+- Existing macros with no trigger scope keep the compatibility default of matching all terminals. Secret prompts should use the safer `active-session` or `profile` trigger scope where practical.
 - Add `triggerInterval` for polling-style macros. Once the prompt matches again, the macro is armed and can fire on this interval without extra user input.
 - Add `triggerInitiallyDisabled` when a macro should start paused until you manually resume it from the macros view. If the prompt already matched recently, resuming can fire immediately without extra terminal output.
 - Auto-trigger can be paused/resumed per macro from the macros view, and globally toggled with `nexus.terminal.macros.autoTrigger`.
@@ -191,11 +193,10 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 | `nexus.terminal.openLocation` | enum | `editor` | `panel`, `editor` | Where to open terminals |
 | `nexus.terminal.keyboardPassthrough` | boolean | `true` | - | Pass Ctrl+ key combinations to the terminal |
 | `nexus.terminal.passthroughKeys` | array | `[b,e,g,j,k,n,o,p,r,w]` | - | Which Ctrl+ keys to pass through |
-| `nexus.terminal.macros` | array | `[]` | - | Terminal macros with optional `keybinding`, `triggerPattern`, `triggerCooldown`, `triggerInterval`, `triggerInitiallyDisabled` |
 | `nexus.terminal.macros.autoTrigger` | boolean | `true` | - | Enable auto-trigger for macros with a `triggerPattern` |
 | `nexus.terminal.macros.defaultCooldown` | number | `3` | 0–300 s | Default cooldown for auto-trigger macros |
 | `nexus.terminal.macros.bufferLength` | number | `2048` | 256–16384 chars | Max characters retained per terminal for pattern matching |
-| `nexus.terminal.highlighting.enabled` | boolean | `true` | — | Enable regex-based terminal highlighting |
+| `nexus.terminal.highlighting.enabled` | boolean | `true` | — | Enable regex-based terminal highlighting. Rules are edited in the Highlighting Rules editor and unsafe regex shapes are rejected before use. |
 
 ### 5.5 Logging
 

@@ -55,7 +55,7 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
       isNonEmptyString(obj.id) &&
       isNonEmptyString(obj.name) &&
       isNonEmptyString(obj.host) &&
-      typeof obj.port === "number" &&
+      isValidPort(obj.port) &&
       isNonEmptyString(obj.username) &&
       (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
     )
@@ -84,9 +84,9 @@ export function validateTunnelProfile(item: unknown): item is TunnelProfile {
   return (
     isNonEmptyString(obj.id) &&
     isNonEmptyString(obj.name) &&
-    typeof obj.localPort === "number" &&
+    isValidPort(obj.localPort) &&
     isNonEmptyString(obj.remoteIP) &&
-    typeof obj.remotePort === "number"
+    (isValidPort(obj.remotePort) || (obj.tunnelType === "dynamic" && obj.remotePort === 0))
   );
 }
 
