@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { AuthProfile, AuthType, ProxyConfig, ServerConfig } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
+import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { serverFormDefinition } from "../ui/formDefinitions";
@@ -120,6 +121,10 @@ function isAuthType(value: unknown): value is AuthType {
 
 function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
+}
+
+function getTranscriptRotationOptions(ctx: CommandContext): Partial<LoggerRotationOptions> | undefined {
+  return (ctx.loggerFactory as { getRotationOptions?: () => LoggerRotationOptions }).getRotationOptions?.();
 }
 
 function isValidProxyPort(port: number): boolean {
@@ -640,7 +645,8 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
         createSessionTranscript(
           ctx.sessionLogDir,
           server.name,
-          server.logSession ?? getDefaultSessionTranscriptsEnabled()
+          server.logSession ?? getDefaultSessionTranscriptsEnabled(),
+          getTranscriptRotationOptions(ctx)
         ),
         ctx.highlighter,
         triggerObserver,

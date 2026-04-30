@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialSessionStatus, type SerialStopBits } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
+import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SerialPty } from "../services/serial/serialPty";
 import { isSerialRuntimeMissingError } from "../services/serial/errorMatchers";
 import {
@@ -220,6 +221,10 @@ function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
 }
 
+function getTranscriptRotationOptions(ctx: CommandContext): Partial<LoggerRotationOptions> | undefined {
+  return (ctx.loggerFactory as { getRotationOptions?: () => LoggerRotationOptions }).getRotationOptions?.();
+}
+
 function serialTerminalName(profile: SerialProfile): string {
   return resolveSerialProfileMode(profile) === "smartFollow"
     ? `Nexus Serial: ${profile.name} [Smart Follow]`
@@ -385,7 +390,8 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
     createSessionTranscript(
       ctx.sessionLogDir,
       profile.name,
-      profile.logSession ?? getDefaultSessionTranscriptsEnabled()
+      profile.logSession ?? getDefaultSessionTranscriptsEnabled(),
+      getTranscriptRotationOptions(ctx)
     ),
     ctx.highlighter,
     triggerObserver
@@ -481,7 +487,8 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     createSessionTranscript(
       ctx.sessionLogDir,
       profile.name,
-      profile.logSession ?? getDefaultSessionTranscriptsEnabled()
+      profile.logSession ?? getDefaultSessionTranscriptsEnabled(),
+      getTranscriptRotationOptions(ctx)
     ),
     ctx.highlighter,
     triggerObserver

@@ -11,7 +11,7 @@ import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
-import { TerminalLoggerFactory } from "./logging/terminalLogger";
+import { TerminalLoggerFactory, type LoggerRotationOptions } from "./logging/terminalLogger";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
 import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFileSystemProvider";
 import { SftpService } from "./services/sftp/sftpService";
@@ -58,6 +58,16 @@ import { resolveScriptMaxRuntimeMs } from "./services/scripts/maxRuntime";
 
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
 const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
+
+function resolveLogRotationOptions(): LoggerRotationOptions {
+  const loggingConfig = vscode.workspace.getConfiguration("nexus.logging");
+  const maxFileSizeMb = clamp(Math.floor(loggingConfig.get<number>("maxFileSizeMb", 10)), 1, 1024);
+  const maxRotatedFiles = clamp(Math.floor(loggingConfig.get<number>("maxRotatedFiles", 1)), 0, 99);
+  return {
+    maxFileSizeBytes: maxFileSizeMb * 1024 * 1024,
+    maxRotatedFiles
+  };
+}
 
 /**
  * Repair VS Code settings so macro shortcuts reach the extension.
@@ -205,13 +215,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const core = new NexusCore(repository);
   await core.initialize();
 
-  const loggingConfig = vscode.workspace.getConfiguration("nexus.logging");
-  const maxFileSizeMb = clamp(Math.floor(loggingConfig.get<number>("maxFileSizeMb", 10)), 1, 1024);
-  const maxRotatedFiles = clamp(Math.floor(loggingConfig.get<number>("maxRotatedFiles", 1)), 0, 99);
-  const loggerFactory = new TerminalLoggerFactory(path.join(context.globalStorageUri.fsPath, "logs"), {
-    maxFileSizeBytes: maxFileSizeMb * 1024 * 1024,
-    maxRotatedFiles
-  });
+  const loggerFactory = new TerminalLoggerFactory(
+    path.join(context.globalStorageUri.fsPath, "logs"),
+    resolveLogRotationOptions
+  );
   const secretVault = new VscodeSecretVault(context);
 
   const macroStore = new VscodeMacroStore(context);

@@ -11,7 +11,7 @@ export interface LoggerRotationOptions {
   maxRotatedFiles: number;
 }
 
-const DEFAULT_ROTATION_OPTIONS: LoggerRotationOptions = {
+export const DEFAULT_ROTATION_OPTIONS: LoggerRotationOptions = {
   maxFileSizeBytes: 10 * 1024 * 1024,
   maxRotatedFiles: 1
 };
@@ -19,6 +19,17 @@ const DEFAULT_ROTATION_OPTIONS: LoggerRotationOptions = {
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
+
+export function normalizeLoggerRotationOptions(options?: Partial<LoggerRotationOptions>): LoggerRotationOptions {
+  const maxFileSizeBytes = options?.maxFileSizeBytes ?? DEFAULT_ROTATION_OPTIONS.maxFileSizeBytes;
+  const maxRotatedFiles = options?.maxRotatedFiles ?? DEFAULT_ROTATION_OPTIONS.maxRotatedFiles;
+  return {
+    maxFileSizeBytes: clamp(Math.floor(maxFileSizeBytes), 1, 1024 * 1024 * 1024),
+    maxRotatedFiles: clamp(Math.floor(maxRotatedFiles), 0, 99)
+  };
+}
+
+export type LoggerRotationOptionsProvider = () => Partial<LoggerRotationOptions> | undefined;
 
 class RotatingFileSessionLogger implements SessionLogger {
   private fd: number;
@@ -94,25 +105,27 @@ class RotatingFileSessionLogger implements SessionLogger {
 }
 
 export class TerminalLoggerFactory {
-  private readonly rotation: LoggerRotationOptions;
+  private readonly rotationProvider: LoggerRotationOptionsProvider;
 
-  public constructor(baseDir: string, options?: Partial<LoggerRotationOptions>) {
+  public constructor(
+    baseDir: string,
+    options?: Partial<LoggerRotationOptions> | LoggerRotationOptionsProvider
+  ) {
     this.baseDir = baseDir;
     mkdirSync(this.baseDir, { recursive: true });
-    const maxFileSizeBytes = options?.maxFileSizeBytes ?? DEFAULT_ROTATION_OPTIONS.maxFileSizeBytes;
-    const maxRotatedFiles = options?.maxRotatedFiles ?? DEFAULT_ROTATION_OPTIONS.maxRotatedFiles;
-    this.rotation = {
-      maxFileSizeBytes: clamp(Math.floor(maxFileSizeBytes), 1, 1024 * 1024 * 1024),
-      maxRotatedFiles: clamp(Math.floor(maxRotatedFiles), 0, 99)
-    };
+    this.rotationProvider = typeof options === "function" ? options : () => options;
   }
 
   private readonly baseDir: string;
+
+  public getRotationOptions(): LoggerRotationOptions {
+    return normalizeLoggerRotationOptions(this.rotationProvider());
+  }
 
   public create(kind: "terminal" | "tunnel", id: string): SessionLogger {
     const safeId = id.replace(/[^\w.-]/g, "_");
     const filename = `${kind}-${safeId}.log`;
     const filepath = path.join(this.baseDir, filename);
-    return new RotatingFileSessionLogger(filepath, this.rotation);
+    return new RotatingFileSessionLogger(filepath, this.getRotationOptions());
   }
 }
