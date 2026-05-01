@@ -141,7 +141,7 @@ async function confirmAndRepairMacroKeybindings(): Promise<void> {
   void vscode.window.showInformationMessage("Nexus macro keybinding settings were updated.");
 }
 
-const ALL_PASSTHROUGH_KEYS = ["b", "e", "g", "j", "k", "n", "o", "p", "r", "w"] as const;
+const ALL_PASSTHROUGH_KEYS = ["b", "e", "g", "j", "k", "n", "o", "p", "q", "r", "w"] as const;
 
 /** Track which passthrough context keys are currently set to true, so we only update the delta. */
 const activePassthroughKeys = new Set<string>();

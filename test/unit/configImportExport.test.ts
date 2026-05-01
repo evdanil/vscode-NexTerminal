@@ -22,6 +22,7 @@ const mockCreateDirectory = vi.fn();
 const mockWithProgress = vi.fn();
 const mockConfigUpdate = vi.fn();
 const configStore = new Map<string, unknown>();
+const configDefaults = new Map<string, unknown>();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -55,7 +56,19 @@ vi.mock("vscode", () => ({
       { uri: { fsPath: "/workspace", scheme: "file", path: "/workspace" }, name: "workspace", index: 0 }
     ],
     getConfiguration: vi.fn((section: string) => ({
-      get: (key: string) => configStore.get(`${section}.${key}`),
+      get: (key: string, fallback?: unknown) => {
+        const fullKey = `${section}.${key}`;
+        if (configStore.has(fullKey)) return configStore.get(fullKey);
+        if (configDefaults.has(fullKey)) return configDefaults.get(fullKey);
+        return fallback;
+      },
+      inspect: (key: string) => {
+        const fullKey = `${section}.${key}`;
+        return {
+          defaultValue: configDefaults.get(fullKey),
+          globalValue: configStore.has(fullKey) ? configStore.get(fullKey) : undefined
+        };
+      },
       update: (key: string, value: unknown) => {
         if (value === undefined) {
           configStore.delete(`${section}.${key}`);
@@ -179,6 +192,7 @@ function makeExportData(overrides: Record<string, unknown> = {}) {
 // initialized before any test that triggers exportBackup or importMergeReplace,
 // both of which call getMacros()/saveMacros().
 beforeEach(async () => {
+  configDefaults.clear();
   const store = new InMemoryMacroStore();
   await store.initialize();
   setActiveMacroStore(store);
@@ -455,6 +469,20 @@ describe("config import command (legacy)", () => {
     expect(configStore.get("nexus.tunnel.defaultBindAddress")).toBe("0.0.0.0");
     expect(configStore.has("nexus.logging.unexpectedKey")).toBe(false);
     expect(configStore.has("badkey")).toBe(false);
+  });
+
+  it("imports backed-up Ctrl+Q terminal passthrough selection", async () => {
+    const exportData = makeExportData({
+      settings: {
+        "nexus.terminal.passthroughKeys": ["b", "q", "w"]
+      }
+    });
+    await runImport(exportData);
+
+    expect(configStore.get("nexus.terminal.passthroughKeys")).toEqual(["b", "q", "w"]);
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
   });
 
   it("skips unsafe imported highlighting rules", async () => {
@@ -734,6 +762,28 @@ describe("backup export command", () => {
     expect(Buffer.from(fileBackups.find((b) => b.id === "ssh")!.files[0].contentsBase64, "base64").toString("utf8")).toBe("Host lab\n");
     expect(fileBackups.find((b) => b.id === "scripts")?.configuredPath).toBe(".nexus/scripts");
     expect(fileBackups.find((b) => b.id === "scripts")?.files[0].relativePath).toBe("hello.js");
+  });
+
+  it("exports only explicitly configured settings, not package defaults", async () => {
+    configDefaults.set("nexus.scripts.defaultTimeoutSeconds", 30);
+    configDefaults.set("nexus.scripts.maxRuntimeSeconds", 1800);
+    configDefaults.set("nexus.terminal.highlighting.enabled", true);
+    configStore.set("nexus.scripts.defaultTimeout", 60_000);
+    configStore.set("nexus.scripts.maxRuntimeMs", 0);
+
+    mockShowInputBox
+      .mockResolvedValueOnce("testpass123")
+      .mockResolvedValueOnce("testpass123");
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+
+    const backupCmd = registeredCommands.get("nexus.config.export.backup")!;
+    await backupCmd();
+
+    const writtenData = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+    expect(writtenData.settings).toEqual({
+      "nexus.scripts.defaultTimeout": 60_000,
+      "nexus.scripts.maxRuntimeMs": 0
+    });
   });
 });
 
@@ -1746,6 +1796,65 @@ describe("share export round-trip", () => {
 });
 
 describe("backup export round-trip", () => {
+  it("backup export then import preserves explicitly configured settings without invalid warnings", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const sourceRepo = new InMemoryConfigRepository();
+    const sourceCore = new NexusCore(sourceRepo);
+    await sourceCore.initialize();
+    configStore.set("nexus.terminal.passthroughKeys", ["b", "q", "w"]);
+    configStore.set("nexus.ui.showTreeDescriptions", false);
+
+    registerConfigCommands(sourceCore, vault);
+
+    mockShowInputBox
+      .mockResolvedValueOnce("masterpass1")
+      .mockResolvedValueOnce("masterpass1");
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+
+    const backupCmd = registeredCommands.get("nexus.config.export.backup")!;
+    await backupCmd();
+
+    const exported = JSON.parse(exportedJson);
+    expect(exported.version).toBe(2);
+    expect(exported.exportType).toBe("backup");
+    expect(exported.settings).toEqual({
+      "nexus.ui.showTreeDescriptions": false,
+      "nexus.terminal.passthroughKeys": ["b", "q", "w"]
+    });
+
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+
+    const destRepo = new InMemoryConfigRepository();
+    const destCore = new NexusCore(destRepo);
+    await destCore.initialize();
+    registerConfigCommands(destCore, vault);
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(exportedJson, "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowInputBox.mockResolvedValueOnce("masterpass1");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(configStore.get("nexus.terminal.passthroughKeys")).toEqual(["b", "q", "w"]);
+    expect(configStore.get("nexus.ui.showTreeDescriptions")).toBe(false);
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
+  });
+
   it("backup export then import preserves passwords and secret macros", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();

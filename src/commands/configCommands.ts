@@ -31,6 +31,7 @@ import { validateAndSanitizeHighlightRules } from "../utils/highlightRuleValidat
 import { validateRegexSafety } from "../utils/regexSafety";
 import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
 import { MAX_SCRIPT_WAIT_TIMEOUT_MS } from "../services/scripts/defaultTimeout";
+import { getConfiguredSettingValue } from "../utils/configurationInspection";
 
 interface MacroEntry {
   name?: string;
@@ -127,7 +128,7 @@ function readSettings(): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const { section, key } of SETTINGS_KEYS) {
     const config = vscode.workspace.getConfiguration(section);
-    const value = config.get(key);
+    const value = getConfiguredSettingValue(config, key);
     if (value !== undefined) {
       result[`${section}.${key}`] = value;
     }

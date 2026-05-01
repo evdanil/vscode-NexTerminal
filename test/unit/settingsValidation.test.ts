@@ -14,7 +14,7 @@ describe("validateSettingUpdate", () => {
 
   it("accepts valid enum and multi-checkbox values", () => {
     expect(validateSettingUpdate("nexus.terminal", "openLocation", "editor").ok).toBe(true);
-    expect(validateSettingUpdate("nexus.terminal", "passthroughKeys", ["b", "w"]).ok).toBe(true);
+    expect(validateSettingUpdate("nexus.terminal", "passthroughKeys", ["b", "q", "w"]).ok).toBe(true);
   });
 
   it("rejects unknown multi-checkbox values", () => {

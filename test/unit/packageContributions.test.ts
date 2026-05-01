@@ -124,6 +124,15 @@ describe("package contributions", () => {
     expect(commandsToSkipShell).toEqual(["nexus.macro.run", "nexus.macro.runBinding"]);
   });
 
+  it("keeps Ctrl+Q terminal passthrough configurable", () => {
+    const prop = packageJson.contributes.configuration?.properties?.["nexus.terminal.passthroughKeys"];
+    expect(prop?.default).toContain("q");
+    expect(prop?.items?.enum).toContain("q");
+
+    const binding = packageJson.contributes.keybindings?.find((item) => item.key === "ctrl+q");
+    expect(binding?.when).toContain("nexus.passthrough.ctrlQ");
+  });
+
   describe("Scripts view contributions (S1/S2/S3/F3/P1)", () => {
     it("contributes a viewsWelcome entry for nexusScripts with New Script and docs actions", () => {
       const welcome = packageJson.contributes.viewsWelcome ?? [];

@@ -235,6 +235,7 @@ export const SETTINGS_META: SettingMeta[] = [
       { label: "Ctrl+N", value: "n" },
       { label: "Ctrl+O", value: "o" },
       { label: "Ctrl+P", value: "p" },
+      { label: "Ctrl+Q", value: "q" },
       { label: "Ctrl+R", value: "r" },
       { label: "Ctrl+W", value: "w" }
     ],
