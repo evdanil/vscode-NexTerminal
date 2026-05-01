@@ -485,6 +485,26 @@ describe("config import command (legacy)", () => {
     );
   });
 
+  it.each(["merge", "replace"] as const)(
+    "migrates backed-up legacy default wait timeout to the registered seconds setting in %s mode",
+    async (mode) => {
+    const exportData = makeExportData({
+      exportType: "backup",
+      settings: {
+        "nexus.scripts.defaultTimeout": 60_000
+      }
+    });
+    await runImport(exportData, mode);
+
+    expect(configStore.get("nexus.scripts.defaultTimeoutSeconds")).toBe(60);
+    expect(configStore.has("nexus.scripts.defaultTimeout")).toBe(false);
+    expect(mockConfigUpdate).not.toHaveBeenCalledWith("nexus.scripts", "defaultTimeout", expect.anything());
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
+    }
+  );
+
   it("skips unsafe imported highlighting rules", async () => {
     const exportData = makeExportData({
       settings: {
@@ -781,7 +801,7 @@ describe("backup export command", () => {
 
     const writtenData = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
     expect(writtenData.settings).toEqual({
-      "nexus.scripts.defaultTimeout": 60_000,
+      "nexus.scripts.defaultTimeoutSeconds": 60,
       "nexus.scripts.maxRuntimeMs": 0
     });
   });

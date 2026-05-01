@@ -30,7 +30,7 @@ import { validateSettingUpdate } from "../ui/settingsValidation";
 import { validateAndSanitizeHighlightRules } from "../utils/highlightRuleValidation";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
-import { MAX_SCRIPT_WAIT_TIMEOUT_MS } from "../services/scripts/defaultTimeout";
+import { MAX_SCRIPT_WAIT_TIMEOUT_MS, MAX_SCRIPT_WAIT_TIMEOUT_SECONDS } from "../services/scripts/defaultTimeout";
 import { getConfiguredSettingValue } from "../utils/configurationInspection";
 
 interface MacroEntry {
@@ -123,6 +123,16 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
 ];
 
 const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`));
+const SCRIPT_DEFAULT_TIMEOUT_SECONDS_KEY = "nexus.scripts.defaultTimeoutSeconds";
+const LEGACY_SCRIPT_DEFAULT_TIMEOUT_MS_KEY = "nexus.scripts.defaultTimeout";
+
+function legacyDefaultTimeoutMsToSeconds(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 100) {
+    return undefined;
+  }
+
+  return Math.max(1, Math.min(MAX_SCRIPT_WAIT_TIMEOUT_SECONDS, value / 1000));
+}
 
 function readSettings(): Record<string, unknown> {
   const result: Record<string, unknown> = {};
@@ -130,7 +140,17 @@ function readSettings(): Record<string, unknown> {
     const config = vscode.workspace.getConfiguration(section);
     const value = getConfiguredSettingValue(config, key);
     if (value !== undefined) {
-      result[`${section}.${key}`] = value;
+      const fullKey = `${section}.${key}`;
+      if (fullKey === LEGACY_SCRIPT_DEFAULT_TIMEOUT_MS_KEY) {
+        if (result[SCRIPT_DEFAULT_TIMEOUT_SECONDS_KEY] === undefined) {
+          const seconds = legacyDefaultTimeoutMsToSeconds(value);
+          if (seconds !== undefined) {
+            result[SCRIPT_DEFAULT_TIMEOUT_SECONDS_KEY] = seconds;
+          }
+        }
+      } else {
+        result[fullKey] = value;
+      }
     }
   }
   return result;
@@ -140,10 +160,26 @@ function readSettings(): Record<string, unknown> {
 async function applySettings(settings: Record<string, unknown>): Promise<void> {
   const allowedSettings: Record<string, unknown> = {};
   let invalidCount = 0;
+  let legacyDefaultTimeoutSeconds: number | undefined;
   for (const [fullKey, value] of Object.entries(settings)) {
-    if (SETTINGS_KEY_SET.has(fullKey)) {
-      allowedSettings[fullKey] = value;
+    if (!SETTINGS_KEY_SET.has(fullKey)) {
+      continue;
     }
+
+    if (fullKey === LEGACY_SCRIPT_DEFAULT_TIMEOUT_MS_KEY) {
+      const seconds = legacyDefaultTimeoutMsToSeconds(value);
+      if (seconds === undefined) {
+        invalidCount++;
+      } else {
+        legacyDefaultTimeoutSeconds = seconds;
+      }
+      continue;
+    }
+
+    allowedSettings[fullKey] = value;
+  }
+  if (legacyDefaultTimeoutSeconds !== undefined) {
+    allowedSettings[SCRIPT_DEFAULT_TIMEOUT_SECONDS_KEY] = legacyDefaultTimeoutSeconds;
   }
   // nexus.terminal.macros (the array) is intentionally excluded from SETTINGS_KEYS
   // — macros now live in MacroStore, not settings. The allowedSettings filter above
