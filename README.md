@@ -175,6 +175,10 @@ npm run package:vsix
 | `nexus.scripts.maxRuntimeSeconds` | `1800` | Overall runtime cap in seconds. Exceeded runs are auto-stopped with reason `max-runtime-exceeded`; `0` disables the cap; maximum `2147483` |
 | `nexus.scripts.maxRuntimeMs` | `1800000` | Legacy millisecond runtime cap retained for compatibility when the seconds setting is absent |
 
+## Maintainer Notes
+
+- Release process: [docs/release.md](docs/release.md)
+
 ## Documentation
 
 See [docs/functional-documentation.md](docs/functional-documentation.md) for detailed architecture and design documentation.
