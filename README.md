@@ -2,6 +2,8 @@
 
 Unified SSH, Serial, and Port Forwarding hub for VS Code.
 
+[![Open VSX](https://img.shields.io/badge/Open%20VSX-Nexus%20Terminal-blue)](https://open-vsx.org/extension/<publisher>/nexus-terminal)
+
 Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support, SFTP file explorer, connection multiplexing, terminal macros, regex highlighting, unread activity indicators, color schemes, and configuration import/export.
 
 ## Features
@@ -50,17 +52,29 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 
 ## Getting Started
 
+Nexus Terminal is available from both the VS Code Marketplace and Open VSX registries.
+
 ### Install from VS Code Marketplace
 
 1. Open VS Code and go to the Extensions view (`Ctrl+Shift+X`)
 2. Search for **Nexus Terminal**
-3. Click **Install**
-4. Open the **Nexus** sidebar (activity bar icon)
+3. Select the listing from the **Visual Studio Marketplace**
+4. Click **Install**
+5. Open the **Nexus** sidebar (activity bar icon)
+
+### Install from Open VSX
+
+- Listing URL: https://open-vsx.org/extension/<publisher>/nexus-terminal
+
+1. Open your Open VSX-compatible editor (for example VSCodium, Eclipse Theia, or Gitpod).
+2. Go to the Extensions view and search for **Nexus Terminal** in the Open VSX registry, then click **Install**.
+3. Or install directly from a downloaded VSIX: `Extensions` > `...` > `Install from VSIX...` and select the package file.
+4. Open the **Nexus** sidebar (activity bar icon).
 
 ### Install from VSIX
 
 1. Download the `.vsix` from [GitHub Releases](https://github.com/evdanil/vscode-NexTerminal/releases)
-2. In VS Code: `Extensions` > `...` > `Install from VSIX...`
+2. In VS Code or Open VSX-compatible editors: `Extensions` > `...` > `Install from VSIX...`
 3. Open the **Nexus** sidebar (activity bar icon)
 
 ### Add a Server
