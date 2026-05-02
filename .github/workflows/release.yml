@@ -77,13 +77,6 @@ jobs:
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
-      - name: Publish to Open VSX Registry
-        if: >-
-          startsWith(github.ref, 'refs/tags/v')
-          || inputs.publish_marketplace
-        run: npx ovsx publish *.vsix --pat "$OVSX_PAT"
-        env:
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
 
       - name: Prune old npm caches
         if: always()

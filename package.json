@@ -3057,6 +3057,8 @@
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
     "package:vsix": "npm run build:production && vsce package",
+    "package:ovsx": "npm run build:production && npx --yes ovsx@0.10.5 package",
+    "publish:ovsx": "npm run package:ovsx && npx --yes ovsx@0.10.5 publish *.vsix --pat \"$OVSX_PAT\"",
     "generate:keybindings": "node scripts/generateKeybindings.mjs"
   },
   "dependencies": {
@@ -3072,6 +3074,7 @@
     "@vitest/coverage-v8": "^3.0.9",
     "@vscode/vsce": "^3.3.2",
     "esbuild": "^0.27.3",
+    "ovsx": "0.10.5",
     "rimraf": "^6.0.1",
     "typescript": "^5.8.2",
     "vitest": "^3.0.9"
