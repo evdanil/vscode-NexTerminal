@@ -33,7 +33,7 @@ Maintainer-only checklist for shipping a new Nexus Terminal extension release.
 5. **Publish to both registries**
    ```bash
    npx @vscode/vsce publish --packagePath *.vsix --pat "$VSCE_PAT"
-   npx ovsx publish *.vsix --pat "$OVSX_PAT"
+   npm run publish:ovsx
    ```
 6. **Verify listing pages**
    - VS Code Marketplace: confirm latest version/changelog is visible.

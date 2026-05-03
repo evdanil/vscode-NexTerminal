@@ -2,7 +2,7 @@
 
 Unified SSH, Serial, and Port Forwarding hub for VS Code.
 
-[![Open VSX](https://img.shields.io/badge/Open%20VSX-Nexus%20Terminal-blue)](https://open-vsx.org/extension/<publisher>/nexus-terminal)
+[![Open VSX](https://img.shields.io/badge/Open%20VSX-Nexus%20Terminal-blue)](https://open-vsx.org/extension/sentriflow/vscode-nexterminal)
 
 Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support, SFTP file explorer, connection multiplexing, terminal macros, regex highlighting, unread activity indicators, color schemes, and configuration import/export.
 
@@ -64,7 +64,7 @@ Nexus Terminal is available from both the VS Code Marketplace and Open VSX regis
 
 ### Install from Open VSX
 
-- Listing URL: https://open-vsx.org/extension/<publisher>/nexus-terminal
+- Listing URL: https://open-vsx.org/extension/sentriflow/vscode-nexterminal
 
 1. Open your Open VSX-compatible editor (for example VSCodium, Eclipse Theia, or Gitpod).
 2. Go to the Extensions view and search for **Nexus Terminal** in the Open VSX registry, then click **Install**.
