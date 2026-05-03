@@ -1,4 +1,5 @@
 # Source and config
+!dist/**
 src/**
 test/**
 docs/**
