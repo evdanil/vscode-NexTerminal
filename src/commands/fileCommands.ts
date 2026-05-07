@@ -482,7 +482,13 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
         return;
       }
       try {
-        await ctx.sftpService.delete(item.serverId, remotePath);
+        await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: "Deleting...", cancellable: false },
+          async (progress) => {
+            progress.report({ message: item.entry.name });
+            await ctx.sftpService.delete(item.serverId, remotePath);
+          }
+        );
         ctx.fileExplorerProvider.refresh();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

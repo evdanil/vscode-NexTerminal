@@ -260,6 +260,38 @@ describe("fileCommands title bar actions", () => {
     expect(ctx.fileExplorerProvider.refresh).not.toHaveBeenCalled();
   });
 
+  it("single directory delete reports progress while deleting", async () => {
+    const ctx = createContext();
+    const item = createFileTreeItem({
+      entry: {
+        name: "subdir",
+        isDirectory: true,
+        isSymlink: false,
+        size: 4096,
+        modifiedAt: 1700000000,
+        permissions: 0o755,
+      },
+    });
+    const progress = { report: vi.fn() };
+    mockShowWarningMessage.mockResolvedValue("Delete");
+    mockWithProgress.mockImplementationOnce(async (_opts: unknown, task: (progress: { report: (arg: unknown) => void }) => Promise<void>) =>
+      task(progress)
+    );
+    registerFileCommands(ctx);
+
+    const deleteCommand = registeredCommands.get("nexus.files.delete");
+    expect(deleteCommand).toBeDefined();
+    await deleteCommand!(item);
+
+    expect(mockWithProgress).toHaveBeenCalledWith(
+      { location: 15, title: "Deleting...", cancellable: false },
+      expect.any(Function)
+    );
+    expect(progress.report).toHaveBeenCalledWith({ message: "subdir" });
+    expect(ctx.sftpService.delete).toHaveBeenCalledWith("srv-1", "/home/subdir");
+    expect(ctx.fileExplorerProvider.refresh).toHaveBeenCalled();
+  });
+
   it("multi-delete dedupes parent directories and preserves colon-containing paths", async () => {
     const ctx = createContext();
     const parent = createFileTreeItem({
