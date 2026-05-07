@@ -1,16 +1,33 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommandContext } from "../../src/commands/types";
+import type { DirectoryEntry } from "../../src/services/sftp/sftpService";
 import { registerFileCommands } from "../../src/commands/fileCommands";
+import { FileTreeItem } from "../../src/ui/fileExplorerTreeProvider";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockExecuteCommand = vi.fn();
 const mockShowInputBox = vi.fn();
 const mockShowOpenDialog = vi.fn();
 const mockShowErrorMessage = vi.fn();
+const mockShowWarningMessage = vi.fn();
 const mockWithProgress = vi.fn(async (_opts: unknown, task: (progress: { report: (arg: unknown) => void }) => Promise<void>) =>
   task({ report: vi.fn() })
 );
 const mockBuildUri = vi.fn((serverId: string, remotePath: string) => ({ scheme: "nexterm", serverId, remotePath }));
+
+function createFileTreeItem(overrides: {
+  serverId?: string;
+  remotePath?: string;
+  entry: DirectoryEntry;
+}): FileTreeItem {
+  const item = {
+    serverId: overrides.serverId ?? "srv-1",
+    remotePath: overrides.remotePath ?? "/home",
+    entry: overrides.entry,
+    label: overrides.entry.name
+  } as unknown as FileTreeItem;
+  return Object.setPrototypeOf(item, FileTreeItem.prototype);
+}
 
 vi.mock("vscode", () => ({
   commands: {
@@ -25,7 +42,7 @@ vi.mock("vscode", () => ({
     showOpenDialog: (...args: unknown[]) => mockShowOpenDialog(...args),
     withProgress: (...args: unknown[]) => mockWithProgress(...args),
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
-    showWarningMessage: vi.fn(),
+    showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: vi.fn(),
     showQuickPick: vi.fn(),
     showSaveDialog: vi.fn()
@@ -191,5 +208,94 @@ describe("fileCommands title bar actions", () => {
 
     expect(mockShowInputBox).not.toHaveBeenCalled();
     expect(ctx.sftpService.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("single delete refreshes explorer after success", async () => {
+    const ctx = createContext();
+    const item = createFileTreeItem({
+      entry: {
+        name: "file.txt",
+        isDirectory: false,
+        isSymlink: false,
+        size: 128,
+        modifiedAt: 1700000000,
+        permissions: 0o644,
+      },
+    });
+    mockShowWarningMessage.mockResolvedValue("Delete");
+    registerFileCommands(ctx);
+
+    const deleteCommand = registeredCommands.get("nexus.files.delete");
+    expect(deleteCommand).toBeDefined();
+    await deleteCommand!(item);
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(`Delete file "file.txt"?`, { modal: true }, "Delete");
+    expect(ctx.sftpService.delete).toHaveBeenCalledWith("srv-1", "/home/file.txt");
+    expect(ctx.fileExplorerProvider.refresh).toHaveBeenCalled();
+  });
+
+  it("single delete shows an error when service deletion fails", async () => {
+    const ctx = createContext();
+    const item = createFileTreeItem({
+      entry: {
+        name: "bad.txt",
+        isDirectory: false,
+        isSymlink: false,
+        size: 128,
+        modifiedAt: 1700000000,
+        permissions: 0o644,
+      },
+    });
+    mockShowWarningMessage.mockResolvedValue("Delete");
+    ctx.sftpService.delete = vi.fn(async () => {
+      throw new Error("delete failed");
+    });
+    registerFileCommands(ctx);
+
+    const deleteCommand = registeredCommands.get("nexus.files.delete");
+    expect(deleteCommand).toBeDefined();
+    await deleteCommand!(item);
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("Failed to delete \"bad.txt\": delete failed");
+    expect(ctx.fileExplorerProvider.refresh).not.toHaveBeenCalled();
+  });
+
+  it("multi-delete dedupes parent directories and preserves colon-containing paths", async () => {
+    const ctx = createContext();
+    const parent = createFileTreeItem({
+      serverId: "srv-1",
+      remotePath: "/remote:drive",
+      entry: {
+        name: "project",
+        isDirectory: true,
+        isSymlink: false,
+        size: 4096,
+        modifiedAt: 1700000000,
+        permissions: 0o755,
+      },
+    });
+    const child = createFileTreeItem({
+      serverId: "srv-1",
+      remotePath: "/remote:drive/project",
+      entry: {
+        name: "file.txt",
+        isDirectory: false,
+        isSymlink: false,
+        size: 10,
+        modifiedAt: 1700000000,
+        permissions: 0o644,
+      },
+    });
+    mockShowWarningMessage.mockResolvedValue("Delete");
+    ctx.sftpService.delete = vi.fn(async () => {});
+    registerFileCommands(ctx);
+
+    const deleteCommand = registeredCommands.get("nexus.files.delete");
+    expect(deleteCommand).toBeDefined();
+    await deleteCommand!(undefined, [parent, child]);
+
+    expect(ctx.sftpService.delete).toHaveBeenCalledTimes(1);
+    expect(ctx.sftpService.delete).toHaveBeenCalledWith("srv-1", "/remote:drive/project");
+    expect(ctx.fileExplorerProvider.refresh).toHaveBeenCalled();
   });
 });

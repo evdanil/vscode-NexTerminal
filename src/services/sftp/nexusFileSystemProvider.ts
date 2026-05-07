@@ -81,11 +81,11 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
     const entry = await this.sftp.lstat(serverId, remotePath);
     if (entry.isSymlink) {
       // Always unlink symlinks directly — never recurse into their targets
-      await this.sftp.delete(serverId, remotePath, false);
+      await this.sftp.delete(serverId, remotePath);
     } else if (entry.isDirectory && !options.recursive) {
       throw vscode.FileSystemError.NoPermissions("Directory is not empty (use recursive delete)");
     } else {
-      await this.sftp.delete(serverId, remotePath, entry.isDirectory);
+      await this.sftp.delete(serverId, remotePath);
     }
     this.onDidChangeFileEmitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
   }

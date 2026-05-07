@@ -3,6 +3,7 @@ import type { SFTPWrapper, FileEntry, Stats, TransferOptions } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import { clamp } from "../../utils/helpers";
 import { shellEscape } from "../../utils/shellEscape";
+import { isSafeEntryName } from "../../utils/pathSafety";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
 import { RemoteDirectoryWatcher, type RemoteChangeEvent, type WatchMode } from "./remoteDirectoryWatcher";
 
@@ -213,20 +214,7 @@ export class SftpService {
       return cached.entries;
     }
 
-    const sftp = this.getSftp(serverId);
-    const entries = await withTimeout<FileEntry[]>("readdir", this.operationTimeoutMs, (resolve, reject) => {
-      sftp.readdir(remotePath, (error, list) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve(list);
-      });
-    });
-
-    const result = entries
-      .filter((e) => e.filename !== "." && e.filename !== "..")
-      .map(toDirectoryEntry);
+    const result = await this.readDirectoryUncached(serverId, remotePath);
 
     this.dirCache.set(key, { entries: result, fetchedAt: Date.now() });
     this.evictCacheIfNeeded();
@@ -385,22 +373,53 @@ export class SftpService {
     this.invalidateCache(serverId, parentDir(remotePath));
   }
 
-  public async delete(serverId: string, remotePath: string, isDir: boolean): Promise<void> {
+  public async delete(serverId: string, remotePath: string): Promise<void> {
     const sftp = this.getSftp(serverId);
-    if (isDir) {
-      await this.deleteRecursive(sftp, serverId, remotePath, 0, { count: 0 });
-    } else {
-      await withTimeout<void>("unlink", this.operationTimeoutMs, (resolve, reject) => {
-        sftp.unlink(remotePath, (error) => {
+    const parentPath = parentDir(remotePath);
+    try {
+      const entry = await this.lstat(serverId, remotePath);
+      if (entry.isSymlink || !entry.isDirectory) {
+        await this.unlink(sftp, remotePath);
+      } else {
+        await this.deleteRecursive(sftp, serverId, remotePath, 0, { count: 0 });
+      }
+    } finally {
+      this.invalidateCache(serverId, parentPath);
+      this.invalidateCacheTree(serverId, remotePath);
+    }
+  }
+
+  private async unlink(sftp: SFTPWrapper, remotePath: string): Promise<void> {
+    await withTimeout<void>("unlink", this.operationTimeoutMs, (resolve, reject) => {
+      sftp.unlink(remotePath, (error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  private async readDirectoryUncached(serverId: string, remotePath: string): Promise<DirectoryEntry[]> {
+    const sftp = this.getSftp(serverId);
+    const entries = await withTimeout<FileEntry[]>(
+      "readdir",
+      this.operationTimeoutMs,
+      (resolve, reject) => {
+        sftp.readdir(remotePath, (error, list) => {
           if (error) {
             reject(error);
             return;
           }
-          resolve();
+          resolve(list);
         });
-      });
-    }
-    this.invalidateCache(serverId, parentDir(remotePath));
+      }
+    );
+
+    return entries
+      .filter((e) => e.filename !== "." && e.filename !== "..")
+      .map(toDirectoryEntry);
   }
 
   public async rename(serverId: string, oldPath: string, newPath: string): Promise<void> {
@@ -759,34 +778,43 @@ export class SftpService {
     if (depth > this.maxDeleteDepth) {
       throw new Error(`Delete aborted: directory nesting exceeds ${this.maxDeleteDepth} levels`);
     }
-    const entries = await this.readDirectory(serverId, dirPath);
+    const entries = await this.readDirectoryUncached(serverId, dirPath);
     for (const entry of entries) {
+      if (!isSafeEntryName(entry.name)) {
+        throw new Error(`Delete aborted: unsafe entry name "${entry.name}" at "${dirPath}"`);
+      }
       if (++ops.count > this.maxDeleteOps) {
         throw new Error(`Delete aborted: more than ${this.maxDeleteOps} items`);
       }
       const fullPath = path.posix.join(dirPath, entry.name);
-      if (entry.isDirectory && !entry.isSymlink) {
-        await this.deleteRecursive(sftp, serverId, fullPath, depth + 1, ops);
-      } else {
-        await withTimeout<void>("unlink", this.operationTimeoutMs, (resolve, reject) => {
-          sftp.unlink(fullPath, (error) => {
-            if (error) {
-              reject(error);
-              return;
-            }
-            resolve();
-          });
-        });
+      try {
+        if (entry.isDirectory && !entry.isSymlink) {
+          await this.deleteRecursive(sftp, serverId, fullPath, depth + 1, ops);
+        } else {
+          await this.unlink(sftp, fullPath);
+        }
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          continue;
+        }
+        throw error;
       }
     }
-    await withTimeout<void>("rmdir", this.operationTimeoutMs, (resolve, reject) => {
-      sftp.rmdir(dirPath, (error) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve();
+
+    try {
+      await withTimeout<void>("rmdir", this.operationTimeoutMs, (resolve, reject) => {
+        sftp.rmdir(dirPath, (error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
       });
-    });
+    } catch (error) {
+      if (!isMissingPathError(error)) {
+        throw error;
+      }
+    }
   }
 }

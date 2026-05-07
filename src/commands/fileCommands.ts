@@ -94,6 +94,11 @@ interface DownloadItem {
   remotePath: string;
 }
 
+interface DeleteItem {
+  item: FileTreeItem;
+  remotePath: string;
+}
+
 function dedupeDownloadItems(items: FileTreeItem[]): DownloadItem[] {
   const normalized = items
     .filter((item) => item.label !== ".")
@@ -103,6 +108,27 @@ function dedupeDownloadItems(items: FileTreeItem[]): DownloadItem[] {
   const result: DownloadItem[] = [];
   for (const candidate of normalized) {
     if (result.some((existing) => candidate.remotePath === existing.remotePath || candidate.remotePath.startsWith(`${existing.remotePath}/`))) {
+      continue;
+    }
+    result.push(candidate);
+  }
+  return result;
+}
+
+function dedupeDeleteItems(items: FileTreeItem[]): DeleteItem[] {
+  const normalized = items
+    .filter((item) => item.label !== ".")
+    .map((item) => ({ item, remotePath: path.posix.join(item.remotePath, item.entry.name) }))
+    .sort((a, b) => a.remotePath.localeCompare(b.remotePath));
+
+  const result: DeleteItem[] = [];
+  for (const candidate of normalized) {
+    if (result.some((existing) =>
+      candidate.item.serverId === existing.item.serverId && (
+        candidate.remotePath === existing.remotePath ||
+        candidate.remotePath.startsWith(`${existing.remotePath}/`)
+      )
+    )) {
       continue;
     }
     result.push(candidate);
@@ -416,13 +442,13 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
   });
 
   const deleteCmd = vscode.commands.registerCommand("nexus.files.delete", async (arg?: unknown, allSelected?: unknown) => {
-    const items = resolveSelectedItems(arg, allSelected);
+    const items = dedupeDeleteItems(resolveSelectedItems(arg, allSelected));
     if (items.length === 0) {
       return;
     }
 
     if (items.length === 1) {
-      const item = items[0];
+      const { item, remotePath } = items[0];
       const label = item.entry.isDirectory ? "directory" : "file";
       const confirm = await vscode.window.showWarningMessage(
         `Delete ${label} "${item.entry.name}"?`,
@@ -432,9 +458,13 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       if (confirm !== "Delete") {
         return;
       }
-      const fullPath = path.posix.join(item.remotePath, item.entry.name);
-      await ctx.sftpService.delete(item.serverId, fullPath, item.entry.isDirectory);
-      ctx.fileExplorerProvider.refresh();
+      try {
+        await ctx.sftpService.delete(item.serverId, remotePath);
+        ctx.fileExplorerProvider.refresh();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`Failed to delete "${item.entry.name}": ${message}`);
+      }
       return;
     }
 
@@ -446,16 +476,13 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     if (confirm !== "Delete") {
       return;
     }
-    const dirsToInvalidate = new Set<string>();
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "Deleting...", cancellable: false },
       async (progress) => {
-        for (const item of items) {
+        for (const { item, remotePath } of items) {
           progress.report({ message: item.entry.name });
-          const fullPath = path.posix.join(item.remotePath, item.entry.name);
           try {
-            await ctx.sftpService.delete(item.serverId, fullPath, item.entry.isDirectory);
-            dirsToInvalidate.add(`${item.serverId}:${item.remotePath}`);
+            await ctx.sftpService.delete(item.serverId, remotePath);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             vscode.window.showErrorMessage(`Failed to delete "${item.entry.name}": ${message}`);
@@ -463,10 +490,6 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
         }
       }
     );
-    for (const key of dirsToInvalidate) {
-      const [serverId, dirPath] = key.split(":", 2);
-      ctx.sftpService.invalidateCache(serverId, dirPath);
-    }
     ctx.fileExplorerProvider.refresh();
   });
 

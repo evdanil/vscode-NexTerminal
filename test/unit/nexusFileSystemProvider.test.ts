@@ -207,7 +207,7 @@ describe("NexusFileSystemProvider", () => {
     await provider.delete(uri, { recursive: false });
 
     expect(sftp.lstat).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt");
-    expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt", false);
+    expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt");
     // FileChangeType.Deleted = 3
     expect(events[0].type).toBe(3);
   });
@@ -221,7 +221,7 @@ describe("NexusFileSystemProvider", () => {
     await provider.delete(uri, { recursive: true });
 
     // Should delete as file (not directory), even though target is a directory
-    expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/link", false);
+    expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/link");
   });
 
   it("delete rejects non-recursive directory delete", async () => {
