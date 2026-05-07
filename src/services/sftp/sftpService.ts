@@ -3,7 +3,7 @@ import type { SFTPWrapper, FileEntry, Stats, TransferOptions } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import { clamp } from "../../utils/helpers";
 import { shellEscape } from "../../utils/shellEscape";
-import { isSafeEntryName } from "../../utils/pathSafety";
+import { isSafeEntryName, joinRemoteEntryPath } from "../../utils/pathSafety";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
 import { RemoteDirectoryWatcher, type RemoteChangeEvent, type WatchMode } from "./remoteDirectoryWatcher";
 
@@ -81,6 +81,18 @@ function isMissingPathError(error: unknown): boolean {
     return true;
   }
   return typeof candidate.message === "string" && /\b(no such file|not found)\b/i.test(candidate.message);
+}
+
+function isStrictMissingPathError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as { code?: number | string };
+  return (
+    candidate.code === SSH_FX_NO_SUCH_FILE ||
+    candidate.code === "2" ||
+    candidate.code === "ENOENT"
+  );
 }
 
 function normalizeConfigValue(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -373,13 +385,20 @@ export class SftpService {
     this.invalidateCache(serverId, parentDir(remotePath));
   }
 
-  public async delete(serverId: string, remotePath: string): Promise<void> {
+  public async delete(
+    serverId: string,
+    remotePath: string,
+    options: { recursive?: boolean } = {}
+  ): Promise<void> {
     const sftp = this.getSftp(serverId);
+    const recursive = options.recursive !== false;
     const parentPath = parentDir(remotePath);
     try {
       const entry = await this.lstat(serverId, remotePath);
       if (entry.isSymlink || !entry.isDirectory) {
         await this.unlink(sftp, remotePath);
+      } else if (!recursive) {
+        throw new Error("Directory is not empty (use recursive delete)");
       } else {
         await this.deleteRecursive(sftp, serverId, remotePath, 0, { count: 0 });
       }
@@ -786,15 +805,29 @@ export class SftpService {
       if (++ops.count > this.maxDeleteOps) {
         throw new Error(`Delete aborted: more than ${this.maxDeleteOps} items`);
       }
-      const fullPath = path.posix.join(dirPath, entry.name);
+      const fullPath = joinRemoteEntryPath(dirPath, entry.name);
+      if (!fullPath) {
+        throw new Error(`Delete aborted: unsafe entry name "${entry.name}" at "${dirPath}"`);
+      }
+
+      let childEntry: DirectoryEntry;
       try {
-        if (entry.isDirectory && !entry.isSymlink) {
+        childEntry = await this.lstat(serverId, fullPath);
+      } catch (error) {
+        if (isStrictMissingPathError(error)) {
+          continue;
+        }
+        throw error;
+      }
+
+      try {
+        if (childEntry.isDirectory && !childEntry.isSymlink) {
           await this.deleteRecursive(sftp, serverId, fullPath, depth + 1, ops);
         } else {
           await this.unlink(sftp, fullPath);
         }
       } catch (error) {
-        if (isMissingPathError(error)) {
+        if (isStrictMissingPathError(error)) {
           continue;
         }
         throw error;
@@ -812,7 +845,7 @@ export class SftpService {
         });
       });
     } catch (error) {
-      if (!isMissingPathError(error)) {
+      if (!isStrictMissingPathError(error)) {
         throw error;
       }
     }

@@ -298,4 +298,27 @@ describe("fileCommands title bar actions", () => {
     expect(ctx.sftpService.delete).toHaveBeenCalledWith("srv-1", "/remote:drive/project");
     expect(ctx.fileExplorerProvider.refresh).toHaveBeenCalled();
   });
+
+  it("copyPath ignores unsafe remote entry names instead of copying undefined", async () => {
+    const vscode = await import("vscode");
+    const ctx = createContext();
+    const item = createFileTreeItem({
+      entry: {
+        name: "../bad.txt",
+        isDirectory: false,
+        isSymlink: false,
+        size: 10,
+        modifiedAt: 1700000000,
+        permissions: 0o644,
+      },
+    });
+    registerFileCommands(ctx);
+
+    const copyPath = registeredCommands.get("nexus.files.copyPath");
+    expect(copyPath).toBeDefined();
+    await copyPath!(item);
+
+    expect(vscode.env.clipboard.writeText).not.toHaveBeenCalled();
+    expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
+  });
 });

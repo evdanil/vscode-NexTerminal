@@ -4,7 +4,7 @@ import type { ServerConfig } from "../models/config";
 import type { DirectoryEntry } from "../services/sftp/sftpService";
 import type { SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
-import { isSafeEntryName } from "../utils/pathSafety";
+import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "./conflictResolution";
 
 const FILE_DRAG_MIME = "application/vnd.nexus.fileitem";
@@ -128,8 +128,8 @@ export class FileTreeItem extends vscode.TreeItem {
         : vscode.TreeItemCollapsibleState.None
     );
 
-    const fullPath = path.posix.join(remotePath, entry.name);
-    const uri = buildUri(serverId, fullPath);
+    const fullPath = joinRemoteEntryPath(remotePath, entry.name);
+    const uri = buildUri(serverId, fullPath ?? remotePath);
     this.resourceUri = uri;
 
     if (entry.isDirectory) {
@@ -139,7 +139,7 @@ export class FileTreeItem extends vscode.TreeItem {
       this.contextValue = "nexus.fileExplorer.file";
       this.iconPath = vscode.ThemeIcon.File;
       const maxOpenBytes = vscode.workspace.getConfiguration("nexus.sftp").get<number>("maxOpenFileSizeMB", 5) * 1024 * 1024;
-      if (entry.size <= maxOpenBytes) {
+      if (fullPath && entry.size <= maxOpenBytes) {
         this.command = {
           command: "vscode.open",
           title: "Open File",
@@ -308,7 +308,10 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     }
 
     if (element instanceof FileTreeItem && element.entry.isDirectory) {
-      const dirPath = path.posix.join(element.remotePath, element.entry.name);
+      const dirPath = joinRemoteEntryPath(element.remotePath, element.entry.name);
+      if (!dirPath) {
+        return [];
+      }
       return this.loadDirectory(this.activeServerId, dirPath);
     }
 
@@ -338,9 +341,12 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     );
 
     const uris = items.map((item) => {
-      const fullPath = path.posix.join(item.remotePath, item.entry.name);
+      const fullPath = joinRemoteEntryPath(item.remotePath, item.entry.name);
+      if (!fullPath) {
+        return null;
+      }
       return buildUri(item.serverId, fullPath).toString();
-    });
+    }).filter((uri): uri is string => uri !== null);
     dataTransfer.set(
       URI_LIST_MIME,
       new vscode.DataTransferItem(uris.join("\r\n"))
@@ -377,9 +383,15 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   private resolveTargetDirectory(target: FileExplorerItem | undefined): string | undefined {
     let targetDir: string;
     if (target instanceof FileTreeItem) {
-      targetDir = target.entry.isDirectory
-        ? path.posix.join(target.remotePath, target.entry.name)
-        : target.remotePath;
+      if (target.entry.isDirectory) {
+        const joinedTargetDir = joinRemoteEntryPath(target.remotePath, target.entry.name);
+        if (!joinedTargetDir) {
+          return undefined;
+        }
+        targetDir = joinedTargetDir;
+      } else {
+        targetDir = target.remotePath;
+      }
     } else if (target instanceof ParentDirItem) {
       targetDir = target.parentPath;
     } else if (this.currentRootPath) {
@@ -414,19 +426,27 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       if (!sourceDirNormalized) {
         return [];
       }
-      const oldPath = path.posix.normalize(path.posix.join(sourceDirNormalized, item.name));
+      const oldPath = joinRemoteEntryPath(sourceDirNormalized, item.name);
+      if (!oldPath) {
+        return [];
+      }
+      const normalizedOldPath = path.posix.normalize(oldPath);
       const sourcePrefix = sourceDirNormalized === "/" ? "/" : `${sourceDirNormalized}/`;
-      if (!oldPath.startsWith(sourcePrefix)) {
+      if (!normalizedOldPath.startsWith(sourcePrefix)) {
         return [];
       }
-      const newPath = path.posix.normalize(path.posix.join(targetDirNormalized, item.name));
-      if (oldPath === newPath) {
+      const destination = joinRemoteEntryPath(targetDirNormalized, item.name);
+      if (!destination) {
         return [];
       }
-      if (item.isDirectory && (newPath + "/").startsWith(oldPath + "/")) {
+      const newPath = path.posix.normalize(destination);
+      if (normalizedOldPath === newPath) {
         return [];
       }
-      return [{ ...item, oldPath, newPath }];
+      if (item.isDirectory && (newPath + "/").startsWith(normalizedOldPath + "/")) {
+        return [];
+      }
+      return [{ ...item, oldPath: normalizedOldPath, newPath }];
     });
 
     if (validItems.length === 0) {
@@ -807,6 +827,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     try {
       const entries = await this.sftp.readDirectory(serverId, dirPath);
       return entries
+        .filter((entry) => isSafeEntryName(entry.name))
         .sort((a, b) => {
           if (a.isDirectory !== b.isDirectory) {
             return a.isDirectory ? -1 : 1;

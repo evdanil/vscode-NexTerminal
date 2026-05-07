@@ -301,16 +301,27 @@ describe("SftpService", () => {
     await service.connect(testServer);
 
     let readdirCallCount = 0;
-    sftp.lstat.mockImplementation((_path: string, cb: Function) => {
-      cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+    sftp.lstat.mockImplementation((pathName: string, cb: Function) => {
+      if (pathName === "/home/dev") {
+        cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+        return;
+      }
+      if (pathName === "/home/dev/stale.txt") {
+        cb(missingPathError("missing stale"));
+        return;
+      }
+      if (pathName === "/home/dev/live.txt") {
+        cb(null, { mode: 0o100644, size: 111, mtime: 1700000000 });
+        return;
+      }
+      cb(new Error(`unexpected path: ${pathName}`));
     });
     sftp.readdir.mockImplementation((_path: string, cb: Function) => {
       readdirCallCount += 1;
-      if (readdirCallCount === 1) {
-        cb(null, [{ filename: "stale.txt", attrs: { mode: 0o100644, size: 111, mtime: 1700000000 } }]);
-        return;
-      }
-      cb(null, [{ filename: "live.txt", attrs: { mode: 0o100644, size: 111, mtime: 1700000000 } }]);
+      cb(null, [
+        { filename: "stale.txt", attrs: { mode: 0o100644, size: 111, mtime: 1700000000 } },
+        { filename: "live.txt", attrs: { mode: 0o100644, size: 111, mtime: 1700000000 } },
+      ]);
     });
     sftp.unlink.mockImplementation((_path: string, cb: Function) => {
       cb(null);
@@ -328,11 +339,66 @@ describe("SftpService", () => {
     expect(sftp.unlink).not.toHaveBeenCalledWith("/home/dev/stale.txt", expect.any(Function));
   });
 
+  it("delete enforces non-recursive policy from fresh lstat", async () => {
+    await service.connect(testServer);
+
+    sftp.lstat.mockImplementation((pathName: string, cb: Function) => {
+      if (pathName === "/home/dev") {
+        cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+        return;
+      }
+      cb(null, { mode: 0o100644, size: 111, mtime: 1700000000 });
+    });
+
+    await expect(service.delete("srv-1", "/home/dev", { recursive: false })).rejects.toThrow(/not empty/i);
+
+    expect(sftp.readdir).not.toHaveBeenCalled();
+    expect(sftp.unlink).not.toHaveBeenCalled();
+    expect(sftp.rmdir).not.toHaveBeenCalled();
+  });
+
+  it("delete rechecks child entries before descending", async () => {
+    await service.connect(testServer);
+
+    sftp.lstat.mockImplementation((pathName: string, cb: Function) => {
+      if (pathName === "/home/dev") {
+        cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+        return;
+      }
+      if (pathName === "/home/dev/link") {
+        cb(null, { mode: 0o120777, size: 4096, mtime: 1700000000 });
+        return;
+      }
+      cb(new Error(`unexpected path: ${pathName}`));
+    });
+    sftp.readdir.mockImplementation((_path: string, cb: Function) => {
+      cb(null, [{ filename: "link", attrs: { mode: 0o040755, size: 4096, mtime: 1700000000 } }]);
+    });
+    sftp.unlink.mockImplementation((_path: string, cb: Function) => {
+      cb(null);
+    });
+    sftp.rmdir.mockImplementation((_path: string, cb: Function) => {
+      cb(null);
+    });
+
+    await service.delete("srv-1", "/home/dev");
+
+    expect(sftp.lstat).toHaveBeenNthCalledWith(1, "/home/dev", expect.any(Function));
+    expect(sftp.lstat).toHaveBeenNthCalledWith(2, "/home/dev/link", expect.any(Function));
+    expect(sftp.readdir).toHaveBeenCalledWith("/home/dev", expect.any(Function));
+    expect(sftp.readdir).not.toHaveBeenCalledWith("/home/dev/link", expect.any(Function));
+    expect(sftp.unlink).toHaveBeenCalledWith("/home/dev/link", expect.any(Function));
+  });
+
   it("delete aborts recursive traversal on unsafe child names", async () => {
     await service.connect(testServer);
 
-    sftp.lstat.mockImplementation((_path: string, cb: Function) => {
-      cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+    sftp.lstat.mockImplementation((pathName: string, cb: Function) => {
+      if (pathName === "/home/dev") {
+        cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+        return;
+      }
+      cb(null, { mode: 0o100644, size: 111, mtime: 1700000000 });
     });
     sftp.readdir.mockImplementation((_path: string, cb: Function) => {
       cb(null, [{ filename: "../../evil", attrs: { mode: 0o100644, size: 111, mtime: 1700000000 } }]);
@@ -345,8 +411,12 @@ describe("SftpService", () => {
   it("delete ignores missing child entries during recursive deletes", async () => {
     await service.connect(testServer);
 
-    sftp.lstat.mockImplementation((_path: string, cb: Function) => {
-      cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+    sftp.lstat.mockImplementation((pathName: string, cb: Function) => {
+      if (pathName === "/home/dev") {
+        cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+        return;
+      }
+      cb(null, { mode: 0o100644, size: 111, mtime: 1700000000 });
     });
     sftp.readdir.mockImplementation((_path: string, cb: Function) => {
       cb(null, [
@@ -373,8 +443,12 @@ describe("SftpService", () => {
   it("delete propagates non-missing errors", async () => {
     await service.connect(testServer);
 
-    sftp.lstat.mockImplementation((_path: string, cb: Function) => {
-      cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+    sftp.lstat.mockImplementation((pathName: string, cb: Function) => {
+      if (pathName === "/home/dev") {
+        cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+        return;
+      }
+      cb(null, { mode: 0o100644, size: 111, mtime: 1700000000 });
     });
     sftp.readdir.mockImplementation((_path: string, cb: Function) => {
       cb(null, [
@@ -390,6 +464,32 @@ describe("SftpService", () => {
     });
 
     await expect(service.delete("srv-1", "/home/dev")).rejects.toThrow("permission denied");
+    expect(sftp.rmdir).not.toHaveBeenCalled();
+  });
+
+  it("delete propagates EACCES errors even when message contains not found", async () => {
+    await service.connect(testServer);
+
+    sftp.lstat.mockImplementation((pathName: string, cb: Function) => {
+      if (pathName === "/home/dev") {
+        cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+        return;
+      }
+      cb(null, { mode: 0o100644, size: 111, mtime: 1700000000 });
+    });
+    sftp.readdir.mockImplementation((_path: string, cb: Function) => {
+      cb(null, [
+        { filename: "denied.txt", attrs: { mode: 0o100644, size: 111, mtime: 1700000000 } },
+      ]);
+    });
+    sftp.unlink.mockImplementation((_path: string, cb: Function) => {
+      cb(Object.assign(new Error("permission denied (not found)"), { code: "EACCES" }));
+    });
+    sftp.rmdir.mockImplementation((_path: string, cb: Function) => {
+      cb(null);
+    });
+
+    await expect(service.delete("srv-1", "/home/dev")).rejects.toThrow("not found");
     expect(sftp.rmdir).not.toHaveBeenCalled();
   });
 
@@ -432,8 +532,12 @@ describe("SftpService", () => {
       }
       cb(null, []);
     });
-    sftp.lstat.mockImplementation((_path: string, cb: Function) => {
-      cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+    sftp.lstat.mockImplementation((pathName: string, cb: Function) => {
+      if (pathName === "/home/dev") {
+        cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+        return;
+      }
+      cb(null, { mode: 0o100644, size: 111, mtime: 1700000000 });
     });
     sftp.unlink.mockImplementation((remotePath: string, cb: Function) => {
       if (remotePath.endsWith("/denied.txt")) {

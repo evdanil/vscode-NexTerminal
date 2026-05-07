@@ -57,7 +57,20 @@ vi.mock("vscode", () => {
 
 import { NexusFileSystemProvider, buildUri, NEXTERM_SCHEME } from "../../src/services/sftp/nexusFileSystemProvider";
 import type { DirectoryEntry } from "../../src/services/sftp/sftpService";
+import { SftpService } from "../../src/services/sftp/sftpService";
+import type { SshConnection, SshFactory } from "../../src/services/ssh/contracts";
 import { createMockSftpService } from "../helpers/mockSftpService";
+import type { ServerConfig } from "../../src/models/config";
+
+const testServer: ServerConfig = {
+  id: "srv-1",
+  name: "Test Server",
+  host: "example.com",
+  port: 22,
+  username: "dev",
+  authType: "password",
+  isHidden: false,
+};
 
 const fileEntry: DirectoryEntry = {
   name: "test.txt",
@@ -79,6 +92,45 @@ const dirEntry: DirectoryEntry = {
 
 function missingRemoteError(message = "No such file"): Error & { code: number } {
   return Object.assign(new Error(message), { code: 2 });
+}
+
+function createMockSftp() {
+  return {
+    readdir: vi.fn(),
+    stat: vi.fn(),
+    lstat: vi.fn(),
+    createReadStream: vi.fn(),
+    createWriteStream: vi.fn(),
+    unlink: vi.fn(),
+    rename: vi.fn(),
+    mkdir: vi.fn(),
+    rmdir: vi.fn(),
+    realpath: vi.fn(),
+    fastGet: vi.fn(),
+    fastPut: vi.fn(),
+    end: vi.fn(),
+  };
+}
+
+function createMockConnection(sftp: ReturnType<typeof createMockSftp>): SshConnection {
+  return {
+    openShell: vi.fn(),
+    openDirectTcp: vi.fn(),
+    openSftp: vi.fn(async () => sftp as any),
+    exec: vi.fn(),
+    requestForwardIn: vi.fn(),
+    cancelForwardIn: vi.fn(),
+    onTcpConnection: vi.fn().mockReturnValue(() => {}),
+    onClose: vi.fn().mockReturnValue(() => {}),
+    getBanner: vi.fn().mockReturnValue(undefined),
+    dispose: vi.fn(),
+  };
+}
+
+function createMockFactory(connection: SshConnection): SshFactory {
+  return {
+    connect: vi.fn(async () => connection),
+  };
 }
 
 describe("NexusFileSystemProvider", () => {
@@ -207,7 +259,7 @@ describe("NexusFileSystemProvider", () => {
     await provider.delete(uri, { recursive: false });
 
     expect(sftp.lstat).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt");
-    expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt");
+    expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt", { recursive: false });
     // FileChangeType.Deleted = 3
     expect(events[0].type).toBe(3);
   });
@@ -221,7 +273,7 @@ describe("NexusFileSystemProvider", () => {
     await provider.delete(uri, { recursive: true });
 
     // Should delete as file (not directory), even though target is a directory
-    expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/link");
+    expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/link", { recursive: true });
   });
 
   it("delete rejects non-recursive directory delete", async () => {
@@ -229,6 +281,59 @@ describe("NexusFileSystemProvider", () => {
 
     const uri = buildUri("srv-1", "/home/dev/subdir");
     await expect(provider.delete(uri, { recursive: false })).rejects.toThrow(/not empty/i);
+  });
+
+  it("delete forwards recursive option through to SFTP service", async () => {
+    (sftp.lstat as any).mockResolvedValue(fileEntry);
+    (sftp.delete as any).mockResolvedValue(undefined);
+
+    const uri = buildUri("srv-1", "/home/dev/test.txt");
+    await provider.delete(uri, { recursive: false });
+
+    expect(sftp.delete).toHaveBeenCalledWith("srv-1", "/home/dev/test.txt", { recursive: false });
+  });
+
+  it("delete rejects when provider-observed file became directory before service recursive check", async () => {
+    const sftpWrapper = createMockSftp();
+    const connection = createMockConnection(sftpWrapper);
+    const factory = createMockFactory(connection);
+    const service = new SftpService(factory);
+    await service.connect(testServer);
+
+    let lstatCalls = 0;
+    sftpWrapper.lstat.mockImplementation((remotePath: string, cb: Function) => {
+      lstatCalls += 1;
+      if (remotePath === "/home/dev/race") {
+        if (lstatCalls === 1) {
+          cb(null, { mode: 0o100644, size: 64, mtime: 1700000000 });
+          return;
+        }
+        cb(null, { mode: 0o040755, size: 4096, mtime: 1700000000 });
+        return;
+      }
+      cb(new Error(`unexpected path ${remotePath}`));
+    });
+    sftpWrapper.readdir.mockImplementation((_path: string, cb: Function) => {
+      cb(null, []);
+    });
+    sftpWrapper.rmdir.mockImplementation((_path: string, cb: Function) => {
+      cb(null);
+    });
+    sftpWrapper.unlink.mockImplementation((_path: string, cb: Function) => {
+      cb(null);
+    });
+
+    const providerWithService = new NexusFileSystemProvider(service);
+    const uri = buildUri("srv-1", "/home/dev/race");
+
+    await expect(providerWithService.delete(uri, { recursive: false })).rejects.toThrow(/not empty/i);
+
+    expect(sftpWrapper.lstat).toHaveBeenCalledTimes(2);
+    expect(sftpWrapper.rmdir).not.toHaveBeenCalled();
+    expect(sftpWrapper.unlink).not.toHaveBeenCalled();
+    expect(sftpWrapper.readdir).not.toHaveBeenCalled();
+
+    service.disconnect("srv-1");
   });
 
   it("rename rejects cross-server operations", async () => {

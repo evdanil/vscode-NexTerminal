@@ -304,6 +304,13 @@ describe("FileExplorerTreeProvider", () => {
     expect(item.command).toBeUndefined();
   });
 
+  it("file items with unsafe names do not open the parent path", () => {
+    const unsafeFile: DirectoryEntry = { ...fileEntry, name: "../bad.txt" };
+    const item = new FileTreeItem("srv-1", "/home/dev", unsafeFile);
+    expect(item.contextValue).toBe("nexus.fileExplorer.file");
+    expect(item.command).toBeUndefined();
+  });
+
   it("directory items expose nexterm:// resourceUri", () => {
     const item = new FileTreeItem("srv-1", "/home/dev", dirEntry);
     expect(item.resourceUri).toBeDefined();

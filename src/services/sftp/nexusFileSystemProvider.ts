@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { SftpService, DirectoryEntry } from "./sftpService";
-import { isSafeEntryName } from "../../utils/pathSafety";
+import { isSafeEntryName, joinRemoteEntryPath } from "../../utils/pathSafety";
 
 export const NEXTERM_SCHEME = "nexterm";
 
@@ -81,11 +81,11 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
     const entry = await this.sftp.lstat(serverId, remotePath);
     if (entry.isSymlink) {
       // Always unlink symlinks directly — never recurse into their targets
-      await this.sftp.delete(serverId, remotePath);
+      await this.sftp.delete(serverId, remotePath, options);
     } else if (entry.isDirectory && !options.recursive) {
       throw vscode.FileSystemError.NoPermissions("Directory is not empty (use recursive delete)");
     } else {
-      await this.sftp.delete(serverId, remotePath);
+      await this.sftp.delete(serverId, remotePath, options);
     }
     this.onDidChangeFileEmitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
   }
@@ -197,7 +197,10 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
         continue;
       }
 
-      const remoteChild = path.posix.join(remoteDir, entry.name);
+      const remoteChild = joinRemoteEntryPath(remoteDir, entry.name);
+      if (!remoteChild) {
+        continue;
+      }
       const localChild = vscode.Uri.joinPath(localDir, entry.name);
       if (entry.isDirectory) {
         await this.ensureLocalDirectoryDestination(localChild, overwrite);

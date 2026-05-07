@@ -6,7 +6,7 @@ import { buildUri } from "../services/sftp/nexusFileSystemProvider";
 import { ServerTreeItem } from "../ui/nexusTreeProvider";
 import { FileTreeItem } from "../ui/fileExplorerTreeProvider";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "../ui/conflictResolution";
-import { isSafeEntryName } from "../utils/pathSafety";
+import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
 import type { CommandContext } from "./types";
 
 const MAX_DOWNLOAD_DEPTH = 100;
@@ -58,9 +58,13 @@ function resolveTargetDirectory(
   arg: unknown
 ): { serverId: string; dirPath: string } | undefined {
   if (arg instanceof FileTreeItem && arg.entry.isDirectory) {
+    const remoteDir = joinRemoteEntryPath(arg.remotePath, arg.entry.name);
+    if (!remoteDir) {
+      return undefined;
+    }
     return {
       serverId: arg.serverId,
-      dirPath: path.posix.join(arg.remotePath, arg.entry.name),
+      dirPath: remoteDir,
     };
   }
   const serverId = ctx.fileExplorerProvider.getActiveServerId();
@@ -102,7 +106,11 @@ interface DeleteItem {
 function dedupeDownloadItems(items: FileTreeItem[]): DownloadItem[] {
   const normalized = items
     .filter((item) => item.label !== ".")
-    .map((item) => ({ item, remotePath: path.posix.join(item.remotePath, item.entry.name) }))
+    .map((item) => ({
+      item,
+      remotePath: joinRemoteEntryPath(item.remotePath, item.entry.name)
+    }))
+    .filter((item): item is { item: FileTreeItem; remotePath: string } => item.remotePath !== undefined)
     .sort((a, b) => a.remotePath.localeCompare(b.remotePath));
 
   const result: DownloadItem[] = [];
@@ -118,7 +126,11 @@ function dedupeDownloadItems(items: FileTreeItem[]): DownloadItem[] {
 function dedupeDeleteItems(items: FileTreeItem[]): DeleteItem[] {
   const normalized = items
     .filter((item) => item.label !== ".")
-    .map((item) => ({ item, remotePath: path.posix.join(item.remotePath, item.entry.name) }))
+    .map((item) => ({
+      item,
+      remotePath: joinRemoteEntryPath(item.remotePath, item.entry.name)
+    }))
+    .filter((item): item is { item: FileTreeItem; remotePath: string } => item.remotePath !== undefined)
     .sort((a, b) => a.remotePath.localeCompare(b.remotePath));
 
   const result: DeleteItem[] = [];
@@ -233,7 +245,11 @@ async function downloadDirectoryToLocal(
     if (entry.isSymlink || !isSafeEntryName(entry.name)) {
       continue;
     }
-    const childRemote = path.posix.join(remoteDir, entry.name);
+    const childRemote = joinRemoteEntryPath(remoteDir, entry.name);
+    if (!childRemote) {
+      summary.skipped += 1;
+      continue;
+    }
     const childLocal = vscode.Uri.joinPath(localDir, entry.name);
     if (entry.isDirectory) {
       await downloadDirectoryToLocal(sftp, serverId, childRemote, childLocal, conflictState, summary, depth + 1);
@@ -292,7 +308,11 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
 
   const open = vscode.commands.registerCommand("nexus.files.open", async (arg?: unknown) => {
     if (arg instanceof FileTreeItem && !arg.entry.isDirectory) {
-      const uri = buildUri(arg.serverId, path.posix.join(arg.remotePath, arg.entry.name));
+      const remotePath = joinRemoteEntryPath(arg.remotePath, arg.entry.name);
+      if (!remotePath) {
+        return;
+      }
+      const uri = buildUri(arg.serverId, remotePath);
       await vscode.commands.executeCommand("vscode.open", uri);
     }
   });
@@ -371,7 +391,10 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
         return;
       }
 
-      const remoteFile = path.posix.join(item.remotePath, item.entry.name);
+      const remoteFile = joinRemoteEntryPath(item.remotePath, item.entry.name);
+      if (!remoteFile) {
+        return;
+      }
       try {
         await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: `Downloading ${item.entry.name}...` },
@@ -506,8 +529,11 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     if (!newName || newName === arg.entry.name) {
       return;
     }
-    const oldPath = path.posix.join(arg.remotePath, arg.entry.name);
-    const newPath = path.posix.join(arg.remotePath, newName);
+    const oldPath = joinRemoteEntryPath(arg.remotePath, arg.entry.name);
+    const newPath = joinRemoteEntryPath(arg.remotePath, newName);
+    if (!oldPath || !newPath) {
+      return;
+    }
     await ctx.sftpService.rename(arg.serverId, oldPath, newPath);
     ctx.fileExplorerProvider.refresh();
   });
@@ -583,12 +609,17 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     if (items.length === 0) {
       return;
     }
-    const paths = items.map((item) => path.posix.join(item.remotePath, item.entry.name));
+    const paths = items
+      .map((item) => joinRemoteEntryPath(item.remotePath, item.entry.name))
+      .filter((remotePath): remotePath is string => remotePath !== undefined);
+    if (paths.length === 0) {
+      return;
+    }
     await vscode.env.clipboard.writeText(paths.join("\n"));
     vscode.window.showInformationMessage(
-      items.length === 1
+      paths.length === 1
         ? `Copied: ${paths[0]}`
-        : `Copied ${items.length} remote paths`
+        : `Copied ${paths.length} remote paths`
     );
   });
 
