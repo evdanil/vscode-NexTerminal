@@ -91,6 +91,15 @@ interface DownloadSummary {
   conflicts: number;
   failed: number;
   canceled: boolean;
+  canceledCount: number;
+}
+
+interface UploadSummary {
+  uploaded: number;
+  skipped: number;
+  conflicts: number;
+  failed: number;
+  canceled: number;
 }
 
 interface DownloadItem {
@@ -157,11 +166,33 @@ async function resolveDownloadConflict(
   return resolveConflict(`Local target "${targetLabel}" already exists. Choose an action.`, conflictState);
 }
 
+async function resolveUploadConflict(
+  targetLabel: string,
+  conflictState: { mode: ConflictMode },
+  summary: UploadSummary
+): Promise<ConflictDecision> {
+  summary.conflicts += 1;
+  return resolveConflict(`Remote target "${targetLabel}" already exists. Choose an action.`, conflictState);
+}
+
 async function tryLocalStat(uri: vscode.Uri): Promise<vscode.FileStat | undefined> {
   try {
     return await vscode.workspace.fs.stat(uri);
   } catch {
     return undefined;
+  }
+}
+
+async function remoteDestinationExists(
+  sftp: SftpService,
+  serverId: string,
+  remotePath: string
+): Promise<boolean> {
+  try {
+    await sftp.stat(serverId, remotePath);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -184,6 +215,7 @@ async function downloadItemToLocal(
       const decision = await resolveDownloadConflict(localUri.fsPath, conflictState, summary);
       if (decision === "cancel") {
         summary.canceled = true;
+        summary.canceledCount += 1;
         return;
       }
       if (decision === "skip") {
@@ -260,6 +292,7 @@ async function downloadDirectoryToLocal(
           const decision = await resolveDownloadConflict(childLocal.fsPath, conflictState, summary);
           if (decision === "cancel") {
             summary.canceled = true;
+            summary.canceledCount += 1;
             return;
           }
           if (decision === "skip") {
@@ -355,24 +388,65 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     if (!files || files.length === 0) {
       return;
     }
-    try {
-      await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: "Uploading files..." },
-        async (progress) => {
-          for (const file of files) {
-            const fileName = path.basename(file.fsPath);
-            progress.report({ message: fileName });
-            const remoteDest = path.posix.join(target.dirPath, fileName);
+    const conflictState: { mode: ConflictMode } = { mode: "ask" };
+    const summary: UploadSummary = {
+      uploaded: 0,
+      skipped: 0,
+      conflicts: 0,
+      failed: 0,
+      canceled: 0
+    };
+
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: "Uploading files..." },
+      async (progress) => {
+        for (const file of files) {
+          if (summary.canceled > 0) {
+            break;
+          }
+          const fileName = path.basename(file.fsPath);
+          progress.report({ message: fileName });
+          const remoteDest = path.posix.join(target.dirPath, fileName);
+
+          if (await remoteDestinationExists(ctx.sftpService, target.serverId, remoteDest)) {
+            const decision = await resolveUploadConflict(fileName, conflictState, summary);
+            if (decision === "cancel") {
+              summary.canceled += 1;
+              break;
+            }
+            if (decision === "skip") {
+              summary.skipped += 1;
+              continue;
+            }
+          }
+
+          try {
             await ctx.sftpService.upload(target.serverId, file.fsPath, remoteDest);
+            summary.uploaded += 1;
+          } catch (error) {
+            summary.failed += 1;
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Failed to upload "${fileName}": ${message}`);
           }
         }
-      );
+      }
+    );
+
+    if (summary.uploaded > 0) {
       ctx.sftpService.invalidateCache(target.serverId, target.dirPath);
       ctx.fileExplorerProvider.refresh();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      vscode.window.showErrorMessage(`Failed to upload: ${message}`);
     }
+
+    const detail = `uploaded ${summary.uploaded}, skipped ${summary.skipped}, conflicts ${summary.conflicts}, failed ${summary.failed}, canceled ${summary.canceled}`;
+    if (summary.canceled > 0) {
+      vscode.window.showWarningMessage(`Upload canceled (${detail}).`);
+      return;
+    }
+    if (summary.skipped > 0 || summary.conflicts > 0 || summary.failed > 0) {
+      vscode.window.showWarningMessage(`Upload completed with issues (${detail}).`);
+      return;
+    }
+    vscode.window.showInformationMessage(`Uploaded ${summary.uploaded} item${summary.uploaded === 1 ? "" : "s"}.`);
   });
 
   const download = vscode.commands.registerCommand("nexus.files.download", async (arg?: unknown, allSelected?: unknown) => {
@@ -427,11 +501,16 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       skipped: 0,
       conflicts: 0,
       failed: 0,
-      canceled: false
+      canceled: false,
+      canceledCount: 0
     };
 
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "Downloading files...", cancellable: false },
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Downloading ${items.length} selected item${items.length === 1 ? "" : "s"}...`,
+        cancellable: false
+      },
       async (progress) => {
         for (const { item, remotePath } of items) {
           if (summary.canceled) {
@@ -452,7 +531,7 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       }
     );
 
-    const detail = `downloaded ${summary.downloaded}, skipped ${summary.skipped}, conflicts ${summary.conflicts}, failed ${summary.failed}`;
+    const detail = `downloaded ${summary.downloaded}, skipped ${summary.skipped}, conflicts ${summary.conflicts}, failed ${summary.failed}, canceled ${summary.canceledCount}`;
     if (summary.canceled) {
       vscode.window.showWarningMessage(`Download canceled (${detail}).`);
       return;
@@ -481,18 +560,23 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       if (confirm !== "Delete") {
         return;
       }
+      const summary = { deleted: 0, failed: 0 };
       try {
         await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: "Deleting...", cancellable: false },
           async (progress) => {
             progress.report({ message: item.entry.name });
             await ctx.sftpService.delete(item.serverId, remotePath);
+            summary.deleted += 1;
           }
         );
         ctx.fileExplorerProvider.refresh();
+        vscode.window.showInformationMessage(`Deleted ${item.entry.name}.`);
       } catch (error) {
+        summary.failed += 1;
         const message = error instanceof Error ? error.message : String(error);
         vscode.window.showErrorMessage(`Failed to delete "${item.entry.name}": ${message}`);
+        vscode.window.showWarningMessage(`Delete completed with issues (deleted ${summary.deleted}, failed ${summary.failed}).`);
       }
       return;
     }
@@ -505,6 +589,7 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     if (confirm !== "Delete") {
       return;
     }
+    const summary = { deleted: 0, failed: 0 };
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "Deleting...", cancellable: false },
       async (progress) => {
@@ -512,14 +597,23 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
           progress.report({ message: item.entry.name });
           try {
             await ctx.sftpService.delete(item.serverId, remotePath);
+            summary.deleted += 1;
           } catch (error) {
+            summary.failed += 1;
             const message = error instanceof Error ? error.message : String(error);
             vscode.window.showErrorMessage(`Failed to delete "${item.entry.name}": ${message}`);
           }
         }
       }
     );
-    ctx.fileExplorerProvider.refresh();
+    if (summary.deleted > 0) {
+      ctx.fileExplorerProvider.refresh();
+    }
+    if (summary.failed > 0) {
+      vscode.window.showWarningMessage(`Delete completed with issues (deleted ${summary.deleted}, failed ${summary.failed}).`);
+      return;
+    }
+    vscode.window.showInformationMessage(`Deleted ${summary.deleted} items.`);
   });
 
   const rename = vscode.commands.registerCommand("nexus.files.rename", async (arg?: unknown) => {
