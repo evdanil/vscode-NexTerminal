@@ -14,6 +14,7 @@ import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTree
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../services/ssh/deploySshKey";
 import type { KeyPairInfo } from "../services/ssh/deploySshKey";
+import { classifySshConnectionError, type ConnectionDiagnosticResult } from "../services/ssh/connectionDiagnostics";
 import { resolveTunnelConnectionMode, startTunnel } from "./tunnelCommands";
 import type { CommandContext, ServerTerminalMap } from "./types";
 import {
@@ -670,6 +671,51 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
   );
 }
 
+function diagnosticField(value: string | number): string {
+  return String(value).replace(/[\r\n]+/g, " ").trim();
+}
+
+function formatSshDiagnosticDetails(server: ServerConfig, diagnostic: ConnectionDiagnosticResult): string {
+  return [
+    `Server: ${diagnosticField(server.name)}`,
+    `Host: ${diagnosticField(server.host)}`,
+    `Port: ${diagnosticField(server.port)}`,
+    `Stage: ${diagnostic.stage}`,
+    `Title: ${diagnostic.title}`,
+    `Detail: ${diagnostic.detail}`,
+    `Suggestion: ${diagnostic.suggestion}`
+  ].join("\n");
+}
+
+async function testServerConnection(ctx: CommandContext, arg?: unknown): Promise<void> {
+  const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
+  if (!server) {
+    return;
+  }
+
+  try {
+    const connection = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Testing connection to ${server.name}...`,
+        cancellable: false
+      },
+      () => ctx.sshFactory.connect(server)
+    );
+    connection.dispose();
+    void vscode.window.showInformationMessage(`Connection test succeeded for ${server.name}.`);
+  } catch (error) {
+    const diagnostic = classifySshConnectionError(error);
+    const choice = await vscode.window.showErrorMessage(
+      `${diagnostic.title}: ${diagnostic.detail}`,
+      "Copy Details"
+    );
+    if (choice === "Copy Details") {
+      await vscode.env.clipboard.writeText(formatSshDiagnosticDetails(server, diagnostic));
+    }
+  }
+}
+
 /**
  * Connect to a server (opening a fresh session) and auto-run a picked Nexus
  * script against it the moment the session registers. Invoked from the server
@@ -771,7 +817,7 @@ async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<voi
 export function registerServerCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.server.add", () => {
-      void vscode.commands.executeCommand("nexus.profile.add");
+      void vscode.commands.executeCommand("nexus.profile.add", { addMode: "ssh", profileType: "ssh" });
     }),
 
     vscode.commands.registerCommand("nexus.server.edit", async (arg?: unknown) => {
@@ -846,6 +892,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
     }),
 
     vscode.commands.registerCommand("nexus.server.connect", (arg?: unknown) => connectServer(ctx, arg)),
+    vscode.commands.registerCommand("nexus.server.testConnection", (arg?: unknown) => testServerConnection(ctx, arg)),
     vscode.commands.registerCommand("nexus.server.disconnect", (arg?: unknown) => disconnectServer(ctx, arg)),
     vscode.commands.registerCommand("nexus.server.runWithScript", (arg?: unknown) => connectAndRunScript(ctx, arg)),
 

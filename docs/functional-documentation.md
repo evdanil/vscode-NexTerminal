@@ -41,6 +41,19 @@ Nexus Terminal provides one operational surface in VS Code for:
 3. Server appears in **Connectivity Hub**.
 4. Right-click server item to connect/disconnect/edit/remove/duplicate/rename.
 
+#### 4.1.1 Profile Quick Actions
+- `Nexus: Add Profile` opens the unified profile flow for SSH server or Serial profile creation.
+- The tree-only `nexus.profile.actions` command opens the **Profile Actions** quick pick from a profile item. It is hidden from the Command Palette and exposed through the tree.
+- Server profile actions include **Connect**, **Test Connection**, **Browse Files** when connected, **Connect and Run Script**, **Edit**, **Duplicate**, **Copy Connection Info**, and **Delete**.
+- Serial profile actions include **Connect**, **Test Connection**, **Connect and Run Script**, **Edit**, **Duplicate**, **Copy Port Info**, and **Delete**.
+- Folder actions use folder-specific labels for bulk operations: **Connect Folder Servers** and **Disconnect Folder Servers**.
+
+#### 4.1.2 Connection Test Diagnostics
+- Server profiles expose **Test Connection** (`nexus.server.testConnection`). It opens a progress notification, attempts an SSH connection with the same profile configuration, disposes the test connection on success, and shows `Connection test succeeded for <name>.`
+- On SSH failure, the test classifies the connection error and shows a diagnostic title/detail pair with **Copy Details**. Copying details writes the formatted diagnostic text to the clipboard.
+- Serial profiles expose **Test Connection** (`nexus.serial.testConnection`). Standard serial tests check whether the configured port path is currently available.
+- Smart Follow serial tests also compare the saved path and saved hardware hint. Results distinguish saved-path availability, matching-device availability, and missing-device states. Failure prompts can offer **Scan Serial Ports**.
+
 ### 4.2 Silent Auth (Password mode)
 1. Lookup in secret vault.
 2. Attempt login.
@@ -63,6 +76,15 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 4. Session appears in **Connectivity Hub**.
 5. Unread output marks both the sidebar session node and the terminal tab title until the terminal regains focus.
 6. Output/input logs are written under extension global storage logs.
+
+#### 4.4.1 SFTP File Explorer Operations
+- **Browse Files** (`nexus.files.browse`) selects an active connected SSH profile as the SFTP target.
+- The **File Explorer** view supports open, upload, download, delete, rename, new directory, new file, go to path, go home, copy remote path, refresh, and disconnect commands.
+- Upload and download operations track summary counts for completed items, skipped items, conflicts, and cancellations.
+- Drag-and-drop uploads report `Upload completed`, `Upload completed with skips`, or `Upload canceled` notifications with summary counts.
+- Recursive uploads skip symbolic links, unsafe entry names, unreadable local paths, and directories beyond the upload depth limit.
+- Recursive deletes are constrained by `nexus.sftp.deleteDepthLimit` and `nexus.sftp.deleteOperationLimit`.
+- Directory listings use the SFTP cache and remote watch settings. Manual refresh invalidates cached entries for the active target.
 
 ### 4.5 Port Forwarding
 1. Create tunnel profile with `Nexus: Add Tunnel`. Choose tunnel type from the dropdown:
@@ -127,11 +149,25 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - Legacy `slot` values are still read and auto-migrated to `keybinding` on startup.
 - Add, edit, remove, reorder, pause/resume auto-trigger, and assign shortcuts via the context menu.
 
+#### 4.9.1 Macro Templates
+- `Nexus: Add Macro From Template` opens a starter-template picker and then opens the Macro Editor on the created macro.
+- Built-in templates are **Send command**, **Send password when prompted**, **Wait and send confirmation**, and **Scoped auto-trigger example**.
+- The password template creates a secret macro with empty text, an active-session trigger scope, and a password prompt pattern. It does not include a sample password.
+- Auto-trigger templates default to active-session scope so generated macros react only to the active terminal unless the user changes the scope.
+
 ### 4.10 Configuration Export/Import
 - `Nexus: Export Configuration` creates a sanitized JSON export suitable for sharing (credentials stripped, learned Smart Follow hardware identifiers removed, IDs remapped).
 - `Nexus: Export Backup` creates an encrypted backup that includes profiles, settings, saved credentials, the user `.ssh` folder, and the configured Nexus scripts folder.
 - `Nexus: Import Configuration` restores from either format with merge or replace options. For encrypted folder payloads, merge skips existing local `.ssh` / script files; replace overwrites files present in the backup but does not delete extra local files.
 - `Nexus: Import from MobaXterm` and `Nexus: Import from SecureCRT` migrate external SSH profiles while preserving folder hierarchy where possible.
+
+#### 4.10.1 Security & Data Settings
+- The Settings view includes a **Security & Data** category for host trust, credential storage, backups, exports, imports, resets, and data deletion.
+- Credentials are stored in VS Code SecretStorage. Host keys and non-secret profile metadata are stored in VS Code global state.
+- **Encrypted Backup** / `Nexus: Export Backup` is password-protected and can include secrets, the user `.ssh` folder, and the configured Nexus scripts folder.
+- **Export for Sharing** / `Nexus: Export Configuration` is sanitized for sharing: credentials are stripped, learned Smart Follow hardware identifiers are removed, and IDs are remapped.
+- **Import Configuration** restores either encrypted backup or sanitized export data. Merge preserves existing local `.ssh` / script files; replace overwrites files present in the backup but does not delete extra local files.
+- **Reset All Settings to Defaults** resets extension settings. **Delete All Data** / `nexus.config.completeReset` is destructive and removes Nexus data after confirmation.
 
 ### 4.11 Terminal Tab Commands
 Right-click any Nexus terminal tab (SSH, Standard Serial, or Smart Follow Serial — docked in the panel or opened as an editor tab) to access three PuTTY-style commands:
@@ -226,12 +262,14 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 - `nexusTunnels`: tunnel profiles and active traffic state.
 - `nexusFileExplorer`: remote file browser for the active connected server.
 - `nexusMacros`: terminal macros with optional custom keyboard shortcuts and auto-trigger state.
+- `nexusScripts`: script files, run state, and script view actions.
 - `nexusSettings`: extension settings sidebar panel.
 
 ### 6.2 Commands
 **Server:**
 - `nexus.server.add`, `nexus.server.edit`, `nexus.server.remove`
-- `nexus.server.connect`, `nexus.server.disconnect`
+- `nexus.server.connect`, `nexus.server.testConnection`, `nexus.server.disconnect`
+- `nexus.server.runWithScript`
 - `nexus.server.copyInfo`, `nexus.server.duplicate`, `nexus.server.rename`
 - `nexus.server.deployKey`
 
@@ -246,12 +284,14 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 
 **Serial:**
 - `nexus.serial.add`, `nexus.serial.edit`, `nexus.serial.remove`
-- `nexus.serial.connect`, `nexus.serial.disconnect`
+- `nexus.serial.connect`, `nexus.serial.testConnection`, `nexus.serial.disconnect`
+- `nexus.serial.runWithScript`
 - `nexus.serial.copyInfo`, `nexus.serial.duplicate`, `nexus.serial.rename`
 - `nexus.serial.listPorts`, `nexus.serial.sendBreak`
 
 **Profile:**
 - `nexus.profile.add` (unified add form)
+- `nexus.profile.actions` (tree-item quick-action picker; hidden from the Command Palette)
 
 **Auth Profile:**
 - `nexus.authProfile.add`, `nexus.authProfile.manage`
@@ -259,7 +299,7 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 
 **Macros:**
 - `nexus.macro.editor`
-- `nexus.macro.add`, `nexus.macro.edit`, `nexus.macro.remove`
+- `nexus.macro.add`, `nexus.macro.addFromTemplate`, `nexus.macro.edit`, `nexus.macro.remove`
 - `nexus.macro.run` (Alt+S quick pick)
 - `nexus.macro.runBinding` (explicit shortcut dispatch)
 - `nexus.macro.runItem` (tree item click/play button)
@@ -267,6 +307,14 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 - `nexus.macro.moveUp`, `nexus.macro.moveDown`
 - `nexus.macro.disableTrigger`, `nexus.macro.enableTrigger`
 - `nexus.macro.copySecret`, `nexus.macro.pasteSecret`
+- `nexus.macro.copyAllAsJson`
+
+**Scripts:**
+- `nexus.script.new` (opens the script template picker before naming the script)
+- `nexus.script.run`, `nexus.script.runQuick`, `nexus.script.stop`
+- `nexus.script.edit`, `nexus.script.delete`
+- `nexus.script.openOutput`, `nexus.script.openDocs`, `nexus.script.openExamples`
+- `nexus.script.openScriptsFolder`, `nexus.script.revealInExplorer`
 
 **Files:**
 - `nexus.files.browse`, `nexus.files.open`
@@ -335,6 +383,14 @@ Author-and-run automation on top of any active SSH or Serial session.
 2. First time a Nexus script command runs in the workspace, `ScriptTypesGenerator` seeds `types/nexus-scripts.d.ts` + `jsconfig.json` so the editor gives autocomplete and JSDoc hovers for `expect`, `sendLine`, `poll`, `prompt`, etc.
 3. Invoke `nexus.script.run` from the Command Palette / sidebar / `▶ Run in Nexus` CodeLens. The runtime parses the header, resolves the target session (filter by `@target-type`; auto-select on `@target-profile` match; else QuickPick), and spawns a `node:worker_threads` Worker.
 4. While running, the script's status shows in the **Nexus Scripts** status-bar entry and the **Nexus Scripts** Output Channel logs timestamped events (`→ expect …`, `← matched`, `log info: …`, `end: completed (…ms)`).
+
+#### 9.1.1 Script Templates
+- `Nexus: New Nexus Script` opens a starter-template picker before asking for the script name.
+- Built-in templates are **Basic command**, **Wait for prompt then send**, **Capture command output**, and **Backup running config**.
+- New scripts are written to the resolved scripts directory: `<workspace>/<nexus.scripts.path>` when a workspace folder is open, or the extension global-storage scripts directory when no folder is open.
+- If `<name>.js` already exists, Nexus opens the existing file instead of overwriting it.
+- Template bodies include the required `@nexus-script` marker and use the entered script name in the generated `@name` field.
+- The generated script comments link developers to `types/nexus-scripts.d.ts`; that type file is seeded on first script command run in the workspace.
 
 ### 9.2 Macro coordination
 - When a script starts, macros on the script's bound session are suspended by default (`nexus.scripts.macroPolicy = "suspend-all"`). Macros on unrelated sessions keep firing.

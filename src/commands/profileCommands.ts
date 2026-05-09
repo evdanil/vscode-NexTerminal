@@ -1,8 +1,8 @@
 import * as vscode from "vscode";
 import type { UnifiedProfileSeed } from "../ui/formDefinitions";
-import { unifiedProfileFormDefinition } from "../ui/formDefinitions";
+import { unifiedProfileFormDefinition, unifiedProfileFormId } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
-import { FolderTreeItem } from "../ui/nexusTreeProvider";
+import { FolderTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
@@ -17,6 +17,23 @@ import {
   MAX_FOLDER_DEPTH
 } from "../utils/folderPaths";
 
+interface ProfileActionPick extends vscode.QuickPickItem {
+  command: string;
+}
+
+function isUnifiedProfileSeed(arg: unknown): arg is UnifiedProfileSeed {
+  if (!arg || typeof arg !== "object") {
+    return false;
+  }
+  const candidate = arg as Partial<UnifiedProfileSeed>;
+  return candidate.profileType === "ssh" ||
+    candidate.profileType === "serial" ||
+    candidate.addMode === "profile" ||
+    candidate.addMode === "ssh" ||
+    candidate.addMode === "serial" ||
+    typeof candidate.group === "string";
+}
+
 export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed): void {
   const existingGroups = collectGroups(ctx);
   const defaultLogSession = vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
@@ -24,7 +41,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
   const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles);
   const inlineAuthProfile = createInlineAuthProfileCreation(ctx);
-  const panel = WebviewFormPanel.open("profile-add", definition, {
+  const panel = WebviewFormPanel.open(unifiedProfileFormId(seed), definition, {
     onSubmit: async (values: FormValues) => {
       if (normalizeOptionalFolderPath(values.group) === null) {
         throw new Error(INVALID_FOLDER_PATH_MESSAGE);
@@ -63,11 +80,54 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
 }
 
 export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[] {
+  const showProfileActions = async (arg?: unknown): Promise<void> => {
+    if (arg instanceof ServerTreeItem) {
+      const picks: ProfileActionPick[] = [
+        { label: "Connect", command: "nexus.server.connect" },
+        { label: "Test Connection", command: "nexus.server.testConnection" },
+        ...(ctx.core.isServerConnected(arg.server.id)
+          ? [{ label: "Browse Files", command: "nexus.files.browse" }]
+          : []),
+        { label: "Connect and Run Script", command: "nexus.server.runWithScript" },
+        { label: "Edit", command: "nexus.server.edit" },
+        { label: "Duplicate", command: "nexus.server.duplicate" },
+        { label: "Copy Connection Info", command: "nexus.server.copyInfo" },
+        { label: "Delete", command: "nexus.server.remove" }
+      ];
+      const picked = await vscode.window.showQuickPick(picks, { title: "Profile Actions" });
+      if (picked) {
+        await vscode.commands.executeCommand(picked.command, arg);
+      }
+      return;
+    }
+
+    if (arg instanceof SerialProfileTreeItem) {
+      const picks: ProfileActionPick[] = [
+        { label: "Connect", command: "nexus.serial.connect" },
+        { label: "Test Connection", command: "nexus.serial.testConnection" },
+        { label: "Connect and Run Script", command: "nexus.serial.runWithScript" },
+        { label: "Edit", command: "nexus.serial.edit" },
+        { label: "Duplicate", command: "nexus.serial.duplicate" },
+        { label: "Copy Port Info", command: "nexus.serial.copyInfo" },
+        { label: "Delete", command: "nexus.serial.remove" }
+      ];
+      const picked = await vscode.window.showQuickPick(picks, { title: "Profile Actions" });
+      if (picked) {
+        await vscode.commands.executeCommand(picked.command, arg);
+      }
+    }
+  };
+
   return [
     vscode.commands.registerCommand("nexus.profile.add", (arg?: unknown) => {
-      const group = arg instanceof FolderTreeItem ? arg.folderPath : undefined;
-      openUnifiedForm(ctx, { profileType: "ssh", group });
+      if (arg instanceof FolderTreeItem) {
+        openUnifiedForm(ctx, { group: arg.folderPath });
+        return;
+      }
+      openUnifiedForm(ctx, isUnifiedProfileSeed(arg) ? arg : undefined);
     }),
+
+    vscode.commands.registerCommand("nexus.profile.actions", showProfileActions),
 
     vscode.commands.registerCommand("nexus.group.add", async (arg?: unknown) => {
       const parentPath = arg instanceof FolderTreeItem ? arg.folderPath : undefined;

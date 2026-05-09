@@ -61,6 +61,15 @@ export function renderMacroEditorHtml(
       `<div class="custom-select-option${profile.id === triggerProfileId ? " selected" : ""}" data-value="${escapeHtml(profile.id)}">${escapeHtml(profile.label)}</div>`
     ).join("\n        ")
     : '<div class="custom-select-option selected" data-value="">No server or serial profiles</div>';
+  const emptyStateHtml = macros.length === 0
+    ? `<div class="empty-state">
+    <div class="empty-title">No macros yet</div>
+    <div class="empty-actions">
+      <button type="button" class="btn-primary" id="empty-add-btn">Add Macro</button>
+      <button type="button" class="btn-secondary" id="empty-template-btn">Add From Template</button>
+    </div>
+  </div>`
+    : "";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -97,9 +106,24 @@ export function renderMacroEditorHtml(
     .dirty-indicator.visible {
       display: inline;
     }
+    .empty-state {
+      margin-bottom: 18px;
+      padding: 10px 0 14px 0;
+      border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
+    }
+    .empty-title {
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .empty-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
   </style>
 </head>
 <body>
+  ${emptyStateHtml}
   <div class="form-group">
     <label>Macro</label>
     <div class="custom-select" id="macro-selector">
@@ -259,6 +283,31 @@ export function renderMacroEditorHtml(
         document.getElementById("dirty-flag").classList.remove("visible");
       }
 
+      function requestNewMacro() {
+        if (dirty) {
+          vscode.postMessage({ type: "confirmSwitch", targetValue: "__new__" });
+        } else {
+          vscode.postMessage({ type: "selectMacro", value: "__new__" });
+        }
+      }
+
+      function requestAddFromTemplate() {
+        if (dirty) {
+          vscode.postMessage({ type: "confirmAddFromTemplate" });
+        } else {
+          vscode.postMessage({ type: "addFromTemplate" });
+        }
+      }
+
+      var emptyAddBtn = document.getElementById("empty-add-btn");
+      if (emptyAddBtn) {
+        emptyAddBtn.addEventListener("click", requestNewMacro);
+      }
+      var emptyTemplateBtn = document.getElementById("empty-template-btn");
+      if (emptyTemplateBtn) {
+        emptyTemplateBtn.addEventListener("click", requestAddFromTemplate);
+      }
+
       // Track changes
       document.getElementById("macro-name").addEventListener("input", markDirty);
       document.getElementById("macro-text").addEventListener("input", markDirty);
@@ -391,13 +440,7 @@ export function renderMacroEditorHtml(
       });
 
       // New
-      document.getElementById("new-btn").addEventListener("click", function() {
-        if (dirty) {
-          vscode.postMessage({ type: "confirmSwitch", targetValue: "__new__" });
-        } else {
-          vscode.postMessage({ type: "selectMacro", value: "__new__" });
-        }
-      });
+      document.getElementById("new-btn").addEventListener("click", requestNewMacro);
 
       // Messages from host
       window.addEventListener("message", function(event) {

@@ -1,13 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { formatSettingValueForTree, CATEGORY_ICONS, SETTINGS_META, type SettingMeta } from "../../src/ui/settingsMetadata";
+import { formatSettingValueForTree, CATEGORY_DESCRIPTIONS, CATEGORY_ICONS, SETTINGS_META, type SettingMeta } from "../../src/ui/settingsMetadata";
 
 describe("CATEGORY_ICONS", () => {
   it("has an icon for every category", () => {
-    const expectedCategories = ["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial"];
+    const expectedCategories = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"];
     for (const cat of expectedCategories) {
       expect(CATEGORY_ICONS[cat]).toBeDefined();
       expect(typeof CATEGORY_ICONS[cat]).toBe("string");
     }
+  });
+});
+
+describe("CATEGORY_DESCRIPTIONS", () => {
+  it("has a concise description for Security & Data", () => {
+    expect(CATEGORY_DESCRIPTIONS.securityData).toContain("credentials");
+    expect(CATEGORY_DESCRIPTIONS.securityData).toContain("backups");
   });
 });
 
@@ -48,6 +55,12 @@ describe("SETTINGS_META", () => {
   it("recommends editor tabs for terminal open location to match the package default", () => {
     const openLocation = SETTINGS_META.find((item) => item.section === "nexus.terminal" && item.key === "openLocation");
     expect(openLocation?.enumOptions?.find((option) => option.value === "editor")?.recommended).toBe(true);
+  });
+
+  it("keeps Trust New Hosts on the same key but groups it under Security & Data", () => {
+    const trustNewHosts = SETTINGS_META.find((item) => item.section === "nexus.ssh" && item.key === "trustNewHosts");
+    expect(trustNewHosts).toBeDefined();
+    expect(trustNewHosts?.category).toBe("securityData");
   });
 });
 

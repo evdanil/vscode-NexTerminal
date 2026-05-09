@@ -153,6 +153,74 @@ describe("renderFormHtml", () => {
     expect(html).toContain("ssh");
   });
 
+  it("groups advanced fields behind a details summary", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        { type: "text", key: "host", label: "Host", required: true },
+        { type: "checkbox", key: "multiplexing", label: "Enable multiplexing", advanced: true },
+        { type: "combobox", key: "group", label: "Folder", suggestions: [], advanced: true }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    const hostIndex = html.indexOf('id="field-host"');
+    const detailsIndex = html.indexOf('<details class="advanced-fields">');
+    const summaryIndex = html.indexOf("<summary>Advanced options</summary>");
+    const multiplexingIndex = html.indexOf('id="field-multiplexing"');
+    const groupIndex = html.indexOf('id="field-group"');
+
+    expect(detailsIndex).toBeGreaterThan(-1);
+    expect(summaryIndex).toBeGreaterThan(detailsIndex);
+    expect(hostIndex).toBeGreaterThan(-1);
+    expect(hostIndex).toBeLessThan(detailsIndex);
+    expect(multiplexingIndex).toBeGreaterThan(summaryIndex);
+    expect(groupIndex).toBeGreaterThan(summaryIndex);
+  });
+
+  it("keeps advanced fields subject to visibleWhen attributes", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "profileType",
+          label: "Type",
+          options: [
+            { label: "SSH", value: "ssh" },
+            { label: "Serial", value: "serial" }
+          ],
+          value: "ssh"
+        },
+        {
+          type: "text",
+          key: "proxyHost",
+          label: "Proxy Host",
+          advanced: true,
+          visibleWhen: { field: "profileType", value: "ssh" }
+        }
+      ]
+    };
+    const html = renderFormHtml(definition);
+    const detailsIndex = html.indexOf('<details class="advanced-fields">');
+    const proxyIndex = html.indexOf('id="field-proxyHost"');
+
+    expect(proxyIndex).toBeGreaterThan(detailsIndex);
+    expect(html).toContain("data-visible-when=");
+    expect(html).toContain('&quot;field&quot;:&quot;profileType&quot;');
+    expect(html).toContain('&quot;value&quot;:&quot;ssh&quot;');
+  });
+
+  it("includes CSS for advanced field grouping", () => {
+    const html = renderFormHtml({
+      title: "Test",
+      fields: [{ type: "text", key: "notes", label: "Notes", advanced: true }]
+    });
+
+    expect(html).toContain(".advanced-fields");
+    expect(html).toContain(".advanced-fields summary");
+    expect(html).toContain(".advanced-fields .form-group");
+  });
+
   it("includes CSS for visibleWhen hidden/visible states", () => {
     const definition: FormDefinition = {
       title: "Test",

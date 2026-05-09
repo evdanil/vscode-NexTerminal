@@ -10,6 +10,7 @@ import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
+const mockShowErrorMessage = vi.fn();
 
 vi.mock("node:fs/promises", () => ({
   readFile: vi.fn()
@@ -45,10 +46,16 @@ vi.mock("vscode", () => ({
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showQuickPick: vi.fn(),
     showInformationMessage: vi.fn(),
+    showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
     showInputBox: vi.fn(),
     showOpenDialog: vi.fn(),
     withProgress: vi.fn(),
     createTerminal: vi.fn(() => ({ show: vi.fn(), dispose: vi.fn() }))
+  },
+  env: {
+    clipboard: {
+      writeText: vi.fn()
+    }
   },
   workspace: {
     getConfiguration: vi.fn(() => ({
@@ -246,6 +253,21 @@ describe("server disconnect with tunnel autoStop", () => {
     registeredCommands.clear();
   });
 
+  it("routes Add SSH Server to a dedicated SSH add form", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+
+    registerServerCommands(ctx);
+    const addCmd = registeredCommands.get("nexus.server.add");
+    expect(addCmd).toBeDefined();
+
+    await addCmd!();
+
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.profile.add", {
+      addMode: "ssh",
+      profileType: "ssh"
+    });
+  });
+
   it("keeps pool connection when autoStop=false tunnel remains active", async () => {
     const autoStopProfile = makeTunnel({ id: "tp-stop", autoStop: true });
     const keepProfile = makeTunnel({ id: "tp-keep", autoStop: false });
@@ -337,6 +359,90 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).not.toHaveBeenCalledWith("s-child");
     expect(disconnectPool).not.toHaveBeenCalledWith("s-hidden");
     expect(disconnectPool).not.toHaveBeenCalledWith("s-other");
+  });
+});
+
+describe("server test connection command", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(async (_options: unknown, task: () => Promise<unknown>) => task());
+  });
+
+  it("connects, disposes the probe connection, and reports success", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+    const connection = { dispose: vi.fn() };
+    (ctx.sshFactory as any).connect = vi.fn(async () => connection);
+
+    registerServerCommands(ctx);
+    const testCmd = registeredCommands.get("nexus.server.testConnection");
+    expect(testCmd).toBeDefined();
+
+    await testCmd!("srv-1");
+
+    expect(vscode.window.withProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Testing connection to Server 1..." }),
+      expect.any(Function)
+    );
+    expect((ctx.sshFactory as any).connect).toHaveBeenCalledWith(expect.objectContaining({ id: "srv-1" }));
+    expect(connection.dispose).toHaveBeenCalledTimes(1);
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith("Connection test succeeded for Server 1.");
+  });
+
+  it("shows classified failure details and copies sanitized diagnostics on request", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ name: "Prod", host: "prod.example.com", port: 2222 })]
+    });
+    (ctx.sshFactory as any).connect = vi.fn(async () => {
+      throw new Error("All configured authentication methods failed for password hunter2");
+    });
+    mockShowErrorMessage.mockResolvedValueOnce("Copy Details");
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.testConnection")!("srv-1");
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("Authentication failed"),
+      "Copy Details"
+    );
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledTimes(1);
+    const copied = vi.mocked(vscode.env.clipboard.writeText).mock.calls[0][0];
+    expect(copied).toContain("Server: Prod");
+    expect(copied).toContain("Host: prod.example.com");
+    expect(copied).toContain("Port: 2222");
+    expect(copied).toContain("Stage: auth");
+    expect(copied).toContain("Authentication failed");
+    expect(copied).not.toContain("hunter2");
+    expect(copied).not.toContain("password hunter2");
+  });
+
+  it("falls back to a server QuickPick when no server tree item is supplied", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [
+        makeServer({ id: "srv-a", name: "Alpha", host: "alpha.example.com" }),
+        makeServer({ id: "srv-b", name: "Beta", host: "beta.example.com" })
+      ]
+    });
+    const connection = { dispose: vi.fn() };
+    (ctx.sshFactory as any).connect = vi.fn(async () => connection);
+    vi.mocked(vscode.window.showQuickPick as any).mockResolvedValueOnce({
+      label: "Beta",
+      server: makeServer({ id: "srv-b", name: "Beta", host: "beta.example.com" })
+    });
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.testConnection")!();
+
+    expect(vscode.window.showQuickPick).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ label: "Beta" })]),
+      expect.objectContaining({ title: "Select Nexus Server" })
+    );
+    expect((ctx.sshFactory as any).connect).toHaveBeenCalledWith(expect.objectContaining({ id: "srv-b" }));
+    expect(connection.dispose).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -415,6 +415,28 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(disconnected.id).toBe(connected.id);
   });
 
+  it("ServerTreeItem opens profile quick actions on click", () => {
+    const server = makeServer({ id: "s1" });
+    const item = new ServerTreeItem(server, false);
+
+    expect(item.command).toEqual({
+      command: "nexus.profile.actions",
+      title: "Profile Actions",
+      arguments: [item]
+    });
+  });
+
+  it("SerialProfileTreeItem opens profile quick actions on click", () => {
+    const profile = makeSerial({ id: "sp1" });
+    const item = new SerialProfileTreeItem(profile, "connected");
+
+    expect(item.command).toEqual({
+      command: "nexus.profile.actions",
+      title: "Profile Actions",
+      arguments: [item]
+    });
+  });
+
   it("marks smart-follow serial profiles in the description", () => {
     const profile = makeSerial({ id: "sp-smart", mode: "smartFollow" });
     const item = new SerialProfileTreeItem(profile, "disconnected");

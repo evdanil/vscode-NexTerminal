@@ -86,23 +86,27 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "No servers or serial devices configured.\n[Add Profile](command:nexus.profile.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+        "contents": "Start by adding a connection profile.\n[Add Profile](command:nexus.profile.add)\n[Add SSH Server](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
       },
       {
         "view": "nexusTunnels",
-        "contents": "Use the **+** button above to add a tunnel.\nRight-click a tunnel to start, stop, or edit it."
+        "contents": "Add a tunnel, then start it from this view.\n[Add Tunnel](command:nexus.tunnel.add)"
       },
       {
         "view": "nexusFileExplorer",
-        "contents": "No server selected.\nRight-click a connected server → \"Browse Files\" to start."
+        "contents": "Browsing starts from a connected profile.\n[Browse Files](command:nexus.files.browse)"
       },
       {
         "view": "nexusMacros",
-        "contents": "No macros defined.\n[Add Macro](command:nexus.macro.add)\nMacros send predefined text to the active terminal."
+        "contents": "No macros defined.\n[Add Macro](command:nexus.macro.add)\n[Add From Template](command:nexus.macro.addFromTemplate)\nMacros send predefined text to the active terminal."
       },
       {
         "view": "nexusScripts",
-        "contents": "Nexus scripts automate SSH and Serial sessions with expect/send style.\n[New Script](command:nexus.script.new)\n[Open scripting guide](command:nexus.script.openDocs)\n[Open script examples](command:nexus.script.openExamples)"
+        "contents": "Nexus script templates include basic commands, prompt waits, output capture, and backup running config.\n[New Script](command:nexus.script.new)\n[Open scripting guide](command:nexus.script.openDocs)\n[Open script examples](command:nexus.script.openExamples)"
+      },
+      {
+        "view": "nexusSettings",
+        "contents": "Open Nexus settings or import/export your configuration.\n[Open Settings](command:nexus.settings.openPanel)\n[Encrypted Backup](command:nexus.config.export.backup)\n[Import Configuration](command:nexus.config.import)"
       }
     ],
     "commands": [
@@ -132,6 +136,12 @@
         "command": "nexus.server.connect",
         "title": "Connect",
         "icon": "$(plug)"
+      },
+      {
+        "command": "nexus.server.testConnection",
+        "title": "Test Connection",
+        "category": "Nexus",
+        "icon": "$(beaker)"
       },
       {
         "command": "nexus.server.disconnect",
@@ -256,6 +266,12 @@
         "icon": "$(plug)"
       },
       {
+        "command": "nexus.serial.testConnection",
+        "title": "Test Connection",
+        "category": "Nexus",
+        "icon": "$(beaker)"
+      },
+      {
         "command": "nexus.serial.disconnect",
         "title": "Disconnect",
         "icon": "$(debug-disconnect)"
@@ -342,6 +358,11 @@
         "icon": "$(add)"
       },
       {
+        "command": "nexus.profile.actions",
+        "title": "Profile Actions",
+        "category": "Nexus"
+      },
+      {
         "command": "nexus.group.add",
         "title": "New Folder",
         "category": "Nexus",
@@ -400,6 +421,12 @@
         "title": "Add Macro",
         "category": "Nexus",
         "icon": "$(add)"
+      },
+      {
+        "command": "nexus.macro.addFromTemplate",
+        "title": "Add Macro From Template",
+        "category": "Nexus",
+        "icon": "$(new-file)"
       },
       {
         "command": "nexus.macro.edit",
@@ -464,7 +491,7 @@
       },
       {
         "command": "nexus.macro.copyAllAsJson",
-        "title": "Nexus: Copy All Macros as JSON",
+        "title": "Copy All Macros as JSON",
         "category": "Nexus"
       },
       {
@@ -1315,6 +1342,10 @@
           "when": "true"
         },
         {
+          "command": "nexus.profile.actions",
+          "when": "false"
+        },
+        {
           "command": "nexus.group.add",
           "when": "true"
         },
@@ -1384,6 +1415,10 @@
         },
         {
           "command": "nexus.macro.add",
+          "when": "true"
+        },
+        {
+          "command": "nexus.macro.addFromTemplate",
           "when": "true"
         },
         {

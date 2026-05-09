@@ -240,6 +240,29 @@ function sameDeviceHint(left: SerialDeviceHint | undefined, right: SerialDeviceH
   );
 }
 
+function portPathEquals(left: string, right: string): boolean {
+  return normalizePortPath(left) === normalizePortPath(right);
+}
+
+function matchesDeviceHint(port: SerialPortInfo, hint: SerialDeviceHint | undefined): boolean {
+  if (!hint) {
+    return false;
+  }
+  if (!hint.manufacturer && !hint.serialNumber && !hint.vendorId && !hint.productId) {
+    return false;
+  }
+  return (
+    (hint.manufacturer === undefined || port.manufacturer === hint.manufacturer) &&
+    (hint.serialNumber === undefined || port.serialNumber === hint.serialNumber) &&
+    (hint.vendorId === undefined || port.vendorId === hint.vendorId) &&
+    (hint.productId === undefined || port.productId === hint.productId)
+  );
+}
+
+function hasDeviceHint(hint: SerialDeviceHint | undefined): boolean {
+  return !!(hint?.manufacturer || hint?.serialNumber || hint?.vendorId || hint?.productId);
+}
+
 /**
  * Look up an existing serial terminal entry for a profile so a second "Connect"
  * click refocuses the existing terminal instead of creating a duplicate.
@@ -525,10 +548,72 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   terminal.show();
 }
 
+async function testSerialConnection(ctx: CommandContext, arg?: unknown): Promise<void> {
+  const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
+  if (!profile) {
+    return;
+  }
+
+  const ports = await listSerialPorts(ctx.serialSidecar);
+  const savedPathPort = ports.find((port) => portPathEquals(port.path, profile.path));
+
+  if (resolveSerialProfileMode(profile) !== "smartFollow") {
+    if (savedPathPort) {
+      void vscode.window.showInformationMessage(
+        `Connection test succeeded for ${profile.name}: ${profile.path} is available.`
+      );
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `Serial port ${profile.path} is not available. Scan Serial Ports or check the cable and OS permissions.`,
+      "Scan Serial Ports"
+    );
+    if (choice === "Scan Serial Ports") {
+      await vscode.commands.executeCommand("nexus.serial.listPorts");
+    }
+    return;
+  }
+
+  const matchingDevice = hasDeviceHint(profile.deviceHint)
+    ? ports.find((port) => matchesDeviceHint(port, profile.deviceHint))
+    : undefined;
+  if (!hasDeviceHint(profile.deviceHint) && savedPathPort) {
+    void vscode.window.showInformationMessage(
+      `Smart Follow test for ${profile.name}: saved path ${profile.path} is available. No hardware hint is saved yet.`
+    );
+    return;
+  }
+  if (matchingDevice && savedPathPort) {
+    void vscode.window.showInformationMessage(
+      `Smart Follow test succeeded for ${profile.name}: saved path ${profile.path} is available and a matching device is present.`
+    );
+    return;
+  }
+  if (matchingDevice) {
+    void vscode.window.showInformationMessage(
+      `Smart Follow found a matching device for ${profile.name} on ${matchingDevice.path}, but saved path ${profile.path} is not currently available.`
+    );
+    return;
+  }
+  if (savedPathPort) {
+    void vscode.window.showWarningMessage(
+      `Saved path ${profile.path} is available for ${profile.name}, but no device matching the Smart Follow hardware hint was found.`
+    );
+    return;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    `No matching Smart Follow device is present for ${profile.name}, and saved path ${profile.path} is not available. Scan Serial Ports or check the cable and OS permissions.`,
+    "Scan Serial Ports"
+  );
+  if (choice === "Scan Serial Ports") {
+    await vscode.commands.executeCommand("nexus.serial.listPorts");
+  }
+}
+
 export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.serial.add", () => {
-      void vscode.commands.executeCommand("nexus.profile.add");
+      void vscode.commands.executeCommand("nexus.profile.add", { addMode: "serial", profileType: "serial" });
     }),
 
     vscode.commands.registerCommand("nexus.serial.edit", async (arg?: unknown) => {
@@ -602,6 +687,8 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         void vscode.window.showErrorMessage(`Failed to open serial terminal: ${message}`);
       }
     }),
+
+    vscode.commands.registerCommand("nexus.serial.testConnection", (arg?: unknown) => testSerialConnection(ctx, arg)),
 
     // Connect to a serial profile and auto-run a picked Nexus script once the
     // session is registered. Same pattern as nexus.server.runWithScript but for

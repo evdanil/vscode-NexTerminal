@@ -1,7 +1,7 @@
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
-import { SETTINGS_META, CATEGORY_ORDER, CATEGORY_LABELS, type SettingMeta } from "./settingsMetadata";
+import { SETTINGS_META, CATEGORY_ORDER, CATEGORY_DESCRIPTIONS, CATEGORY_LABELS, type SettingMeta } from "./settingsMetadata";
 
 interface SettingValues {
   [sectionDotKey: string]: unknown;
@@ -138,6 +138,34 @@ function renderSetting(meta: SettingMeta, values: SettingValues): string {
   }
 }
 
+function renderSecurityDataInfo(): string {
+  return `<section class="security-data-info" aria-label="Security and data storage">
+    <p>Credentials are stored in VS Code SecretStorage, and host keys are stored in VS Code global state.</p>
+    <p>An encrypted backup includes secrets only when you create a backup; sanitized export excludes secrets.</p>
+  </section>`;
+}
+
+function renderFocusedDataManagementControls(): string {
+  return `
+  <h4 class="settings-subgroup">Data Management</h4>
+  <div class="setting-desc">Back up, share, import, reset, or delete Nexus data.</div>
+  <div class="button-row">
+    <button type="button" class="btn-primary" id="backup-btn">Backup\u2026</button>
+    <button type="button" class="btn-secondary" id="share-btn">Export for Sharing\u2026</button>
+    <button type="button" class="btn-secondary" id="import-btn">Import\u2026</button>
+  </div>
+  <div class="button-row" style="margin-top: 16px; justify-content: flex-end;">
+    <button type="button" class="btn-secondary" id="reset-all-btn">Reset All to Defaults</button>
+  </div>
+  <div class="danger-zone">
+    <h4>Danger Zone</h4>
+    <div class="setting-desc">Permanently delete all your data. This cannot be undone.</div>
+    <div class="button-row">
+      <button type="button" class="btn-danger" id="complete-reset-btn">Delete All Data\u2026</button>
+    </div>
+  </div>`;
+}
+
 export function renderSettingsHtml(values: SettingValues, nonce: string, categoryFilter?: string): string {
   const grouped = new Map<string, SettingMeta[]>();
   for (const meta of SETTINGS_META) {
@@ -158,11 +186,21 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
   </div>`;
 
   if (categoryFilter) {
+    const categoryLabel = CATEGORY_LABELS[categoryFilter] ?? categoryFilter;
+    const categoryDescription = CATEGORY_DESCRIPTIONS[categoryFilter] ?? "Review settings for this Nexus category.";
     // Focused mode: render only the target category
     sectionsHtml += `
   <div class="button-row" style="margin-bottom: 16px;">
     <button type="button" class="btn-secondary" id="open-all-settings-btn">All Settings</button>
-  </div>`;
+  </div>
+  <header class="settings-panel-header">
+    <h2>Nexus: ${escapeHtml(categoryLabel)}</h2>
+    <p>${escapeHtml(categoryDescription)}</p>
+  </header>`;
+
+    if (categoryFilter === "securityData") {
+      sectionsHtml += renderSecurityDataInfo();
+    }
 
     const metas = grouped.get(categoryFilter);
     if (metas && metas.length > 0) {
@@ -179,6 +217,10 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
     // Show highlighting rule editor button for terminal category
     if (categoryFilter === "terminal") {
       sectionsHtml += terminalActionsHtml;
+    }
+
+    if (categoryFilter === "securityData") {
+      sectionsHtml += renderFocusedDataManagementControls();
     }
 
     // Per-category reset button
@@ -232,6 +274,10 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
     </div>
   </div>`;
   }
+
+  const infoBannerText = categoryFilter
+    ? `${CATEGORY_LABELS[categoryFilter] ?? categoryFilter} settings auto-save as you change them.`
+    : "Settings auto-save as you change them. Open a category to focus on one task area.";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -342,6 +388,10 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       margin-top: 0;
       color: var(--vscode-errorForeground, #f48771);
     }
+    .danger-zone h4 {
+      margin-top: 0;
+      color: var(--vscode-errorForeground, #f48771);
+    }
     .btn-danger {
       padding: 6px 16px;
       background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
@@ -370,11 +420,30 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       padding: 14px 16px;
       margin-bottom: 16px;
     }
+    .settings-panel-header {
+      margin-bottom: 16px;
+    }
+    .settings-panel-header h2 {
+      margin-bottom: 4px;
+    }
+    .settings-panel-header p,
+    .security-data-info p {
+      margin: 0 0 6px;
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .security-data-info {
+      margin-bottom: 16px;
+      padding: 10px 12px;
+      border-left: 3px solid var(--vscode-focusBorder, #3794ff);
+      background: var(--vscode-editorWidget-background, rgba(128,128,128,0.08));
+    }
   </style>
 </head>
 <body>
   <div class="info-banner">
-    Settings are stored in your global VS Code configuration and auto-save on change.
+    ${escapeHtml(infoBannerText)}
   </div>
   ${sectionsHtml}
   <script nonce="${nonce}">

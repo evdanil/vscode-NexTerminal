@@ -75,7 +75,19 @@ async function pickScriptFile(globalStoragePath: string): Promise<vscode.Uri | u
   return picked?.[0];
 }
 
-const STARTER_SCRIPT_TEMPLATE = `/**
+type ScriptTemplate = {
+  id: string;
+  label: string;
+  description: string;
+  body: string;
+};
+
+export const SCRIPT_TEMPLATES: ScriptTemplate[] = [
+  {
+    id: "basic-command",
+    label: "Basic command",
+    description: "Wait for a shell prompt, run one command, and log output.",
+    body: `/**
  * @nexus-script
  * @name {{NAME}}
  * @description A new Nexus automation script.
@@ -102,13 +114,128 @@ try {
   log.error("script failed:", message);
   throw err;
 }
-`;
+`
+  },
+  {
+    id: "wait-send",
+    label: "Wait for prompt then send",
+    description: "Wait for login-style prompts and send responses.",
+    body: `/**
+ * @nexus-script
+ * @name {{NAME}}
+ * @description Wait for terminal prompts and send responses.
+ * @target-type ssh
+ */
+
+// Full API reference: ./types/nexus-scripts.d.ts
+
+try {
+  await expect(/login:\\s*$/i, { timeout: 30_000 });
+  await sendLine("admin");
+
+  await expect(/[$#] $/, { timeout: 30_000 });
+  await sendLine("terminal length 0");
+
+  const prompt = await expect(/[$#] $/, { timeout: 10_000 });
+  log.info("ready:", prompt.text);
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err);
+  log.error("script failed:", message);
+  throw err;
+}
+`
+  },
+  {
+    id: "capture-output",
+    label: "Capture command output",
+    description: "Run a command, capture text before the next prompt, and log it.",
+    body: `/**
+ * @nexus-script
+ * @name {{NAME}}
+ * @description Capture output from a Nexus terminal command.
+ * @target-type ssh
+ */
+
+// Full API reference: ./types/nexus-scripts.d.ts
+
+try {
+  await expect(/[$#] $/, { timeout: 10_000 });
+  await sendLine("show version");
+
+  const result = await expect(/[$#] $/, { timeout: 10_000 });
+  const output = result.before.trim();
+  log.info("command output:", output);
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err);
+  log.error("script failed:", message);
+  throw err;
+}
+`
+  },
+  {
+    id: "backup-running-config",
+    label: "Backup running config",
+    description: "Disable paging, collect running config, and log the backup text.",
+    body: `/**
+ * @nexus-script
+ * @name {{NAME}}
+ * @description Capture a network device running configuration.
+ * @target-type ssh
+ */
+
+// Full API reference: ./types/nexus-scripts.d.ts
+
+try {
+  await expect(/[$#] $/, { timeout: 10_000 });
+  await sendLine("terminal length 0");
+  await expect(/[$#] $/, { timeout: 10_000 });
+
+  await sendLine("show running-config");
+  const result = await expect(/[$#] $/, { timeout: 30_000 });
+  const runningConfig = result.before.trim();
+  log.info("running config backup:", runningConfig);
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err);
+  log.error("script failed:", message);
+  throw err;
+}
+`
+  }
+];
 
 function stripJsExtension(raw: string): string {
   return raw.replace(/\.js$/i, "");
 }
 
+function resolveScriptTemplate(picked: unknown): ScriptTemplate | undefined {
+  if (!picked || typeof picked !== "object") return undefined;
+  const maybe = picked as { template?: ScriptTemplate; templateId?: string; id?: string; label?: string };
+  if (maybe.template) return maybe.template;
+  return SCRIPT_TEMPLATES.find(
+    (template) => template.id === maybe.templateId || template.id === maybe.id || template.label === maybe.label
+  );
+}
+
+async function pickScriptTemplate(): Promise<ScriptTemplate | undefined> {
+  const picked = await vscode.window.showQuickPick(
+    SCRIPT_TEMPLATES.map((template) => ({
+      label: template.label,
+      description: template.description,
+      templateId: template.id,
+      template
+    })),
+    {
+      title: "New Nexus Script",
+      placeHolder: "Choose a starter template"
+    }
+  );
+  return resolveScriptTemplate(picked);
+}
+
 async function createNewScript(globalStoragePath: string): Promise<void> {
+  const template = await pickScriptTemplate();
+  if (!template) return;
+
   const input = await vscode.window.showInputBox({
     prompt: "Name for the new Nexus script",
     placeHolder: "my-procedure",
@@ -133,7 +260,7 @@ async function createNewScript(globalStoragePath: string): Promise<void> {
     await vscode.workspace.fs.stat(target);
     void vscode.window.showWarningMessage(`${name}.js already exists. Opening the existing file.`);
   } catch {
-    const body = STARTER_SCRIPT_TEMPLATE.replace("{{NAME}}", name);
+    const body = template.body.replaceAll("{{NAME}}", name);
     await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(body));
   }
   const doc = await vscode.workspace.openTextDocument(target);
