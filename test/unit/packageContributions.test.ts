@@ -57,6 +57,20 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.group.remove");
   });
 
+  it("contributes profile quick action and placeholder diagnostic commands", () => {
+    const commands = packageJson.contributes.commands.map((item) => item.command);
+    expect(commands).toContain("nexus.profile.actions");
+    expect(commands).toContain("nexus.server.testConnection");
+    expect(commands).toContain("nexus.serial.testConnection");
+  });
+
+  it("hides the tree-only profile quick action command from the command palette", () => {
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    const item = paletteMenu.find((entry) => entry.command === "nexus.profile.actions");
+    expect(item).toBeDefined();
+    expect(item?.when).toBe("false");
+  });
+
   it("contributes settings.openPanel command", () => {
     const commands = packageJson.contributes.commands.map((item) => item.command);
     expect(commands).toContain("nexus.settings.openPanel");
@@ -109,6 +123,32 @@ describe("package contributions", () => {
     );
     expect(addCommands).toHaveLength(1);
     expect(addCommands[0].command).toBe("nexus.profile.add");
+  });
+
+  it("uses guided welcome links for empty views", () => {
+    const welcome = packageJson.contributes.viewsWelcome ?? [];
+    const entry = (view: string) => {
+      const found = welcome.find((item) => item.view === view);
+      expect(found, `Expected welcome entry for ${view}`).toBeDefined();
+      return found!.contents;
+    };
+
+    const hub = entry("nexusCommandCenter");
+    expect(hub).toContain("command:nexus.profile.add");
+    expect(hub).toContain("command:nexus.server.add");
+    expect(hub).toContain("command:nexus.serial.add");
+    expect(hub).toContain("command:nexus.serial.listPorts");
+
+    const files = entry("nexusFileExplorer");
+    expect(files).toMatch(/connected profile/i);
+    expect(files).toContain("command:nexus.files.browse");
+
+    expect(entry("nexusTunnels")).toContain("command:nexus.tunnel.add");
+
+    const settings = entry("nexusSettings");
+    expect(settings).toContain("command:nexus.settings.openPanel");
+    expect(settings).toContain("command:nexus.config.export.backup");
+    expect(settings).toContain("command:nexus.config.import");
   });
 
   it("uses explicit folder-server wording for folder connect actions", () => {
