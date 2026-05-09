@@ -1336,6 +1336,10 @@
           "when": "true"
         },
         {
+          "command": "nexus.profile.actions",
+          "when": "false"
+        },
+        {
           "command": "nexus.group.add",
           "when": "true"
         },

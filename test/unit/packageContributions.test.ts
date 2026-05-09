@@ -64,6 +64,13 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.serial.testConnection");
   });
 
+  it("hides the tree-only profile quick action command from the command palette", () => {
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    const item = paletteMenu.find((entry) => entry.command === "nexus.profile.actions");
+    expect(item).toBeDefined();
+    expect(item?.when).toBe("false");
+  });
+
   it("contributes settings.openPanel command", () => {
     const commands = packageJson.contributes.commands.map((item) => item.command);
     expect(commands).toContain("nexus.settings.openPanel");
