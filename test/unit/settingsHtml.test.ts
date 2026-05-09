@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderSettingsHtml } from "../../src/ui/settingsHtml";
-import { SETTINGS_META, CATEGORY_ORDER, CATEGORY_LABELS } from "../../src/ui/settingsMetadata";
+import { SETTINGS_META, CATEGORY_ORDER, CATEGORY_DESCRIPTIONS, CATEGORY_LABELS } from "../../src/ui/settingsMetadata";
 
 function buildDefaultValues(): Record<string, unknown> {
   const values: Record<string, unknown> = {};
@@ -27,8 +27,9 @@ describe("renderSettingsHtml", () => {
     const html = renderWithDefaults();
     for (const cat of CATEGORY_ORDER) {
       const label = CATEGORY_LABELS[cat];
+      const labelHtml = label.replace(/&/g, "&amp;");
       expect(html).toContain(`id="section-${cat}"`);
-      expect(html).toContain(label);
+      expect(html).toContain(labelHtml);
     }
   });
 
@@ -188,6 +189,37 @@ describe("renderSettingsHtml", () => {
       const html = renderSettingsHtml(values, "test-nonce-123", "logging");
       expect(html).toContain("open-all-settings-btn");
       expect(html).toContain('type: "openAllSettings"');
+    });
+
+    it("renders a task-oriented focused header with the category description", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "securityData");
+      expect(html).toContain("Nexus: Security &amp; Data");
+      expect(html).toContain(CATEGORY_DESCRIPTIONS.securityData);
+      expect(html).toContain("Security &amp; Data settings auto-save");
+    });
+
+    it("renders Security & Data storage and export clarity before controls", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "securityData");
+      const copyIndex = html.indexOf("VS Code SecretStorage");
+      const controlIndex = html.indexOf("Trust New Hosts");
+      expect(copyIndex).toBeGreaterThan(-1);
+      expect(controlIndex).toBeGreaterThan(copyIndex);
+      expect(html).toContain("host keys");
+      expect(html).toContain("VS Code global state");
+      expect(html).toContain("encrypted backup");
+      expect(html).toContain("sanitized export");
+    });
+
+    it("keeps data commands reachable from the Security & Data focused panel", () => {
+      const values = buildDefaultValues();
+      const html = renderSettingsHtml(values, "test-nonce-123", "securityData");
+      expect(html).toContain('id="backup-btn"');
+      expect(html).toContain('id="share-btn"');
+      expect(html).toContain('id="import-btn"');
+      expect(html).toContain('id="reset-all-btn"');
+      expect(html).toContain('id="complete-reset-btn"');
     });
 
     it("wraps settings in .settings-card in focused mode", () => {

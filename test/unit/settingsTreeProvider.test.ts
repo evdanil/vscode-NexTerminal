@@ -94,13 +94,13 @@ describe("SettingsTreeProvider", () => {
       expect(roots).toHaveLength(11);
     });
 
-    it("has 8 category items first (Scripts sits after Serial)", () => {
+    it("has 9 category items first with Security & Data after SSH", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const categories = roots.filter((r) => r instanceof SettingsCategoryItem);
-      expect(categories).toHaveLength(8);
+      expect(categories).toHaveLength(9);
       expect(categories.map((c) => (c as SettingsCategoryItem).categoryKey))
-        .toEqual(["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"]);
+        .toEqual(["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"]);
     });
 
     it("has 2 root link items for Macros and Auth Profiles", () => {
@@ -111,11 +111,11 @@ describe("SettingsTreeProvider", () => {
       expect(links.map((link) => link.label)).toEqual(["Macros", "Auth Profiles"]);
     });
 
-    it("has 1 Data Management group", () => {
+    it("does not keep Data Management as a root group", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const groups = roots.filter((r) => r instanceof DataManagementGroupItem);
-      expect(groups).toHaveLength(1);
+      expect(groups).toHaveLength(0);
     });
   });
 
@@ -128,11 +128,21 @@ describe("SettingsTreeProvider", () => {
       expect(children.every((c) => c instanceof SettingsValueItem)).toBe(true);
     });
 
-    it("returns 8 children for ssh category", () => {
+    it("returns 7 children for ssh category after host trust moves to Security & Data", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("ssh");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(8);
+      expect(children).toHaveLength(7);
+    });
+
+    it("returns Trust New Hosts and Data Management under Security & Data", () => {
+      const provider = createProvider();
+      const category = new SettingsCategoryItem("securityData");
+      const children = provider.getChildren(category);
+      expect(children).toHaveLength(2);
+      expect(children[0]).toBeInstanceOf(SettingsValueItem);
+      expect(children[0].label).toContain("Trust New Hosts");
+      expect(children[1]).toBeInstanceOf(DataManagementGroupItem);
     });
 
     it("returns 3 children for tunnels category", () => {
@@ -183,6 +193,12 @@ describe("SettingsTreeProvider", () => {
       const children = provider.getChildren(category) as SettingsValueItem[];
       expect(children[0].label).toContain("ON");
       expect(children[2].label).toContain("10 MB");
+    });
+
+    it("uses category descriptions as category tooltips", () => {
+      const item = new SettingsCategoryItem("securityData");
+      expect(item.tooltip).toContain("credentials");
+      expect(item.tooltip).toContain("backups");
     });
   });
 

@@ -4,6 +4,7 @@ import {
   CATEGORY_ORDER,
   CATEGORY_LABELS,
   CATEGORY_ICONS,
+  CATEGORY_DESCRIPTIONS,
   formatSettingValueForTree,
   type SettingMeta
 } from "./settingsMetadata";
@@ -30,7 +31,7 @@ export class SettingsCategoryItem extends vscode.TreeItem {
       title: `Open ${label} Settings`,
       arguments: [categoryKey]
     };
-    this.tooltip = `Click to open ${label} settings`;
+    this.tooltip = CATEGORY_DESCRIPTIONS[categoryKey] ?? `Click to open ${label} settings`;
   }
 }
 
@@ -169,15 +170,12 @@ export class SettingsTreeProvider
       new SettingsLinkItem("Auth Profiles", "nexus.authProfile.manage", "key", "Create and manage reusable credential templates")
     );
 
-    // 1 data management group
-    items.push(new DataManagementGroupItem());
-
     return items;
   }
 
-  private getCategoryChildren(categoryKey: string): SettingsValueItem[] {
+  private getCategoryChildren(categoryKey: string): SettingsTreeItem[] {
     const metas = SETTINGS_META.filter((m) => m.category === categoryKey);
-    const items: SettingsValueItem[] = [];
+    const items: SettingsTreeItem[] = [];
 
     for (const meta of metas) {
       // Apply visibleWhen filtering
@@ -196,6 +194,9 @@ export class SettingsTreeProvider
       const rawValue = config.get(meta.key);
       const formatted = formatSettingValueForTree(meta, rawValue);
       items.push(new SettingsValueItem(meta, categoryKey, formatted));
+    }
+    if (categoryKey === "securityData") {
+      items.push(new DataManagementGroupItem());
     }
     return items;
   }
