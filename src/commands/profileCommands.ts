@@ -67,11 +67,6 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
 }
 
 export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[] {
-  const showPlaceholderDiagnostics = (kind: "server" | "serial") => {
-    const label = kind === "server" ? "SSH diagnostics" : "Serial diagnostics";
-    void vscode.window.showInformationMessage(`${label} are not implemented yet.`);
-  };
-
   const showProfileActions = async (arg?: unknown): Promise<void> => {
     if (arg instanceof ServerTreeItem) {
       const picks: ProfileActionPick[] = [
@@ -117,11 +112,6 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
     }),
 
     vscode.commands.registerCommand("nexus.profile.actions", showProfileActions),
-
-    // Temporary Chunk 1 placeholders; Chunk 2 owns replacing these diagnostics commands.
-    vscode.commands.registerCommand("nexus.server.testConnection", () => showPlaceholderDiagnostics("server")),
-
-    vscode.commands.registerCommand("nexus.serial.testConnection", () => showPlaceholderDiagnostics("serial")),
 
     vscode.commands.registerCommand("nexus.group.add", async (arg?: unknown) => {
       const parentPath = arg instanceof FolderTreeItem ? arg.folderPath : undefined;

@@ -272,6 +272,105 @@ describe("registerSerialCommands port collision", () => {
   });
 });
 
+describe("serial test connection command", () => {
+  const profile = {
+    id: "sp1",
+    name: "USB Console",
+    path: "COM3",
+    baudRate: 115200,
+    dataBits: 8,
+    stopBits: 1,
+    parity: "none",
+    rtscts: false,
+    mode: "standard"
+  };
+
+  function makeTestCtx(overrides: { profiles?: any[]; ports?: any[] } = {}) {
+    const profiles = overrides.profiles ?? [profile];
+    return {
+      core: {
+        getSerialProfile: vi.fn((id: string) => profiles.find((p) => p.id === id)),
+        getSnapshot: vi.fn(() => ({
+          servers: [],
+          tunnels: [],
+          serialProfiles: profiles,
+          activeSessions: [],
+          activeSerialSessions: [],
+          activeTunnels: [],
+          remoteTunnels: [],
+          explicitGroups: [],
+          authProfiles: [],
+          activitySessionIds: new Set(),
+          focusedSessionId: undefined
+        }))
+      },
+      serialSidecar: {
+        listPorts: vi.fn(async () => overrides.ports ?? [])
+      },
+      loggerFactory: { create: vi.fn() } as any,
+      macroAutoTrigger: { createObserver: vi.fn() } as any,
+      sessionLogDir: "",
+      serialTerminals: new Map(),
+      highlighter: {} as any,
+      focusedTerminal: undefined,
+      activityIndicators: new Map()
+    } as any;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it("reports success when the configured serial path is present", async () => {
+    const ctx = makeTestCtx({ ports: [{ path: "COM3", manufacturer: "Acme" }] });
+
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.testConnection")!("sp1");
+
+    expect(ctx.serialSidecar.listPorts).toHaveBeenCalledTimes(1);
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
+      "Connection test succeeded for USB Console: COM3 is available."
+    );
+  });
+
+  it("warns when the configured serial path is missing", async () => {
+    const ctx = makeTestCtx({ ports: [{ path: "COM4", manufacturer: "Acme" }] });
+
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.testConnection")!("sp1");
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      "Serial port COM3 is not available. Scan Serial Ports or check the cable and OS permissions.",
+      "Scan Serial Ports"
+    );
+  });
+
+  it("reports saved-path status for smart-follow profiles without claiming a missing hardware hint matched", async () => {
+    const ctx = makeTestCtx({
+      profiles: [{ ...profile, mode: "smartFollow" }],
+      ports: [{ path: "COM3", manufacturer: "Acme" }]
+    });
+
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.testConnection")!("sp1");
+
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
+      "Smart Follow test for USB Console: saved path COM3 is available. No hardware hint is saved yet."
+    );
+  });
+
+  it("shows a warning and does not scan ports when no serial profiles exist", async () => {
+    const ctx = makeTestCtx({ profiles: [], ports: [{ path: "COM3" }] });
+
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.testConnection")!();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("No Nexus serial profiles configured");
+    expect(ctx.serialSidecar.listPorts).not.toHaveBeenCalled();
+  });
+});
+
 describe("serial terminal tab visual differentiation", () => {
   const baseProfile = {
     id: "sp1",
