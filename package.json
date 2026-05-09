@@ -491,7 +491,7 @@
       },
       {
         "command": "nexus.macro.copyAllAsJson",
-        "title": "Nexus: Copy All Macros as JSON",
+        "title": "Copy All Macros as JSON",
         "category": "Nexus"
       },
       {
