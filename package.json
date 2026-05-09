@@ -98,11 +98,11 @@
       },
       {
         "view": "nexusMacros",
-        "contents": "No macros defined.\n[Add Macro](command:nexus.macro.add)\nMacros send predefined text to the active terminal."
+        "contents": "No macros defined.\n[Add Macro](command:nexus.macro.add)\n[Add From Template](command:nexus.macro.addFromTemplate)\nMacros send predefined text to the active terminal."
       },
       {
         "view": "nexusScripts",
-        "contents": "Nexus scripts automate SSH and Serial sessions with expect/send style.\n[New Script](command:nexus.script.new)\n[Open scripting guide](command:nexus.script.openDocs)\n[Open script examples](command:nexus.script.openExamples)"
+        "contents": "Nexus script templates include basic commands, prompt waits, output capture, and backup running config.\n[New Script](command:nexus.script.new)\n[Open scripting guide](command:nexus.script.openDocs)\n[Open script examples](command:nexus.script.openExamples)"
       },
       {
         "view": "nexusSettings",
@@ -421,6 +421,12 @@
         "title": "Add Macro",
         "category": "Nexus",
         "icon": "$(add)"
+      },
+      {
+        "command": "nexus.macro.addFromTemplate",
+        "title": "Add Macro From Template",
+        "category": "Nexus",
+        "icon": "$(new-file)"
       },
       {
         "command": "nexus.macro.edit",
@@ -1409,6 +1415,10 @@
         },
         {
           "command": "nexus.macro.add",
+          "when": "true"
+        },
+        {
+          "command": "nexus.macro.addFromTemplate",
           "when": "true"
         },
         {

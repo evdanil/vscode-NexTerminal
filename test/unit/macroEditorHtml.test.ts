@@ -21,6 +21,15 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("Create");
   });
 
+  it("renders an empty state with add and template actions when there are no macros", () => {
+    const html = render([], null);
+    expect(html).toContain("No macros yet");
+    expect(html).toContain("empty-add-btn");
+    expect(html).toContain("empty-template-btn");
+    expect(html).toContain("Add From Template");
+    expect(html).toContain('type: "addFromTemplate"');
+  });
+
   it("renders macro selector with all macros", () => {
     const macros: TerminalMacro[] = [
       { name: "Hello", text: "echo hello" },

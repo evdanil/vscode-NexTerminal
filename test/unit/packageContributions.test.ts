@@ -86,6 +86,11 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.macro.editor");
   });
 
+  it("contributes macro.addFromTemplate command", () => {
+    const commands = packageJson.contributes.commands.map((item) => item.command);
+    expect(commands).toContain("nexus.macro.addFromTemplate");
+  });
+
   it("does not gate secret macro paste behind clipboard context state", () => {
     const pasteSecret = packageJson.contributes.commands.find((item) => item.command === "nexus.macro.pasteSecret");
     expect(pasteSecret).toBeDefined();
@@ -151,6 +156,12 @@ describe("package contributions", () => {
     expect(settings).toContain("command:nexus.config.import");
   });
 
+  it("links macro templates from the Macros welcome view", () => {
+    const entry = packageJson.contributes.viewsWelcome?.find((item) => item.view === "nexusMacros");
+    expect(entry?.contents).toContain("command:nexus.macro.add");
+    expect(entry?.contents).toContain("command:nexus.macro.addFromTemplate");
+  });
+
   it("uses explicit folder-server wording for folder connect actions", () => {
     const commands = packageJson.contributes.commands;
     const connect = commands.find((item) => item.command === "nexus.group.connect");
@@ -181,6 +192,8 @@ describe("package contributions", () => {
       expect(entry?.contents).toContain("command:nexus.script.new");
       expect(entry?.contents).toContain("command:nexus.script.openDocs");
       expect(entry?.contents).toContain("command:nexus.script.openExamples");
+      expect(entry?.contents).toMatch(/templates/i);
+      expect(entry?.contents).toMatch(/backup running config/i);
     });
 
     it("contributes a nexus.script.openDocs command", () => {

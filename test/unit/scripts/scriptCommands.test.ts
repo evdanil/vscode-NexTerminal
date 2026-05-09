@@ -5,6 +5,8 @@ const state = {
   writtenFiles: new Map<string, string>(),
   inputBoxValidator: undefined as ((v: string) => string | undefined) | undefined,
   inputBoxReturn: undefined as string | undefined,
+  quickPickOptions: undefined as unknown,
+  quickPickReturn: undefined as unknown,
   warningReturn: undefined as string | undefined,
   mockShowWarningMessage: vi.fn(),
   mockShowInformationMessage: vi.fn(),
@@ -43,7 +45,13 @@ vi.mock("vscode", () => ({
     },
     showOpenDialog: vi.fn(() => Promise.resolve(undefined)),
     showTextDocument: vi.fn(() => Promise.resolve()),
-    showQuickPick: vi.fn(() => Promise.resolve(undefined))
+    showQuickPick: vi.fn((items: unknown) => {
+      state.quickPickOptions = items;
+      if (state.quickPickReturn !== undefined) {
+        return Promise.resolve(state.quickPickReturn);
+      }
+      return Promise.resolve(Array.isArray(items) ? items[0] : undefined);
+    })
   },
   workspace: {
     workspaceFolders: [
@@ -114,6 +122,8 @@ describe("scriptCommands", () => {
     state.writtenFiles.clear();
     state.inputBoxValidator = undefined;
     state.inputBoxReturn = undefined;
+    state.quickPickOptions = undefined;
+    state.quickPickReturn = undefined;
     state.warningReturn = undefined;
     state.mockShowWarningMessage.mockClear();
     state.mockShowInformationMessage.mockClear();
@@ -124,7 +134,21 @@ describe("scriptCommands", () => {
     state.mockFsStatThrows = true;
   });
 
-  describe("F1/F2 — starter template", () => {
+  describe("F1/F2 — starter templates", () => {
+    it("offers script templates before asking for the script name", async () => {
+      state.inputBoxReturn = "my-procedure";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler();
+      const labels = (state.quickPickOptions as Array<{ label: string }>).map((item) => item.label);
+      expect(labels).toEqual([
+        "Basic command",
+        "Wait for prompt then send",
+        "Capture command output",
+        "Backup running config"
+      ]);
+    });
+
     it("writes a starter script that includes @target-type ssh", async () => {
       state.inputBoxReturn = "my-procedure";
       registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
@@ -145,6 +169,37 @@ describe("scriptCommands", () => {
       expect(body!).toMatch(/@allow-macros/);
       expect(body!).toMatch(/try\s*\{/);
       expect(body!).toMatch(/catch\s*\(/);
+    });
+
+    it("writes the selected wait-and-send template content", async () => {
+      state.inputBoxReturn = "wait-send";
+      state.quickPickReturn = { label: "Wait for prompt then send", templateId: "wait-send" };
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler();
+      const body = state.writtenFiles.get("/ws/.nexus/scripts/wait-send.js");
+      expect(body).toBeDefined();
+      expect(body!).toMatch(/@nexus-script/);
+      expect(body!).toMatch(/@name wait-send/);
+      expect(body!).toMatch(/await expect\(\s*\/login:/);
+      expect(body!).toMatch(/await sendLine\("admin"\)/);
+    });
+
+    it("writes capture-output and backup-running-config templates as valid Nexus scripts", async () => {
+      for (const [templateId, scriptName, expected] of [
+        ["capture-output", "capture", /const output = result\.before\.trim\(\)/],
+        ["backup-running-config", "backup", /show running-config/]
+      ] as const) {
+        state.inputBoxReturn = scriptName;
+        state.quickPickReturn = { label: templateId, templateId };
+        registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+        const handler = state.registeredCommands.get("nexus.script.new")!;
+        await handler();
+        const body = state.writtenFiles.get(`/ws/.nexus/scripts/${scriptName}.js`);
+        expect(body).toBeDefined();
+        expect(body!).toMatch(/@nexus-script/);
+        expect(body!).toMatch(expected);
+      }
     });
   });
 
