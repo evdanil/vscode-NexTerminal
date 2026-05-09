@@ -262,12 +262,14 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 - `nexusTunnels`: tunnel profiles and active traffic state.
 - `nexusFileExplorer`: remote file browser for the active connected server.
 - `nexusMacros`: terminal macros with optional custom keyboard shortcuts and auto-trigger state.
+- `nexusScripts`: script files, run state, and script view actions.
 - `nexusSettings`: extension settings sidebar panel.
 
 ### 6.2 Commands
 **Server:**
 - `nexus.server.add`, `nexus.server.edit`, `nexus.server.remove`
-- `nexus.server.connect`, `nexus.server.disconnect`
+- `nexus.server.connect`, `nexus.server.testConnection`, `nexus.server.disconnect`
+- `nexus.server.runWithScript`
 - `nexus.server.copyInfo`, `nexus.server.duplicate`, `nexus.server.rename`
 - `nexus.server.deployKey`
 
@@ -282,12 +284,14 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 
 **Serial:**
 - `nexus.serial.add`, `nexus.serial.edit`, `nexus.serial.remove`
-- `nexus.serial.connect`, `nexus.serial.disconnect`
+- `nexus.serial.connect`, `nexus.serial.testConnection`, `nexus.serial.disconnect`
+- `nexus.serial.runWithScript`
 - `nexus.serial.copyInfo`, `nexus.serial.duplicate`, `nexus.serial.rename`
 - `nexus.serial.listPorts`, `nexus.serial.sendBreak`
 
 **Profile:**
 - `nexus.profile.add` (unified add form)
+- `nexus.profile.actions` (tree-item quick-action picker; hidden from the Command Palette)
 
 **Auth Profile:**
 - `nexus.authProfile.add`, `nexus.authProfile.manage`
@@ -295,7 +299,7 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 
 **Macros:**
 - `nexus.macro.editor`
-- `nexus.macro.add`, `nexus.macro.edit`, `nexus.macro.remove`
+- `nexus.macro.add`, `nexus.macro.addFromTemplate`, `nexus.macro.edit`, `nexus.macro.remove`
 - `nexus.macro.run` (Alt+S quick pick)
 - `nexus.macro.runBinding` (explicit shortcut dispatch)
 - `nexus.macro.runItem` (tree item click/play button)
@@ -303,6 +307,14 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 - `nexus.macro.moveUp`, `nexus.macro.moveDown`
 - `nexus.macro.disableTrigger`, `nexus.macro.enableTrigger`
 - `nexus.macro.copySecret`, `nexus.macro.pasteSecret`
+- `nexus.macro.copyAllAsJson`
+
+**Scripts:**
+- `nexus.script.new` (opens the script template picker before naming the script)
+- `nexus.script.run`, `nexus.script.runQuick`, `nexus.script.stop`
+- `nexus.script.edit`, `nexus.script.delete`
+- `nexus.script.openOutput`, `nexus.script.openDocs`, `nexus.script.openExamples`
+- `nexus.script.openScriptsFolder`, `nexus.script.revealInExplorer`
 
 **Files:**
 - `nexus.files.browse`, `nexus.files.open`
