@@ -54,6 +54,15 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 
 Nexus Terminal is available from both the VS Code Marketplace and Open VSX registries.
 
+### First Use Flow
+
+1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, or `Nexus: Add Serial Profile`.
+2. Select **Connect** on the profile to open an SSH or Serial terminal.
+3. For SSH profiles, open **File Explorer** and run **Browse Files** to choose the connected profile and browse SFTP files.
+4. Open **Port Forwarding**, add a tunnel with `Nexus: Add Tunnel`, assign an SSH server, then select **Start**.
+5. Create repeatable terminal input with `Nexus: Add Macro` or **Add Macro From Template**; create longer automation with `Nexus: New Nexus Script`.
+6. Open **Settings** and use **Encrypted Backup** to save a password-protected backup, or **Export for Sharing** to create a sanitized export without secrets.
+
 ### Install from VS Code Marketplace
 
 1. Open VS Code and go to the Extensions view (`Ctrl+Shift+X`)

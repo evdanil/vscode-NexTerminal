@@ -7,7 +7,7 @@ const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
   dependencies: Record<string, string>;
   configurationDefaults?: Record<string, unknown>;
   contributes: {
-    commands: Array<{ command: string; title: string; enablement?: string; icon?: string }>;
+    commands: Array<{ command: string; title: string; category?: string; enablement?: string; icon?: string }>;
     menus: Record<string, Array<{ command: string; when?: string; group?: string }>>;
     configuration?: { properties?: Record<string, any> };
     viewsWelcome?: Array<{ view: string; contents: string }>;
@@ -89,6 +89,13 @@ describe("package contributions", () => {
   it("contributes macro.addFromTemplate command", () => {
     const commands = packageJson.contributes.commands.map((item) => item.command);
     expect(commands).toContain("nexus.macro.addFromTemplate");
+  });
+
+  it("uses a plain Nexus-category title for macro JSON export", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.macro.copyAllAsJson");
+    expect(command).toBeDefined();
+    expect(command?.title).toBe("Copy All Macros as JSON");
+    expect(command?.category).toBe("Nexus");
   });
 
   it("does not gate secret macro paste behind clipboard context state", () => {
