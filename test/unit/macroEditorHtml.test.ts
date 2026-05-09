@@ -27,7 +27,17 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("empty-add-btn");
     expect(html).toContain("empty-template-btn");
     expect(html).toContain("Add From Template");
-    expect(html).toContain('type: "addFromTemplate"');
+  });
+
+  it("routes empty-state actions through the dirty-discard guard", () => {
+    const html = render([], null);
+    expect(html).toContain("function requestNewMacro()");
+    expect(html).toContain("function requestAddFromTemplate()");
+    expect(html).toContain('type: "confirmSwitch", targetValue: "__new__"');
+    expect(html).toContain('type: "confirmAddFromTemplate"');
+    expect(html).toContain('emptyAddBtn.addEventListener("click", requestNewMacro)');
+    expect(html).toContain('emptyTemplateBtn.addEventListener("click", requestAddFromTemplate)');
+    expect(html).not.toContain('emptyTemplateBtn.addEventListener("click", function()');
   });
 
   it("renders macro selector with all macros", () => {

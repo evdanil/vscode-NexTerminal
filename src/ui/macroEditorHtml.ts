@@ -283,17 +283,29 @@ export function renderMacroEditorHtml(
         document.getElementById("dirty-flag").classList.remove("visible");
       }
 
+      function requestNewMacro() {
+        if (dirty) {
+          vscode.postMessage({ type: "confirmSwitch", targetValue: "__new__" });
+        } else {
+          vscode.postMessage({ type: "selectMacro", value: "__new__" });
+        }
+      }
+
+      function requestAddFromTemplate() {
+        if (dirty) {
+          vscode.postMessage({ type: "confirmAddFromTemplate" });
+        } else {
+          vscode.postMessage({ type: "addFromTemplate" });
+        }
+      }
+
       var emptyAddBtn = document.getElementById("empty-add-btn");
       if (emptyAddBtn) {
-        emptyAddBtn.addEventListener("click", function() {
-          vscode.postMessage({ type: "selectMacro", value: "__new__" });
-        });
+        emptyAddBtn.addEventListener("click", requestNewMacro);
       }
       var emptyTemplateBtn = document.getElementById("empty-template-btn");
       if (emptyTemplateBtn) {
-        emptyTemplateBtn.addEventListener("click", function() {
-          vscode.postMessage({ type: "addFromTemplate" });
-        });
+        emptyTemplateBtn.addEventListener("click", requestAddFromTemplate);
       }
 
       // Track changes
@@ -428,13 +440,7 @@ export function renderMacroEditorHtml(
       });
 
       // New
-      document.getElementById("new-btn").addEventListener("click", function() {
-        if (dirty) {
-          vscode.postMessage({ type: "confirmSwitch", targetValue: "__new__" });
-        } else {
-          vscode.postMessage({ type: "selectMacro", value: "__new__" });
-        }
-      });
+      document.getElementById("new-btn").addEventListener("click", requestNewMacro);
 
       // Messages from host
       window.addEventListener("message", function(event) {
