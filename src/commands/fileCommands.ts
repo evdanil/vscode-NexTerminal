@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
-import type { SftpService } from "../services/sftp/sftpService";
+import type { DirectoryEntry, SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
 import { ServerTreeItem } from "../ui/nexusTreeProvider";
 import { FileTreeItem } from "../ui/fileExplorerTreeProvider";
@@ -10,6 +10,7 @@ import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
 import type { CommandContext } from "./types";
 
 const MAX_DOWNLOAD_DEPTH = 100;
+const SSH_FX_NO_SUCH_FILE = 2;
 
 function validateFilename(value: string): string | undefined {
   if (!value) {
@@ -183,12 +184,31 @@ async function tryLocalStat(uri: vscode.Uri): Promise<vscode.FileStat | undefine
   }
 }
 
+function isStrictMissingPathError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as { code?: number | string };
+  return (
+    candidate.code === SSH_FX_NO_SUCH_FILE ||
+    candidate.code === "2" ||
+    candidate.code === "ENOENT"
+  );
+}
+
 async function tryRemoteDestinationStat(
   sftp: SftpService,
   serverId: string,
   remotePath: string
-): Promise<Awaited<ReturnType<SftpService["tryStat"]>>> {
-  return sftp.tryStat(serverId, remotePath);
+): Promise<DirectoryEntry | undefined> {
+  try {
+    return await sftp.stat(serverId, remotePath);
+  } catch (error) {
+    if (isStrictMissingPathError(error)) {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 async function downloadItemToLocal(
@@ -220,7 +240,14 @@ async function downloadItemToLocal(
     }
     // If overwriting and types differ, remove the existing entry first
     if (isDirectory !== ((existing.type & vscode.FileType.Directory) !== 0)) {
-      await vscode.workspace.fs.delete(localUri, { recursive: true, useTrash: false });
+      try {
+        await vscode.workspace.fs.delete(localUri, { recursive: true, useTrash: false });
+      } catch (error) {
+        summary.failed += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(`Failed to prepare local target "${path.basename(localUri.fsPath)}": ${message}`);
+        return;
+      }
     }
   }
 
@@ -253,7 +280,14 @@ async function downloadDirectoryToLocal(
     return;
   }
 
-  await vscode.workspace.fs.createDirectory(localDir);
+  try {
+    await vscode.workspace.fs.createDirectory(localDir);
+  } catch (error) {
+    summary.failed += 1;
+    const message = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(`Failed to create local directory "${path.basename(localDir.fsPath)}": ${message}`);
+    return;
+  }
 
   let entries;
   try {
@@ -528,10 +562,16 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
           progress.report({ message: item.entry.name });
 
           const destinationUri = vscode.Uri.joinPath(destRoot, item.entry.name);
-          await downloadItemToLocal(
-            ctx.sftpService, item.serverId, remotePath, item.entry.isDirectory,
-            destinationUri, conflictState, summary
-          );
+          try {
+            await downloadItemToLocal(
+              ctx.sftpService, item.serverId, remotePath, item.entry.isDirectory,
+              destinationUri, conflictState, summary
+            );
+          } catch (error) {
+            summary.failed += 1;
+            const message = error instanceof Error ? error.message : String(error);
+            void vscode.window.showErrorMessage(`Failed to download "${item.entry.name}": ${message}`);
+          }
         }
       }
     );
