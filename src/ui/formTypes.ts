@@ -5,16 +5,22 @@ export interface VisibleWhenCondition {
 
 export type VisibleWhen = VisibleWhenCondition | VisibleWhenCondition[];
 
+interface FormFieldCommon {
+  advanced?: boolean;
+  hint?: string;
+  visibleWhen?: VisibleWhen;
+}
+
 export type FormFieldDescriptor =
-  | { type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean; hint?: string; visibleWhen?: VisibleWhen }
-  | { type: "password"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; hint?: string; visibleWhen?: VisibleWhen }
-  | { type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; placeholder?: string; value?: number; hint?: string; visibleWhen?: VisibleWhen }
-  | { type: "select"; key: string; label: string; options: { label: string; value: string }[]; value?: string; hint?: string; visibleWhen?: VisibleWhen; autofill?: boolean }
-  | { type: "combobox"; key: string; label: string; suggestions: string[]; placeholder?: string; value?: string; hint?: string; visibleWhen?: VisibleWhen }
-  | { type: "checkbox"; key: string; label: string; value?: boolean; hint?: string; visibleWhen?: VisibleWhen }
-  | { type: "file"; key: string; label: string; value?: string; hint?: string; visibleWhen?: VisibleWhen }
+  | ({ type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean } & FormFieldCommon)
+  | ({ type: "password"; key: string; label: string; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
+  | ({ type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; placeholder?: string; value?: number } & FormFieldCommon)
+  | ({ type: "select"; key: string; label: string; options: { label: string; value: string }[]; value?: string; autofill?: boolean } & FormFieldCommon)
+  | ({ type: "combobox"; key: string; label: string; suggestions: string[]; placeholder?: string; value?: string } & FormFieldCommon)
+  | ({ type: "checkbox"; key: string; label: string; value?: boolean } & FormFieldCommon)
+  | ({ type: "file"; key: string; label: string; value?: string } & FormFieldCommon)
   /** Raw HTML injected without escaping. `content` must only contain trusted, developer-authored markup — never user-controlled data. */
-  | { type: "html"; content: string; visibleWhen?: VisibleWhen };
+  | ({ type: "html"; content: string } & FormFieldCommon);
 
 export interface FormDefinition {
   title: string;

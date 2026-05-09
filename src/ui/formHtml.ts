@@ -36,7 +36,7 @@ function renderField(field: FormFieldDescriptor): string {
   <div class="file-input-row">
     <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
     <button type="button" class="scan-btn" data-key="${key}">Scan</button>
-  </div>
+  </div>${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
       }
@@ -78,7 +78,7 @@ function renderField(field: FormFieldDescriptor): string {
     <div class="custom-select-dropdown">
       ${optionsHtml}
     </div>
-  </div>
+  </div>${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
     }
@@ -94,7 +94,7 @@ function renderField(field: FormFieldDescriptor): string {
     <div class="custom-select-dropdown">
       ${suggestionsHtml}
     </div>
-  </div>
+  </div>${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
     }
@@ -104,7 +104,7 @@ function renderField(field: FormFieldDescriptor): string {
   <label>
     <input type="checkbox" id="${id}" name="${key}"${field.value ? " checked" : ""} />
     ${escapeHtml(field.label)}
-  </label>
+  </label>${renderHint(field)}
 </div>`;
 
     case "file":
@@ -114,14 +114,23 @@ function renderField(field: FormFieldDescriptor): string {
     <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" readonly />
     <button type="button" class="browse-btn" data-key="${key}">Browse</button>
     <button type="button" class="clear-btn" data-key="${key}" title="Clear">✕</button>
-  </div>
+  </div>${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
   }
 }
 
 export function renderFormHtml(definition: FormDefinition, nonce?: string): string {
-  const fieldsHtml = definition.fields.map(renderField).join("\n");
+  const basicFields = definition.fields.filter((field) => !field.advanced);
+  const advancedFields = definition.fields.filter((field) => field.advanced);
+  const basicFieldsHtml = basicFields.map(renderField).join("\n");
+  const advancedFieldsHtml = advancedFields.length > 0
+    ? `<details class="advanced-fields">
+      <summary>Advanced options</summary>
+      ${advancedFields.map(renderField).join("\n      ")}
+    </details>`
+    : "";
+  const fieldsHtml = [basicFieldsHtml, advancedFieldsHtml].filter(Boolean).join("\n");
   const csp = nonce
     ? `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />`
     : "";
@@ -136,6 +145,23 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
   <style${nonceAttr}>
     ${baseWebviewCss()}
     body { max-width: 700px; }
+    .advanced-fields {
+      margin: 6px 0 18px;
+      padding: 10px 12px 2px;
+      border: 1px solid var(--vscode-panel-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
+      border-radius: 4px;
+      background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+    }
+    .advanced-fields summary {
+      cursor: pointer;
+      color: var(--vscode-foreground);
+      font-weight: 600;
+      font-size: 12px;
+      margin-bottom: 10px;
+    }
+    .advanced-fields .form-group {
+      margin-bottom: 14px;
+    }
   </style>
 </head>
 <body>

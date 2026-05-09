@@ -16,7 +16,8 @@ function authProfileSelectField(authProfiles?: AuthProfile[], vw?: VisibleWhen, 
     label: "Auth Profile",
     options,
     value: selectedId ?? "",
-    hint: "Link server credentials to a saved auth profile",
+    hint: "Reuse saved SSH credentials instead of entering them here.",
+    advanced: true,
     autofill: true,
     visibleWhen: vw
   };
@@ -24,7 +25,7 @@ function authProfileSelectField(authProfiles?: AuthProfile[], vw?: VisibleWhen, 
 
 function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDescriptor[] {
   return [
-    { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host, visibleWhen: vw },
+    { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host, hint: "Hostname or IP address of the SSH server.", visibleWhen: vw },
     { type: "number", key: "port", label: "Port", required: true, min: 1, max: 65535, value: seed?.port ?? 22, visibleWhen: vw },
     { type: "text", key: "username", label: "Username", required: true, placeholder: "root", value: seed?.username, visibleWhen: vw },
     {
@@ -37,11 +38,12 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDes
         { label: "SSH Agent", value: "agent" }
       ],
       value: seed?.authType ?? "password",
+      hint: "Choose how Nexus should authenticate to this server.",
       visibleWhen: vw
     },
-    { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, visibleWhen: vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "authType", value: "key" }] : { field: "authType", value: "key" } },
-    { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, hint: "Overrides the global multiplexing setting for this server", visibleWhen: vw },
-    { type: "checkbox", key: "legacyAlgorithms", label: "Enable legacy SSH algorithms", value: seed?.legacyAlgorithms ?? false, hint: "Append older key exchange, cipher, and MAC algorithms for connecting to legacy devices (e.g. Cisco IOS, embedded systems)", visibleWhen: vw }
+    { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, hint: "Private key used when Authentication is Private Key.", visibleWhen: vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "authType", value: "key" }] : { field: "authType", value: "key" } },
+    { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, hint: "Overrides the global multiplexing setting for this server.", advanced: true, visibleWhen: vw },
+    { type: "checkbox", key: "legacyAlgorithms", label: "Enable legacy SSH algorithms", value: seed?.legacyAlgorithms ?? false, hint: "Use only for older devices that reject modern SSH algorithms.", advanced: true, visibleWhen: vw }
   ];
 }
 
@@ -70,7 +72,7 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
       ].join(""),
       visibleWhen: smartFollowVw
     },
-    { type: "text", key: "path", label: "Port Path", required: true, placeholder: "COM3 or /dev/ttyUSB0", value: seed?.path, scannable: true, visibleWhen: vw },
+    { type: "text", key: "path", label: "Port Path", required: true, placeholder: "COM3 or /dev/ttyUSB0", value: seed?.path, scannable: true, hint: "Serial device path such as COM3 or /dev/ttyUSB0.", visibleWhen: vw },
     {
       type: "select",
       key: "baudRate",
@@ -86,6 +88,7 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
         { label: "921600", value: "921600" }
       ],
       value: `${seed?.baudRate ?? 115200}`,
+      hint: "Serial speed; 115200 is common for development boards.",
       visibleWhen: vw
     },
     {
@@ -99,6 +102,7 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
         { label: "5", value: "5" }
       ],
       value: `${seed?.dataBits ?? 8}`,
+      advanced: true,
       visibleWhen: vw
     },
     {
@@ -110,6 +114,7 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
         { label: "2", value: "2" }
       ],
       value: `${seed?.stopBits ?? 1}`,
+      advanced: true,
       visibleWhen: vw
     },
     {
@@ -124,9 +129,10 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
         { label: "Space", value: "space" }
       ],
       value: seed?.parity ?? "none",
+      advanced: true,
       visibleWhen: vw
     },
-    { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", value: seed?.rtscts ?? false, visibleWhen: vw }
+    { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", value: seed?.rtscts ?? false, advanced: true, visibleWhen: vw }
   ];
 }
 
@@ -136,14 +142,16 @@ function sharedTrailingFields(
   defaultLogSession = true
 ): FormFieldDescriptor[] {
   return [
-    { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.logSession ?? defaultLogSession },
+    { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.logSession ?? defaultLogSession, advanced: true },
     {
       type: "combobox",
       key: "group",
       label: "Folder",
       suggestions: existingGroups ?? [],
       placeholder: "Type a folder path or pick existing...",
-      value: seed?.group ?? ""
+      value: seed?.group ?? "",
+      hint: "Optional sidebar folder for organizing profiles.",
+      advanced: true
     }
   ];
 }
@@ -200,6 +208,8 @@ function proxyFields(
         { label: "HTTP CONNECT Proxy", value: "http" }
       ],
       value: proxyType,
+      hint: "Route SSH through a jump host, SOCKS5 proxy, or HTTP CONNECT proxy.",
+      advanced: true,
       visibleWhen: vw
     },
     // SSH Jump Host fields
@@ -209,18 +219,19 @@ function proxyFields(
       label: "Jump Host Server",
       options: serverOptions,
       value: jumpHostId,
+      advanced: true,
       visibleWhen: compoundVw(sshJumpVw)
     },
     // SOCKS5 fields
-    { type: "text", key: "proxySocks5Host", label: "SOCKS5 Proxy Host", required: true, placeholder: "proxy.example.com", value: socks5Host, visibleWhen: compoundVw(socks5Vw) },
-    { type: "number", key: "proxySocks5Port", label: "SOCKS5 Proxy Port", required: true, min: 1, max: 65535, value: socks5Port, visibleWhen: compoundVw(socks5Vw) },
-    { type: "text", key: "proxySocks5Username", label: "SOCKS5 Username", placeholder: "Optional", value: socks5Username, visibleWhen: compoundVw(socks5Vw) },
-    { type: "password", key: "proxySocks5Password", label: "SOCKS5 Password", placeholder: "Leave blank to keep existing", visibleWhen: compoundVw(socks5Vw) },
+    { type: "text", key: "proxySocks5Host", label: "SOCKS5 Proxy Host", required: true, placeholder: "proxy.example.com", value: socks5Host, advanced: true, visibleWhen: compoundVw(socks5Vw) },
+    { type: "number", key: "proxySocks5Port", label: "SOCKS5 Proxy Port", required: true, min: 1, max: 65535, value: socks5Port, advanced: true, visibleWhen: compoundVw(socks5Vw) },
+    { type: "text", key: "proxySocks5Username", label: "SOCKS5 Username", placeholder: "Optional", value: socks5Username, advanced: true, visibleWhen: compoundVw(socks5Vw) },
+    { type: "password", key: "proxySocks5Password", label: "SOCKS5 Password", placeholder: "Leave blank to keep existing", advanced: true, visibleWhen: compoundVw(socks5Vw) },
     // HTTP CONNECT fields
-    { type: "text", key: "proxyHttpHost", label: "HTTP Proxy Host", required: true, placeholder: "proxy.example.com", value: httpHost, visibleWhen: compoundVw(httpVw) },
-    { type: "number", key: "proxyHttpPort", label: "HTTP Proxy Port", required: true, min: 1, max: 65535, value: httpPort, visibleWhen: compoundVw(httpVw) },
-    { type: "text", key: "proxyHttpUsername", label: "HTTP Proxy Username", placeholder: "Optional", value: httpUsername, visibleWhen: compoundVw(httpVw) },
-    { type: "password", key: "proxyHttpPassword", label: "HTTP Proxy Password", placeholder: "Leave blank to keep existing", visibleWhen: compoundVw(httpVw) }
+    { type: "text", key: "proxyHttpHost", label: "HTTP Proxy Host", required: true, placeholder: "proxy.example.com", value: httpHost, advanced: true, visibleWhen: compoundVw(httpVw) },
+    { type: "number", key: "proxyHttpPort", label: "HTTP Proxy Port", required: true, min: 1, max: 65535, value: httpPort, advanced: true, visibleWhen: compoundVw(httpVw) },
+    { type: "text", key: "proxyHttpUsername", label: "HTTP Proxy Username", placeholder: "Optional", value: httpUsername, advanced: true, visibleWhen: compoundVw(httpVw) },
+    { type: "password", key: "proxyHttpPassword", label: "HTTP Proxy Password", placeholder: "Leave blank to keep existing", advanced: true, visibleWhen: compoundVw(httpVw) }
   ];
 }
 

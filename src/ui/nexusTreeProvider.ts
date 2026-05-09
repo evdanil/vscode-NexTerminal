@@ -57,6 +57,11 @@ export class ServerTreeItem extends vscode.TreeItem {
       connected ? "plug" : "debug-disconnect",
       new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
     );
+    this.command = {
+      command: "nexus.profile.actions",
+      title: "Profile Actions",
+      arguments: [this]
+    };
   }
 }
 
@@ -101,6 +106,11 @@ export class SerialProfileTreeItem extends vscode.TreeItem {
       smartFollow ? "sync" : connected ? "plug" : "debug-disconnect",
       new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
     );
+    this.command = {
+      command: "nexus.profile.actions",
+      title: "Profile Actions",
+      arguments: [this]
+    };
   }
 }
 
