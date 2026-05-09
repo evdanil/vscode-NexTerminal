@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { serialFormDefinition, serverFormDefinition, unifiedProfileFormDefinition } from "../../src/ui/formDefinitions";
+import {
+  serialFormDefinition,
+  serverFormDefinition,
+  unifiedProfileFormDefinition,
+  unifiedProfileFormId
+} from "../../src/ui/formDefinitions";
 import type { FormDefinition, FormFieldDescriptor } from "../../src/ui/formTypes";
 
 function keyedField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { key: string }> {
@@ -136,5 +141,26 @@ describe("formDefinitions keyPath visibility", () => {
       expect(keyedField(definition, key).hint, key).toBeTruthy();
     }
     expect(keyedField(serialDefinition, "path").hint).toBeTruthy();
+  });
+
+  it("uses distinct add form metadata for generic, SSH, and serial entry points", () => {
+    const generic = unifiedProfileFormDefinition();
+    const ssh = unifiedProfileFormDefinition({ addMode: "ssh" });
+    const serial = unifiedProfileFormDefinition({ addMode: "serial" });
+
+    expect(generic.title).toBe("Add Profile");
+    expect(ssh.title).toBe("Add SSH Server");
+    expect(serial.title).toBe("Add Serial Profile");
+    expect(unifiedProfileFormId()).toBe("profile-add");
+    expect(unifiedProfileFormId({ addMode: "ssh" })).toBe("server-add");
+    expect(unifiedProfileFormId({ addMode: "serial" })).toBe("serial-add");
+  });
+
+  it("locks the profile type selector for explicit SSH and serial add forms", () => {
+    const ssh = unifiedProfileFormDefinition({ addMode: "ssh" });
+    const serial = unifiedProfileFormDefinition({ addMode: "serial" });
+
+    expect(keyedField(ssh, "profileType")).toEqual(expect.objectContaining({ type: "hidden", value: "ssh" }));
+    expect(keyedField(serial, "profileType")).toEqual(expect.objectContaining({ type: "hidden", value: "serial" }));
   });
 });

@@ -613,7 +613,7 @@ async function testSerialConnection(ctx: CommandContext, arg?: unknown): Promise
 export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.serial.add", () => {
-      void vscode.commands.executeCommand("nexus.profile.add");
+      void vscode.commands.executeCommand("nexus.profile.add", { addMode: "serial", profileType: "serial" });
     }),
 
     vscode.commands.registerCommand("nexus.serial.edit", async (arg?: unknown) => {

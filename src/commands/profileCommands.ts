@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { UnifiedProfileSeed } from "../ui/formDefinitions";
-import { unifiedProfileFormDefinition } from "../ui/formDefinitions";
+import { unifiedProfileFormDefinition, unifiedProfileFormId } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -21,6 +21,19 @@ interface ProfileActionPick extends vscode.QuickPickItem {
   command: string;
 }
 
+function isUnifiedProfileSeed(arg: unknown): arg is UnifiedProfileSeed {
+  if (!arg || typeof arg !== "object") {
+    return false;
+  }
+  const candidate = arg as Partial<UnifiedProfileSeed>;
+  return candidate.profileType === "ssh" ||
+    candidate.profileType === "serial" ||
+    candidate.addMode === "profile" ||
+    candidate.addMode === "ssh" ||
+    candidate.addMode === "serial" ||
+    typeof candidate.group === "string";
+}
+
 export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed): void {
   const existingGroups = collectGroups(ctx);
   const defaultLogSession = vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
@@ -28,7 +41,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
   const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles);
   const inlineAuthProfile = createInlineAuthProfileCreation(ctx);
-  const panel = WebviewFormPanel.open("profile-add", definition, {
+  const panel = WebviewFormPanel.open(unifiedProfileFormId(seed), definition, {
     onSubmit: async (values: FormValues) => {
       if (normalizeOptionalFolderPath(values.group) === null) {
         throw new Error(INVALID_FOLDER_PATH_MESSAGE);
@@ -107,8 +120,11 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
 
   return [
     vscode.commands.registerCommand("nexus.profile.add", (arg?: unknown) => {
-      const group = arg instanceof FolderTreeItem ? arg.folderPath : undefined;
-      openUnifiedForm(ctx, { profileType: "ssh", group });
+      if (arg instanceof FolderTreeItem) {
+        openUnifiedForm(ctx, { group: arg.folderPath });
+        return;
+      }
+      openUnifiedForm(ctx, isUnifiedProfileSeed(arg) ? arg : undefined);
     }),
 
     vscode.commands.registerCommand("nexus.profile.actions", showProfileActions),

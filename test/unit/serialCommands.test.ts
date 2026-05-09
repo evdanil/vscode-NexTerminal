@@ -133,6 +133,30 @@ describe("registerSerialCommands port collision", () => {
     registeredCommands.clear();
   });
 
+  it("routes Add Serial Profile to a dedicated serial add form", async () => {
+    const ctx = {
+      core: { getSnapshot: vi.fn(() => ({ serialProfiles: [], servers: [], explicitGroups: [] })) },
+      serialSidecar: {} as any,
+      loggerFactory: { create: vi.fn() } as any,
+      macroAutoTrigger: { createObserver: vi.fn() } as any,
+      sessionLogDir: "",
+      serialTerminals: new Map(),
+      highlighter: {} as any,
+      activityIndicators: new Map()
+    } as any;
+
+    registerSerialCommands(ctx);
+    const addCmd = registeredCommands.get("nexus.serial.add");
+    expect(addCmd).toBeDefined();
+
+    await addCmd!();
+
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.profile.add", {
+      addMode: "serial",
+      profileType: "serial"
+    });
+  });
+
   it("blocks a new serial session when the target port is already held by another session", async () => {
     const profile = {
       id: "sp1",

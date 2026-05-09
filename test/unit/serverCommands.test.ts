@@ -253,6 +253,21 @@ describe("server disconnect with tunnel autoStop", () => {
     registeredCommands.clear();
   });
 
+  it("routes Add SSH Server to a dedicated SSH add form", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+
+    registerServerCommands(ctx);
+    const addCmd = registeredCommands.get("nexus.server.add");
+    expect(addCmd).toBeDefined();
+
+    await addCmd!();
+
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.profile.add", {
+      addMode: "ssh",
+      profileType: "ssh"
+    });
+  });
+
   it("keeps pool connection when autoStop=false tunnel remains active", async () => {
     const autoStopProfile = makeTunnel({ id: "tp-stop", autoStop: true });
     const keepProfile = makeTunnel({ id: "tp-keep", autoStop: false });

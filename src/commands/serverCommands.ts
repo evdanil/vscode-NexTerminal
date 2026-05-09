@@ -817,7 +817,7 @@ async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<voi
 export function registerServerCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.server.add", () => {
-      void vscode.commands.executeCommand("nexus.profile.add");
+      void vscode.commands.executeCommand("nexus.profile.add", { addMode: "ssh", profileType: "ssh" });
     }),
 
     vscode.commands.registerCommand("nexus.server.edit", async (arg?: unknown) => {

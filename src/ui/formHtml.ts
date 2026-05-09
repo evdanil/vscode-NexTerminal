@@ -29,6 +29,9 @@ function renderField(field: FormFieldDescriptor): string {
   const vw = visibleWhenAttrs(field);
 
   switch (field.type) {
+    case "hidden":
+      return `<input type="hidden" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" />`;
+
     case "text":
       if (field.scannable) {
         return `<div class="form-group"${vw}>

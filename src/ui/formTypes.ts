@@ -12,6 +12,7 @@ interface FormFieldCommon {
 }
 
 export type FormFieldDescriptor =
+  | ({ type: "hidden"; key: string; value?: string } & FormFieldCommon)
   | ({ type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean } & FormFieldCommon)
   | ({ type: "password"; key: string; label: string; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; placeholder?: string; value?: number } & FormFieldCommon)

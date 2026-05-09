@@ -356,9 +356,62 @@ export function serialFormDefinition(
   };
 }
 
+export type UnifiedProfileAddMode = "profile" | "ssh" | "serial";
+
 export interface UnifiedProfileSeed {
   profileType?: "ssh" | "serial";
   group?: string;
+  addMode?: UnifiedProfileAddMode;
+}
+
+function normalizedUnifiedProfileMode(seed?: UnifiedProfileSeed): UnifiedProfileAddMode {
+  return seed?.addMode ?? "profile";
+}
+
+export function unifiedProfileFormId(seed?: UnifiedProfileSeed): string {
+  switch (normalizedUnifiedProfileMode(seed)) {
+    case "ssh":
+      return "server-add";
+    case "serial":
+      return "serial-add";
+    case "profile":
+      return "profile-add";
+  }
+}
+
+function unifiedProfileFormTitle(seed?: UnifiedProfileSeed): string {
+  switch (normalizedUnifiedProfileMode(seed)) {
+    case "ssh":
+      return "Add SSH Server";
+    case "serial":
+      return "Add Serial Profile";
+    case "profile":
+      return "Add Profile";
+  }
+}
+
+function unifiedProfileTypeValue(seed?: UnifiedProfileSeed): "ssh" | "serial" {
+  if (seed?.profileType) {
+    return seed.profileType;
+  }
+  return normalizedUnifiedProfileMode(seed) === "serial" ? "serial" : "ssh";
+}
+
+function unifiedProfileTypeField(seed?: UnifiedProfileSeed): FormFieldDescriptor {
+  const value = unifiedProfileTypeValue(seed);
+  if (normalizedUnifiedProfileMode(seed) !== "profile") {
+    return { type: "hidden", key: "profileType", value };
+  }
+  return {
+    type: "select",
+    key: "profileType",
+    label: "Profile Type",
+    options: [
+      { label: "SSH Server", value: "ssh" },
+      { label: "Serial Port", value: "serial" }
+    ],
+    value
+  };
 }
 
 export function unifiedProfileFormDefinition(
@@ -372,18 +425,9 @@ export function unifiedProfileFormDefinition(
   const serialVw: VisibleWhenCondition = { field: "profileType", value: "serial" };
 
   return {
-    title: "Add Profile",
+    title: unifiedProfileFormTitle(seed),
     fields: [
-      {
-        type: "select",
-        key: "profileType",
-        label: "Profile Type",
-        options: [
-          { label: "SSH Server", value: "ssh" },
-          { label: "Serial Port", value: "serial" }
-        ],
-        value: seed?.profileType ?? "ssh"
-      },
+      unifiedProfileTypeField(seed),
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server or Arduino" },
       authProfileSelectField(authProfiles, sshVw),
       ...sshFields(undefined, sshVw),
