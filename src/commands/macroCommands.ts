@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { MacroTreeItem } from "../ui/macroTreeProvider";
 import { MacroEditorPanel } from "../ui/macroEditorPanel";
 import type { MacroProfileOptionInput } from "../ui/macroProfileOptions";
+import type { TerminalMacro } from "../models/terminalMacro";
 import {
   bindingToContextKey,
   bindingToDisplayLabel,
@@ -20,8 +21,99 @@ import {
   normalizeBinding
 } from "../macroBindingHelpers";
 
+type MacroTemplate = {
+  id: string;
+  label: string;
+  description: string;
+  macro: TerminalMacro;
+};
+
+export const MACRO_TEMPLATES: MacroTemplate[] = [
+  {
+    id: "send-command",
+    label: "Send command",
+    description: "Send a common command to the active terminal.",
+    macro: {
+      name: "Show version",
+      text: "show version\n"
+    }
+  },
+  {
+    id: "password",
+    label: "Send password when prompted",
+    description: "Create a secret prompt macro without storing a sample password.",
+    macro: {
+      name: "Password prompt",
+      text: "",
+      secret: true,
+      triggerPattern: "[Pp]assword:\\s*$",
+      triggerScope: "active-session"
+    }
+  },
+  {
+    id: "confirm",
+    label: "Wait and send confirmation",
+    description: "Send yes when a confirmation prompt appears.",
+    macro: {
+      name: "Confirm yes",
+      text: "yes\n",
+      triggerPattern: "(confirm|continue).*\\?\\s*$",
+      triggerScope: "active-session"
+    }
+  },
+  {
+    id: "scoped-auto-trigger",
+    label: "Scoped auto-trigger example",
+    description: "Run a command only for the active terminal when a prompt returns.",
+    macro: {
+      name: "Prompt scoped command",
+      text: "show clock\n",
+      triggerPattern: "[$#] $",
+      triggerScope: "active-session",
+      triggerInitiallyDisabled: true
+    }
+  }
+];
+
 function sendMacroText(text: string): void {
   void vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text });
+}
+
+function cloneMacro(macro: TerminalMacro): TerminalMacro {
+  return { ...macro };
+}
+
+function resolveMacroTemplate(picked: unknown): MacroTemplate | undefined {
+  if (!picked || typeof picked !== "object") return undefined;
+  const maybe = picked as { template?: MacroTemplate; templateId?: string; id?: string; label?: string };
+  if (maybe.template) return maybe.template;
+  return MACRO_TEMPLATES.find(
+    (template) => template.id === maybe.templateId || template.id === maybe.id || template.label === maybe.label
+  );
+}
+
+async function addMacroFromTemplate(): Promise<void> {
+  const picked = await vscode.window.showQuickPick(
+    MACRO_TEMPLATES.map((template) => ({
+      label: template.label,
+      description: template.description,
+      templateId: template.id,
+      template
+    })),
+    {
+      title: "Add Macro From Template",
+      placeHolder: "Choose a starter macro"
+    }
+  );
+  const template = resolveMacroTemplate(picked);
+  if (!template) return;
+
+  const macros = getMacros();
+  macros.push(cloneMacro(template.macro));
+  const index = macros.length - 1;
+  await saveMacros(macros);
+  updateMacroContext();
+  MacroEditorPanel.open(index);
 }
 
 /** Track which context keys are currently set to true, so we only update the delta. */
@@ -132,6 +224,10 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
   return [
     vscode.commands.registerCommand("nexus.macro.add", () => {
       MacroEditorPanel.openNew();
+    }),
+
+    vscode.commands.registerCommand("nexus.macro.addFromTemplate", async () => {
+      await addMacroFromTemplate();
     }),
 
     vscode.commands.registerCommand("nexus.macro.editor", () => {

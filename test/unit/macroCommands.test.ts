@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerMacroCommands } from "../../src/commands/macroCommands";
+import { MacroEditorPanel } from "../../src/ui/macroEditorPanel";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockExecuteCommand = vi.fn();
@@ -114,5 +115,73 @@ describe("macroCommands clipboard actions", () => {
     expect(macros[0].text).toBe("new-secret\n");
     expect(mockSaveMacros).toHaveBeenCalledWith(macros);
     expect(mockShowInformationMessage).toHaveBeenNthCalledWith(2, 'Updated "Password" from clipboard.');
+  });
+});
+
+describe("macroCommands template actions", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockGetMacros.mockReturnValue([]);
+    mockShowQuickPick.mockImplementation(async (items: unknown) => Array.isArray(items) ? items[0] : undefined);
+    registerMacroCommands();
+  });
+
+  it("registers addFromTemplate and offers starter macro templates", async () => {
+    const addFromTemplate = registeredCommands.get("nexus.macro.addFromTemplate");
+    expect(addFromTemplate).toBeDefined();
+
+    await addFromTemplate!();
+
+    const labels = mockShowQuickPick.mock.calls[0][0].map((item: { label: string }) => item.label);
+    expect(labels).toEqual([
+      "Send command",
+      "Send password when prompted",
+      "Wait and send confirmation",
+      "Scoped auto-trigger example"
+    ]);
+  });
+
+  it("creates the selected macro through getMacros and saveMacros then opens it", async () => {
+    const macros = [{ name: "Existing", text: "show version\n" }];
+    mockGetMacros.mockReturnValue(macros);
+    mockShowQuickPick.mockResolvedValue({ label: "Wait and send confirmation", templateId: "confirm" });
+
+    await registeredCommands.get("nexus.macro.addFromTemplate")!();
+
+    expect(macros[1]).toMatchObject({
+      name: "Confirm yes",
+      text: "yes\n",
+      triggerPattern: expect.stringMatching(/confirm|continue/i)
+    });
+    expect(mockSaveMacros).toHaveBeenCalledWith(macros);
+    expect(MacroEditorPanel.open).toHaveBeenCalledWith(1);
+  });
+
+  it("creates the secret template without storing plaintext sample secrets", async () => {
+    const macros: unknown[] = [];
+    mockGetMacros.mockReturnValue(macros);
+    mockShowQuickPick.mockResolvedValue({ label: "Send password when prompted", templateId: "password" });
+
+    await registeredCommands.get("nexus.macro.addFromTemplate")!();
+
+    expect(macros[0]).toMatchObject({
+      name: "Password prompt",
+      text: "",
+      secret: true,
+      triggerPattern: "[Pp]assword:\\s*$",
+      triggerScope: "active-session"
+    });
+    expect(JSON.stringify(macros[0])).not.toMatch(/password123|hunter2|changeme/i);
+    expect(mockSaveMacros).toHaveBeenCalledWith(macros);
+  });
+
+  it("does not save a macro when template selection is cancelled", async () => {
+    mockShowQuickPick.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.macro.addFromTemplate")!();
+
+    expect(mockSaveMacros).not.toHaveBeenCalled();
+    expect(MacroEditorPanel.open).not.toHaveBeenCalled();
   });
 });

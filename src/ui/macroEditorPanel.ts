@@ -110,6 +110,21 @@ export class MacroEditorPanel {
         }
         break;
       }
+      case "addFromTemplate": {
+        await vscode.commands.executeCommand("nexus.macro.addFromTemplate");
+        break;
+      }
+      case "confirmAddFromTemplate": {
+        const answer = await vscode.window.showWarningMessage(
+          "You have unsaved changes. Discard them?",
+          { modal: true },
+          "Discard"
+        );
+        if (answer === "Discard") {
+          await vscode.commands.executeCommand("nexus.macro.addFromTemplate");
+        }
+        break;
+      }
       case "save": {
         const name = (msg.name as string).trim();
         const text = msg.text as string;
