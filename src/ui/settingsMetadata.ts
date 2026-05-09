@@ -3,7 +3,7 @@ export interface SettingMeta {
   section: string;
   label: string;
   type: "boolean" | "number" | "string" | "enum" | "directory" | "multi-checkbox";
-  category: "logging" | "ssh" | "tunnels" | "terminal" | "ui" | "sftp" | "serial" | "scripts";
+  category: "logging" | "ssh" | "securityData" | "tunnels" | "terminal" | "ui" | "sftp" | "serial" | "scripts";
   description?: string;
   badge?: string;
   badgeClass?: string;
@@ -83,8 +83,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.ssh",
     label: "Trust New Hosts",
     type: "boolean",
-    category: "ssh",
-    subgroup: "Security",
+    category: "securityData",
+    subgroup: "Host Trust",
     description: "Trust-On-First-Use: auto-accept host keys on first connection. Only prompt when a key changes (possible MITM)."
   },
   // --- SSH > Advanced ---
@@ -475,11 +475,12 @@ export const SETTINGS_META: SettingMeta[] = [
   }
 ];
 
-export const CATEGORY_ORDER = ["logging", "ssh", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"] as const;
+export const CATEGORY_ORDER = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"] as const;
 
 export const CATEGORY_LABELS: Record<string, string> = {
   logging: "Logging",
   ssh: "SSH",
+  securityData: "Security & Data",
   tunnels: "Tunnels",
   terminal: "Terminal",
   ui: "Interface",
@@ -491,12 +492,25 @@ export const CATEGORY_LABELS: Record<string, string> = {
 export const CATEGORY_ICONS: Record<string, string> = {
   logging: "output",
   ssh: "remote",
+  securityData: "shield",
   tunnels: "plug",
   terminal: "terminal",
   ui: "layout",
   sftp: "folder-opened",
   serial: "circuit-board",
   scripts: "play"
+};
+
+export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
+  logging: "Control session transcripts, log locations, and rotation limits.",
+  ssh: "Tune SSH connection sharing, timeouts, keepalives, proxy handshakes, and terminal identity.",
+  securityData: "Review host trust, credentials, backups, exports, imports, resets, and data deletion.",
+  tunnels: "Set defaults for shared or isolated tunnel connections and bind behavior.",
+  terminal: "Choose terminal placement, keyboard passthrough, highlighting, and macro trigger behavior.",
+  ui: "Adjust how Nexus connection details are shown in the VS Code views.",
+  sftp: "Configure remote file browsing, caching, watching, transfer timeouts, and delete safety limits.",
+  serial: "Set serial command timeout behavior.",
+  scripts: "Configure script storage, wait timing, runtime limits, and macro behavior during runs."
 };
 
 export function formatSettingValueForTree(meta: SettingMeta, rawValue: unknown): string {
