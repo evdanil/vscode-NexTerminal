@@ -183,17 +183,12 @@ async function tryLocalStat(uri: vscode.Uri): Promise<vscode.FileStat | undefine
   }
 }
 
-async function remoteDestinationExists(
+async function tryRemoteDestinationStat(
   sftp: SftpService,
   serverId: string,
   remotePath: string
-): Promise<boolean> {
-  try {
-    await sftp.stat(serverId, remotePath);
-    return true;
-  } catch {
-    return false;
-  }
+): Promise<Awaited<ReturnType<SftpService["tryStat"]>>> {
+  return sftp.tryStat(serverId, remotePath);
 }
 
 async function downloadItemToLocal(
@@ -408,7 +403,17 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
           progress.report({ message: fileName });
           const remoteDest = path.posix.join(target.dirPath, fileName);
 
-          if (await remoteDestinationExists(ctx.sftpService, target.serverId, remoteDest)) {
+          let existingRemote;
+          try {
+            existingRemote = await tryRemoteDestinationStat(ctx.sftpService, target.serverId, remoteDest);
+          } catch (error) {
+            summary.failed += 1;
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Failed to check remote target "${fileName}": ${message}`);
+            continue;
+          }
+
+          if (existingRemote) {
             const decision = await resolveUploadConflict(fileName, conflictState, summary);
             if (decision === "cancel") {
               summary.canceled += 1;

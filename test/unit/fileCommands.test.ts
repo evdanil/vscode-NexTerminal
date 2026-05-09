@@ -123,6 +123,7 @@ function createContext(overrides?: {
       connect: vi.fn(),
       realpath: vi.fn(),
       stat: vi.fn(async () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); }),
+      tryStat: vi.fn(async () => undefined),
       delete: vi.fn(),
       rename: vi.fn(),
       createDirectory: vi.fn(),
@@ -208,7 +209,7 @@ describe("fileCommands title bar actions", () => {
 
   it("upload overwrites an existing remote file when requested", async () => {
     const ctx = createContext();
-    ctx.sftpService.stat = vi.fn(async () => ({
+    ctx.sftpService.tryStat = vi.fn(async () => ({
       name: "a.txt",
       isDirectory: false,
       isSymlink: false,
@@ -223,7 +224,7 @@ describe("fileCommands title bar actions", () => {
     const upload = registeredCommands.get("nexus.files.upload");
     await upload!(undefined);
 
-    expect(ctx.sftpService.stat).toHaveBeenCalledWith("srv-1", "/home/a.txt");
+    expect(ctx.sftpService.tryStat).toHaveBeenCalledWith("srv-1", "/home/a.txt");
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
       'Remote target "a.txt" already exists. Choose an action.',
       "Overwrite",
@@ -238,7 +239,7 @@ describe("fileCommands title bar actions", () => {
 
   it("upload skips an existing remote file when requested", async () => {
     const ctx = createContext();
-    ctx.sftpService.stat = vi.fn(async () => ({
+    ctx.sftpService.tryStat = vi.fn(async () => ({
       name: "a.txt",
       isDirectory: false,
       isSymlink: false,
@@ -259,7 +260,7 @@ describe("fileCommands title bar actions", () => {
 
   it("upload cancels after an existing remote file conflict", async () => {
     const ctx = createContext();
-    ctx.sftpService.stat = vi.fn(async () => ({
+    ctx.sftpService.tryStat = vi.fn(async () => ({
       name: "a.txt",
       isDirectory: false,
       isSymlink: false,
@@ -279,6 +280,30 @@ describe("fileCommands title bar actions", () => {
 
     expect(ctx.sftpService.upload).not.toHaveBeenCalled();
     expect(mockShowWarningMessage).toHaveBeenCalledWith("Upload canceled (uploaded 0, skipped 0, conflicts 1, failed 0, canceled 1).");
+  });
+
+  it("upload treats non-missing remote stat failures as failed items and continues", async () => {
+    const ctx = createContext();
+    ctx.sftpService.tryStat = vi.fn(async (_serverId: string, remotePath: string) => {
+      if (remotePath.endsWith("/a.txt")) {
+        throw new Error("permission denied");
+      }
+      return undefined;
+    });
+    mockShowOpenDialog.mockResolvedValue([
+      { fsPath: "/tmp/a.txt" },
+      { fsPath: "/tmp/b.txt" }
+    ]);
+    registerFileCommands(ctx);
+
+    const upload = registeredCommands.get("nexus.files.upload");
+    await upload!(undefined);
+
+    expect(ctx.sftpService.upload).toHaveBeenCalledTimes(1);
+    expect(ctx.sftpService.upload).toHaveBeenCalledWith("srv-1", "/tmp/b.txt", "/home/b.txt");
+    expect(ctx.sftpService.upload).not.toHaveBeenCalledWith("srv-1", "/tmp/a.txt", "/home/a.txt");
+    expect(mockShowErrorMessage).toHaveBeenCalledWith('Failed to check remote target "a.txt": permission denied');
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("Upload completed with issues (uploaded 1, skipped 0, conflicts 0, failed 1, canceled 0).");
   });
 
   it("returns early when no active server/root is available", async () => {
