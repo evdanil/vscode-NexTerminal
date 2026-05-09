@@ -35,7 +35,7 @@ export function classifySshConnectionError(error: unknown): ConnectionDiagnostic
     };
   }
 
-  if (/host key|hostkey|remote host identification has changed|key verification failed|key rejected/.test(message)) {
+  if (/host key|hostkey|remote host identification has changed|key verification failed|key rejected|host denied \(verification failed\)/.test(message)) {
     return {
       ok: false,
       stage: "host-key",

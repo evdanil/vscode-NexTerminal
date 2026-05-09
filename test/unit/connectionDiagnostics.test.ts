@@ -55,6 +55,16 @@ describe("classifySshConnectionError", () => {
     });
   });
 
+  it("classifies ssh2 host verifier rejections as host-key failures", () => {
+    const result = classifySshConnectionError(new Error("Host denied (verification failed)"));
+    expect(result).toMatchObject({
+      ok: false,
+      stage: "host-key",
+      title: "Host key verification failed",
+      suggestion: "Verify the server identity. If the change is expected, remove the old trusted host key and reconnect."
+    });
+  });
+
   it("classifies unsupported private keys and passphrase problems", () => {
     const result = classifySshConnectionError(new Error("Cannot parse privateKey: Unsupported key format"));
     expect(result).toMatchObject({
