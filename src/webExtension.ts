@@ -59,6 +59,7 @@ const unsupportedCommands = [
   "nexus.openHighlightRuleEditor",
   "nexus.tunnel.openBrowser",
   "nexus.profile.add",
+  "nexus.profile.actions",
   "nexus.group.add",
   "nexus.group.remove",
   "nexus.config.export",
@@ -115,6 +116,8 @@ const unsupportedCommands = [
   "nexus.script.revealInExplorer",
   "nexus.server.runWithScript",
   "nexus.serial.runWithScript",
+  "nexus.server.testConnection",
+  "nexus.serial.testConnection",
   "nexus.terminal.reset",
   "nexus.terminal.clearScrollback",
   "nexus.terminal.copyAll"

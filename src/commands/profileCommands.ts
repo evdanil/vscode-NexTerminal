@@ -118,6 +118,7 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
 
     vscode.commands.registerCommand("nexus.profile.actions", showProfileActions),
 
+    // Temporary Chunk 1 placeholders; Chunk 2 owns replacing these diagnostics commands.
     vscode.commands.registerCommand("nexus.server.testConnection", () => showPlaceholderDiagnostics("server")),
 
     vscode.commands.registerCommand("nexus.serial.testConnection", () => showPlaceholderDiagnostics("serial")),
