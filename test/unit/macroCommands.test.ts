@@ -196,7 +196,8 @@ describe("macroCommands template actions", () => {
       text: "",
       secret: true,
       triggerPattern: "[Pp]assword:\\s*$",
-      triggerScope: "active-session"
+      triggerScope: "active-session",
+      triggerInitiallyDisabled: true
     });
     expect(JSON.stringify(macros[0])).not.toMatch(/password123|hunter2|changeme/i);
     expect(mockSaveMacros).toHaveBeenCalledWith(macros);

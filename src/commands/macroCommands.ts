@@ -42,13 +42,14 @@ export const MACRO_TEMPLATES: MacroTemplate[] = [
   {
     id: "password",
     label: "Send password when prompted",
-    description: "Create a secret prompt macro without storing a sample password.",
+    description: "Create a paused secret prompt macro without storing a sample password.",
     macro: {
       name: "Password prompt",
       text: "",
       secret: true,
       triggerPattern: "[Pp]assword:\\s*$",
-      triggerScope: "active-session"
+      triggerScope: "active-session",
+      triggerInitiallyDisabled: true
     }
   },
   {

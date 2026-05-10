@@ -30,8 +30,9 @@ you run it manually or assign a shortcut.
 Built-in templates include:
 
 - **Send command**: sends a normal command to the active terminal.
-- **Send password when prompted**: creates a secret active-session trigger with
-  no sample password stored.
+- **Send password when prompted**: creates a paused secret active-session
+  trigger with no sample password stored. Enter the secret, save, then resume
+  auto-trigger when you are ready.
 - **Wait and send confirmation**: sends `yes` when a confirmation prompt
   appears.
 - **Scoped auto-trigger example**: shows a prompt-triggered command that starts
