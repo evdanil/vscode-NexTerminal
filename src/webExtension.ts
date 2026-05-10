@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { repositoryBlobUrl } from "./utils/repositoryLinks";
 
 class StaticTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   public constructor(private readonly label: string) {}
@@ -144,8 +145,11 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     })
   );
+  const macroDocsCommand = vscode.commands.registerCommand("nexus.macro.openDocs", async () => {
+    await vscode.env.openExternal(vscode.Uri.parse(repositoryBlobUrl("docs/macros.md")));
+  });
 
-  context.subscriptions.push(commandCenterView, tunnelsView, fileExplorerView, ...commandRegistrations);
+  context.subscriptions.push(commandCenterView, tunnelsView, fileExplorerView, ...commandRegistrations, macroDocsCommand);
 }
 
 export function deactivate(): void {}

@@ -133,6 +133,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 ### 4.9 Terminal Macros
 - Define named macros in the Macro Editor. Macro metadata is stored in VS Code globalState; secret macro text is stored in VS Code SecretStorage.
 - Macros appear in the **Terminal Macros** sidebar view (`nexusMacros`).
+- See the [Macro Guide](macros.md) for step-by-step setup, trigger scopes, cooldowns, intervals, and regex examples.
 - Click the play button or the label to send macro text to the active terminal.
 - Press `Alt+S` to open a quick pick of all macros.
 - Each macro can have an explicit `keybinding` such as `alt+m`, `alt+shift+5`, or `ctrl+shift+a`. Right-click a macro and select **Assign Shortcut** to edit it.
@@ -141,7 +142,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - If VS Code terminal/menu settings intercept macro shortcuts, run **Nexus: Fix Macro Keybindings** explicitly. Nexus no longer mutates those global settings during activation.
 - Add `triggerPattern` to enable auto-trigger (expect/send). Matching terminal output sends the macro text automatically, with optional per-macro `triggerCooldown`.
 - Existing macros with no trigger scope keep the compatibility default of matching all terminals. Secret prompts should use the safer `active-session` or `profile` trigger scope where practical.
-- Add `triggerInterval` for polling-style macros. Once the prompt matches again, the macro is armed and can fire on this interval without extra user input.
+- Add `triggerInterval` for polling-style macros. An interval macro starts only when its pattern matches the active terminal; that terminal owns delayed sends even if focus changes. Later matches on that same session send immediately if the interval has elapsed, or wait until it has.
 - Add `triggerInitiallyDisabled` when a macro should start paused until you manually resume it from the macros view. If the prompt already matched recently, resuming can fire immediately without extra terminal output.
 - Auto-trigger can be paused/resumed per macro from the macros view, and globally toggled with `nexus.terminal.macros.autoTrigger`.
 - Secret macros support **Copy Value** and **Paste Value** from the macros view context menu. Copying writes the macro value to the OS clipboard as plain text.
@@ -152,7 +153,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 #### 4.9.1 Macro Templates
 - `Nexus: Add Macro From Template` opens a starter-template picker and then opens the Macro Editor on the created macro.
 - Built-in templates are **Send command**, **Send password when prompted**, **Wait and send confirmation**, and **Scoped auto-trigger example**.
-- The password template creates a secret macro with empty text, an active-session trigger scope, and a password prompt pattern. It does not include a sample password.
+- The password template creates a secret macro with empty text, an active-session trigger scope, a password prompt pattern, and start-paused enabled. It stores no sample password; the user must enter and save the secret, then resume auto-trigger from the macros view before it can auto-send.
 - Auto-trigger templates default to active-session scope so generated macros react only to the active terminal unless the user changes the scope.
 
 ### 4.10 Configuration Export/Import
@@ -299,7 +300,7 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 
 **Macros:**
 - `nexus.macro.editor`
-- `nexus.macro.add`, `nexus.macro.addFromTemplate`, `nexus.macro.edit`, `nexus.macro.remove`
+- `nexus.macro.add`, `nexus.macro.addFromTemplate`, `nexus.macro.openDocs`, `nexus.macro.edit`, `nexus.macro.remove`
 - `nexus.macro.run` (Alt+S quick pick)
 - `nexus.macro.runBinding` (explicit shortcut dispatch)
 - `nexus.macro.runItem` (tree item click/play button)

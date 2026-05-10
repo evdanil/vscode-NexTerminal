@@ -15,6 +15,11 @@ function extractWebExtensionCommands(source: string): string[] {
   return [...new Set((source.match(/"nexus\.[^"]+"/g) ?? []).map((value) => value.slice(1, -1)))];
 }
 
+function extractUnsupportedCommands(source: string): string[] {
+  const match = source.match(/const unsupportedCommands = \[([\s\S]*?)\];/);
+  return match ? extractWebExtensionCommands(match[1]) : [];
+}
+
 describe("web extension fallback command coverage", () => {
   it("covers all Nexus-owned contributed commands", () => {
     // Only our own `nexus.*` commands need desktop-only fallback stubs; a
@@ -29,5 +34,13 @@ describe("web extension fallback command coverage", () => {
     const fallback = extractWebExtensionCommands(source).sort();
 
     expect(fallback).toEqual(contributed);
+  });
+
+  it("includes a graceful web fallback for the macro guide command", () => {
+    const source = readFileSync(webExtensionPath, "utf8");
+    expect(extractWebExtensionCommands(source)).toContain("nexus.macro.openDocs");
+    expect(extractUnsupportedCommands(source)).not.toContain("nexus.macro.openDocs");
+    expect(source).toContain('registerCommand("nexus.macro.openDocs"');
+    expect(source).toContain("openExternal");
   });
 });

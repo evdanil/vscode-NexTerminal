@@ -21,6 +21,8 @@ const NESTED_QUANTIFIER_SOURCE = `${GROUP_START_SOURCE}${GROUP_BODY_SOURCE}${INN
 const QUANTIFIED_ALTERNATION_SOURCE = `${GROUP_START_SOURCE}${GROUP_BODY_SOURCE}\\|${GROUP_BODY_SOURCE}\\)${OUTER_UNBOUNDED_QUANTIFIER_SOURCE}`;
 const NESTED_QUANTIFIER_RE = new RegExp(NESTED_QUANTIFIER_SOURCE);
 const QUANTIFIED_ALTERNATION_RE = new RegExp(QUANTIFIED_ALTERNATION_SOURCE);
+const REGEX_SAFETY_GUIDANCE =
+  "Avoid risky shapes like (.*)+; anchor to the prompt and use line-bounded text like [^\\n]* or bounded repeats like (?:yes|no){1,3}.";
 
 export function validateRegexSafety(pattern: unknown, maxLength = MAX_PATTERN_LENGTH): RegexSafetyResult {
   if (typeof pattern !== "string" || pattern.length === 0) {
@@ -30,10 +32,16 @@ export function validateRegexSafety(pattern: unknown, maxLength = MAX_PATTERN_LE
     return { ok: false, message: `Pattern is too long (max ${maxLength} characters).` };
   }
   if (NESTED_QUANTIFIER_RE.test(pattern)) {
-    return { ok: false, message: "Pattern rejected: nested quantifiers can hang terminal processing." };
+    return {
+      ok: false,
+      message: `Pattern rejected: nested quantifiers can hang terminal processing. ${REGEX_SAFETY_GUIDANCE}`
+    };
   }
   if (QUANTIFIED_ALTERNATION_RE.test(pattern)) {
-    return { ok: false, message: "Pattern rejected: quantified alternation can hang terminal processing." };
+    return {
+      ok: false,
+      message: `Pattern rejected: quantified alternation can hang terminal processing. ${REGEX_SAFETY_GUIDANCE}`
+    };
   }
   return { ok: true };
 }
@@ -49,11 +57,11 @@ export function regexSafetyWebviewJs(maxLength = MAX_PATTERN_LENGTH): string {
         }
         var nestedQuantifierPattern = new RegExp(${serializeForInlineScript(NESTED_QUANTIFIER_SOURCE)});
         if (nestedQuantifierPattern.test(pattern)) {
-          return "Pattern rejected: nested quantifiers can hang terminal processing.";
+          return ${serializeForInlineScript(`Pattern rejected: nested quantifiers can hang terminal processing. ${REGEX_SAFETY_GUIDANCE}`)};
         }
         var quantifiedAlternationPattern = new RegExp(${serializeForInlineScript(QUANTIFIED_ALTERNATION_SOURCE)});
         if (quantifiedAlternationPattern.test(pattern)) {
-          return "Pattern rejected: quantified alternation can hang terminal processing.";
+          return ${serializeForInlineScript(`Pattern rejected: quantified alternation can hang terminal processing. ${REGEX_SAFETY_GUIDANCE}`)};
         }
         return "";
       }

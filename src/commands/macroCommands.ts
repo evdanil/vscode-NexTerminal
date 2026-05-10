@@ -20,6 +20,7 @@ import {
   getAssignedBinding,
   normalizeBinding
 } from "../macroBindingHelpers";
+import { repositoryBlobUrl } from "../utils/repositoryLinks";
 
 type MacroTemplate = {
   id: string;
@@ -41,13 +42,14 @@ export const MACRO_TEMPLATES: MacroTemplate[] = [
   {
     id: "password",
     label: "Send password when prompted",
-    description: "Create a secret prompt macro without storing a sample password.",
+    description: "Create a paused secret prompt macro without storing a sample password.",
     macro: {
       name: "Password prompt",
       text: "",
       secret: true,
       triggerPattern: "[Pp]assword:\\s*$",
-      triggerScope: "active-session"
+      triggerScope: "active-session",
+      triggerInitiallyDisabled: true
     }
   },
   {
@@ -81,6 +83,10 @@ function sendMacroText(text: string): void {
 
 function cloneMacro(macro: TerminalMacro): TerminalMacro {
   return { ...macro };
+}
+
+function macroDocsUrl(): string {
+  return repositoryBlobUrl("docs/macros.md");
 }
 
 function resolveMacroTemplate(picked: unknown): MacroTemplate | undefined {
@@ -230,6 +236,10 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       await addMacroFromTemplate();
     }),
 
+    vscode.commands.registerCommand("nexus.macro.openDocs", async () => {
+      await vscode.env.openExternal(vscode.Uri.parse(macroDocsUrl()));
+    }),
+
     vscode.commands.registerCommand("nexus.macro.editor", () => {
       MacroEditorPanel.open();
     }),
@@ -285,9 +295,9 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (macros.length === 0) {
         const action = await vscode.window.showInformationMessage(
           "No macros defined.",
-          "Add Macro"
+          "Add Blank Macro"
         );
-        if (action === "Add Macro") {
+        if (action === "Add Blank Macro") {
           await vscode.commands.executeCommand("nexus.macro.add");
         }
         return;
