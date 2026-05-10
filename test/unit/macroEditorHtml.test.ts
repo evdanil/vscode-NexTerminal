@@ -49,7 +49,7 @@ describe("renderMacroEditorHtml", () => {
     const html = render(macros, 0);
     expect(html).toContain("Hello");
     expect(html).toContain("Deploy");
-    expect(html).toContain("+ New Macro");
+    expect(html).toContain("+ New Blank Macro");
   });
 
   it("populates form fields when macro is selected", () => {
@@ -135,8 +135,9 @@ describe("renderMacroEditorHtml", () => {
     const html = render([], null);
     expect(html).toContain("macro-interval");
     expect(html).toContain("Trigger Interval");
-    expect(html).toContain("then repeats on this interval without new terminal output");
-    expect(html).not.toContain("Once the prompt matches again");
+    expect(html).toContain("Later matches on the same session send immediately if the interval has elapsed");
+    expect(html).toContain("Nexus does not send again until the pattern matches again");
+    expect(html).not.toContain("without new terminal output");
   });
 
   it("describes macro text as exact saved text", () => {
@@ -144,6 +145,13 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("Text is sent exactly as saved");
     expect(html).toContain("Press Enter in the textarea to include a newline");
     expect(html).not.toContain("Each line is sent as a separate command");
+  });
+
+  it("describes trigger patterns without slash delimiters or flags", () => {
+    const html = render([], null);
+    expect(html).toContain("Enter the JavaScript regex pattern only");
+    expect(html).toContain("without surrounding /slashes/ or flags");
+    expect(html).toContain("When matched, this macro's text is sent automatically");
   });
 
   it("shows current binding value when macro has keybinding", () => {
@@ -193,10 +201,10 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("Unsaved changes");
   });
 
-  it("renders New Macro button", () => {
+  it("renders New Blank Macro button", () => {
     const html = render([], null);
     expect(html).toContain("new-btn");
-    expect(html).toContain("New Macro");
+    expect(html).toContain("New Blank Macro");
   });
 
   it("includes validation error placeholders", () => {

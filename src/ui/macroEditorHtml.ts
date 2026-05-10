@@ -23,9 +23,9 @@ export function renderMacroEditorHtml(
     )
     .join("\n        ");
 
-  const newMacroOption = `<div class="custom-select-option${selectedIndex === null && macros.length > 0 ? " selected" : ""}" data-value="__new__">+ New Macro</div>`;
+  const newMacroOption = `<div class="custom-select-option${selectedIndex === null && macros.length > 0 ? " selected" : ""}" data-value="__new__">+ New Blank Macro</div>`;
 
-  const triggerLabel = macro ? macro.name : (macros.length > 0 ? "Select a macro\u2026" : "+ New Macro");
+  const triggerLabel = macro ? macro.name : (macros.length > 0 ? "Select a macro\u2026" : "+ New Blank Macro");
   const hiddenValue = selectedIndex !== null ? String(selectedIndex) : "__new__";
 
   const bindingValue = macro ? (getAssignedBinding(macro) ?? "") : "";
@@ -163,7 +163,7 @@ export function renderMacroEditorHtml(
     <label for="macro-trigger">Auto-Trigger Pattern</label>
     <input type="text" id="macro-trigger" value="${escapeHtml(triggerValue)}" placeholder="e.g., [Pp]assword:\\s*$" />
     <div class="field-error" id="error-trigger"></div>
-    <div class="hint">Regex matched against terminal output. When matched, this macro's text is sent automatically (expect/send).</div>
+    <div class="hint">Enter the JavaScript regex pattern only, without surrounding /slashes/ or flags. When matched, this macro's text is sent automatically (expect/send).</div>
   </div>
 
   <div class="form-group">
@@ -204,7 +204,7 @@ export function renderMacroEditorHtml(
   <div class="form-group">
     <label for="macro-interval">Trigger Interval (seconds)</label>
     <input type="number" id="macro-interval" value="${escapeHtml(String(intervalValue))}" min="1" max="86400" step="1" placeholder="Optional" />
-    <div class="hint">After the trigger pattern matches, the macro sends once, then repeats on this interval without new terminal output.</div>
+    <div class="hint">When the pattern matches, Nexus sends once. Later matches on the same session send immediately if the interval has elapsed, or wait until it has. Nexus does not send again until the pattern matches again.</div>
   </div>
 
   <div class="form-group form-group-checkbox">
@@ -226,7 +226,7 @@ export function renderMacroEditorHtml(
     <button type="button" class="btn-primary" id="save-btn">${escapeHtml(saveLabel)}</button>
     <button type="button" class="btn-secondary" id="delete-btn"${deleteDisabled}>Delete</button>
     <div class="spacer"></div>
-    <button type="button" class="btn-secondary" id="new-btn">New Macro</button>
+    <button type="button" class="btn-secondary" id="new-btn">New Blank Macro</button>
   </div>
 
   <script nonce="${nonce}">

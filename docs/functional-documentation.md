@@ -142,7 +142,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - If VS Code terminal/menu settings intercept macro shortcuts, run **Nexus: Fix Macro Keybindings** explicitly. Nexus no longer mutates those global settings during activation.
 - Add `triggerPattern` to enable auto-trigger (expect/send). Matching terminal output sends the macro text automatically, with optional per-macro `triggerCooldown`.
 - Existing macros with no trigger scope keep the compatibility default of matching all terminals. Secret prompts should use the safer `active-session` or `profile` trigger scope where practical.
-- Add `triggerInterval` for polling-style macros. After the trigger pattern matches, Nexus sends the macro once, then repeats on that interval while the session owns the interval.
+- Add `triggerInterval` for polling-style macros. After the trigger pattern matches, Nexus sends the macro once. Later matches on the same session send immediately if the interval has elapsed, or wait until it has.
 - Add `triggerInitiallyDisabled` when a macro should start paused until you manually resume it from the macros view. If the prompt already matched recently, resuming can fire immediately without extra terminal output.
 - Auto-trigger can be paused/resumed per macro from the macros view, and globally toggled with `nexus.terminal.macros.autoTrigger`.
 - Secret macros support **Copy Value** and **Paste Value** from the macros view context menu. Copying writes the macro value to the OS clipboard as plain text.

@@ -170,20 +170,23 @@ Example: a password macro has `triggerCooldown: 5`. It fires at `12:00:00`.
 Another `Password:` prompt arrives at `12:00:02`; it is ignored. A later prompt
 at `12:00:06` can fire.
 
-**Interval** is for prompt-gated polling. The trigger pattern arms the macro.
-Once armed, the macro repeats on the interval without needing new terminal
-output. For interval macros, the interval is the repeat delay; `triggerCooldown`
-does not control the repeat cadence.
+**Interval** is for prompt-gated polling. When the trigger pattern matches,
+Nexus sends the macro once. Later matches on the same session send immediately
+if the interval has elapsed, or wait until it has. Nexus does not send again
+until the pattern matches again. For interval macros, the interval controls the
+next matched prompt; `triggerCooldown` does not control that cadence.
 
 Example: a macro has pattern `router#\s*$`, text `show clock\n`, and
 `triggerInterval: 10`. When the active terminal shows `router#`, Nexus sends
-`show clock\n` immediately, then again about 10 seconds after each prior send
-while the interval remains armed.
+`show clock\n` immediately. If another `router#` prompt appears 10 seconds or
+more after that send, Nexus sends again immediately. If the prompt appears
+sooner, Nexus waits until the 10-second interval has elapsed, then sends once.
 
-Interval ownership matters. The terminal that first arms the interval owns that
-cycle. The cycle continues even if focus changes, until you pause the macro,
-disconnect the session, dispose the terminal observer, edit the macro so the
-interval no longer applies, or otherwise clear the interval state.
+Interval ownership matters. The terminal that first matches the interval macro
+owns delayed sends for that macro. Ownership continues even if focus changes,
+until you pause the macro, disconnect the session, dispose the terminal
+observer, edit the macro so the interval no longer applies, or otherwise clear
+the interval state.
 
 Use interval macros carefully. A broad shell prompt pattern with a short interval
 can create noisy command loops.
