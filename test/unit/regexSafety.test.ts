@@ -23,4 +23,12 @@ describe("validateRegexSafety", () => {
     expect(validateRegexSafety("\\b\\d{1,3}(?:\\.\\d{1,3}){3}\\b").ok).toBe(true);
     expect(validateRegexSafety("(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}").ok).toBe(true);
   });
+
+  it("returns actionable guidance for rejected patterns", () => {
+    const result = validateRegexSafety("(.*)+");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain("line-bounded text like [^\\n]*");
+    }
+  });
 });

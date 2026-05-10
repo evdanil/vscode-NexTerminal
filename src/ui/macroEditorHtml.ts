@@ -163,7 +163,7 @@ export function renderMacroEditorHtml(
     <label for="macro-trigger">Auto-Trigger Pattern</label>
     <input type="text" id="macro-trigger" value="${escapeHtml(triggerValue)}" placeholder="e.g., [Pp]assword:\\s*$" />
     <div class="field-error" id="error-trigger"></div>
-    <div class="hint">Enter the JavaScript regex pattern only, without surrounding /slashes/ or flags. When matched, this macro's text is sent automatically (expect/send).</div>
+    <div class="hint">Enter the JavaScript regex pattern only, without surrounding /slashes/ or flags. Avoid risky shapes like (.*)+; use line-bounded text like [^\\n]*. When matched, this macro's text is sent automatically (expect/send).</div>
   </div>
 
   <div class="form-group">
@@ -204,7 +204,7 @@ export function renderMacroEditorHtml(
   <div class="form-group">
     <label for="macro-interval">Trigger Interval (seconds)</label>
     <input type="number" id="macro-interval" value="${escapeHtml(String(intervalValue))}" min="1" max="86400" step="1" placeholder="Optional" />
-    <div class="hint">When the pattern matches, Nexus sends once. Later matches on the same session send immediately if the interval has elapsed, or wait until it has. Nexus does not send again until the pattern matches again.</div>
+    <div class="hint">An interval macro starts only when its pattern matches the active terminal; delayed sends stay on that same session even if focus changes. Later matches on the same session send immediately if the interval has elapsed, or wait until it has. Nexus does not send again until the pattern matches again.</div>
   </div>
 
   <div class="form-group form-group-checkbox">

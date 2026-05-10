@@ -135,6 +135,8 @@ describe("renderMacroEditorHtml", () => {
     const html = render([], null);
     expect(html).toContain("macro-interval");
     expect(html).toContain("Trigger Interval");
+    expect(html).toContain("An interval macro starts only when its pattern matches the active terminal");
+    expect(html).toContain("delayed sends stay on that same session even if focus changes");
     expect(html).toContain("Later matches on the same session send immediately if the interval has elapsed");
     expect(html).toContain("Nexus does not send again until the pattern matches again");
     expect(html).not.toContain("without new terminal output");
@@ -151,6 +153,8 @@ describe("renderMacroEditorHtml", () => {
     const html = render([], null);
     expect(html).toContain("Enter the JavaScript regex pattern only");
     expect(html).toContain("without surrounding /slashes/ or flags");
+    expect(html).toContain("Avoid risky shapes like (.*)+");
+    expect(html).toContain("use line-bounded text like [^\\n]*");
     expect(html).toContain("When matched, this macro's text is sent automatically");
   });
 

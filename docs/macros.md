@@ -119,6 +119,9 @@ Rules to keep in mind:
 - Nexus rejects patterns that can match an empty string, are longer than the
   allowed limit, or use risky shapes such as nested quantifiers like `(.*)+` or
   repeated alternation like `(yes|no)*`.
+- Avoid those risky shapes by anchoring to the prompt, replacing broad repeats
+  with line-bounded text such as `[^\n]*`, or using bounded repeats such as
+  `(?:yes|no){1,3}` when repetition is required.
 - Matching text is removed from the buffer after a match, even if cooldown stops
   the macro from firing. This prevents one prompt from repeatedly retriggering
   the same macro.
@@ -170,8 +173,9 @@ Example: a password macro has `triggerCooldown: 5`. It fires at `12:00:00`.
 Another `Password:` prompt arrives at `12:00:02`; it is ignored. A later prompt
 at `12:00:06` can fire.
 
-**Interval** is for prompt-gated polling. When the trigger pattern matches,
-Nexus sends the macro once. Later matches on the same session send immediately
+**Interval** is for prompt-gated polling. An interval macro starts only when its
+pattern matches the active terminal. That terminal owns delayed sends for the
+macro even if focus changes. Later matches on that same session send immediately
 if the interval has elapsed, or wait until it has. Nexus does not send again
 until the pattern matches again. For interval macros, the interval controls the
 next matched prompt; `triggerCooldown` does not control that cadence.
@@ -183,10 +187,10 @@ more after that send, Nexus sends again immediately. If the prompt appears
 sooner, Nexus waits until the 10-second interval has elapsed, then sends once.
 
 Interval ownership matters. The terminal that first matches the interval macro
-owns delayed sends for that macro. Ownership continues even if focus changes,
-until you pause the macro, disconnect the session, dispose the terminal
-observer, edit the macro so the interval no longer applies, or otherwise clear
-the interval state.
+must be active, and it owns delayed sends for that macro. Ownership continues
+even if focus changes, until you pause the macro, disconnect the session,
+dispose the terminal observer, edit the macro so the interval no longer applies,
+or otherwise clear the interval state.
 
 Use interval macros carefully. A broad shell prompt pattern with a short interval
 can create noisy command loops.
