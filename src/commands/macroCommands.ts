@@ -20,6 +20,7 @@ import {
   getAssignedBinding,
   normalizeBinding
 } from "../macroBindingHelpers";
+import { repositoryBlobUrl } from "../utils/repositoryLinks";
 
 type MacroTemplate = {
   id: string;
@@ -81,6 +82,10 @@ function sendMacroText(text: string): void {
 
 function cloneMacro(macro: TerminalMacro): TerminalMacro {
   return { ...macro };
+}
+
+function macroDocsUrl(): string {
+  return repositoryBlobUrl("docs/macros.md");
 }
 
 function resolveMacroTemplate(picked: unknown): MacroTemplate | undefined {
@@ -228,6 +233,10 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
 
     vscode.commands.registerCommand("nexus.macro.addFromTemplate", async () => {
       await addMacroFromTemplate();
+    }),
+
+    vscode.commands.registerCommand("nexus.macro.openDocs", async () => {
+      await vscode.env.openExternal(vscode.Uri.parse(macroDocsUrl()));
     }),
 
     vscode.commands.registerCommand("nexus.macro.editor", () => {

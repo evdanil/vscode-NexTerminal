@@ -71,6 +71,7 @@ const unsupportedCommands = [
   "nexus.macro.editor",
   "nexus.macro.add",
   "nexus.macro.addFromTemplate",
+  "nexus.macro.openDocs",
   "nexus.macro.edit",
   "nexus.macro.remove",
   "nexus.macro.run",

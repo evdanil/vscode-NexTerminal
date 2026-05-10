@@ -3,6 +3,8 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
+const readmePath = path.resolve(__dirname, "..", "..", "README.md");
+const functionalDocsPath = path.resolve(__dirname, "..", "..", "docs", "functional-documentation.md");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
   dependencies: Record<string, string>;
   configurationDefaults?: Record<string, unknown>;
@@ -14,6 +16,8 @@ const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
     keybindings?: Array<{ command: string; key: string; mac?: string; when?: string }>;
   };
 };
+const readme = readFileSync(readmePath, "utf8");
+const functionalDocs = readFileSync(functionalDocsPath, "utf8");
 
 describe("package contributions", () => {
   it("includes serialport runtime dependency", () => {
@@ -122,6 +126,18 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.macro.addFromTemplate");
   });
 
+  it("contributes macro.openDocs command for the command palette", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.macro.openDocs");
+    expect(command).toBeDefined();
+    expect(command?.title).toBe("Open Macro Guide");
+    expect(command?.category).toBe("Nexus");
+    expect(command?.icon).toBe("$(book)");
+
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    const paletteOverride = paletteMenu.find((item) => item.command === "nexus.macro.openDocs");
+    expect(paletteOverride?.when).not.toBe("false");
+  });
+
   it("uses a plain Nexus-category title for macro JSON export", () => {
     const command = packageJson.contributes.commands.find((item) => item.command === "nexus.macro.copyAllAsJson");
     expect(command).toBeDefined();
@@ -198,6 +214,39 @@ describe("package contributions", () => {
     const entry = packageJson.contributes.viewsWelcome?.find((item) => item.view === "nexusMacros");
     expect(entry?.contents).toContain("command:nexus.macro.add");
     expect(entry?.contents).toContain("command:nexus.macro.addFromTemplate");
+  });
+
+  it("links the macro guide from public docs and command references", () => {
+    expect(readme).toContain("[macro guide](docs/macros.md)");
+    expect(functionalDocs).toContain("[Macro Guide](macros.md)");
+    expect(functionalDocs).toContain("nexus.macro.openDocs");
+  });
+
+  it("orders Macros welcome links by guided setup path", () => {
+    const entry = packageJson.contributes.viewsWelcome?.find((item) => item.view === "nexusMacros");
+    expect(entry).toBeDefined();
+    const contents = entry!.contents;
+
+    expect(contents).toContain("command:nexus.macro.addFromTemplate");
+    expect(contents).toContain("command:nexus.macro.add");
+    expect(contents).toContain("command:nexus.macro.openDocs");
+    expect(contents).toMatch(/starter/i);
+
+    const templateIndex = contents.indexOf("command:nexus.macro.addFromTemplate");
+    const blankIndex = contents.indexOf("[Add Blank Macro](command:nexus.macro.add)");
+    const docsIndex = contents.indexOf("command:nexus.macro.openDocs");
+    expect(templateIndex).toBeLessThan(blankIndex);
+    expect(blankIndex).toBeLessThan(docsIndex);
+  });
+
+  it("adds ordered Macros title-bar actions for blank, template, and guide flows", () => {
+    const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+    const macroItems = titleMenuItems.filter((item) => item.when === "view == nexusMacros");
+    expect(macroItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({ command: "nexus.macro.add", group: "navigation@1" }),
+      expect.objectContaining({ command: "nexus.macro.addFromTemplate", group: "navigation@2" }),
+      expect.objectContaining({ command: "nexus.macro.openDocs", group: "navigation@3" })
+    ]));
   });
 
   it("uses explicit folder-server wording for folder connect actions", () => {

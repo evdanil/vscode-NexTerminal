@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 import { parseScriptHeader } from "../services/scripts/scriptHeader";
 import { resolveScriptsDir } from "../services/scripts/resolveScriptsDir";
+import { repositoryBlobUrl, repositoryTreeUrl } from "../utils/repositoryLinks";
 
 /**
  * Structural check for a URI — `instanceof vscode.Uri` is unreliable across module
@@ -267,27 +268,12 @@ async function createNewScript(globalStoragePath: string): Promise<void> {
   await vscode.window.showTextDocument(doc);
 }
 
-function readRepositoryUrl(): string {
-  // Resolve once from package.json; bundler inlines this via require at build time.
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const pkg = require("../../package.json") as { repository?: { url?: string } };
-    const raw = pkg.repository?.url ?? "";
-    // git+https://... → https://..., strip .git suffix
-    return raw.replace(/^git\+/, "").replace(/\.git$/, "");
-  } catch {
-    return "https://github.com/evdanil/vscode-NexTerminal";
-  }
-}
-
 function scriptingDocsUrl(): string {
-  const base = readRepositoryUrl();
-  return `${base.replace(/\/+$/, "")}/blob/main/docs/scripting.md`;
+  return repositoryBlobUrl("docs/scripting.md");
 }
 
 function scriptExamplesUrl(): string {
-  const base = readRepositoryUrl();
-  return `${base.replace(/\/+$/, "")}/tree/main/examples/scripts`;
+  return repositoryTreeUrl("examples/scripts");
 }
 
 async function deleteScript(uri: vscode.Uri): Promise<void> {

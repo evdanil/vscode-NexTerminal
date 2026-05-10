@@ -133,6 +133,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 ### 4.9 Terminal Macros
 - Define named macros in the Macro Editor. Macro metadata is stored in VS Code globalState; secret macro text is stored in VS Code SecretStorage.
 - Macros appear in the **Terminal Macros** sidebar view (`nexusMacros`).
+- See the [Macro Guide](macros.md) for task-first setup, trigger-scope, cooldown, interval, and regex examples.
 - Click the play button or the label to send macro text to the active terminal.
 - Press `Alt+S` to open a quick pick of all macros.
 - Each macro can have an explicit `keybinding` such as `alt+m`, `alt+shift+5`, or `ctrl+shift+a`. Right-click a macro and select **Assign Shortcut** to edit it.
@@ -299,7 +300,7 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 
 **Macros:**
 - `nexus.macro.editor`
-- `nexus.macro.add`, `nexus.macro.addFromTemplate`, `nexus.macro.edit`, `nexus.macro.remove`
+- `nexus.macro.add`, `nexus.macro.addFromTemplate`, `nexus.macro.openDocs`, `nexus.macro.edit`, `nexus.macro.remove`
 - `nexus.macro.run` (Alt+S quick pick)
 - `nexus.macro.runBinding` (explicit shortcut dispatch)
 - `nexus.macro.runItem` (tree item click/play button)

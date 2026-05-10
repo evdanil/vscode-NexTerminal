@@ -98,7 +98,7 @@
       },
       {
         "view": "nexusMacros",
-        "contents": "No macros defined.\n[Add Macro](command:nexus.macro.add)\n[Add From Template](command:nexus.macro.addFromTemplate)\nMacros send predefined text to the active terminal."
+        "contents": "Create a starter macro or begin with a blank one.\n[Add Macro From Template](command:nexus.macro.addFromTemplate)\n[Add Blank Macro](command:nexus.macro.add)\n[Open Macro Guide](command:nexus.macro.openDocs)"
       },
       {
         "view": "nexusScripts",
@@ -429,6 +429,12 @@
         "icon": "$(new-file)"
       },
       {
+        "command": "nexus.macro.openDocs",
+        "title": "Open Macro Guide",
+        "category": "Nexus",
+        "icon": "$(book)"
+      },
+      {
         "command": "nexus.macro.edit",
         "title": "Edit",
         "icon": "$(edit)"
@@ -724,6 +730,16 @@
           "command": "nexus.macro.add",
           "when": "view == nexusMacros",
           "group": "navigation@1"
+        },
+        {
+          "command": "nexus.macro.addFromTemplate",
+          "when": "view == nexusMacros",
+          "group": "navigation@2"
+        },
+        {
+          "command": "nexus.macro.openDocs",
+          "when": "view == nexusMacros",
+          "group": "navigation@3"
         },
         {
           "command": "nexus.files.createFile",

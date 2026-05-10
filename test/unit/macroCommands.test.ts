@@ -10,6 +10,7 @@ const mockShowQuickPick = vi.fn();
 const mockShowWarningMessage = vi.fn();
 const mockClipboardReadText = vi.fn();
 const mockClipboardWriteText = vi.fn();
+const mockOpenExternal = vi.fn();
 const mockGetMacros = vi.fn();
 const mockSaveMacros = vi.fn();
 
@@ -28,10 +29,14 @@ vi.mock("vscode", () => ({
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args)
   },
   env: {
+    openExternal: (...args: unknown[]) => mockOpenExternal(...args),
     clipboard: {
       readText: (...args: unknown[]) => mockClipboardReadText(...args),
       writeText: (...args: unknown[]) => mockClipboardWriteText(...args)
     }
+  },
+  Uri: {
+    parse: (value: string) => ({ toString: () => value, value })
   },
   InputBoxValidationSeverity: {
     Warning: 2
@@ -115,6 +120,27 @@ describe("macroCommands clipboard actions", () => {
     expect(macros[0].text).toBe("new-secret\n");
     expect(mockSaveMacros).toHaveBeenCalledWith(macros);
     expect(mockShowInformationMessage).toHaveBeenNthCalledWith(2, 'Updated "Password" from clipboard.');
+  });
+});
+
+describe("macroCommands documentation actions", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockGetMacros.mockReturnValue([]);
+    registerMacroCommands();
+  });
+
+  it("registers openDocs and opens the macro guide on GitHub", async () => {
+    const openDocs = registeredCommands.get("nexus.macro.openDocs");
+    expect(openDocs).toBeDefined();
+
+    await openDocs!();
+
+    expect(mockOpenExternal).toHaveBeenCalled();
+    const arg = mockOpenExternal.mock.calls[0][0] as { toString: () => string };
+    expect(arg.toString()).toMatch(/github\.com/);
+    expect(arg.toString()).toMatch(/docs\/macros\.md/);
   });
 });
 

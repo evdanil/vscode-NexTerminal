@@ -30,4 +30,9 @@ describe("web extension fallback command coverage", () => {
 
     expect(fallback).toEqual(contributed);
   });
+
+  it("includes a graceful web fallback for the macro guide command", () => {
+    const source = readFileSync(webExtensionPath, "utf8");
+    expect(extractWebExtensionCommands(source)).toContain("nexus.macro.openDocs");
+  });
 });
