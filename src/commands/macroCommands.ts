@@ -294,9 +294,9 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (macros.length === 0) {
         const action = await vscode.window.showInformationMessage(
           "No macros defined.",
-          "Add Macro"
+          "Add Blank Macro"
         );
-        if (action === "Add Macro") {
+        if (action === "Add Blank Macro") {
           await vscode.commands.executeCommand("nexus.macro.add");
         }
         return;

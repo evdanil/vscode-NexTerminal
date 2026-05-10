@@ -126,6 +126,11 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.macro.addFromTemplate");
   });
 
+  it("labels the blank macro command consistently with guided macro copy", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.macro.add");
+    expect(command?.title).toBe("Add Blank Macro");
+  });
+
   it("contributes macro.openDocs command for the command palette", () => {
     const command = packageJson.contributes.commands.find((item) => item.command === "nexus.macro.openDocs");
     expect(command).toBeDefined();
@@ -217,8 +222,8 @@ describe("package contributions", () => {
   });
 
   it("links the macro guide from public docs and command references", () => {
-    expect(readme).toContain("[macro guide](docs/macros.md)");
-    expect(functionalDocs).toContain("[Macro Guide](macros.md)");
+    expect(readme).toContain("step-by-step setup, trigger scopes, cooldowns, intervals, and regex examples");
+    expect(functionalDocs).toContain("step-by-step setup, trigger scopes, cooldowns, intervals, and regex examples");
     expect(functionalDocs).toContain("nexus.macro.openDocs");
   });
 

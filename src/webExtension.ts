@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { repositoryBlobUrl } from "./utils/repositoryLinks";
 
 class StaticTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   public constructor(private readonly label: string) {}
@@ -71,7 +72,6 @@ const unsupportedCommands = [
   "nexus.macro.editor",
   "nexus.macro.add",
   "nexus.macro.addFromTemplate",
-  "nexus.macro.openDocs",
   "nexus.macro.edit",
   "nexus.macro.remove",
   "nexus.macro.run",
@@ -145,8 +145,11 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     })
   );
+  const macroDocsCommand = vscode.commands.registerCommand("nexus.macro.openDocs", async () => {
+    await vscode.env.openExternal(vscode.Uri.parse(repositoryBlobUrl("docs/macros.md")));
+  });
 
-  context.subscriptions.push(commandCenterView, tunnelsView, fileExplorerView, ...commandRegistrations);
+  context.subscriptions.push(commandCenterView, tunnelsView, fileExplorerView, ...commandRegistrations, macroDocsCommand);
 }
 
 export function deactivate(): void {}

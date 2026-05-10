@@ -39,11 +39,13 @@ Built-in templates include:
 
 ## Sending Text and Newlines
 
-Macro text is sent exactly as saved.
+Macro text is sent exactly as saved. In examples, `\n` means an actual newline.
+In the Macro Editor, press Enter to create that newline; typing `\n` sends
+those two characters.
 
-- `show version\n` sends `show version` and presses Enter.
-- `configure terminal\ninterface gi0/1\n` sends two commands, each followed by
-  Enter.
+- `show version` followed by a new line sends `show version` and presses Enter.
+- `configure terminal` followed by a new line and then `interface gi0/1` sends
+  two commands when each line ends with Enter.
 - `admin` sends `admin` without pressing Enter.
 - A blank line in the editor is also sent as a newline.
 
@@ -78,6 +80,10 @@ Not protected:
 For secret auto-triggers, prefer **Active session** or **Matching profile** scope
 instead of **All terminals**.
 
+A host or background session can trigger a secret macro by printing text that
+matches the pattern. For passwords and tokens, use **Active session** or
+**Matching profile**, keep the regex narrow, and avoid **All terminals**.
+
 ## Keybindings
 
 Use **Assign Shortcut** from a macro's context menu to choose a shortcut. Nexus
@@ -103,10 +109,16 @@ regular expression. Nexus watches SSH and Serial terminal output, removes ANSI
 escape codes and most control characters, keeps a bounded tail buffer, and tests
 the trigger pattern against that buffer.
 
+Enter only the JavaScript regex pattern, without surrounding slashes or flags.
+Use `[Pp]assword:\s*$`, not `/password:\s*$/i`. Macro triggers do not have a
+separate flags field.
+
 Rules to keep in mind:
 
 - A pattern must not match the empty string.
-- Unsafe or invalid regex patterns are skipped.
+- Nexus rejects patterns that can match an empty string, are longer than the
+  allowed limit, or use risky shapes such as nested quantifiers like `(.*)+` or
+  repeated alternation like `(yes|no)*`.
 - Matching text is removed from the buffer after a match, even if cooldown stops
   the macro from firing. This prevents one prompt from repeatedly retriggering
   the same macro.
@@ -119,8 +131,10 @@ Each auto-trigger can be scoped.
 
 **All terminals**
 
-The compatibility default for older macros. Any Nexus terminal output can match
-the pattern. Use this for harmless, broad helpers only.
+The current default when no explicit trigger scope is set, kept for compatibility
+with older macros. Any Nexus terminal output can match the pattern. Use this for
+harmless, broad helpers only. For passwords, tokens, and other sensitive
+responses, choose **Active session** or **Matching profile** instead.
 
 **Active session**
 
