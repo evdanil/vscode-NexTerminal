@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.8.36] — 2026-05-10
+
+### Added
+
+- **First-time setup is now more guided.** Clean installs show direct welcome actions for adding a generic profile, SSH server, serial profile, scanning serial ports, browsing files, opening settings, and creating script or macro templates.
+- **Connection diagnostics are available before connecting.** SSH and serial profiles now have visible row/menu test-connection actions that report actionable success or failure details without starting a full terminal session.
+- **Starter templates are available for scripts and macros.** The Scripts and Macros views now include guided template entry points, with documentation refreshed for the new commands.
+
+### Changed
+
+- **Settings are reorganized for first-time users.** Security and backup-related settings are grouped under a clearer Security & Data area, and advanced profile fields are tucked behind advanced sections in the add profile flow.
+- **SFTP operations provide clearer progress and summaries.** Upload, download, and delete flows now report per-item progress, conflicts, skipped items, and failures more consistently.
+
+### Fixed
+
+- **Add Profile, Add SSH Server, and Add Serial Profile now open distinct add flows.** The generic action keeps the profile-type selector, while SSH and serial-specific actions open dedicated forms with the intended type selected.
+
 ## [2.8.26] — 2026-04-25
 
 ### Fixed

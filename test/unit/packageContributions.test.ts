@@ -64,6 +64,37 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.serial.testConnection");
   });
 
+  it("surfaces test connection actions in the Command Center row menus", () => {
+    const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+    expect(menuItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        command: "nexus.server.testConnection",
+        when: "view == nexusCommandCenter && viewItem == nexus.server",
+        group: "inline@2"
+      }),
+      expect.objectContaining({
+        command: "nexus.server.testConnection",
+        when: "view == nexusCommandCenter && viewItem == nexus.serverConnected",
+        group: "inline@3"
+      }),
+      expect.objectContaining({
+        command: "nexus.server.testConnection",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+        group: "0_connect@4"
+      }),
+      expect.objectContaining({
+        command: "nexus.serial.testConnection",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+        group: "inline@2"
+      }),
+      expect.objectContaining({
+        command: "nexus.serial.testConnection",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+        group: "0_connect@4"
+      })
+    ]));
+  });
+
   it("hides the tree-only profile quick action command from the command palette", () => {
     const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
     const item = paletteMenu.find((entry) => entry.command === "nexus.profile.actions");
