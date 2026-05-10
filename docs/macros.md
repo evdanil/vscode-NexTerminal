@@ -226,11 +226,12 @@ match in unrelated banners.
 ### Enable or Configuration Prompts
 
 ```regex
-^(?:enable|configure terminal)\?\s*\[yes/no\]:\s*$
+(?:^|\n)(?:enable|configure terminal)\?\s*\[yes/no\]:[ \t]*(?:\n|$)
 ```
 
-Why: anchors the whole prompt, allows only the expected command words, and
-requires the `[yes/no]:` shape.
+Why: anchors the prompt to a buffer or line boundary without requiring regex
+flags, allows only the expected command words, and requires the `[yes/no]:`
+shape.
 
 Risk: a broad pattern such as `yes/no` may match documentation, warnings, or
 command output instead of an interactive prompt.
@@ -238,11 +239,12 @@ command output instead of an interactive prompt.
 ### Interface Status Prompts
 
 ```regex
-^Interface\s+\S+\s+is\s+(?:administratively\s+)?down\s*$
+(?:^|\n)Interface\s+\S+\s+is\s+(?:administratively\s+)?down[ \t]*(?:\n|$)
 ```
 
-Why: matches a complete interface status line and handles both `down` and
-`administratively down`.
+Why: matches a complete interface status line at a buffer or line boundary and
+handles both `down` and `administratively down` without relying on multiline
+regex flags.
 
 Risk: if this macro sends a remediation command, scope it to a matching profile
 or active session. Interface status output is common and can appear during
@@ -263,11 +265,12 @@ paging with a command such as `terminal length 0` when appropriate.
 ### Error Banners
 
 ```regex
-^% ?(?:Error|Invalid input|Incomplete command)\b.*$
+(?:^|\n)% ?(?:Error|Invalid input|Incomplete command)\b[^\n]*(?:\n|$)
 ```
 
-Why: Cisco-style errors often start with `%`. The pattern anchors to the start of
-the line and lists specific error classes.
+Why: Cisco-style errors often start with `%`. The pattern anchors to a buffer or
+line boundary, lists specific error classes, and avoids relying on multiline
+regex flags.
 
 Risk: avoid triggering a macro that automatically retries the same failed
 command unless the retry condition is very specific. Otherwise you can create a

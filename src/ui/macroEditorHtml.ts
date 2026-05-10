@@ -65,8 +65,8 @@ export function renderMacroEditorHtml(
     ? `<div class="empty-state">
     <div class="empty-title">No macros yet</div>
     <div class="empty-actions">
-      <button type="button" class="btn-primary" id="empty-add-btn">Add Macro</button>
-      <button type="button" class="btn-secondary" id="empty-template-btn">Add From Template</button>
+      <button type="button" class="btn-primary" id="empty-add-btn">Add Blank Macro</button>
+      <button type="button" class="btn-secondary" id="empty-template-btn">Add Macro From Template</button>
     </div>
   </div>`
     : "";
@@ -148,7 +148,7 @@ export function renderMacroEditorHtml(
   <div class="form-group">
     <label for="macro-text">Text</label>
     <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">${escapeHtml(textValue)}</textarea>
-    <div class="hint">Each line is sent as a separate command. Press Enter in the textarea for newlines.</div>
+    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline.</div>
     <div class="field-error" id="error-text"></div>
   </div>
 
@@ -204,7 +204,7 @@ export function renderMacroEditorHtml(
   <div class="form-group">
     <label for="macro-interval">Trigger Interval (seconds)</label>
     <input type="number" id="macro-interval" value="${escapeHtml(String(intervalValue))}" min="1" max="86400" step="1" placeholder="Optional" />
-    <div class="hint">Optional scheduler for polling-style macros. Once the prompt matches again, the macro is armed and fires on this interval without extra user input.</div>
+    <div class="hint">After the trigger pattern matches, the macro sends once, then repeats on this interval without new terminal output.</div>
   </div>
 
   <div class="form-group form-group-checkbox">

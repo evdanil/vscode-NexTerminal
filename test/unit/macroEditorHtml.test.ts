@@ -26,7 +26,8 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("No macros yet");
     expect(html).toContain("empty-add-btn");
     expect(html).toContain("empty-template-btn");
-    expect(html).toContain("Add From Template");
+    expect(html).toContain("Add Blank Macro");
+    expect(html).toContain("Add Macro From Template");
   });
 
   it("routes empty-state actions through the dirty-discard guard", () => {
@@ -134,6 +135,15 @@ describe("renderMacroEditorHtml", () => {
     const html = render([], null);
     expect(html).toContain("macro-interval");
     expect(html).toContain("Trigger Interval");
+    expect(html).toContain("then repeats on this interval without new terminal output");
+    expect(html).not.toContain("Once the prompt matches again");
+  });
+
+  it("describes macro text as exact saved text", () => {
+    const html = render([], null);
+    expect(html).toContain("Text is sent exactly as saved");
+    expect(html).toContain("Press Enter in the textarea to include a newline");
+    expect(html).not.toContain("Each line is sent as a separate command");
   });
 
   it("shows current binding value when macro has keybinding", () => {
