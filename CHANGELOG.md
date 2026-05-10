@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.8.37] — 2026-05-10
+
+### Added
+
+- **A dedicated Macro Guide is now available from the extension and docs.** The new guide covers blank vs template macros, newlines, secret macro caveats, auto-trigger scope, cooldowns, intervals, pause/resume behavior, and practical JavaScript regex examples.
+- **Terminal Macros now expose a direct guide action.** The Macros view includes an **Open Macro Guide** action and welcome link, including a web-extension fallback that opens the guide externally.
+
+### Changed
+
+- **Macro creation labels now distinguish blank macros from templates.** The command, title-bar actions, empty state, selector, and editor button copy make it clearer when a user is starting from scratch versus a starter template.
+- **Macro editor help text is more explicit.** Hints now explain exact newline behavior, regex entry without `/slashes/` or flags, interval ownership, active-terminal start behavior, and safer regex alternatives for rejected patterns.
+- **Shared repository-link generation is reused for docs commands.** Script and macro documentation links now use the same helper instead of duplicating GitHub URL construction.
+
+### Fixed
+
+- **The password macro template now starts paused by default.** It stores no sample secret and cannot auto-send an empty response before the user enters, saves, and resumes the secret macro.
+- **Macro interval documentation now matches runtime behavior.** Interval macros start only from the active terminal, keep delayed sends on that same session, and do not send again until the pattern matches again.
+
 ## [2.8.36] — 2026-05-10
 
 ### Added
