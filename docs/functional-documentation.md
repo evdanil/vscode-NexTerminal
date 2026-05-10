@@ -153,7 +153,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 #### 4.9.1 Macro Templates
 - `Nexus: Add Macro From Template` opens a starter-template picker and then opens the Macro Editor on the created macro.
 - Built-in templates are **Send command**, **Send password when prompted**, **Wait and send confirmation**, and **Scoped auto-trigger example**.
-- The password template creates a secret macro with empty text, an active-session trigger scope, a password prompt pattern, and start-paused enabled. It does not include a sample password and will not auto-send before the user fills and resumes it.
+- The password template creates a secret macro with empty text, an active-session trigger scope, a password prompt pattern, and start-paused enabled. It stores no sample password; the user must enter and save the secret, then resume auto-trigger from the macros view before it can auto-send.
 - Auto-trigger templates default to active-session scope so generated macros react only to the active terminal unless the user changes the scope.
 
 ### 4.10 Configuration Export/Import
