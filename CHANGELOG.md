@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.8.38] — 2026-05-11
+
 ### Fixed
 
 - **Test Connection icon is no longer shown on connected SSH and serial profiles.** The inline and context-menu test actions are hidden once a profile has an active session — testing is redundant when the connection is already established.
