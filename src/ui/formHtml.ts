@@ -173,6 +173,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
     ${fieldsHtml}
     <div class="actions">
       <button type="submit" class="btn-primary">Save</button>
+      ${definition.testable ? '<button type="button" class="btn-secondary" id="test-btn">Test Connection</button>' : ""}
       <button type="button" class="btn-secondary" id="cancel-btn">Cancel</button>
     </div>
   </form>
@@ -261,6 +262,26 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       document.getElementById("cancel-btn").addEventListener("click", function() {
         vscode.postMessage({ type: "cancel" });
       });
+
+      var testBtn = document.getElementById("test-btn");
+      if (testBtn) {
+        testBtn.addEventListener("click", function() {
+          var values = {};
+          for (var i = 0; i < form.elements.length; i++) {
+            var el = form.elements[i];
+            if (el.disabled) continue;
+            if (!el.name) continue;
+            if (el.type === "checkbox") {
+              values[el.name] = el.checked;
+            } else if (el.type === "number") {
+              values[el.name] = el.value === "" ? undefined : Number(el.value);
+            } else {
+              values[el.name] = el.value;
+            }
+          }
+          vscode.postMessage({ type: "test", values: values });
+        });
+      }
 
       var browseBtns = document.querySelectorAll(".browse-btn");
       for (var bi = 0; bi < browseBtns.length; bi++) {

@@ -40,6 +40,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   const snapshot = ctx.core.getSnapshot();
   const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
   const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles);
+  definition.testable = true;
   const inlineAuthProfile = createInlineAuthProfileCreation(ctx);
   const panel = WebviewFormPanel.open(unifiedProfileFormId(seed), definition, {
     onSubmit: async (values: FormValues) => {
@@ -74,6 +75,23 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         authType: profile.authType,
         ...(profile.keyPath ? { keyPath: profile.keyPath } : {})
       };
+    },
+    onTest: async (values: FormValues) => {
+      if (values.profileType === "serial") {
+        const draft = formValuesToSerial(values);
+        if (!draft) {
+          void vscode.window.showWarningMessage("Fill in the required serial fields (Name, Port) before testing.");
+          return;
+        }
+        await vscode.commands.executeCommand("nexus.serial.testConnection", { profile: draft });
+      } else {
+        const draft = formValuesToServer(values);
+        if (!draft) {
+          void vscode.window.showWarningMessage("Fill in the required fields (Name, Host, Username) before testing.");
+          return;
+        }
+        await vscode.commands.executeCommand("nexus.server.testConnection", { server: draft });
+      }
     }
   });
   inlineAuthProfile.attachPanel(panel);

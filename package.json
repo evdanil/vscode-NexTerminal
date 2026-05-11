@@ -824,11 +824,6 @@
           "group": "inline@2"
         },
         {
-          "command": "nexus.server.testConnection",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
-          "group": "inline@3"
-        },
-        {
           "command": "nexus.server.disconnect",
           "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
           "group": "inline"
@@ -860,7 +855,7 @@
         },
         {
           "command": "nexus.server.testConnection",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem == nexus.server",
           "group": "0_connect@4"
         },
         {
@@ -965,7 +960,7 @@
         },
         {
           "command": "nexus.serial.testConnection",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/",
           "group": "inline@2"
         },
         {
@@ -1005,7 +1000,7 @@
         },
         {
           "command": "nexus.serial.testConnection",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/",
           "group": "0_connect@4"
         },
         {

@@ -78,25 +78,30 @@ describe("package contributions", () => {
       }),
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem == nexus.serverConnected",
-        group: "inline@3"
-      }),
-      expect.objectContaining({
-        command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+        when: "view == nexusCommandCenter && viewItem == nexus.server",
         group: "0_connect@4"
       }),
       expect.objectContaining({
         command: "nexus.serial.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/",
         group: "inline@2"
       }),
       expect.objectContaining({
         command: "nexus.serial.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/",
         group: "0_connect@4"
       })
     ]));
+  });
+
+  it("does not show test connection for connected SSH or serial profiles", () => {
+    const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+    const serverTestItems = menuItems.filter((item) => item.command === "nexus.server.testConnection");
+    const serialTestItems = menuItems.filter((item) => item.command === "nexus.serial.testConnection");
+    // No SSH test connection entry should reference nexus.serverConnected
+    expect(serverTestItems.every((item) => !item.when?.includes("nexus.serverConnected"))).toBe(true);
+    // No serial test connection entry should reference nexus.serialProfileConnected
+    expect(serialTestItems.every((item) => !item.when?.includes("Connected"))).toBe(true);
   });
 
   it("hides the tree-only profile quick action command from the command palette", () => {

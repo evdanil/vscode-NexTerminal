@@ -26,6 +26,8 @@ export type FormFieldDescriptor =
 export interface FormDefinition {
   title: string;
   fields: FormFieldDescriptor[];
+  /** When true, a "Test Connection" button is rendered in the form footer. */
+  testable?: boolean;
 }
 
 export type FormValues = Record<string, string | number | boolean | undefined>;
@@ -36,7 +38,8 @@ export type FormMessage =
   | { type: "browse"; key: string }
   | { type: "scan"; key: string }
   | { type: "createInline"; key: string }
-  | { type: "autofill"; key: string; value: string };
+  | { type: "autofill"; key: string; value: string }
+  | { type: "test"; values: FormValues };
 
 export type ExtensionMessage =
   | { type: "init"; definition: FormDefinition; values: FormValues }

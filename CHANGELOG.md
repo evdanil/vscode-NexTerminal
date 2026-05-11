@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Test Connection icon is no longer shown on connected SSH and serial profiles.** The inline and context-menu test actions are hidden once a profile has an active session — testing is redundant when the connection is already established.
+- **Profile creation forms now include a Test Connection button.** Clicking "Test Connection" in the Add SSH Server or Add Profile form runs the same connection test against the in-progress (unsaved) profile data, allowing verification before saving.
+
 ## [2.8.37] — 2026-05-10
 
 ### Added
