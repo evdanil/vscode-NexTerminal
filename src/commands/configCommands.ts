@@ -509,11 +509,22 @@ export function sanitizeForSharing(
   servers: ServerConfig[],
   tunnels: TunnelProfile[],
   serialProfiles: SerialProfile[],
-  localShellProfiles: LocalShellProfile[],
-  settings: Record<string, unknown>,
-  authProfiles: AuthProfile[] = [],
-  macros: TerminalMacro[] = []
+  localShellProfilesOrSettings: LocalShellProfile[] | Record<string, unknown>,
+  settingsOrAuthProfiles: Record<string, unknown> | AuthProfile[] = {},
+  authProfilesOrMacros: AuthProfile[] | TerminalMacro[] = [],
+  macrosArg: TerminalMacro[] = []
 ): SanitizedSnapshot {
+  const hasLocalShellProfilesArg = Array.isArray(localShellProfilesOrSettings);
+  const localShellProfiles = hasLocalShellProfilesArg ? localShellProfilesOrSettings : [];
+  const settings = hasLocalShellProfilesArg
+    ? (settingsOrAuthProfiles as Record<string, unknown>)
+    : localShellProfilesOrSettings;
+  const authProfiles = hasLocalShellProfilesArg
+    ? (authProfilesOrMacros as AuthProfile[])
+    : (Array.isArray(settingsOrAuthProfiles) ? settingsOrAuthProfiles : []);
+  const macros = hasLocalShellProfilesArg
+    ? macrosArg
+    : (authProfilesOrMacros as TerminalMacro[]);
   const idMap = new Map<string, string>();
 
   // First pass: assign new IDs for auth profiles

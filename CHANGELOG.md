@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.40] — 2026-05-13
+
+### Fixed
+
+- **Release builds no longer fail while sanitizing share exports from older callers.** `sanitizeForSharing` accepts both the pre-Local Shell argument shape and the new Local Shell-aware shape.
+
 ## [2.8.39] — 2026-05-13
 
 ### Added
