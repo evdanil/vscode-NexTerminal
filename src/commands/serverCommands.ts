@@ -112,6 +112,13 @@ function collectGroups(ctx: CommandContext): string[] {
       }
     }
   }
+  for (const profile of snapshot.localShellProfiles) {
+    if (profile.group) {
+      for (const ancestor of getAncestorPaths(profile.group)) {
+        groups.add(ancestor);
+      }
+    }
+  }
   return [...groups].sort((a, b) => a.localeCompare(b));
 }
 

@@ -102,6 +102,7 @@ describe("renderFormHtml", () => {
           key: "group",
           label: "Group",
           suggestions: ["Dev", "Prod"],
+          required: true,
           placeholder: "Pick or type...",
           value: "Dev"
         }
@@ -110,6 +111,8 @@ describe("renderFormHtml", () => {
     const html = renderFormHtml(definition);
     expect(html).toContain("custom-combobox");
     expect(html).toContain('autocomplete="off"');
+    expect(html).toContain('name="group"');
+    expect(html).toContain("required");
     expect(html).toContain("custom-select-option");
     expect(html).toContain("Dev");
     expect(html).toContain("Prod");
@@ -151,6 +154,32 @@ describe("renderFormHtml", () => {
     expect(html).toContain("data-visible-when=");
     expect(html).toContain("profileType");
     expect(html).toContain("ssh");
+  });
+
+  it("renders conditional visibility on the test button", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "profileType",
+          label: "Type",
+          options: [
+            { label: "SSH", value: "ssh" },
+            { label: "Local Shell", value: "localShell" }
+          ],
+          value: "ssh"
+        }
+      ],
+      testable: true,
+      testableWhen: { field: "profileType", value: ["ssh"] }
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain('id="test-btn"');
+    expect(html).toContain(".actions button[data-visible-when]");
+    expect(html).toContain("group.disabled = !visible");
+    expect(html).toContain('&quot;field&quot;:&quot;profileType&quot;');
+    expect(html).toContain('&quot;value&quot;:[&quot;ssh&quot;]');
   });
 
   it("groups advanced fields behind a details summary", () => {

@@ -1,4 +1,4 @@
-import type { AuthProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
+import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
 import { resolveTunnelType } from "../models/config";
 import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhen, VisibleWhenCondition } from "./formTypes";
@@ -136,13 +136,104 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
   ];
 }
 
+function localShellVisibleWhen(vw: VisibleWhen | undefined, field: string, value: string): VisibleWhen {
+  const inner: VisibleWhenCondition = { field, value };
+  if (!vw) return inner;
+  return [...(Array.isArray(vw) ? vw : [vw]), inner];
+}
+
+interface LocalShellFormOptions {
+  vscodeTerminalProfileNames?: string[];
+}
+
+function localShellFields(
+  seed?: Partial<LocalShellProfile>,
+  vw?: VisibleWhen,
+  options: LocalShellFormOptions = {}
+): FormFieldDescriptor[] {
+  const launchMode = seed?.launchMode ?? "custom";
+  return [
+    {
+      type: "select",
+      key: "launchMode",
+      label: "Launch Mode",
+      options: [
+        { label: "VS Code Profile", value: "vscodeProfile" },
+        { label: "Custom Shell", value: "custom" }
+      ],
+      value: launchMode,
+      visibleWhen: vw
+    },
+    {
+      type: "combobox",
+      key: "vscodeProfileName",
+      label: "VS Code Profile Name",
+      suggestions: options.vscodeTerminalProfileNames ?? [],
+      required: true,
+      placeholder: "Select a VS Code terminal profile",
+      value: seed?.vscodeProfileName ?? "",
+      hint: "Pick a saved VS Code terminal profile available to Nexus, or use Custom Shell.",
+      visibleWhen: localShellVisibleWhen(vw, "launchMode", "vscodeProfile")
+    },
+    {
+      type: "text",
+      key: "shellPath",
+      label: "Shell Path",
+      required: true,
+      placeholder: "/bin/bash or C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      value: seed?.shellPath ?? "",
+      hint: "For WSL on Windows, use C:\\Windows\\System32\\wsl.exe and set distro options in Arguments.",
+      visibleWhen: localShellVisibleWhen(vw, "launchMode", "custom")
+    },
+    {
+      type: "textarea",
+      key: "shellArgs",
+      label: "Arguments",
+      placeholder: "--login\n-i",
+      value: (seed?.shellArgs ?? []).join("\n"),
+      rows: 4,
+      hint: "Enter one argument per line. For WSL distro selection, use -d on one line and the distro name on the next.",
+      visibleWhen: localShellVisibleWhen(vw, "launchMode", "custom")
+    },
+    {
+      type: "text",
+      key: "cwd",
+      label: "Working Directory",
+      placeholder: "${workspaceFolder} or ~",
+      value: seed?.cwd ?? "",
+      hint: "Optional startup directory. VS Code resolves common terminal variables such as workspace folder and home; source/autodetected VS Code profiles may ignore this.",
+      advanced: true,
+      visibleWhen: vw
+    },
+    {
+      type: "textarea",
+      key: "startupCommand",
+      label: "Startup Command",
+      placeholder: "npm run dev",
+      value: seed?.startupCommand ?? "",
+      rows: 3,
+      hint: "Optional text sent to the terminal after it opens.",
+      advanced: true,
+      visibleWhen: vw
+    }
+  ];
+}
+
 function sharedTrailingFields(
   seed?: { logSession?: boolean; group?: string },
   existingGroups?: string[],
-  defaultLogSession = true
+  defaultLogSession = true,
+  logSessionVisibleWhen?: VisibleWhen
 ): FormFieldDescriptor[] {
   return [
-    { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.logSession ?? defaultLogSession, advanced: true },
+    {
+      type: "checkbox",
+      key: "logSession",
+      label: "Log session transcript",
+      value: seed?.logSession ?? defaultLogSession,
+      advanced: true,
+      visibleWhen: logSessionVisibleWhen
+    },
     {
       type: "combobox",
       key: "group",
@@ -245,7 +336,7 @@ export function serverFormDefinition(
   const isEdit = Boolean(seed?.id);
 
   return {
-    title: isEdit ? "Edit Server" : "Add Server",
+    title: isEdit ? "Edit SSH Server Profile" : "Add SSH Server Profile",
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
       authProfileSelectField(authProfiles, undefined, seed?.authProfileId),
@@ -356,10 +447,27 @@ export function serialFormDefinition(
   };
 }
 
-export type UnifiedProfileAddMode = "profile" | "ssh" | "serial";
+export function localShellFormDefinition(
+  seed?: Partial<LocalShellProfile>,
+  existingGroups?: string[],
+  options?: LocalShellFormOptions
+): FormDefinition {
+  const isEdit = Boolean(seed?.id);
+
+  return {
+    title: isEdit ? "Edit Local Shell Profile" : "Add Local Shell Profile",
+    fields: [
+      { type: "text", key: "name", label: "Name", required: true, placeholder: "Local Shell Profile", value: seed?.name },
+      ...localShellFields(seed, undefined, options),
+      ...sharedTrailingFields(seed, existingGroups, false).filter((field) => !("key" in field) || field.key !== "logSession")
+    ]
+  };
+}
+
+export type UnifiedProfileAddMode = "profile" | "ssh" | "serial" | "localShell";
 
 export interface UnifiedProfileSeed {
-  profileType?: "ssh" | "serial";
+  profileType?: "ssh" | "serial" | "localShell";
   group?: string;
   addMode?: UnifiedProfileAddMode;
 }
@@ -374,6 +482,8 @@ export function unifiedProfileFormId(seed?: UnifiedProfileSeed): string {
       return "server-add";
     case "serial":
       return "serial-add";
+    case "localShell":
+      return "local-shell-add";
     case "profile":
       return "profile-add";
   }
@@ -382,19 +492,24 @@ export function unifiedProfileFormId(seed?: UnifiedProfileSeed): string {
 function unifiedProfileFormTitle(seed?: UnifiedProfileSeed): string {
   switch (normalizedUnifiedProfileMode(seed)) {
     case "ssh":
-      return "Add SSH Server";
+      return "Add SSH Server Profile";
     case "serial":
       return "Add Serial Profile";
+    case "localShell":
+      return "Add Local Shell Profile";
     case "profile":
       return "Add Profile";
   }
 }
 
-function unifiedProfileTypeValue(seed?: UnifiedProfileSeed): "ssh" | "serial" {
+function unifiedProfileTypeValue(seed?: UnifiedProfileSeed): "ssh" | "serial" | "localShell" {
   if (seed?.profileType) {
     return seed.profileType;
   }
-  return normalizedUnifiedProfileMode(seed) === "serial" ? "serial" : "ssh";
+  const mode = normalizedUnifiedProfileMode(seed);
+  if (mode === "serial") return "serial";
+  if (mode === "localShell") return "localShell";
+  return "ssh";
 }
 
 function unifiedProfileTypeField(seed?: UnifiedProfileSeed): FormFieldDescriptor {
@@ -407,8 +522,9 @@ function unifiedProfileTypeField(seed?: UnifiedProfileSeed): FormFieldDescriptor
     key: "profileType",
     label: "Profile Type",
     options: [
-      { label: "SSH Server", value: "ssh" },
-      { label: "Serial Port", value: "serial" }
+      { label: "SSH Server Profile", value: "ssh" },
+      { label: "Serial Profile", value: "serial" },
+      { label: "Local Shell Profile", value: "localShell" }
     ],
     value
   };
@@ -419,10 +535,22 @@ export function unifiedProfileFormDefinition(
   existingGroups?: string[],
   defaultLogSession = true,
   servers?: ServerListEntry[],
-  authProfiles?: AuthProfile[]
+  authProfiles?: AuthProfile[],
+  localShellOptions?: LocalShellFormOptions
 ): FormDefinition {
   const sshVw: VisibleWhenCondition = { field: "profileType", value: "ssh" };
   const serialVw: VisibleWhenCondition = { field: "profileType", value: "serial" };
+  const localShellVw: VisibleWhenCondition = { field: "profileType", value: "localShell" };
+  const mode = normalizedUnifiedProfileMode(seed);
+  const sharedFields = mode === "localShell"
+    ? sharedTrailingFields({ group: seed?.group }, existingGroups, defaultLogSession)
+      .filter((field) => !("key" in field) || field.key !== "logSession")
+    : sharedTrailingFields(
+      { group: seed?.group },
+      existingGroups,
+      defaultLogSession,
+      mode === "profile" ? { field: "profileType", value: ["ssh", "serial"] } : undefined
+    );
 
   return {
     title: unifiedProfileFormTitle(seed),
@@ -433,7 +561,8 @@ export function unifiedProfileFormDefinition(
       ...sshFields(undefined, sshVw),
       ...proxyFields(undefined, servers, sshVw),
       ...serialFields(undefined, serialVw),
-      ...sharedTrailingFields({ group: seed?.group }, existingGroups, defaultLogSession)
+      ...localShellFields(undefined, localShellVw, localShellOptions),
+      ...sharedFields
     ]
   };
 }

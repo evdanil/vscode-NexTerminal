@@ -1,8 +1,10 @@
 import type {
+  ActiveLocalShellSession,
   ActiveSerialSession,
   ActiveSession,
   ActiveTunnel,
   AuthProfile,
+  LocalShellProfile,
   SerialProfile,
   ServerConfig,
   TunnelProfile,
@@ -18,8 +20,10 @@ export class NexusCore {
   private readonly servers = new Map<string, ServerConfig>();
   private readonly tunnels = new Map<string, TunnelProfile>();
   private readonly serialProfiles = new Map<string, SerialProfile>();
+  private readonly localShellProfiles = new Map<string, LocalShellProfile>();
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly activeSerialSessions = new Map<string, ActiveSerialSession>();
+  private readonly activeLocalShellSessions = new Map<string, ActiveLocalShellSession>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
   private readonly activitySessionIds = new Set<string>();
   private focusedSessionId: string | undefined = undefined;
@@ -30,16 +34,18 @@ export class NexusCore {
   public constructor(private readonly repository: ConfigRepository) {}
 
   public async initialize(): Promise<void> {
-    const [servers, tunnels, serialProfiles, groups, authProfiles] = await Promise.all([
+    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles] = await Promise.all([
       this.repository.getServers(),
       this.repository.getTunnels(),
       this.repository.getSerialProfiles(),
+      this.repository.getLocalShellProfiles(),
       this.repository.getGroups(),
       this.repository.getAuthProfiles()
     ]);
     this.servers.clear();
     this.tunnels.clear();
     this.serialProfiles.clear();
+    this.localShellProfiles.clear();
     this.explicitGroups.clear();
     this.authProfiles.clear();
     for (const server of servers) {
@@ -50,6 +56,9 @@ export class NexusCore {
     }
     for (const profile of serialProfiles) {
       this.serialProfiles.set(profile.id, profile);
+    }
+    for (const profile of localShellProfiles) {
+      this.localShellProfiles.set(profile.id, profile);
     }
     for (const group of groups) {
       this.explicitGroups.add(group);
@@ -65,8 +74,10 @@ export class NexusCore {
       servers: [...this.servers.values()],
       tunnels: [...this.tunnels.values()],
       serialProfiles: [...this.serialProfiles.values()],
+      localShellProfiles: [...this.localShellProfiles.values()],
       activeSessions: [...this.activeSessions.values()],
       activeSerialSessions: [...this.activeSerialSessions.values()],
+      activeLocalShellSessions: [...this.activeLocalShellSessions.values()],
       activeTunnels: [...this.activeTunnels.values()],
       remoteTunnels: [...this.remoteTunnels],
       explicitGroups: [...this.explicitGroups],
@@ -91,6 +102,10 @@ export class NexusCore {
 
   public getSerialProfile(id: string): SerialProfile | undefined {
     return this.serialProfiles.get(id);
+  }
+
+  public getLocalShellProfile(id: string): LocalShellProfile | undefined {
+    return this.localShellProfiles.get(id);
   }
 
   public getAuthProfile(id: string): AuthProfile | undefined {
@@ -137,6 +152,15 @@ export class NexusCore {
     return false;
   }
 
+  public isLocalShellProfileConnected(profileId: string): boolean {
+    for (const session of this.activeLocalShellSessions.values()) {
+      if (session.profileId === profileId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   public async addOrUpdateServer(server: ServerConfig): Promise<void> {
     this.servers.set(server.id, server);
     await this.repository.saveServers([...this.servers.values()]);
@@ -162,10 +186,23 @@ export class NexusCore {
     this.emitChanged();
   }
 
+  public async addOrUpdateLocalShellProfile(profile: LocalShellProfile): Promise<void> {
+    this.localShellProfiles.set(profile.id, profile);
+    await this.repository.saveLocalShellProfiles([...this.localShellProfiles.values()]);
+    this.emitChanged();
+  }
+
   public async removeSerialProfile(profileId: string): Promise<void> {
     this.serialProfiles.delete(profileId);
     this.removeSerialProfileSessions(profileId);
     await this.repository.saveSerialProfiles([...this.serialProfiles.values()]);
+    this.emitChanged();
+  }
+
+  public async removeLocalShellProfile(profileId: string): Promise<void> {
+    this.localShellProfiles.delete(profileId);
+    this.removeLocalShellProfileSessions(profileId);
+    await this.repository.saveLocalShellProfiles([...this.localShellProfiles.values()]);
     this.emitChanged();
   }
 
@@ -190,12 +227,26 @@ export class NexusCore {
     this.emitChanged();
   }
 
+  public registerLocalShellSession(session: ActiveLocalShellSession): void {
+    this.activeLocalShellSessions.set(session.id, session);
+    this.emitChanged();
+  }
+
   /**
    * Returns the active SSH or serial session with the given id.
    * Callers use this to resolve the {@link SessionPtyHandle} for output observation / input locking.
    */
   public getActiveSessionById(sessionId: string): ActiveSession | ActiveSerialSession | undefined {
     return this.activeSessions.get(sessionId) ?? this.activeSerialSessions.get(sessionId);
+  }
+
+  public unregisterLocalShellSession(sessionId: string): void {
+    if (this.focusedSessionId === sessionId) {
+      this.focusedSessionId = undefined;
+    }
+    this.activeLocalShellSessions.delete(sessionId);
+    this.activitySessionIds.delete(sessionId);
+    this.emitChanged();
   }
 
   public unregisterSerialSession(sessionId: string): void {
@@ -333,6 +384,12 @@ export class NexusCore {
           this.removeSerialProfileSessions(id);
         }
       }
+      for (const [id, profile] of this.localShellProfiles.entries()) {
+        if (profile.group && isDescendantOrSelf(profile.group, path)) {
+          this.localShellProfiles.delete(id);
+          this.removeLocalShellProfileSessions(id);
+        }
+      }
     } else {
       for (const server of this.servers.values()) {
         if (server.group && isDescendantOrSelf(server.group, path)) {
@@ -341,6 +398,12 @@ export class NexusCore {
         }
       }
       for (const profile of this.serialProfiles.values()) {
+        if (profile.group && isDescendantOrSelf(profile.group, path)) {
+          const suffix = profile.group.slice(path.length);
+          profile.group = parent ? parent + suffix : suffix.slice(1) || undefined;
+        }
+      }
+      for (const profile of this.localShellProfiles.values()) {
         if (profile.group && isDescendantOrSelf(profile.group, path)) {
           const suffix = profile.group.slice(path.length);
           profile.group = parent ? parent + suffix : suffix.slice(1) || undefined;
@@ -366,14 +429,16 @@ export class NexusCore {
     await Promise.all([
       this.repository.saveServers([...this.servers.values()]),
       this.repository.saveSerialProfiles([...this.serialProfiles.values()]),
+      this.repository.saveLocalShellProfiles([...this.localShellProfiles.values()]),
       this.repository.saveGroups([...this.explicitGroups])
     ]);
     this.emitChanged();
   }
 
-  public getItemsInFolder(path: string, recursive: boolean): { servers: ServerConfig[]; serialProfiles: SerialProfile[] } {
+  public getItemsInFolder(path: string, recursive: boolean): { servers: ServerConfig[]; serialProfiles: SerialProfile[]; localShellProfiles: LocalShellProfile[] } {
     const servers: ServerConfig[] = [];
     const profiles: SerialProfile[] = [];
+    const localShellProfiles: LocalShellProfile[] = [];
     for (const server of this.servers.values()) {
       if (!server.group) {
         continue;
@@ -390,7 +455,15 @@ export class NexusCore {
         profiles.push(profile);
       }
     }
-    return { servers, serialProfiles: profiles };
+    for (const profile of this.localShellProfiles.values()) {
+      if (!profile.group) {
+        continue;
+      }
+      if (recursive ? isDescendantOrSelf(profile.group, path) : profile.group === path) {
+        localShellProfiles.push(profile);
+      }
+    }
+    return { servers, serialProfiles: profiles, localShellProfiles };
   }
 
   private async _renameFolderPath(oldPath: string, newPath: string): Promise<void> {
@@ -421,10 +494,16 @@ export class NexusCore {
         profile.group = newPath + profile.group.slice(oldPath.length);
       }
     }
+    for (const profile of this.localShellProfiles.values()) {
+      if (profile.group && isDescendantOrSelf(profile.group, oldPath)) {
+        profile.group = newPath + profile.group.slice(oldPath.length);
+      }
+    }
 
     await Promise.all([
       this.repository.saveServers([...this.servers.values()]),
       this.repository.saveSerialProfiles([...this.serialProfiles.values()]),
+      this.repository.saveLocalShellProfiles([...this.localShellProfiles.values()]),
       this.repository.saveGroups([...this.explicitGroups])
     ]);
     this.emitChanged();
@@ -438,7 +517,7 @@ export class NexusCore {
   }
 
   private hasSession(sessionId: string): boolean {
-    return this.activeSessions.has(sessionId) || this.activeSerialSessions.has(sessionId);
+    return this.activeSessions.has(sessionId) || this.activeSerialSessions.has(sessionId) || this.activeLocalShellSessions.has(sessionId);
   }
 
   private removeServerSessions(serverId: string): void {
@@ -460,6 +539,18 @@ export class NexusCore {
           this.focusedSessionId = undefined;
         }
         this.activeSerialSessions.delete(sessionId);
+        this.activitySessionIds.delete(sessionId);
+      }
+    }
+  }
+
+  private removeLocalShellProfileSessions(profileId: string): void {
+    for (const [sessionId, session] of this.activeLocalShellSessions.entries()) {
+      if (session.profileId === profileId) {
+        if (this.focusedSessionId === sessionId) {
+          this.focusedSessionId = undefined;
+        }
+        this.activeLocalShellSessions.delete(sessionId);
         this.activitySessionIds.delete(sessionId);
       }
     }

@@ -49,6 +49,27 @@ describe("sessionTerminalFocus", () => {
     expect(terminal.show).toHaveBeenCalledTimes(1);
   });
 
+  it("focuses a local shell terminal without requiring activity tracking", () => {
+    const terminal = { show: vi.fn() };
+    const clearSessionActivity = vi.fn();
+
+    const focused = focusSessionTerminal(
+      {
+        core: { clearSessionActivity },
+        sessionTerminals: new Map(),
+        serialTerminals: new Map(),
+        localShellTerminals: new Map([["local-1", { terminal: terminal as any }]]),
+        activityIndicators: new Map()
+      },
+      "local-1",
+      "localShell"
+    );
+
+    expect(focused).toBe(true);
+    expect(clearSessionActivity).toHaveBeenCalledWith("local-1");
+    expect(terminal.show).toHaveBeenCalledTimes(1);
+  });
+
   it("does nothing when the session terminal is missing", () => {
     const clearSessionActivity = vi.fn();
     const setActivityIndicator = vi.fn();

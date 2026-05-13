@@ -25,6 +25,17 @@ describe("NexusCore", () => {
           remotePort: 5432,
           autoStart: false
         }
+      ],
+      [],
+      [],
+      [],
+      [
+        {
+          id: "local-1",
+          name: "Local Dev",
+          launchMode: "custom",
+          shellPath: "/bin/bash"
+        }
       ]
     );
     const core = new NexusCore(repository);
@@ -34,6 +45,42 @@ describe("NexusCore", () => {
 
     expect(snapshot.servers).toHaveLength(1);
     expect(snapshot.tunnels).toHaveLength(1);
+    expect(snapshot.localShellProfiles).toHaveLength(1);
+  });
+
+  it("persists local shell profiles and tracks multiple sessions per profile", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addOrUpdateLocalShellProfile({
+      id: "local-1",
+      name: "Local Dev",
+      launchMode: "custom",
+      shellPath: "/bin/bash",
+      group: "Labs"
+    });
+    core.registerLocalShellSession({
+      id: "local-session-1",
+      profileId: "local-1",
+      terminalName: "Nexus Local Shell: Local Dev",
+      startedAt: Date.now()
+    });
+    core.registerLocalShellSession({
+      id: "local-session-2",
+      profileId: "local-1",
+      terminalName: "Nexus Local Shell: Local Dev",
+      startedAt: Date.now()
+    });
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.localShellProfiles).toHaveLength(1);
+    expect(snapshot.activeLocalShellSessions).toHaveLength(2);
+    expect(core.isLocalShellProfileConnected("local-1")).toBe(true);
+
+    await core.removeLocalShellProfile("local-1");
+    expect(core.getSnapshot().localShellProfiles).toHaveLength(0);
+    expect(core.getSnapshot().activeLocalShellSessions).toHaveLength(0);
   });
 
   it("persists server CRUD and tracks sessions", async () => {

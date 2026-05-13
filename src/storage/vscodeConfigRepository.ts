@@ -1,11 +1,12 @@
 import * as vscode from "vscode";
-import type { AuthProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
+import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
 import type { ConfigRepository } from "../core/contracts";
-import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateAuthProfile } from "../utils/validation";
+import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateAuthProfile, validateLocalShellProfile } from "../utils/validation";
 
 const SERVERS_KEY = "nexus.servers";
 const TUNNELS_KEY = "nexus.tunnels";
 const SERIAL_PROFILES_KEY = "nexus.serialProfiles";
+const LOCAL_SHELL_PROFILES_KEY = "nexus.localShellProfiles";
 const GROUPS_KEY = "nexus.groups";
 const AUTH_PROFILES_KEY = "nexus.authProfiles";
 
@@ -55,6 +56,21 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async saveSerialProfiles(profiles: SerialProfile[]): Promise<void> {
     await this.context.globalState.update(SERIAL_PROFILES_KEY, profiles);
+  }
+
+  public async getLocalShellProfiles(): Promise<LocalShellProfile[]> {
+    const raw = this.context.globalState.get<LocalShellProfile[]>(LOCAL_SHELL_PROFILES_KEY, []);
+    return raw.filter((item) => {
+      if (validateLocalShellProfile(item)) {
+        return true;
+      }
+      console.warn("[Nexus] Skipping invalid local shell profile entry:", JSON.stringify(item));
+      return false;
+    });
+  }
+
+  public async saveLocalShellProfiles(profiles: LocalShellProfile[]): Promise<void> {
+    await this.context.globalState.update(LOCAL_SHELL_PROFILES_KEY, profiles);
   }
 
   public async getGroups(): Promise<string[]> {

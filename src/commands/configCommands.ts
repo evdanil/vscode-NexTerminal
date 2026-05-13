@@ -3,7 +3,7 @@ import { chmod } from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
-import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
+import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
 import type { SecretVault } from "../services/ssh/contracts";
 import {
@@ -23,7 +23,7 @@ import {
   type ImportParseResult,
   type SecureCrtFileEntry
 } from "../utils/securecrtParser";
-import { validateServerConfig, validateTunnelProfile, validateSerialProfile } from "../utils/validation";
+import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateLocalShellProfile } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import { getMacros, saveMacros, getActiveMacroStore } from "../macroSettings";
 import { validateSettingUpdate } from "../ui/settingsValidation";
@@ -52,6 +52,7 @@ interface NexusConfigExport {
   servers?: ServerConfig[];
   tunnels?: TunnelProfile[];
   serialProfiles?: SerialProfile[];
+  localShellProfiles?: LocalShellProfile[];
   authProfiles?: AuthProfile[];
   groups?: string[];
   macros?: TerminalMacro[]; // Non-secret fields; secret macros carry `text: ""`
@@ -452,7 +453,7 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
     return false;
   }
   const obj = data as Record<string, unknown>;
-  const profileArrayKeys = ["servers", "tunnels", "serialProfiles", "authProfiles", "macros"] as const;
+  const profileArrayKeys = ["servers", "tunnels", "serialProfiles", "localShellProfiles", "authProfiles", "macros"] as const;
   for (const key of profileArrayKeys) {
     const value = obj[key];
     if (value !== undefined && !Array.isArray(value)) {
@@ -482,6 +483,7 @@ interface SanitizedSnapshot {
   servers: ServerConfig[];
   tunnels: TunnelProfile[];
   serialProfiles: SerialProfile[];
+  localShellProfiles: LocalShellProfile[];
   authProfiles: AuthProfile[];
   macros: TerminalMacro[];
   settings: Record<string, unknown>;
@@ -507,6 +509,7 @@ export function sanitizeForSharing(
   servers: ServerConfig[],
   tunnels: TunnelProfile[],
   serialProfiles: SerialProfile[],
+  localShellProfiles: LocalShellProfile[],
   settings: Record<string, unknown>,
   authProfiles: AuthProfile[] = [],
   macros: TerminalMacro[] = []
@@ -556,6 +559,17 @@ export function sanitizeForSharing(
     return { ...p, id: newId, deviceHint: undefined };
   });
 
+  const newLocalShellProfiles = localShellProfiles.map((p) => {
+    const newId = randomUUID();
+    idMap.set(p.id, newId);
+    return {
+      ...p,
+      id: newId,
+      cwd: undefined,
+      startupCommand: undefined
+    };
+  });
+
   const sanitizedMacros = macros
     .filter((m) => !m.secret)
     .map((m) => ({ ...m, id: randomUUID() })); // fresh ids for share exports
@@ -570,6 +584,7 @@ export function sanitizeForSharing(
     servers: newServers,
     tunnels: newTunnels,
     serialProfiles: newSerialProfiles,
+    localShellProfiles: newLocalShellProfiles,
     authProfiles: newAuthProfiles,
     macros: sanitizedMacros,
     settings: sanitizedSettings
@@ -797,6 +812,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           servers: snapshot.servers,
           tunnels: snapshot.tunnels,
           serialProfiles: snapshot.serialProfiles,
+          localShellProfiles: snapshot.localShellProfiles,
           authProfiles: snapshot.authProfiles,
           groups: snapshot.explicitGroups,
           macros: nonSecretForTopLevel,
@@ -814,7 +830,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         const json = JSON.stringify(exportData, null, 2);
         await vscode.workspace.fs.writeFile(uri, Buffer.from(json, "utf8"));
 
-        const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + snapshot.authProfiles.length;
+        const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + snapshot.localShellProfiles.length + snapshot.authProfiles.length;
         const fileCount = fileBackups.reduce((sum, folder) => sum + folder.files.length, 0);
         const fileNote = fileCount > 0
           ? ` and ${plural(fileCount, "encrypted .ssh/script file")}`
@@ -833,6 +849,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       snapshot.servers,
       snapshot.tunnels,
       snapshot.serialProfiles,
+      snapshot.localShellProfiles,
       settings,
       snapshot.authProfiles,
       allMacros
@@ -845,6 +862,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       servers: sanitized.servers,
       tunnels: sanitized.tunnels,
       serialProfiles: sanitized.serialProfiles,
+      localShellProfiles: sanitized.localShellProfiles,
       authProfiles: sanitized.authProfiles.length > 0 ? sanitized.authProfiles : undefined,
       groups: snapshot.explicitGroups,
       macros: sanitized.macros.length > 0 ? sanitized.macros : undefined,
@@ -861,7 +879,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     const json = JSON.stringify(exportData, null, 2);
     await vscode.workspace.fs.writeFile(uri, Buffer.from(json, "utf8"));
 
-    const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + sanitized.authProfiles.length;
+    const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + snapshot.localShellProfiles.length + sanitized.authProfiles.length;
     const excludedSecretCount = allMacros.filter((m) => m.secret).length;
     const base = `Exported ${count} profiles for sharing to ${uri.fsPath}`;
     const suffix = excludedSecretCount > 0
@@ -945,6 +963,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     const servers = data.servers ?? [];
     const tunnels = data.tunnels ?? [];
     const serialProfiles = data.serialProfiles ?? [];
+    const localShellProfiles = data.localShellProfiles ?? [];
 
     // First pass: assign new IDs for auth profiles and servers so links can be remapped.
     for (const profile of authProfiles) {
@@ -1022,6 +1041,19 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         skipped++;
       }
     }
+    for (const profile of localShellProfiles) {
+      ensureId(profile as unknown as Record<string, unknown>);
+      const remappedProfile: LocalShellProfile = {
+        ...profile,
+        id: randomUUID()
+      };
+      if (validateLocalShellProfile(remappedProfile)) {
+        await core.addOrUpdateLocalShellProfile(remappedProfile);
+        imported++;
+      } else {
+        skipped++;
+      }
+    }
 
     if (Array.isArray(data.groups)) {
       for (const group of data.groups) {
@@ -1078,6 +1110,9 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       for (const profile of snapshot.serialProfiles) {
         await core.removeSerialProfile(profile.id);
       }
+      for (const profile of snapshot.localShellProfiles) {
+        await core.removeLocalShellProfile(profile.id);
+      }
       for (const profile of snapshot.authProfiles) {
         if (vault) {
           await vault.delete(authProfilePasswordSecretKey(profile.id));
@@ -1095,6 +1130,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           ...snapshot.servers.map((s) => s.id),
           ...snapshot.tunnels.map((t) => t.id),
           ...snapshot.serialProfiles.map((p) => p.id),
+          ...snapshot.localShellProfiles.map((p) => p.id),
           ...snapshot.authProfiles.map((p) => p.id)
         ])
       : new Set<string>();
@@ -1131,6 +1167,17 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         skipped++;
       } else {
         await core.addOrUpdateSerialProfile(profile);
+        imported++;
+      }
+    }
+    for (const profile of data.localShellProfiles ?? []) {
+      ensureId(profile as unknown as Record<string, unknown>);
+      if (existingIds.has(profile.id)) {
+        skipped++;
+      } else if (!validateLocalShellProfile(profile)) {
+        skipped++;
+      } else {
+        await core.addOrUpdateLocalShellProfile(profile);
         imported++;
       }
     }
@@ -1238,7 +1285,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
   async function completeReset(): Promise<void> {
     const confirm = await vscode.window.showWarningMessage(
-      "This will permanently delete ALL servers, tunnels, serial profiles, macros, groups, and saved passwords. This cannot be undone.",
+      "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, macros, groups, and saved passwords. This cannot be undone.",
       { modal: true },
       "Delete Everything"
     );
@@ -1274,6 +1321,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // Remove all serial profiles
     for (const profile of snapshot.serialProfiles) {
       await core.removeSerialProfile(profile.id);
+    }
+
+    // Remove all local shell profiles
+    for (const profile of snapshot.localShellProfiles) {
+      await core.removeLocalShellProfile(profile.id);
     }
 
     // Remove all auth profiles

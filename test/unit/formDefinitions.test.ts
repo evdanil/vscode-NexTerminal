@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  localShellFormDefinition,
   serialFormDefinition,
   serverFormDefinition,
   unifiedProfileFormDefinition,
@@ -14,6 +15,13 @@ function keyedField(definition: FormDefinition, key: string): Extract<FormFieldD
   );
   expect(field, `Expected field "${key}"`).toBeDefined();
   return field!;
+}
+
+function maybeKeyedField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { key: string }> | undefined {
+  return definition.fields.find(
+    (candidate): candidate is Extract<FormFieldDescriptor, { key: string }> =>
+      "key" in candidate && candidate.key === key
+  );
 }
 
 function keyPathVisibleWhen(definition: ReturnType<typeof serverFormDefinition>) {
@@ -147,20 +155,108 @@ describe("formDefinitions keyPath visibility", () => {
     const generic = unifiedProfileFormDefinition();
     const ssh = unifiedProfileFormDefinition({ addMode: "ssh" });
     const serial = unifiedProfileFormDefinition({ addMode: "serial" });
+    const localShell = unifiedProfileFormDefinition({ addMode: "localShell" });
 
     expect(generic.title).toBe("Add Profile");
-    expect(ssh.title).toBe("Add SSH Server");
+    expect(ssh.title).toBe("Add SSH Server Profile");
     expect(serial.title).toBe("Add Serial Profile");
+    expect(localShell.title).toBe("Add Local Shell Profile");
     expect(unifiedProfileFormId()).toBe("profile-add");
     expect(unifiedProfileFormId({ addMode: "ssh" })).toBe("server-add");
     expect(unifiedProfileFormId({ addMode: "serial" })).toBe("serial-add");
+    expect(unifiedProfileFormId({ addMode: "localShell" })).toBe("local-shell-add");
   });
 
-  it("locks the profile type selector for explicit SSH and serial add forms", () => {
+  it("locks the profile type selector for explicit SSH, serial, and local shell add forms", () => {
     const ssh = unifiedProfileFormDefinition({ addMode: "ssh" });
     const serial = unifiedProfileFormDefinition({ addMode: "serial" });
+    const localShell = unifiedProfileFormDefinition({ addMode: "localShell" });
 
     expect(keyedField(ssh, "profileType")).toEqual(expect.objectContaining({ type: "hidden", value: "ssh" }));
     expect(keyedField(serial, "profileType")).toEqual(expect.objectContaining({ type: "hidden", value: "serial" }));
+    expect(keyedField(localShell, "profileType")).toEqual(expect.objectContaining({ type: "hidden", value: "localShell" }));
+  });
+
+  it("adds Local Shell profile type and launch fields to the unified form", () => {
+    const definition = unifiedProfileFormDefinition();
+    const profileType = keyedField(definition, "profileType");
+
+    expect(profileType).toMatchObject({ type: "select" });
+    if (profileType.type === "select") {
+      expect(profileType.options).toContainEqual({ label: "Local Shell Profile", value: "localShell" });
+    }
+    expect(keyedField(definition, "launchMode")).toEqual(expect.objectContaining({
+      label: "Launch Mode",
+      visibleWhen: { field: "profileType", value: "localShell" }
+    }));
+    expect(keyedField(definition, "vscodeProfileName")).toEqual(expect.objectContaining({
+      type: "combobox",
+      label: "VS Code Profile Name",
+      required: true,
+      placeholder: "Select a VS Code terminal profile",
+      visibleWhen: [
+        { field: "profileType", value: "localShell" },
+        { field: "launchMode", value: "vscodeProfile" }
+      ]
+    }));
+    expect(definition.fields.some((field) => field.type === "info")).toBe(false);
+    expect(keyedField(definition, "shellPath")).toEqual(expect.objectContaining({
+      label: "Shell Path",
+      required: true,
+      hint: expect.stringMatching(/WSL.*wsl\.exe/i),
+      visibleWhen: [
+        { field: "profileType", value: "localShell" },
+        { field: "launchMode", value: "custom" }
+      ]
+    }));
+    expect(keyedField(definition, "shellArgs")).toEqual(expect.objectContaining({
+      type: "textarea",
+      label: "Arguments"
+    }));
+  });
+
+  it("marks Local Shell launch-specific fields as required in direct forms", () => {
+    const definition = localShellFormDefinition(undefined, undefined, {
+      vscodeTerminalProfileNames: ["PowerShell", "Ubuntu"]
+    });
+
+    expect(keyedField(definition, "vscodeProfileName")).toEqual(expect.objectContaining({
+      type: "combobox",
+      required: true,
+      suggestions: ["PowerShell", "Ubuntu"],
+      visibleWhen: { field: "launchMode", value: "vscodeProfile" }
+    }));
+    expect(keyedField(definition, "shellPath")).toEqual(expect.objectContaining({
+      required: true,
+      hint: expect.stringMatching(/WSL.*wsl\.exe/i),
+      visibleWhen: { field: "launchMode", value: "custom" }
+    }));
+    expect(definition.fields.some((field) => field.type === "info")).toBe(false);
+  });
+
+  it("marks Local Shell working directory and startup command as advanced with hints", () => {
+    const definition = localShellFormDefinition();
+
+    expect(keyedField(definition, "cwd")).toEqual(expect.objectContaining({
+      label: "Working Directory",
+      advanced: true,
+      hint: expect.stringMatching(/workspace|home/i)
+    }));
+    expect(keyedField(definition, "startupCommand")).toEqual(expect.objectContaining({
+      label: "Startup Command",
+      advanced: true,
+      hint: expect.stringMatching(/sent/i)
+    }));
+  });
+
+  it("omits transcript logging from Local Shell forms", () => {
+    expect(keyedField(unifiedProfileFormDefinition(), "logSession").visibleWhen).toEqual({
+      field: "profileType",
+      value: ["ssh", "serial"]
+    });
+    expect(maybeKeyedField(localShellFormDefinition(), "logSession")).toBeUndefined();
+    expect(maybeKeyedField(unifiedProfileFormDefinition({ addMode: "localShell" }), "logSession")).toBeUndefined();
+    expect(keyedField(unifiedProfileFormDefinition({ addMode: "ssh" }), "logSession")).toBeDefined();
+    expect(keyedField(unifiedProfileFormDefinition({ addMode: "serial" }), "logSession")).toBeDefined();
   });
 });

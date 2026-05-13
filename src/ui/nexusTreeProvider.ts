@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
-import { resolveSerialProfileMode, type ActiveSerialSession, type ActiveSession, type AuthProfile, type ProxyConfig, type SerialProfile, type SerialSessionStatus, type ServerConfig } from "../models/config";
+import { resolveSerialProfileMode, type ActiveLocalShellSession, type ActiveSerialSession, type ActiveSession, type AuthProfile, type LocalShellProfile, type ProxyConfig, type SerialProfile, type SerialSessionStatus, type ServerConfig } from "../models/config";
 import { getAncestorPaths, folderDisplayName, isDescendantOrSelf, parentPath as folderParentPath } from "../utils/folderPaths";
 import { toParityCode } from "../utils/helpers";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
@@ -135,11 +135,45 @@ export class SerialSessionTreeItem extends vscode.TreeItem {
   }
 }
 
-type NexusTreeItem = FolderTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem;
+export class LocalShellProfileTreeItem extends vscode.TreeItem {
+  public constructor(public readonly profile: LocalShellProfile, connected: boolean, showDescription = true) {
+    super(profile.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
+    this.id = `localShell:${profile.id}`;
+    const description = profile.launchMode === "vscodeProfile"
+      ? `VS Code: ${profile.vscodeProfileName ?? ""}`
+      : profile.shellPath ?? "";
+    this.tooltip = description;
+    this.description = showDescription ? description : undefined;
+    this.contextValue = connected ? "nexus.localShellProfileConnected" : "nexus.localShellProfile";
+    this.iconPath = new vscode.ThemeIcon("terminal");
+    this.command = {
+      command: "nexus.profile.actions",
+      title: "Profile Actions",
+      arguments: [this]
+    };
+  }
+}
+
+export class LocalShellSessionTreeItem extends vscode.TreeItem {
+  public constructor(public readonly session: ActiveLocalShellSession, isFocused = false) {
+    super(session.terminalName, vscode.TreeItemCollapsibleState.None);
+    this.id = `local-shell-session:${session.id}`;
+    this.contextValue = "nexus.localShellSessionNode";
+    this.description = isFocused ? "▶ active" : "active";
+    this.iconPath = new vscode.ThemeIcon("terminal");
+    this.command = {
+      command: "nexus.focusSessionTerminal",
+      title: "Focus Terminal",
+      arguments: [session.id, "localShell"]
+    };
+  }
+}
+
+type NexusTreeItem = FolderTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem | LocalShellProfileTreeItem | LocalShellSessionTreeItem;
 
 export interface NexusTreeCallbacks {
   onTunnelDropped(serverId: string, tunnelProfileId: string): Promise<void>;
-  onItemGroupChanged(itemType: "server" | "serial", itemId: string, newGroup: string | undefined): Promise<void>;
+  onItemGroupChanged(itemType: "server" | "serial" | "localShell", itemId: string, newGroup: string | undefined): Promise<void>;
   onFolderMoved(oldPath: string, newParentPath: string | undefined): Promise<void>;
 }
 
@@ -155,8 +189,10 @@ export class NexusTreeProvider
     servers: [],
     tunnels: [],
     serialProfiles: [],
+    localShellProfiles: [],
     activeSessions: [],
     activeSerialSessions: [],
+    activeLocalShellSessions: [],
     activeTunnels: [],
     remoteTunnels: [],
     explicitGroups: [],
@@ -176,7 +212,11 @@ export class NexusTreeProvider
     this.onDidChangeTreeDataEmitter.event;
 
   public setSnapshot(snapshot: SessionSnapshot): void {
-    this.snapshot = snapshot;
+    this.snapshot = {
+      ...snapshot,
+      localShellProfiles: snapshot.localShellProfiles ?? [],
+      activeLocalShellSessions: snapshot.activeLocalShellSessions ?? []
+    };
     this.authProfileById = new Map(snapshot.authProfiles.map((profile) => [profile.id, profile]));
     this.computeFolderCache();
     this.refresh();
@@ -234,6 +274,9 @@ export class NexusTreeProvider
     if (element instanceof SerialProfileTreeItem) {
       return element.profile.group ? this.makeFolderItem(element.profile.group) : undefined;
     }
+    if (element instanceof LocalShellProfileTreeItem) {
+      return element.profile.group ? this.makeFolderItem(element.profile.group) : undefined;
+    }
     if (element instanceof SessionTreeItem) {
       const server = this.snapshot.servers.find((s) => s.id === element.session.serverId);
       return server ? this.toServerItem(server) : undefined;
@@ -241,6 +284,10 @@ export class NexusTreeProvider
     if (element instanceof SerialSessionTreeItem) {
       const profile = this.snapshot.serialProfiles.find((p) => p.id === element.session.profileId);
       return profile ? this.toSerialProfileItem(profile) : undefined;
+    }
+    if (element instanceof LocalShellSessionTreeItem) {
+      const profile = this.snapshot.localShellProfiles.find((p) => p.id === element.session.profileId);
+      return profile ? this.toLocalShellProfileItem(profile) : undefined;
     }
     return undefined;
   }
@@ -262,6 +309,11 @@ export class NexusTreeProvider
         .filter((session) => session.profileId === element.profile.id)
         .map((session) => new SerialSessionTreeItem(session, this.snapshot.activitySessionIds.has(session.id), this.snapshot.focusedSessionId === session.id));
     }
+    if (element instanceof LocalShellProfileTreeItem) {
+      return this.snapshot.activeLocalShellSessions
+        .filter((session) => session.profileId === element.profile.id)
+        .map((session) => new LocalShellSessionTreeItem(session, this.snapshot.focusedSessionId === session.id));
+    }
     return [];
   }
 
@@ -274,6 +326,8 @@ export class NexusTreeProvider
       dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "server", id: item.server.id })));
     } else if (item instanceof SerialProfileTreeItem) {
       dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "serial", id: item.profile.id })));
+    } else if (item instanceof LocalShellProfileTreeItem) {
+      dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "localShell", id: item.profile.id })));
     } else if (item instanceof FolderTreeItem) {
       dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "folder", id: item.folderPath })));
     }
@@ -321,8 +375,8 @@ export class NexusTreeProvider
       return;
     }
 
-    if (parsed.type === "server" || parsed.type === "serial") {
-      await this.callbacks.onItemGroupChanged(parsed.type as "server" | "serial", parsed.id, targetPath);
+    if (parsed.type === "server" || parsed.type === "serial" || parsed.type === "localShell") {
+      await this.callbacks.onItemGroupChanged(parsed.type as "server" | "serial" | "localShell", parsed.id, targetPath);
     }
   }
 
@@ -371,6 +425,10 @@ export class NexusTreeProvider
       if (!p.group) return false;
       if (!isDescendantOrSelf(p.group, folderPath)) return false;
       return p.name.toLowerCase().includes(this.filterText);
+    }) || this.snapshot.localShellProfiles.some((p) => {
+      if (!p.group) return false;
+      if (!isDescendantOrSelf(p.group, folderPath)) return false;
+      return p.name.toLowerCase().includes(this.filterText);
     });
   }
 
@@ -389,6 +447,13 @@ export class NexusTreeProvider
       }
     }
     for (const profile of this.snapshot.serialProfiles) {
+      if (profile.group) {
+        for (const ancestor of getAncestorPaths(profile.group)) {
+          allPaths.add(ancestor);
+        }
+      }
+    }
+    for (const profile of this.snapshot.localShellProfiles) {
       if (profile.group) {
         for (const ancestor of getAncestorPaths(profile.group)) {
           allPaths.add(ancestor);
@@ -459,6 +524,21 @@ export class NexusTreeProvider
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((profile) => this.toSerialProfileItem(profile));
 
+    const directLocalShellProfiles = this.snapshot.localShellProfiles
+      .filter((profile) => {
+        if (parentPath === undefined) {
+          if (profile.group) return false;
+        } else {
+          if (profile.group !== parentPath) return false;
+        }
+        if (this.filterText) {
+          return profile.name.toLowerCase().includes(this.filterText);
+        }
+        return true;
+      })
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((profile) => this.toLocalShellProfileItem(profile));
+
     const filteredFolders = this.filterText
       ? childFolderPaths.filter((p) => this.folderHasMatchingDescendant(p))
       : childFolderPaths;
@@ -467,7 +547,7 @@ export class NexusTreeProvider
       .sort((a, b) => a.localeCompare(b))
       .map((p) => this.makeFolderItem(p));
 
-    return [...folderItems, ...directServers, ...directSerialProfiles];
+    return [...folderItems, ...directServers, ...directSerialProfiles, ...directLocalShellProfiles];
   }
 
   private toServerItem(server: ServerConfig): ServerTreeItem {
@@ -488,5 +568,11 @@ export class NexusTreeProvider
           : "disconnected";
     const showDesc = vscode.workspace.getConfiguration("nexus.ui").get<boolean>("showTreeDescriptions", true);
     return new SerialProfileTreeItem(profile, state, showDesc);
+  }
+
+  private toLocalShellProfileItem(profile: LocalShellProfile): LocalShellProfileTreeItem {
+    const connected = this.snapshot.activeLocalShellSessions.some((session) => session.profileId === profile.id);
+    const showDesc = vscode.workspace.getConfiguration("nexus.ui").get<boolean>("showTreeDescriptions", true);
+    return new LocalShellProfileTreeItem(profile, connected, showDesc);
   }
 }

@@ -1,4 +1,4 @@
-import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile, ProxyConfig } from "../models/config";
+import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile, ProxyConfig, LocalShellProfile } from "../models/config";
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
@@ -102,6 +102,48 @@ export function validateSerialProfile(item: unknown): item is SerialProfile {
     typeof obj.baudRate === "number" &&
     (obj.mode === undefined || obj.mode === "standard" || obj.mode === "smartFollow") &&
     validateSerialDeviceHint(obj.deviceHint)
+  );
+}
+
+function validateStringArray(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === "string"));
+}
+
+function validateEnv(value: unknown): boolean {
+  if (value === undefined) {
+    return true;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  return Object.values(value).every((item) => typeof item === "string");
+}
+
+export function validateLocalShellProfile(item: unknown): item is LocalShellProfile {
+  if (typeof item !== "object" || item === null) {
+    return false;
+  }
+  const obj = item as Record<string, unknown>;
+  if (!(isNonEmptyString(obj.id) && isNonEmptyString(obj.name))) {
+    return false;
+  }
+  if (obj.launchMode === "vscodeProfile") {
+    if (!isNonEmptyString(obj.vscodeProfileName)) {
+      return false;
+    }
+  } else if (obj.launchMode === "custom") {
+    if (!isNonEmptyString(obj.shellPath)) {
+      return false;
+    }
+  } else {
+    return false;
+  }
+  return (
+    validateStringArray(obj.shellArgs) &&
+    validateEnv(obj.env) &&
+    isOptionalNonEmptyString(obj.group) &&
+    isOptionalNonEmptyString(obj.cwd) &&
+    isOptionalNonEmptyString(obj.startupCommand)
   );
 }
 

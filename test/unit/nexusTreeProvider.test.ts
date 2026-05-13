@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
-import { FolderTreeItem, NexusTreeProvider, SerialProfileTreeItem, SerialSessionTreeItem, ServerTreeItem, SessionTreeItem } from "../../src/ui/nexusTreeProvider";
+import { FolderTreeItem, LocalShellProfileTreeItem, LocalShellSessionTreeItem, NexusTreeProvider, SerialProfileTreeItem, SerialSessionTreeItem, ServerTreeItem, SessionTreeItem } from "../../src/ui/nexusTreeProvider";
 import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
-import type { SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
+import type { LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 
 vi.mock("vscode", () => ({
   TreeItem: class {
@@ -326,6 +326,25 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
     expect(folder!.contextValue).toBe("nexus.folder");
   });
 
+  it("places local shell profiles in folders and filters by local shell name", () => {
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      localShellProfiles: [
+        makeLocalShell({ id: "local-prod", name: "Prod Local", group: "Lab" }),
+        makeLocalShell({ id: "local-dev", name: "Dev Local", group: "Lab" })
+      ]
+    });
+
+    provider.setFilter("prod");
+
+    const rootChildren = provider.getChildren(undefined) as FolderTreeItem[];
+    const folder = rootChildren.find((c) => c instanceof FolderTreeItem && c.folderPath === "Lab");
+    expect(folder).toBeDefined();
+    const folderChildren = provider.getChildren(folder!) as LocalShellProfileTreeItem[];
+    expect(folderChildren.filter((c) => c instanceof LocalShellProfileTreeItem).map((item) => item.profile.id)).toEqual(["local-prod"]);
+  });
+
   it("filters folder hierarchy by matching server name or host", () => {
     const provider = new NexusTreeProvider(callbacks);
     provider.setSnapshot({
@@ -374,13 +393,25 @@ function makeSerial(overrides: Partial<SerialProfile> = {}): SerialProfile {
   };
 }
 
+function makeLocalShell(overrides: Partial<LocalShellProfile> = {}): LocalShellProfile {
+  return {
+    id: "local-1",
+    name: "Local 1",
+    launchMode: "custom",
+    shellPath: "/bin/bash",
+    ...overrides
+  };
+}
+
 function emptySnapshot() {
   return {
     servers: [] as ServerConfig[],
     tunnels: [] as TunnelProfile[],
     serialProfiles: [] as SerialProfile[],
+    localShellProfiles: [] as LocalShellProfile[],
     activeSessions: [] as any[],
     activeSerialSessions: [] as any[],
+    activeLocalShellSessions: [] as any[],
     activeTunnels: [] as any[],
     remoteTunnels: [] as any[],
     explicitGroups: [] as string[],
@@ -415,6 +446,15 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(disconnected.id).toBe(connected.id);
   });
 
+  it("LocalShellProfileTreeItem ID does not change with connection state", () => {
+    const profile = makeLocalShell({ id: "local-1" });
+    const disconnected = new LocalShellProfileTreeItem(profile, false);
+    const connected = new LocalShellProfileTreeItem(profile, true);
+    expect(disconnected.id).toBe("localShell:local-1");
+    expect(connected.id).toBe("localShell:local-1");
+    expect(disconnected.id).toBe(connected.id);
+  });
+
   it("ServerTreeItem opens profile quick actions on click", () => {
     const server = makeServer({ id: "s1" });
     const item = new ServerTreeItem(server, false);
@@ -435,6 +475,19 @@ describe("NexusTreeProvider stable IDs", () => {
       title: "Profile Actions",
       arguments: [item]
     });
+  });
+
+  it("LocalShellProfileTreeItem opens profile quick actions on click", () => {
+    const profile = makeLocalShell({ id: "local-1" });
+    const item = new LocalShellProfileTreeItem(profile, true);
+
+    expect(item.command).toEqual({
+      command: "nexus.profile.actions",
+      title: "Profile Actions",
+      arguments: [item]
+    });
+    expect((item.iconPath as { id: string }).id).toBe("terminal");
+    expect(item.description).toBe("/bin/bash");
   });
 
   it("marks smart-follow serial profiles in the description", () => {
@@ -519,6 +572,17 @@ describe("NexusTreeProvider getParent", () => {
     const parent = provider.getParent(item) as SerialProfileTreeItem;
     expect(parent).toBeInstanceOf(SerialProfileTreeItem);
     expect(parent.profile.id).toBe("sp1");
+  });
+
+  it("returns LocalShellProfileTreeItem for LocalShellSessionTreeItem", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    const profile = makeLocalShell({ id: "local-1" });
+    const session = { id: "local-session-1", profileId: "local-1", terminalName: "local", startedAt: 0 };
+    provider.setSnapshot({ ...emptySnapshot(), localShellProfiles: [profile], activeLocalShellSessions: [session] });
+    const item = new LocalShellSessionTreeItem(session);
+    const parent = provider.getParent(item) as LocalShellProfileTreeItem;
+    expect(parent).toBeInstanceOf(LocalShellProfileTreeItem);
+    expect(parent.profile.id).toBe("local-1");
   });
 });
 
@@ -793,6 +857,17 @@ describe("NexusTreeProvider session activity indicators", () => {
     });
   });
 
+  it("LocalShellSessionTreeItem focuses the matching local shell terminal on click", () => {
+    const session = { id: "local-session-1", profileId: "local-1", terminalName: "Nexus Local Shell: Local 1", startedAt: 0 };
+    const item = new LocalShellSessionTreeItem(session);
+
+    expect(item.command).toEqual({
+      command: "nexus.focusSessionTerminal",
+      title: "Focus Terminal",
+      arguments: ["local-session-1", "localShell"]
+    });
+  });
+
   it("SessionTreeItem description is '▶ active' when isFocused is true", () => {
     const session = { id: "sess-focused", serverId: "srv-1", terminalName: "bash", startedAt: 0 };
     const item = new SessionTreeItem(session, false, true);
@@ -867,5 +942,24 @@ describe("NexusTreeProvider session activity indicators", () => {
     const profile = (provider.getChildren(undefined) as SerialProfileTreeItem[]).find((c) => c instanceof SerialProfileTreeItem)!;
     const sessions = provider.getChildren(profile) as SerialSessionTreeItem[];
     expect(sessions[0].description).toBe("active");
+  });
+
+  it("getChildren returns multiple local shell sessions for one saved profile", () => {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      localShellProfiles: [makeLocalShell()],
+      activeLocalShellSessions: [
+        { id: "local-session-1", profileId: "local-1", terminalName: "Nexus Local Shell: Local 1", startedAt: 0 },
+        { id: "local-session-2", profileId: "local-1", terminalName: "Nexus Local Shell: Local 1", startedAt: 1 }
+      ],
+      focusedSessionId: "local-session-2"
+    });
+    const profile = (provider.getChildren(undefined) as LocalShellProfileTreeItem[]).find((c) => c instanceof LocalShellProfileTreeItem)!;
+    expect(profile.contextValue).toBe("nexus.localShellProfileConnected");
+    const sessions = provider.getChildren(profile) as LocalShellSessionTreeItem[];
+    expect(sessions).toHaveLength(2);
+    expect(sessions[0].description).toBe("active");
+    expect(sessions[1].description).toBe("▶ active");
   });
 });

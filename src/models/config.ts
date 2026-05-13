@@ -10,6 +10,7 @@ export type SerialDataBits = 5 | 6 | 7 | 8;
 export type SerialStopBits = 1 | 2;
 export type SerialProfileMode = "standard" | "smartFollow";
 export type SerialSessionStatus = "connected" | "waiting";
+export type LocalShellLaunchMode = "vscodeProfile" | "custom";
 
 export interface SshJumpProxy {
   type: "ssh";
@@ -91,6 +92,19 @@ export interface SerialProfile {
   deviceHint?: SerialDeviceHint;
 }
 
+export interface LocalShellProfile {
+  id: string;
+  name: string;
+  group?: string;
+  launchMode: LocalShellLaunchMode;
+  vscodeProfileName?: string;
+  shellPath?: string;
+  shellArgs?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  startupCommand?: string;
+}
+
 /**
  * Narrow runtime handle exposed by SshPty / SmartSerialPty / SerialPty. Consumers
  * include the script runtime (observe I/O, write programmatically, lock input),
@@ -137,6 +151,13 @@ export interface ActiveSerialSession {
   startedAt: number;
   status?: SerialSessionStatus;
   pty?: SessionPtyHandle;
+}
+
+export interface ActiveLocalShellSession {
+  id: string;
+  profileId: string;
+  terminalName: string;
+  startedAt: number;
 }
 
 export interface TunnelRouteInfo {

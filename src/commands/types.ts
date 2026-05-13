@@ -28,6 +28,11 @@ export interface SerialTerminalEntry {
 }
 
 export type SerialTerminalMap = Map<string, SerialTerminalEntry>;
+export interface LocalShellTerminalEntry {
+  terminal: vscode.Terminal;
+  profileId: string;
+}
+export type LocalShellTerminalMap = Map<string, LocalShellTerminalEntry>;
 
 export interface CommandContext {
   core: NexusCore;
@@ -40,6 +45,7 @@ export interface CommandContext {
   terminalsByServer: ServerTerminalMap;
   sessionTerminals: SessionTerminalMap;
   serialTerminals: SerialTerminalMap;
+  localShellTerminals: LocalShellTerminalMap;
   highlighter: TerminalHighlighter;
   macroAutoTrigger: MacroAutoTrigger;
   sftpService: SftpService;

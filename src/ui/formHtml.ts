@@ -1,4 +1,4 @@
-import type { FormDefinition, FormFieldDescriptor } from "./formTypes";
+import type { FormDefinition, FormFieldDescriptor, VisibleWhen } from "./formTypes";
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
@@ -10,12 +10,16 @@ function renderHint(field: FormFieldDescriptor): string {
   return `\n  <div class="field-hint">${escapeHtml(field.hint)}</div>`;
 }
 
-function visibleWhenAttrs(field: FormFieldDescriptor): string {
-  if (!field.visibleWhen) {
+function visibleWhenDataAttr(visibleWhen?: VisibleWhen): string {
+  if (!visibleWhen) {
     return "";
   }
-  const conditions = Array.isArray(field.visibleWhen) ? field.visibleWhen : [field.visibleWhen];
+  const conditions = Array.isArray(visibleWhen) ? visibleWhen : [visibleWhen];
   return ` data-visible-when='${escapeHtml(JSON.stringify(conditions))}'`;
+}
+
+function visibleWhenAttrs(field: FormFieldDescriptor): string {
+  return visibleWhenDataAttr(field.visibleWhen);
 }
 
 function renderField(field: FormFieldDescriptor): string {
@@ -46,6 +50,13 @@ function renderField(field: FormFieldDescriptor): string {
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
   <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />${renderHint(field)}
+  <div class="field-error" id="error-${key}"></div>
+</div>`;
+
+    case "textarea":
+      return `<div class="form-group"${vw}>
+  <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
+  <textarea id="${id}" name="${key}" rows="${field.rows ?? 4}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}>${escapeHtml(field.value ?? "")}</textarea>${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
 
@@ -91,9 +102,9 @@ function renderField(field: FormFieldDescriptor): string {
         `<div class="custom-select-option" data-value="${escapeHtml(s)}">${escapeHtml(s)}</div>`
       ).join("\n      ");
       return `<div class="form-group"${vw}>
-  <label for="${id}">${escapeHtml(field.label)}</label>
+  <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
   <div class="custom-combobox">
-    <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "Type or select...")}" autocomplete="off" />
+    <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "Type or select...")}" autocomplete="off"${field.required ? " required" : ""} />
     <div class="custom-select-dropdown">
       ${suggestionsHtml}
     </div>
@@ -165,6 +176,12 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
     .advanced-fields .form-group {
       margin-bottom: 14px;
     }
+    .actions button[data-visible-when] {
+      display: none;
+    }
+    .actions button[data-visible-when].field-visible {
+      display: inline-flex;
+    }
   </style>
 </head>
 <body>
@@ -173,7 +190,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
     ${fieldsHtml}
     <div class="actions">
       <button type="submit" class="btn-primary">Save</button>
-      ${definition.testable ? '<button type="button" class="btn-secondary" id="test-btn">Test Connection</button>' : ""}
+      ${definition.testable ? `<button type="button" class="btn-secondary" id="test-btn"${visibleWhenDataAttr(definition.testableWhen)}>Test Connection</button>` : ""}
       <button type="button" class="btn-secondary" id="cancel-btn">Cancel</button>
     </div>
   </form>
@@ -203,12 +220,19 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           var visible = true;
           for (var ci = 0; ci < conditions.length; ci++) {
             var control = form.elements[conditions[ci].field];
-            if (!control || control.value !== conditions[ci].value) {
+            var expectedValue = conditions[ci].value;
+            var matches = Array.isArray(expectedValue)
+              ? expectedValue.indexOf(control && control.value) !== -1
+              : control && control.value === expectedValue;
+            if (!matches) {
               visible = false;
               break;
             }
           }
           group.classList.toggle("field-visible", visible);
+          if (group.tagName === "BUTTON") {
+            group.disabled = !visible;
+          }
           var inputs = group.querySelectorAll("input, select, textarea");
           for (var ii = 0; ii < inputs.length; ii++) {
             if (visible) {

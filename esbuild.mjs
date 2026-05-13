@@ -19,7 +19,10 @@ await esbuild.build({
   ...common,
   entryPoints: ["src/extension.ts"],
   outfile: "dist/extension.js",
-  external: ["vscode"],
+  // ssh2 treats cpu-features as an optional native acceleration module and
+  // catches require failures at runtime. Keep it external so local package
+  // builds do not depend on a platform-specific cpufeatures.node artifact.
+  external: ["vscode", "cpu-features"],
 });
 
 // Web extension (browser fallback — no Node deps)

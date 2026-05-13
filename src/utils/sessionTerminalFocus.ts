@@ -12,7 +12,11 @@ export interface SerialTerminalEntry {
   terminal: vscode.Terminal;
 }
 
-export type SessionTerminalType = "ssh" | "serial";
+export interface LocalShellTerminalEntry {
+  terminal: vscode.Terminal;
+}
+
+export type SessionTerminalType = "ssh" | "serial" | "localShell";
 
 interface SessionActivityOptions {
   core: SessionActivityController;
@@ -22,6 +26,7 @@ interface SessionActivityOptions {
 export interface FocusSessionTerminalOptions extends SessionActivityOptions {
   sessionTerminals: Map<string, vscode.Terminal>;
   serialTerminals: Map<string, SerialTerminalEntry>;
+  localShellTerminals?: Map<string, LocalShellTerminalEntry>;
   onTerminalFocused?: (terminal: vscode.Terminal) => void;
 }
 
@@ -36,8 +41,10 @@ export function focusSessionTerminal(
   type: SessionTerminalType
 ): boolean {
   const terminal = type === "serial"
-    ? options.serialTerminals.get(sessionId)?.terminal
-    : options.sessionTerminals.get(sessionId);
+      ? options.serialTerminals.get(sessionId)?.terminal
+    : type === "localShell"
+      ? options.localShellTerminals?.get(sessionId)?.terminal
+      : options.sessionTerminals.get(sessionId);
   if (!terminal) {
     return false;
   }

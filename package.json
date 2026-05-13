@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Unified SSH, Serial, and Port Forwarding hub for VS Code. Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support (jump hosts, SOCKS5, HTTP CONNECT), SFTP file explorer, connection multiplexing, auth profiles, terminal macros with auto-trigger (expect/send), regex highlighting, unread activity indicators, color schemes, and configuration import/export.",
-  "version": "2.8.38",
+  "version": "2.8.39",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -38,6 +38,8 @@
     "onCommand:nexus.server.connect",
     "onCommand:nexus.serial.add",
     "onCommand:nexus.serial.connect",
+    "onCommand:nexus.localShell.add",
+    "onCommand:nexus.localShell.connect",
     "onCommand:nexus.profile.add",
     "onFileSystem:nexterm"
   ],
@@ -86,7 +88,7 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "Start by adding a connection profile.\n[Add Profile](command:nexus.profile.add)\n[Add SSH Server](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+        "contents": "Start by adding a connection profile.\n[Add Profile](command:nexus.profile.add)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
       },
       {
         "view": "nexusTunnels",
@@ -118,7 +120,7 @@
       },
       {
         "command": "nexus.server.add",
-        "title": "Add Server",
+        "title": "Add SSH Server Profile",
         "category": "Nexus",
         "icon": "$(add)"
       },
@@ -302,6 +304,48 @@
         "title": "Send Break",
         "category": "Nexus",
         "icon": "$(zap)"
+      },
+      {
+        "command": "nexus.localShell.add",
+        "title": "Add Local Shell Profile",
+        "category": "Nexus",
+        "icon": "$(add)"
+      },
+      {
+        "command": "nexus.localShell.edit",
+        "title": "Edit",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.localShell.remove",
+        "title": "Remove",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "nexus.localShell.connect",
+        "title": "Open Local Shell",
+        "category": "Nexus",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "nexus.localShell.disconnect",
+        "title": "Disconnect",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "nexus.localShell.copyInfo",
+        "title": "Copy Shell Info",
+        "icon": "$(clippy)"
+      },
+      {
+        "command": "nexus.localShell.duplicate",
+        "title": "Duplicate",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "nexus.localShell.rename",
+        "title": "Rename",
+        "icon": "$(edit)"
       },
       {
         "command": "nexus.group.connect",
@@ -1034,6 +1078,51 @@
           "group": "3_destructive"
         },
         {
+          "command": "nexus.localShell.connect",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.localShell.disconnect",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localShellSessionNode",
+          "group": "inline@2"
+        },
+        {
+          "command": "nexus.localShell.connect",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "group": "0_connect@1"
+        },
+        {
+          "command": "nexus.localShell.disconnect",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)$/",
+          "group": "0_connect@2"
+        },
+        {
+          "command": "nexus.localShell.edit",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "nexus.localShell.rename",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "group": "1_manage@2"
+        },
+        {
+          "command": "nexus.localShell.duplicate",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "group": "1_manage@3"
+        },
+        {
+          "command": "nexus.localShell.copyInfo",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "group": "2_clipboard"
+        },
+        {
+          "command": "nexus.localShell.remove",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "group": "3_destructive"
+        },
+        {
           "command": "nexus.tunnel.start",
           "when": "view == nexusTunnels && viewItem == nexus.tunnel",
           "group": "inline"
@@ -1371,6 +1460,38 @@
         },
         {
           "command": "nexus.serial.sendBreak",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localShell.add",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localShell.edit",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localShell.connect",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localShell.disconnect",
+          "when": "false"
+        },
+        {
+          "command": "nexus.localShell.remove",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localShell.copyInfo",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localShell.duplicate",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localShell.rename",
           "when": "true"
         },
         {

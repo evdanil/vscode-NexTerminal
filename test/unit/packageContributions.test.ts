@@ -57,6 +57,8 @@ describe("package contributions", () => {
   it("contributes unified profile.add, group.add, and group.remove commands", () => {
     const commands = packageJson.contributes.commands.map((item) => item.command);
     expect(commands).toContain("nexus.profile.add");
+    expect(commands).toContain("nexus.localShell.add");
+    expect(commands).toContain("nexus.localShell.connect");
     expect(commands).toContain("nexus.group.add");
     expect(commands).toContain("nexus.group.remove");
   });
@@ -206,6 +208,7 @@ describe("package contributions", () => {
     expect(hub).toContain("command:nexus.profile.add");
     expect(hub).toContain("command:nexus.server.add");
     expect(hub).toContain("command:nexus.serial.add");
+    expect(hub).toContain("command:nexus.localShell.add");
     expect(hub).toContain("command:nexus.serial.listPorts");
 
     const files = entry("nexusFileExplorer");
@@ -218,6 +221,26 @@ describe("package contributions", () => {
     expect(settings).toContain("command:nexus.settings.openPanel");
     expect(settings).toContain("command:nexus.config.export.backup");
     expect(settings).toContain("command:nexus.config.import");
+  });
+
+  it("surfaces local shell actions without terminal-tab command contexts", () => {
+    const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+    expect(menuItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        command: "nexus.localShell.connect",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+        group: "inline@1"
+      }),
+      expect.objectContaining({
+        command: "nexus.localShell.edit",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/"
+      })
+    ]));
+    const terminalTabCommands = ["nexus.terminal.reset", "nexus.terminal.clearScrollback", "nexus.terminal.copyAll"];
+    for (const command of terminalTabCommands) {
+      const items = menuItems.filter((item) => item.command === command);
+      expect(items.every((item) => !item.when?.includes("localShell"))).toBe(true);
+    }
   });
 
   it("links macro templates from the Macros welcome view", () => {

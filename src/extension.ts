@@ -3,13 +3,14 @@ import * as vscode from "vscode";
 import { registerFileCommands } from "./commands/fileCommands";
 import { registerScriptCommands } from "./commands/scriptCommands";
 import { registerSerialCommands } from "./commands/serialCommands";
+import { registerLocalShellCommands } from "./commands/localShellCommands";
 import { registerServerCommands } from "./commands/serverCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
 import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import { TerminalRegistry } from "./services/terminal/terminalRegistry";
 import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
-import type { CommandContext, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
+import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory, type LoggerRotationOptions } from "./logging/terminalLogger";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
@@ -40,6 +41,7 @@ import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
 import { createCoalescedInvoker } from "./utils/coalescedInvoker";
 import { clearTrackedSessionActivity, focusSessionTerminal } from "./utils/sessionTerminalFocus";
+import { resolveScriptSessionForTerminal, resolveSessionForTerminal } from "./utils/terminalSessionLookup";
 import { registerSettingsCommands } from "./commands/settingsCommands";
 import { SettingsPanel } from "./ui/settingsPanel";
 import { registerConfigCommands } from "./commands/configCommands";
@@ -292,6 +294,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const terminalsByServer: ServerTerminalMap = new Map();
   const sessionTerminals: SessionTerminalMap = new Map();
   const serialTerminals: SerialTerminalMap = new Map();
+  const localShellTerminals: LocalShellTerminalMap = new Map();
 
   const highlighter = new TerminalHighlighter();
   const macroAutoTrigger = new MacroAutoTrigger();
@@ -305,22 +308,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     assetsDir: vscode.Uri.file(path.join(context.extensionPath, "dist", "services", "scripts", "assets")),
     globalStoragePath: context.globalStorageUri.fsPath
   });
-  // Reverse-lookup: given a VS Code Terminal, find the Nexus session id that owns
-  // it. Used by the `runQuick` flow to auto-pick the focused terminal when the
-  // user hits ▶ on a script in the sidebar.
-  const resolveSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined => {
-    if (!terminal) return undefined;
-    for (const [sid, term] of sessionTerminals) if (term === terminal) return sid;
-    for (const [sid, entry] of serialTerminals) if (entry.terminal === terminal) return sid;
-    return undefined;
-  };
+  // Reverse-lookup: given a VS Code Terminal, find the Nexus session id that owns it.
+  const resolveTrackedSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined =>
+    resolveSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals);
+  const resolveScriptCapableSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined =>
+    resolveScriptSessionForTerminal(terminal, sessionTerminals, serialTerminals);
   const globalStoragePath = context.globalStorageUri.fsPath;
   SettingsPanel.setGlobalStoragePath(globalStoragePath);
   const scriptCommandDisposables = registerScriptCommands(
     scriptRuntimeManager,
     scriptOutputChannel,
     globalStoragePath,
-    resolveSessionForTerminal
+    resolveScriptCapableSessionForTerminal
   );
   const scriptTreeProvider = new ScriptTreeProvider(scriptRuntimeManager, globalStoragePath);
   const scriptCodeLensProvider = new ScriptCodeLensProvider(scriptRuntimeManager);
@@ -493,6 +492,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     terminalsByServer,
     sessionTerminals,
     serialTerminals,
+    localShellTerminals,
     highlighter,
     macroAutoTrigger,
     sftpService,
@@ -538,10 +538,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (server) {
           await core.addOrUpdateServer({ ...server, group: newGroup });
         }
-      } else {
+      } else if (itemType === "serial") {
         const profile = core.getSerialProfile(itemId);
         if (profile) {
           await core.addOrUpdateSerialProfile({ ...profile, group: newGroup });
+        }
+      } else {
+        const profile = core.getLocalShellProfile(itemId);
+        if (profile) {
+          await core.addOrUpdateLocalShellProfile({ ...profile, group: newGroup });
         }
       }
     },
@@ -667,7 +672,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     nexusTreeProvider.setSnapshot(snapshot);
     tunnelTreeProvider.setSnapshot(snapshot);
     const totalTunnels = snapshot.activeTunnels.length + snapshot.remoteTunnels.length;
-    statusBarItem.text = `$(terminal) Nexus: ${snapshot.activeSessions.length} sessions, ${totalTunnels} tunnels`;
+    statusBarItem.text = `$(terminal) Nexus: ${snapshot.activeSessions.length + snapshot.activeLocalShellSessions.length} sessions, ${totalTunnels} tunnels`;
     if (snapshot.remoteTunnels.length > 0) {
       statusBarItem.tooltip = `${snapshot.activeTunnels.length} local, ${snapshot.remoteTunnels.length} in other window`;
     } else {
@@ -692,7 +697,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const terminalActivityListener = vscode.window.onDidChangeActiveTerminal((terminal) => {
     ctx.focusedTerminal = terminal ?? undefined;
-    const sessionId = resolveSessionForTerminal(terminal);
+    const sessionId = resolveTrackedSessionForTerminal(terminal);
     core.setFocusedSession(sessionId);
     if (sessionId) {
       clearTrackedSessionActivity({ core, activityIndicators: ctx.activityIndicators }, sessionId);
@@ -802,12 +807,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
 
-  const focusSessionCommand = vscode.commands.registerCommand("nexus.focusSessionTerminal", (sessionId: string, type: "ssh" | "serial") => {
+  const focusSessionCommand = vscode.commands.registerCommand("nexus.focusSessionTerminal", (sessionId: string, type: "ssh" | "serial" | "localShell") => {
     focusSessionTerminal(
       {
         core,
         sessionTerminals,
         serialTerminals,
+        localShellTerminals,
         activityIndicators: ctx.activityIndicators,
         onTerminalFocused: (terminal) => {
           ctx.focusedTerminal = terminal;
@@ -890,6 +896,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const serverDisposables = registerServerCommands(ctx);
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
+  const localShellDisposables = registerLocalShellCommands(ctx);
   registerTerminalTabCommands(context, {
     registry: terminalRegistry,
     sessionTerminals: ctx.sessionTerminals,
@@ -969,6 +976,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ...serverDisposables,
     ...tunnelDisposables,
     ...serialDisposables,
+    ...localShellDisposables,
     ...profileDisposables,
     ...settingsDisposables,
     ...authProfileDisposables,
@@ -1005,6 +1013,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
         }
         serialTerminals.clear();
+        localShellTerminals.clear();
         serialSidecar.dispose();
         fileExplorerProvider.dispose();
         sftpService.dispose();

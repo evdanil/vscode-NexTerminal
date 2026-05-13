@@ -106,7 +106,7 @@ import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
 import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
 import type { SecretVault } from "../../src/services/ssh/contracts";
-import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
+import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
@@ -161,6 +161,18 @@ function makeSerialProfile(overrides: Partial<SerialProfile> = {}): SerialProfil
     stopBits: 1,
     parity: "none",
     rtscts: false,
+    ...overrides
+  };
+}
+
+function makeLocalShellProfile(overrides: Partial<LocalShellProfile> = {}): LocalShellProfile {
+  return {
+    id: "local1",
+    name: "Local Dev",
+    launchMode: "custom",
+    shellPath: "/bin/bash",
+    shellArgs: ["--login"],
+    cwd: "/workspace",
     ...overrides
   };
 }
@@ -238,6 +250,10 @@ describe("isValidExport", () => {
 
   it("accepts serialProfiles-only partial config", () => {
     expect(isValidExport({ version: 1, serialProfiles: [makeSerialProfile()] })).toBe(true);
+  });
+
+  it("accepts localShellProfiles-only partial config", () => {
+    expect(isValidExport({ version: 1, localShellProfiles: [makeLocalShellProfile()] })).toBe(true);
   });
 
   it("accepts authProfiles-only partial config", () => {
@@ -568,6 +584,45 @@ describe("config import command (legacy)", () => {
     expect(snapshot.tunnels).toHaveLength(0);
     expect(snapshot.serialProfiles).toHaveLength(0);
     expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profile.");
+  });
+
+  it("imports partial config with only local shell profiles", async () => {
+    const partialExport = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      localShellProfiles: [makeLocalShellProfile()]
+    };
+    await runImport(partialExport);
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.localShellProfiles).toHaveLength(1);
+    expect(snapshot.localShellProfiles[0].id).toBe("local1");
+    expect(snapshot.servers).toHaveLength(0);
+    expect(snapshot.serialProfiles).toHaveLength(0);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profile.");
+  });
+
+  it("imports shared local shell profiles after path sanitization", async () => {
+    const sanitized = sanitizeForSharing(
+      [],
+      [],
+      [],
+      [makeLocalShellProfile({ cwd: "/home/alice/project", startupCommand: "npm run dev" })],
+      {}
+    );
+    const partialExport = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      localShellProfiles: sanitized.localShellProfiles
+    };
+
+    await runImport(partialExport);
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.localShellProfiles).toHaveLength(1);
+    expect(snapshot.localShellProfiles[0].cwd).toBeUndefined();
+    expect(snapshot.localShellProfiles[0].startupCommand).toBeUndefined();
   });
 });
 
@@ -1493,6 +1548,7 @@ describe("sanitizeForSharing", () => {
     const servers = [makeServer({ username: "alice", keyPath: "/home/alice/.ssh/id_rsa" })];
     const tunnels = [makeTunnel({ defaultServerId: "s1" })];
     const serialProfiles = [makeSerialProfile({ deviceHint: { serialNumber: "ABC123", vendorId: "1111", productId: "2222" } })];
+    const localShellProfiles = [makeLocalShellProfile({ cwd: "/home/alice/project", startupCommand: "npm run dev" })];
     const settings: Record<string, unknown> = {
       "nexus.logging.sessionLogDirectory": "/home/alice/logs"
     };
@@ -1501,7 +1557,7 @@ describe("sanitizeForSharing", () => {
       { id: "m2", name: "secret", text: "password123", secret: true }
     ];
 
-    const result = sanitizeForSharing(servers, tunnels, serialProfiles, settings, [], macrosArg);
+    const result = sanitizeForSharing(servers, tunnels, serialProfiles, localShellProfiles, settings, [], macrosArg);
 
     expect(result.servers[0].id).not.toBe("s1");
     expect(result.servers[0].username).toBe("user");
@@ -1512,6 +1568,9 @@ describe("sanitizeForSharing", () => {
 
     expect(result.serialProfiles[0].id).not.toBe("sp1");
     expect(result.serialProfiles[0].deviceHint).toBeUndefined();
+    expect(result.localShellProfiles[0].id).not.toBe("local1");
+    expect(result.localShellProfiles[0].cwd).toBeUndefined();
+    expect(result.localShellProfiles[0].startupCommand).toBeUndefined();
 
     // Secret macros excluded from share; non-secret macros are in result.macros
     expect(result.macros).toHaveLength(1);
@@ -1525,7 +1584,7 @@ describe("sanitizeForSharing", () => {
   it("clears defaultServerId when server not in export", () => {
     const servers: ServerConfig[] = [];
     const tunnels = [makeTunnel({ defaultServerId: "missing" })];
-    const result = sanitizeForSharing(servers, tunnels, [], {});
+    const result = sanitizeForSharing(servers, tunnels, [], [], {});
     expect(result.tunnels[0].defaultServerId).toBeUndefined();
   });
 
@@ -1536,7 +1595,7 @@ describe("sanitizeForSharing", () => {
       name: "Target",
       proxy: { type: "ssh", jumpHostId: "jump-1" }
     });
-    const result = sanitizeForSharing([jumpServer, targetServer], [], [], {});
+    const result = sanitizeForSharing([jumpServer, targetServer], [], [], [], {});
 
     const newJump = result.servers.find((s) => s.name === "Jump")!;
     const newTarget = result.servers.find((s) => s.name === "Target")!;
@@ -1551,7 +1610,7 @@ describe("sanitizeForSharing", () => {
     const server = makeServer({
       proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "user1" }
     });
-    const result = sanitizeForSharing([server], [], [], {});
+    const result = sanitizeForSharing([server], [], [], [], {});
     const sanitized = result.servers[0];
     expect(sanitized.proxy).toBeDefined();
     if (sanitized.proxy?.type === "socks5") {
@@ -1563,19 +1622,19 @@ describe("sanitizeForSharing", () => {
     const server = makeServer({
       proxy: { type: "ssh", jumpHostId: "nonexistent" }
     });
-    const result = sanitizeForSharing([server], [], [], {});
+    const result = sanitizeForSharing([server], [], [], [], {});
     expect(result.servers[0].proxy).toBeUndefined();
   });
 
   it("returns empty authProfiles when none referenced", () => {
-    const result = sanitizeForSharing([makeServer()], [], [], {});
+    const result = sanitizeForSharing([makeServer()], [], [], [], {});
     expect(result.authProfiles).toHaveLength(0);
   });
 
   it("preserves authProfileId link with sanitized auth profile copy", () => {
     const profile = makeAuthProfile({ id: "ap-123", name: "Prod Auth", username: "deploy", keyPath: "/key" });
     const server = makeServer({ authProfileId: "ap-123" });
-    const result = sanitizeForSharing([server], [], [], {}, [profile]);
+    const result = sanitizeForSharing([server], [], [], [], {}, [profile]);
 
     // Server should have remapped authProfileId
     expect(result.servers[0].authProfileId).toBeDefined();
@@ -1592,7 +1651,7 @@ describe("sanitizeForSharing", () => {
   it("omits unreferenced auth profiles from share export", () => {
     const profile = makeAuthProfile({ id: "ap-unused" });
     const server = makeServer(); // no authProfileId
-    const result = sanitizeForSharing([server], [], [], {}, [profile]);
+    const result = sanitizeForSharing([server], [], [], [], {}, [profile]);
     expect(result.authProfiles).toHaveLength(0);
     expect(result.servers[0].authProfileId).toBeUndefined();
   });

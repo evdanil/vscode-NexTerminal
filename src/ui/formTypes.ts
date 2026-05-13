@@ -1,6 +1,6 @@
 export interface VisibleWhenCondition {
   field: string;
-  value: string;
+  value: string | string[];
 }
 
 export type VisibleWhen = VisibleWhenCondition | VisibleWhenCondition[];
@@ -14,10 +14,11 @@ interface FormFieldCommon {
 export type FormFieldDescriptor =
   | ({ type: "hidden"; key: string; value?: string } & FormFieldCommon)
   | ({ type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean } & FormFieldCommon)
+  | ({ type: "textarea"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; rows?: number } & FormFieldCommon)
   | ({ type: "password"; key: string; label: string; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; placeholder?: string; value?: number } & FormFieldCommon)
   | ({ type: "select"; key: string; label: string; options: { label: string; value: string }[]; value?: string; autofill?: boolean } & FormFieldCommon)
-  | ({ type: "combobox"; key: string; label: string; suggestions: string[]; placeholder?: string; value?: string } & FormFieldCommon)
+  | ({ type: "combobox"; key: string; label: string; suggestions: string[]; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "checkbox"; key: string; label: string; value?: boolean } & FormFieldCommon)
   | ({ type: "file"; key: string; label: string; value?: string } & FormFieldCommon)
   /** Raw HTML injected without escaping. `content` must only contain trusted, developer-authored markup — never user-controlled data. */
@@ -28,6 +29,8 @@ export interface FormDefinition {
   fields: FormFieldDescriptor[];
   /** When true, a "Test Connection" button is rendered in the form footer. */
   testable?: boolean;
+  /** Optional visibility rule for the "Test Connection" button. */
+  testableWhen?: VisibleWhen;
 }
 
 export type FormValues = Record<string, string | number | boolean | undefined>;
