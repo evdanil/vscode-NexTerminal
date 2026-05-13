@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [2.8.39] — 2026-05-13
+
+### Added
+
+- **Local Shell profiles can now be saved and opened from the Connectivity Hub.** Profiles can use a saved VS Code terminal profile or a custom local shell path, support multiple simultaneous local sessions, and participate in active-terminal macro sending.
+
+### Changed
+
+- **The profile creation flow now includes Local Shell alongside SSH Server and Serial profiles.** VS Code terminal profiles are shown in an editable dropdown, while WSL and other shells that are not listed can be configured through Custom Shell with `wsl.exe` or another local executable.
+
 ## [2.8.38] — 2026-05-11
 
 ### Fixed
