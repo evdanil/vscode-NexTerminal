@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.41] — 2026-05-13
+
+### Changed
+
+- **The README and Marketplace description now document Local Shell profiles.** The getting started flow and feature list now cover saved Local Shell profiles, VS Code terminal profile selection, custom shell paths and arguments, WSL through `wsl.exe`, multiple local sessions, and the current macros-versus-scripting scope.
+
 ## [2.8.40] — 2026-05-13
 
 ### Fixed

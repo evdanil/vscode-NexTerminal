@@ -1,10 +1,10 @@
 # Nexus Terminal
 
-Unified SSH, Serial, and Port Forwarding hub for VS Code.
+Unified SSH, Serial, Local Shell, and Port Forwarding hub for VS Code.
 
 [![Open VSX](https://img.shields.io/badge/Open%20VSX-Nexus%20Terminal-blue)](https://open-vsx.org/extension/sentriflow/vscode-nexterminal)
 
-Manage remote servers, serial devices, and TCP tunnels from a single sidebar — with proxy support, SFTP file explorer, connection multiplexing, terminal macros, regex highlighting, unread activity indicators, color schemes, and configuration import/export.
+Manage remote servers, serial devices, local shell profiles, and TCP tunnels from a single sidebar — with proxy support, SFTP file explorer, connection multiplexing, terminal macros, regex highlighting, unread activity indicators, color schemes, and configuration import/export.
 
 ## Features
 
@@ -18,6 +18,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
   - **HTTP CONNECT Proxy** — Connect through an HTTP proxy using the CONNECT method, common in corporate environments.
 - **SFTP File Explorer** — Browse, download, and manage remote files on connected servers. Drag-and-drop support for moving files between directories.
 - **Serial Terminal Sessions** — Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, parity, stop bits, and RTS/CTS flow control. Supports break signal and XON passthrough. Includes **Smart Follow** mode for Windows COM-port renumbering: it retries the preferred port, silently reconnects only to the previously approved device when metadata matches, prompts before switching to unfamiliar replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped instead of tearing the tab down on serial errors. Runs in an isolated sidecar process for crash safety.
+- **Local Shell Profiles** — Save named local terminal profiles and open one or more local shell sessions from the Connectivity Hub. Use a configured VS Code terminal profile from the profile dropdown, or choose **Custom Shell** to set an explicit shell path, one argument per line, a working directory, and an optional startup command. WSL can be configured as a custom shell with `wsl.exe` plus any required arguments. Manual terminal macros can send text to the active Local Shell terminal; Nexus scripting support is intentionally limited to SSH and Serial sessions for now.
 - **Port Forwarding (TCP Tunnels)** — Three tunnel modes:
   - **Local (-L)** — Forward a local port to a remote host through SSH.
   - **Reverse (-R)** — Forward a remote port back to a local target.
@@ -25,7 +26,7 @@ Manage remote servers, serial devices, and TCP tunnels from a single sidebar —
 
   All modes support configurable local bind addresses (localhost, LAN, or all interfaces), auto-start/auto-stop with server connections, live traffic counters, and a browser URL shortcut for quick access.
 - **SSH Connection Multiplexing** — Share SSH connections across terminals, tunnels, and SFTP for the same server. Reduces connection overhead with automatic ref-counting and configurable idle timeout. Per-server toggle lets you disable multiplexing for devices that don't support multiple channels (e.g. Cisco). Automatic fallback to standalone connections handles channel failures transparently.
-- **Connectivity Hub** — Sidebar tree view showing all servers and serial devices, organized into nested folders. Built-in filter to quickly search by name. Drag and drop to rearrange profiles, move between folders, or assign tunnels to servers. Active SSH and serial sessions highlight unread terminal activity in the tree and prepend `●` to the terminal tab title until you focus that terminal again.
+- **Connectivity Hub** — Sidebar tree view showing all servers, serial devices, and local shell profiles, organized into nested folders. Built-in filter to quickly search by name. Drag and drop to rearrange profiles, move between folders, or assign tunnels to servers. Active SSH and serial sessions highlight unread terminal activity in the tree and prepend `●` to the terminal tab title until you focus that terminal again.
 - **Terminal Appearance** — Customize terminal font family, size, and weight. Import color schemes from MobaXterm INI files or configure custom themes with live preview.
 - **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH and serial terminal output. 20+ built-in rules detect errors, warnings, status keywords, IP/MAC addresses, UUIDs, URLs, interface counters and more with inline ANSI colouring while respecting existing remote colours. Includes a visual Rule Editor with live preview, staged Apply/Cancel, rule ordering, custom SGR foreground codes, regex safety checks, and one-click reset to defaults.
 - **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign any macro a custom keybinding from 108 combinations across three modifier groups: `Alt`, `Alt+Shift`, and `Ctrl+Shift` with A-Z or 0-9 keys. Macros without a keybinding are accessible via `Alt+S` quick-pick. Includes a Macro Editor panel with multiline editing, secret macro support, inline keybinding assignment, and Macros-view actions to copy or paste secret values via the system clipboard. Clipboard copies place the value in the OS clipboard as plain text. **Auto-trigger (expect/send)**: add a `triggerPattern` regex to any macro — when terminal output matches, the macro text is sent automatically. Existing macros default to all-terminal matching for compatibility; new macros can be scoped to the active terminal or a matching profile, which is recommended for secret prompts. `triggerCooldown` prevents echo loops, `triggerInterval` enables prompt-gated polling macros, and macros can optionally start with auto-trigger paused until you resume them from the Macros view. See the [macro guide](docs/macros.md) for step-by-step setup, trigger scopes, cooldowns, intervals, and regex examples.
@@ -56,8 +57,8 @@ Nexus Terminal is available from both the VS Code Marketplace and Open VSX regis
 
 ### First Use Flow
 
-1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, or `Nexus: Add Serial Profile`.
-2. Select **Connect** on the profile to open an SSH or Serial terminal.
+1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, `Nexus: Add Serial Profile`, or `Nexus: Add Local Shell Profile`.
+2. Select **Connect** / **Open Local Shell** on the profile to open an SSH, Serial, or Local Shell terminal.
 3. For SSH profiles, open **File Explorer** and run **Browse Files** to choose the connected profile and browse SFTP files.
 4. Open **Port Forwarding**, add a tunnel with `Nexus: Add Tunnel`, assign an SSH server, then select **Start**.
 5. Create repeatable terminal input with `Nexus: Add Blank Macro` or **Add Macro From Template**; create longer automation with `Nexus: New Nexus Script`.
@@ -108,6 +109,15 @@ If your target server is behind a firewall or bastion host:
 3. Choose **Standard** or **Smart Follow** connection mode, then configure baud rate, data bits, parity, and stop bits
 4. Right-click the profile and select **Connect**
 5. Smart Follow profiles coexist with other serial sessions on different ports, print status updates in the terminal when they switch ports or wait for reattach, silently reconnect only to the previously approved device, and prompt before switching to unfamiliar free ports. Connecting any serial profile is blocked only when the target port is already held by another Nexus serial session.
+
+### Add a Local Shell Profile
+
+1. Run `Nexus: Add Local Shell Profile`, or use `Nexus: Add Profile` and select **Local Shell Profile**
+2. Name the profile for the workflow you want to save, for example `PowerShell Admin`, `WSL Ubuntu`, or `Project Shell`
+3. Choose **VS Code Profile** to pick one of the terminal profiles defined in your VS Code settings, or choose **Custom Shell** to enter a shell path directly
+4. For WSL on Windows, use **Custom Shell** with `C:\Windows\System32\wsl.exe`; add arguments one per line when you need a distro or startup option, for example `-d` and `Ubuntu`
+5. Optionally set a working directory and startup command, then save the profile
+6. Right-click the profile and select **Open Local Shell**. You can open multiple sessions from the same saved Local Shell profile.
 
 ### Set Up Port Forwarding
 
