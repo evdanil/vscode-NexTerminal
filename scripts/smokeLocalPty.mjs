@@ -3,6 +3,8 @@ import path from "node:path";
 
 const MARKER = "NEXUS_SMOKE_OK";
 const TIMEOUT_MS = 10000;
+const CURSOR_POSITION_QUERY = "\x1b[6n";
+const CURSOR_POSITION_RESPONSE = "\x1b[1;1R";
 
 function parseArgs(argv) {
   const binaryPath = argv[2];
@@ -27,6 +29,10 @@ function launchOptions() {
 
 function decodeBase64(data) {
   return Buffer.from(data ?? "", "base64").toString("utf8");
+}
+
+function encodeInput(text) {
+  return `${JSON.stringify({ type: "input", data: Buffer.from(text, "utf8").toString("base64") })}\n`;
 }
 
 async function smoke(binaryPath) {
@@ -73,6 +79,9 @@ async function smoke(binaryPath) {
             sawReady = true;
           } else if (frame.type === "data") {
             const text = decodeBase64(frame.data);
+            if (text.includes(CURSOR_POSITION_QUERY)) {
+              child.stdin.write(encodeInput(CURSOR_POSITION_RESPONSE));
+            }
             if (text.includes(MARKER)) {
               sawMarker = true;
               child.stdin.write(`${JSON.stringify({ type: "kill" })}\n`);
