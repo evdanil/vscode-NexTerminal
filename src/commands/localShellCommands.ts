@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import { getMacros } from "../macroSettings";
 import type { LocalShellProfile } from "../models/config";
 import { LocalShellPty, resolveLocalPtySidecarPath } from "../services/local/localShellPty";
+import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 import { localShellFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { LocalShellProfileTreeItem, LocalShellSessionTreeItem } from "../ui/nexusTreeProvider";
@@ -24,6 +25,10 @@ interface LocalShellLaunchOptions {
   shellArgs?: string[];
   cwd?: string;
   env?: Record<string, string | null | undefined>;
+}
+
+interface OpenLocalShellOptions {
+  waitForStartup?: boolean;
 }
 
 const SOURCE_PROFILE_GUIDANCE =
@@ -118,6 +123,55 @@ function normalizeProfileArgs(args: string | string[] | undefined): string[] | u
   return undefined;
 }
 
+function expandHome(value: string): string {
+  return value.replace(/^~(?=\/|\\|$)/, os.homedir());
+}
+
+function workspaceFolders(): ReadonlyArray<{ name?: string; uri: { fsPath: string } }> {
+  return vscode.workspace.workspaceFolders ?? [];
+}
+
+function expandWorkspaceVariables(value: string): string {
+  const folders = workspaceFolders();
+  const defaultFolder = folders[0]?.uri.fsPath;
+  let expanded = value;
+  if (defaultFolder) {
+    expanded = expanded
+      .replace(/\$\{workspaceFolder\}/g, defaultFolder)
+      .replace(/\$\{workspaceRoot\}/g, defaultFolder);
+  }
+  expanded = expanded.replace(/\$\{workspaceFolder:([^}]+)\}/g, (match, name: string) => {
+    const folder = folders.find((item) => item.name === name);
+    return folder?.uri.fsPath ?? match;
+  });
+  return expanded;
+}
+
+function expandEnvVariables(value: string): string {
+  return value.replace(/\$\{env:([^}]+)\}/g, (match, name: string) => process.env[name] ?? match);
+}
+
+function expandLocalShellValue(value: string | undefined): string | undefined {
+  if (!value?.trim()) return undefined;
+  return expandEnvVariables(expandWorkspaceVariables(expandHome(value.trim())));
+}
+
+function expandLocalShellArgs(args: string[] | undefined): string[] | undefined {
+  if (!args) return undefined;
+  return args.map((arg) => expandLocalShellValue(arg) ?? "");
+}
+
+function expandLocalShellEnv(
+  env: Record<string, string | null | undefined> | undefined
+): Record<string, string | null | undefined> | undefined {
+  if (!env) return undefined;
+  const result: Record<string, string | null | undefined> = {};
+  for (const [key, value] of Object.entries(env)) {
+    result[key] = typeof value === "string" ? expandLocalShellValue(value) : value;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
 function normalizeProfileEnv(env: VscodeTerminalProfileConfig["env"]): LocalShellLaunchOptions["env"] {
   if (!env) {
     return undefined;
@@ -125,22 +179,14 @@ function normalizeProfileEnv(env: VscodeTerminalProfileConfig["env"]): LocalShel
   const result: NonNullable<LocalShellLaunchOptions["env"]> = {};
   for (const [key, value] of Object.entries(env)) {
     if (typeof value === "string" || value === null) {
-      result[key] = value;
+      result[key] = typeof value === "string" ? expandLocalShellValue(value) : value;
     }
   }
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function expandLocalShellCwd(cwd: string | undefined): string | undefined {
-  if (!cwd?.trim()) return undefined;
-  let expanded = cwd.trim().replace(/^~(?=\/|\\|$)/, os.homedir());
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (workspaceFolder) {
-    expanded = expanded
-      .replace(/\$\{workspaceFolder\}/g, workspaceFolder)
-      .replace(/\$\{workspaceRoot\}/g, workspaceFolder);
-  }
-  return expanded;
+  return expandLocalShellValue(cwd);
 }
 
 export function resolveLocalShellLaunchOptions(profile: LocalShellProfile): LocalShellLaunchOptions {
@@ -158,8 +204,8 @@ export function resolveLocalShellLaunchOptions(profile: LocalShellProfile): Loca
       throw new Error(`${SOURCE_PROFILE_GUIDANCE} Profile: "${profileName}".`);
     }
     return {
-      shellPath,
-      shellArgs: normalizeProfileArgs(terminalProfile.args),
+      shellPath: expandLocalShellValue(shellPath) ?? shellPath,
+      shellArgs: expandLocalShellArgs(normalizeProfileArgs(terminalProfile.args)),
       env: normalizeProfileEnv(terminalProfile.env),
       cwd: expandLocalShellCwd(profile.cwd)
     };
@@ -169,10 +215,10 @@ export function resolveLocalShellLaunchOptions(profile: LocalShellProfile): Loca
     throw new Error(`Local Shell profile "${profile.name}" is missing a shell path.`);
   }
   return {
-    shellPath: profile.shellPath,
-    shellArgs: profile.shellArgs,
+    shellPath: expandLocalShellValue(profile.shellPath) ?? profile.shellPath,
+    shellArgs: expandLocalShellArgs(profile.shellArgs),
     cwd: expandLocalShellCwd(profile.cwd),
-    env: profile.env
+    env: expandLocalShellEnv(profile.env)
   };
 }
 
@@ -283,16 +329,21 @@ function toLocalShellSessionIdFromArg(arg: unknown): string | undefined {
   return undefined;
 }
 
-async function openLocalShell(ctx: CommandContext, profile: LocalShellProfile): Promise<void> {
+async function openLocalShell(
+  ctx: CommandContext,
+  profile: LocalShellProfile,
+  options: OpenLocalShellOptions = {}
+): Promise<string | undefined> {
   const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
   const launchOptions = resolveLocalShellLaunchOptions(profile);
   if (!(await confirmLocalShellAutoTriggers(ctx))) {
-    return;
+    return undefined;
   }
   const terminalName = `Nexus Local Shell: ${profile.name}`;
   const sessionId = randomUUID();
   let terminalRef: vscode.Terminal | undefined;
   let ptyRef: LocalShellPty | undefined;
+  let terminatedEarly = false;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
     (text) => ptyRef?.handleInput(text),
     () => ctx.focusedTerminal === terminalRef,
@@ -311,6 +362,12 @@ async function openLocalShell(ctx: CommandContext, profile: LocalShellProfile): 
   });
   ptyRef = pty;
   pty.addOutputObserver(triggerObserver);
+  pty.onDidTerminateEarly(() => {
+    terminatedEarly = true;
+    if (!ctx.localShellTerminals.has(sessionId)) return;
+    ctx.localShellTerminals.delete(sessionId);
+    ctx.core.unregisterLocalShellSession(sessionId);
+  });
   const terminal = vscode.window.createTerminal({
     name: terminalName,
     pty,
@@ -318,9 +375,21 @@ async function openLocalShell(ctx: CommandContext, profile: LocalShellProfile): 
     location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
   });
   terminalRef = terminal;
+  if (terminatedEarly) {
+    ctx.focusedTerminal = terminal;
+    terminal.show();
+    return undefined;
+  }
   const entry: LocalShellTerminalEntry = { terminal, profileId: profile.id, pty };
   ctx.localShellTerminals.set(sessionId, entry);
   ctx.terminalRegistry?.register(terminal, pty);
+  if (terminatedEarly) {
+    ctx.localShellTerminals.delete(sessionId);
+    ctx.core.unregisterLocalShellSession(sessionId);
+    ctx.focusedTerminal = terminal;
+    terminal.show();
+    return undefined;
+  }
   ctx.core.registerLocalShellSession({
     id: sessionId,
     profileId: profile.id,
@@ -330,6 +399,17 @@ async function openLocalShell(ctx: CommandContext, profile: LocalShellProfile): 
   });
   ctx.focusedTerminal = terminal;
   terminal.show();
+  if (terminatedEarly) {
+    ctx.localShellTerminals.delete(sessionId);
+    ctx.core.unregisterLocalShellSession(sessionId);
+    return undefined;
+  }
+  if (options.waitForStartup && !(await pty.waitForStartup())) {
+    ctx.localShellTerminals.delete(sessionId);
+    ctx.core.unregisterLocalShellSession(sessionId);
+    return undefined;
+  }
+  return sessionId;
 }
 
 export function registerLocalShellCommands(ctx: CommandContext): vscode.Disposable[] {
@@ -357,6 +437,26 @@ export function registerLocalShellCommands(ctx: CommandContext): vscode.Disposab
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         void vscode.window.showErrorMessage(`Failed to open local shell: ${message}`);
+      }
+    }),
+    vscode.commands.registerCommand("nexus.localShell.runWithScript", async (arg?: unknown) => {
+      const profile = toLocalShellProfileFromArg(ctx.core, arg) ?? (await pickLocalShellProfile(ctx.core));
+      if (!profile) {
+        return;
+      }
+      if (!ctx.scriptRuntimeManager) {
+        void vscode.window.showErrorMessage("Nexus script runtime is not available in this context.");
+        return;
+      }
+      const scriptUri = await pickScriptFromWorkspace(ctx.globalStoragePath, "local");
+      if (!scriptUri) return;
+      try {
+        const sessionId = await openLocalShell(ctx, profile, { waitForStartup: true });
+        if (!sessionId) return;
+        await ctx.scriptRuntimeManager.runScript(scriptUri, sessionId);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(`Failed to open local shell with script: ${message}`);
       }
     }),
     vscode.commands.registerCommand("nexus.localShell.edit", async (arg?: unknown) => {

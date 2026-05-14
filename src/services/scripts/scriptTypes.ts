@@ -14,6 +14,8 @@ export type RunState =
 
 export type FinalState = Exclude<RunState, "starting" | "running">;
 
+export type ScriptTargetType = "ssh" | "serial" | "local";
+
 export interface ScriptRunOperation {
   kind: "wait" | "poll" | "prompt" | "sleep";
   label: string;
@@ -26,7 +28,7 @@ export interface RunningScriptSnapshot {
   scriptPath: string;
   sessionId: string;
   sessionName: string;
-  sessionType: "ssh" | "serial";
+  sessionType: ScriptTargetType;
   startedAt: number;
   state: RunState;
   currentOperation: ScriptRunOperation | null;
@@ -86,7 +88,7 @@ export type ScriptRunEvent =
  */
 export interface ScriptSessionMetadata {
   id: string;
-  type: "ssh" | "serial";
+  type: ScriptTargetType;
   name: string;
   targetId: string;
 }

@@ -48,8 +48,10 @@ function makeDescriptor(overrides: Partial<ScriptTargetDescriptor> = {}): Script
 interface MockSnapshot {
   activeSessions: Array<{ id: string; serverId: string; terminalName: string }>;
   activeSerialSessions: Array<{ id: string; profileId: string; terminalName: string }>;
+  activeLocalShellSessions?: Array<{ id: string; profileId: string; terminalName: string }>;
   servers: Array<{ id: string; name: string }>;
   serialProfiles: Array<{ id: string; name: string }>;
+  localShellProfiles?: Array<{ id: string; name: string }>;
 }
 
 function makeCore(snapshot: MockSnapshot): Parameters<typeof pickTarget>[1] {
@@ -112,6 +114,26 @@ describe("scriptTarget / pickTarget", () => {
     expect(quickPickCalls[0].items.every((i) => i.label.includes("serial"))).toBe(true);
   });
 
+  it("filters by targetType local and includes Local Shell candidates", async () => {
+    resetPicker();
+    pickBySessionId = "local1";
+    const core = makeCore({
+      activeSessions: [{ id: "ssh1", serverId: "srv1", terminalName: "web" }],
+      activeSerialSessions: [{ id: "ser1", profileId: "p1", terminalName: "serial-A" }],
+      activeLocalShellSessions: [
+        { id: "local1", profileId: "local-profile", terminalName: "Nexus Local Shell: Dev" }
+      ],
+      servers: [{ id: "srv1", name: "Web" }],
+      serialProfiles: [{ id: "p1", name: "A" }],
+      localShellProfiles: [{ id: "local-profile", name: "Dev" }]
+    });
+    const result = await pickTarget(makeDescriptor({ targetType: "local" }), core);
+    expect(result?.id).toBe("local1");
+    expect(quickPickCalls).toHaveLength(1);
+    expect(quickPickCalls[0].items).toHaveLength(1);
+    expect(quickPickCalls[0].items[0].label).toContain("Nexus Local Shell");
+  });
+
   it("pre-selects matching targetProfile when active (auto-picks without showing the picker)", async () => {
     resetPicker();
     const core = makeCore({
@@ -160,11 +182,13 @@ describe("scriptTarget / pickTarget", () => {
     const core = makeCore({
       activeSessions: [{ id: "ssh1", serverId: "srv1", terminalName: "web-1" }],
       activeSerialSessions: [{ id: "ser1", profileId: "p1", terminalName: "serial-A" }],
+      activeLocalShellSessions: [{ id: "local1", profileId: "local-profile", terminalName: "local-A" }],
       servers: [{ id: "srv1", name: "web" }],
-      serialProfiles: [{ id: "p1", name: "A" }]
+      serialProfiles: [{ id: "p1", name: "A" }],
+      localShellProfiles: [{ id: "local-profile", name: "Local" }]
     });
     await pickTarget(makeDescriptor({ targetType: undefined }), core);
-    expect(quickPickCalls[0].items).toHaveLength(2);
+    expect(quickPickCalls[0].items).toHaveLength(3);
   });
 
   it("matches @target-profile by server id before falling back to name", async () => {
@@ -238,5 +262,33 @@ describe("scriptTarget / pickTarget", () => {
     );
     expect(result?.id).toBe("ssh1");
     expect(quickPickCalls).toHaveLength(0);
+  });
+
+  it("matches @target-profile against Local Shell profile id and name, disambiguating duplicate names", async () => {
+    resetPicker();
+    pickBySessionId = "local2";
+    const core = makeCore({
+      activeSessions: [],
+      activeSerialSessions: [],
+      activeLocalShellSessions: [
+        { id: "local1", profileId: "local-a", terminalName: "local-a" },
+        { id: "local2", profileId: "local-b", terminalName: "local-b" }
+      ],
+      servers: [],
+      serialProfiles: [],
+      localShellProfiles: [
+        { id: "local-a", name: "Dev" },
+        { id: "local-b", name: "Dev" }
+      ]
+    });
+
+    const byId = await pickTarget(makeDescriptor({ targetType: "local", targetProfile: "local-b" }), core);
+    expect(byId?.id).toBe("local2");
+    expect(quickPickCalls).toHaveLength(0);
+
+    const byDuplicateName = await pickTarget(makeDescriptor({ targetType: "local", targetProfile: "Dev" }), core);
+    expect(byDuplicateName?.id).toBe("local2");
+    expect(quickPickCalls).toHaveLength(1);
+    expect(quickPickCalls[0].items).toHaveLength(2);
   });
 });

@@ -4,6 +4,7 @@ const mockMacros = vi.hoisted(() => [] as any[]);
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockCreateTerminal = vi.fn(() => ({ show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" }));
 const mockExecuteCommand = vi.fn();
+const mockPickScriptFromWorkspace = vi.fn();
 const mockShowErrorMessage = vi.fn();
 const mockShowWarningMessage = vi.fn();
 const mockShowQuickPick = vi.fn();
@@ -15,6 +16,10 @@ let mockWorkspaceFolders: Array<{ uri: { fsPath: string } }> | undefined;
 
 vi.mock("../../src/macroSettings", () => ({
   getMacros: () => mockMacros
+}));
+
+vi.mock("../../src/services/scripts/scriptPicker", () => ({
+  pickScriptFromWorkspace: (...args: unknown[]) => mockPickScriptFromWorkspace(...args)
 }));
 
 vi.mock("vscode", () => ({
@@ -132,11 +137,13 @@ function makeCtx(profile = makeProfile()) {
       addOrUpdateLocalShellProfile: vi.fn(),
       removeLocalShellProfile: vi.fn(),
       registerLocalShellSession: vi.fn(),
-      unregisterLocalShellSession: vi.fn()
+      unregisterLocalShellSession: vi.fn(),
+      onDidChange: vi.fn(() => vi.fn())
     },
     localShellTerminals: new Map(),
     focusedTerminal: undefined,
     extensionPath: "/ext",
+    globalStoragePath: "/gs",
     globalState: {
       get: vi.fn(() => false),
       update: vi.fn()
@@ -183,6 +190,7 @@ describe("resolveLocalShellLaunchOptions", () => {
     vi.clearAllMocks();
     mockMacros.length = 0;
     mockWorkspaceFolders = undefined;
+    mockPickScriptFromWorkspace.mockReset();
     registeredCommands.clear();
     closeTerminalListeners.length = 0;
     openTerminalListeners.length = 0;
@@ -191,7 +199,11 @@ describe("resolveLocalShellLaunchOptions", () => {
       get: vi.fn((key: string, fallback?: unknown) => {
         if (section === "terminal.integrated" && key === "profiles.linux") {
           return {
-            Bash: { path: "/usr/bin/bash", args: ["--login"], env: { DEV: "1", REMOVE_ME: null } },
+            Bash: {
+              path: "${env:SHELL_ROOT}/bash",
+              args: ["--rcfile", "${workspaceFolder:api}/.bashrc", "~/literal"],
+              env: { DEV: "${env:DEV_VALUE}", REMOVE_ME: null }
+            },
             Auto: { source: "Git Bash" }
           };
         }
@@ -208,6 +220,12 @@ describe("resolveLocalShellLaunchOptions", () => {
   });
 
   it("resolves explicit VS Code terminal profiles to launch options", () => {
+    process.env.SHELL_ROOT = "/usr/bin";
+    process.env.DEV_VALUE = "1";
+    mockWorkspaceFolders = [
+      { uri: { fsPath: "/repo/app" }, name: "app" },
+      { uri: { fsPath: "/repo/api" }, name: "api" }
+    ] as any;
     const options = resolveLocalShellLaunchOptions(makeProfile({
       launchMode: "vscodeProfile",
       vscodeProfileName: "Bash",
@@ -217,7 +235,7 @@ describe("resolveLocalShellLaunchOptions", () => {
 
     expect(options).toMatchObject({
       shellPath: "/usr/bin/bash",
-      shellArgs: ["--login"],
+      shellArgs: ["--rcfile", "/repo/api/.bashrc", `${process.env.HOME ?? ""}/literal`],
       env: { DEV: "1", REMOVE_ME: null }
     });
   });
@@ -230,6 +248,24 @@ describe("resolveLocalShellLaunchOptions", () => {
     }));
 
     expect(options.cwd).toBe("/repo/project/tools");
+  });
+
+  it("expands environment, workspace, named workspace, and home variables in custom shell path, args, and cwd", () => {
+    process.env.NEXUS_TEST_SHELL = "/opt/shells/zsh";
+    mockWorkspaceFolders = [
+      { uri: { fsPath: "/repo/app" }, name: "app" },
+      { uri: { fsPath: "/repo/tools" }, name: "tools" }
+    ] as any;
+
+    const options = resolveLocalShellLaunchOptions(makeProfile({
+      shellPath: "${env:NEXUS_TEST_SHELL}",
+      shellArgs: ["--init-file", "${workspaceFolder:tools}/zshrc", "~/arg"],
+      cwd: "${workspaceFolder}/src"
+    }));
+
+    expect(options.shellPath).toBe("/opt/shells/zsh");
+    expect(options.shellArgs).toEqual(["--init-file", "/repo/tools/zshrc", `${process.env.HOME ?? ""}/arg`]);
+    expect(options.cwd).toBe("/repo/app/src");
   });
 
   it("does not resolve source-only VS Code terminal profiles to launch options", () => {
@@ -246,6 +282,7 @@ describe("registerLocalShellCommands", () => {
     vi.clearAllMocks();
     mockMacros.length = 0;
     mockWorkspaceFolders = undefined;
+    mockPickScriptFromWorkspace.mockReset();
     registeredCommands.clear();
     closeTerminalListeners.length = 0;
     openTerminalListeners.length = 0;
@@ -344,6 +381,71 @@ describe("registerLocalShellCommands", () => {
 
     expect(ctx.localShellTerminals.has(sessionId)).toBe(false);
     expect(ctx.core.unregisterLocalShellSession).toHaveBeenCalledWith(sessionId);
+  });
+
+  it("unregisters local shell sessions on early PTY termination while leaving the terminal visible", async () => {
+    const terminal = { show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+    mockCreateTerminal.mockReturnValueOnce(terminal);
+    const ctx = makeCtx();
+
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.connect")!("local-1");
+    const sessionId = [...ctx.localShellTerminals.keys()][0];
+    const pty = (mockCreateTerminal.mock.calls[0][0] as { pty: unknown }).pty;
+
+    (pty as any).earlyTerminateEmitter.fire({ code: 2 });
+
+    expect(ctx.localShellTerminals.has(sessionId)).toBe(false);
+    expect(ctx.core.unregisterLocalShellSession).toHaveBeenCalledWith(sessionId);
+    expect(terminal.dispose).not.toHaveBeenCalled();
+  });
+
+  it("opens a local shell profile and runs a picked compatible script against the new session", async () => {
+    const terminal = { show: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+    const scriptUri = { fsPath: "/ws/.nexus/scripts/local.js" };
+    mockCreateTerminal.mockImplementationOnce((options: { pty: unknown }) => {
+      setImmediate(() => (options.pty as any).startupCompleteEmitter.fire());
+      return terminal;
+    });
+    mockPickScriptFromWorkspace.mockResolvedValueOnce(scriptUri);
+    const ctx = {
+      ...makeCtx(),
+      scriptRuntimeManager: {
+        runScript: vi.fn(async () => "run-1")
+      }
+    } as any;
+
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.runWithScript")!("local-1");
+
+    const sessionId = [...ctx.localShellTerminals.keys()][0];
+    expect(mockPickScriptFromWorkspace).toHaveBeenCalledWith(ctx.globalStoragePath, "local");
+    expect(ctx.scriptRuntimeManager.runScript).toHaveBeenCalledWith(scriptUri, sessionId);
+  });
+
+  it("does not run a picked script when the new local shell terminates during startup", async () => {
+    const terminal = { show: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+    const scriptUri = { fsPath: "/ws/.nexus/scripts/local.js" };
+    mockCreateTerminal.mockImplementationOnce((options: { pty: unknown }) => {
+      setImmediate(() => (options.pty as any).earlyTerminateEmitter.fire({ code: 2 }));
+      return terminal;
+    });
+    mockPickScriptFromWorkspace.mockResolvedValueOnce(scriptUri);
+    const ctx = {
+      ...makeCtx(),
+      scriptRuntimeManager: {
+        runScript: vi.fn(async () => "run-1")
+      }
+    } as any;
+
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.runWithScript")!("local-1");
+
+    expect(mockPickScriptFromWorkspace).toHaveBeenCalledWith(ctx.globalStoragePath, "local");
+    expect(ctx.scriptRuntimeManager.runScript).not.toHaveBeenCalled();
+    expect(ctx.localShellTerminals.size).toBe(0);
+    expect(ctx.core.unregisterLocalShellSession).toHaveBeenCalled();
+    expect(terminal.dispose).not.toHaveBeenCalled();
   });
 
   it("routes Add Local Shell to the unified local shell add form", async () => {

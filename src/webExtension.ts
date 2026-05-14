@@ -53,6 +53,7 @@ const unsupportedCommands = [
   "nexus.localShell.edit",
   "nexus.localShell.remove",
   "nexus.localShell.connect",
+  "nexus.localShell.runWithScript",
   "nexus.localShell.disconnect",
   "nexus.localShell.copyInfo",
   "nexus.localShell.duplicate",

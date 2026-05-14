@@ -70,7 +70,7 @@ import {
 } from "../../../src/services/scripts/scriptRuntimeManager";
 import type { FailureReason, StopReason } from "../../../src/services/scripts/scriptTypes";
 import type { NexusCore } from "../../../src/core/nexusCore";
-import type { ActiveSession, SessionPtyHandle } from "../../../src/models/config";
+import type { ActiveLocalShellSession, ActiveSession, SessionPtyHandle } from "../../../src/models/config";
 import type { PtyOutputObserver } from "../../../src/services/macroAutoTrigger";
 import type { WorkerInbound, WorkerOutbound } from "../../../src/services/scripts/scriptTypes";
 
@@ -149,7 +149,9 @@ function makeTestPty(): TestPty {
   return pty;
 }
 
-function makeMockCore(session: ActiveSession): NexusCore & {
+type TestSession = ActiveSession | ActiveLocalShellSession;
+
+function makeMockCore(session: TestSession): NexusCore & {
   emitChange(): void;
   removeSession(): void;
 } {
@@ -157,10 +159,12 @@ function makeMockCore(session: ActiveSession): NexusCore & {
   const listeners = new Set<() => void>();
   return {
     getSnapshot: () => ({
-      activeSessions: sessionPresent ? [session] : [],
+      activeSessions: sessionPresent && "serverId" in session ? [session] : [],
       activeSerialSessions: [],
-      servers: [{ id: session.serverId, name: "mock-server" }],
+      activeLocalShellSessions: sessionPresent && "profileId" in session ? [session] : [],
+      servers: "serverId" in session ? [{ id: session.serverId, name: "mock-server" }] : [],
       serialProfiles: [],
+      localShellProfiles: "profileId" in session ? [{ id: session.profileId, name: "mock-local" }] : [],
       tunnels: [],
       activeTunnels: []
     }),
@@ -225,6 +229,48 @@ async function createHarness(scriptSource: string): Promise<Harness> {
   const fs = await import("node:fs/promises");
   const os = await import("node:os");
   const fixture = path.join(os.tmpdir(), `nexus-runtime-unit-${Date.now()}-${Math.random()}.js`);
+  await fs.writeFile(fixture, scriptSource, "utf8");
+  const scriptUri = { fsPath: fixture, scheme: "file", path: fixture, toString: () => fixture };
+
+  const events: Array<{ kind: string; data?: unknown }> = [];
+  manager.onDidChangeRun((e) => events.push({ kind: e.kind, data: e }));
+
+  return { manager, worker, pty, core, output, events, scriptUri };
+}
+
+async function createLocalHarness(scriptSource: string): Promise<Harness> {
+  const pty = makeTestPty();
+  const session: ActiveLocalShellSession = {
+    id: "test-local-session",
+    profileId: "local1",
+    terminalName: "Nexus Local Shell: Dev",
+    startedAt: Date.now(),
+    pty
+  };
+  const core = makeMockCore(session);
+  const output: string[] = [];
+  const outputChannel = {
+    appendLine: (s: string) => output.push(s),
+    append: vi.fn(),
+    show: vi.fn(),
+    dispose: vi.fn()
+  } as unknown as { appendLine: (s: string) => void };
+
+  const worker = makeFakeWorker();
+  const manager = new ScriptRuntimeManager({
+    core,
+    macroAutoTrigger: {
+      pushFilter: () => ({ dispose: () => {} }),
+      bindObserverToSession: () => {}
+    } as never,
+    outputChannel: outputChannel as never,
+    workerPath: "/fake/worker.js",
+    createWorker: () => worker
+  });
+
+  const fs = await import("node:fs/promises");
+  const os = await import("node:os");
+  const fixture = path.join(os.tmpdir(), `nexus-runtime-local-unit-${Date.now()}-${Math.random()}.js`);
   await fs.writeFile(fixture, scriptSource, "utf8");
   const scriptUri = { fsPath: fixture, scheme: "file", path: fixture, toString: () => fixture };
 
@@ -500,6 +546,47 @@ describe("ScriptRuntimeManager — unit fakes", () => {
     expect(load.session.type).toBe("ssh");
     expect(load.session.name).toBe("test-terminal");
     expect(load.session.targetId).toBe("srv1");
+  });
+
+  it("runs against Local Shell sessions with local metadata", async () => {
+    const h = await createLocalHarness(`/**\n * @nexus-script\n * @target-type local\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-local-session");
+    const load = h.worker.posted.find((m) => m.kind === "load") as unknown as {
+      kind: "load";
+      session: { id: string; type: string; name: string; targetId: string };
+    };
+    expect(load.session).toEqual({
+      id: "test-local-session",
+      type: "local",
+      name: "Nexus Local Shell: Dev",
+      targetId: "local1"
+    });
+  });
+
+  it("rejects explicit sessions whose type does not match @target-type", async () => {
+    const vscode = await import("vscode");
+    const h = await createLocalHarness(`/**\n * @nexus-script\n * @target-type ssh\n */\n`);
+
+    const runId = await h.manager.runScript(h.scriptUri as never, "test-local-session");
+
+    expect(runId).toBeUndefined();
+    expect(h.worker.posted).toHaveLength(0);
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("targets SSH sessions")
+    );
+  });
+
+  it("releases input-lock when a Local Shell session is deregistered during a run", async () => {
+    const h = await createLocalHarness(`/**\n * @nexus-script\n * @lock-input\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-local-session");
+    expect(h.pty.inputBlockedHistory).toEqual([true]);
+
+    h.core.removeSession();
+    h.core.emitChange();
+    await new Promise((r) => setTimeout(r, 250));
+
+    expect(h.pty.inputBlockedHistory).toEqual([true, false]);
+    expect(h.manager.getRuns()).toHaveLength(0);
   });
 
   it("Codex P1: readScriptFile prefers the live editor text over the filesystem (handles untitled + unsaved edits)", async () => {

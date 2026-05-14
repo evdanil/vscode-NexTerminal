@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { parseScriptHeader } from "./scriptHeader";
 import { resolveScriptsDir } from "./resolveScriptsDir";
+import type { ScriptTargetType } from "./scriptTypes";
 
 interface ScriptPickItem extends vscode.QuickPickItem {
   uri: vscode.Uri;
@@ -26,7 +27,7 @@ interface ScriptPickItem extends vscode.QuickPickItem {
  */
 export async function pickScriptFromWorkspace(
   globalStoragePath: string,
-  targetType?: "ssh" | "serial"
+  targetType?: ScriptTargetType
 ): Promise<vscode.Uri | undefined> {
   const dir = resolveScriptsDir(globalStoragePath);
 

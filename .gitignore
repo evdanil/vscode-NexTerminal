@@ -145,7 +145,12 @@ vite.config.ts.timestamp-*
 tmp/
 .specify/
 .claude/
-specs/
+specs/*
+!specs/001-scripting-support/
+specs/001-scripting-support/*
+!specs/001-scripting-support/contracts/
+specs/001-scripting-support/contracts/*
+!specs/001-scripting-support/contracts/script-api.d.ts
 
 # Rust build output
 native/**/target/

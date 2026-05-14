@@ -233,11 +233,11 @@ export class NexusCore {
   }
 
   /**
-   * Returns the active SSH or serial session with the given id.
+   * Returns the active SSH, serial, or Local Shell session with the given id.
    * Callers use this to resolve the {@link SessionPtyHandle} for output observation / input locking.
    */
-  public getActiveSessionById(sessionId: string): ActiveSession | ActiveSerialSession | undefined {
-    return this.activeSessions.get(sessionId) ?? this.activeSerialSessions.get(sessionId);
+  public getActiveSessionById(sessionId: string): ActiveSession | ActiveSerialSession | ActiveLocalShellSession | undefined {
+    return this.activeSessions.get(sessionId) ?? this.activeSerialSessions.get(sessionId) ?? this.activeLocalShellSessions.get(sessionId);
   }
 
   public unregisterLocalShellSession(sessionId: string): void {

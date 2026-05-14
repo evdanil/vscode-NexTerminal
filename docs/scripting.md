@@ -1,6 +1,6 @@
 # Nexus Scripts — User Guide
 
-Nexus Scripts let you automate multi-step terminal procedures in plain JavaScript, with full editor support, running against any live SSH or Serial session.
+Nexus Scripts let you automate multi-step terminal procedures in plain JavaScript, with full editor support, running against any live SSH, Serial, or Local Shell session.
 
 - [When to use a script (vs. a macro)](#when-to-use-a-script-vs-a-macro)
 - [Quickstart](#quickstart)
@@ -47,7 +47,7 @@ A script is a regular `.js` file — kept either in your workspace (under versio
 ## Quickstart
 
 1. **(Optional) Open a folder in VS Code.** When a folder is open, scripts live under `<workspace>/.nexus/scripts/` so they can travel with your repo. With no folder open, Nexus transparently stores scripts in its extension global-storage folder instead — every script command (run, new, edit, "Connect and Run Script…") still works.
-2. **Open at least one SSH or Serial session** through the Nexus sidebar.
+2. **Open at least one SSH, Serial, or Local Shell session** through the Nexus sidebar.
 3. **Create a script** at `.nexus/scripts/hello.js` (or simply run `Nexus: New Nexus Script` — it writes to the resolved scripts directory wherever it lives):
    ```js
    /**
@@ -67,9 +67,11 @@ A script is a regular `.js` file — kept either in your workspace (under versio
    - `Cmd/Ctrl+Shift+P` → **Nexus: Run Nexus Script** (always shows the session picker).
    - In the **Nexus** sidebar, expand **Scripts** and click the inline **▶** button. This "quick-run" binds to the terminal you currently have focused; if no Nexus terminal is focused it falls back to the picker.
    - Open `hello.js` in the editor and click the **▶ Run in Nexus** CodeLens above the header — always shows the picker.
-   - Right-click a server or serial profile → **Connect and Run Script…** — picks a script, connects, and runs it against the new session.
+   - Right-click a server, serial, or Local Shell profile → **Connect/Open and Run Script…** — picks a script, opens the profile, and runs it against the new session.
 
    The session picker always renders — even when only one session is eligible — so you can see which terminal the script will drive before it starts. Auto-pick only happens when the script's `@target-profile` uniquely matches an active session.
+
+   For Local Shell profiles, the VS Code terminal-profile dropdown only includes profiles with an explicit executable path. Source/autodetect profiles are not script-capable through extensions; configure WSL as a custom Local Shell profile with `wsl.exe` as the shell path and any distribution arguments in the shell arguments field.
 5. **Watch it run.** The **Nexus Scripts** Output Channel prints each event:
    ```text
    [12:01:33.221] Hello  start (session: web-1, ssh)
@@ -130,8 +132,8 @@ Every field except `@nexus-script` is optional.
 | `@nexus-script` | flag — no value | — | Required marker. Files without this are not Nexus scripts. |
 | `@name` | single-line string | filename without `.js` | Display name in tree, CodeLens, picker, and status bar. |
 | `@description` | single-line string | empty | Shown as tooltip in the sidebar. |
-| `@target-type` | `ssh` or `serial` | unrestricted | Filters the session picker so only matching sessions are offered. |
-| `@target-profile` | server name or serial profile name | none | When a session of this profile is active, it's auto-selected without showing the picker. |
+| `@target-type` | `ssh`, `serial`, or `local` | unrestricted | Filters the session picker so only matching sessions are offered. |
+| `@target-profile` | server name, serial profile name, Local Shell profile name, or matching id | none | When a session of this profile is active, it's auto-selected without showing the picker. Duplicate names are disambiguated with a narrowed picker. |
 | `@default-timeout` | duration: `1500ms`, `30s`, `5m` | `nexus.scripts.defaultTimeoutSeconds` (30s) | Used by `waitFor`/`expect`/`waitAny` when no per-call `timeout` is provided. |
 | `@lock-input` | flag — no value | absent (terminal stays interactive) | Makes the bound terminal read-only for the run. User keystrokes are discarded with a one-shot notice line. |
 | `@allow-macros` | comma-separated macro names | `[]` | Names of macros to keep enabled on the bound session while the script runs. Default policy (suspend-all) suspends everything else. |
@@ -139,7 +141,7 @@ Every field except `@nexus-script` is optional.
 ### Header validation
 
 - Unknown `@<tag>` names produce a warning in the Output Channel — the script still loads.
-- Invalid values for `@target-type` (not `ssh` / `serial`) or `@default-timeout` (not `<n>ms|s|m`) block the run with a descriptive error.
+- Invalid values for `@target-type` (not `ssh` / `serial` / `local`) or `@default-timeout` (not `<n>ms|s|m`) block the run with a descriptive error.
 - Duplicate fields are tolerated: the first occurrence wins and a warning is logged — **except `@allow-macros`, which concatenates** so you can spread a long allow-list across multiple lines.
 - Only the first JSDoc block in the file is examined.
 
@@ -365,9 +367,9 @@ A read-only `session` global describes the session the script is bound to:
 | Field | Type | Notes |
 |---|---|---|
 | `session.id` | `string` | Stable session id (matches `ActiveSession.id` in NexusCore). |
-| `session.type` | `"ssh" \| "serial"` | Transport type. |
+| `session.type` | `"ssh" \| "serial" \| "local"` | Transport type. |
 | `session.name` | `string` | Terminal title (display name). |
-| `session.targetId` | `string` | Server id (for SSH) or serial profile id (for serial). |
+| `session.targetId` | `string` | Server id (for SSH), serial profile id (for serial), or Local Shell profile id (for local). |
 
 Use it to branch on context, e.g. to change behaviour based on whether you're running against a lab device or production:
 
@@ -562,6 +564,10 @@ await sendLine("dir usbflash0:");
 if (session.type === "serial") {
   // Serial: longer timeouts and poll harder.
   await poll({ send: "\r", until: /ROMMON>/i, every: 500, timeout: 20_000 });
+} else if (session.type === "local") {
+  // Local Shell: use local commands and paths.
+  await expect(/[$#>] $/, { timeout: 10_000 });
+  await sendLine("pwd");
 } else {
   // SSH: we expect quick responses.
   await expect(/[$#] $/, { timeout: 5_000 });
@@ -597,7 +603,7 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | `Nexus: Edit Script` | — | Right-click a script → Edit. Opens the file in the editor. (Clicking the row no longer auto-opens the editor — it would be noisy.) |
 | `Nexus: Delete Script` | — | Right-click a script in the sidebar. Asks for confirmation, then moves to Trash. |
 | `Nexus: Open Scripts Folder` | — | Reveal the configured scripts directory in the OS file manager. |
-| `Connect and Run Script…` (server / serial right-click) | — | Pick a Nexus script, connect to the profile, and run the script against the new session once it registers. Scripts are filtered to those whose `@target-type` is compatible with the profile. 90-second watchdog warns if the script never starts. |
+| `Connect/Open and Run Script…` (server, serial, or Local Shell right-click) | — | Pick a Nexus script, open the profile, and run the script against the new session once it registers. Scripts are filtered to those whose `@target-type` is compatible with the profile. SSH and Serial use a 90-second watchdog; Local Shell starts the run after the terminal session is created. |
 | `Nexus: Show Nexus Scripts Output` | — | Open the **Nexus Scripts** Output Channel. |
 | `Nexus: Open Scripting Guide` | — | Open this document in your browser. |
 | `Nexus: Open Script Examples` | — | Open the bundled script examples in your browser. |
@@ -607,7 +613,7 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 - **Nexus sidebar → Scripts** — lists all `.js` files under the configured directory that carry the `@nexus-script` marker. Clicking the row does **nothing by default** (prevents accidental editor churn); use the right-click menu for Edit / Run / Stop / Reveal / Delete, or the inline **▶** button for quick-run. The view's title bar has buttons for New Script, Open Scripts Folder, Open Scripting Guide, and Open Script Examples. Empty state (no folder / no scripts) shows inline help links for those same getting-started actions.
 - **Editor CodeLens** — the inline `▶ Run in Nexus` action at the top of any script file. Flips to `◼ Stop` while a run is active on that file. Works on `file://`, `vscode-remote://`, and `untitled:` schemes. Always shows the session picker (the editor context is "I'm authoring" — deliberate target choice).
 - **Nexus Settings panel → Scripts** — the same four settings as in `Settings` below, surfaced in the Nexus Settings panel webview (no need to open `settings.json`).
-- **Connectivity Hub right-click → Connect and Run Script…** — available on both SSH and serial profile items. Picks a compatible script (filtered by `@target-type`), connects to the profile, then auto-runs the script once the session registers. 90-second watchdog warns if the script never starts.
+- **Connectivity Hub right-click → Connect/Open and Run Script…** — available on SSH, serial, and Local Shell profile items. Picks a compatible script (filtered by `@target-type`), opens the profile, then auto-runs the script once the session registers.
 - **Status bar — run indicator** — when at least one script is running, the left status bar shows the current operation + elapsed time. Click to open the Output Channel. Tooltip contains a `◼ Stop` action per running script.
 - **Status bar — input-lock indicator** — when an `@lock-input` script is running, a second left-aligned status bar item renders `$(lock) Terminal locked — click to stop`. Clicking stops the locking script. If multiple locked scripts run at once it shows a count and offers a QuickPick on click.
 - **Output Channel** — the `Nexus Scripts` channel streams timestamped events. Lines are prefixed with `[hh:mm:ss.sss] ScriptName@SessionName` so you can correlate interleaved output when multiple scripts run at once.
