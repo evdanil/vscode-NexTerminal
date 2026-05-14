@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.8.45] — 2026-05-15
+
 ### Fixed
 
 - **Local Shell VS Code profile selection now includes more launchable local profiles.** Nexus maps common VS Code source/autodetected profiles such as PowerShell, Git Bash, Command Prompt, and detected WSL distros to executable-backed Local Shell profiles when possible, and avoids choosing missing `Sysnative` paths when a working `System32` path is available.
