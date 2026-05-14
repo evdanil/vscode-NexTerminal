@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as vscode from "vscode";
 import { getMacros } from "../macroSettings";
@@ -32,7 +34,7 @@ interface OpenLocalShellOptions {
 }
 
 const SOURCE_PROFILE_GUIDANCE =
-  "This VS Code profile uses source/autodetect and does not expose an executable path to extensions. Auto-trigger macros require Nexus to launch the shell directly. Choose Custom Shell and enter the command, for example pwsh.exe, powershell.exe, cmd.exe, wsl.exe, /bin/bash, or /bin/zsh.";
+  "This VS Code profile uses source/autodetect and does not expose a launchable executable path to extensions. Auto-trigger macros require Nexus to launch the shell directly. Choose Custom Shell and enter the command, for example pwsh.exe, powershell.exe, cmd.exe, wsl.exe, /bin/bash, or /bin/zsh.";
 const LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY = "nexus.localShell.autoTriggerWarningShown";
 const REVIEW_MACROS_ACTION = "Review Macros";
 const DISABLE_AUTOTRIGGER_ACTION = "Disable Globally";
@@ -51,10 +53,7 @@ function getConfiguredVscodeTerminalProfiles(): Record<string, VscodeTerminalPro
 }
 
 export function getConfiguredVscodeTerminalProfileNames(): string[] {
-  return Object.entries(getConfiguredVscodeTerminalProfiles())
-    .filter(([, profile]) => Boolean(firstShellPath(profile.path)))
-    .map(([name]) => name)
-    .sort((a, b) => a.localeCompare(b));
+  return Array.from(getLaunchableVscodeTerminalProfiles().keys()).sort((a, b) => a.localeCompare(b));
 }
 
 function readString(value: FormValues[string]): string {
@@ -103,14 +102,187 @@ export function formValuesToLocalShell(values: FormValues, existing?: Partial<Lo
   };
 }
 
-function firstShellPath(pathValue: string | string[] | undefined): string | undefined {
+function shellPathCandidates(pathValue: string | string[] | undefined): string[] {
   if (typeof pathValue === "string" && pathValue.trim()) {
-    return pathValue;
+    return [pathValue];
   }
   if (Array.isArray(pathValue)) {
-    return pathValue.find((item) => typeof item === "string" && item.trim());
+    return pathValue.filter((item): item is string => typeof item === "string" && Boolean(item.trim()));
+  }
+  return [];
+}
+
+function isBareCommand(value: string): boolean {
+  return !/[\\/]/.test(value) && !/^[A-Za-z]:/.test(value);
+}
+
+function pathExists(value: string): boolean {
+  try {
+    return fs.existsSync(value);
+  } catch {
+    return false;
+  }
+}
+
+function unique(values: string[]): string[] {
+  return Array.from(new Set(values));
+}
+
+function chooseShellPath(pathValue: string | string[] | undefined): string | undefined {
+  const candidates = shellPathCandidates(pathValue)
+    .map((item) => expandLocalShellValue(item))
+    .filter((item): item is string => Boolean(item));
+  if (candidates.length === 0) return undefined;
+  return candidates.find(pathExists) ?? candidates.find(isBareCommand) ?? candidates[0];
+}
+
+function firstExistingPath(candidates: string[]): string | undefined {
+  return unique(candidates.map((item) => expandLocalShellValue(item) ?? item))
+    .find((item) => Boolean(item) && pathExists(item));
+}
+
+function readEnv(name: string): string | undefined {
+  const direct = process.env[name];
+  if (direct !== undefined) return direct;
+  const foundKey = Object.keys(process.env).find((key) => key.toLowerCase() === name.toLowerCase());
+  return foundKey ? process.env[foundKey] : undefined;
+}
+
+function windowsRoot(): string {
+  return readEnv("windir") ?? readEnv("SystemRoot") ?? "C:\\Windows";
+}
+
+function windowsSystem32(binary: string): string {
+  return `${windowsRoot()}\\System32\\${binary}`;
+}
+
+function powershellPath(): string | undefined {
+  return firstExistingPath([
+    `${windowsRoot()}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+    "powershell.exe"
+  ]);
+}
+
+function gitBashPath(): string | undefined {
+  const programFiles = readEnv("ProgramFiles") ?? "C:\\Program Files";
+  const programFilesX86 = readEnv("ProgramFiles(x86)") ?? "C:\\Program Files (x86)";
+  const localAppData = readEnv("LOCALAPPDATA");
+  return firstExistingPath([
+    `${programFiles}\\Git\\bin\\bash.exe`,
+    `${programFiles}\\Git\\usr\\bin\\bash.exe`,
+    `${programFilesX86}\\Git\\bin\\bash.exe`,
+    `${programFilesX86}\\Git\\usr\\bin\\bash.exe`,
+    ...(localAppData ? [`${localAppData}\\Programs\\Git\\bin\\bash.exe`] : [])
+  ]);
+}
+
+function wslPath(): string | undefined {
+  return firstExistingPath([windowsSystem32("wsl.exe"), "wsl.exe"]);
+}
+
+function distroNameFromWslProfile(profileName: string): string | undefined {
+  const match = profileName.match(/^(.*?)\s*\(WSL\)$/i);
+  return match?.[1]?.trim() || undefined;
+}
+
+function decodeWslOutput(output: Buffer): string {
+  const utf8 = output.toString("utf8");
+  return utf8.includes("\u0000")
+    ? output.toString("utf16le").replace(/\u0000/g, "")
+    : utf8;
+}
+
+function listWslDistros(shellPath: string): string[] {
+  try {
+    const output = execFileSync(shellPath, ["-l", "-q"], {
+      timeout: 1500,
+      windowsHide: true
+    });
+    return decodeWslOutput(output)
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.includes("docker-desktop"));
+  } catch {
+    return [];
+  }
+}
+
+function profileFromSource(name: string, source: string | undefined): VscodeTerminalProfileConfig | undefined {
+  const normalized = source?.toLowerCase() ?? "";
+  if (normalized.includes("powershell")) {
+    const path = powershellPath();
+    return path ? { path } : undefined;
+  }
+  if (normalized.includes("git bash")) {
+    const path = gitBashPath();
+    return path ? { path } : undefined;
+  }
+  if (normalized.includes("wsl") || distroNameFromWslProfile(name)) {
+    const path = wslPath();
+    if (!path) return undefined;
+    const distro = distroNameFromWslProfile(name);
+    return { path, args: distro ? ["-d", distro] : undefined };
   }
   return undefined;
+}
+
+function profileFromInferredWslName(name: string): VscodeTerminalProfileConfig | undefined {
+  if (name !== "WSL" && !distroNameFromWslProfile(name)) return undefined;
+  return profileFromSource(name, "WSL");
+}
+
+function normalizeVscodeTerminalProfile(
+  name: string,
+  profile: VscodeTerminalProfileConfig
+): VscodeTerminalProfileConfig | undefined {
+  const shellPath = chooseShellPath(profile.path);
+  if (shellPath) {
+    return { ...profile, path: shellPath };
+  }
+  const sourceProfile = profileFromSource(name, profile.source);
+  if (!sourceProfile) return undefined;
+  return {
+    ...profile,
+    path: sourceProfile.path,
+    args: profile.args ?? sourceProfile.args
+  };
+}
+
+function getLaunchableVscodeTerminalProfiles(): Map<string, VscodeTerminalProfileConfig> {
+  const profiles = new Map<string, VscodeTerminalProfileConfig>();
+  for (const [name, profile] of Object.entries(getConfiguredVscodeTerminalProfiles())) {
+    const normalized = normalizeVscodeTerminalProfile(name, profile);
+    if (normalized) profiles.set(name, normalized);
+  }
+
+  if (process.platform === "win32") {
+    const cmdPath = firstExistingPath([windowsSystem32("cmd.exe")]);
+    if (cmdPath && !profiles.has("Command Prompt")) {
+      profiles.set("Command Prompt", { path: cmdPath });
+    }
+    const psPath = powershellPath();
+    if (psPath && !profiles.has("PowerShell")) {
+      profiles.set("PowerShell", { path: psPath });
+    }
+    const bashPath = gitBashPath();
+    if (bashPath && !profiles.has("Git Bash")) {
+      profiles.set("Git Bash", { path: bashPath });
+    }
+    const wsl = wslPath();
+    if (wsl) {
+      if (!profiles.has("WSL")) {
+        profiles.set("WSL", { path: wsl });
+      }
+      for (const distro of listWslDistros(wsl)) {
+        const name = `${distro} (WSL)`;
+        if (!profiles.has(name)) {
+          profiles.set(name, { path: wsl, args: ["-d", distro] });
+        }
+      }
+    }
+  }
+
+  return profiles;
 }
 
 function normalizeProfileArgs(args: string | string[] | undefined): string[] | undefined {
@@ -148,7 +320,7 @@ function expandWorkspaceVariables(value: string): string {
 }
 
 function expandEnvVariables(value: string): string {
-  return value.replace(/\$\{env:([^}]+)\}/g, (match, name: string) => process.env[name] ?? match);
+  return value.replace(/\$\{env:([^}]+)\}/g, (match, name: string) => readEnv(name) ?? match);
 }
 
 function expandLocalShellValue(value: string | undefined): string | undefined {
@@ -195,11 +367,15 @@ export function resolveLocalShellLaunchOptions(profile: LocalShellProfile): Loca
     if (!profileName) {
       throw new Error("Local Shell profile is missing a VS Code terminal profile name.");
     }
-    const terminalProfile = getConfiguredVscodeTerminalProfiles()[profileName];
+    let terminalProfile = getLaunchableVscodeTerminalProfiles().get(profileName);
+    terminalProfile ??= profileFromInferredWslName(profileName);
     if (!terminalProfile) {
+      if (getConfiguredVscodeTerminalProfiles()[profileName]) {
+        throw new Error(`${SOURCE_PROFILE_GUIDANCE} Profile: "${profileName}".`);
+      }
       throw new Error(`VS Code terminal profile "${profileName}" was not found for this platform.`);
     }
-    const shellPath = firstShellPath(terminalProfile.path);
+    const shellPath = chooseShellPath(terminalProfile.path);
     if (!shellPath) {
       throw new Error(`${SOURCE_PROFILE_GUIDANCE} Profile: "${profileName}".`);
     }

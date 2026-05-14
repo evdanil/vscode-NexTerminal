@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockMacros = vi.hoisted(() => [] as any[]);
+const mockExistingPaths = vi.hoisted(() => new Set<string>());
+const mockExecFileSync = vi.hoisted(() => vi.fn());
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockCreateTerminal = vi.fn(() => ({ show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" }));
 const mockExecuteCommand = vi.fn();
@@ -13,6 +15,32 @@ const closeTerminalListeners: Array<(terminal: unknown) => void> = [];
 const openTerminalListeners: Array<(terminal: unknown) => void> = [];
 const mockTerminals: unknown[] = [];
 let mockWorkspaceFolders: Array<{ uri: { fsPath: string } }> | undefined;
+
+function normalizeMockPath(value: string): string {
+  return value.replace(/\//g, "\\").toLowerCase();
+}
+
+function markPathExists(value: string): void {
+  mockExistingPaths.add(normalizeMockPath(value));
+}
+
+function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
+  const original = process.platform;
+  Object.defineProperty(process, "platform", { value: platform });
+  try {
+    return fn();
+  } finally {
+    Object.defineProperty(process, "platform", { value: original });
+  }
+}
+
+vi.mock("node:fs", () => ({
+  existsSync: (value: string) => mockExistingPaths.has(normalizeMockPath(String(value)))
+}));
+
+vi.mock("node:child_process", () => ({
+  execFileSync: (...args: unknown[]) => mockExecFileSync(...args)
+}));
 
 vi.mock("../../src/macroSettings", () => ({
   getMacros: () => mockMacros
@@ -189,6 +217,8 @@ describe("resolveLocalShellLaunchOptions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockMacros.length = 0;
+    mockExistingPaths.clear();
+    mockExecFileSync.mockReset();
     mockWorkspaceFolders = undefined;
     mockPickScriptFromWorkspace.mockReset();
     registeredCommands.clear();
@@ -215,8 +245,11 @@ describe("resolveLocalShellLaunchOptions", () => {
     }));
   });
 
-  it("lists configured VS Code terminal profile names with explicit shell paths for form suggestions", () => {
-    expect(getConfiguredVscodeTerminalProfileNames()).toEqual(["Bash"]);
+  it("lists configured VS Code terminal profile names with explicit or resolvable source shell paths", () => {
+    markPathExists("/usr/bin/bash");
+    markPathExists("C:\\Program Files\\Git\\bin\\bash.exe");
+
+    expect(getConfiguredVscodeTerminalProfileNames()).toEqual(["Auto", "Bash"]);
   });
 
   it("resolves explicit VS Code terminal profiles to launch options", () => {
@@ -237,6 +270,103 @@ describe("resolveLocalShellLaunchOptions", () => {
       shellPath: "/usr/bin/bash",
       shellArgs: ["--rcfile", "/repo/api/.bashrc", `${process.env.HOME ?? ""}/literal`],
       env: { DEV: "1", REMOVE_ME: null }
+    });
+  });
+
+  it("chooses the first existing path from VS Code profile path arrays", () => {
+    process.env.windir = "C:\\Windows";
+    markPathExists("C:\\Windows\\System32\\cmd.exe");
+    mockGetConfiguration.mockImplementation((section: string) => ({
+      get: vi.fn((key: string, fallback?: unknown) => {
+        if (section === "terminal.integrated" && key === "profiles.linux") {
+          return {
+            "Command Prompt": {
+              path: ["${env:windir}\\Sysnative\\cmd.exe", "${env:windir}\\System32\\cmd.exe"]
+            }
+          };
+        }
+        return fallback;
+      })
+    }));
+
+    const options = resolveLocalShellLaunchOptions(makeProfile({
+      launchMode: "vscodeProfile",
+      vscodeProfileName: "Command Prompt",
+      shellPath: undefined,
+      shellArgs: undefined
+    }));
+
+    expect(options.shellPath).toBe("C:\\Windows\\System32\\cmd.exe");
+  });
+
+  it("resolves configured PowerShell source profiles to a launchable shell path", () => {
+    process.env.windir = "C:\\Windows";
+    markPathExists("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    mockGetConfiguration.mockImplementation((section: string) => ({
+      get: vi.fn((key: string, fallback?: unknown) => {
+        if (section === "terminal.integrated" && key === "profiles.linux") {
+          return {
+            PowerShell: { source: "PowerShell" }
+          };
+        }
+        return fallback;
+      })
+    }));
+
+    expect(getConfiguredVscodeTerminalProfileNames()).toEqual(["PowerShell"]);
+    const options = resolveLocalShellLaunchOptions(makeProfile({
+      launchMode: "vscodeProfile",
+      vscodeProfileName: "PowerShell",
+      shellPath: undefined
+    }));
+
+    expect(options.shellPath).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  });
+
+  it("adds detected WSL distro profiles on Windows", () => {
+    process.env.windir = "C:\\Windows";
+    markPathExists("C:\\Windows\\System32\\wsl.exe");
+    mockExecFileSync.mockReturnValueOnce(Buffer.from("Ubuntu\r\n", "utf8"));
+    mockGetConfiguration.mockImplementation((section: string) => ({
+      get: vi.fn((key: string, fallback?: unknown) => {
+        if (section === "terminal.integrated" && key === "profiles.windows") {
+          return {};
+        }
+        return fallback;
+      })
+    }));
+
+    withPlatform("win32", () => {
+      expect(getConfiguredVscodeTerminalProfileNames()).toContain("Ubuntu (WSL)");
+      const options = resolveLocalShellLaunchOptions(makeProfile({
+        launchMode: "vscodeProfile",
+        vscodeProfileName: "Ubuntu (WSL)",
+        shellPath: undefined
+      }));
+
+      expect(options).toMatchObject({
+        shellPath: "C:\\Windows\\System32\\wsl.exe",
+        shellArgs: ["-d", "Ubuntu"]
+      });
+    });
+  });
+
+  it("does not treat arbitrary missing profile names as WSL profiles", () => {
+    process.env.windir = "C:\\Windows";
+    markPathExists("C:\\Windows\\System32\\wsl.exe");
+    mockGetConfiguration.mockImplementation((section: string) => ({
+      get: vi.fn((_key: string, fallback?: unknown) => {
+        if (section === "terminal.integrated") return {};
+        return fallback;
+      })
+    }));
+
+    withPlatform("win32", () => {
+      expect(() => resolveLocalShellLaunchOptions(makeProfile({
+        launchMode: "vscodeProfile",
+        vscodeProfileName: "Not A Real Profile",
+        shellPath: undefined
+      }))).toThrow(/was not found for this platform/i);
     });
   });
 
@@ -268,12 +398,12 @@ describe("resolveLocalShellLaunchOptions", () => {
     expect(options.cwd).toBe("/repo/app/src");
   });
 
-  it("does not resolve source-only VS Code terminal profiles to launch options", () => {
+  it("does not resolve unsupported source-only VS Code terminal profiles to launch options", () => {
     expect(() => resolveLocalShellLaunchOptions(makeProfile({
       launchMode: "vscodeProfile",
       vscodeProfileName: "Auto",
       shellPath: undefined
-    }))).toThrow(/uses source\/autodetect and does not expose an executable path/i);
+    }))).toThrow(/does not expose a launchable executable path/i);
   });
 });
 
@@ -281,6 +411,8 @@ describe("registerLocalShellCommands", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockMacros.length = 0;
+    mockExistingPaths.clear();
+    mockExecFileSync.mockReset();
     mockWorkspaceFolders = undefined;
     mockPickScriptFromWorkspace.mockReset();
     registeredCommands.clear();
@@ -351,7 +483,7 @@ describe("registerLocalShellCommands", () => {
     expect(ctx.localShellTerminals.size).toBe(0);
   });
 
-  it("rejects source-only VS Code terminal profiles with explicit Custom Shell guidance", async () => {
+  it("rejects unsupported source-only VS Code terminal profiles with explicit Custom Shell guidance", async () => {
     const ctx = makeCtx(makeProfile({
       launchMode: "vscodeProfile",
       vscodeProfileName: "PowerShell",

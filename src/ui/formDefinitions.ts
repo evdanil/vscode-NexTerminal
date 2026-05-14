@@ -170,9 +170,9 @@ function localShellFields(
       label: "VS Code Terminal Profile",
       suggestions: options.vscodeTerminalProfileNames ?? [],
       required: true,
-      placeholder: "Select a VS Code terminal profile with a shell path",
+      placeholder: "Select a launchable VS Code terminal profile",
       value: seed?.vscodeProfileName ?? "",
-      hint: "Only VS Code profiles with an explicit shell path appear here. Use Custom Shell for WSL or source/autodetected profiles.",
+      hint: "Shows explicit-path profiles plus mapped PowerShell, Git Bash, Command Prompt, and WSL profiles when Nexus can resolve their executable.",
       visibleWhen: localShellVisibleWhen(vw, "launchMode", "vscodeProfile")
     },
     {
