@@ -46,6 +46,8 @@ Nexus Terminal provides one operational surface in VS Code for:
 - The tree-only `nexus.profile.actions` command opens the **Profile Actions** quick pick from a profile item. It is hidden from the Command Palette and exposed through the tree.
 - Server profile actions include **Connect**, **Test Connection**, **Browse Files** when connected, **Connect and Run Script**, **Edit**, **Duplicate**, **Copy Connection Info**, and **Delete**.
 - Serial profile actions include **Connect**, **Test Connection**, **Connect and Run Script**, **Edit**, **Duplicate**, **Copy Port Info**, and **Delete**.
+- Local Shell profile actions include **Open Local Shell**, **Open and Run Script**, **Edit**, **Duplicate**, **Copy Shell Info**, and **Delete**. Local Shell profiles do not show a Test Connection action.
+- The Local Shell VS Code profile dropdown lists only terminal profiles that expose an explicit executable path to extensions. For WSL, use a custom Local Shell profile with `wsl.exe` as the shell path and any distribution arguments as shell arguments.
 - Folder actions use folder-specific labels for bulk operations: **Connect Folder Servers** and **Disconnect Folder Servers**.
 
 #### 4.1.2 Connection Test Diagnostics
@@ -290,6 +292,11 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 - `nexus.serial.copyInfo`, `nexus.serial.duplicate`, `nexus.serial.rename`
 - `nexus.serial.listPorts`, `nexus.serial.sendBreak`
 
+**Local Shell:**
+- `nexus.localShell.add`, `nexus.localShell.edit`, `nexus.localShell.remove`
+- `nexus.localShell.connect`, `nexus.localShell.runWithScript`, `nexus.localShell.disconnect`
+- `nexus.localShell.copyInfo`, `nexus.localShell.duplicate`, `nexus.localShell.rename`
+
 **Profile:**
 - `nexus.profile.add` (unified add form)
 - `nexus.profile.actions` (tree-item quick-action picker; hidden from the Command Palette)
@@ -377,12 +384,12 @@ Deferred (~10%):
 
 ## 9. Scripts
 
-Author-and-run automation on top of any active SSH or Serial session.
+Author-and-run automation on top of any active SSH, Serial, or Local Shell session.
 
 ### 9.1 Flow
 1. Create a `.js` file under `<workspaceRoot>/<nexus.scripts.path>` (default `.nexus/scripts/`). Tag the leading JSDoc block with `@nexus-script` and any of the optional fields `@name`, `@description`, `@target-type`, `@target-profile`, `@default-timeout`, `@lock-input`, `@allow-macros`.
 2. First time a Nexus script command runs in the workspace, `ScriptTypesGenerator` seeds `types/nexus-scripts.d.ts` + `jsconfig.json` so the editor gives autocomplete and JSDoc hovers for `expect`, `sendLine`, `poll`, `prompt`, etc.
-3. Invoke `nexus.script.run` from the Command Palette / sidebar / `▶ Run in Nexus` CodeLens. The runtime parses the header, resolves the target session (filter by `@target-type`; auto-select on `@target-profile` match; else QuickPick), and spawns a `node:worker_threads` Worker.
+3. Invoke `nexus.script.run` from the Command Palette / sidebar / `▶ Run in Nexus` CodeLens. The runtime parses the header, resolves the target session (filter by `@target-type` values `ssh`, `serial`, or `local`; auto-select on `@target-profile` id/name match; else QuickPick), and spawns a `node:worker_threads` Worker.
 4. While running, the script's status shows in the **Nexus Scripts** status-bar entry and the **Nexus Scripts** Output Channel logs timestamped events (`→ expect …`, `← matched`, `log info: …`, `end: completed (…ms)`).
 
 #### 9.1.1 Script Templates
@@ -401,7 +408,7 @@ Author-and-run automation on top of any active SSH or Serial session.
 ### 9.3 Stopping / failure paths
 - User stops from the status bar, CodeLens, or `nexus.script.stop`. `worker.terminate()` kills tight loops in <100 ms.
 - Wait timeout: `expect` throws `{ code: "Timeout", pattern, timeoutMs, elapsedMs }`; `waitFor` returns `null`.
-- SSH drop / serial session close while a wait is pending: pending RPCs reject with `{ code: "ConnectionLost", sessionId }`; the runtime gives the script a 150 ms grace period to run `try/catch`/`finally` before force-termination.
+- SSH drop / serial session close / Local Shell unregister while a wait is pending: pending RPCs reject with `{ code: "ConnectionLost", sessionId }`; the runtime gives the script a 150 ms grace period to run `try/catch`/`finally` before force-termination.
 - Macros, input lock, and output-observer subscription are restored/disposed on every exit path (`finally` in `cleanupRun`).
 
 ### 9.4 Isolation

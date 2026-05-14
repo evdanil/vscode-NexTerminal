@@ -59,6 +59,7 @@ describe("package contributions", () => {
     expect(commands).toContain("nexus.profile.add");
     expect(commands).toContain("nexus.localShell.add");
     expect(commands).toContain("nexus.localShell.connect");
+    expect(commands).toContain("nexus.localShell.runWithScript");
     expect(commands).toContain("nexus.group.add");
     expect(commands).toContain("nexus.group.remove");
   });
@@ -104,6 +105,22 @@ describe("package contributions", () => {
     expect(serverTestItems.every((item) => !item.when?.includes("nexus.serverConnected"))).toBe(true);
     // No serial test connection entry should reference nexus.serialProfileConnected
     expect(serialTestItems.every((item) => !item.when?.includes("Connected"))).toBe(true);
+  });
+
+  it("contributes Local Shell Open and Run Script without adding a Test Connection action", () => {
+    const commands = packageJson.contributes.commands.map((item) => item.command);
+    expect(commands).toContain("nexus.localShell.runWithScript");
+    expect(commands).not.toContain("nexus.localShell.testConnection");
+
+    const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+    expect(menuItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        command: "nexus.localShell.runWithScript",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+        group: "0_connect@3"
+      })
+    ]));
+    expect(menuItems.some((item) => item.command === "nexus.localShell.testConnection")).toBe(false);
   });
 
   it("hides the tree-only profile quick action command from the command palette", () => {

@@ -155,21 +155,28 @@ describe("LocalShellPty", () => {
   });
 
   it("does not emit duplicate close events when protocol and process exits both arrive", () => {
-    const pty = new LocalShellPty({
-      sidecarPath: "/native/local-pty",
-      shellPath: "/bin/bash",
-      shellArgs: [],
-      terminalName: "Nexus Local Shell: Bash",
-      spawnSidecar
-    });
-    const closes: Array<number | void> = [];
-    pty.onDidClose((code) => closes.push(code));
+    vi.useFakeTimers();
+    try {
+      const pty = new LocalShellPty({
+        sidecarPath: "/native/local-pty",
+        shellPath: "/bin/bash",
+        shellArgs: [],
+        terminalName: "Nexus Local Shell: Bash",
+        spawnSidecar
+      });
+      const closes: Array<number | void> = [];
+      pty.onDidClose((code) => closes.push(code));
 
-    pty.open({ rows: 24, columns: 80 });
-    sidecar.emitStdout({ type: "exit", code: 0 });
-    sidecar.emit("exit", 0, null);
+      pty.open({ rows: 24, columns: 80 });
+      sidecar.emitStdout({ type: "ready" });
+      vi.advanceTimersByTime(5_001);
+      sidecar.emitStdout({ type: "exit", code: 0 });
+      sidecar.emit("exit", 0, null);
 
-    expect(closes).toEqual([0]);
+      expect(closes).toEqual([0]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("ignores ready frames that arrive after the shell has already exited", () => {
@@ -216,5 +223,77 @@ describe("LocalShellPty", () => {
     expect(outputChannel.appendLine).toHaveBeenCalledWith(expect.stringContaining("exited before ready"));
     expect(observer.pauseIntervalMacros).toHaveBeenCalledOnce();
     expect(observer.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("signals early termination even after ready and startup output so callers can unregister stale sessions", () => {
+    vi.useFakeTimers();
+    try {
+      const pty = new LocalShellPty({
+        sidecarPath: "/native/local-pty",
+        shellPath: "/bin/bash",
+        shellArgs: [],
+        terminalName: "Nexus Local Shell: Bash",
+        spawnSidecar
+      });
+      const early: Array<{ code: number | null }> = [];
+      pty.onDidTerminateEarly((event) => early.push(event));
+
+      pty.open({ rows: 24, columns: 80 });
+      sidecar.emitStdout({ type: "ready" });
+      sidecar.emitStdout({ type: "data", data: encode("bash: bad option\n") });
+      sidecar.emitStdout({ type: "exit", code: 2 });
+
+      expect(early).toEqual([{ code: 2 }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps early-termination diagnostics visible when the killed sidecar process exits afterward", () => {
+    vi.useFakeTimers();
+    try {
+      const pty = new LocalShellPty({
+        sidecarPath: "/native/local-pty",
+        shellPath: "/bin/bash",
+        shellArgs: [],
+        terminalName: "Nexus Local Shell: Bash",
+        spawnSidecar
+      });
+      const closes: Array<number | void> = [];
+      pty.onDidClose((code) => closes.push(code));
+
+      pty.open({ rows: 24, columns: 80 });
+      sidecar.emitStdout({ type: "ready" });
+      sidecar.emitStdout({ type: "exit", code: 2 });
+      sidecar.emit("exit", 2, null);
+
+      expect(closes).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not classify exits after the startup window as early termination", () => {
+    vi.useFakeTimers();
+    try {
+      const pty = new LocalShellPty({
+        sidecarPath: "/native/local-pty",
+        shellPath: "/bin/bash",
+        shellArgs: [],
+        terminalName: "Nexus Local Shell: Bash",
+        spawnSidecar
+      });
+      const early = vi.fn();
+      pty.onDidTerminateEarly(early);
+
+      pty.open({ rows: 24, columns: 80 });
+      sidecar.emitStdout({ type: "ready" });
+      vi.advanceTimersByTime(5_001);
+      sidecar.emitStdout({ type: "exit", code: 0 });
+
+      expect(early).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

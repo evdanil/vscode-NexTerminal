@@ -3,6 +3,7 @@ import type { FormDefinition, FormValues } from "../../src/ui/formTypes";
 
 const mockExecuteCommand = vi.fn();
 const mockShowWarningMessage = vi.fn();
+const mockShowQuickPick = vi.fn();
 const mockGetConfiguration = vi.fn();
 const mockWebviewOpen = vi.fn();
 const mockFormValuesToServer = vi.fn();
@@ -24,7 +25,7 @@ vi.mock("vscode", () => ({
   },
   window: {
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
-    showQuickPick: vi.fn(),
+    showQuickPick: (...args: unknown[]) => mockShowQuickPick(...args),
     showInformationMessage: vi.fn()
   },
   workspace: {
@@ -64,7 +65,8 @@ vi.mock("../../src/commands/inlineAuthProfileCreation", () => ({
   createInlineAuthProfileCreation: () => mockInlineAuthProfile
 }));
 
-import { openUnifiedForm } from "../../src/commands/profileCommands";
+import { openUnifiedForm, registerProfileCommands } from "../../src/commands/profileCommands";
+import { LocalShellProfileTreeItem } from "../../src/ui/nexusTreeProvider";
 
 function makeCtx() {
   return {
@@ -105,6 +107,7 @@ describe("openUnifiedForm test action", () => {
     mockGetConfiguration.mockReturnValue({
       get: vi.fn((_key: string, fallback: unknown) => fallback)
     });
+    mockShowQuickPick.mockReset();
     mockWebviewOpen.mockReturnValue({ dispose: vi.fn() });
     mockFormValuesToServer.mockReturnValue({ id: "draft-server" });
     mockFormValuesToSerial.mockReturnValue({ id: "draft-serial" });
@@ -182,5 +185,21 @@ describe("openUnifiedForm test action", () => {
 
     expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.server.testConnection", { server: { id: "draft-server" } });
     expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.serial.testConnection", { profile: { id: "draft-serial" } });
+  });
+
+  it("offers Open and Run Script for Local Shell profile quick actions without Test Connection", async () => {
+    const profile = { id: "local-1", name: "Dev", launchMode: "custom", shellPath: "/bin/bash" };
+    const item = new LocalShellProfileTreeItem(profile as any, false);
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Open and Run Script", command: "nexus.localShell.runWithScript" });
+    registerProfileCommands(makeCtx());
+
+    await (vi.mocked((await import("vscode")).commands.registerCommand).mock.calls.find(
+      ([command]) => command === "nexus.profile.actions"
+    )?.[1] as (arg: unknown) => Promise<void>)(item);
+
+    const picks = mockShowQuickPick.mock.calls[0][0] as Array<{ label: string }>;
+    expect(picks.map((pick) => pick.label)).toContain("Open and Run Script");
+    expect(picks.map((pick) => pick.label)).not.toContain("Test Connection");
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.localShell.runWithScript", item);
   });
 });

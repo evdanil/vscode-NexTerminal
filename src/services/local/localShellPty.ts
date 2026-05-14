@@ -6,6 +6,7 @@ import type { SessionPtyHandle } from "../../models/config";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 
 const MAX_FRAME_LENGTH = 1024 * 1024;
+const EARLY_TERMINATION_WINDOW_MS = 5_000;
 
 type LocalPtyState = "idle" | "spawning" | "running" | "failed" | "exited" | "closing" | "disposed";
 
@@ -40,6 +41,10 @@ export interface LocalShellPtyOptions {
   startupCommand?: string;
   spawnSidecar?: LocalPtySidecarSpawner;
   outputChannel?: LocalShellOutputChannel;
+}
+
+export interface LocalShellEarlyTerminationEvent {
+  code: number | null;
 }
 
 function encodeBase64(text: string): string {
@@ -81,6 +86,8 @@ export function resolveLocalPtySidecarPath(extensionPath: string): string {
 export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   private readonly writeEmitter = new vscode.EventEmitter<string>();
   private readonly closeEmitter = new vscode.EventEmitter<number | void>();
+  private readonly earlyTerminateEmitter = new vscode.EventEmitter<LocalShellEarlyTerminationEvent>();
+  private readonly startupCompleteEmitter = new vscode.EventEmitter<void>();
   private readonly outputObservers = new Set<PtyOutputObserver>();
   private readonly queuedInput: string[] = [];
   private readonly spawnSidecar: LocalPtySidecarSpawner;
@@ -89,9 +96,14 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   private state: LocalPtyState = "idle";
   private inputBlocked = false;
   private inputBlockNoticeArmed = false;
+  private startupWindowTimer?: ReturnType<typeof setTimeout>;
+  private startupWindowActive = false;
+  private startupCompleted = false;
 
   public readonly onDidWrite = this.writeEmitter.event;
   public readonly onDidClose = this.closeEmitter.event;
+  public readonly onDidTerminateEarly = this.earlyTerminateEmitter.event;
+  public readonly onDidStartupComplete = this.startupCompleteEmitter.event;
 
   public constructor(private readonly options: LocalShellPtyOptions) {
     this.spawnSidecar = options.spawnSidecar ?? defaultSpawnSidecar;
@@ -100,6 +112,16 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   public open(dimensions?: vscode.TerminalDimensions): void {
     if (this.state !== "idle") return;
     this.state = "spawning";
+    this.startupCompleted = false;
+    this.startupWindowActive = true;
+    this.startupWindowTimer = setTimeout(() => {
+      this.startupWindowTimer = undefined;
+      if (this.state === "running") {
+        this.finishStartup();
+      } else {
+        this.startupWindowActive = false;
+      }
+    }, EARLY_TERMINATION_WINDOW_MS);
     this.log(`Starting ${this.options.terminalName}`);
     this.log(`Sidecar: ${this.options.sidecarPath}`);
     this.log(`Shell: ${this.options.shellPath}${this.options.shellArgs?.length ? ` ${this.options.shellArgs.join(" ")}` : ""}`);
@@ -184,6 +206,31 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.sidecar = undefined;
   }
 
+  public waitForStartup(timeoutMs = EARLY_TERMINATION_WINDOW_MS + 500): Promise<boolean> {
+    if (this.startupCompleted) return Promise.resolve(true);
+    if (this.state === "failed" || this.state === "exited" || this.state === "closing" || this.state === "disposed") {
+      return Promise.resolve(false);
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
+      const disposables: vscode.Disposable[] = [];
+      const settle = (started: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        for (const disposable of disposables) disposable.dispose();
+        resolve(started);
+      };
+
+      disposables.push(this.onDidStartupComplete(() => settle(true)));
+      disposables.push(this.onDidTerminateEarly(() => settle(false)));
+      disposables.push(this.onDidClose(() => settle(false)));
+      timer = setTimeout(() => settle(false), Math.max(0, timeoutMs));
+    });
+  }
+
   private handleStdout(chunk: Buffer | string): void {
     this.stdoutBuffer += chunk.toString();
     if (this.stdoutBuffer.length > MAX_FRAME_LENGTH) {
@@ -218,6 +265,9 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
         while (this.queuedInput.length > 0) {
           this.sendInput(this.queuedInput.shift() ?? "");
         }
+        if (!this.startupWindowActive) {
+          this.finishStartup();
+        }
         break;
       case "data": {
         const output = decodeBase64(frame.data);
@@ -250,12 +300,17 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   }
 
   private handleExit(code: number | null): void {
-    if (this.state === "disposed" || this.state === "exited" || this.state === "closing") return;
+    if (this.state === "disposed" || this.state === "exited" || this.state === "closing" || this.state === "failed") return;
     if (this.state === "spawning") {
       this.failBeforeReady(`Local Shell sidecar exited before startup completed. Exit code: ${code ?? "unknown"}.`);
       return;
     }
+    if (this.startupWindowActive) {
+      this.failEarlyAfterReady(code);
+      return;
+    }
     this.state = "exited";
+    this.clearStartupWindowTimer();
     this.pauseIntervalMacros();
     this.disposeObservers();
     this.closeEmitter.fire(code ?? undefined);
@@ -264,6 +319,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   private failBeforeReady(message: string): void {
     if (this.state === "disposed" || this.state === "failed") return;
     this.state = "failed";
+    this.clearStartupWindowTimer();
     this.log(`Sidecar exited before ready: ${message}`);
     this.writeEmitter.fire(`\r\n[Nexus Local Shell Error] ${message}\r\n`);
     this.writeEmitter.fire(`[Nexus Local Shell] Sidecar: ${this.options.sidecarPath}\r\n`);
@@ -271,11 +327,28 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.pauseIntervalMacros();
     this.disposeObservers();
     this.sidecar = undefined;
+    this.earlyTerminateEmitter.fire({ code: null });
+  }
+
+  private failEarlyAfterReady(code: number | null): void {
+    if (this.state === "disposed" || this.state === "failed") return;
+    this.state = "failed";
+    this.clearStartupWindowTimer();
+    this.log(`Shell exited during startup window. Exit code: ${code ?? "unknown"}.`);
+    this.writeEmitter.fire(`\r\n[Nexus Local Shell Error] Shell exited shortly after startup. Exit code: ${code ?? "unknown"}.\r\n`);
+    this.writeEmitter.fire("[Nexus Local Shell] The terminal remains open so startup output can be reviewed.\r\n");
+    this.writeEmitter.fire("[Nexus Local Shell] Close this terminal and reopen the profile to retry.\r\n");
+    this.pauseIntervalMacros();
+    this.disposeObservers();
+    this.sidecar?.kill();
+    this.sidecar = undefined;
+    this.earlyTerminateEmitter.fire({ code });
   }
 
   private fail(message: string): void {
     if (this.state === "disposed") return;
     this.state = "failed";
+    this.clearStartupWindowTimer();
     this.log(`Failed: ${message}`);
     this.writeEmitter.fire(`\r\n[Nexus Local Shell Error] ${message}\r\n`);
     this.pauseIntervalMacros();
@@ -307,9 +380,25 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.outputObservers.clear();
   }
 
+  private finishStartup(): void {
+    if (this.startupCompleted) return;
+    this.startupCompleted = true;
+    this.clearStartupWindowTimer();
+    this.startupCompleteEmitter.fire();
+  }
+
+  private clearStartupWindowTimer(): void {
+    this.startupWindowActive = false;
+    if (this.startupWindowTimer) {
+      clearTimeout(this.startupWindowTimer);
+      this.startupWindowTimer = undefined;
+    }
+  }
+
   private dispose(nextState: LocalPtyState): void {
     if (this.state === "disposed") return;
     this.state = nextState;
+    this.clearStartupWindowTimer();
     this.pauseIntervalMacros();
     this.sendFrame({ type: "kill" });
     this.sidecar?.kill();
@@ -318,5 +407,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.state = "disposed";
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
+    this.earlyTerminateEmitter.dispose();
+    this.startupCompleteEmitter.dispose();
   }
 }

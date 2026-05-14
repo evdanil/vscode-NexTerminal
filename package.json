@@ -40,6 +40,7 @@
     "onCommand:nexus.serial.connect",
     "onCommand:nexus.localShell.add",
     "onCommand:nexus.localShell.connect",
+    "onCommand:nexus.localShell.runWithScript",
     "onCommand:nexus.profile.add",
     "onFileSystem:nexterm"
   ],
@@ -326,6 +327,12 @@
         "title": "Open Local Shell",
         "category": "Nexus",
         "icon": "$(terminal)"
+      },
+      {
+        "command": "nexus.localShell.runWithScript",
+        "title": "Open and Run Script…",
+        "category": "Nexus",
+        "icon": "$(run-all)"
       },
       {
         "command": "nexus.localShell.disconnect",
@@ -1098,6 +1105,11 @@
           "group": "0_connect@2"
         },
         {
+          "command": "nexus.localShell.runWithScript",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "group": "0_connect@3"
+        },
+        {
           "command": "nexus.localShell.edit",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
           "group": "1_manage@1"
@@ -1472,6 +1484,10 @@
         },
         {
           "command": "nexus.localShell.connect",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localShell.runWithScript",
           "when": "true"
         },
         {

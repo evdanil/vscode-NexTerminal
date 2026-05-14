@@ -430,11 +430,11 @@ describe("scriptCommands", () => {
       (await import("vscode")).window.activeTerminal = undefined;
     });
 
-    it("falls back to the picker when the focused Nexus terminal is a Local Shell session", async () => {
+    it("binds to the focused Local Shell terminal when one is active", async () => {
       const mgr = makeManager();
       const localShellTerminal = { name: "Nexus Local Shell: Dev" } as unknown as import("vscode").Terminal;
       (await import("vscode")).window.activeTerminal = localShellTerminal;
-      const resolver = vi.fn(() => undefined); // Local Shell is intentionally not script-capable in v1.
+      const resolver = vi.fn((terminal: unknown) => terminal === localShellTerminal ? "local-session" : undefined);
 
       registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs", resolver as never);
       const runQuick = state.registeredCommands.get("nexus.script.runQuick")!;
@@ -442,7 +442,7 @@ describe("scriptCommands", () => {
       await runQuick(uri);
 
       expect(resolver).toHaveBeenCalledWith(localShellTerminal);
-      expect(mgr.runScript).toHaveBeenCalledWith(uri, undefined);
+      expect(mgr.runScript).toHaveBeenCalledWith(uri, "local-session");
 
       (await import("vscode")).window.activeTerminal = undefined;
     });

@@ -68,6 +68,7 @@ describe("scriptHeader / parseScriptHeader", () => {
   it("accepts case-insensitive @target-type values", () => {
     expect(parseScriptHeader(base("@nexus-script\n@target-type SSH")).targetType).toBe("ssh");
     expect(parseScriptHeader(base("@nexus-script\n@target-type Serial")).targetType).toBe("serial");
+    expect(parseScriptHeader(base("@nexus-script\n@target-type Local")).targetType).toBe("local");
   });
 
   it("trims whitespace in comma-separated @allow-macros", () => {

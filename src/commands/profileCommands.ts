@@ -156,6 +156,7 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
     if (arg instanceof LocalShellProfileTreeItem) {
       const picks: ProfileActionPick[] = [
         { label: "Open Local Shell", command: "nexus.localShell.connect" },
+        { label: "Open and Run Script", command: "nexus.localShell.runWithScript" },
         { label: "Edit", command: "nexus.localShell.edit" },
         { label: "Duplicate", command: "nexus.localShell.duplicate" },
         { label: "Copy Shell Info", command: "nexus.localShell.copyInfo" },

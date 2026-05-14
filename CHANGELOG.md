@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Nexus Scripts can now run against Local Shell sessions.** `@target-type local`, `session.type === "local"`, quick-run from a focused Local Shell terminal, and Local Shell **Open and Run Script** profile actions are supported alongside SSH and Serial.
+
+### Fixed
+
+- **Local Shell startup failures now leave diagnostics visible without stale active sessions.** Early local process exits unregister the Nexus session while keeping the terminal tab available for reviewing startup output.
+
 ## [2.8.41] — 2026-05-13
 
 ### Changed

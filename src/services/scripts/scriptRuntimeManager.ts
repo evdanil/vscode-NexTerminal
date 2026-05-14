@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import * as vscode from "vscode";
 import type { NexusCore } from "../../core/nexusCore";
-import type { ActiveSession, ActiveSerialSession, SessionPtyHandle } from "../../models/config";
+import type { ActiveLocalShellSession, ActiveSession, ActiveSerialSession, SessionPtyHandle } from "../../models/config";
 import type { MacroAutoTrigger, PtyOutputObserver } from "../macroAutoTrigger";
 import { parseScriptHeader, type ScriptHeader } from "./scriptHeader";
 import { ScriptMacroFilter } from "./scriptMacroFilter";
@@ -18,6 +18,7 @@ import type {
   RunningScriptSnapshot,
   ScriptRunEvent,
   ScriptRunOperation,
+  ScriptTargetType,
   StopReason,
   WorkerInbound,
   WorkerOutbound
@@ -66,7 +67,7 @@ interface RunningScriptRecord {
   scriptPath: string;
   sessionId: string;
   sessionName: string;
-  sessionType: "ssh" | "serial";
+  sessionType: ScriptTargetType;
   startedAt: number;
   state: RunState;
   currentOperation: ScriptRunOperation | null;
@@ -143,6 +144,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       ? this.resolveSession(sessionId)
       : await this.pickTargetForScript(displayName, header);
     if (!target) return undefined;
+    if (sessionId && !this.validateExplicitTarget(displayName, header, target)) {
+      return undefined;
+    }
 
     if (this.runs.has(target.session.id)) {
       const existing = this.runs.get(target.session.id)!;
@@ -244,7 +248,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
         targetId:
           target.type === "ssh"
             ? (target.session as ActiveSession).serverId
-            : (target.session as ActiveSerialSession).profileId
+            : (target.session as ActiveSerialSession | ActiveLocalShellSession).profileId
       }
     });
     return record.id;
@@ -346,19 +350,61 @@ export class ScriptRuntimeManager implements vscode.Disposable {
 
   private resolveSession(
     sessionId: string
-  ): { type: "ssh" | "serial"; session: (ActiveSession | ActiveSerialSession) } | undefined {
+  ): { type: ScriptTargetType; session: (ActiveSession | ActiveSerialSession | ActiveLocalShellSession) } | undefined {
     const snapshot = this.deps.core.getSnapshot();
     const ssh = snapshot.activeSessions.find((s) => s.id === sessionId);
     if (ssh) return { type: "ssh", session: ssh };
     const serial = snapshot.activeSerialSessions.find((s) => s.id === sessionId);
     if (serial) return { type: "serial", session: serial };
+    const local = snapshot.activeLocalShellSessions.find((s) => s.id === sessionId);
+    if (local) return { type: "local", session: local };
     return undefined;
+  }
+
+  private validateExplicitTarget(
+    displayName: string,
+    header: ScriptHeader,
+    target: { type: ScriptTargetType; session: ActiveSession | ActiveSerialSession | ActiveLocalShellSession }
+  ): boolean {
+    if (header.targetType && header.targetType !== target.type) {
+      void vscode.window.showErrorMessage(
+        `"${displayName}" targets ${friendlyTargetType(header.targetType)} sessions, but the focused terminal is ${friendlyTargetType(target.type)}.`
+      );
+      return false;
+    }
+    if (header.targetProfile && !this.explicitTargetProfileMatches(header.targetProfile, target)) {
+      void vscode.window.showErrorMessage(
+        `"${displayName}" targets profile "${header.targetProfile}", but the focused terminal is ${target.session.terminalName}.`
+      );
+      return false;
+    }
+    return true;
+  }
+
+  private explicitTargetProfileMatches(
+    targetProfile: string,
+    target: { type: ScriptTargetType; session: ActiveSession | ActiveSerialSession | ActiveLocalShellSession }
+  ): boolean {
+    const snapshot = this.deps.core.getSnapshot();
+    if (target.type === "ssh") {
+      const session = target.session as ActiveSession;
+      const serverName = snapshot.servers.find((server) => server.id === session.serverId)?.name;
+      return session.serverId === targetProfile || serverName === targetProfile;
+    }
+    if (target.type === "serial") {
+      const session = target.session as ActiveSerialSession;
+      const profileName = snapshot.serialProfiles.find((profile) => profile.id === session.profileId)?.name;
+      return session.profileId === targetProfile || profileName === targetProfile;
+    }
+    const session = target.session as ActiveLocalShellSession;
+    const profileName = (snapshot.localShellProfiles ?? []).find((profile) => profile.id === session.profileId)?.name;
+    return session.profileId === targetProfile || profileName === targetProfile;
   }
 
   private async pickTargetForScript(
     displayName: string,
     header: ScriptHeader
-  ): Promise<{ type: "ssh" | "serial"; session: ActiveSession | ActiveSerialSession } | undefined> {
+  ): Promise<{ type: ScriptTargetType; session: ActiveSession | ActiveSerialSession | ActiveLocalShellSession } | undefined> {
     const descriptor: ScriptTargetDescriptor = {
       displayName,
       targetType: header.targetType,
@@ -366,9 +412,13 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     };
     const session = await pickTarget(descriptor, this.deps.core);
     if (!session) return undefined;
-    // Classify by whether the session is in activeSessions or activeSerialSessions
+    // Classify by which active-session collection owns the picked id.
     const snapshot = this.deps.core.getSnapshot();
-    const kind: "ssh" | "serial" = snapshot.activeSessions.some((s) => s.id === session.id) ? "ssh" : "serial";
+    const kind: ScriptTargetType = snapshot.activeSessions.some((s) => s.id === session.id)
+      ? "ssh"
+      : snapshot.activeSerialSessions.some((s) => s.id === session.id)
+        ? "serial"
+        : "local";
     return { type: kind, session };
   }
 
@@ -817,6 +867,12 @@ let pendingIdCounter = 0;
 
 function patternToLabel(p: string | RegExp): string {
   return typeof p === "string" ? JSON.stringify(p) : p.toString();
+}
+
+function friendlyTargetType(type: ScriptTargetType): string {
+  if (type === "ssh") return "SSH";
+  if (type === "serial") return "Serial";
+  return "Local Shell";
 }
 
 function makeError(

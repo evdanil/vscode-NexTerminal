@@ -77,6 +77,7 @@ describe("NexusCore", () => {
     expect(snapshot.localShellProfiles).toHaveLength(1);
     expect(snapshot.activeLocalShellSessions).toHaveLength(2);
     expect(core.isLocalShellProfileConnected("local-1")).toBe(true);
+    expect(core.getActiveSessionById("local-session-1")?.terminalName).toBe("Nexus Local Shell: Local Dev");
 
     await core.removeLocalShellProfile("local-1");
     expect(core.getSnapshot().localShellProfiles).toHaveLength(0);

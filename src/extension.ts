@@ -314,7 +314,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const resolveTrackedSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined =>
     resolveSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals);
   const resolveScriptCapableSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined =>
-    resolveScriptSessionForTerminal(terminal, sessionTerminals, serialTerminals);
+    resolveScriptSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals);
   const globalStoragePath = context.globalStorageUri.fsPath;
   SettingsPanel.setGlobalStoragePath(globalStoragePath);
   const scriptCommandDisposables = registerScriptCommands(

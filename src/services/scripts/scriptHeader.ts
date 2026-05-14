@@ -1,8 +1,10 @@
+import type { ScriptTargetType } from "./scriptTypes";
+
 export interface ScriptHeader {
   marker: boolean;
   name?: string;
   description?: string;
-  targetType?: "ssh" | "serial";
+  targetType?: ScriptTargetType;
   targetProfile?: string;
   defaultTimeoutMs?: number;
   lockInput: boolean;
@@ -95,8 +97,8 @@ export function parseScriptHeader(source: string): ScriptHeader {
         break;
       case "@target-type": {
         const normalized = value.toLowerCase();
-        if (normalized !== "ssh" && normalized !== "serial") {
-          header.parseErrors.push(`@target-type must be "ssh" or "serial", got "${value}"`);
+        if (normalized !== "ssh" && normalized !== "serial" && normalized !== "local") {
+          header.parseErrors.push(`@target-type must be "ssh", "serial", or "local", got "${value}"`);
           break;
         }
         header.targetType = normalized;

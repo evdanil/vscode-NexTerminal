@@ -99,6 +99,7 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     mockFsEntries.set("/ws/.nexus/scripts", [
       ["ssh-only.js", 1],
       ["serial-only.js", 1],
+      ["local-only.js", 1],
       ["unrestricted.js", 1]
     ]);
     mockFiles.set("/ws/.nexus/scripts/ssh-only.js", "/**\n * @nexus-script\n * @name SshOnly\n * @target-type ssh\n */\n");
@@ -106,14 +107,18 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
       "/ws/.nexus/scripts/serial-only.js",
       "/**\n * @nexus-script\n * @name SerialOnly\n * @target-type serial\n */\n"
     );
+    mockFiles.set(
+      "/ws/.nexus/scripts/local-only.js",
+      "/**\n * @nexus-script\n * @name LocalOnly\n * @target-type local\n */\n"
+    );
     mockFiles.set("/ws/.nexus/scripts/unrestricted.js", "/**\n * @nexus-script\n * @name Any\n */\n");
 
-    await pickScriptFromWorkspace(GLOBAL_STORAGE, "serial");
+    await pickScriptFromWorkspace(GLOBAL_STORAGE, "local");
     const labels = (quickPickItems as Array<{ label: string }>)?.map((i) => i.label) ?? [];
-    expect(labels.sort()).toEqual(["Any", "SerialOnly"]);
+    expect(labels.sort()).toEqual(["Any", "LocalOnly"]);
   });
 
-  it("shows an unrestricted script in both SSH and serial contexts", async () => {
+  it("shows an unrestricted script in SSH, serial, and Local Shell contexts", async () => {
     mockFsEntries.set("/ws/.nexus/scripts", [["a.js", 1]]);
     mockFiles.set("/ws/.nexus/scripts/a.js", "/**\n * @nexus-script\n * @name Any\n */\n");
 
@@ -125,6 +130,11 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     await pickScriptFromWorkspace(GLOBAL_STORAGE, "serial");
     const serialLabels = (quickPickItems as Array<{ label: string }>)?.map((i) => i.label) ?? [];
     expect(serialLabels).toEqual(["Any"]);
+
+    quickPickItems = undefined;
+    await pickScriptFromWorkspace(GLOBAL_STORAGE, "local");
+    const localLabels = (quickPickItems as Array<{ label: string }>)?.map((i) => i.label) ?? [];
+    expect(localLabels).toEqual(["Any"]);
   });
 
   it("surfaces a helpful message when no compatible scripts exist", async () => {
