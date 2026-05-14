@@ -193,8 +193,8 @@ describe("formDefinitions keyPath visibility", () => {
       type: "combobox",
       label: "VS Code Terminal Profile",
       required: true,
-      placeholder: "Select a VS Code terminal profile with a shell path",
-      hint: expect.stringMatching(/Custom Shell.*WSL/i),
+      placeholder: "Select a launchable VS Code terminal profile",
+      hint: expect.stringMatching(/mapped PowerShell, Git Bash, Command Prompt, and WSL profiles/i),
       visibleWhen: [
         { field: "profileType", value: "localShell" },
         { field: "launchMode", value: "vscodeProfile" }
