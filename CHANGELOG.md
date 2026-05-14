@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.8.44] — 2026-05-15
+
 ### Added
 
 - **Nexus Scripts can now run against Local Shell sessions.** `@target-type local`, `session.type === "local"`, quick-run from a focused Local Shell terminal, and Local Shell **Open and Run Script** profile actions are supported alongside SSH and Serial.
