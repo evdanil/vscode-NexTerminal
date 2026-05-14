@@ -12,10 +12,77 @@ permissions:
   contents: read
 
 jobs:
+  build-local-pty:
+    name: Build Local PTY (${{ matrix.key }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            key: linux-x64
+            binary: nexus-local-pty
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            key: linux-arm64
+            binary: nexus-local-pty
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            key: darwin-x64
+            binary: nexus-local-pty
+          - os: macos-15
+            target: aarch64-apple-darwin
+            key: darwin-arm64
+            binary: nexus-local-pty
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            key: win32-x64
+            binary: nexus-local-pty.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            key: win32-arm64
+            binary: nexus-local-pty.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/local-pty
+
+      - name: Build sidecar
+        run: cargo build --manifest-path native/local-pty/Cargo.toml --release --target "${{ matrix.target }}"
+
+      - name: Smoke test sidecar
+        run: node scripts/smokeLocalPty.mjs "native/local-pty/target/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+      - name: Prepare artifact
+        run: node scripts/collectLocalPtyArtifact.mjs "${{ matrix.target }}" "${{ matrix.key }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: local-pty-${{ matrix.key }}
+          path: local-pty-dist
+
   build-and-publish-openvsx:
+    needs: build-local-pty
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: local-pty-*
+          path: native/local-pty-artifacts
+          merge-multiple: true
 
       - uses: actions/setup-node@v4
         with:
@@ -32,13 +99,32 @@ jobs:
         run: npm ci
 
       - name: Build production bundle
+        env:
+          LOCAL_PTY_REQUIRE_ALL: "1"
         run: npm run build:production
 
       - name: Remove CI-compiled native addons (keep cross-platform prebuilds)
         run: rm -rf node_modules/@serialport/bindings-cpp/build
 
       - name: Package VSIX for Open VSX
+        env:
+          LOCAL_PTY_REQUIRE_ALL: "1"
         run: npm run package:ovsx
+
+      - name: Verify VSIX contents
+        shell: bash
+        run: |
+          VSIX_FILE=$(ls *.vsix)
+          for platform in win32-x64 win32-arm64 linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            binary="nexus-local-pty"
+            if [[ "$platform" == win32-* ]]; then
+              binary="nexus-local-pty.exe"
+            fi
+            unzip -l "$VSIX_FILE" | grep "extension/dist/native/local-pty/$platform/$binary" || {
+              echo "ERROR: Local Shell PTY sidecar missing from VSIX: $platform/$binary"
+              exit 1
+            }
+          done
 
       - name: Publish to Open VSX Registry
         run: npm run publish:ovsx

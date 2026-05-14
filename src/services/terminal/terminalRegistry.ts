@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { ActiveSerialSession, ActiveSession, SessionPtyHandle } from "../../models/config";
+import type { ActiveLocalShellSession, ActiveSerialSession, ActiveSession, SessionPtyHandle } from "../../models/config";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { TerminalCaptureBuffer } from "./terminalCaptureBuffer";
 
@@ -19,6 +19,7 @@ interface InternalEntry extends RegistryEntry {
 interface CoreSnapshotLike {
   activeSessions: ReadonlyArray<Pick<ActiveSession, "pty">>;
   activeSerialSessions: ReadonlyArray<Pick<ActiveSerialSession, "pty" | "status">>;
+  activeLocalShellSessions: ReadonlyArray<Pick<ActiveLocalShellSession, "pty">>;
 }
 
 export interface NexusCoreLike {
@@ -82,6 +83,9 @@ export class TerminalRegistry implements vscode.Disposable {
     }
     for (const s of snap.activeSerialSessions) {
       if (s.pty === entry.pty && s.status !== "waiting") return true;
+    }
+    for (const s of snap.activeLocalShellSessions) {
+      if (s.pty === entry.pty) return true;
     }
     return false;
   }

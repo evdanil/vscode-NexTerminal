@@ -3242,13 +3242,15 @@
   "scripts": {
     "clean": "rimraf dist coverage",
     "compile": "tsc -p tsconfig.json --noEmit",
-    "build": "npm run clean && npm run compile && node esbuild.mjs",
-    "build:production": "npm run clean && npm run compile && node esbuild.mjs --production",
+    "build": "npm run clean && npm run compile && node esbuild.mjs && npm run prepare:local-pty",
+    "build:production": "npm run clean && npm run compile && node esbuild.mjs --production && npm run prepare:local-pty",
+    "prepare:local-pty": "node scripts/installLocalPtyArtifacts.mjs",
+    "prepare:local-pty:required": "node scripts/installLocalPtyArtifacts.mjs --require-all",
     "watch": "tsc -p tsconfig.json --watch --noEmit",
     "test": "vitest run --coverage",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
-    "package:vsix": "npm run build:production && vsce package",
+    "package:vsix": "npm run clean && npm run compile && node esbuild.mjs --production && npm run prepare:local-pty:required && vsce package",
     "package:ovsx": "npm run package:vsix",
     "publish:ovsx": "ovsx publish \"vscode-nexterminal-${npm_package_version}.vsix\" --pat \"$OVSX_PAT\"",
     "generate:keybindings": "node scripts/generateKeybindings.mjs"

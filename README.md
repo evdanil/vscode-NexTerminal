@@ -18,7 +18,7 @@ Manage remote servers, serial devices, local shell profiles, and TCP tunnels fro
   - **HTTP CONNECT Proxy** — Connect through an HTTP proxy using the CONNECT method, common in corporate environments.
 - **SFTP File Explorer** — Browse, download, and manage remote files on connected servers. Drag-and-drop support for moving files between directories.
 - **Serial Terminal Sessions** — Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, parity, stop bits, and RTS/CTS flow control. Supports break signal and XON passthrough. Includes **Smart Follow** mode for Windows COM-port renumbering: it retries the preferred port, silently reconnects only to the previously approved device when metadata matches, prompts before switching to unfamiliar replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped instead of tearing the tab down on serial errors. Runs in an isolated sidecar process for crash safety.
-- **Local Shell Profiles** — Save named local terminal profiles and open one or more local shell sessions from the Connectivity Hub. Use a configured VS Code terminal profile from the profile dropdown, or choose **Custom Shell** to set an explicit shell path, one argument per line, a working directory, and an optional startup command. WSL can be configured as a custom shell with `wsl.exe` plus any required arguments. Manual terminal macros can send text to the active Local Shell terminal; Nexus scripting support is intentionally limited to SSH and Serial sessions for now.
+- **Local Shell Profiles** — Save named local terminal profiles and open one or more local shell sessions from the Connectivity Hub. Use a configured VS Code terminal profile from the profile dropdown, or choose **Custom Shell** to set an explicit shell path, one argument per line, a working directory, and an optional startup command. WSL can be configured as a custom shell with `wsl.exe` plus any required arguments. Manual macros and auto-trigger macros work with Local Shell sessions; Nexus scripting support is intentionally limited to SSH and Serial sessions for now.
 - **Port Forwarding (TCP Tunnels)** — Three tunnel modes:
   - **Local (-L)** — Forward a local port to a remote host through SSH.
   - **Reverse (-R)** — Forward a remote port back to a local target.
@@ -114,10 +114,11 @@ If your target server is behind a firewall or bastion host:
 
 1. Run `Nexus: Add Local Shell Profile`, or use `Nexus: Add Profile` and select **Local Shell Profile**
 2. Name the profile for the workflow you want to save, for example `PowerShell Admin`, `WSL Ubuntu`, or `Project Shell`
-3. Choose **VS Code Profile** to pick one of the terminal profiles defined in your VS Code settings, or choose **Custom Shell** to enter a shell path directly
+3. Choose **VS Code Terminal Profile** to pick a VS Code terminal profile that has an explicit shell path, or choose **Custom Shell** to enter a shell path directly. Source/autodetected profiles that VS Code does not expose with a path should be recreated as a Custom Shell profile.
 4. For WSL on Windows, use **Custom Shell** with `C:\Windows\System32\wsl.exe`; add arguments one per line when you need a distro or startup option, for example `-d` and `Ubuntu`
 5. Optionally set a working directory and startup command, then save the profile
 6. Right-click the profile and select **Open Local Shell**. You can open multiple sessions from the same saved Local Shell profile.
+7. Auto-trigger macros can match Local Shell output. Existing macros scoped to **All terminals** will also apply to Local Shell sessions; use profile-scoped macros for shell-specific prompts.
 
 ### Set Up Port Forwarding
 

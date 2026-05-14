@@ -55,12 +55,12 @@ export function renderMacroEditorHtml(
   const profileOptions = buildMacroProfileSelectOptions(profiles, triggerProfileId);
   const profileIdsJson = serializeForInlineScript(profileOptions.map((profile) => profile.id));
   const selectedProfileLabel = profileOptions.find((profile) => profile.id === triggerProfileId)?.label
-    ?? (profileOptions.length > 0 ? "Select a profile\u2026" : "No server or serial profiles");
+    ?? (profileOptions.length > 0 ? "Select a profile\u2026" : "No SSH, Serial, or Local Shell profiles");
   const triggerProfileOptionsHtml = profileOptions.length > 0
     ? profileOptions.map((profile) =>
       `<div class="custom-select-option${profile.id === triggerProfileId ? " selected" : ""}" data-value="${escapeHtml(profile.id)}">${escapeHtml(profile.label)}</div>`
     ).join("\n        ")
-    : '<div class="custom-select-option selected" data-value="">No server or serial profiles</div>';
+    : '<div class="custom-select-option selected" data-value="">No SSH, Serial, or Local Shell profiles</div>';
   const emptyStateHtml = macros.length === 0
     ? `<div class="empty-state">
     <div class="empty-title">No macros yet</div>
@@ -191,7 +191,7 @@ export function renderMacroEditorHtml(
         ${triggerProfileOptionsHtml}
       </div>
     </div>
-    <div class="hint">Used only when scope is Matching profile. The saved value remains the underlying profile id.</div>
+    <div class="hint">Used only when scope is Matching profile. Pick the saved profile whose output should trigger this macro.</div>
     <div class="field-error" id="error-trigger-profile"></div>
   </div>
 
@@ -326,9 +326,9 @@ export function renderMacroEditorHtml(
         markDirty();
         var triggerValue = document.getElementById("macro-trigger").value.trim();
         if (triggerValue && document.getElementById("macro-trigger-scope").value === "profile" && !this.value.trim()) {
-          document.getElementById("error-trigger-profile").textContent = "Matching profile scope requires a profile id.";
+          document.getElementById("error-trigger-profile").textContent = "Matching profile scope requires a saved profile.";
         } else if (triggerValue && KNOWN_PROFILE_IDS.length > 0 && this.value.trim() && KNOWN_PROFILE_IDS.indexOf(this.value.trim()) === -1) {
-          document.getElementById("error-trigger-profile").textContent = "Unknown profile id.";
+          document.getElementById("error-trigger-profile").textContent = "Unknown profile.";
         } else {
           document.getElementById("error-trigger-profile").textContent = "";
         }
@@ -407,10 +407,10 @@ export function renderMacroEditorHtml(
           document.getElementById("error-trigger").textContent = "";
         }
         if (triggerVal && triggerScope === "profile" && !triggerProfileId) {
-          document.getElementById("error-trigger-profile").textContent = "Matching profile scope requires a profile id.";
+          document.getElementById("error-trigger-profile").textContent = "Matching profile scope requires a saved profile.";
           valid = false;
         } else if (triggerVal && triggerScope === "profile" && KNOWN_PROFILE_IDS.length > 0 && KNOWN_PROFILE_IDS.indexOf(triggerProfileId) === -1) {
-          document.getElementById("error-trigger-profile").textContent = "Unknown profile id.";
+          document.getElementById("error-trigger-profile").textContent = "Unknown profile.";
           valid = false;
         } else {
           document.getElementById("error-trigger-profile").textContent = "";

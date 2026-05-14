@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const mockMacros = vi.hoisted(() => [] as any[]);
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockCreateTerminal = vi.fn(() => ({ show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" }));
 const mockExecuteCommand = vi.fn();
@@ -10,8 +11,32 @@ const mockGetConfiguration = vi.fn();
 const closeTerminalListeners: Array<(terminal: unknown) => void> = [];
 const openTerminalListeners: Array<(terminal: unknown) => void> = [];
 const mockTerminals: unknown[] = [];
+let mockWorkspaceFolders: Array<{ uri: { fsPath: string } }> | undefined;
+
+vi.mock("../../src/macroSettings", () => ({
+  getMacros: () => mockMacros
+}));
 
 vi.mock("vscode", () => ({
+  EventEmitter: class<T> {
+    private readonly listeners: Array<(event: T) => void> = [];
+    public event = (listener: (event: T) => void) => {
+      this.listeners.push(listener);
+      return { dispose: vi.fn() };
+    };
+    public fire(event: T): void {
+      for (const listener of this.listeners) listener(event);
+    }
+    public dispose(): void {
+      this.listeners.length = 0;
+    }
+  },
+  Disposable: class {
+    public constructor(private readonly fn: () => void) {}
+    public dispose(): void {
+      this.fn();
+    }
+  },
   commands: {
     registerCommand: vi.fn((id: string, handler: (...args: unknown[]) => unknown) => {
       registeredCommands.set(id, handler);
@@ -39,8 +64,12 @@ vi.mock("vscode", () => ({
     })
   },
   workspace: {
-    getConfiguration: (...args: unknown[]) => mockGetConfiguration(...args)
+    getConfiguration: (...args: unknown[]) => mockGetConfiguration(...args),
+    get workspaceFolders() {
+      return mockWorkspaceFolders;
+    }
   },
+  ConfigurationTarget: { Global: 1 },
   env: {
     clipboard: {
       writeText: vi.fn()
@@ -75,7 +104,7 @@ import {
   formValuesToLocalShell,
   getConfiguredVscodeTerminalProfileNames,
   registerLocalShellCommands,
-  resolveLocalShellTerminalOptions
+  resolveLocalShellLaunchOptions
 } from "../../src/commands/localShellCommands";
 import type { LocalShellProfile } from "../../src/models/config";
 
@@ -106,7 +135,18 @@ function makeCtx(profile = makeProfile()) {
       unregisterLocalShellSession: vi.fn()
     },
     localShellTerminals: new Map(),
-    focusedTerminal: undefined
+    focusedTerminal: undefined,
+    extensionPath: "/ext",
+    globalState: {
+      get: vi.fn(() => false),
+      update: vi.fn()
+    },
+    terminalRegistry: {
+      register: vi.fn()
+    },
+    macroAutoTrigger: {
+      createObserver: vi.fn(() => ({ onOutput: vi.fn(), pauseIntervalMacros: vi.fn(), dispose: vi.fn() }))
+    }
   } as any;
 }
 
@@ -138,9 +178,11 @@ describe("formValuesToLocalShell", () => {
   });
 });
 
-describe("resolveLocalShellTerminalOptions", () => {
+describe("resolveLocalShellLaunchOptions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockMacros.length = 0;
+    mockWorkspaceFolders = undefined;
     registeredCommands.clear();
     closeTerminalListeners.length = 0;
     openTerminalListeners.length = 0;
@@ -161,12 +203,12 @@ describe("resolveLocalShellTerminalOptions", () => {
     }));
   });
 
-  it("lists configured VS Code terminal profile names for form suggestions", () => {
-    expect(getConfiguredVscodeTerminalProfileNames()).toEqual(["Auto", "Bash"]);
+  it("lists configured VS Code terminal profile names with explicit shell paths for form suggestions", () => {
+    expect(getConfiguredVscodeTerminalProfileNames()).toEqual(["Bash"]);
   });
 
-  it("resolves explicit VS Code terminal profiles to TerminalOptions", () => {
-    const options = resolveLocalShellTerminalOptions(makeProfile({
+  it("resolves explicit VS Code terminal profiles to launch options", () => {
+    const options = resolveLocalShellLaunchOptions(makeProfile({
       launchMode: "vscodeProfile",
       vscodeProfileName: "Bash",
       shellPath: undefined,
@@ -180,18 +222,30 @@ describe("resolveLocalShellTerminalOptions", () => {
     });
   });
 
-  it("does not resolve source-only VS Code terminal profiles to TerminalOptions", () => {
-    expect(() => resolveLocalShellTerminalOptions(makeProfile({
+  it("expands common local shell working-directory variables before launching", () => {
+    mockWorkspaceFolders = [{ uri: { fsPath: "/repo/project" } }];
+
+    const options = resolveLocalShellLaunchOptions(makeProfile({
+      cwd: "${workspaceFolder}/tools"
+    }));
+
+    expect(options.cwd).toBe("/repo/project/tools");
+  });
+
+  it("does not resolve source-only VS Code terminal profiles to launch options", () => {
+    expect(() => resolveLocalShellLaunchOptions(makeProfile({
       launchMode: "vscodeProfile",
       vscodeProfileName: "Auto",
       shellPath: undefined
-    }))).toThrow(/does not define an explicit shell path/i);
+    }))).toThrow(/uses source\/autodetect and does not expose an executable path/i);
   });
 });
 
 describe("registerLocalShellCommands", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockMacros.length = 0;
+    mockWorkspaceFolders = undefined;
     registeredCommands.clear();
     closeTerminalListeners.length = 0;
     openTerminalListeners.length = 0;
@@ -209,8 +263,8 @@ describe("registerLocalShellCommands", () => {
     }));
   });
 
-  it("opens a custom local shell with TerminalOptions and sends the startup command", async () => {
-    const terminal = { show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+  it("opens a custom local shell with an extension-owned PTY", async () => {
+    const terminal = { show: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
     mockCreateTerminal.mockReturnValueOnce(terminal);
     const ctx = makeCtx();
 
@@ -219,30 +273,48 @@ describe("registerLocalShellCommands", () => {
 
     expect(mockCreateTerminal).toHaveBeenCalledWith(expect.objectContaining({
       name: "Nexus Local Shell: Dev",
-      shellPath: "/bin/bash",
-      shellArgs: ["--login"],
-      cwd: "/workspace",
+      pty: expect.objectContaining({
+        handleInput: expect.any(Function),
+        markShuttingDown: expect.any(Function)
+      }),
       iconPath: expect.objectContaining({ id: "terminal" })
     }));
-    expect(terminal.sendText).toHaveBeenCalledWith("echo ready");
     expect(ctx.core.registerLocalShellSession).toHaveBeenCalledWith(expect.objectContaining({
       profileId: "local-1",
-      terminalName: "Nexus Local Shell: Dev"
+      terminalName: "Nexus Local Shell: Dev",
+      pty: expect.objectContaining({
+        handleInput: expect.any(Function)
+      })
     }));
     expect(ctx.localShellTerminals.size).toBe(1);
     expect(ctx.focusedTerminal).toBe(terminal);
+    expect(ctx.terminalRegistry.register).toHaveBeenCalledWith(
+      terminal,
+      expect.objectContaining({ handleInput: expect.any(Function) })
+    );
   });
 
-  it("opens source-only VS Code terminal profiles through VS Code profile command", async () => {
-    const terminal = { show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "PowerShell" };
-    mockExecuteCommand.mockImplementation(async (command: string) => {
-      if (command === "workbench.action.terminal.newWithProfile") {
-        mockTerminals.push(terminal);
-        for (const listener of openTerminalListeners) {
-          listener(terminal);
-        }
-      }
-    });
+  it("warns before opening a local shell when all-terminal auto-trigger macros already exist", async () => {
+    mockMacros.push({ name: "Password prompt", text: "secret\n", triggerPattern: "[Pp]assword:" });
+    mockShowWarningMessage.mockResolvedValueOnce("Review Macros");
+    const ctx = makeCtx();
+
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.connect")!("local-1");
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("Existing \"All terminals\" macros can also run in Local Shell sessions."),
+      "Review Macros",
+      "Disable Globally",
+      "Continue"
+    );
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.macro.editor");
+    expect(ctx.globalState.update).not.toHaveBeenCalled();
+    expect(mockCreateTerminal).not.toHaveBeenCalled();
+    expect(ctx.localShellTerminals.size).toBe(0);
+  });
+
+  it("rejects source-only VS Code terminal profiles with explicit Custom Shell guidance", async () => {
     const ctx = makeCtx(makeProfile({
       launchMode: "vscodeProfile",
       vscodeProfileName: "PowerShell",
@@ -254,17 +326,9 @@ describe("registerLocalShellCommands", () => {
     await registeredCommands.get("nexus.localShell.connect")!("local-1");
 
     expect(mockCreateTerminal).not.toHaveBeenCalled();
-    expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.terminal.newWithProfile", {
-      profileName: "PowerShell",
-      location: "editor"
-    });
-    expect(terminal.sendText).toHaveBeenCalledWith("echo ready");
-    expect(ctx.core.registerLocalShellSession).toHaveBeenCalledWith(expect.objectContaining({
-      profileId: "local-1",
-      terminalName: "Nexus Local Shell: Dev"
-    }));
-    expect(ctx.localShellTerminals.size).toBe(1);
-    expect(ctx.focusedTerminal).toBe(terminal);
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith("workbench.action.terminal.newWithProfile", expect.anything());
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Choose Custom Shell and enter the command"));
+    expect(ctx.localShellTerminals.size).toBe(0);
   });
 
   it("unregisters local shell sessions when their terminal closes", async () => {

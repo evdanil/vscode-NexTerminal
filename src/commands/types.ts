@@ -31,6 +31,7 @@ export type SerialTerminalMap = Map<string, SerialTerminalEntry>;
 export interface LocalShellTerminalEntry {
   terminal: vscode.Terminal;
   profileId: string;
+  pty?: import("../models/config").SessionPtyHandle;
 }
 export type LocalShellTerminalMap = Map<string, LocalShellTerminalEntry>;
 
@@ -56,5 +57,8 @@ export interface CommandContext {
   activityIndicators: Map<string, { setActivityIndicator(active: boolean): void }>;
   scriptRuntimeManager?: ScriptRuntimeManager;
   terminalRegistry?: TerminalRegistry;
+  localShellOutputChannel?: vscode.OutputChannel;
   globalStoragePath: string;
+  extensionPath: string;
+  globalState: vscode.Memento;
 }

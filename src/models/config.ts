@@ -158,6 +158,7 @@ export interface ActiveLocalShellSession {
   profileId: string;
   terminalName: string;
   startedAt: number;
+  pty?: SessionPtyHandle;
 }
 
 export interface TunnelRouteInfo {

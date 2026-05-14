@@ -55,6 +55,7 @@ interface FakeNexusCore {
   getSnapshot(): {
     activeSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
     activeSerialSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
+    activeLocalShellSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
   };
   onDidChange(l: () => void): () => void;
 }
@@ -82,13 +83,23 @@ function makePty(): SessionPtyHandle & { resetTerminal: () => void; onOutput(tex
   } as unknown as SessionPtyHandle & { resetTerminal: () => void; onOutput(text: string): void; __observers: Array<(text: string) => void> };
 }
 
-function makeCore(): FakeNexusCore & { sessions: Array<{ id: string; pty?: SessionPtyHandle }>; serialSessions: Array<{ id: string; pty?: SessionPtyHandle }>; emit: () => void } {
+function makeCore(): FakeNexusCore & {
+  sessions: Array<{ id: string; pty?: SessionPtyHandle }>;
+  serialSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
+  localShellSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
+  emit: () => void;
+} {
   const listeners = new Set<() => void>();
   const core = {
     sessions: [] as Array<{ id: string; pty?: SessionPtyHandle }>,
     serialSessions: [] as Array<{ id: string; pty?: SessionPtyHandle }>,
+    localShellSessions: [] as Array<{ id: string; pty?: SessionPtyHandle }>,
     getSnapshot() {
-      return { activeSessions: core.sessions, activeSerialSessions: core.serialSessions };
+      return {
+        activeSessions: core.sessions,
+        activeSerialSessions: core.serialSessions,
+        activeLocalShellSessions: core.localShellSessions
+      };
     },
     onDidChange(l: () => void) {
       listeners.add(l);
@@ -210,6 +221,18 @@ describe("TerminalRegistry", () => {
     const terminal = {} as never;
     const pty = makePty();
     core.serialSessions.push({ id: "sr1", pty });
+    reg.register(terminal, pty);
+    fireActiveTerminal(terminal);
+    expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(true);
+    reg.dispose();
+  });
+
+  it("recognizes Local Shell sessions as connected", () => {
+    const core = makeCore();
+    const reg = new TerminalRegistry(core);
+    const terminal = {} as never;
+    const pty = makePty();
+    core.localShellSessions.push({ id: "local1", pty });
     reg.register(terminal, pty);
     fireActiveTerminal(terminal);
     expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(true);

@@ -1,4 +1,10 @@
-export type MacroProfileKind = "server" | "serial" | "profile";
+export type MacroProfileKind = "server" | "serial" | "localShell" | "profile";
+
+export interface MacroProfileSourceSnapshot {
+  servers: Array<{ id: string; name: string }>;
+  serialProfiles: Array<{ id: string; name: string }>;
+  localShellProfiles: Array<{ id: string; name: string }>;
+}
 
 export interface MacroProfileOption {
   id: string;
@@ -29,6 +35,7 @@ function kindLabel(kind: MacroProfileKind | undefined): string {
   switch (kind) {
     case "server": return "Server";
     case "serial": return "Serial";
+    case "localShell": return "Local Shell";
     default: return "Profile";
   }
 }
@@ -83,4 +90,12 @@ export function buildMacroProfileSelectOptions(
       label: displayLabel(option, (nameCounts.get(option.name.toLocaleLowerCase()) ?? 0) > 1)
     }))
     .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+export function buildMacroProfileInputsFromSnapshot(snapshot: MacroProfileSourceSnapshot): MacroProfileOption[] {
+  return [
+    ...snapshot.servers.map((server) => ({ id: server.id, name: server.name, kind: "server" as const })),
+    ...snapshot.serialProfiles.map((profile) => ({ id: profile.id, name: profile.name, kind: "serial" as const })),
+    ...snapshot.localShellProfiles.map((profile) => ({ id: profile.id, name: profile.name, kind: "localShell" as const }))
+  ];
 }

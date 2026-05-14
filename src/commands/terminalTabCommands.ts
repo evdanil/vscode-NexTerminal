@@ -1,11 +1,12 @@
 import * as vscode from "vscode";
 import type { RegistryEntry, TerminalRegistry } from "../services/terminal/terminalRegistry";
-import type { SessionTerminalMap, SerialTerminalMap } from "./types";
+import type { LocalShellTerminalMap, SessionTerminalMap, SerialTerminalMap } from "./types";
 
 export interface TerminalTabCommandsDeps {
   registry: TerminalRegistry;
   sessionTerminals: SessionTerminalMap;
   serialTerminals: SerialTerminalMap;
+  localShellTerminals?: LocalShellTerminalMap;
 }
 
 function resolveTerminal(
@@ -22,10 +23,15 @@ function resolveTerminal(
     if (ssh) return ssh;
     const serial = deps.serialTerminals.get(sessionId);
     if (serial) return serial.terminal;
+    const localShell = deps.localShellTerminals?.get(sessionId);
+    if (localShell) return localShell.terminal;
   }
   if (asAny?.profile && typeof (asAny.profile as Record<string, unknown>).id === "string") {
     const profileId = (asAny.profile as { id: string }).id;
     for (const entry of deps.serialTerminals.values()) {
+      if (entry.profileId === profileId) return entry.terminal;
+    }
+    for (const entry of deps.localShellTerminals?.values() ?? []) {
       if (entry.profileId === profileId) return entry.terminal;
     }
   }

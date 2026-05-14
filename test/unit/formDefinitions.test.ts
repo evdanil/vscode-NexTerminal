@@ -191,9 +191,10 @@ describe("formDefinitions keyPath visibility", () => {
     }));
     expect(keyedField(definition, "vscodeProfileName")).toEqual(expect.objectContaining({
       type: "combobox",
-      label: "VS Code Profile Name",
+      label: "VS Code Terminal Profile",
       required: true,
-      placeholder: "Select a VS Code terminal profile",
+      placeholder: "Select a VS Code terminal profile with a shell path",
+      hint: expect.stringMatching(/Custom Shell.*WSL/i),
       visibleWhen: [
         { field: "profileType", value: "localShell" },
         { field: "launchMode", value: "vscodeProfile" }
@@ -240,7 +241,7 @@ describe("formDefinitions keyPath visibility", () => {
     expect(keyedField(definition, "cwd")).toEqual(expect.objectContaining({
       label: "Working Directory",
       advanced: true,
-      hint: expect.stringMatching(/workspace|home/i)
+      hint: expect.stringMatching(/\$\{workspaceFolder\}.*~/i)
     }));
     expect(keyedField(definition, "startupCommand")).toEqual(expect.objectContaining({
       label: "Startup Command",

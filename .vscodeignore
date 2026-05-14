@@ -4,6 +4,8 @@
 src/**
 test/**
 docs/**
+native/**
+scripts/**
 *.ts
 tsconfig*.json
 vitest.config.ts

@@ -50,6 +50,7 @@ import { registerProfileCommands } from "./commands/profileCommands";
 import { registerAuthProfileCommands } from "./commands/authProfileCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
+import { buildMacroProfileInputsFromSnapshot } from "./ui/macroProfileOptions";
 import { VscodeColorSchemeStorage } from "./storage/vscodeColorSchemeStorage";
 import { ColorSchemeService } from "./services/colorSchemeService";
 import { TerminalAppearancePanel } from "./ui/terminalAppearancePanel";
@@ -300,6 +301,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const macroAutoTrigger = new MacroAutoTrigger();
 
   const scriptOutputChannel = vscode.window.createOutputChannel("Nexus Scripts");
+  const localShellOutputChannel = vscode.window.createOutputChannel("Nexus Local Shell");
   const scriptRuntimeManager = new ScriptRuntimeManager({
     core,
     macroAutoTrigger,
@@ -503,7 +505,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     activityIndicators: new Map(),
     scriptRuntimeManager,
     terminalRegistry: undefined,
-    globalStoragePath
+    localShellOutputChannel,
+    globalStoragePath,
+    extensionPath: context.extensionPath,
+    globalState: context.globalState
   };
   const terminalRegistry = new TerminalRegistry(core);
   context.subscriptions.push(terminalRegistry);
@@ -900,18 +905,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerTerminalTabCommands(context, {
     registry: terminalRegistry,
     sessionTerminals: ctx.sessionTerminals,
-    serialTerminals: ctx.serialTerminals
+    serialTerminals: ctx.serialTerminals,
+    localShellTerminals: ctx.localShellTerminals
   });
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);
   const configDisposables = registerConfigCommands(core, secretVault, context);
   const macroDisposables = registerMacroCommands(() => {
-    const snapshot = core.getSnapshot();
-    return [
-      ...snapshot.servers.map((server) => ({ id: server.id, name: server.name, kind: "server" as const })),
-      ...snapshot.serialProfiles.map((profile) => ({ id: profile.id, name: profile.name, kind: "serial" as const }))
-    ];
+    return buildMacroProfileInputsFromSnapshot(core.getSnapshot());
   });
   const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
@@ -945,6 +947,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     macroAutoTriggerListener,
     scriptRuntimeManager,
     scriptOutputChannel,
+    localShellOutputChannel,
     scriptTreeProvider,
     scriptCodeLensProvider,
     scriptsView,
@@ -1010,6 +1013,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             session.pty?.markShuttingDown(shutdownReason);
           } catch (err) {
             console.error("[Nexus] markShuttingDown failed for serial session", session.id, err);
+          }
+        }
+        for (const session of snapshot.activeLocalShellSessions) {
+          try {
+            session.pty?.markShuttingDown(shutdownReason);
+          } catch (err) {
+            console.error("[Nexus] markShuttingDown failed for local shell session", session.id, err);
           }
         }
         serialTerminals.clear();

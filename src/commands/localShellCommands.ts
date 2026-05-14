@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
+import * as os from "node:os";
 import * as vscode from "vscode";
+import { getMacros } from "../macroSettings";
 import type { LocalShellProfile } from "../models/config";
+import { LocalShellPty, resolveLocalPtySidecarPath } from "../services/local/localShellPty";
 import { localShellFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { LocalShellProfileTreeItem, LocalShellSessionTreeItem } from "../ui/nexusTreeProvider";
@@ -16,12 +19,19 @@ interface VscodeTerminalProfileConfig {
   source?: string;
 }
 
-type LocalShellLaunchPlan =
-  | { kind: "terminalOptions"; options: vscode.TerminalOptions }
-  | { kind: "vscodeProfileCommand"; profileName: string };
+interface LocalShellLaunchOptions {
+  shellPath: string;
+  shellArgs?: string[];
+  cwd?: string;
+  env?: Record<string, string | null | undefined>;
+}
 
-const VSCODE_NEW_TERMINAL_WITH_PROFILE_COMMAND = "workbench.action.terminal.newWithProfile";
-const OPEN_TERMINAL_TIMEOUT_MS = 5000;
+const SOURCE_PROFILE_GUIDANCE =
+  "This VS Code profile uses source/autodetect and does not expose an executable path to extensions. Auto-trigger macros require Nexus to launch the shell directly. Choose Custom Shell and enter the command, for example pwsh.exe, powershell.exe, cmd.exe, wsl.exe, /bin/bash, or /bin/zsh.";
+const LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY = "nexus.localShell.autoTriggerWarningShown";
+const REVIEW_MACROS_ACTION = "Review Macros";
+const DISABLE_AUTOTRIGGER_ACTION = "Disable Globally";
+const CONTINUE_ACTION = "Continue";
 
 function platformTerminalProfilesKey(): string {
   if (process.platform === "win32") return "profiles.windows";
@@ -36,7 +46,10 @@ function getConfiguredVscodeTerminalProfiles(): Record<string, VscodeTerminalPro
 }
 
 export function getConfiguredVscodeTerminalProfileNames(): string[] {
-  return Object.keys(getConfiguredVscodeTerminalProfiles()).sort((a, b) => a.localeCompare(b));
+  return Object.entries(getConfiguredVscodeTerminalProfiles())
+    .filter(([, profile]) => Boolean(firstShellPath(profile.path)))
+    .map(([name]) => name)
+    .sort((a, b) => a.localeCompare(b));
 }
 
 function readString(value: FormValues[string]): string {
@@ -105,11 +118,11 @@ function normalizeProfileArgs(args: string | string[] | undefined): string[] | u
   return undefined;
 }
 
-function normalizeProfileEnv(env: VscodeTerminalProfileConfig["env"]): vscode.TerminalOptions["env"] {
+function normalizeProfileEnv(env: VscodeTerminalProfileConfig["env"]): LocalShellLaunchOptions["env"] {
   if (!env) {
     return undefined;
   }
-  const result: NonNullable<vscode.TerminalOptions["env"]> = {};
+  const result: NonNullable<LocalShellLaunchOptions["env"]> = {};
   for (const [key, value] of Object.entries(env)) {
     if (typeof value === "string" || value === null) {
       result[key] = value;
@@ -118,7 +131,19 @@ function normalizeProfileEnv(env: VscodeTerminalProfileConfig["env"]): vscode.Te
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
-export function resolveLocalShellTerminalOptions(profile: LocalShellProfile): vscode.TerminalOptions {
+function expandLocalShellCwd(cwd: string | undefined): string | undefined {
+  if (!cwd?.trim()) return undefined;
+  let expanded = cwd.trim().replace(/^~(?=\/|\\|$)/, os.homedir());
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (workspaceFolder) {
+    expanded = expanded
+      .replace(/\$\{workspaceFolder\}/g, workspaceFolder)
+      .replace(/\$\{workspaceRoot\}/g, workspaceFolder);
+  }
+  return expanded;
+}
+
+export function resolveLocalShellLaunchOptions(profile: LocalShellProfile): LocalShellLaunchOptions {
   if (profile.launchMode === "vscodeProfile") {
     const profileName = profile.vscodeProfileName?.trim();
     if (!profileName) {
@@ -130,14 +155,13 @@ export function resolveLocalShellTerminalOptions(profile: LocalShellProfile): vs
     }
     const shellPath = firstShellPath(terminalProfile.path);
     if (!shellPath) {
-      throw new Error(`VS Code terminal profile "${profileName}" does not define an explicit shell path. Source-only or autodetected profiles are not supported for Local Shell.`);
+      throw new Error(`${SOURCE_PROFILE_GUIDANCE} Profile: "${profileName}".`);
     }
     return {
       shellPath,
       shellArgs: normalizeProfileArgs(terminalProfile.args),
       env: normalizeProfileEnv(terminalProfile.env),
-      cwd: profile.cwd,
-      name: `Nexus Local Shell: ${profile.name}`
+      cwd: expandLocalShellCwd(profile.cwd)
     };
   }
 
@@ -147,34 +171,60 @@ export function resolveLocalShellTerminalOptions(profile: LocalShellProfile): vs
   return {
     shellPath: profile.shellPath,
     shellArgs: profile.shellArgs,
-    cwd: profile.cwd,
-    env: profile.env,
-    name: `Nexus Local Shell: ${profile.name}`
+    cwd: expandLocalShellCwd(profile.cwd),
+    env: profile.env
   };
 }
 
-function resolveLocalShellLaunchPlan(profile: LocalShellProfile): LocalShellLaunchPlan {
-  if (profile.launchMode !== "vscodeProfile") {
-    return { kind: "terminalOptions", options: resolveLocalShellTerminalOptions(profile) };
-  }
-
-  const profileName = profile.vscodeProfileName?.trim();
-  if (!profileName) {
-    throw new Error("Local Shell profile is missing a VS Code terminal profile name.");
-  }
-
-  const terminalProfile = getConfiguredVscodeTerminalProfiles()[profileName];
-  if (!terminalProfile || !firstShellPath(terminalProfile.path)) {
-    return { kind: "vscodeProfileCommand", profileName };
-  }
-
-  return { kind: "terminalOptions", options: resolveLocalShellTerminalOptions(profile) };
-}
+export const resolveLocalShellTerminalOptions = resolveLocalShellLaunchOptions;
 
 function localShellDescription(profile: LocalShellProfile): string {
   return profile.launchMode === "vscodeProfile"
     ? `VS Code: ${profile.vscodeProfileName ?? ""}`
     : profile.shellPath ?? "";
+}
+
+function hasAllTerminalAutoTriggerMacros(): boolean {
+  return getMacros().some((macro) =>
+    Boolean(macro.triggerPattern) &&
+    (macro.triggerScope === undefined || macro.triggerScope === "all-terminals")
+  );
+}
+
+async function confirmLocalShellAutoTriggers(ctx: CommandContext): Promise<boolean> {
+  if (ctx.globalState.get<boolean>(LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY, false)) {
+    return true;
+  }
+
+  const autoTriggerEnabled = vscode.workspace
+    .getConfiguration("nexus.terminal.macros")
+    .get<boolean>("autoTrigger", true);
+  if (!autoTriggerEnabled || !hasAllTerminalAutoTriggerMacros()) {
+    return true;
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    "Local Shell auto-trigger is now available. Existing \"All terminals\" macros can also run in Local Shell sessions. Disabling here turns off auto-trigger macros globally for SSH, Serial, and Local Shell.",
+    REVIEW_MACROS_ACTION,
+    DISABLE_AUTOTRIGGER_ACTION,
+    CONTINUE_ACTION
+  );
+  if (choice === REVIEW_MACROS_ACTION) {
+    void vscode.commands.executeCommand("nexus.macro.editor");
+    return false;
+  }
+  if (choice === DISABLE_AUTOTRIGGER_ACTION) {
+    await vscode.workspace
+      .getConfiguration("nexus.terminal.macros")
+      .update("autoTrigger", false, vscode.ConfigurationTarget.Global);
+    await ctx.globalState.update(LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY, true);
+    return true;
+  }
+  if (choice === CONTINUE_ACTION) {
+    await ctx.globalState.update(LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY, true);
+    return true;
+  }
+  return false;
 }
 
 async function pickLocalShellProfile(core: import("../core/nexusCore").NexusCore): Promise<LocalShellProfile | undefined> {
@@ -233,86 +283,53 @@ function toLocalShellSessionIdFromArg(arg: unknown): string | undefined {
   return undefined;
 }
 
-async function createTerminalFromVscodeProfile(profileName: string, openInEditor: boolean): Promise<vscode.Terminal> {
-  const existingTerminals = new Set(vscode.window.terminals);
-  let cleanup = () => {};
-
-  const terminalPromise = new Promise<vscode.Terminal>((resolve, reject) => {
-    let settled = false;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    let listener: vscode.Disposable | undefined;
-
-    const finish = (terminal: vscode.Terminal) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(terminal);
-    };
-    const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-
-    cleanup = () => {
-      if (timeout) {
-        clearTimeout(timeout);
-        timeout = undefined;
-      }
-      listener?.dispose();
-      listener = undefined;
-    };
-
-    listener = vscode.window.onDidOpenTerminal((terminal) => {
-      if (!existingTerminals.has(terminal)) {
-        finish(terminal);
-      }
-    });
-    timeout = setTimeout(() => {
-      fail(new Error(`VS Code did not report a new terminal for profile "${profileName}".`));
-    }, OPEN_TERMINAL_TIMEOUT_MS);
-  });
-
-  try {
-    await vscode.commands.executeCommand(VSCODE_NEW_TERMINAL_WITH_PROFILE_COMMAND, {
-      profileName,
-      location: openInEditor ? "editor" : "view"
-    });
-  } catch (error) {
-    cleanup();
-    throw error;
-  }
-
-  return terminalPromise;
-}
-
 async function openLocalShell(ctx: CommandContext, profile: LocalShellProfile): Promise<void> {
   const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
-  const plan = resolveLocalShellLaunchPlan(profile);
+  const launchOptions = resolveLocalShellLaunchOptions(profile);
+  if (!(await confirmLocalShellAutoTriggers(ctx))) {
+    return;
+  }
   const terminalName = `Nexus Local Shell: ${profile.name}`;
-  const terminal = plan.kind === "terminalOptions"
-    ? vscode.window.createTerminal({
-      ...plan.options,
-      name: terminalName,
-      iconPath: new vscode.ThemeIcon("terminal"),
-      location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-    })
-    : await createTerminalFromVscodeProfile(plan.profileName, openInEditor);
   const sessionId = randomUUID();
-  const entry: LocalShellTerminalEntry = { terminal, profileId: profile.id };
+  let terminalRef: vscode.Terminal | undefined;
+  let ptyRef: LocalShellPty | undefined;
+  const triggerObserver = ctx.macroAutoTrigger.createObserver(
+    (text) => ptyRef?.handleInput(text),
+    () => ctx.focusedTerminal === terminalRef,
+    sessionId,
+    profile.id
+  );
+  const pty = new LocalShellPty({
+    sidecarPath: resolveLocalPtySidecarPath(ctx.extensionPath),
+    shellPath: launchOptions.shellPath,
+    shellArgs: launchOptions.shellArgs,
+    cwd: launchOptions.cwd,
+    env: launchOptions.env,
+    terminalName,
+    startupCommand: profile.startupCommand,
+    outputChannel: ctx.localShellOutputChannel
+  });
+  ptyRef = pty;
+  pty.addOutputObserver(triggerObserver);
+  const terminal = vscode.window.createTerminal({
+    name: terminalName,
+    pty,
+    iconPath: new vscode.ThemeIcon("terminal"),
+    location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+  });
+  terminalRef = terminal;
+  const entry: LocalShellTerminalEntry = { terminal, profileId: profile.id, pty };
   ctx.localShellTerminals.set(sessionId, entry);
+  ctx.terminalRegistry?.register(terminal, pty);
   ctx.core.registerLocalShellSession({
     id: sessionId,
     profileId: profile.id,
     terminalName,
-    startedAt: Date.now()
+    startedAt: Date.now(),
+    pty
   });
   ctx.focusedTerminal = terminal;
   terminal.show();
-  if (profile.startupCommand) {
-    terminal.sendText(profile.startupCommand);
-  }
 }
 
 export function registerLocalShellCommands(ctx: CommandContext): vscode.Disposable[] {

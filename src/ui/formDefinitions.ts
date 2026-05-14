@@ -167,12 +167,12 @@ function localShellFields(
     {
       type: "combobox",
       key: "vscodeProfileName",
-      label: "VS Code Profile Name",
+      label: "VS Code Terminal Profile",
       suggestions: options.vscodeTerminalProfileNames ?? [],
       required: true,
-      placeholder: "Select a VS Code terminal profile",
+      placeholder: "Select a VS Code terminal profile with a shell path",
       value: seed?.vscodeProfileName ?? "",
-      hint: "Pick a saved VS Code terminal profile available to Nexus, or use Custom Shell.",
+      hint: "Only VS Code profiles with an explicit shell path appear here. Use Custom Shell for WSL or source/autodetected profiles.",
       visibleWhen: localShellVisibleWhen(vw, "launchMode", "vscodeProfile")
     },
     {
@@ -182,7 +182,7 @@ function localShellFields(
       required: true,
       placeholder: "/bin/bash or C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
       value: seed?.shellPath ?? "",
-      hint: "For WSL on Windows, use C:\\Windows\\System32\\wsl.exe and set distro options in Arguments.",
+      hint: "For WSL on Windows, use wsl.exe and set distro or shell options in Arguments.",
       visibleWhen: localShellVisibleWhen(vw, "launchMode", "custom")
     },
     {
@@ -199,9 +199,9 @@ function localShellFields(
       type: "text",
       key: "cwd",
       label: "Working Directory",
-      placeholder: "${workspaceFolder} or ~",
+      placeholder: "${workspaceFolder}/project or ~",
       value: seed?.cwd ?? "",
-      hint: "Optional startup directory. VS Code resolves common terminal variables such as workspace folder and home; source/autodetected VS Code profiles may ignore this.",
+      hint: "Optional startup directory. Supports ${workspaceFolder}, ${workspaceRoot}, and ~.",
       advanced: true,
       visibleWhen: vw
     },
@@ -556,7 +556,7 @@ export function unifiedProfileFormDefinition(
     title: unifiedProfileFormTitle(seed),
     fields: [
       unifiedProfileTypeField(seed),
-      { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server or Arduino" },
+      { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server, Console, or Project Shell" },
       authProfileSelectField(authProfiles, sshVw),
       ...sshFields(undefined, sshVw),
       ...proxyFields(undefined, servers, sshVw),

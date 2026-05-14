@@ -146,3 +146,6 @@ tmp/
 .specify/
 .claude/
 specs/
+
+# Rust build output
+native/**/target/
