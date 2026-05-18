@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.48] — 2026-05-18
+
+### Fixed
+
+- **Release builds now include the Local Shell highlighting fix.** This release republishes the Local Shell terminal-highlighting changes with the fixed code on `main` before the release tag is pushed, so tag-triggered builds consume the corrected implementation.
+
 ## [2.8.47] — 2026-05-18
 
 ### Fixed
