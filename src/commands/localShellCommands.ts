@@ -534,7 +534,8 @@ async function openLocalShell(
     env: launchOptions.env,
     terminalName,
     startupCommand: profile.startupCommand,
-    outputChannel: ctx.localShellOutputChannel
+    outputChannel: ctx.localShellOutputChannel,
+    highlighter: ctx.highlighter
   });
   ptyRef = pty;
   pty.addOutputObserver(triggerObserver);

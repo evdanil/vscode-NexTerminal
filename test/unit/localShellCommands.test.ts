@@ -181,6 +181,10 @@ function makeCtx(profile = makeProfile()) {
     },
     macroAutoTrigger: {
       createObserver: vi.fn(() => ({ onOutput: vi.fn(), pauseIntervalMacros: vi.fn(), dispose: vi.fn() }))
+    },
+    highlighter: {
+      apply: vi.fn((text: string) => text),
+      createStream: vi.fn()
     }
   } as any;
 }
@@ -461,6 +465,18 @@ describe("registerLocalShellCommands", () => {
       terminal,
       expect.objectContaining({ handleInput: expect.any(Function) })
     );
+  });
+
+  it("passes the command context highlighter into the local shell PTY", async () => {
+    const terminal = { show: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+    mockCreateTerminal.mockReturnValueOnce(terminal);
+    const ctx = makeCtx();
+
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.connect")!("local-1");
+
+    const pty = (mockCreateTerminal.mock.calls[0][0] as { pty: unknown }).pty;
+    expect((pty as any).options.highlighter).toBe(ctx.highlighter);
   });
 
   it("warns before opening a local shell when all-terminal auto-trigger macros already exist", async () => {

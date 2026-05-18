@@ -106,6 +106,87 @@ describe("LocalShellPty", () => {
     expect(observer.onOutput).toHaveBeenCalledWith("Password: ");
   });
 
+  it("writes highlighted sidecar data to the terminal while observers receive raw output", () => {
+    let highlighterStream: { push: ReturnType<typeof vi.fn>; flush: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> };
+    const highlighter = {
+      apply: vi.fn((text: string) => `[apply]${text}`),
+      createStream: vi.fn((emit: (text: string) => void) => {
+        highlighterStream = {
+          push: vi.fn((text: string) => emit(`[hl]${text}`)),
+          flush: vi.fn(),
+          dispose: vi.fn()
+        };
+        return highlighterStream;
+      })
+    };
+    const observer = { onOutput: vi.fn(), pauseIntervalMacros: vi.fn(), dispose: vi.fn() };
+    const pty = new LocalShellPty({
+      sidecarPath: "/native/local-pty",
+      shellPath: "/bin/bash",
+      shellArgs: [],
+      terminalName: "Nexus Local Shell: Bash",
+      spawnSidecar,
+      highlighter: highlighter as any
+    });
+    const writes: string[] = [];
+    pty.onDidWrite((text) => writes.push(text));
+    pty.addOutputObserver(observer);
+
+    pty.open({ rows: 24, columns: 80 });
+    sidecar.emitStdout({ type: "ready" });
+    sidecar.emitStdout({ type: "data", data: encode("Password: ") });
+
+    expect(highlighter.createStream).toHaveBeenCalledTimes(1);
+    expect(highlighterStream!.push).toHaveBeenCalledWith("Password: ");
+    expect(highlighter.apply).not.toHaveBeenCalled();
+    expect(writes).toEqual(["[hl]Password: "]);
+    expect(observer.onOutput).toHaveBeenCalledWith("Password: ");
+  });
+
+  it("flushes buffered highlighted output before early-exit messaging", () => {
+    let buffered = "";
+    let highlighterStream: { push: ReturnType<typeof vi.fn>; flush: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> };
+    const highlighter = {
+      createStream: vi.fn((emit: (text: string) => void) => {
+        highlighterStream = {
+          push: vi.fn((text: string) => {
+            buffered += text;
+          }),
+          flush: vi.fn(() => {
+            if (buffered) {
+              emit(`[hl]${buffered}`);
+              buffered = "";
+            }
+          }),
+          dispose: vi.fn()
+        };
+        return highlighterStream;
+      })
+    };
+    const pty = new LocalShellPty({
+      sidecarPath: "/native/local-pty",
+      shellPath: "/bin/bash",
+      shellArgs: [],
+      terminalName: "Nexus Local Shell: Bash",
+      spawnSidecar,
+      highlighter: highlighter as any
+    });
+    const writes: string[] = [];
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open({ rows: 24, columns: 80 });
+    sidecar.emitStdout({ type: "ready" });
+    sidecar.emitStdout({ type: "data", data: encode("bash: bad option\n") });
+    expect(writes).toEqual([]);
+
+    sidecar.emitStdout({ type: "exit", code: 2 });
+
+    expect(highlighterStream!.push).toHaveBeenCalledWith("bash: bad option\n");
+    expect(highlighterStream!.flush).toHaveBeenCalledTimes(1);
+    expect(writes[0]).toBe("[hl]bash: bad option\n");
+    expect(writes.slice(1).join("")).toContain("Shell exited shortly after startup");
+  });
+
   it("writes user and macro input through the sidecar protocol and forwards resize", () => {
     const pty = new LocalShellPty({
       sidecarPath: "/native/local-pty",

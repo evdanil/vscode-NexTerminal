@@ -4,6 +4,7 @@ import type { Readable, Writable } from "node:stream";
 import * as vscode from "vscode";
 import type { SessionPtyHandle } from "../../models/config";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
+import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 
 const MAX_FRAME_LENGTH = 1024 * 1024;
 const EARLY_TERMINATION_WINDOW_MS = 5_000;
@@ -41,6 +42,7 @@ export interface LocalShellPtyOptions {
   startupCommand?: string;
   spawnSidecar?: LocalPtySidecarSpawner;
   outputChannel?: LocalShellOutputChannel;
+  highlighter?: TerminalHighlighter;
 }
 
 export interface LocalShellEarlyTerminationEvent {
@@ -91,6 +93,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   private readonly outputObservers = new Set<PtyOutputObserver>();
   private readonly queuedInput: string[] = [];
   private readonly spawnSidecar: LocalPtySidecarSpawner;
+  private readonly highlighterStream?: TerminalHighlighterStream;
   private sidecar?: LocalPtySidecarProcess;
   private stdoutBuffer = "";
   private state: LocalPtyState = "idle";
@@ -107,6 +110,10 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
 
   public constructor(private readonly options: LocalShellPtyOptions) {
     this.spawnSidecar = options.spawnSidecar ?? defaultSpawnSidecar;
+    this.highlighterStream =
+      typeof (options.highlighter as { createStream?: unknown } | undefined)?.createStream === "function"
+        ? options.highlighter?.createStream((text) => this.writeEmitter.fire(text))
+        : undefined;
   }
 
   public open(dimensions?: vscode.TerminalDimensions): void {
@@ -199,6 +206,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     if (this.state === "disposed" || this.state === "closing") return;
     this.state = "closing";
     this.pauseIntervalMacros();
+    this.flushHighlightedOutput();
     this.writeEmitter.fire(`\r\n[Nexus Local Shell] ${reason}\r\n`);
     this.writeEmitter.fire("[Nexus Local Shell] Close this terminal and reopen the profile to reconnect.\r\n");
     this.sendFrame({ type: "kill" });
@@ -272,7 +280,11 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
       case "data": {
         const output = decodeBase64(frame.data);
         this.outputObservers.forEach((observer) => observer.onOutput(output));
-        this.writeEmitter.fire(output);
+        if (this.highlighterStream) {
+          this.highlighterStream.push(output);
+        } else {
+          this.writeEmitter.fire(this.options.highlighter ? this.options.highlighter.apply(output) : output);
+        }
         break;
       }
       case "exit":
@@ -312,6 +324,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.state = "exited";
     this.clearStartupWindowTimer();
     this.pauseIntervalMacros();
+    this.flushHighlightedOutput();
     this.disposeObservers();
     this.closeEmitter.fire(code ?? undefined);
   }
@@ -321,6 +334,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.state = "failed";
     this.clearStartupWindowTimer();
     this.log(`Sidecar exited before ready: ${message}`);
+    this.flushHighlightedOutput();
     this.writeEmitter.fire(`\r\n[Nexus Local Shell Error] ${message}\r\n`);
     this.writeEmitter.fire(`[Nexus Local Shell] Sidecar: ${this.options.sidecarPath}\r\n`);
     this.writeEmitter.fire("[Nexus Local Shell] See the Nexus Local Shell output channel for startup details.\r\n");
@@ -335,6 +349,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.state = "failed";
     this.clearStartupWindowTimer();
     this.log(`Shell exited during startup window. Exit code: ${code ?? "unknown"}.`);
+    this.flushHighlightedOutput();
     this.writeEmitter.fire(`\r\n[Nexus Local Shell Error] Shell exited shortly after startup. Exit code: ${code ?? "unknown"}.\r\n`);
     this.writeEmitter.fire("[Nexus Local Shell] The terminal remains open so startup output can be reviewed.\r\n");
     this.writeEmitter.fire("[Nexus Local Shell] Close this terminal and reopen the profile to retry.\r\n");
@@ -350,6 +365,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.state = "failed";
     this.clearStartupWindowTimer();
     this.log(`Failed: ${message}`);
+    this.flushHighlightedOutput();
     this.writeEmitter.fire(`\r\n[Nexus Local Shell Error] ${message}\r\n`);
     this.pauseIntervalMacros();
     this.disposeObservers();
@@ -380,6 +396,10 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.outputObservers.clear();
   }
 
+  private flushHighlightedOutput(): void {
+    this.highlighterStream?.flush();
+  }
+
   private finishStartup(): void {
     if (this.startupCompleted) return;
     this.startupCompleted = true;
@@ -403,6 +423,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.sendFrame({ type: "kill" });
     this.sidecar?.kill();
     this.sidecar = undefined;
+    this.highlighterStream?.dispose();
     this.disposeObservers();
     this.state = "disposed";
     this.writeEmitter.dispose();

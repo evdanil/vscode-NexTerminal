@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.47] — 2026-05-18
+
+### Fixed
+
+- **Local Shell output now participates in terminal highlighting.** Regex highlighting now matches SSH, Serial, and Local Shell terminal output while macro/script observers continue to receive raw Local Shell data.
+
 ## [2.8.46] — 2026-05-15
 
 ### Fixed
