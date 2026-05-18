@@ -47,6 +47,18 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDes
   ];
 }
 
+function openFileExplorerOnFirstConnectField(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDescriptor {
+  return {
+    type: "checkbox",
+    key: "openFileExplorerOnFirstConnect",
+    label: "Open File Explorer on first connection",
+    value: seed?.openFileExplorerOnFirstConnect ?? false,
+    hint: "After a normal Connect, opens the File Explorer when it is not already showing this server. Saving this checked disables it on any other SSH profile. Ignored for jump hosts, tunnels, group Connect, and Connect and Run Script.",
+    advanced: true,
+    visibleWhen: vw
+  };
+}
+
 function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFieldDescriptor[] {
   const smartFollowVw = vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "mode", value: "smartFollow" }] : { field: "mode", value: "smartFollow" };
   return [
@@ -342,6 +354,7 @@ export function serverFormDefinition(
       authProfileSelectField(authProfiles, undefined, seed?.authProfileId),
       ...sshFields(seed),
       ...proxyFields(seed, servers),
+      openFileExplorerOnFirstConnectField(seed),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ]
   };
@@ -560,6 +573,7 @@ export function unifiedProfileFormDefinition(
       authProfileSelectField(authProfiles, sshVw),
       ...sshFields(undefined, sshVw),
       ...proxyFields(undefined, servers, sshVw),
+      openFileExplorerOnFirstConnectField(undefined, sshVw),
       ...serialFields(undefined, serialVw),
       ...localShellFields(undefined, localShellVw, localShellOptions),
       ...sharedFields

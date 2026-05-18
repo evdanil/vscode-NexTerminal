@@ -48,6 +48,7 @@ export interface ServerConfig {
   logSession?: boolean;
   multiplexing?: boolean;  // undefined = follow global, false = always standalone
   legacyAlgorithms?: boolean;
+  openFileExplorerOnFirstConnect?: boolean;
   proxy?: ProxyConfig;
   authProfileId?: string;  // references AuthProfile.id; credentials resolved at connection time
 }

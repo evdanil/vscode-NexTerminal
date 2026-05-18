@@ -441,6 +441,20 @@ describe("config import command (legacy)", () => {
     expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profile (2 skipped).");
   });
 
+  it("skips servers with invalid File Explorer auto-open values", async () => {
+    const exportData = makeExportData({
+      servers: [
+        { ...makeServer(), openFileExplorerOnFirstConnect: "yes" }
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+    await runImport(exportData);
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 0 profiles (1 skipped).");
+  });
+
   it("rejects invalid JSON", async () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/config.json", scheme: "file" }]);
     mockReadFile.mockResolvedValue(Buffer.from("not json!", "utf8"));
@@ -568,6 +582,35 @@ describe("config import command (legacy)", () => {
     const snapshot = core.getSnapshot();
     expect(snapshot.servers).toHaveLength(1);
     expect(snapshot.servers[0].legacyAlgorithms).toBe(true);
+  });
+
+  it("preserves File Explorer auto-open through import", async () => {
+    const exportData = makeExportData({
+      servers: [makeServer({ openFileExplorerOnFirstConnect: true })],
+      tunnels: [],
+      serialProfiles: []
+    });
+    await runImport(exportData);
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0].openFileExplorerOnFirstConnect).toBe(true);
+  });
+
+  it("keeps only one imported server marked for File Explorer auto-open", async () => {
+    const exportData = makeExportData({
+      servers: [
+        makeServer({ id: "s1", openFileExplorerOnFirstConnect: true }),
+        makeServer({ id: "s2", name: "Server 2", openFileExplorerOnFirstConnect: true })
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+    await runImport(exportData);
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers.find((server) => server.id === "s1")?.openFileExplorerOnFirstConnect).toBeUndefined();
+    expect(snapshot.servers.find((server) => server.id === "s2")?.openFileExplorerOnFirstConnect).toBe(true);
   });
 
   it("imports partial config with only servers", async () => {

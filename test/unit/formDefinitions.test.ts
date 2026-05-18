@@ -115,11 +115,43 @@ describe("formDefinitions keyPath visibility", () => {
       "proxyHttpHost",
       "multiplexing",
       "legacyAlgorithms",
+      "openFileExplorerOnFirstConnect",
       "logSession",
       "group"
     ]) {
       expect(keyedField(definition, key).advanced, key).toBe(true);
     }
+  });
+
+  it("adds an SSH-only File Explorer auto-open checkbox to SSH profile forms", () => {
+    const editDefinition = serverFormDefinition({
+      id: "srv-1",
+      name: "Server",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      isHidden: false,
+      openFileExplorerOnFirstConnect: true
+    });
+    const editField = keyedField(editDefinition, "openFileExplorerOnFirstConnect");
+
+    expect(editField).toEqual(expect.objectContaining({
+      type: "checkbox",
+      label: "Open File Explorer on first connection",
+      value: true,
+      advanced: true,
+      hint: "After a normal Connect, opens the File Explorer when it is not already showing this server. Saving this checked disables it on any other SSH profile. Ignored for jump hosts, tunnels, group Connect, and Connect and Run Script."
+    }));
+
+    const unifiedField = keyedField(unifiedProfileFormDefinition(), "openFileExplorerOnFirstConnect");
+    expect(unifiedField).toEqual(expect.objectContaining({
+      type: "checkbox",
+      value: false,
+      visibleWhen: { field: "profileType", value: "ssh" }
+    }));
+    expect(maybeKeyedField(serialFormDefinition(), "openFileExplorerOnFirstConnect")).toBeUndefined();
+    expect(maybeKeyedField(localShellFormDefinition(), "openFileExplorerOnFirstConnect")).toBeUndefined();
   });
 
   it("keeps basic SSH fields visible in the unified profile form", () => {
@@ -145,7 +177,7 @@ describe("formDefinitions keyPath visibility", () => {
     const definition = unifiedProfileFormDefinition();
     const serialDefinition = serialFormDefinition();
 
-    for (const key of ["host", "authType", "keyPath", "baudRate", "group", "proxyType", "legacyAlgorithms"]) {
+    for (const key of ["host", "authType", "keyPath", "baudRate", "group", "proxyType", "legacyAlgorithms", "openFileExplorerOnFirstConnect"]) {
       expect(keyedField(definition, key).hint, key).toBeTruthy();
     }
     expect(keyedField(serialDefinition, "path").hint).toBeTruthy();

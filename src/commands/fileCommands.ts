@@ -342,6 +342,23 @@ async function downloadDirectoryToLocal(
   }
 }
 
+export async function browseServerFiles(ctx: CommandContext, server: ServerConfig): Promise<void> {
+  try {
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Connecting SFTP to ${server.name}...` },
+      async () => {
+        await ctx.sftpService.connect(server);
+        const homeDir = await ctx.sftpService.realpath(server.id, ".");
+        ctx.fileExplorerProvider.setActiveServer(server, homeDir);
+      }
+    );
+    await vscode.commands.executeCommand("nexusFileExplorer.focus");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    vscode.window.showErrorMessage(`Failed to browse files on ${server.name}: ${message}`);
+  }
+}
+
 export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
   const browse = vscode.commands.registerCommand("nexus.files.browse", async (arg?: unknown) => {
     let server = toServerFromArg(ctx, arg);
@@ -352,20 +369,7 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       return;
     }
 
-    try {
-      await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: `Connecting SFTP to ${server.name}...` },
-        async () => {
-          await ctx.sftpService.connect(server);
-          const homeDir = await ctx.sftpService.realpath(server.id, ".");
-          ctx.fileExplorerProvider.setActiveServer(server, homeDir);
-        }
-      );
-      await vscode.commands.executeCommand("nexusFileExplorer.focus");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      vscode.window.showErrorMessage(`Failed to browse files on ${server.name}: ${message}`);
-    }
+    await browseServerFiles(ctx, server);
   });
 
   const open = vscode.commands.registerCommand("nexus.files.open", async (arg?: unknown) => {

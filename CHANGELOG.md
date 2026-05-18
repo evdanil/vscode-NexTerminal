@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.49] — 2026-05-19
+
+### Added
+
+- **SSH profiles can auto-open the File Explorer on first connection.** A new advanced SSH profile checkbox starts SFTP and switches the single Nexus File Explorer to that server after normal Connect when the view is not already showing that server, with only one profile allowed to own the behavior at a time.
+
 ## [2.8.48] — 2026-05-18
 
 ### Fixed

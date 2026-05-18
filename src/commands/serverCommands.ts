@@ -16,6 +16,7 @@ import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyP
 import type { KeyPairInfo } from "../services/ssh/deploySshKey";
 import { classifySshConnectionError, type ConnectionDiagnosticResult } from "../services/ssh/connectionDiagnostics";
 import { resolveTunnelConnectionMode, startTunnel } from "./tunnelCommands";
+import { browseServerFiles } from "./fileCommands";
 import type { CommandContext, ServerTerminalMap } from "./types";
 import {
   getAncestorPaths,
@@ -516,6 +517,7 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
     multiplexing: typeof values.multiplexing === "boolean" ? values.multiplexing : undefined,
     legacyAlgorithms: typeof values.legacyAlgorithms === "boolean" ? values.legacyAlgorithms : undefined,
+    openFileExplorerOnFirstConnect: values.openFileExplorerOnFirstConnect === true ? true : undefined,
     proxy: formValuesToProxy(values),
     authProfileId: typeof values.authProfileId === "string" && values.authProfileId
       ? values.authProfileId : undefined
@@ -564,11 +566,17 @@ function hasActiveTunnelsForServer(ctx: CommandContext, serverId: string): boole
   return ctx.core.getSnapshot().activeTunnels.some((tunnel) => tunnel.serverId === serverId);
 }
 
-async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> {
+interface ConnectServerOptions {
+  allowAutoFileExplorer?: boolean;
+}
+
+async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
     return;
   }
+  const allowAutoFileExplorer = options.allowAutoFileExplorer ?? true;
+  let autoFileExplorerHandled = false;
 
   await vscode.window.withProgress(
     {
@@ -605,6 +613,17 @@ async function connectServer(ctx: CommandContext, arg?: unknown): Promise<void> 
             }
             if (ptyRef) {
               ctx.activityIndicators.set(sessionId, ptyRef);
+            }
+
+            if (
+              allowAutoFileExplorer &&
+              server.openFileExplorerOnFirstConnect &&
+              !autoFileExplorerHandled
+            ) {
+              autoFileExplorerHandled = true;
+              if (ctx.fileExplorerProvider.getActiveServerId() !== server.id) {
+                void browseServerFiles(ctx, server);
+              }
             }
 
             for (const tunnel of ctx.core.getSnapshot().tunnels) {
@@ -780,7 +799,7 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
   }, timeoutMs);
 
   try {
-    await connectServer(ctx, server.id);
+    await connectServer(ctx, server.id, { allowAutoFileExplorer: false });
   } catch (err) {
     // connectServer can reject (auth failure, proxy error). Without this
     // the subscription + timer would leak until the 90-second watchdog.
@@ -918,7 +937,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!server) {
         return;
       }
-      const copy = { ...server, id: randomUUID(), name: `${server.name} (copy)` };
+      const copy = { ...server, id: randomUUID(), name: `${server.name} (copy)`, openFileExplorerOnFirstConnect: undefined };
       await ctx.core.addOrUpdateServer(copy);
     }),
 
@@ -975,7 +994,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         .getSnapshot()
         .servers.filter((s) => s.group === folderPath && !s.isHidden);
       for (const server of servers) {
-        void connectServer(ctx, server.id);
+        void connectServer(ctx, server.id, { allowAutoFileExplorer: false });
       }
     }),
 

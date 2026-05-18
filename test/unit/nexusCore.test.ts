@@ -164,6 +164,100 @@ describe("NexusCore", () => {
     expect(snapshot.tunnels[0].localPort).toBe(1001);
   });
 
+  it("keeps only one server marked to open the File Explorer on first connection", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addOrUpdateServer({
+      id: "s1",
+      name: "Server 1",
+      host: "one.example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      isHidden: false,
+      openFileExplorerOnFirstConnect: true
+    });
+    await core.addOrUpdateServer({
+      id: "s2",
+      name: "Server 2",
+      host: "two.example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      isHidden: false,
+      openFileExplorerOnFirstConnect: true
+    });
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers.find((server) => server.id === "s1")?.openFileExplorerOnFirstConnect).toBeUndefined();
+    expect(snapshot.servers.find((server) => server.id === "s2")?.openFileExplorerOnFirstConnect).toBe(true);
+  });
+
+  it("does not clear another server's File Explorer auto-open setting when saving a disabled server", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    await core.addOrUpdateServer({
+      id: "s1",
+      name: "Server 1",
+      host: "one.example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      isHidden: false,
+      openFileExplorerOnFirstConnect: true
+    });
+    await core.addOrUpdateServer({
+      id: "s2",
+      name: "Server 2",
+      host: "two.example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      isHidden: false
+    });
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers.find((server) => server.id === "s1")?.openFileExplorerOnFirstConnect).toBe(true);
+    expect(snapshot.servers.find((server) => server.id === "s2")?.openFileExplorerOnFirstConnect).toBeUndefined();
+  });
+
+  it("normalizes stored File Explorer auto-open ownership during initialize", async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "s1",
+        name: "Server 1",
+        host: "one.example.com",
+        port: 22,
+        username: "dev",
+        authType: "password",
+        isHidden: false,
+        openFileExplorerOnFirstConnect: true
+      },
+      {
+        id: "s2",
+        name: "Server 2",
+        host: "two.example.com",
+        port: 22,
+        username: "dev",
+        authType: "password",
+        isHidden: false,
+        openFileExplorerOnFirstConnect: true
+      }
+    ]);
+    const core = new NexusCore(repository);
+
+    await core.initialize();
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers.find((server) => server.id === "s1")?.openFileExplorerOnFirstConnect).toBeUndefined();
+    expect(snapshot.servers.find((server) => server.id === "s2")?.openFileExplorerOnFirstConnect).toBe(true);
+    expect((await repository.getServers()).find((server) => server.id === "s1")?.openFileExplorerOnFirstConnect).toBeUndefined();
+  });
+
   it("tracks tunnel lifecycle and traffic counters", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

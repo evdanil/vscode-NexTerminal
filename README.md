@@ -16,7 +16,7 @@ Manage remote servers, serial devices, local shell profiles, and TCP tunnels fro
   - **SSH Jump Host** — Select another configured server as a bastion/jump host (ProxyJump equivalent). Supports multi-hop chaining (A → B → C) with full auth reuse.
   - **SOCKS5 Proxy** — Connect through a SOCKS5 proxy server with optional username/password authentication.
   - **HTTP CONNECT Proxy** — Connect through an HTTP proxy using the CONNECT method, common in corporate environments.
-- **SFTP File Explorer** — Browse, download, and manage remote files on connected servers. Drag-and-drop support for moving files between directories.
+- **SFTP File Explorer** — Browse, download, and manage remote files on connected servers. Drag-and-drop support for moving files between directories. One SSH profile can be set to open the File Explorer automatically after normal Connect when the view is not already showing that server.
 - **Serial Terminal Sessions** — Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, parity, stop bits, and RTS/CTS flow control. Supports break signal and XON passthrough. Includes **Smart Follow** mode for Windows COM-port renumbering: it retries the preferred port, silently reconnects only to the previously approved device when metadata matches, prompts before switching to unfamiliar replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped instead of tearing the tab down on serial errors. Runs in an isolated sidecar process for crash safety.
 - **Local Shell Profiles** — Save named local terminal profiles and open one or more local shell sessions from the Connectivity Hub. Use a launchable VS Code terminal profile from the profile dropdown, including common resolved PowerShell, Git Bash, Command Prompt, and WSL profiles when available, or choose **Custom Shell** to set an explicit shell path, one argument per line, a working directory, and an optional startup command. Manual macros, auto-trigger macros, and Nexus scripts work with Local Shell sessions.
 - **Port Forwarding (TCP Tunnels)** — Three tunnel modes:
@@ -138,6 +138,8 @@ You can also drag a tunnel profile onto a server in the Connectivity Hub to star
 2. Open the **File Explorer** section in the Nexus sidebar
 3. Click the server icon to set it as the active SFTP target
 4. Browse, download, or drag files between remote directories
+
+In an SSH profile's advanced options, enable **Open File Explorer on first connection** to start SFTP automatically after normal Connect when the File Explorer is not already showing that server. Saving it checked disables it on any other SSH profile, and it does not run when that profile is used as a jump host, tunnel connection, group connect item, or script-started connection.
 
 ### Export / Import Configuration
 

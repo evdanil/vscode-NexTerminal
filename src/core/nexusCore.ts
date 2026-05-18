@@ -48,7 +48,8 @@ export class NexusCore {
     this.localShellProfiles.clear();
     this.explicitGroups.clear();
     this.authProfiles.clear();
-    for (const server of servers) {
+    const normalizedServers = normalizeFileExplorerAutoOpenOwner(servers);
+    for (const server of normalizedServers.servers) {
       this.servers.set(server.id, server);
     }
     for (const tunnel of tunnels) {
@@ -65,6 +66,9 @@ export class NexusCore {
     }
     for (const profile of authProfiles) {
       this.authProfiles.set(profile.id, profile);
+    }
+    if (normalizedServers.changed) {
+      await this.repository.saveServers(normalizedServers.servers);
     }
     this.emitChanged();
   }
@@ -162,7 +166,17 @@ export class NexusCore {
   }
 
   public async addOrUpdateServer(server: ServerConfig): Promise<void> {
-    this.servers.set(server.id, server);
+    const next = server.openFileExplorerOnFirstConnect
+      ? server
+      : { ...server, openFileExplorerOnFirstConnect: undefined };
+    if (next.openFileExplorerOnFirstConnect) {
+      for (const [id, existing] of this.servers.entries()) {
+        if (id !== next.id && existing.openFileExplorerOnFirstConnect) {
+          this.servers.set(id, { ...existing, openFileExplorerOnFirstConnect: undefined });
+        }
+      }
+    }
+    this.servers.set(next.id, next);
     await this.repository.saveServers([...this.servers.values()]);
     this.emitChanged();
   }
@@ -555,4 +569,26 @@ export class NexusCore {
       }
     }
   }
+}
+
+function normalizeFileExplorerAutoOpenOwner(servers: ServerConfig[]): { servers: ServerConfig[]; changed: boolean } {
+  let ownerId: string | undefined;
+  for (const server of servers) {
+    if (server.openFileExplorerOnFirstConnect) {
+      ownerId = server.id;
+    }
+  }
+  if (!ownerId) {
+    return { servers, changed: false };
+  }
+
+  let changed = false;
+  const normalized = servers.map((server) => {
+    if (server.id === ownerId || !server.openFileExplorerOnFirstConnect) {
+      return server;
+    }
+    changed = true;
+    return { ...server, openFileExplorerOnFirstConnect: undefined };
+  });
+  return { servers: normalized, changed };
 }

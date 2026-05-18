@@ -81,6 +81,9 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 
 #### 4.4.1 SFTP File Explorer Operations
 - **Browse Files** (`nexus.files.browse`) selects an active connected SSH profile as the SFTP target.
+- SSH profiles can enable **Open File Explorer on first connection** in advanced options. After a normal **Connect**, Nexus starts SFTP and switches the single **File Explorer** view to that server when it is not already active there.
+- Only one SSH profile can have this automatic File Explorer behavior enabled. Saving it on one profile clears it from any other profile.
+- Automatic File Explorer opening does not run for jump-host use, tunnel starts, group Connect, or Connect and Run Script.
 - The **File Explorer** view supports open, upload, download, delete, rename, new directory, new file, go to path, go home, copy remote path, refresh, and disconnect commands.
 - Upload and download operations track summary counts for completed items, skipped items, conflicts, and cancellations.
 - Drag-and-drop uploads report `Upload completed`, `Upload completed with skips`, or `Upload canceled` notifications with summary counts.

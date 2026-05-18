@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommandContext } from "../../src/commands/types";
 import type { DirectoryEntry } from "../../src/services/sftp/sftpService";
-import { registerFileCommands } from "../../src/commands/fileCommands";
+import { browseServerFiles, registerFileCommands } from "../../src/commands/fileCommands";
 import { FileTreeItem } from "../../src/ui/fileExplorerTreeProvider";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
@@ -121,8 +121,8 @@ function createContext(overrides?: {
       writeFile,
       upload,
       invalidateCache: vi.fn(),
-      connect: vi.fn(),
-      realpath: vi.fn(),
+      connect: vi.fn(async () => {}),
+      realpath: vi.fn(async () => "/home/dev"),
       stat: vi.fn(async () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); }),
       tryStat: vi.fn(async () => undefined),
       delete: vi.fn(),
@@ -146,6 +146,26 @@ describe("fileCommands title bar actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+  });
+
+  it("browseServerFiles connects SFTP and focuses the Nexus File Explorer", async () => {
+    const ctx = createContext();
+    const server = {
+      id: "srv-1",
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password" as const,
+      isHidden: false
+    };
+
+    await browseServerFiles(ctx, server);
+
+    expect(ctx.sftpService.connect).toHaveBeenCalledWith(server);
+    expect(ctx.sftpService.realpath).toHaveBeenCalledWith("srv-1", ".");
+    expect(ctx.fileExplorerProvider.setActiveServer).toHaveBeenCalledWith(server, "/home/dev");
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexusFileExplorer.focus");
   });
 
   it("createFile falls back to active root directory when no tree item is passed", async () => {

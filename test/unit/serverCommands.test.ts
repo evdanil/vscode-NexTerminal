@@ -7,6 +7,7 @@ import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
 import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import { SshPty } from "../../src/services/ssh/sshPty";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
@@ -32,6 +33,10 @@ vi.mock("../../src/services/ssh/sshPty", () => ({
 
 vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
   createSessionTranscript: vi.fn(() => undefined)
+}));
+
+vi.mock("../../src/services/scripts/scriptPicker", () => ({
+  pickScriptFromWorkspace: vi.fn(async () => ({ fsPath: "/workspace/.nexus/scripts/task.js" }))
 }));
 
 vi.mock("vscode", () => ({
@@ -153,7 +158,7 @@ function setupHarness(options: {
     servers: options.servers ?? [makeServer()],
     tunnels: options.profiles,
     serialProfiles: [],
-    activeSessions: [],
+    activeSessions: [] as Array<{ id: string; serverId: string; terminalName: string; startedAt: number; pty?: unknown }>,
     activeSerialSessions: [],
     activeTunnels: options.activeTunnels.map((t) => ({
       id: t.id,
@@ -198,6 +203,12 @@ function setupHarness(options: {
   const terminalDispose = vi.fn();
   const terminalsByServer = new Map<string, Set<{ dispose: () => void }>>();
   terminalsByServer.set("srv-1", new Set([{ dispose: terminalDispose }]));
+  const changeListeners: Array<(nextSnapshot: typeof snapshot) => void> = [];
+  const emitChange = () => {
+    for (const listener of changeListeners) {
+      listener(snapshot);
+    }
+  };
 
   const core = {
     getServer: vi.fn((id: string) => snapshot.servers.find((s) => s.id === id)),
@@ -205,6 +216,30 @@ function setupHarness(options: {
     getTunnel: vi.fn((id: string) => snapshot.tunnels.find((t) => t.id === id)),
     getSnapshot: vi.fn(() => snapshot),
     isServerConnected: vi.fn(() => false),
+    registerSession: vi.fn((session: { id: string; serverId: string; terminalName: string; startedAt: number; pty?: unknown }) => {
+      snapshot = {
+        ...snapshot,
+        activeSessions: [...snapshot.activeSessions.filter((item) => item.id !== session.id), session]
+      };
+      emitChange();
+    }),
+    unregisterSession: vi.fn((sessionId: string) => {
+      snapshot = {
+        ...snapshot,
+        activeSessions: snapshot.activeSessions.filter((item) => item.id !== sessionId)
+      };
+      emitChange();
+    }),
+    markSessionActivity: vi.fn(),
+    onDidChange: vi.fn((listener: (nextSnapshot: typeof snapshot) => void) => {
+      changeListeners.push(listener);
+      return () => {
+        const index = changeListeners.indexOf(listener);
+        if (index >= 0) {
+          changeListeners.splice(index, 1);
+        }
+      };
+    }),
     removeServer,
     addOrUpdateServer,
     addOrUpdateAuthProfile
@@ -221,15 +256,30 @@ function setupHarness(options: {
     terminalsByServer: terminalsByServer as any,
     sessionTerminals: new Map(),
     serialTerminals: new Map(),
+    localShellTerminals: new Map(),
     highlighter: {} as any,
-    sftpService: {} as any,
-    fileExplorerProvider: {} as any,
+    macroAutoTrigger: {
+      createObserver: vi.fn(() => ({})),
+      bindObserverToSession: vi.fn()
+    } as any,
+    sftpService: {
+      connect: vi.fn(async () => {}),
+      realpath: vi.fn(async () => "/home/dev")
+    } as any,
+    fileExplorerProvider: {
+      getActiveServerId: vi.fn(() => undefined),
+      setActiveServer: vi.fn()
+    } as any,
     secretVault: {
       get: vi.fn(async (key: string) => secrets.get(key)),
       store: secretStore,
       delete: secretDelete
     },
-    registrySync: undefined
+    registrySync: undefined,
+    activityIndicators: new Map(),
+    globalStoragePath: "/workspace/global",
+    extensionPath: "/workspace/extension",
+    globalState: {} as any
   };
 
   mockShowWarningMessage.mockResolvedValue(options.confirmRemove === false ? undefined : "Remove");
@@ -245,6 +295,19 @@ function setupHarness(options: {
     secretDelete,
     secretStore
   };
+}
+
+function latestSshCallbacks(): { onSessionOpened(sessionId: string): void } {
+  const calls = vi.mocked(SshPty).mock.calls;
+  expect(calls.length).toBeGreaterThan(0);
+  return calls[calls.length - 1][2] as unknown as { onSessionOpened(sessionId: string): void };
+}
+
+async function flushPromises(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 describe("server disconnect with tunnel autoStop", () => {
@@ -334,6 +397,25 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
+  });
+
+  it("clears File Explorer auto-open on duplicated server profiles", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ openFileExplorerOnFirstConnect: true })]
+    });
+
+    registerServerCommands(ctx);
+    const duplicateCmd = registeredCommands.get("nexus.server.duplicate");
+    expect(duplicateCmd).toBeDefined();
+
+    await duplicateCmd!("srv-1");
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(expect.objectContaining({
+      name: "Server 1 (copy)",
+      openFileExplorerOnFirstConnect: undefined
+    }));
   });
 
   it("group disconnect applies only to direct-folder servers and skips hidden ones", async () => {
@@ -600,6 +682,36 @@ describe("formValuesToServer authProfileId", () => {
     });
     expect(server).toBeDefined();
     expect(server!.authProfileId).toBeUndefined();
+  });
+});
+
+describe("formValuesToServer File Explorer auto-open", () => {
+  it("maps enabled File Explorer auto-open from form values", () => {
+    const server = formValuesToServer({
+      name: "Test",
+      host: "example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      openFileExplorerOnFirstConnect: true
+    });
+
+    expect(server).toBeDefined();
+    expect(server!.openFileExplorerOnFirstConnect).toBe(true);
+  });
+
+  it("omits File Explorer auto-open when unchecked", () => {
+    const server = formValuesToServer({
+      name: "Test",
+      host: "example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      openFileExplorerOnFirstConnect: false
+    });
+
+    expect(server).toBeDefined();
+    expect(server!.openFileExplorerOnFirstConnect).toBeUndefined();
   });
 });
 
@@ -1138,5 +1250,142 @@ describe("SSH terminal tab visual differentiation", () => {
         color: expect.objectContaining({ id: "terminal.ansiCyan" })
       })
     );
+  });
+});
+
+describe("SSH File Explorer auto-open on manual connect", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  it("opens the File Explorer once after the first successful normal Connect session", async () => {
+    const server = makeServer({ openFileExplorerOnFirstConnect: true });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    vi.mocked(ctx.fileExplorerProvider.getActiveServerId as any).mockReturnValue("other-server");
+
+    registerServerCommands(ctx);
+    const connectCmd = registeredCommands.get("nexus.server.connect");
+    expect(connectCmd).toBeDefined();
+
+    await connectCmd!("srv-1");
+    const callbacks = latestSshCallbacks();
+    callbacks.onSessionOpened("session-1");
+    callbacks.onSessionOpened("session-2");
+    await flushPromises();
+
+    expect(ctx.sftpService.connect).toHaveBeenCalledTimes(1);
+    expect(ctx.sftpService.connect).toHaveBeenCalledWith(server);
+    expect(ctx.sftpService.realpath).toHaveBeenCalledWith("srv-1", ".");
+    expect(ctx.fileExplorerProvider.setActiveServer).toHaveBeenCalledWith(server, "/home/dev");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexusFileExplorer.focus");
+  });
+
+  it("does not open the File Explorer when the profile is not enabled", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+    vi.mocked(ctx.fileExplorerProvider.getActiveServerId as any).mockReturnValue("other-server");
+
+    registerServerCommands(ctx);
+    const connectCmd = registeredCommands.get("nexus.server.connect");
+    await connectCmd!("srv-1");
+    latestSshCallbacks().onSessionOpened("session-1");
+    await flushPromises();
+
+    expect(ctx.sftpService.connect).not.toHaveBeenCalled();
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexusFileExplorer.focus");
+  });
+
+  it("does not reopen the File Explorer when it already targets the same server", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ openFileExplorerOnFirstConnect: true })]
+    });
+    vi.mocked(ctx.fileExplorerProvider.getActiveServerId as any).mockReturnValue("srv-1");
+
+    registerServerCommands(ctx);
+    const connectCmd = registeredCommands.get("nexus.server.connect");
+    await connectCmd!("srv-1");
+    latestSshCallbacks().onSessionOpened("session-1");
+    await flushPromises();
+
+    expect(ctx.sftpService.connect).not.toHaveBeenCalled();
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexusFileExplorer.focus");
+  });
+
+  it("does not open the File Explorer for Connect and Run Script", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ openFileExplorerOnFirstConnect: true })]
+    });
+    ctx.scriptRuntimeManager = { runScript: vi.fn(async () => {}) } as any;
+    vi.mocked(ctx.fileExplorerProvider.getActiveServerId as any).mockReturnValue("other-server");
+
+    registerServerCommands(ctx);
+    const runWithScriptCmd = registeredCommands.get("nexus.server.runWithScript");
+    expect(runWithScriptCmd).toBeDefined();
+
+    await runWithScriptCmd!("srv-1");
+    latestSshCallbacks().onSessionOpened("script-session-1");
+    await flushPromises();
+
+    expect(ctx.sftpService.connect).not.toHaveBeenCalled();
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexusFileExplorer.focus");
+    expect(ctx.scriptRuntimeManager.runScript).toHaveBeenCalledWith(
+      expect.objectContaining({ fsPath: "/workspace/.nexus/scripts/task.js" }),
+      "script-session-1"
+    );
+  });
+
+  it("does not open the File Explorer for group Connect", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [
+        makeServer({
+          id: "srv-1",
+          group: "Prod",
+          openFileExplorerOnFirstConnect: true
+        })
+      ]
+    });
+    vi.mocked(ctx.fileExplorerProvider.getActiveServerId as any).mockReturnValue("other-server");
+
+    registerServerCommands(ctx);
+    const groupConnectCmd = registeredCommands.get("nexus.group.connect");
+    expect(groupConnectCmd).toBeDefined();
+
+    await groupConnectCmd!(new FolderTreeItem("Prod", "Prod"));
+    latestSshCallbacks().onSessionOpened("group-session-1");
+    await flushPromises();
+
+    expect(ctx.sftpService.connect).not.toHaveBeenCalled();
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexusFileExplorer.focus");
+  });
+
+  it("keeps the SSH session registered when automatic File Explorer browse fails", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ openFileExplorerOnFirstConnect: true })]
+    });
+    vi.mocked(ctx.fileExplorerProvider.getActiveServerId as any).mockReturnValue("other-server");
+    vi.mocked(ctx.sftpService.connect as any).mockRejectedValue(new Error("sftp unavailable"));
+
+    registerServerCommands(ctx);
+    const connectCmd = registeredCommands.get("nexus.server.connect");
+    await connectCmd!("srv-1");
+    latestSshCallbacks().onSessionOpened("session-1");
+    await flushPromises();
+
+    expect(ctx.core.registerSession).toHaveBeenCalledWith(expect.objectContaining({
+      id: "session-1",
+      serverId: "srv-1"
+    }));
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("Failed to browse files on Server 1: sftp unavailable");
   });
 });
