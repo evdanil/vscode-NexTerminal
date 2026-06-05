@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [2.8.50] — 2026-06-05
+
+### Fixed
+
+- **Settings corruption: `nexus.terminal.passthroughKeys` can no longer be saved or imported as an empty array.** An empty selection is now rejected by validation (the `nexus.terminal.keyboardPassthrough` master toggle is the supported way to disable passthrough), backup import skips a corrupted `[]` value with a warning, and the runtime falls back to the full default key set when the configured value is corrupt — without rewriting your `settings.json`.
+- **Settings webview no longer clobbers externally-changed passthrough keys.** Multi-checkbox controls now re-sync when settings change outside the panel (second window, Settings Sync, import, reset), so a later checkbox click can't save a stale key set. Unchecking every key re-selects all keys instead of saving an empty list.
+- **Keybinding repair cleans up orphaned `terminal.integrated.commandsToSkipShell` entries.** The confirm-gated "Fix Keybindings" command now removes the stale `nexus.macro.slot` entry left behind by v2.3.1–v2.8.27 auto-repair, only writes when a value actually changes, and applies its settings updates sequentially to avoid write races.
+
+### Changed
+
+- **Refreshed README and Marketplace description/keywords** to better describe the zero-footprint SSH client positioning.
+
 ## [2.8.49] — 2026-05-19
 
 ### Added
