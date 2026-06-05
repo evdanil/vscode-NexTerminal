@@ -39,6 +39,7 @@ import { ScriptTreeProvider } from "./ui/scriptTreeProvider";
 import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
 import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
+import { readBoundedNumber } from "./utils/boundedConfig";
 import { createCoalescedInvoker } from "./utils/coalescedInvoker";
 import { clearTrackedSessionActivity, focusSessionTerminal } from "./utils/sessionTerminalFocus";
 import { resolveScriptSessionForTerminal, resolveSessionForTerminal } from "./utils/terminalSessionLookup";
@@ -165,11 +166,6 @@ function updatePassthroughContext(): void {
   }
 }
 
-function readBoundedNumber(section: string, key: string, fallback: number, min: number, max: number): number {
-  const raw = vscode.workspace.getConfiguration(section).get<number>(key, fallback);
-  return typeof raw === "number" && Number.isFinite(raw) ? clamp(raw, min, max) : fallback;
-}
-
 function readBoundedMs(section: string, key: string, fallbackSeconds: number, minSeconds: number, maxSeconds: number): number {
   return readBoundedNumber(section, key, fallbackSeconds, minSeconds, maxSeconds) * 1000;
 }
@@ -266,10 +262,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const multiplexingConfig = vscode.workspace.getConfiguration("nexus.ssh.multiplexing");
   const pool = new SshConnectionPool(proxiedFactory, {
     enabled: multiplexingConfig.get<boolean>("enabled", true),
-    idleTimeoutMs: Math.min(
-      multiplexingConfig.get<number>("idleTimeout", 300) * 1000,
-      3_600_000
-    )
+    idleTimeoutMs: readBoundedMs("nexus.ssh.multiplexing", "idleTimeout", 300, 0, 3600)
   });
   proxiedFactory.setJumpHostConnectionFactory(pool);
   const tunnelManager = new TunnelManager(
@@ -653,7 +646,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   updatePassthroughContext();
 
   const sftpConfig = vscode.workspace.getConfiguration("nexus.sftp");
-  const autoRefreshInterval = sftpConfig.get<number>("autoRefreshInterval", 10);
+  const autoRefreshInterval = readBoundedNumber("nexus.sftp", "autoRefreshInterval", 10, 0, 60);
   fileExplorerProvider.setAutoRefreshInterval(autoRefreshInterval);
   const remoteWatchMode = sftpConfig.get<string>("remoteWatchMode", "auto") === "polling" ? "polling" as const : "auto" as const;
   fileExplorerProvider.setRemoteWatchMode(remoteWatchMode);
@@ -882,7 +875,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       sftpService.updateConfig(readSftpServiceConfig());
     }
     if (event.affectsConfiguration("nexus.sftp.autoRefreshInterval")) {
-      const interval = vscode.workspace.getConfiguration("nexus.sftp").get<number>("autoRefreshInterval", 10);
+      const interval = readBoundedNumber("nexus.sftp", "autoRefreshInterval", 10, 0, 60);
       fileExplorerProvider.setAutoRefreshInterval(interval);
     }
     if (event.affectsConfiguration("nexus.sftp.remoteWatchMode")) {

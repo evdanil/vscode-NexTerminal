@@ -4,13 +4,18 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { ColorScheme, TerminalFontConfig } from "../models/colorScheme";
 import { parseMobaXtermIni } from "../services/colorSchemeParser";
-import { buildColorCustomizations } from "../services/colorSchemeApplier";
+import { buildColorCustomizations, colorCustomizationsWriteValue } from "../services/colorSchemeApplier";
+import { planFontWrites } from "../services/terminal/fontWritePlan";
 import type { ColorSchemeService } from "../services/colorSchemeService";
 import { renderTerminalAppearanceHtml } from "./terminalAppearanceHtml";
+
+/** Terminal font settings the appearance panel reads/writes (global scope). */
+const FONT_SETTING_KEYS = ["fontFamily", "fontSize", "fontWeight"] as const;
 
 export class TerminalAppearancePanel {
   private static instance: TerminalAppearancePanel | undefined;
   private readonly panel: vscode.WebviewPanel;
+  private readonly configListener: vscode.Disposable;
   private disposed = false;
 
   private constructor(private readonly service: ColorSchemeService) {
@@ -24,7 +29,22 @@ export class TerminalAppearancePanel {
     this.panel.webview.onDidReceiveMessage((msg) => this.handleMessage(msg));
     this.panel.onDidDispose(() => {
       this.disposed = true;
+      this.configListener.dispose();
       TerminalAppearancePanel.instance = undefined;
+    });
+
+    // Keep the panel's font inputs in sync with external configuration changes
+    // (other window, Settings Sync, manual settings.json edit). Without this,
+    // an Apply Font click would write the stale rendered DOM values back over
+    // the external change.
+    this.configListener = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (this.disposed) return;
+      const fontAffected = FONT_SETTING_KEYS.some((key) =>
+        event.affectsConfiguration(`terminal.integrated.${key}`)
+      );
+      if (fontAffected) {
+        this.pushFontUpdate();
+      }
     });
   }
 
@@ -85,8 +105,15 @@ export class TerminalAppearancePanel {
     await this.service.setActiveSchemeId(schemeId);
     const scheme = schemeId ? this.service.getSchemeById(schemeId) ?? null : null;
     const config = vscode.workspace.getConfiguration("workbench");
-    const existing = config.get<Record<string, string>>("colorCustomizations", {});
-    const updated = buildColorCustomizations(existing, scheme);
+    // Read the GLOBAL-scope value only (read-scope == write-scope invariant).
+    // `get()` returns the effective deep-merged value across default/global/
+    // workspace/workspaceFolder scopes; merging that and writing it to Global
+    // would permanently copy workspace-scoped color keys into global settings.
+    const existing =
+      config.inspect<Record<string, string>>("colorCustomizations")?.globalValue ?? {};
+    const merged = buildColorCustomizations(existing, scheme);
+    // Write `undefined` (key removal) when nothing is left, for a clean settings.json.
+    const updated = colorCustomizationsWriteValue(merged);
     await config.update("colorCustomizations", updated, vscode.ConfigurationTarget.Global);
     this.pushUpdate();
   }
@@ -174,16 +201,24 @@ export class TerminalAppearancePanel {
     };
     await this.service.saveFontConfig(config);
     const termConfig = vscode.workspace.getConfiguration("terminal.integrated");
-    if (config.family) {
-      await termConfig.update("fontFamily", config.family, vscode.ConfigurationTarget.Global);
-    }
-    if (config.size > 0) {
-      await termConfig.update("fontSize", config.size, vscode.ConfigurationTarget.Global);
-    }
-    if (config.weight) {
-      await termConfig.update("fontWeight", config.weight, vscode.ConfigurationTarget.Global);
+    // Write only the fields whose value actually differs from what VS Code
+    // currently resolves. If the DOM is stale (an external change happened
+    // while the panel was open), re-writing every field would clobber that
+    // change; planFontWrites suppresses no-op writes.
+    const current = this.readVsCodeFontConfig();
+    const writes = planFontWrites(current, config);
+    for (const write of writes) {
+      await termConfig.update(write.field, write.value, vscode.ConfigurationTarget.Global);
     }
     void vscode.window.showInformationMessage("Terminal font settings applied.");
+  }
+
+  private pushFontUpdate(): void {
+    if (this.disposed) return;
+    void this.panel.webview.postMessage({
+      type: "fontUpdated",
+      font: this.readVsCodeFontConfig()
+    });
   }
 
   private pushUpdate(): void {

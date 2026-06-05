@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [2.8.51] — 2026-06-05
+
+### Fixed
+
+- **Applying a terminal color scheme no longer copies workspace-scoped `workbench.colorCustomizations` entries into your global settings.** The scheme merge now starts from the global-scope value only, and clearing the last scheme removes the key instead of leaving an empty object behind.
+- **Terminal Appearance panel re-syncs font fields when settings change outside the panel** (second window, Settings Sync, manual edits), and Apply Font only writes the fields that actually changed — a stale panel can no longer revert an external font change.
+- **Corrupt extension storage no longer breaks activation.** If stored profile, group, or macro data has an invalid shape, Nexus now degrades to an empty list instead of failing to activate.
+- **Corrupt numeric settings values fall back to safe defaults.** `nexus.sftp.maxOpenFileSizeMB`, `nexus.sftp.autoRefreshInterval`, and `nexus.ssh.multiplexing.idleTimeout` are now range-clamped on read, so a hand-edited or synced-in invalid value can't silently break file opening, auto-refresh, or connection multiplexing.
+- **Macro editor saves are now keyed by macro identity, not list position.** If macros change in another window while the editor is open, saving can no longer overwrite or delete the wrong macro; the editor re-syncs and warns instead.
+
 ## [2.8.50] — 2026-06-05
 
 ### Fixed

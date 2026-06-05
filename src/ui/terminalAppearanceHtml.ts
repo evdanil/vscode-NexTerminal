@@ -334,8 +334,28 @@ export function renderTerminalAppearanceHtml(
         var msg = event.data;
         if (msg.type === "schemesUpdated") {
           updateSchemes(msg.schemes, msg.activeId);
+        } else if (msg.type === "fontUpdated") {
+          syncFontInputs(msg.font);
         }
       });
+
+      // Re-sync the three font inputs after an external configuration change
+      // (other window, Settings Sync, manual settings.json edit) so Apply Font
+      // never writes stale DOM values back over the external change.
+      function syncFontInputs(font) {
+        if (!font) return;
+        document.getElementById("font-family").value = font.family || "";
+        document.getElementById("font-size").value = (font.size || 14);
+        var weightInput = document.getElementById("font-weight");
+        weightInput.value = font.weight || "normal";
+        var weightWrapper = document.getElementById("font-weight-wrapper");
+        var selectedOption = weightWrapper.querySelector('.custom-select-option[data-value="' + (font.weight || "normal") + '"]');
+        var triggerText = weightWrapper.querySelector('.custom-select-text');
+        if (triggerText) {
+          triggerText.textContent = selectedOption ? selectedOption.textContent : (font.weight || "normal");
+        }
+        updateFontPreview();
+      }
 
       function updateSchemes(schemes, activeId) {
         var builtIn = schemes.filter(function(s) { return s.builtIn; });

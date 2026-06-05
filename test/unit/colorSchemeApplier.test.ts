@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildColorCustomizations, buildTerminalColorKeys } from "../../src/services/colorSchemeApplier";
+import {
+  buildColorCustomizations,
+  buildTerminalColorKeys,
+  colorCustomizationsWriteValue
+} from "../../src/services/colorSchemeApplier";
 import { BUILTIN_SCHEMES } from "../../src/services/builtinSchemes";
 
 describe("buildTerminalColorKeys", () => {
@@ -55,5 +59,55 @@ describe("buildColorCustomizations", () => {
     const existing = { "terminalCursor.foreground": "#old" };
     const result = buildColorCustomizations(existing, null);
     expect(result["terminalCursor.foreground"]).toBeUndefined();
+  });
+
+  // H1: the merge base must be the GLOBAL-scope value only (inspect().globalValue),
+  // never the effective merged value. A workspace-scoped key present only in the
+  // effective value must NOT be carried into the global-scope object we write.
+  it("does not carry workspace-scoped keys into the merge base when given globalValue only", () => {
+    // Simulate read-scope == write-scope: caller passes ONLY the global-scope
+    // value. A workspace-scoped 'editor.foreground' is absent here by construction.
+    const globalValueOnly = { "editor.background": "#globalBg" };
+    const result = buildColorCustomizations(globalValueOnly, BUILTIN_SCHEMES[0]);
+    expect(result["editor.background"]).toBe("#globalBg");
+    expect(result["editor.foreground"]).toBeUndefined();
+  });
+
+  it("preserves existing global non-terminal keys while replacing terminal.* with the scheme", () => {
+    const globalValueOnly = {
+      "editor.background": "#globalBg",
+      "terminal.background": "#staleTermBg"
+    };
+    const scheme = BUILTIN_SCHEMES[0];
+    const result = buildColorCustomizations(globalValueOnly, scheme);
+    expect(result["editor.background"]).toBe("#globalBg");
+    expect(result["terminal.background"]).toBe(scheme.background);
+  });
+
+  it("clear-scheme path keeps only non-terminal global keys", () => {
+    const globalValueOnly = {
+      "editor.background": "#globalBg",
+      "terminal.background": "#termBg",
+      "terminalCursor.foreground": "#cur"
+    };
+    const result = buildColorCustomizations(globalValueOnly, null);
+    expect(result).toEqual({ "editor.background": "#globalBg" });
+  });
+});
+
+describe("colorCustomizationsWriteValue", () => {
+  it("returns undefined for an empty merged object (key removal)", () => {
+    expect(colorCustomizationsWriteValue({})).toBeUndefined();
+  });
+
+  it("returns the object unchanged when it has keys", () => {
+    const merged = { "editor.background": "#111" };
+    expect(colorCustomizationsWriteValue(merged)).toBe(merged);
+  });
+
+  it("clear-scheme with no other global keys yields undefined (clean settings.json)", () => {
+    // globalValue had only terminal.* keys; after stripping, merged is empty.
+    const merged = buildColorCustomizations({ "terminal.background": "#bg" }, null);
+    expect(colorCustomizationsWriteValue(merged)).toBeUndefined();
   });
 });

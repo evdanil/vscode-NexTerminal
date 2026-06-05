@@ -5,6 +5,7 @@ import type { DirectoryEntry } from "../services/sftp/sftpService";
 import type { SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
 import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
+import { readBoundedNumber } from "../utils/boundedConfig";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "./conflictResolution";
 
 const FILE_DRAG_MIME = "application/vnd.nexus.fileitem";
@@ -138,7 +139,7 @@ export class FileTreeItem extends vscode.TreeItem {
     } else {
       this.contextValue = "nexus.fileExplorer.file";
       this.iconPath = vscode.ThemeIcon.File;
-      const maxOpenBytes = vscode.workspace.getConfiguration("nexus.sftp").get<number>("maxOpenFileSizeMB", 5) * 1024 * 1024;
+      const maxOpenBytes = readBoundedNumber("nexus.sftp", "maxOpenFileSizeMB", 5, 1, 200) * 1024 * 1024;
       if (fullPath && entry.size <= maxOpenBytes) {
         this.command = {
           command: "vscode.open",

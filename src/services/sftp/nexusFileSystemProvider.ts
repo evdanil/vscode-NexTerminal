@@ -2,11 +2,12 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { SftpService, DirectoryEntry } from "./sftpService";
 import { isSafeEntryName, joinRemoteEntryPath } from "../../utils/pathSafety";
+import { readBoundedNumber } from "../../utils/boundedConfig";
 
 export const NEXTERM_SCHEME = "nexterm";
 
 function getMaxFileSize(): number {
-  return vscode.workspace.getConfiguration("nexus.sftp").get<number>("maxOpenFileSizeMB", 5) * 1024 * 1024;
+  return readBoundedNumber("nexus.sftp", "maxOpenFileSizeMB", 5, 1, 200) * 1024 * 1024;
 }
 const MAX_COPY_DEPTH = 100;
 

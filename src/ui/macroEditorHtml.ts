@@ -235,6 +235,7 @@ export function renderMacroEditorHtml(
       var vscode = acquireVsCodeApi();
       var dirty = false;
       var currentIndex = ${selectedIndex !== null ? selectedIndex : "null"};
+      var currentId = ${macro?.id ? JSON.stringify(macro.id) : "null"};
       var KNOWN_PROFILE_IDS = ${profileIdsJson};
 
       var VALID_PATTERN = /^(alt\\+[a-z0-9]|alt\\+shift\\+[a-z0-9]|ctrl\\+shift\\+[a-z0-9])$/;
@@ -420,6 +421,7 @@ export function renderMacroEditorHtml(
         vscode.postMessage({
           type: "save",
           index: currentIndex,
+          id: currentId,
           name: name,
           text: text,
           secret: secret,
@@ -436,7 +438,7 @@ export function renderMacroEditorHtml(
       // Delete
       document.getElementById("delete-btn").addEventListener("click", function() {
         if (currentIndex === null) return;
-        vscode.postMessage({ type: "delete", index: currentIndex });
+        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId });
       });
 
       // New

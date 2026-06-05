@@ -50,3 +50,22 @@ export function buildColorCustomizations(
 
   return { ...cleaned, ...buildTerminalColorKeys(scheme) };
 }
+
+/**
+ * Normalize the value to write to `workbench.colorCustomizations`.
+ *
+ * When the merged object is empty (e.g. clearing the scheme with no other
+ * non-terminal keys present in the global scope), writing `undefined` removes
+ * the key from settings.json entirely — cleaner than persisting an empty `{}`
+ * that VS Code would otherwise leave behind.
+ *
+ * The `existing` base MUST come from the SAME scope being written
+ * (`inspect().globalValue`), never the effective merged value, or workspace /
+ * default-scoped keys would leak into the global file (read-scope ==
+ * write-scope invariant).
+ */
+export function colorCustomizationsWriteValue(
+  merged: Record<string, string>
+): Record<string, string> | undefined {
+  return Object.keys(merged).length === 0 ? undefined : merged;
+}

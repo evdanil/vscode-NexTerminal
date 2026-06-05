@@ -10,11 +10,21 @@ const LOCAL_SHELL_PROFILES_KEY = "nexus.localShellProfiles";
 const GROUPS_KEY = "nexus.groups";
 const AUTH_PROFILES_KEY = "nexus.authProfiles";
 
+/**
+ * `globalState.get(key, [])` only substitutes the default when the key is ABSENT.
+ * A corrupt non-array value (object/string/null from a Settings Sync conflict or
+ * storage corruption) would otherwise reach `.filter(...)` and throw during
+ * activation. Degrade any non-array shape to an empty list.
+ */
+function asArray<T>(raw: unknown): T[] {
+  return Array.isArray(raw) ? (raw as T[]) : [];
+}
+
 export class VscodeConfigRepository implements ConfigRepository {
   public constructor(private readonly context: vscode.ExtensionContext) {}
 
   public async getServers(): Promise<ServerConfig[]> {
-    const raw = this.context.globalState.get<ServerConfig[]>(SERVERS_KEY, []);
+    const raw = asArray<ServerConfig>(this.context.globalState.get(SERVERS_KEY, []));
     return raw.filter((item) => {
       if (validateServerConfig(item)) {
         return true;
@@ -29,7 +39,7 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getTunnels(): Promise<TunnelProfile[]> {
-    const raw = this.context.globalState.get<TunnelProfile[]>(TUNNELS_KEY, []);
+    const raw = asArray<TunnelProfile>(this.context.globalState.get(TUNNELS_KEY, []));
     return raw.filter((item) => {
       if (validateTunnelProfile(item)) {
         return true;
@@ -44,7 +54,7 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getSerialProfiles(): Promise<SerialProfile[]> {
-    const raw = this.context.globalState.get<SerialProfile[]>(SERIAL_PROFILES_KEY, []);
+    const raw = asArray<SerialProfile>(this.context.globalState.get(SERIAL_PROFILES_KEY, []));
     return raw.filter((item) => {
       if (validateSerialProfile(item)) {
         return true;
@@ -59,7 +69,7 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getLocalShellProfiles(): Promise<LocalShellProfile[]> {
-    const raw = this.context.globalState.get<LocalShellProfile[]>(LOCAL_SHELL_PROFILES_KEY, []);
+    const raw = asArray<LocalShellProfile>(this.context.globalState.get(LOCAL_SHELL_PROFILES_KEY, []));
     return raw.filter((item) => {
       if (validateLocalShellProfile(item)) {
         return true;
@@ -74,7 +84,9 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getGroups(): Promise<string[]> {
-    return this.context.globalState.get<string[]>(GROUPS_KEY, []);
+    return asArray<string>(this.context.globalState.get(GROUPS_KEY, [])).filter(
+      (item): item is string => typeof item === "string"
+    );
   }
 
   public async saveGroups(groups: string[]): Promise<void> {
@@ -82,7 +94,7 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getAuthProfiles(): Promise<AuthProfile[]> {
-    const raw = this.context.globalState.get<AuthProfile[]>(AUTH_PROFILES_KEY, []);
+    const raw = asArray<AuthProfile>(this.context.globalState.get(AUTH_PROFILES_KEY, []));
     return raw.filter((item) => {
       if (validateAuthProfile(item)) {
         return true;

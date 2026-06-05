@@ -196,3 +196,58 @@ describe("VscodeMacroStore", () => {
     expect(secretBag.has("macro-secret-text-orphan")).toBe(false);
   });
 });
+
+describe("VscodeMacroStore corrupt globalState shape", () => {
+  // A context whose globalState returns the default ONLY when the key is absent,
+  // mirroring VS Code: a corrupt stored value (object/string/null/number) is
+  // returned verbatim and must not crash initialize().
+  function makeStrictContext(initialState: Record<string, unknown> = {}) {
+    const state: Record<string, unknown> = { ...initialState };
+    const secretBag = new Map<string, string>();
+    return {
+      globalState: {
+        get<T>(key: string, fallback: T): T {
+          return (key in state ? state[key] : fallback) as T;
+        },
+        async update(key: string, value: unknown): Promise<void> {
+          if (value === undefined) delete state[key];
+          else state[key] = value;
+        }
+      },
+      secrets: {
+        async get(key: string): Promise<string | undefined> {
+          return secretBag.get(key);
+        },
+        async store(key: string, value: string): Promise<void> {
+          secretBag.set(key, value);
+        },
+        async delete(key: string): Promise<void> {
+          secretBag.delete(key);
+        }
+      }
+    } as unknown as import("vscode").ExtensionContext;
+  }
+
+  const CORRUPT_SHAPES: Array<[string, unknown]> = [
+    ["an object", { not: "array" }],
+    ["a string", "corrupt"],
+    ["null", null],
+    ["a number", 7]
+  ];
+
+  for (const [label, shape] of CORRUPT_SHAPES) {
+    it(`initialize() degrades to [] when nexus.macros is ${label}`, async () => {
+      const context = makeStrictContext({ "nexus.macros": shape });
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await expect(store.initialize()).resolves.toBeUndefined();
+      expect(store.getAll()).toEqual([]);
+    });
+  }
+
+  it("clearAll does not throw when nexus.macros.secretIds is corrupt", async () => {
+    const context = makeStrictContext({ "nexus.macros.secretIds": { bad: true } });
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+    await expect(store.clearAll()).resolves.toBeUndefined();
+  });
+});

@@ -7,6 +7,7 @@ import {
 } from "../macroBindingHelpers";
 import {
   confirmBindingWarnings,
+  getActiveMacroStore,
   getMacros,
   saveMacros
 } from "../macroSettings";
@@ -24,6 +25,13 @@ export class MacroEditorPanel {
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
   private selectedIndex: number | null = null;
+  private unsubscribe: () => void = () => {};
+  /**
+   * Set while this panel is persisting its own save/delete. The macro store's
+   * change event fires for our own writes too; without this guard a self-save
+   * would re-render mid-flow and could clobber the just-applied `selectedIndex`.
+   */
+  private isSaving = false;
 
   public static setProfileProvider(provider: MacroProfileProvider): void {
     MacroEditorPanel.profileProvider = provider;
@@ -41,7 +49,14 @@ export class MacroEditorPanel {
     this.panel.webview.onDidReceiveMessage((msg) => this.handleMessage(msg));
     this.panel.onDidDispose(() => {
       this.disposed = true;
+      this.unsubscribe();
       MacroEditorPanel.instance = undefined;
+    });
+    // Re-render when the macro store changes externally (second window, Settings
+    // Sync, legacy absorption, clearAll) so index/id resolution stays current.
+    this.unsubscribe = getActiveMacroStore().onDidChange(() => {
+      if (this.isSaving) return;
+      this.render();
     });
   }
 
@@ -133,8 +148,21 @@ export class MacroEditorPanel {
         }
         const secret = msg.secret as boolean;
         const bindingRaw = msg.keybinding as string | null;
-        const index = msg.index as number | null;
+        const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
+        // Resolve the target by stable id, never by the render-time array index:
+        // an external reorder/delete between render and save would otherwise hit
+        // the wrong macro. A null id means an unsaved (new) macro → push path.
+        const index = macroId !== null ? macros.findIndex((m) => m.id === macroId) : -1;
+        if (macroId !== null && index === -1) {
+          // The macro we were editing was deleted/changed externally. Do not
+          // fall through to the push path (that would create a stray duplicate).
+          void vscode.window.showWarningMessage(
+            "This macro changed externally and could not be saved. The editor has been refreshed."
+          );
+          this.render();
+          return;
+        }
         const triggerInitiallyDisabled = msg.triggerInitiallyDisabled as boolean | undefined;
         const triggerInterval = msg.triggerInterval as number | undefined | null;
         const triggerScope = msg.triggerScope as TerminalMacro["triggerScope"] | undefined;
@@ -196,7 +224,7 @@ export class MacroEditorPanel {
           }
         }
 
-        const existingMacro = index !== null && index < macros.length ? macros[index] : undefined;
+        const existingMacro = index >= 0 ? macros[index] : undefined;
         const macro: TerminalMacro = { ...existingMacro, name, text };
         delete macro.keybinding;
         delete macro.slot;
@@ -236,7 +264,7 @@ export class MacroEditorPanel {
           if (!(await confirmBindingWarnings(normalizedBinding))) {
             break;
           }
-          if (index !== null && index < macros.length) {
+          if (index >= 0) {
             macros[index] = macro;
             assignBinding(macros, index, normalizedBinding);
             this.selectedIndex = index;
@@ -246,7 +274,7 @@ export class MacroEditorPanel {
             assignBinding(macros, newIndex, normalizedBinding);
             this.selectedIndex = newIndex;
           }
-        } else if (index !== null && index < macros.length) {
+        } else if (index >= 0) {
           macros[index] = macro;
           this.selectedIndex = index;
         } else {
@@ -254,16 +282,26 @@ export class MacroEditorPanel {
           this.selectedIndex = macros.length - 1;
         }
 
-        await saveMacros(macros);
+        await this.persist(macros);
         this.render();
         void this.panel.webview.postMessage({ type: "saved" });
         break;
       }
       case "delete": {
-        const index = msg.index as number;
+        const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
-        const macro = macros[index];
-        if (!macro) break;
+        // Resolve by stable id; the render-time index may be stale.
+        const index = macroId !== null ? macros.findIndex((m) => m.id === macroId) : -1;
+        const macro = index >= 0 ? macros[index] : undefined;
+        if (!macro) {
+          if (macroId !== null) {
+            void vscode.window.showWarningMessage(
+              "This macro changed externally and could not be deleted. The editor has been refreshed."
+            );
+            this.render();
+          }
+          break;
+        }
 
         const confirm = await vscode.window.showWarningMessage(
           `Delete macro "${macro.name}"?`,
@@ -273,11 +311,25 @@ export class MacroEditorPanel {
         if (confirm !== "Delete") break;
 
         macros.splice(index, 1);
-        await saveMacros(macros);
+        await this.persist(macros);
         this.selectedIndex = macros.length > 0 ? Math.min(index, macros.length - 1) : null;
         this.render();
         break;
       }
+    }
+  }
+
+  /**
+   * Persist macros while suppressing the store's change-event re-render for our
+   * own write, so a self-save does not race the explicit `render()` calls in the
+   * save/delete handlers (which set `selectedIndex` to the just-applied target).
+   */
+  private async persist(macros: TerminalMacro[]): Promise<void> {
+    this.isSaving = true;
+    try {
+      await saveMacros(macros);
+    } finally {
+      this.isSaving = false;
     }
   }
 }

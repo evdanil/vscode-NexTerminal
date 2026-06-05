@@ -7,6 +7,16 @@ const MACROS_KEY = "nexus.macros";
 const SECRET_IDS_KEY = "nexus.macros.secretIds";
 const SECRET_PREFIX = "macro-secret-text-";
 
+/**
+ * `globalState.get(key, [])` returns the default only when the key is ABSENT.
+ * A corrupt non-array value (object/string/null from a Settings Sync conflict or
+ * storage corruption) would otherwise be iterated directly and throw during
+ * `initialize()`. Degrade any non-array shape to an empty list.
+ */
+function asArray<T>(raw: unknown): T[] {
+  return Array.isArray(raw) ? (raw as T[]) : [];
+}
+
 export interface VscodeMacroStoreOptions {
   /** If false, skip the one-time legacy-settings absorption (used by tests). Default: true. */
   runLegacyMigration?: boolean;
@@ -102,7 +112,9 @@ export class VscodeMacroStore implements MacroStore {
 
     // Also read the persisted index to sweep any orphaned vault entries that
     // were left by a prior crash between vault-store and globalState-update.
-    const indexedIds = this.context.globalState.get<string[]>(SECRET_IDS_KEY, []);
+    const indexedIds = asArray<string>(this.context.globalState.get(SECRET_IDS_KEY, [])).filter(
+      (id): id is string => typeof id === "string"
+    );
 
     // Delete vault entries FIRST (before clearing the index) so a crash between
     // these two awaits leaves the index intact — next clearAll can still find orphans.
@@ -120,7 +132,7 @@ export class VscodeMacroStore implements MacroStore {
   }
 
   private async reloadFromState(): Promise<void> {
-    const raw = this.context.globalState.get<TerminalMacro[]>(MACROS_KEY, []);
+    const raw = asArray<TerminalMacro>(this.context.globalState.get(MACROS_KEY, []));
     const resolved: TerminalMacro[] = [];
     for (const entry of raw) {
       if (!entry || typeof entry !== "object") continue;
@@ -173,7 +185,7 @@ export class VscodeMacroStore implements MacroStore {
     if (collected.length === 0) return; // Nothing to absorb
 
     const deduped = dedupeLegacyMacros(collected);
-    const existing = this.context.globalState.get<TerminalMacro[]>(MACROS_KEY, []);
+    const existing = asArray<TerminalMacro>(this.context.globalState.get(MACROS_KEY, []));
     const existingKeys = new Set(existing.map(keyOfLegacy));
     const toAdd = deduped.filter((m) => !existingKeys.has(keyOfLegacy(m)));
     if (toAdd.length > 0) {
