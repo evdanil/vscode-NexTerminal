@@ -41,19 +41,19 @@ describe("sanitizeForSharing — macros", () => {
       { id: "1", name: "public", text: "hello" },
       { id: "2", name: "private", text: "classified", secret: true }
     ];
-    const result = sanitizeForSharing([], [], [], {}, [], macros);
+    const result = sanitizeForSharing([], [], [], [], {}, [], macros);
     expect(result.macros.map((m) => m.name)).toEqual(["public"]);
   });
 
   it("reassigns fresh ids to shared macros", () => {
     const macros: TerminalMacro[] = [{ id: "stable-id", name: "p", text: "t" }];
-    const result = sanitizeForSharing([], [], [], {}, [], macros);
+    const result = sanitizeForSharing([], [], [], [], {}, [], macros);
     expect(result.macros[0].id).not.toBe("stable-id");
   });
 
   it("does not include macros in the settings object", () => {
     // readSettings() never emits nexus.terminal.macros; confirm the key is absent
-    const result = sanitizeForSharing([], [], [], {}, [], []);
+    const result = sanitizeForSharing([], [], [], [], {}, [], []);
     expect(result.settings["nexus.terminal.macros"]).toBeUndefined();
   });
 });

@@ -1,7 +1,7 @@
-import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { renderFormHtml } from "./formHtml";
 import type { FormDefinition, FormMessage, FormValues } from "./formTypes";
+import { createWebviewNonce } from "./shared/webviewNonce";
 
 export class WebviewFormPanel {
   private static activePanels = new Map<string, WebviewFormPanel>();
@@ -28,7 +28,7 @@ export class WebviewFormPanel {
       { enableScripts: true, retainContextWhenHidden: true }
     );
 
-    const nonce = randomBytes(16).toString("base64");
+    const nonce = createWebviewNonce();
     this.panel.webview.html = renderFormHtml(definition, nonce);
 
     this.panel.webview.onDidReceiveMessage(async (message: FormMessage) => {

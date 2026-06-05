@@ -1,9 +1,10 @@
-import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { renderSettingsHtml } from "./settingsHtml";
 import { SETTINGS_META, CATEGORY_LABELS } from "./settingsMetadata";
 import { validateSettingUpdate } from "./settingsValidation";
+import { createWebviewNonce } from "./shared/webviewNonce";
+import { resetSettings } from "./settingsReset";
 
 /**
  * Pick a sensible `defaultUri` for `vscode.window.showOpenDialog` when the
@@ -148,7 +149,7 @@ export class SettingsPanel {
   }
 
   private render(): void {
-    const nonce = randomBytes(16).toString("base64");
+    const nonce = createWebviewNonce();
     const values = this.readAllValues();
     this.panel.webview.html = renderSettingsHtml(values, nonce, this.currentCategory);
     if (this.pendingScrollTo && !this.currentCategory) {
@@ -248,10 +249,7 @@ export class SettingsPanel {
           "Reset"
         );
         if (confirm === "Reset") {
-          for (const meta of SETTINGS_META) {
-            const config = vscode.workspace.getConfiguration(meta.section);
-            await config.update(meta.key, undefined, vscode.ConfigurationTarget.Global);
-          }
+          await resetSettings(SETTINGS_META);
           this.render();
         }
         break;
@@ -266,10 +264,7 @@ export class SettingsPanel {
         );
         if (confirm === "Reset") {
           const categoryMetas = SETTINGS_META.filter((m) => m.category === category);
-          for (const meta of categoryMetas) {
-            const config = vscode.workspace.getConfiguration(meta.section);
-            await config.update(meta.key, undefined, vscode.ConfigurationTarget.Global);
-          }
+          await resetSettings(categoryMetas);
           this.render();
         }
         break;

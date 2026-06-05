@@ -8,6 +8,7 @@ import type { SshConnection, SshFactory } from "./contracts";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
+import { PtyObserverHub } from "../terminal/ptyObserverHub";
 
 export interface SshPtyCallbacks {
   onSessionOpened(sessionId: string): void;
@@ -33,9 +34,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   private activityIndicator = false;
   private readonly highlighterStream?: TerminalHighlighterStream;
 
-  private readonly outputObservers = new Set<PtyOutputObserver>();
-  private inputBlocked = false;
-  private inputBlockNoticeArmed = true;
+  private readonly observerHub: PtyObserverHub;
 
   public constructor(
     private readonly serverConfig: ServerConfig,
@@ -51,19 +50,15 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       typeof (highlighter as { createStream?: unknown } | undefined)?.createStream === "function"
         ? highlighter?.createStream((text) => this.writeEmitter.fire(text))
         : undefined;
-    if (outputObserver) this.outputObservers.add(outputObserver);
+    this.observerHub = new PtyObserverHub(outputObserver);
   }
 
   public addOutputObserver(observer: PtyOutputObserver): vscode.Disposable {
-    this.outputObservers.add(observer);
-    return new vscode.Disposable(() => {
-      this.outputObservers.delete(observer);
-    });
+    return this.observerHub.addOutputObserver(observer);
   }
 
   public setInputBlocked(blocked: boolean): void {
-    this.inputBlocked = blocked;
-    if (blocked) this.inputBlockNoticeArmed = true;
+    this.observerHub.setInputBlocked(blocked);
   }
 
   public writeProgrammatic(data: string): void {
@@ -105,11 +100,9 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     if (this.shuttingDown) {
       return;
     }
-    if (this.inputBlocked) {
-      if (this.inputBlockNoticeArmed) {
-        this.inputBlockNoticeArmed = false;
-        this.writeEmitter.fire("\r\n[Nexus] Terminal is locked while a script is running. Stop the script to send input.\r\n");
-      }
+    if (this.observerHub.isInputBlocked) {
+      const notice = this.observerHub.consumeLockedNotice();
+      if (notice) this.writeEmitter.fire(notice);
       return;
     }
     if (this.connectFailed) {
@@ -141,7 +134,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.shuttingDown = true;
-    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
+    this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
     this.stream?.destroy();
     this.connection?.dispose();
@@ -163,14 +156,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.highlighterStream?.dispose();
     this.stream?.destroy();
     this.connection?.dispose();
-    this.outputObservers.forEach((o) => {
-      try {
-        o.dispose();
-      } catch {
-        /* tolerate misbehaving observer */
-      }
-    });
-    this.outputObservers.clear();
+    this.observerHub.disposeAll();
     this.transcript?.close();
     this.logger.log("terminal closed");
     this.logger.close();
@@ -188,7 +174,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     if (this.disposed || this.disconnected || generation !== this.connectionGeneration) {
       return;
     }
-    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
+    this.observerHub.pauseIntervalMacros();
     this.disconnected = true;
     this.highlighterStream?.flush();
     this.stream?.destroy();
@@ -277,13 +263,10 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
         const text = typeof data === "string" ? data : data.toString("utf8");
         this.logger.log(`stdout ${JSON.stringify(text)}`);
         this.transcript?.write(text);
-        this.outputObservers.forEach((o) => o.onOutput(text));
+        this.observerHub.notifyOutput(text, this.highlighterStream, this.highlighter, (rendered) =>
+          this.writeEmitter.fire(rendered)
+        );
         this.callbacks.onDataReceived?.(this.sessionId);
-        if (this.highlighterStream) {
-          this.highlighterStream.push(text);
-        } else {
-          this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(text) : text);
-        }
       });
       stream.on("end", () => this.handleDisconnect(generation, "remote-closed"));
       stream.on("close", () => this.handleDisconnect(generation));

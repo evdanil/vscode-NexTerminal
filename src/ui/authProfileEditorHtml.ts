@@ -2,6 +2,7 @@ import type { AuthProfile } from "../models/config";
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
+import { renderWebviewDocument } from "./shared/webviewDocument";
 
 export function renderAuthProfileEditorHtml(
   profiles: AuthProfile[],
@@ -44,14 +45,9 @@ export function renderAuthProfileEditorHtml(
     .join("\n          ");
   const authTypeTriggerLabel = authTypeOptions.find((o) => o.value === authTypeValue)?.label ?? "Password";
 
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />
-  <style nonce="${nonce}">
-    ${baseWebviewCss()}
+  return renderWebviewDocument({
+    nonce,
+    css: `    ${baseWebviewCss()}
     .hint {
       font-size: 11px;
       color: var(--vscode-descriptionForeground, var(--vscode-foreground));
@@ -88,11 +84,8 @@ export function renderAuthProfileEditorHtml(
     }
     .conditional-field.visible {
       display: block;
-    }
-  </style>
-</head>
-<body>
-  <div class="form-group">
+    }`,
+    body: `  <div class="form-group">
     <label>Auth Profile</label>
     <div class="custom-select" id="profile-selector">
       <input type="hidden" id="profile-select-value" value="${hiddenValue}" />
@@ -152,9 +145,8 @@ export function renderAuthProfileEditorHtml(
     <div class="spacer"></div>
     <button type="button" class="btn-secondary" id="new-btn">New Profile</button>
   </div>
-
-  <script nonce="${nonce}">
-    ${baseWebviewJs()}
+`,
+    script: `    ${baseWebviewJs()}
     (function() {
       var vscode = acquireVsCodeApi();
       var dirty = false;
@@ -279,8 +271,6 @@ export function renderAuthProfileEditorHtml(
           markDirty();
         }
       });
-    })();
-  </script>
-</body>
-</html>`;
+    })();`
+  });
 }

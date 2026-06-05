@@ -5,6 +5,7 @@ import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
+import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { toParityCode } from "../../utils/helpers";
 import type { SerialTransport } from "./serialPty";
 import { isSerialRuntimeMissingError } from "./errorMatchers";
@@ -105,9 +106,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
   private readonly unsubscribeError: () => void;
   private readonly unsubscribeDisconnect: () => void;
 
-  private readonly outputObservers = new Set<PtyOutputObserver>();
-  private inputBlocked = false;
-  private inputBlockNoticeArmed = true;
+  private readonly observerHub: PtyObserverHub;
 
   public constructor(
     private readonly transport: SmartSerialTransport,
@@ -118,7 +117,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     private readonly highlighter?: TerminalHighlighter,
     outputObserver?: PtyOutputObserver
   ) {
-    if (outputObserver) this.outputObservers.add(outputObserver);
+    this.observerHub = new PtyObserverHub(outputObserver);
     this.preferredPath = profile.path;
     this.deviceHint = profile.deviceHint;
     this.highlighterStream =
@@ -132,13 +131,10 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       const output = data.toString("utf8");
       this.logger.log(`smart serial stdout ${JSON.stringify(output)}`);
       this.transcript?.write(output);
-      this.outputObservers.forEach((o) => o.onOutput(output));
+      this.observerHub.notifyOutput(output, this.highlighterStream, this.highlighter, (rendered) =>
+        this.writeEmitter.fire(rendered)
+      );
       this.callbacks.onDataReceived?.();
-      if (this.highlighterStream) {
-        this.highlighterStream.push(output);
-      } else {
-        this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(output) : output);
-      }
     });
     this.unsubscribeError = this.transport.onDidReceiveError((sessionId, message) => {
       if (sessionId !== this.transportSessionId) {
@@ -161,15 +157,11 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
   public readonly onDidChangeName: vscode.Event<string> = this.nameEmitter.event;
 
   public addOutputObserver(observer: PtyOutputObserver): vscode.Disposable {
-    this.outputObservers.add(observer);
-    return new vscode.Disposable(() => {
-      this.outputObservers.delete(observer);
-    });
+    return this.observerHub.addOutputObserver(observer);
   }
 
   public setInputBlocked(blocked: boolean): void {
-    this.inputBlocked = blocked;
-    if (blocked) this.inputBlockNoticeArmed = true;
+    this.observerHub.setInputBlocked(blocked);
   }
 
   public writeProgrammatic(data: string): void {
@@ -218,11 +210,9 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
   }
 
   public handleInput(data: string): void {
-    if (this.inputBlocked) {
-      if (this.inputBlockNoticeArmed) {
-        this.inputBlockNoticeArmed = false;
-        this.writeEmitter.fire("\r\n[Nexus] Terminal is locked while a script is running. Stop the script to send input.\r\n");
-      }
+    if (this.observerHub.isInputBlocked) {
+      const notice = this.observerHub.consumeLockedNotice();
+      if (notice) this.writeEmitter.fire(notice);
       return;
     }
     if (this.stopped) {
@@ -260,7 +250,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     }
     this.stopped = true;
     this.stopPolling();
-    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
+    this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
     this.waiting = false;
     this.currentPath = undefined;
@@ -281,14 +271,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.disposed = true;
     this.stopPolling();
     this.highlighterStream?.dispose();
-    this.outputObservers.forEach((o) => {
-      try {
-        o.dispose();
-      } catch {
-        /* tolerate misbehaving observer */
-      }
-    });
-    this.outputObservers.clear();
+    this.observerHub.disposeAll();
     this.unsubscribeData();
     this.unsubscribeError();
     this.unsubscribeDisconnect();
@@ -601,7 +584,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     if (this.disposed || this.stopped) {
       return;
     }
-    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
+    this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
     const lostPath = this.currentPath ?? this.preferredPath;
     this.logger.log(`smart serial port disconnected: ${reason}`);

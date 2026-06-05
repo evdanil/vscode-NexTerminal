@@ -5,6 +5,8 @@ import * as vscode from "vscode";
 import type { SessionPtyHandle } from "../../models/config";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
+import { PtyObserverHub } from "../terminal/ptyObserverHub";
+import { CLEAR_SCREEN_AND_SCROLLBACK } from "../terminal/terminalEscapes";
 
 const MAX_FRAME_LENGTH = 1024 * 1024;
 const EARLY_TERMINATION_WINDOW_MS = 5_000;
@@ -90,15 +92,13 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   private readonly closeEmitter = new vscode.EventEmitter<number | void>();
   private readonly earlyTerminateEmitter = new vscode.EventEmitter<LocalShellEarlyTerminationEvent>();
   private readonly startupCompleteEmitter = new vscode.EventEmitter<void>();
-  private readonly outputObservers = new Set<PtyOutputObserver>();
+  private readonly observerHub = new PtyObserverHub(undefined, false);
   private readonly queuedInput: string[] = [];
   private readonly spawnSidecar: LocalPtySidecarSpawner;
   private readonly highlighterStream?: TerminalHighlighterStream;
   private sidecar?: LocalPtySidecarProcess;
   private stdoutBuffer = "";
   private state: LocalPtyState = "idle";
-  private inputBlocked = false;
-  private inputBlockNoticeArmed = false;
   private startupWindowTimer?: ReturnType<typeof setTimeout>;
   private startupWindowActive = false;
   private startupCompleted = false;
@@ -158,11 +158,9 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   }
 
   public handleInput(data: string): void {
-    if (this.inputBlocked) {
-      if (this.inputBlockNoticeArmed) {
-        this.writeEmitter.fire("\r\n[Nexus] Input is locked while a script is running.\r\n");
-        this.inputBlockNoticeArmed = false;
-      }
+    if (this.observerHub.isInputBlocked) {
+      const notice = this.observerHub.consumeLockedNotice();
+      if (notice) this.writeEmitter.fire(notice);
       return;
     }
     this.writeProgrammatic(data);
@@ -178,15 +176,11 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   }
 
   public addOutputObserver(observer: PtyOutputObserver): vscode.Disposable {
-    this.outputObservers.add(observer);
-    return new vscode.Disposable(() => {
-      this.outputObservers.delete(observer);
-    });
+    return this.observerHub.addOutputObserver(observer);
   }
 
   public setInputBlocked(blocked: boolean): void {
-    this.inputBlocked = blocked;
-    if (blocked) this.inputBlockNoticeArmed = true;
+    this.observerHub.setInputBlocked(blocked);
   }
 
   public writeProgrammatic(data: string): void {
@@ -199,7 +193,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   }
 
   public resetTerminal(): void {
-    this.writeEmitter.fire("\x1b[2J\x1b[3J\x1b[H");
+    this.writeEmitter.fire(CLEAR_SCREEN_AND_SCROLLBACK);
   }
 
   public markShuttingDown(reason: string): void {
@@ -279,12 +273,9 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
         break;
       case "data": {
         const output = decodeBase64(frame.data);
-        this.outputObservers.forEach((observer) => observer.onOutput(output));
-        if (this.highlighterStream) {
-          this.highlighterStream.push(output);
-        } else {
-          this.writeEmitter.fire(this.options.highlighter ? this.options.highlighter.apply(output) : output);
-        }
+        this.observerHub.notifyOutput(output, this.highlighterStream, this.options.highlighter, (rendered) =>
+          this.writeEmitter.fire(rendered)
+        );
         break;
       }
       case "exit":
@@ -386,14 +377,11 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   }
 
   private pauseIntervalMacros(): void {
-    this.outputObservers.forEach((observer) => observer.pauseIntervalMacros());
+    this.observerHub.pauseIntervalMacros();
   }
 
   private disposeObservers(): void {
-    for (const observer of this.outputObservers) {
-      observer.dispose();
-    }
-    this.outputObservers.clear();
+    this.observerHub.disposeAll();
   }
 
   private flushHighlightedOutput(): void {

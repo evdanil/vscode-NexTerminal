@@ -27,6 +27,7 @@ import { validateServerConfig, validateTunnelProfile, validateSerialProfile, val
 import { isValidBinding } from "../macroBindings";
 import { getMacros, saveMacros, getActiveMacroStore } from "../macroSettings";
 import { validateSettingUpdate } from "../ui/settingsValidation";
+import { SETTINGS_META } from "../ui/settingsMetadata";
 import { validateAndSanitizeHighlightRules } from "../utils/highlightRuleValidation";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
@@ -80,47 +81,22 @@ interface RestoreBackupFoldersResult {
 
 const DEFAULT_SCRIPTS_RELATIVE_PATH = ".nexus/scripts";
 
-export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
-  { section: "nexus.logging", key: "sessionTranscripts" },
-  { section: "nexus.logging", key: "sessionLogDirectory" },
-  { section: "nexus.logging", key: "maxFileSizeMb" },
-  { section: "nexus.logging", key: "maxRotatedFiles" },
-  { section: "nexus.ui", key: "showTreeDescriptions" },
-  { section: "nexus.tunnel", key: "defaultConnectionMode" },
-  { section: "nexus.tunnel", key: "defaultBindAddress" },
-  { section: "nexus.terminal", key: "openLocation" },
-  { section: "nexus.terminal", key: "keyboardPassthrough" },
-  { section: "nexus.terminal", key: "passthroughKeys" },
-  { section: "nexus.terminal.macros", key: "autoTrigger" },
-  { section: "nexus.terminal.highlighting", key: "enabled" },
+// Import-compat keys that are NOT contributed in settingsMetadata.ts but must still be
+// read/written so old export files keep importing. Appended AFTER the SETTINGS_META-derived
+// entries — `nexus.scripts.defaultTimeout` (legacy ms) intentionally comes after
+// `nexus.scripts.defaultTimeoutSeconds` so the "modern value wins" guard in readSettings holds.
+const EXTRA_IMPORT_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.terminal.highlighting", key: "rules" },
-  { section: "nexus.ssh.multiplexing", key: "enabled" },
-  { section: "nexus.ssh.multiplexing", key: "idleTimeout" },
-  { section: "nexus.ssh", key: "trustNewHosts" },
-  { section: "nexus.sftp", key: "cacheTtlSeconds" },
-  { section: "nexus.sftp", key: "maxCacheEntries" },
-  { section: "nexus.sftp", key: "autoRefreshInterval" },
-  { section: "nexus.sftp", key: "maxOpenFileSizeMB" },
-  { section: "nexus.ssh", key: "connectionTimeout" },
-  { section: "nexus.ssh", key: "keepaliveInterval" },
-  { section: "nexus.ssh", key: "keepaliveCountMax" },
-  { section: "nexus.ssh", key: "terminalType" },
-  { section: "nexus.ssh", key: "proxyTimeout" },
-  { section: "nexus.sftp", key: "operationTimeout" },
-  { section: "nexus.sftp", key: "commandTimeout" },
-  { section: "nexus.sftp", key: "deleteDepthLimit" },
-  { section: "nexus.sftp", key: "deleteOperationLimit" },
-  { section: "nexus.tunnel", key: "socks5HandshakeTimeout" },
-  { section: "nexus.terminal.macros", key: "defaultCooldown" },
-  { section: "nexus.terminal.macros", key: "bufferLength" },
-  { section: "nexus.serial", key: "rpcTimeout" },
-  { section: "nexus.sftp", key: "remoteWatchMode" },
-  { section: "nexus.scripts", key: "path" },
-  { section: "nexus.scripts", key: "defaultTimeoutSeconds" },
   { section: "nexus.scripts", key: "defaultTimeout" },
-  { section: "nexus.scripts", key: "macroPolicy" },
-  { section: "nexus.scripts", key: "maxRuntimeSeconds" },
   { section: "nexus.scripts", key: "maxRuntimeMs" }
+];
+
+// Derived from SETTINGS_META (single source of truth for contributed settings) plus the
+// import-compat extras above, so adding a setting only requires editing settingsMetadata.ts.
+// The SETTINGS_KEYS ⊇ SETTINGS_META invariant is asserted in configImportExport.test.ts.
+export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
+  ...SETTINGS_META.map((m) => ({ section: m.section, key: m.key })),
+  ...EXTRA_IMPORT_KEYS
 ];
 
 const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`));
@@ -134,6 +110,25 @@ function legacyDefaultTimeoutMsToSeconds(value: unknown): number | undefined {
 
   return Math.max(1, Math.min(MAX_SCRIPT_WAIT_TIMEOUT_SECONDS, value / 1000));
 }
+
+type SettingValidation = { ok: true; value: unknown } | { ok: false };
+
+function validBoundedNumber(value: unknown, min: number, max: number): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value >= min && value <= max;
+}
+
+// Per-key validators applied before the generic validateSettingUpdate fallback in applySettings.
+// Keeping them in a lookup map keeps the apply loop flat (no special-case if/else ladder).
+const SPECIAL_SETTING_VALIDATORS: Record<string, (value: unknown) => SettingValidation> = {
+  "nexus.terminal.highlighting.rules": (value) => {
+    const rules = validateAndSanitizeHighlightRules(value);
+    return rules ? { ok: true, value: rules } : { ok: false };
+  },
+  "nexus.scripts.maxRuntimeMs": (value) =>
+    validBoundedNumber(value, 0, MAX_SCRIPT_RUNTIME_MS) ? { ok: true, value } : { ok: false },
+  "nexus.scripts.defaultTimeout": (value) =>
+    validBoundedNumber(value, 100, MAX_SCRIPT_WAIT_TIMEOUT_MS) ? { ok: true, value } : { ok: false }
+};
 
 function readSettings(): Record<string, unknown> {
   const result: Record<string, unknown> = {};
@@ -193,34 +188,18 @@ async function applySettings(settings: Record<string, unknown>): Promise<void> {
     }
     const section = fullKey.substring(0, lastDot);
     const key = fullKey.substring(lastDot + 1);
-    let updateValue = value;
-    if (fullKey === "nexus.terminal.highlighting.rules") {
-      const rules = validateAndSanitizeHighlightRules(value);
-      if (!rules) {
-        invalidCount++;
-        continue;
-      }
-      updateValue = rules;
-    } else if (fullKey === "nexus.scripts.maxRuntimeMs") {
-      if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > MAX_SCRIPT_RUNTIME_MS) {
-        invalidCount++;
-        continue;
-      }
-    } else if (fullKey === "nexus.scripts.defaultTimeout") {
-      if (typeof value !== "number" || !Number.isFinite(value) || value < 100 || value > MAX_SCRIPT_WAIT_TIMEOUT_MS) {
-        invalidCount++;
-        continue;
-      }
-    } else {
-      const validation = validateSettingUpdate(section, key, value);
-      if (!validation.ok) {
-        invalidCount++;
-        continue;
-      }
-      updateValue = validation.value;
+
+    const special = SPECIAL_SETTING_VALIDATORS[fullKey];
+    const validation = special
+      ? special(value)
+      : validateSettingUpdate(section, key, value);
+    if (!validation.ok) {
+      invalidCount++;
+      continue;
     }
+
     const config = vscode.workspace.getConfiguration(section);
-    await config.update(key, updateValue, vscode.ConfigurationTarget.Global);
+    await config.update(key, validation.value, vscode.ConfigurationTarget.Global);
   }
   if (invalidCount > 0) {
     void vscode.window.showWarningMessage(
@@ -479,6 +458,59 @@ function ensureId(item: Record<string, unknown>): void {
   }
 }
 
+interface ImportTally {
+  imported: number;
+  skipped: number;
+}
+
+/**
+ * id-preserving merge/replace import: validate each entity and add it unless its id already
+ * exists (`existingIds`). Used by the backup/legacy import path where ids are kept as-is.
+ */
+async function importPreservingIds<T extends { id: string }>(
+  items: T[] | undefined,
+  existingIds: Set<string>,
+  validate: (entity: T) => boolean,
+  add: (entity: T) => Promise<void>
+): Promise<ImportTally> {
+  const tally: ImportTally = { imported: 0, skipped: 0 };
+  for (const item of items ?? []) {
+    ensureId(item as unknown as Record<string, unknown>);
+    if (existingIds.has(item.id) || !validate(item)) {
+      tally.skipped++;
+    } else {
+      await add(item);
+      tally.imported++;
+    }
+  }
+  return tally;
+}
+
+/** Mechanical validate-then-add tail shared by the share-import remap loops; remap stays inline. */
+async function addIfValid<T>(
+  entity: T,
+  validate: (entity: T) => boolean,
+  add: (entity: T) => Promise<void>
+): Promise<boolean> {
+  if (validate(entity)) {
+    await add(entity);
+    return true;
+  }
+  return false;
+}
+
+/** Restore one secret bucket (id → secret) into the vault under `keyFn(id)`. */
+async function restoreSecrets(
+  record: Record<string, string> | undefined,
+  keyFn: (id: string) => string,
+  vault: SecretVault
+): Promise<void> {
+  if (!record) return;
+  for (const [id, secret] of Object.entries(record)) {
+    await vault.store(keyFn(id), secret);
+  }
+}
+
 interface SanitizedSnapshot {
   servers: ServerConfig[];
   tunnels: TunnelProfile[];
@@ -509,22 +541,11 @@ export function sanitizeForSharing(
   servers: ServerConfig[],
   tunnels: TunnelProfile[],
   serialProfiles: SerialProfile[],
-  localShellProfilesOrSettings: LocalShellProfile[] | Record<string, unknown>,
-  settingsOrAuthProfiles: Record<string, unknown> | AuthProfile[] = {},
-  authProfilesOrMacros: AuthProfile[] | TerminalMacro[] = [],
-  macrosArg: TerminalMacro[] = []
+  localShellProfiles: LocalShellProfile[],
+  settings: Record<string, unknown> = {},
+  authProfiles: AuthProfile[] = [],
+  macros: TerminalMacro[] = []
 ): SanitizedSnapshot {
-  const hasLocalShellProfilesArg = Array.isArray(localShellProfilesOrSettings);
-  const localShellProfiles = hasLocalShellProfilesArg ? localShellProfilesOrSettings : [];
-  const settings = hasLocalShellProfilesArg
-    ? (settingsOrAuthProfiles as Record<string, unknown>)
-    : localShellProfilesOrSettings;
-  const authProfiles = hasLocalShellProfilesArg
-    ? (authProfilesOrMacros as AuthProfile[])
-    : (Array.isArray(settingsOrAuthProfiles) ? settingsOrAuthProfiles : []);
-  const macros = hasLocalShellProfilesArg
-    ? macrosArg
-    : (authProfilesOrMacros as TerminalMacro[]);
   const idMap = new Map<string, string>();
 
   // First pass: assign new IDs for auth profiles
@@ -989,17 +1010,19 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     let imported = 0;
     let skipped = 0;
 
+    // Each block remaps ids inline (semantics differ per entity), then defers the
+    // validate-then-add-or-skip tally to addIfValid to keep that mechanical part DRY.
+    const tally = (ok: boolean): void => {
+      if (ok) imported++;
+      else skipped++;
+    };
+
     for (const profile of authProfiles) {
       const remappedProfile: AuthProfile = {
         ...profile,
         id: idMap.get(profile.id)!
       };
-      if (validateAuthProfile(remappedProfile)) {
-        await core.addOrUpdateAuthProfile(remappedProfile);
-        imported++;
-      } else {
-        skipped++;
-      }
+      tally(await addIfValid(remappedProfile, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e)));
     }
 
     for (const server of servers) {
@@ -1018,12 +1041,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         proxy: remappedProxy,
         authProfileId: server.authProfileId ? idMap.get(server.authProfileId) : undefined
       };
-      if (validateServerConfig(remappedServer)) {
-        await core.addOrUpdateServer(remappedServer);
-        imported++;
-      } else {
-        skipped++;
-      }
+      tally(await addIfValid(remappedServer, validateServerConfig, (e) => core.addOrUpdateServer(e)));
     }
     for (const tunnel of tunnels) {
       ensureId(tunnel as unknown as Record<string, unknown>);
@@ -1032,12 +1050,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         id: randomUUID(),
         defaultServerId: tunnel.defaultServerId ? idMap.get(tunnel.defaultServerId) ?? undefined : undefined
       };
-      if (validateTunnelProfile(remappedTunnel)) {
-        await core.addOrUpdateTunnel(remappedTunnel);
-        imported++;
-      } else {
-        skipped++;
-      }
+      tally(await addIfValid(remappedTunnel, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e)));
     }
     for (const profile of serialProfiles) {
       ensureId(profile as unknown as Record<string, unknown>);
@@ -1045,12 +1058,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         ...profile,
         id: randomUUID()
       };
-      if (validateSerialProfile(remappedProfile)) {
-        await core.addOrUpdateSerialProfile(remappedProfile);
-        imported++;
-      } else {
-        skipped++;
-      }
+      tally(await addIfValid(remappedProfile, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e)));
     }
     for (const profile of localShellProfiles) {
       ensureId(profile as unknown as Record<string, unknown>);
@@ -1058,12 +1066,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         ...profile,
         id: randomUUID()
       };
-      if (validateLocalShellProfile(remappedProfile)) {
-        await core.addOrUpdateLocalShellProfile(remappedProfile);
-        imported++;
-      } else {
-        skipped++;
-      }
+      tally(await addIfValid(remappedProfile, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e)));
     }
 
     if (Array.isArray(data.groups)) {
@@ -1148,60 +1151,17 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
     let imported = 0;
     let skipped = 0;
-    for (const server of data.servers ?? []) {
-      ensureId(server as unknown as Record<string, unknown>);
-      if (existingIds.has(server.id)) {
-        skipped++;
-      } else if (!validateServerConfig(server)) {
-        skipped++;
-      } else {
-        await core.addOrUpdateServer(server);
-        imported++;
-      }
-    }
-    for (const tunnel of data.tunnels ?? []) {
-      ensureId(tunnel as unknown as Record<string, unknown>);
-      if (existingIds.has(tunnel.id)) {
-        skipped++;
-      } else if (!validateTunnelProfile(tunnel)) {
-        skipped++;
-      } else {
-        await core.addOrUpdateTunnel(tunnel);
-        imported++;
-      }
-    }
-    for (const profile of data.serialProfiles ?? []) {
-      ensureId(profile as unknown as Record<string, unknown>);
-      if (existingIds.has(profile.id)) {
-        skipped++;
-      } else if (!validateSerialProfile(profile)) {
-        skipped++;
-      } else {
-        await core.addOrUpdateSerialProfile(profile);
-        imported++;
-      }
-    }
-    for (const profile of data.localShellProfiles ?? []) {
-      ensureId(profile as unknown as Record<string, unknown>);
-      if (existingIds.has(profile.id)) {
-        skipped++;
-      } else if (!validateLocalShellProfile(profile)) {
-        skipped++;
-      } else {
-        await core.addOrUpdateLocalShellProfile(profile);
-        imported++;
-      }
-    }
-    for (const profile of data.authProfiles ?? []) {
-      ensureId(profile as unknown as Record<string, unknown>);
-      if (existingIds.has(profile.id)) {
-        skipped++;
-      } else if (!validateAuthProfile(profile)) {
-        skipped++;
-      } else {
-        await core.addOrUpdateAuthProfile(profile);
-        imported++;
-      }
+    // id-PRESERVING import (distinct from the share path's fresh-id remap): each entity keeps
+    // its id and is skipped when that id already exists. Same shape across all five buckets.
+    for (const tally of [
+      await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => core.addOrUpdateServer(e)),
+      await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e)),
+      await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e)),
+      await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e)),
+      await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e))
+    ]) {
+      imported += tally.imported;
+      skipped += tally.skipped;
     }
 
     // Clear dangling authProfileId references
@@ -1252,36 +1212,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // Restore passwords/passphrases from decrypted secrets
     let fileRestoreResult: RestoreBackupFoldersResult = { restoredFiles: 0, skippedExistingFiles: 0 };
     if (decryptedSecrets) {
-      const passwords = decryptedSecrets.passwords as Record<string, string> | undefined;
-      const passphrases = decryptedSecrets.passphrases as Record<string, string> | undefined;
-      const proxyPasswords = decryptedSecrets.proxyPasswords as Record<string, string> | undefined;
-      if (passwords) {
-        for (const [serverId, pw] of Object.entries(passwords)) {
-          await vault.store(passwordSecretKey(serverId), pw);
-        }
-      }
-      if (passphrases) {
-        for (const [serverId, pp] of Object.entries(passphrases)) {
-          await vault.store(passphraseSecretKey(serverId), pp);
-        }
-      }
-      if (proxyPasswords) {
-        for (const [serverId, pw] of Object.entries(proxyPasswords)) {
-          await vault.store(proxyPasswordSecretKey(serverId), pw);
-        }
-      }
-      const authProfilePws = decryptedSecrets.authProfilePasswords as Record<string, string> | undefined;
-      if (authProfilePws) {
-        for (const [profileId, pw] of Object.entries(authProfilePws)) {
-          await vault.store(authProfilePasswordSecretKey(profileId), pw);
-        }
-      }
-      const authProfilePassphrases = decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined;
-      if (authProfilePassphrases) {
-        for (const [profileId, passphrase] of Object.entries(authProfilePassphrases)) {
-          await vault.store(authProfilePassphraseSecretKey(profileId), passphrase);
-        }
-      }
+      await restoreSecrets(decryptedSecrets.passwords as Record<string, string> | undefined, passwordSecretKey, vault);
+      await restoreSecrets(decryptedSecrets.passphrases as Record<string, string> | undefined, passphraseSecretKey, vault);
+      await restoreSecrets(decryptedSecrets.proxyPasswords as Record<string, string> | undefined, proxyPasswordSecretKey, vault);
+      await restoreSecrets(decryptedSecrets.authProfilePasswords as Record<string, string> | undefined, authProfilePasswordSecretKey, vault);
+      await restoreSecrets(decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined, authProfilePassphraseSecretKey, vault);
       fileRestoreResult = await restoreBackupFolders(decryptedSecrets, mode, context);
     }
 
@@ -1366,23 +1301,18 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     void vscode.window.showInformationMessage("All Nexus data has been deleted.");
   }
 
-  async function importMobaxterm(): Promise<void> {
-    const uris = await vscode.window.showOpenDialog({
-      canSelectFiles: true,
-      canSelectMany: false,
-      filters: { "MobaXterm INI Files": ["ini"] },
-      title: "Import from MobaXterm"
-    });
-    if (!uris || uris.length === 0) return;
-
-    const raw = await vscode.workspace.fs.readFile(uris[0]);
-    const text = Buffer.from(raw).toString("utf8");
-    const result = parseMobaxtermSessions(text);
-
+  // Shared tail for MobaXterm / SecureCRT imports: no-sessions warning, confirm modal,
+  // group + server creation, success toast. `noSessionsLocation` and `sourceName` are the
+  // only per-source differences in the user-facing strings.
+  async function applyImportedSessions(
+    result: ImportParseResult,
+    sourceName: string,
+    noSessionsLocation: string
+  ): Promise<void> {
     if (result.sessions.length === 0) {
       const note = result.skippedCount > 0
         ? `No SSH sessions found (${result.skippedCount} non-SSH skipped).`
-        : "No SSH sessions found in the selected file.";
+        : `No SSH sessions found in the selected ${noSessionsLocation}.`;
       void vscode.window.showWarningMessage(note);
       return;
     }
@@ -1413,8 +1343,24 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     }
 
     void vscode.window.showInformationMessage(
-      `Imported ${result.sessions.length} SSH session(s) from MobaXterm.`
+      `Imported ${result.sessions.length} SSH session(s) from ${sourceName}.`
     );
+  }
+
+  async function importMobaxterm(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectMany: false,
+      filters: { "MobaXterm INI Files": ["ini"] },
+      title: "Import from MobaXterm"
+    });
+    if (!uris || uris.length === 0) return;
+
+    const raw = await vscode.workspace.fs.readFile(uris[0]);
+    const text = Buffer.from(raw).toString("utf8");
+    const result = parseMobaxtermSessions(text);
+
+    await applyImportedSessions(result, "MobaXterm", "file");
   }
 
   async function importSecureCrt(): Promise<void> {
@@ -1490,42 +1436,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       }
     }
 
-    if (result.sessions.length === 0) {
-      const note = result.skippedCount > 0
-        ? `No SSH sessions found (${result.skippedCount} non-SSH skipped).`
-        : `No SSH sessions found in the selected ${sourcePick.value === "xml" ? "file" : "folder"}.`;
-      void vscode.window.showWarningMessage(note);
-      return;
-    }
-
-    const folderNote = result.folders.length > 0 ? ` in ${result.folders.length} folder(s)` : "";
-    const skipNote = result.skippedCount > 0 ? ` (${result.skippedCount} non-SSH skipped)` : "";
-    const confirm = await vscode.window.showInformationMessage(
-      `Found ${result.sessions.length} SSH session(s)${folderNote}${skipNote}. Import?`,
-      { modal: true },
-      "Import"
-    );
-    if (confirm !== "Import") return;
-
-    for (const folder of result.folders) {
-      await core.addGroup(folder);
-    }
-    for (const session of result.sessions) {
-      await core.addOrUpdateServer({
-        id: randomUUID(),
-        name: session.name,
-        host: session.host,
-        port: session.port,
-        username: session.username,
-        authType: "password",
-        isHidden: false,
-        group: session.folder || undefined
-      });
-    }
-
-    void vscode.window.showInformationMessage(
-      `Imported ${result.sessions.length} SSH session(s) from SecureCRT.`
-    );
+    await applyImportedSessions(result, "SecureCRT", sourcePick.value === "xml" ? "file" : "folder");
   }
 
   return [

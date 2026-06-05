@@ -2,6 +2,7 @@ import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
 import { serializeForInlineScript } from "./shared/inlineScriptData";
+import { renderWebviewDocument } from "./shared/webviewDocument";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import type { HighlightRule } from "../utils/highlightRuleValidation";
 
@@ -35,14 +36,9 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
   const colorCssJson = serializeForInlineScript(COLOR_CSS);
   const rulesJson = serializeForInlineScript(rules);
 
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />
-  <style nonce="${nonce}">
-    ${baseWebviewCss()}
+  return renderWebviewDocument({
+    nonce,
+    css: `    ${baseWebviewCss()}
     .rule-row {
       display: flex;
       align-items: center;
@@ -155,11 +151,8 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
       color: var(--vscode-descriptionForeground);
       font-style: italic;
       font-size: 12px;
-    }
-  </style>
-</head>
-<body>
-  <h3>Highlighting Rules</h3>
+    }`,
+    body: `  <h3>Highlighting Rules</h3>
   <div class="setting-desc">Rules use first-match precedence. Move specific rules above broader rules.</div>
 
   <div id="rules-list"></div>
@@ -219,9 +212,8 @@ DEBUG: packet sent 1024 bytes</div>
       <button type="button" class="btn-danger" id="delete-rule-btn" style="margin-left: auto; display: none;">Delete</button>
     </div>
   </div>
-
-  <script nonce="${nonce}">
-    ${baseWebviewJs()}
+`,
+    script: `    ${baseWebviewJs()}
     (function() {
       var vscode = acquireVsCodeApi();
       var VALID_COLORS = ${colorsJson};
@@ -587,8 +579,6 @@ DEBUG: packet sent 1024 bytes</div>
           }
         }
       });
-    })();
-  </script>
-</body>
-</html>`;
+    })();`
+  });
 }

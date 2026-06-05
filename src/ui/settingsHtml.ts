@@ -1,6 +1,7 @@
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
+import { renderWebviewDocument } from "./shared/webviewDocument";
 import { SETTINGS_META, CATEGORY_ORDER, CATEGORY_DESCRIPTIONS, CATEGORY_LABELS, type SettingMeta } from "./settingsMetadata";
 
 interface SettingValues {
@@ -308,14 +309,9 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
     ? `${CATEGORY_LABELS[categoryFilter] ?? categoryFilter} settings auto-save as you change them.`
     : "Settings auto-save as you change them. Open a category to focus on one task area.";
 
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />
-  <style nonce="${nonce}">
-    ${baseWebviewCss()}
+  return renderWebviewDocument({
+    nonce,
+    css: `    ${baseWebviewCss()}
     .setting-desc {
       font-size: 12px;
       color: var(--vscode-descriptionForeground, var(--vscode-foreground));
@@ -467,16 +463,12 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       padding: 10px 12px;
       border-left: 3px solid var(--vscode-focusBorder, #3794ff);
       background: var(--vscode-editorWidget-background, rgba(128,128,128,0.08));
-    }
-  </style>
-</head>
-<body>
-  <div class="info-banner">
+    }`,
+    body: `  <div class="info-banner">
     ${escapeHtml(infoBannerText)}
   </div>
-  ${sectionsHtml}
-  <script nonce="${nonce}">
-    ${baseWebviewJs()}
+  ${sectionsHtml}`,
+    script: `    ${baseWebviewJs()}
     (function() {
       var vscode = acquireVsCodeApi();
 
@@ -736,8 +728,6 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
           }
         }
       });
-    })();
-  </script>
-</body>
-</html>`;
+    })();`
+  });
 }

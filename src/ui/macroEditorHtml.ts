@@ -2,6 +2,7 @@ import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
 import { serializeForInlineScript } from "./shared/inlineScriptData";
+import { renderWebviewDocument } from "./shared/webviewDocument";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { TerminalMacro } from "../models/terminalMacro";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
@@ -71,14 +72,9 @@ export function renderMacroEditorHtml(
   </div>`
     : "";
 
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />
-  <style nonce="${nonce}">
-    ${baseWebviewCss()}
+  return renderWebviewDocument({
+    nonce,
+    css: `    ${baseWebviewCss()}
     .editor-textarea {
       min-height: 120px;
       line-height: 1.5;
@@ -119,11 +115,8 @@ export function renderMacroEditorHtml(
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
-    }
-  </style>
-</head>
-<body>
-  ${emptyStateHtml}
+    }`,
+    body: `  ${emptyStateHtml}
   <div class="form-group">
     <label>Macro</label>
     <div class="custom-select" id="macro-selector">
@@ -228,9 +221,8 @@ export function renderMacroEditorHtml(
     <div class="spacer"></div>
     <button type="button" class="btn-secondary" id="new-btn">New Blank Macro</button>
   </div>
-
-  <script nonce="${nonce}">
-    ${baseWebviewJs()}
+`,
+    script: `    ${baseWebviewJs()}
     (function() {
       var vscode = acquireVsCodeApi();
       var dirty = false;
@@ -459,8 +451,6 @@ export function renderMacroEditorHtml(
         }
       });
       updateTriggerProfileState();
-    })();
-  </script>
-</body>
-</html>`;
+    })();`
+  });
 }

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [2.8.53] — 2026-06-05
+
+### Changed
+
+- **Internal code consolidation (no functional changes intended).** Deduplicated ~250 lines across the codebase: shared PTY observer/lock handling (`PtyObserverHub`), shared webview document shell and nonce helpers, a single reset-settings helper, merged MobaXterm/SecureCRT import flows, simplified import/export internals, and the backup settings list is now derived from the settings metadata registry so the two can no longer drift apart. Byte-identity of rendered webview HTML is locked in with snapshot tests.
+- **Local Shell input-lock message now matches SSH/serial terminals** ("Terminal is locked while a script is running. Stop the script to send input.").
+
 ## [2.8.51] — 2026-06-05
 
 ### Fixed

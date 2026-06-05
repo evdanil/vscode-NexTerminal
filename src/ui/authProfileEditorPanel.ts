@@ -1,10 +1,11 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, AuthType } from "../models/config";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import { renderAuthProfileEditorHtml } from "./authProfileEditorHtml";
+import { createWebviewNonce } from "./shared/webviewNonce";
 
 interface SecretVault {
   get(key: string): Promise<string | undefined>;
@@ -83,7 +84,7 @@ export class AuthProfileEditorPanel {
 
   private render(): void {
     if (this.disposed) return;
-    const nonce = randomBytes(16).toString("base64");
+    const nonce = createWebviewNonce();
     const profiles = this.core.getSnapshot().authProfiles;
     // Clamp selectedId if profile was deleted externally
     if (this.selectedId !== null && !profiles.some((p) => p.id === this.selectedId)) {

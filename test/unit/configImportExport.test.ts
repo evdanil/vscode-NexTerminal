@@ -100,6 +100,7 @@ vi.mock("node:fs/promises", async () => {
 });
 
 import { registerConfigCommands, isValidExport, SETTINGS_KEYS, sanitizeForSharing } from "../../src/commands/configCommands";
+import { SETTINGS_META } from "../../src/ui/settingsMetadata";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
@@ -323,6 +324,14 @@ describe("SETTINGS_KEYS", () => {
   it("includes interface settings", () => {
     const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
     expect(keys).toContain("nexus.ui.showTreeDescriptions");
+  });
+
+  it("is a superset of SETTINGS_META (drift guard — adding a contributed setting must flow through automatically)", () => {
+    const keys = new Set(SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`));
+    const missing = SETTINGS_META
+      .map((m) => `${m.section}.${m.key}`)
+      .filter((fullKey) => !keys.has(fullKey));
+    expect(missing).toEqual([]);
   });
 });
 

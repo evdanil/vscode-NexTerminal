@@ -4,6 +4,7 @@ import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
+import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { toParityCode } from "../../utils/helpers";
 import type { OpenPortParams } from "./protocol";
 
@@ -39,9 +40,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   private activityIndicator = false;
   private readonly highlighterStream?: TerminalHighlighterStream;
 
-  private readonly outputObservers = new Set<PtyOutputObserver>();
-  private inputBlocked = false;
-  private inputBlockNoticeArmed = true;
+  private readonly observerHub: PtyObserverHub;
 
   public constructor(
     private readonly transport: SerialTransport,
@@ -56,19 +55,15 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
       typeof (highlighter as { createStream?: unknown } | undefined)?.createStream === "function"
         ? highlighter?.createStream((text) => this.writeEmitter.fire(text))
         : undefined;
-    if (outputObserver) this.outputObservers.add(outputObserver);
+    this.observerHub = new PtyObserverHub(outputObserver);
   }
 
   public addOutputObserver(observer: PtyOutputObserver): vscode.Disposable {
-    this.outputObservers.add(observer);
-    return new vscode.Disposable(() => {
-      this.outputObservers.delete(observer);
-    });
+    return this.observerHub.addOutputObserver(observer);
   }
 
   public setInputBlocked(blocked: boolean): void {
-    this.inputBlocked = blocked;
-    if (blocked) this.inputBlockNoticeArmed = true;
+    this.observerHub.setInputBlocked(blocked);
   }
 
   public writeProgrammatic(data: string): void {
@@ -111,11 +106,9 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     if (this.shuttingDown) {
       return;
     }
-    if (this.inputBlocked) {
-      if (this.inputBlockNoticeArmed) {
-        this.inputBlockNoticeArmed = false;
-        this.writeEmitter.fire("\r\n[Nexus] Terminal is locked while a script is running. Stop the script to send input.\r\n");
-      }
+    if (this.observerHub.isInputBlocked) {
+      const notice = this.observerHub.consumeLockedNotice();
+      if (notice) this.writeEmitter.fire(notice);
       return;
     }
     if (this.failed || this.disconnected) {
@@ -142,7 +135,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
     this.shuttingDown = true;
     this.disconnected = true;
-    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
+    this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
     this.releaseSubscriptions();
     this.activityIndicator = false;
@@ -158,14 +151,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
     this.disposed = true;
     this.highlighterStream?.dispose();
-    this.outputObservers.forEach((o) => {
-      try {
-        o.dispose();
-      } catch {
-        /* tolerate misbehaving observer */
-      }
-    });
-    this.outputObservers.clear();
+    this.observerHub.disposeAll();
 
     const sessionId = this.releaseSubscriptions();
 
@@ -203,7 +189,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     if (this.disposed || this.disconnected) {
       return;
     }
-    this.outputObservers.forEach((o) => o.pauseIntervalMacros());
+    this.observerHub.pauseIntervalMacros();
     this.disconnected = true;
     this.highlighterStream?.flush();
 
@@ -244,13 +230,10 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         const output = data.toString("utf8");
         this.logger.log(`serial stdout ${JSON.stringify(output)}`);
         this.transcript?.write(output);
-        this.outputObservers.forEach((o) => o.onOutput(output));
+        this.observerHub.notifyOutput(output, this.highlighterStream, this.highlighter, (rendered) =>
+          this.writeEmitter.fire(rendered)
+        );
         this.callbacks.onDataReceived?.(eventSessionId);
-        if (this.highlighterStream) {
-          this.highlighterStream.push(output);
-        } else {
-          this.writeEmitter.fire(this.highlighter ? this.highlighter.apply(output) : output);
-        }
       });
       this.errorSubscription = this.transport.onDidReceiveError((eventSessionId, errorMessage) => {
         if (eventSessionId !== this.sidecarSessionId) {

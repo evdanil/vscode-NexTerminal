@@ -1,4 +1,3 @@
-import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { isValidBinding } from "../macroBindings";
 import {
@@ -16,6 +15,7 @@ import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
 import type { MacroProfileOptionInput } from "./macroProfileOptions";
+import { createWebviewNonce } from "./shared/webviewNonce";
 
 type MacroProfileProvider = () => MacroProfileOptionInput[];
 
@@ -85,7 +85,7 @@ export class MacroEditorPanel {
 
   private render(): void {
     if (this.disposed) return;
-    const nonce = randomBytes(16).toString("base64");
+    const nonce = createWebviewNonce();
     const macros = getMacros();
     // Clamp selectedIndex if macros changed externally
     if (this.selectedIndex !== null && this.selectedIndex >= macros.length) {

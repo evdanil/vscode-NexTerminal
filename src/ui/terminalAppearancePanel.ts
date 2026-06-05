@@ -1,4 +1,3 @@
-import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -8,6 +7,7 @@ import { buildColorCustomizations, colorCustomizationsWriteValue } from "../serv
 import { planFontWrites } from "../services/terminal/fontWritePlan";
 import type { ColorSchemeService } from "../services/colorSchemeService";
 import { renderTerminalAppearanceHtml } from "./terminalAppearanceHtml";
+import { createWebviewNonce } from "./shared/webviewNonce";
 
 /** Terminal font settings the appearance panel reads/writes (global scope). */
 const FONT_SETTING_KEYS = ["fontFamily", "fontSize", "fontWeight"] as const;
@@ -58,7 +58,7 @@ export class TerminalAppearancePanel {
   }
 
   private render(): void {
-    const nonce = randomBytes(16).toString("base64");
+    const nonce = createWebviewNonce();
     const fontConfig = this.service.getFontConfig() ?? this.readVsCodeFontConfig();
     this.panel.webview.html = renderTerminalAppearanceHtml(
       this.service.getAllSchemes(),

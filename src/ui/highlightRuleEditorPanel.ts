@@ -1,6 +1,6 @@
-import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { renderHighlightRuleEditorHtml } from "./highlightRuleEditorHtml";
+import { createWebviewNonce } from "./shared/webviewNonce";
 import {
   validateAndSanitizeHighlightRules,
   validateAndSanitizeHighlightRulesWithError,
@@ -45,7 +45,7 @@ export class HighlightRuleEditorPanel {
   }
 
   private render(): void {
-    const nonce = randomBytes(16).toString("base64");
+    const nonce = createWebviewNonce();
     const rules = this.readRules();
     this.panel.webview.html = renderHighlightRuleEditorHtml(rules, nonce);
   }

@@ -3,6 +3,7 @@ import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
 import { serializeForInlineScript } from "./shared/inlineScriptData";
+import { renderWebviewDocument } from "./shared/webviewDocument";
 
 interface SwatchDef {
   key: string;
@@ -122,14 +123,9 @@ export function renderTerminalAppearanceHtml(
   const selectedWeightLabel = weightOptions.find((opt) => opt.value === fontWeight)?.label ?? "Normal";
   const schemeTriggerLabel = activeScheme?.name ?? "\u2014 None (VS Code Default) \u2014";
 
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />
-  <style nonce="${nonce}">
-    ${baseWebviewCss()}
+  return renderWebviewDocument({
+    nonce,
+    css: `    ${baseWebviewCss()}
     .preview-placeholder {
       padding: 20px;
       text-align: center;
@@ -176,11 +172,8 @@ export function renderTerminalAppearanceHtml(
       background: var(--vscode-input-background);
       border: 1px solid var(--vscode-input-border, transparent);
       border-radius: 2px;
-    }
-  </style>
-</head>
-<body>
-  <div class="info-banner">
+    }`,
+    body: `  <div class="info-banner">
     These settings modify your global VS Code configuration and affect all terminals
     and editor windows — not only terminals opened by this extension.
     For broader theme customization, consider VS Code themes available via the Extensions marketplace.
@@ -274,9 +267,8 @@ export function renderTerminalAppearanceHtml(
     <button type="button" class="btn-secondary" id="import-dir-btn">Import Directory</button>
     <button type="button" class="btn-secondary" id="delete-btn"${deleteDisabled ? " disabled" : ""}>Delete Scheme</button>
   </div>
-
-  <script nonce="${nonce}">
-    ${baseWebviewJs()}
+`,
+    script: `    ${baseWebviewJs()}
     (function() {
       var vscode = acquireVsCodeApi();
 
@@ -410,8 +402,6 @@ export function renderTerminalAppearanceHtml(
       // Apply initial preview from server-rendered data (inline styles blocked by CSP)
       var initialScheme = ${activeSchemeJson};
       updatePreview(initialScheme);
-    })();
-  </script>
-</body>
-</html>`;
+    })();`
+  });
 }
