@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.54] — 2026-06-05
+
+### Added
+
+- **Nexus now warns when VS Code settings block macro keyboard shortcuts.** If `terminal.integrated.sendKeybindingsToShell` is enabled, `terminal.integrated.commandsToSkipShell` is missing the Nexus macro commands (including via workspace overrides), or `window.enableMenuBarMnemonics` intercepts Alt shortcuts, a one-time hint offers a one-click fix via the existing "Fix Macro Keybindings" repair. Detection is read-only — Nexus never changes these settings without your explicit click — and the hint can be permanently dismissed. Background: versions up to v2.8.27 silently rewrote `sendKeybindingsToShell` to `false` on every start; removing those automatic writes in v2.8.28 exposed pre-existing user configurations where macro shortcuts were swallowed by the shell.
+
 ## [2.8.53] — 2026-06-05
 
 ### Changed

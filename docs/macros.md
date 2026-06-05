@@ -103,6 +103,14 @@ Macros without shortcuts are still available from the macro picker with
 If VS Code or the integrated terminal intercepts macro shortcuts, run
 **Nexus: Fix Macro Keybindings** from the Command Palette.
 
+If your macro shortcuts (`Alt+S`, `Alt+<key>`) do nothing, the usual cause is
+`terminal.integrated.sendKeybindingsToShell` being set to `true` — that setting
+overrides `commandsToSkipShell` and lets the terminal swallow the shortcuts. It
+must be `false`. Nexus shows a one-time hint when it detects this (or a missing
+`commandsToSkipShell` entry, or `window.enableMenuBarMnemonics` capturing Alt
+shortcuts); clicking **Fix Keybindings** on that hint, or running **Nexus: Fix
+Macro Keybindings** from the Command Palette, corrects all three.
+
 ## Auto-Trigger Basics
 
 Add a **Trigger Pattern** to make a macro run when terminal output matches a

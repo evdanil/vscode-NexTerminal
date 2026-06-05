@@ -61,6 +61,8 @@ import type { SshConnectionOptions } from "./services/ssh/ssh2Connector";
 import { resolveScriptMaxRuntimeMs } from "./services/scripts/maxRuntime";
 import { ALL_PASSTHROUGH_KEYS, sanitizePassthroughKeys } from "./services/terminal/passthroughKeys";
 import { planSkipShellRepair } from "./services/terminal/skipShellRepair";
+import { detectMacroKeybindingBlockers } from "./services/terminal/macroKeybindingBlockers";
+import { getMacros } from "./macroSettings";
 
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
 const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
@@ -139,6 +141,52 @@ async function confirmAndRepairMacroKeybindings(): Promise<void> {
   if (picked !== "Fix Keybindings") return;
   await repairMacroKeybindings();
   void vscode.window.showInformationMessage("Nexus macro keybinding settings were updated.");
+}
+
+/** globalState key: user clicked "Don't Show Again" on the proactive blocker hint. */
+const MACRO_BLOCKER_HINT_DISMISSED_KEY = "nexus.macros.keybindingBlockerHintDismissed";
+/** Once-per-session cap: set when the proactive hint toast is shown. */
+let macroBlockerHintShownThisSession = false;
+
+/**
+ * Read-only check for VS Code settings that swallow Nexus macro shortcuts. If any
+ * are found, surface a non-modal, dismissible hint pointing at the existing repair.
+ * This NEVER writes settings — the only write path remains the explicit repair
+ * command, triggered by the user clicking "Fix Keybindings".
+ *
+ * Suppressed when: there are no macros (no shortcuts to care about); the user
+ * previously chose "Don't Show Again"; or the hint already fired this session.
+ * The dismissed flag only gates this proactive toast — it never blocks the
+ * explicit `nexus.settings.fixMacroKeybindings` command.
+ */
+async function maybeWarnMacroKeybindingsBlocked(context: vscode.ExtensionContext): Promise<void> {
+  if (macroBlockerHintShownThisSession) return;
+  if (getMacros().length === 0) return;
+  if (context.globalState.get<boolean>(MACRO_BLOCKER_HINT_DISMISSED_KEY, false)) return;
+
+  const termConfig = vscode.workspace.getConfiguration("terminal.integrated");
+  const winConfig = vscode.workspace.getConfiguration("window");
+  const blockers = detectMacroKeybindingBlockers({
+    sendKeybindingsToShell: termConfig.get("sendKeybindingsToShell"),
+    commandsToSkipShell: termConfig.get("commandsToSkipShell"),
+    enableMenuBarMnemonics: winConfig.get("enableMenuBarMnemonics"),
+    requiredCommands: MACRO_SKIP_SHELL_COMMANDS
+  });
+  if (blockers.length === 0) return;
+
+  macroBlockerHintShownThisSession = true;
+  const choice = await vscode.window.showWarningMessage(
+    `Nexus macro shortcuts are blocked by VS Code settings: ${blockers[0]}. Fix now?`,
+    "Fix Keybindings",
+    "Don't Show Again"
+  );
+  if (choice === "Fix Keybindings") {
+    // The toast click IS the consent — go straight to the repair, no second modal.
+    await repairMacroKeybindings();
+    void vscode.window.showInformationMessage("Nexus macro keybinding settings were updated.");
+  } else if (choice === "Don't Show Again") {
+    void context.globalState.update(MACRO_BLOCKER_HINT_DISMISSED_KEY, true);
+  }
 }
 
 /** Track which passthrough context keys are currently set to true, so we only update the delta. */
@@ -235,6 +283,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     });
   }
+
+  // Read-only hint: if macro shortcuts are blocked by VS Code settings, point the
+  // user at the repair. Runs after the macro store is initialized so getMacros()
+  // is populated. Does not block activation.
+  void maybeWarnMacroKeybindingsBlocked(context);
 
   const hostKeyVerifier = new VscodeHostKeyVerifier(context.globalState);
   const sshConnector = new Ssh2Connector(hostKeyVerifier, readSshConnectionOptions());
@@ -844,6 +897,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     if (event.affectsConfiguration("nexus.terminal.highlighting")) {
       highlighter.reload();
+    }
+    if (
+      event.affectsConfiguration("terminal.integrated.sendKeybindingsToShell") ||
+      event.affectsConfiguration("terminal.integrated.commandsToSkipShell") ||
+      event.affectsConfiguration("window.enableMenuBarMnemonics")
+    ) {
+      // Re-check on relevant settings changes. The once-per-session cap means
+      // this re-arms the hint only if it was healthy at startup and just became
+      // blocked (or if the user toggled before the first toast fired).
+      void maybeWarnMacroKeybindingsBlocked(context);
     }
     if (event.affectsConfiguration("nexus.ui.showTreeDescriptions")) {
       nexusTreeProvider.refresh();
