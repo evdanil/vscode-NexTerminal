@@ -86,10 +86,39 @@ function renderEnum(meta: SettingMeta, value: string): string {
 </div>`;
 }
 
-function renderMultiCheckbox(meta: SettingMeta, values: string[]): string {
+/**
+ * Determine which checkbox option values should be rendered as checked.
+ *
+ * When the stored value is corrupt (non-array, empty array, or contains no
+ * entries that match any option), ALL options are checked — mirroring the
+ * runtime fallback in sanitizePassthroughKeys so the UI accurately reflects
+ * what the extension is actually doing.
+ *
+ * Exported for unit testing.
+ */
+export function resolveMultiCheckboxSelection(meta: SettingMeta, raw: unknown): Set<string> {
+  const options = meta.checkboxOptions ?? [];
+  const optionValues = new Set(options.map((o) => o.value));
+
+  if (Array.isArray(raw)) {
+    const valid = new Set<string>();
+    for (const item of raw) {
+      if (typeof item === "string" && optionValues.has(item)) {
+        valid.add(item);
+      }
+    }
+    if (valid.size > 0) {
+      return valid;
+    }
+  }
+  // Corrupt, empty, or all-invalid → show everything checked (matches runtime fallback).
+  return new Set(optionValues);
+}
+
+function renderMultiCheckbox(meta: SettingMeta, raw: unknown): string {
   const id = controlId(meta);
   const options = meta.checkboxOptions ?? [];
-  const set = new Set(values);
+  const set = resolveMultiCheckboxSelection(meta, raw);
   const checksHtml = options
     .map(
       (opt) =>
@@ -134,7 +163,7 @@ function renderSetting(meta: SettingMeta, values: SettingValues): string {
     case "directory":
       return renderDirectory(meta, typeof raw === "string" ? raw : "");
     case "multi-checkbox":
-      return renderMultiCheckbox(meta, Array.isArray(raw) ? raw as string[] : []);
+      return renderMultiCheckbox(meta, raw);
   }
 }
 
@@ -570,6 +599,15 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
               for (var ai = 0; ai < all.length; ai++) {
                 if (all[ai].checked) selected.push(all[ai].value);
               }
+              // Zero-selection is rejected by validation (use the master toggle to
+              // disable passthrough entirely).  Re-check every box and save the full
+              // set so the UI never reaches a dead-end where saving is always rejected.
+              if (selected.length === 0) {
+                for (var ri = 0; ri < all.length; ri++) {
+                  all[ri].checked = true;
+                  selected.push(all[ri].value);
+                }
+              }
               saveSetting(group.dataset.section, group.dataset.key, selected);
             });
           }
@@ -668,7 +706,16 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
             var k = fullKey.substring(dotIdx + 1);
             var el = document.querySelector('[data-section="' + s + '"][data-key="' + k + '"]');
             if (!el) continue;
-            if (el.type === "checkbox") {
+            // Multi-checkbox: the group <div> matches the selector; update each child checkbox.
+            if (el.classList.contains("multi-checkbox-group")) {
+              var incoming = vals[fullKey];
+              // If incoming is not a non-empty array, treat as all-checked (mirrors render fallback).
+              var incomingArr = Array.isArray(incoming) && incoming.length > 0 ? incoming : null;
+              var cbs = el.querySelectorAll('input[type="checkbox"]');
+              for (var cbi = 0; cbi < cbs.length; cbi++) {
+                cbs[cbi].checked = incomingArr === null || incomingArr.indexOf(cbs[cbi].value) !== -1;
+              }
+            } else if (el.type === "checkbox") {
               el.checked = !!vals[fullKey];
             } else if (el.type === "hidden") {
               el.value = String(vals[fullKey]);

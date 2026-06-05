@@ -20,4 +20,25 @@ describe("validateSettingUpdate", () => {
   it("rejects unknown multi-checkbox values", () => {
     expect(validateSettingUpdate("nexus.terminal", "passthroughKeys", ["z"]).ok).toBe(false);
   });
+
+  it("rejects empty array for passthroughKeys ([] is not valid — use master toggle to disable)", () => {
+    const result = validateSettingUpdate("nexus.terminal", "passthroughKeys", []);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain("Select at least one option");
+    }
+  });
+
+  it("deduplicates duplicate entries in a valid multi-checkbox submission", () => {
+    const result = validateSettingUpdate("nexus.terminal", "passthroughKeys", ["b", "q", "b", "w"]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual(["b", "q", "w"]);
+    }
+  });
+
+  it("accepts a single-entry passthroughKeys value", () => {
+    const result = validateSettingUpdate("nexus.terminal", "passthroughKeys", ["r"]);
+    expect(result.ok).toBe(true);
+  });
 });

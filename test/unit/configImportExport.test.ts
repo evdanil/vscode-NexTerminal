@@ -515,6 +515,40 @@ describe("config import command (legacy)", () => {
     );
   });
 
+  it("rejects and does NOT write passthroughKeys: [] from imported backup — shows warning", async () => {
+    // A corrupt backup (or a user who unchecked all boxes before the UI fix) must
+    // not propagate [] into the user's settings.json; validation treats [] as invalid.
+    configStore.clear();
+    mockShowWarningMessage.mockClear();
+    const exportData = makeExportData({
+      settings: {
+        "nexus.terminal.passthroughKeys": []
+      }
+    });
+    await runImport(exportData);
+
+    expect(configStore.has("nexus.terminal.passthroughKeys")).toBe(false);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
+  });
+
+  it("accepts a valid non-empty passthroughKeys subset from imported backup", async () => {
+    configStore.clear();
+    mockShowWarningMessage.mockClear();
+    const exportData = makeExportData({
+      settings: {
+        "nexus.terminal.passthroughKeys": ["b", "r"]
+      }
+    });
+    await runImport(exportData);
+
+    expect(configStore.get("nexus.terminal.passthroughKeys")).toEqual(["b", "r"]);
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
+  });
+
   it.each(["merge", "replace"] as const)(
     "migrates backed-up legacy default wait timeout to the registered seconds setting in %s mode",
     async (mode) => {

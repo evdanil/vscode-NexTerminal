@@ -58,6 +58,8 @@ import { tryRegisterResourceLabelFormatter } from "./services/sftp/resourceLabel
 import type { SftpServiceConfig } from "./services/sftp/sftpService";
 import type { SshConnectionOptions } from "./services/ssh/ssh2Connector";
 import { resolveScriptMaxRuntimeMs } from "./services/scripts/maxRuntime";
+import { ALL_PASSTHROUGH_KEYS, sanitizePassthroughKeys } from "./services/terminal/passthroughKeys";
+import { planSkipShellRepair } from "./services/terminal/skipShellRepair";
 
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
 const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
@@ -75,51 +77,45 @@ function resolveLogRotationOptions(): LoggerRotationOptions {
 /**
  * Repair VS Code settings so macro shortcuts reach the extension.
  * Three settings are patched:
- *  1. terminal.integrated.commandsToSkipShell — our commands must be in the list
+ *  1. terminal.integrated.commandsToSkipShell — our commands must be in the list;
+ *     orphaned `nexus.macro.slot` entries (from v2.3.1–v2.8.27) are also removed here.
+ *     NOTE: `nexus.macro.slot` remains a registered back-compat command alias — only
+ *     its skip-shell registration is cleaned up, the command itself stays active.
  *  2. terminal.integrated.sendKeybindingsToShell — must be false so the shell doesn't swallow shortcuts
  *  3. window.enableMenuBarMnemonics — must be false so Alt+letter shortcuts don't open menus (Linux/Windows)
+ *
+ * All config.update() calls are awaited sequentially to avoid races.
  */
-function repairMacroKeybindings(): void {
+async function repairMacroKeybindings(): Promise<void> {
   // --- 1. commandsToSkipShell ---
   const termConfig = vscode.workspace.getConfiguration("terminal.integrated");
   const inspect = termConfig.inspect<string[]>("commandsToSkipShell");
+  const effective = termConfig.get<string[]>("commandsToSkipShell", []);
 
-  // Patch any user-customised levels so our commands survive alongside their entries.
+  // planSkipShellRepair handles: dropping nexus.macro.slot orphans, appending missing
+  // commands, and the global-fallback write when no user-level override exists.
   const levels: Array<{ value: string[] | undefined; target: vscode.ConfigurationTarget }> = [
     { value: inspect?.globalValue, target: vscode.ConfigurationTarget.Global },
     { value: inspect?.workspaceValue, target: vscode.ConfigurationTarget.Workspace },
     { value: inspect?.workspaceFolderValue, target: vscode.ConfigurationTarget.WorkspaceFolder },
   ];
 
-  let patchedAny = false;
-  for (const { value, target } of levels) {
-    if (value !== undefined) {
-      const missing = MACRO_SKIP_SHELL_COMMANDS.filter(cmd => !value.includes(cmd));
-      if (missing.length > 0) {
-        void termConfig.update("commandsToSkipShell", [...value, ...missing], target);
-      }
-      patchedAny = true;
-    }
-  }
-
-  // Safety net: if no user-level value exists, configurationDefaults SHOULD cover us.
-  // Verify the effective (resolved) value actually contains our commands.
-  // If not, write to Global to guarantee they work on first install.
-  if (!patchedAny) {
-    const effective = termConfig.get<string[]>("commandsToSkipShell", []);
-    const missing = MACRO_SKIP_SHELL_COMMANDS.filter(cmd => !effective.includes(cmd));
-    if (missing.length > 0) {
-      void termConfig.update("commandsToSkipShell", [...effective, ...missing], vscode.ConfigurationTarget.Global);
-    }
+  const writes = planSkipShellRepair(levels, effective, MACRO_SKIP_SHELL_COMMANDS);
+  for (const { target, value } of writes) {
+    // "global-fallback" maps to ConfigurationTarget.Global (same write; different label for clarity)
+    const configTarget = target === "global-fallback"
+      ? vscode.ConfigurationTarget.Global
+      : target;
+    await termConfig.update("commandsToSkipShell", value, configTarget);
   }
 
   // --- 2. sendKeybindingsToShell ---
   // When true the terminal shell receives matched keybindings before VS Code, swallowing macro shortcuts.
   const sendInspect = termConfig.inspect<boolean>("sendKeybindingsToShell");
   if (sendInspect?.globalValue === true) {
-    void termConfig.update("sendKeybindingsToShell", false, vscode.ConfigurationTarget.Global);
+    await termConfig.update("sendKeybindingsToShell", false, vscode.ConfigurationTarget.Global);
   } else if (sendInspect?.globalValue === undefined && termConfig.get<boolean>("sendKeybindingsToShell") === true) {
-    void termConfig.update("sendKeybindingsToShell", false, vscode.ConfigurationTarget.Global);
+    await termConfig.update("sendKeybindingsToShell", false, vscode.ConfigurationTarget.Global);
   }
 
   // --- 3. enableMenuBarMnemonics ---
@@ -127,9 +123,9 @@ function repairMacroKeybindings(): void {
   const winConfig = vscode.workspace.getConfiguration("window");
   const mnemonicInspect = winConfig.inspect<boolean>("enableMenuBarMnemonics");
   if (mnemonicInspect?.globalValue === true) {
-    void winConfig.update("enableMenuBarMnemonics", false, vscode.ConfigurationTarget.Global);
+    await winConfig.update("enableMenuBarMnemonics", false, vscode.ConfigurationTarget.Global);
   } else if (mnemonicInspect?.globalValue === undefined && winConfig.get<boolean>("enableMenuBarMnemonics") === true) {
-    void winConfig.update("enableMenuBarMnemonics", false, vscode.ConfigurationTarget.Global);
+    await winConfig.update("enableMenuBarMnemonics", false, vscode.ConfigurationTarget.Global);
   }
 }
 
@@ -140,11 +136,9 @@ async function confirmAndRepairMacroKeybindings(): Promise<void> {
     "Fix Keybindings"
   );
   if (picked !== "Fix Keybindings") return;
-  repairMacroKeybindings();
+  await repairMacroKeybindings();
   void vscode.window.showInformationMessage("Nexus macro keybinding settings were updated.");
 }
-
-const ALL_PASSTHROUGH_KEYS = ["b", "e", "g", "j", "k", "n", "o", "p", "q", "r", "w"] as const;
 
 /** Track which passthrough context keys are currently set to true, so we only update the delta. */
 const activePassthroughKeys = new Set<string>();
@@ -152,8 +146,10 @@ const activePassthroughKeys = new Set<string>();
 function updatePassthroughContext(): void {
   const config = vscode.workspace.getConfiguration("nexus.terminal");
   const masterEnabled = config.get<boolean>("keyboardPassthrough", true);
-  const selectedKeys = config.get<string[]>("passthroughKeys", [...ALL_PASSTHROUGH_KEYS]);
-  const activeSet = masterEnabled ? new Set(selectedKeys.map(k => k.toLowerCase())) : new Set<string>();
+  // sanitizePassthroughKeys handles corrupt/empty/non-array values gracefully by
+  // falling back to the full default set — no automatic settings.json writes needed.
+  const selectedKeys = sanitizePassthroughKeys(config.get("passthroughKeys"));
+  const activeSet = masterEnabled ? new Set(selectedKeys) : new Set<string>();
 
   for (const key of ALL_PASSTHROUGH_KEYS) {
     const contextKey = `nexus.passthrough.ctrl${key.toUpperCase()}`;

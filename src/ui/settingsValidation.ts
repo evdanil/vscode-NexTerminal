@@ -60,7 +60,17 @@ export function validateSettingUpdate(section: unknown, key: unknown, value: unk
       if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && allowed.has(item))) {
         return { ok: false, message: "Expected a list of supported checkbox values." };
       }
-      return { ok: true, meta, value: [...new Set(value)] };
+      const deduped = [...new Set(value)];
+      // An empty selection is never valid — the master toggle (boolean setting) is the
+      // right way to disable a feature entirely.  This also prevents backup import from
+      // re-propagating a corrupted [] value into the user's settings.json.
+      if (deduped.length === 0) {
+        return {
+          ok: false,
+          message: "Select at least one option. To disable keyboard passthrough entirely, turn off Keyboard Passthrough instead."
+        };
+      }
+      return { ok: true, meta, value: deduped };
     }
   }
 }

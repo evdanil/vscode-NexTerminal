@@ -1,10 +1,29 @@
 # Nexus Terminal
 
-Unified SSH, Serial, Local Shell, and Port Forwarding hub for VS Code.
+A full SSH + serial + port-forwarding client inside VS Code — without Remote-SSH's 300MB server payload on the box.
 
-[![Open VSX](https://img.shields.io/badge/Open%20VSX-Nexus%20Terminal-blue)](https://open-vsx.org/extension/sentriflow/vscode-nexterminal)
+[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/sentriflow.vscode-nexterminal?label=VS%20Code%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=sentriflow.vscode-nexterminal)
+[![Open VSX](https://img.shields.io/open-vsx/v/sentriflow/vscode-nexterminal?label=Open%20VSX)](https://open-vsx.org/extension/sentriflow/vscode-nexterminal)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-Manage remote servers, serial devices, local shell profiles, and TCP tunnels from a single sidebar — with proxy support, SFTP file explorer, connection multiplexing, terminal macros, regex highlighting, unread activity indicators, color schemes, and configuration import/export.
+- **Replaces PuTTY + MobaXterm + SecureCRT + TeraTerm** — SSH, serial consoles, local shells, port forwarding, and SFTP live in one VS Code sidebar instead of four separate windows.
+- **Unlike Remote-SSH, nothing is installed on the remote.** It's a pure client: no `vscode-server` unpacked into the target, no node process running on the far end. That matters when the far end is a Cisco switch, a bastion you only get a shell on, or a change-controlled box where you can't drop an agent.
+- **Bring your existing connections** — import session profiles straight from MobaXterm `.ini` and SecureCRT XML exports, folder hierarchy preserved, so switching costs you minutes, not a weekend.
+
+<!-- TODO: record GIF — jump-host A→B→C chain. ~15s, loopable. -->
+![Nexus Terminal connecting through a multi-hop jump-host chain (A → B → C) and opening a remote shell](media/demo-jump-host.gif)
+
+## Who it's for
+
+- **Network and infra engineers** on Cisco, Juniper, and embedded gear — multi-hop jump-host chaining (A → B → C) and a per-server legacy KEX/cipher toggle keep you connected to old IOS boxes that modern clients refuse.
+- **Embedded and firmware developers** on serial consoles — Smart Follow rides through Windows COM-port renumbering, reconnecting only to the device you already approved instead of dropping the session.
+- **Homelab and self-hosters** — one sidebar for every box, tunnel, and serial cable, with expect/send auto-trigger macros and a JavaScript scripting engine for repeatable tasks.
+- **VSCodium and Open VSX users** — full SSH that Remote-SSH (proprietary, Marketplace-only) can't give you, plus 2FA keyboard-interactive auth and encrypted config backup.
+
+## Install
+
+- **VS Code Marketplace** — open the Extensions view (`Ctrl+Shift+X`), search **Nexus Terminal**, and click Install. Listing: https://marketplace.visualstudio.com/items?itemName=sentriflow.vscode-nexterminal
+- **Open VSX** (VSCodium, Theia, Gitpod) — search **Nexus Terminal** in the Extensions view, or install the VSIX directly. Listing: https://open-vsx.org/extension/sentriflow/vscode-nexterminal
 
 ## Features
 

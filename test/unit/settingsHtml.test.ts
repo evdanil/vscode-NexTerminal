@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderSettingsHtml } from "../../src/ui/settingsHtml";
+import { renderSettingsHtml, resolveMultiCheckboxSelection } from "../../src/ui/settingsHtml";
 import { SETTINGS_META, CATEGORY_ORDER, CATEGORY_DESCRIPTIONS, CATEGORY_LABELS } from "../../src/ui/settingsMetadata";
 
 function buildDefaultValues(): Record<string, unknown> {
@@ -252,5 +252,151 @@ describe("renderSettingsHtml", () => {
       expect(html).toContain("backup-btn");
       expect(html).toContain("complete-reset-btn");
     });
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// resolveMultiCheckboxSelection
+// ──────────────────────────────────────────────────────────────────────────────
+describe("resolveMultiCheckboxSelection", () => {
+  // Find the passthroughKeys meta entry for tests
+  const passthroughMeta = SETTINGS_META.find(
+    (m) => m.section === "nexus.terminal" && m.key === "passthroughKeys"
+  )!;
+  const allValues = passthroughMeta.checkboxOptions!.map((o) => o.value);
+
+  it("returns a valid non-empty subset as-is", () => {
+    const result = resolveMultiCheckboxSelection(passthroughMeta, ["b", "q", "w"]);
+    expect([...result].sort()).toEqual(["b", "q", "w"].sort());
+  });
+
+  it("empty array → all options checked", () => {
+    const result = resolveMultiCheckboxSelection(passthroughMeta, []);
+    expect([...result].sort()).toEqual([...allValues].sort());
+  });
+
+  it("non-array (undefined) → all options checked", () => {
+    const result = resolveMultiCheckboxSelection(passthroughMeta, undefined);
+    expect([...result].sort()).toEqual([...allValues].sort());
+  });
+
+  it("non-array (string) → all options checked", () => {
+    const result = resolveMultiCheckboxSelection(passthroughMeta, "b,q");
+    expect([...result].sort()).toEqual([...allValues].sort());
+  });
+
+  it("array with no valid entries → all options checked", () => {
+    const result = resolveMultiCheckboxSelection(passthroughMeta, ["z", "x", "foo"]);
+    expect([...result].sort()).toEqual([...allValues].sort());
+  });
+
+  it("array with mixed valid/invalid → only valid entries", () => {
+    const result = resolveMultiCheckboxSelection(passthroughMeta, ["b", "z", "q"]);
+    expect([...result].sort()).toEqual(["b", "q"].sort());
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// renderSettingsHtml: multi-checkbox rendering fallback
+// ──────────────────────────────────────────────────────────────────────────────
+describe("renderSettingsHtml multi-checkbox fallback", () => {
+  it("renders all checkboxes checked when stored passthroughKeys value is empty array", () => {
+    const values: Record<string, unknown> = {};
+    for (const meta of SETTINGS_META) {
+      values[`${meta.section}.${meta.key}`] = meta.type === "boolean" ? true
+        : meta.type === "number" ? (meta.min ?? 0)
+        : meta.type === "enum" ? (meta.enumOptions?.[0]?.value ?? "")
+        : meta.type === "multi-checkbox" ? [] // corrupt: empty array
+        : "";
+    }
+    const html = renderSettingsHtml(values, "nonce-abc");
+    // All passthrough-key checkboxes should be rendered as checked
+    const passthroughMeta = SETTINGS_META.find(
+      (m) => m.section === "nexus.terminal" && m.key === "passthroughKeys"
+    )!;
+    for (const opt of passthroughMeta.checkboxOptions!) {
+      // A checked checkbox has: value="<opt>" followed (same label block) by " checked"
+      // The simplest check: every option's value appears in a checked input
+      expect(html).toContain(`value="${opt.value}" checked`);
+    }
+  });
+
+  it("renders all checkboxes checked when stored passthroughKeys is non-array (undefined key)", () => {
+    const values: Record<string, unknown> = {};
+    for (const meta of SETTINGS_META) {
+      const fk = `${meta.section}.${meta.key}`;
+      if (meta.section === "nexus.terminal" && meta.key === "passthroughKeys") {
+        // Omit entirely — raw will be undefined
+        continue;
+      }
+      values[fk] = meta.type === "boolean" ? true
+        : meta.type === "number" ? (meta.min ?? 0)
+        : meta.type === "enum" ? (meta.enumOptions?.[0]?.value ?? "")
+        : meta.type === "multi-checkbox" ? (meta.checkboxOptions?.map((o) => o.value) ?? [])
+        : "";
+    }
+    const html = renderSettingsHtml(values, "nonce-abc");
+    const passthroughMeta = SETTINGS_META.find(
+      (m) => m.section === "nexus.terminal" && m.key === "passthroughKeys"
+    )!;
+    for (const opt of passthroughMeta.checkboxOptions!) {
+      expect(html).toContain(`value="${opt.value}" checked`);
+    }
+  });
+
+  it("renders only the valid subset checked when a proper subset is stored", () => {
+    const values: Record<string, unknown> = {};
+    for (const meta of SETTINGS_META) {
+      const fk = `${meta.section}.${meta.key}`;
+      values[fk] = meta.section === "nexus.terminal" && meta.key === "passthroughKeys"
+        ? ["b", "q"] // valid subset — only b and q should be checked
+        : meta.type === "boolean" ? true
+        : meta.type === "number" ? (meta.min ?? 0)
+        : meta.type === "enum" ? (meta.enumOptions?.[0]?.value ?? "")
+        : meta.type === "multi-checkbox" ? (meta.checkboxOptions?.map((o) => o.value) ?? [])
+        : "";
+    }
+    const html = renderSettingsHtml(values, "nonce-abc");
+    expect(html).toContain(`value="b" checked`);
+    expect(html).toContain(`value="q" checked`);
+    // Other options should NOT be checked — they appear without " checked"
+    // We verify by checking the option values that are NOT in our subset
+    const passthroughMeta = SETTINGS_META.find(
+      (m) => m.section === "nexus.terminal" && m.key === "passthroughKeys"
+    )!;
+    for (const opt of passthroughMeta.checkboxOptions!) {
+      if (opt.value === "b" || opt.value === "q") continue;
+      // The unchecked ones should appear without " checked" — they appear as
+      // `value="<x>"` without a trailing " checked" in the same tag.
+      expect(html).not.toContain(`value="${opt.value}" checked`);
+    }
+  });
+
+  it("generated webview JS contains the multi-checkbox configUpdated sync branch", () => {
+    const values: Record<string, unknown> = {};
+    for (const meta of SETTINGS_META) {
+      values[`${meta.section}.${meta.key}`] = meta.type === "boolean" ? true
+        : meta.type === "number" ? (meta.min ?? 0)
+        : meta.type === "enum" ? (meta.enumOptions?.[0]?.value ?? "")
+        : meta.type === "multi-checkbox" ? (meta.checkboxOptions?.map((o) => o.value) ?? [])
+        : "";
+    }
+    const html = renderSettingsHtml(values, "nonce-abc");
+    expect(html).toContain("multi-checkbox-group");
+    expect(html).toContain("classList.contains");
+    expect(html).toContain("incomingArr");
+  });
+
+  it("generated webview JS change handler contains the zero-selection fallback", () => {
+    const values: Record<string, unknown> = {};
+    for (const meta of SETTINGS_META) {
+      values[`${meta.section}.${meta.key}`] = meta.type === "boolean" ? true
+        : meta.type === "number" ? (meta.min ?? 0)
+        : meta.type === "enum" ? (meta.enumOptions?.[0]?.value ?? "")
+        : meta.type === "multi-checkbox" ? (meta.checkboxOptions?.map((o) => o.value) ?? [])
+        : "";
+    }
+    const html = renderSettingsHtml(values, "nonce-abc");
+    expect(html).toContain("selected.length === 0");
   });
 });
