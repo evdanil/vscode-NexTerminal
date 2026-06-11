@@ -8,6 +8,7 @@ import {
   formatEventLine,
   formatGuardReport,
   renderValue,
+  sanitizeShadow,
   type GuardEvent,
   type GuardScope,
   type ScopeAssessment,
@@ -156,17 +157,18 @@ export class SettingsGuardController implements vscode.Disposable {
     if (this.disposed) return;
     const config = vscode.workspace.getConfiguration(SKIP_SHELL_SECTION);
     const inspect = config.inspect<string[]>(SKIP_SHELL_LEAF);
-    // Note: workspaceFolderValue is reliably undefined here because this
-    // getConfiguration call has no resource URI — the folder scope is never
-    // captured into the shadow and never restored. The guard protects the
-    // global (user) and workspace levels; the external tool rewrites the
-    // user-level settings.json.
+    // The guard handles ONLY the global (user-level) scope. The shadow is
+    // machine-global, while workspace/workspaceFolder values are per-workspace —
+    // capturing those would bleed one workspace's list into other workspaces'
+    // .vscode/settings.json. The external tool rewrites the user-level
+    // settings.json only; workspace-level issues stay with the existing
+    // confirm-gated "Fix Macro Keybindings" repair.
     const current: Record<GuardScope, unknown> = {
       global: inspect?.globalValue,
-      workspace: inspect?.workspaceValue,
-      workspaceFolder: inspect?.workspaceFolderValue,
+      workspace: undefined,
+      workspaceFolder: undefined,
     };
-    const shadow = this.context.globalState.get<SkipShellShadow>(SHADOW_KEY);
+    const shadow = sanitizeShadow(this.context.globalState.get(SHADOW_KEY));
     const assessments = assessScopes(shadow?.values, current, this.requiredCommands, this.ownWrites);
 
     // Consume own-write markers once observed.
@@ -279,7 +281,7 @@ export class SettingsGuardController implements vscode.Disposable {
 
     // Clear the shadow for undone scopes FIRST so the undo write cannot be
     // re-detected as a fresh corruption and immediately re-restored.
-    const shadow = this.context.globalState.get<SkipShellShadow>(SHADOW_KEY);
+    const shadow = sanitizeShadow(this.context.globalState.get(SHADOW_KEY));
     if (shadow) {
       const values = { ...shadow.values };
       for (const a of restores) delete values[a.scope];

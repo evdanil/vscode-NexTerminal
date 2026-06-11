@@ -3,6 +3,7 @@ import {
   assessScopes,
   computeShadowUpdate,
   evaluateRateLimit,
+  sanitizeShadow,
   SESSION_RESTORE_CAP,
   BURST_CAP,
   BURST_WINDOW_MS,
@@ -287,5 +288,47 @@ describe("R1 review fixes", () => {
   it("formatEventLine marks one-sided changes as not recorded", () => {
     const line = formatEventLine({ timestamp: "t", key: "k", kind: "restore", after: '["a"]' });
     expect(line).toContain('(not recorded) -> ["a"]');
+  });
+});
+
+describe("sanitizeShadow (global-scope-only guard)", () => {
+  const GOOD = ["workbench.action.quickOpen", ...REQUIRED];
+
+  it("keeps a valid global scope and drops workspace scopes from pre-release shadows", () => {
+    const raw = {
+      values: { global: GOOD, workspace: ["w1.only"], workspaceFolder: ["wf.only"] },
+      updatedAt: "t",
+    };
+    expect(sanitizeShadow(raw)).toEqual({ values: { global: GOOD }, updatedAt: "t" });
+  });
+
+  it("rejects unrecognizable shapes", () => {
+    expect(sanitizeShadow(undefined)).toBeUndefined();
+    expect(sanitizeShadow(null)).toBeUndefined();
+    expect(sanitizeShadow("junk")).toBeUndefined();
+    expect(sanitizeShadow({})).toBeUndefined();
+    expect(sanitizeShadow({ values: { global: GOOD } })).toBeUndefined(); // no updatedAt
+    expect(sanitizeShadow({ values: { workspace: GOOD }, updatedAt: "t" })).toBeUndefined(); // no global
+    expect(sanitizeShadow({ values: { global: "not-array" }, updatedAt: "t" })).toBeUndefined();
+  });
+
+  it("drops non-string entries and rejects an all-invalid global array", () => {
+    expect(sanitizeShadow({ values: { global: ["a", 1, null] }, updatedAt: "t" })).toEqual({
+      values: { global: ["a"] },
+      updatedAt: "t",
+    });
+    expect(sanitizeShadow({ values: { global: [42] }, updatedAt: "t" })).toBeUndefined();
+  });
+
+  it("regression: a workspace-only shadow can never produce a workspace restore", () => {
+    // Composition scenario from the release review: shadow captured in workspace
+    // W1 must not classify W2's absent override as vanished.
+    const dirty = sanitizeShadow({
+      values: { workspace: GOOD },
+      updatedAt: "t",
+    });
+    expect(dirty).toBeUndefined();
+    const result = assessScopes(dirty?.values, current(undefined, undefined), REQUIRED, NO_OWN_WRITES);
+    expect(result.every((a) => a.restoreValue === undefined)).toBe(true);
   });
 });

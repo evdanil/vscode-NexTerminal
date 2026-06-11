@@ -52,9 +52,16 @@ with thin wiring in `extension.ts`.
 
 ### 1. Shadow (last-known-good)
 
-- `globalState` key `nexus.settingsGuard.lastKnownGood`: per-scope snapshot of
-  `terminal.integrated.commandsToSkipShell` (`globalValue`, `workspaceValue`,
-  `workspaceFolderValue`) plus a timestamp.
+- `globalState` key `nexus.settingsGuard.lastKnownGood`: snapshot of the
+  **global (user-level)** value of `terminal.integrated.commandsToSkipShell`
+  plus a timestamp. The guard deliberately ignores workspace and
+  workspaceFolder scopes: the shadow is machine-global while those values are
+  per-workspace, so guarding them would restore one workspace's list into
+  other workspaces' `.vscode/settings.json`. The external tool rewrites only
+  the user-level `settings.json`; workspace-level problems remain covered by
+  the existing confirm-gated repair. Loaded shadows pass through
+  `sanitizeShadow`, which validates the shape and drops any non-global scopes
+  persisted by pre-release builds.
 - Updated on every configuration change where each defined level contains all
   `MACRO_SKIP_SHELL_COMMANDS` (healthy state). Never updated from a corrupt
   state.

@@ -285,6 +285,30 @@ export function formatGuardReport(
 }
 
 /**
+ * Validate and narrow a shadow loaded from globalState.
+ *
+ * The shadow is machine-global, but workspace/workspaceFolder configuration
+ * values are per-workspace: capturing them globally would make the guard
+ * "restore" one workspace's list into every other workspace's
+ * .vscode/settings.json (a version-controlled file). The guard therefore
+ * protects ONLY the global (user-level) scope — which is also the only file
+ * the external tool rewrites. Any workspace-scope values found in a persisted
+ * shadow (e.g. from a pre-release build) are dropped; unrecognizable shapes
+ * yield undefined (no shadow).
+ */
+export function sanitizeShadow(raw: unknown): SkipShellShadow | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const candidate = raw as { values?: unknown; updatedAt?: unknown };
+  if (typeof candidate.updatedAt !== "string") return undefined;
+  if (typeof candidate.values !== "object" || candidate.values === null) return undefined;
+  const global = (candidate.values as Record<string, unknown>).global;
+  if (!Array.isArray(global)) return undefined;
+  const cleaned = global.filter((v): v is string => typeof v === "string");
+  if (cleaned.length === 0) return undefined;
+  return { values: { global: cleaned }, updatedAt: candidate.updatedAt };
+}
+
+/**
  * Compute a refreshed last-known-good shadow from the current per-scope values.
  *
  * Returns the new shadow only when the observed state is fully healthy: at
