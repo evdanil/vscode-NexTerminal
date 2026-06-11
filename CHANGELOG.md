@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [2.8.55] — 2026-06-11
+
+### Added
+
+- **Settings Guard: Nexus now self-heals `terminal.integrated.commandsToSkipShell` when an external program strips it.** Some corporate environments run agents (e.g. DLP/endpoint tools) that periodically rewrite `settings.json` and drop array-valued keys, silently breaking Nexus macro shortcuts. Nexus now keeps a last-known-good copy of the skip-shell list and automatically restores it when it detects the strip signature (key vanished, array emptied, or Nexus commands removed) — including damage done while VS Code was closed. Every restore shows an Undo notification; restores are rate-limited (12 per session, max 3 per 10 minutes) and pause with a Resume button if an external tool fights back. Disable via `nexus.settingsGuard.enabled`. Boolean settings (`sendKeybindingsToShell`, `enableMenuBarMnemonics`) are never changed automatically — those keep the existing confirm-gated "Fix Macro Keybindings" repair.
+- **New command "Nexus: Show Settings Guard Report"** — a forensic log of external modifications to the watched settings (timestamps, before/after values, kept across restarts). Hand it to your IT team to correlate against endpoint-agent activity logs and identify the tool corrupting `settings.json`.
+
 ## [2.8.54] — 2026-06-05
 
 ### Added
