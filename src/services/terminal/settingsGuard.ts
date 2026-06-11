@@ -179,6 +179,8 @@ export interface GuardEvent {
   before?: string;
   after?: string;
   detail?: string;
+  /** Whether the VS Code window was focused when an external change was observed — interactive edits are focused; background agent rewrites are not. */
+  focused?: boolean;
 }
 
 export const EVENT_LOG_CAP = 50;
@@ -206,6 +208,32 @@ export function renderValue(value: unknown, maxLength = 200): string {
     }
   }
   return rendered.length > maxLength ? `${rendered.slice(0, maxLength - 1)}…` : rendered;
+}
+
+/**
+ * Startup-healing policy for Nexus-own settings: should a raw GLOBAL value
+ * found at activation be removed so the package default applies again?
+ *
+ * Only keys whose corrupt shape is unambiguous are healed:
+ *  - passthroughKeys: an empty or non-array override is never a valid user
+ *    choice (the runtime sanitizer already treats it as "all keys") — removing
+ *    it heals settings.json AND the native settings UI, which otherwise shows
+ *    the broken raw value.
+ *  - highlighting.rules: only a non-array (type-corrupt) value — an empty
+ *    rules array is a legitimate "no rules" choice and must be kept.
+ *
+ * The value passed must be the raw per-scope value (inspect().globalValue),
+ * never the effective value.
+ */
+export function shouldRemoveCorruptNexusValue(key: string, raw: unknown): boolean {
+  if (raw === undefined) return false;
+  if (key === "nexus.terminal.passthroughKeys") {
+    return !Array.isArray(raw) || raw.length === 0;
+  }
+  if (key === "nexus.terminal.highlighting.rules") {
+    return !Array.isArray(raw);
+  }
+  return false;
 }
 
 /**
@@ -241,7 +269,8 @@ export function formatEventLine(e: GuardEvent): string {
     e.before !== undefined || e.after !== undefined
       ? ` ${e.before ?? "(not recorded)"} -> ${e.after ?? "(not recorded)"}`
       : "";
-  return `${e.timestamp} ${e.kind}${detail} ${e.key}${scope}${change}`;
+  const focus = e.focused === undefined ? "" : e.focused ? " {focused}" : " {unfocused}";
+  return `${e.timestamp} ${e.kind}${detail} ${e.key}${scope}${change}${focus}`;
 }
 
 /**

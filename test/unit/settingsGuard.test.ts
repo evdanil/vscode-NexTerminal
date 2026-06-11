@@ -15,6 +15,7 @@ import {
   formatEventLine,
   EVENT_LOG_CAP,
   GuardEvent,
+  shouldRemoveCorruptNexusValue,
 } from "../../src/services/terminal/settingsGuard";
 
 const REQUIRED = ["nexus.macro.run", "nexus.macro.runBinding"];
@@ -330,5 +331,45 @@ describe("sanitizeShadow (global-scope-only guard)", () => {
     expect(dirty).toBeUndefined();
     const result = assessScopes(dirty?.values, current(undefined, undefined), REQUIRED, NO_OWN_WRITES);
     expect(result.every((a) => a.restoreValue === undefined)).toBe(true);
+  });
+});
+
+describe("shouldRemoveCorruptNexusValue", () => {
+  const PK = "nexus.terminal.passthroughKeys";
+  const HR = "nexus.terminal.highlighting.rules";
+
+  it("never removes an absent override", () => {
+    expect(shouldRemoveCorruptNexusValue(PK, undefined)).toBe(false);
+    expect(shouldRemoveCorruptNexusValue(HR, undefined)).toBe(false);
+  });
+
+  it("removes empty or non-array passthroughKeys", () => {
+    expect(shouldRemoveCorruptNexusValue(PK, [])).toBe(true);
+    expect(shouldRemoveCorruptNexusValue(PK, "junk")).toBe(true);
+    expect(shouldRemoveCorruptNexusValue(PK, { a: 1 })).toBe(true);
+  });
+
+  it("keeps a non-empty passthroughKeys array", () => {
+    expect(shouldRemoveCorruptNexusValue(PK, ["b"])).toBe(false);
+  });
+
+  it("removes only type-corrupt highlighting rules, keeps empty array", () => {
+    expect(shouldRemoveCorruptNexusValue(HR, "junk")).toBe(true);
+    expect(shouldRemoveCorruptNexusValue(HR, [])).toBe(false);
+    expect(shouldRemoveCorruptNexusValue(HR, [{ pattern: "x" }])).toBe(false);
+  });
+
+  it("ignores unknown keys", () => {
+    expect(shouldRemoveCorruptNexusValue("nexus.other", [])).toBe(false);
+  });
+});
+
+describe("formatEventLine focus marker", () => {
+  it("appends focused/unfocused when set and omits when undefined", () => {
+    const base = { timestamp: "t", key: "k", kind: "external-other" as const };
+    expect(formatEventLine({ ...base, focused: true })).toContain("{focused}");
+    expect(formatEventLine({ ...base, focused: false })).toContain("{unfocused}");
+    expect(formatEventLine(base)).not.toContain("{focused}");
+    expect(formatEventLine(base)).not.toContain("{unfocused}");
   });
 });
