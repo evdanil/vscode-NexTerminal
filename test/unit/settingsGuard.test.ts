@@ -7,6 +7,12 @@ import {
   BURST_CAP,
   BURST_WINDOW_MS,
   GuardScope,
+  appendEvent,
+  classifyWatchedChange,
+  renderValue,
+  formatGuardReport,
+  EVENT_LOG_CAP,
+  GuardEvent,
 } from "../../src/services/terminal/settingsGuard";
 
 const REQUIRED = ["nexus.macro.run", "nexus.macro.runBinding"];
@@ -163,5 +169,80 @@ describe("evaluateRateLimit", () => {
     const cycle = 3 * 60 * MIN;
     const stamps = Array.from({ length: BURST_CAP + 2 }, (_, i) => i * cycle);
     expect(evaluateRateLimit(stamps, stamps[stamps.length - 1] + 1000)).toBeNull();
+  });
+});
+
+describe("appendEvent ring buffer", () => {
+  const ev = (n: number): GuardEvent => ({
+    timestamp: `t${n}`,
+    key: "k",
+    kind: "external-other",
+  });
+
+  it("appends and preserves order", () => {
+    const log = appendEvent(appendEvent([], ev(1)), ev(2));
+    expect(log.map((e) => e.timestamp)).toEqual(["t1", "t2"]);
+  });
+
+  it("evicts oldest entries beyond the cap", () => {
+    let log: GuardEvent[] = [];
+    for (let i = 0; i < EVENT_LOG_CAP + 5; i++) log = appendEvent(log, ev(i));
+    expect(log).toHaveLength(EVENT_LOG_CAP);
+    expect(log[0].timestamp).toBe("t5");
+    expect(log[log.length - 1].timestamp).toBe(`t${EVENT_LOG_CAP + 4}`);
+  });
+});
+
+describe("renderValue", () => {
+  it("renders undefined as (not set)", () => {
+    expect(renderValue(undefined)).toBe("(not set)");
+  });
+  it("renders JSON and truncates long values", () => {
+    expect(renderValue(["a", "b"])).toBe('["a","b"]');
+    const long = renderValue(Array.from({ length: 100 }, (_, i) => `cmd${i}`));
+    expect(long.length).toBeLessThanOrEqual(200);
+    expect(long.endsWith("…")).toBe(true);
+  });
+});
+
+describe("classifyWatchedChange", () => {
+  it("returns undefined when values are structurally equal", () => {
+    expect(classifyWatchedChange("k", ["a"], ["a"])).toBeUndefined();
+    expect(classifyWatchedChange("k", undefined, undefined)).toBeUndefined();
+  });
+
+  it("classifies array shrink / vanish / emptied as external-strip", () => {
+    expect(classifyWatchedChange("k", ["a", "b"], ["a"])?.kind).toBe("external-strip");
+    expect(classifyWatchedChange("k", ["a"], undefined)?.kind).toBe("external-strip");
+    expect(classifyWatchedChange("k", ["a"], [])?.kind).toBe("external-strip");
+  });
+
+  it("classifies other changes as external-other", () => {
+    expect(classifyWatchedChange("k", false, true)?.kind).toBe("external-other");
+    expect(classifyWatchedChange("k", ["a"], ["a", "b"])?.kind).toBe("external-other");
+    expect(classifyWatchedChange("k", undefined, ["a"])?.kind).toBe("external-other");
+  });
+});
+
+describe("formatGuardReport", () => {
+  it("summarizes counts, first/last seen, affected keys and includes event lines", () => {
+    const events: GuardEvent[] = [
+      { timestamp: "2026-06-11T01:00:00.000Z", key: "terminal.integrated.commandsToSkipShell", scope: "global", kind: "external-strip", before: '["a"]', after: "(not set)" },
+      { timestamp: "2026-06-11T01:00:01.000Z", key: "terminal.integrated.commandsToSkipShell", scope: "global", kind: "restore" },
+      { timestamp: "2026-06-11T04:00:00.000Z", key: "nexus.terminal.passthroughKeys", kind: "external-strip", before: '["b"]', after: "[]" },
+    ];
+    const report = formatGuardReport(events, true, "2026-06-11T05:00:00.000Z");
+    expect(report).toContain("Nexus Settings Guard Report");
+    expect(report).toContain("ENABLED");
+    expect(report).toContain("External modifications observed: 2");
+    expect(report).toContain("Automatic restores performed:    1");
+    expect(report).toContain("First seen: 2026-06-11T01:00:00.000Z");
+    expect(report).toContain("Last seen:  2026-06-11T04:00:00.000Z");
+    expect(report).toContain("terminal.integrated.commandsToSkipShell");
+    expect(report).toContain("nexus.terminal.passthroughKeys");
+  });
+
+  it("reports a disabled guard", () => {
+    expect(formatGuardReport([], false, "t")).toContain("DISABLED");
   });
 });

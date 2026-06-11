@@ -145,6 +145,124 @@ export function evaluateRateLimit(
   return null;
 }
 
+export type GuardEventKind =
+  | "external-strip"   // an array value vanished, emptied, or shrank — the corruption signature
+  | "external-other"   // any other non-Nexus change to a watched key
+  | "own-write"        // a write performed by Nexus itself (guard restore or keybinding repair)
+  | "restore"          // the guard wrote a repaired value
+  | "undo"             // the user clicked Undo on a restore toast
+  | "paused"           // rate limit tripped; auto-repair suspended
+  | "resumed";         // the user clicked Resume Guard
+
+export interface GuardEvent {
+  timestamp: string;
+  key: string;
+  scope?: GuardScope;
+  kind: GuardEventKind;
+  before?: string;
+  after?: string;
+  detail?: string;
+}
+
+export const EVENT_LOG_CAP = 50;
+
+/** Append to the persisted forensic log, evicting the oldest entries past the cap. */
+export function appendEvent(
+  log: readonly GuardEvent[],
+  event: GuardEvent,
+  cap: number = EVENT_LOG_CAP
+): GuardEvent[] {
+  const next = [...log, event];
+  return next.length > cap ? next.slice(next.length - cap) : next;
+}
+
+/** Render a setting value for the log: JSON, truncated, with undefined made explicit. */
+export function renderValue(value: unknown, maxLength = 200): string {
+  let rendered: string;
+  if (value === undefined) {
+    rendered = "(not set)";
+  } else {
+    try {
+      rendered = JSON.stringify(value) ?? String(value);
+    } catch {
+      rendered = String(value);
+    }
+  }
+  return rendered.length > maxLength ? `${rendered.slice(0, maxLength - 1)}…` : rendered;
+}
+
+/**
+ * Classify a change to a log-only watched key (everything except the
+ * skip-shell list, which gets the richer per-scope assessment).
+ * Returns undefined when nothing actually changed.
+ */
+export function classifyWatchedChange(
+  key: string,
+  before: unknown,
+  after: unknown
+): { kind: "external-strip" | "external-other"; before: string; after: string } | undefined {
+  if (jsonEqual(before, after)) return undefined;
+  const wasNonEmptyArray = Array.isArray(before) && before.length > 0;
+  const shrank = wasNonEmptyArray && Array.isArray(after) && after.length < (before as unknown[]).length;
+  const vanished = wasNonEmptyArray && (after === undefined || (Array.isArray(after) && after.length === 0));
+  return {
+    kind: shrank || vanished ? "external-strip" : "external-other",
+    before: renderValue(before),
+    after: renderValue(after),
+  };
+}
+
+/** One human-readable line per event, used for the output channel and the report. */
+export function formatEventLine(e: GuardEvent): string {
+  const scope = e.scope ? ` [${e.scope}]` : "";
+  const detail = e.detail ? ` (${e.detail})` : "";
+  const change =
+    e.before !== undefined || e.after !== undefined
+      ? ` ${e.before ?? "?"} -> ${e.after ?? "?"}`
+      : "";
+  return `${e.timestamp} ${e.kind}${detail} ${e.key}${scope}${change}`;
+}
+
+/**
+ * The forensic report handed to corporate IT: summary counts, first/last-seen
+ * timestamps for correlation against endpoint-agent logs, then the event log.
+ */
+export function formatGuardReport(
+  events: readonly GuardEvent[],
+  guardEnabled: boolean,
+  nowIso: string
+): string {
+  const external = events.filter(
+    (e) => e.kind === "external-strip" || e.kind === "external-other"
+  );
+  const strips = external.filter((e) => e.kind === "external-strip");
+  const restores = events.filter((e) => e.kind === "restore");
+  const keys = [...new Set(external.map((e) => e.key))];
+
+  const lines: string[] = [];
+  lines.push("=".repeat(72));
+  lines.push(`Nexus Settings Guard Report — generated ${nowIso}`);
+  lines.push(`Guard auto-repair: ${guardEnabled ? "ENABLED" : "DISABLED"} (nexus.settingsGuard.enabled)`);
+  lines.push("");
+  lines.push(`External modifications observed: ${external.length} (${strips.length} stripped/emptied arrays)`);
+  lines.push(`Automatic restores performed:    ${restores.length}`);
+  if (external.length > 0) {
+    lines.push(`First seen: ${external[0].timestamp}`);
+    lines.push(`Last seen:  ${external[external.length - 1].timestamp}`);
+    lines.push(`Affected settings: ${keys.join(", ")}`);
+  }
+  lines.push("");
+  lines.push("Give this report to your IT team: the timestamps below identify when an");
+  lines.push("external program (e.g. a DLP/endpoint agent) rewrote settings.json, for");
+  lines.push("correlation against agent activity logs. VS Code's Timeline view on the");
+  lines.push("settings.json file (Local History) shows the same rewrites with content.");
+  lines.push("");
+  lines.push(`Event log (${events.length} events, newest last, cap ${EVENT_LOG_CAP}):`);
+  for (const e of events) lines.push(`  ${formatEventLine(e)}`);
+  lines.push("=".repeat(72));
+  return lines.join("\n");
+}
+
 /**
  * Compute a refreshed last-known-good shadow from the current per-scope values.
  *
