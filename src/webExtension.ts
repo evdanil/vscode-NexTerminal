@@ -66,6 +66,7 @@ const unsupportedCommands = [
   "nexus.settings.openLogDir",
   "nexus.settings.resetAll",
   "nexus.settings.fixMacroKeybindings",
+  "nexus.settingsGuard.showReport",
   "nexus.openHighlightRuleEditor",
   "nexus.tunnel.openBrowser",
   "nexus.profile.add",

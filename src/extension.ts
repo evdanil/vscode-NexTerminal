@@ -63,8 +63,11 @@ import { ALL_PASSTHROUGH_KEYS, sanitizePassthroughKeys } from "./services/termin
 import { planSkipShellRepair } from "./services/terminal/skipShellRepair";
 import { detectMacroKeybindingBlockers } from "./services/terminal/macroKeybindingBlockers";
 import { getMacros } from "./macroSettings";
+import { SettingsGuardController, targetToScope } from "./services/terminal/settingsGuardController";
 
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
+/** Set during activate(); lets repairMacroKeybindings mark its writes as Nexus-own. */
+let activeSettingsGuard: SettingsGuardController | undefined;
 const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
 
 function resolveLogRotationOptions(): LoggerRotationOptions {
@@ -109,6 +112,7 @@ async function repairMacroKeybindings(): Promise<void> {
     const configTarget = target === "global-fallback"
       ? vscode.ConfigurationTarget.Global
       : target;
+    activeSettingsGuard?.recordOwnWrite(targetToScope(configTarget), value);
     await termConfig.update("commandsToSkipShell", value, configTarget);
   }
 
@@ -982,6 +986,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const appearanceCommand = vscode.commands.registerCommand("nexus.terminal.appearance", () => {
     TerminalAppearancePanel.open(colorSchemeService);
   });
+  const settingsGuard = new SettingsGuardController(context, MACRO_SKIP_SHELL_COMMANDS);
+  activeSettingsGuard = settingsGuard;
+  settingsGuard.start();
+  const settingsGuardReportCommand = vscode.commands.registerCommand(
+    "nexus.settingsGuard.showReport",
+    () => settingsGuard.showReport()
+  );
   const fixMacroKeybindingsCommand = vscode.commands.registerCommand(
     "nexus.settings.fixMacroKeybindings",
     () => confirmAndRepairMacroKeybindings()
@@ -1019,6 +1030,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     fsRegistration,
     statusBarItem,
     refreshCommand,
+    settingsGuard,
+    settingsGuardReportCommand,
     fixMacroKeybindingsCommand,
     focusSessionCommand,
     filterCommand,

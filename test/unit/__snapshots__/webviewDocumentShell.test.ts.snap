@@ -4738,6 +4738,15 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="validation-error" data-for="nexus.terminal.macros.bufferLength"></span>
   <span class="save-indicator" aria-live="polite" data-for="nexus.terminal.macros.bufferLength"></span>
 </div>
+  <div class="form-group form-group-checkbox">
+  <label for="setting-nexus-settingsGuard-enabled">
+    <input type="checkbox" id="setting-nexus-settingsGuard-enabled" data-section="nexus.settingsGuard" data-key="enabled" checked />
+    Settings Guard
+  </label>
+  
+  <div class="setting-desc">Automatically restore terminal.integrated.commandsToSkipShell when an external program strips it. Forensic logging stays active even when disabled.</div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.settingsGuard.enabled"></span>
+</div>
 
   <div class="terminal-actions button-row">
     <button type="button" class="btn-secondary" id="open-appearance-btn">Terminal Appearance…</button>

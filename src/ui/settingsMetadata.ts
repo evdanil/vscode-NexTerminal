@@ -472,6 +472,16 @@ export const SETTINGS_META: SettingMeta[] = [
       }
     ],
     default: "suspend-all"
+  },
+  {
+    key: "enabled",
+    section: "nexus.settingsGuard",
+    label: "Settings Guard",
+    type: "boolean",
+    category: "terminal",
+    description:
+      "Automatically restore terminal.integrated.commandsToSkipShell when an external program strips it. Forensic logging stays active even when disabled.",
+    default: true
   }
 ];
 

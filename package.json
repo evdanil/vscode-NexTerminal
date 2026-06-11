@@ -477,6 +477,11 @@
         "category": "Nexus"
       },
       {
+        "command": "nexus.settingsGuard.showReport",
+        "title": "Show Settings Guard Report",
+        "category": "Nexus"
+      },
+      {
         "command": "nexus.macro.editor",
         "title": "Macro Editor",
         "category": "Nexus",
@@ -3258,6 +3263,11 @@
           "maximum": 2147483647,
           "order": 24,
           "markdownDescription": "Legacy maximum total runtime for a script in milliseconds. Prefer `nexus.scripts.maxRuntimeSeconds`. 0 disables the cap."
+        },
+        "nexus.settingsGuard.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically restore `terminal.integrated.commandsToSkipShell` entries when an external program (e.g. a corporate DLP/endpoint agent) strips them from `settings.json`. Restores are rate-limited and every restore shows an Undo notification. Forensic logging (see *Nexus: Show Settings Guard Report*) stays active even when this is disabled."
         }
       }
     }

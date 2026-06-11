@@ -152,14 +152,14 @@ describe("SettingsTreeProvider", () => {
       expect(children).toHaveLength(3);
     });
 
-    it("returns 7 children for terminal when passthrough ON", () => {
+    it("returns 8 children for terminal when passthrough ON", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("terminal");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(7);
+      expect(children).toHaveLength(8);
     });
 
-    it("returns 6 children for terminal when passthrough OFF (visibleWhen filtering)", () => {
+    it("returns 7 children for terminal when passthrough OFF (visibleWhen filtering)", () => {
       mockGetConfiguration.mockImplementation(() => ({
         get: (key: string) => {
           if (key === "keyboardPassthrough") return false;
@@ -170,7 +170,7 @@ describe("SettingsTreeProvider", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("terminal");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(6);
+      expect(children).toHaveLength(7);
     });
 
     it("returns 9 children for sftp", () => {
