@@ -71,6 +71,7 @@ export class SettingsGuardController implements vscode.Disposable {
   };
   private restoreTimestamps: number[] = [];
   private paused = false;
+  private disposed = false;
   private readonly watchedSnapshot = new Map<string, unknown>();
   /**
    * In-memory mirror of the persisted event log. recordEvent appends here and
@@ -111,6 +112,7 @@ export class SettingsGuardController implements vscode.Disposable {
   }
 
   dispose(): void {
+    this.disposed = true;
     for (const d of this.disposables) d.dispose();
     this.output.dispose();
   }
@@ -151,8 +153,14 @@ export class SettingsGuardController implements vscode.Disposable {
   }
 
   private async checkSkipShell(): Promise<void> {
+    if (this.disposed) return;
     const config = vscode.workspace.getConfiguration(SKIP_SHELL_SECTION);
     const inspect = config.inspect<string[]>(SKIP_SHELL_LEAF);
+    // Note: workspaceFolderValue is reliably undefined here because this
+    // getConfiguration call has no resource URI — the folder scope is never
+    // captured into the shadow and never restored. The guard protects the
+    // global (user) and workspace levels; the external tool rewrites the
+    // user-level settings.json.
     const current: Record<GuardScope, unknown> = {
       global: inspect?.globalValue,
       workspace: inspect?.workspaceValue,
@@ -202,10 +210,25 @@ export class SettingsGuardController implements vscode.Disposable {
       return;
     }
 
+    const succeeded: ScopeAssessment[] = [];
     for (const a of restores) {
       const value = a.restoreValue as string[];
       this.ownWrites[a.scope] = value;
-      await config.update(SKIP_SHELL_LEAF, value, scopeToTarget(a.scope));
+      try {
+        await config.update(SKIP_SHELL_LEAF, value, scopeToTarget(a.scope));
+      } catch (err) {
+        // Write rejected (e.g. the external tool holds settings.json). Clear the
+        // phantom marker and log it — the next change event retries naturally.
+        this.ownWrites[a.scope] = null;
+        this.recordEvent({
+          timestamp: new Date().toISOString(),
+          key: SKIP_SHELL_FULL,
+          scope: a.scope,
+          kind: "restore-failed",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
       this.recordEvent({
         timestamp: new Date().toISOString(),
         key: SKIP_SHELL_FULL,
@@ -213,9 +236,11 @@ export class SettingsGuardController implements vscode.Disposable {
         kind: "restore",
         after: renderValue(value),
       });
+      succeeded.push(a);
     }
+    if (succeeded.length === 0) return;
     this.restoreTimestamps.push(Date.now());
-    this.showRestoreToast(restores, current);
+    this.showRestoreToast(succeeded, current);
   }
 
   private showRestoreToast(
@@ -230,6 +255,7 @@ export class SettingsGuardController implements vscode.Disposable {
         "Show Report"
       )
       .then(async (choice) => {
+        if (this.disposed) return;
         if (choice === "Undo") {
           await this.undoRestore(restores, preValues);
         } else if (choice === "Disable Guard") {
@@ -293,6 +319,7 @@ export class SettingsGuardController implements vscode.Disposable {
         "Show Report"
       )
       .then((choice) => {
+        if (this.disposed) return;
         if (choice === "Resume Guard") this.resume();
         else if (choice === "Show Report") this.showReport();
       });
@@ -310,6 +337,7 @@ export class SettingsGuardController implements vscode.Disposable {
   }
 
   private recordEvent(event: GuardEvent): void {
+    if (this.disposed) return;
     this.eventLog = appendEvent(this.eventLog, event);
     void this.context.globalState.update(EVENT_LOG_KEY, this.eventLog);
     this.output.appendLine(formatEventLine(event));

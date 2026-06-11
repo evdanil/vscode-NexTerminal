@@ -166,6 +166,7 @@ export type GuardEventKind =
   | "external-other"   // any other non-Nexus change to a watched key
   | "own-write"        // a write performed by Nexus itself (guard restore or keybinding repair)
   | "restore"          // the guard wrote a repaired value
+  | "restore-failed"   // the guard's repair write was rejected (e.g. settings.json locked)
   | "undo"             // the user clicked Undo on a restore toast
   | "paused"           // rate limit tripped; auto-repair suspended
   | "resumed";         // the user clicked Resume Guard

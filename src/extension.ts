@@ -288,6 +288,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
   }
 
+  // Started before the macro-blocker hint so an activation-time auto-restore
+  // settles first and the hint doesn't fire for damage the guard just repaired.
+  const settingsGuard = new SettingsGuardController(context, MACRO_SKIP_SHELL_COMMANDS);
+  activeSettingsGuard = settingsGuard;
+  settingsGuard.start();
+  const settingsGuardReportCommand = vscode.commands.registerCommand(
+    "nexus.settingsGuard.showReport",
+    () => settingsGuard.showReport()
+  );
+
   // Read-only hint: if macro shortcuts are blocked by VS Code settings, point the
   // user at the repair. Runs after the macro store is initialized so getMacros()
   // is populated. Does not block activation.
@@ -986,13 +996,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const appearanceCommand = vscode.commands.registerCommand("nexus.terminal.appearance", () => {
     TerminalAppearancePanel.open(colorSchemeService);
   });
-  const settingsGuard = new SettingsGuardController(context, MACRO_SKIP_SHELL_COMMANDS);
-  activeSettingsGuard = settingsGuard;
-  settingsGuard.start();
-  const settingsGuardReportCommand = vscode.commands.registerCommand(
-    "nexus.settingsGuard.showReport",
-    () => settingsGuard.showReport()
-  );
   const fixMacroKeybindingsCommand = vscode.commands.registerCommand(
     "nexus.settings.fixMacroKeybindings",
     () => confirmAndRepairMacroKeybindings()
