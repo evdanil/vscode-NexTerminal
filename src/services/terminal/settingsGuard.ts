@@ -179,7 +179,12 @@ export interface GuardEvent {
   before?: string;
   after?: string;
   detail?: string;
-  /** Whether the VS Code window was focused when an external change was observed — interactive edits are focused; background agent rewrites are not. */
+  /**
+   * Best-effort hint: VS Code window focus at OBSERVATION time (not write
+   * time). Background agent rewrites usually surface as unfocused and
+   * interactive edits as focused, but the correlation is heuristic — e.g. a
+   * hand-edit of settings.json in an external editor logs as unfocused.
+   */
   focused?: boolean;
 }
 

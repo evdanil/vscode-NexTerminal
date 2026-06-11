@@ -142,6 +142,10 @@ export class SettingsGuardController implements vscode.Disposable {
    * Detection is logged always; healing (removing the corrupt override so the
    * package default applies) is gated on the guard toggle. Raw GLOBAL values
    * only — never effective values.
+   *
+   * A heal produces three log lines by design: the external-strip evidence,
+   * the restore (removed-corrupt-key), and the own-write echo when the
+   * removal's change event consumes its wildcard registry entry.
    */
   private async scanStartupCorruption(): Promise<void> {
     if (this.disposed) return;
