@@ -22,9 +22,15 @@
  *  - Booleans are never auto-flipped; only the skip-shell array is restored.
  *  - A scope is only ever restored if the shadow previously saw it healthy
  *    (containing all required commands) — the guard never invents state.
+ *  - Restore values converge with the repair command's output: orphaned
+ *    commands (ORPHAN_COMMANDS, e.g. "nexus.macro.slot") are filtered out of
+ *    captured shadows and stripped-path restores, and non-string entries are
+ *    dropped — both write paths produce the same canonical string[].
  *
  * Keeping this logic vscode-free makes it trivially unit-testable.
  */
+
+import { ORPHAN_COMMANDS } from "./skipShellRepair";
 
 export type GuardScope = "global" | "workspace" | "workspaceFolder";
 
@@ -59,6 +65,11 @@ export interface ScopeAssessment {
  *    also recovers the user's non-Nexus entries the external tool destroyed.
  *  - stripped (array survives, Nexus entries missing) → conservative: keep the
  *    current array and append only the missing required commands.
+ *    Repair writes are sanitizing: non-string entries and orphaned commands are
+ *    dropped from the value written.
+ *
+ * An empty `requiredCommands` disables the guard entirely (all scopes classify
+ * as none) — the guard never acts without a stake.
  */
 export function assessScopes(
   shadowValues: Partial<Record<GuardScope, string[]>> | undefined,
@@ -66,6 +77,9 @@ export function assessScopes(
   requiredCommands: readonly string[],
   ownWrites: Record<GuardScope, string[] | null>
 ): ScopeAssessment[] {
+  if (requiredCommands.length === 0) {
+    return GUARD_SCOPES.map((scope) => ({ scope, classification: "none" as const }));
+  }
   return GUARD_SCOPES.map((scope) => {
     const cur = current[scope];
     const own = ownWrites[scope];
@@ -87,7 +101,9 @@ export function assessScopes(
       if (cur.length === 0) {
         return { scope, classification: "emptied" as const, restoreValue: [...goodShadow] };
       }
-      const surviving = cur.filter((v): v is string => typeof v === "string");
+      const surviving = cur.filter(
+        (v): v is string => typeof v === "string" && !(ORPHAN_COMMANDS as readonly string[]).includes(v)
+      );
       const missing = requiredCommands.filter((c) => !surviving.includes(c));
       return { scope, classification: "stripped" as const, restoreValue: [...surviving, ...missing] };
     }
@@ -203,6 +219,10 @@ export function classifyWatchedChange(
 ): { kind: "external-strip" | "external-other"; before: string; after: string } | undefined {
   if (jsonEqual(before, after)) return undefined;
   const wasNonEmptyArray = Array.isArray(before) && before.length > 0;
+  // Deliberately count-based: the observed external-tool signature is
+  // drop-to-empty/shorter. Entry-membership comparison was considered and
+  // rejected — for object-array settings (e.g. highlighting.rules) it would
+  // misclassify ordinary user edits as strips and pollute the IT report.
   const shrank = wasNonEmptyArray && Array.isArray(after) && after.length < (before as unknown[]).length;
   const vanished = wasNonEmptyArray && (after === undefined || (Array.isArray(after) && after.length === 0));
   return {
@@ -218,7 +238,7 @@ export function formatEventLine(e: GuardEvent): string {
   const detail = e.detail ? ` (${e.detail})` : "";
   const change =
     e.before !== undefined || e.after !== undefined
-      ? ` ${e.before ?? "?"} -> ${e.after ?? "?"}`
+      ? ` ${e.before ?? "(not recorded)"} -> ${e.after ?? "(not recorded)"}`
       : "";
   return `${e.timestamp} ${e.kind}${detail} ${e.key}${scope}${change}`;
 }
@@ -272,19 +292,25 @@ export function formatGuardReport(
  * "keep the existing shadow" — the shadow is never updated from a corrupt or
  * partially-corrupt state, and is never cleared here (only an explicit Undo
  * clears a scope, in the controller).
+ *
+ * An empty `requiredCommands` disables the guard entirely (no shadow captured)
+ * — the guard never acts without a stake.
  */
 export function computeShadowUpdate(
   current: Record<GuardScope, unknown>,
   requiredCommands: readonly string[],
   nowIso: string
 ): SkipShellShadow | undefined {
+  if (requiredCommands.length === 0) return undefined;
   const values: Partial<Record<GuardScope, string[]>> = {};
   let anyDefined = false;
   for (const scope of GUARD_SCOPES) {
     const cur = current[scope];
     if (cur === undefined) continue;
     if (!Array.isArray(cur) || !containsAll(cur, requiredCommands)) return undefined;
-    values[scope] = cur.filter((v): v is string => typeof v === "string");
+    values[scope] = cur.filter(
+      (v): v is string => typeof v === "string" && !(ORPHAN_COMMANDS as readonly string[]).includes(v)
+    );
     anyDefined = true;
   }
   if (!anyDefined) return undefined;

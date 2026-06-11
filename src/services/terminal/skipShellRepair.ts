@@ -17,7 +17,7 @@
  */
 
 /** Orphaned command that was renamed; must be removed from skip-shell lists during repair. */
-const ORPHAN_COMMANDS = ["nexus.macro.slot"] as const;
+export const ORPHAN_COMMANDS = ["nexus.macro.slot"] as const;
 
 /**
  * A single per-level configuration update to perform.

@@ -11,6 +11,7 @@ import {
   classifyWatchedChange,
   renderValue,
   formatGuardReport,
+  formatEventLine,
   EVENT_LOG_CAP,
   GuardEvent,
 } from "../../src/services/terminal/settingsGuard";
@@ -244,5 +245,47 @@ describe("formatGuardReport", () => {
 
   it("reports a disabled guard", () => {
     expect(formatGuardReport([], false, "t")).toContain("DISABLED");
+  });
+});
+
+describe("R1 review fixes", () => {
+  const GOOD = ["workbench.action.quickOpen", ...REQUIRED];
+
+  it("assessScopes with empty requiredCommands classifies everything as none", () => {
+    const result = assessScopes({ global: GOOD }, current(undefined), [], NO_OWN_WRITES);
+    expect(result.every((a) => a.classification === "none")).toBe(true);
+  });
+
+  it("computeShadowUpdate with empty requiredCommands captures nothing", () => {
+    expect(computeShadowUpdate(current(GOOD), [], "t")).toBeUndefined();
+  });
+
+  it("stripped restore drops orphaned nexus.macro.slot entries", () => {
+    const remaining = ["nexus.macro.slot", "keep.me", "nexus.macro.run"];
+    const result = assessScopes({ global: GOOD }, current(remaining), REQUIRED, NO_OWN_WRITES);
+    const g = result.find((a) => a.scope === "global");
+    expect(g?.classification).toBe("stripped");
+    expect(g?.restoreValue).toEqual(["keep.me", "nexus.macro.run", "nexus.macro.runBinding"]);
+  });
+
+  it("stripped restore drops non-string entries", () => {
+    const remaining = ["keep.me", 42, { bad: true }, "nexus.macro.run"];
+    const result = assessScopes({ global: GOOD }, current(remaining), REQUIRED, NO_OWN_WRITES);
+    expect(result.find((a) => a.scope === "global")?.restoreValue).toEqual([
+      "keep.me",
+      "nexus.macro.run",
+      "nexus.macro.runBinding",
+    ]);
+  });
+
+  it("shadow capture drops orphaned and non-string entries", () => {
+    const dirty = ["nexus.macro.slot", "keep.me", 7, ...REQUIRED];
+    const shadow = computeShadowUpdate(current(dirty), REQUIRED, "t");
+    expect(shadow?.values.global).toEqual(["keep.me", ...REQUIRED]);
+  });
+
+  it("formatEventLine marks one-sided changes as not recorded", () => {
+    const line = formatEventLine({ timestamp: "t", key: "k", kind: "restore", after: '["a"]' });
+    expect(line).toContain('(not recorded) -> ["a"]');
   });
 });
