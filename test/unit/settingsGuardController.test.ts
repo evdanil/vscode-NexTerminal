@@ -339,12 +339,17 @@ describe("SettingsGuardController", () => {
       update: vi.fn((key: string, value: unknown) => new Promise<void>(r => setTimeout(() => { store.set(key, value); r(); }, 0))),
       _store: store,
     };
-    // Both healable keys healthy
-    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: ["b"] });
-    mockConfig.inspectValues.set("nexus.terminal.highlighting.rules", { globalValue: [{ pattern: "x", color: "red" }] });
-
     const controller = new SettingsGuardController(fakeContext(asyncGlobalState as never), []);
     controller.start();
+    // Let the startup scan finish while both keys are still ABSENT — captures
+    // must happen via the single change event below, concurrently. Seeding
+    // before start() would let the startup scan's serialized captures paper
+    // over the lost-update race this test exists to pin.
+    await new Promise(r => setTimeout(r, 10));
+
+    // Both healable keys become healthy at once
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: ["b"] });
+    mockConfig.inspectValues.set("nexus.terminal.highlighting.rules", { globalValue: [{ pattern: "x", color: "red" }] });
 
     // Fire a change event affecting both healable keys simultaneously
     capturedListener!({
