@@ -139,7 +139,7 @@ describe("SettingsGuardController", () => {
 
   it("startup heal: logs external-strip and restore, calls config.update for corrupt passthroughKeys", async () => {
     const gs = makeGlobalState();
-    // Set inspect to return corrupt value (empty array → shouldRemoveCorruptNexusValue returns true)
+    // Set inspect to return corrupt value (empty array → corrupt for passthroughKeys policy)
     mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [] });
     // guard enabled (default — no override in effectiveValues, so get("enabled", true) returns true)
 
@@ -326,5 +326,164 @@ describe("SettingsGuardController", () => {
 
     const otherEvent = log?.find(e => e.key === "nexus.terminal.highlighting.rules" && e.kind === "external-other");
     expect(otherEvent).toBeUndefined();
+  });
+
+  it("multi-key capture race: both healable keys captured when globalState.update is async", async () => {
+    // This test verifies the in-memory mirror prevents the stale read-modify-write
+    // race where concurrent captures for sibling keys (passthroughKeys + highlighting.rules)
+    // would overwrite each other when globalState.update commits asynchronously.
+    const store = new Map<string, unknown>();
+    const asyncGlobalState = {
+      get: <T>(key: string, def?: T): T =>
+        (store.has(key) ? store.get(key) as T : def as T),
+      update: vi.fn((key: string, value: unknown) => new Promise<void>(r => setTimeout(() => { store.set(key, value); r(); }, 0))),
+      _store: store,
+    };
+    // Both healable keys healthy
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: ["b"] });
+    mockConfig.inspectValues.set("nexus.terminal.highlighting.rules", { globalValue: [{ pattern: "x", color: "red" }] });
+
+    const controller = new SettingsGuardController(fakeContext(asyncGlobalState as never), []);
+    controller.start();
+
+    // Fire a change event affecting both healable keys simultaneously
+    capturedListener!({
+      affectsConfiguration: (key: string) =>
+        key === "nexus.terminal.passthroughKeys" || key === "nexus.terminal.highlighting.rules",
+    });
+
+    // Flush all microtasks and timers
+    await new Promise(r => setTimeout(r, 10));
+
+    // Both keys must be present in the persisted shadow
+    const shadows = store.get("nexus.settingsGuard.lastKnownGoodValues") as Record<string, unknown[]> | undefined;
+    expect(shadows?.["nexus.terminal.passthroughKeys"]).toEqual(["b"]);
+    expect(shadows?.["nexus.terminal.highlighting.rules"]).toEqual([{ pattern: "x", color: "red" }]);
+  });
+
+  it("no double logging: live corruption of passthroughKeys produces exactly one external-strip event", async () => {
+    const gs = makeGlobalState();
+    // Pre-seed shadow so the heal path logs restore
+    gs._store.set("nexus.settingsGuard.lastKnownGoodValues", { "nexus.terminal.passthroughKeys": ["b"] });
+    // Effective (for snapshot) is healthy at start
+    mockConfig.effectiveValues.set("nexus.terminal.passthroughKeys", ["b"]);
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: ["b"] });
+
+    const controller = new SettingsGuardController(fakeContext(gs), []);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    const startupLog = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; key: string }> | undefined;
+    // Startup: healthy, no events
+    expect((startupLog ?? []).filter(e => e.key === "nexus.terminal.passthroughKeys")).toHaveLength(0);
+
+    mockConfig.update.mockClear();
+
+    // Now corrupt it via change event
+    mockConfig.effectiveValues.set("nexus.terminal.passthroughKeys", [{}, {}]);
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [{}, {}] });
+    mockState.windowFocused = true;
+
+    capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+    await new Promise(r => setTimeout(r, 0));
+
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; key: string; focused?: boolean }>;
+    const stripEvents = log.filter(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "external-strip");
+    expect(stripEvents).toHaveLength(1);
+    expect(stripEvents[0].focused).toBe(true);
+
+    const restoreEvents = log.filter(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "restore");
+    expect(restoreEvents).toHaveLength(1);
+  });
+
+  it("failed heal write: counts toward cap, wildcard reclaimed so next external is not masked", async () => {
+    const gs = makeGlobalState();
+    gs._store.set("nexus.settingsGuard.lastKnownGoodValues", { "nexus.terminal.passthroughKeys": ["b"] });
+
+    // Make config.update always throw
+    mockConfig.update.mockRejectedValue(new Error("locked"));
+
+    const controller = new SettingsGuardController(fakeContext(gs), []);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    mockConfig.update.mockClear();
+
+    // Drive 4 corrupt change events — should get 3 restore-failed then paused
+    for (let i = 0; i < 4; i++) {
+      mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [{}, {}] });
+      capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+      await new Promise(r => setTimeout(r, 0));
+      // Restore to healthy between events to allow re-detection
+      mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: ["b"] });
+      capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; detail?: string; key: string }>;
+    const failedEvents = log.filter(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "restore-failed");
+    expect(failedEvents.length).toBeLessThanOrEqual(3);
+
+    const pausedEvent = log.find(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "paused" && e.detail === "value-heal-cap");
+    expect(pausedEvent).toBeDefined();
+
+    // After the cap: a genuine external change event should NOT be classified as own-write
+    // (the wildcard registry entries were reclaimed by the failed heals)
+    mockConfig.update.mockResolvedValue(undefined); // restore normal behavior
+    mockConfig.effectiveValues.set("nexus.terminal.passthroughKeys", []);
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [] });
+
+    const logLengthBefore = log.length;
+    capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+    await new Promise(r => setTimeout(r, 0));
+
+    const logAfter = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; key: string }>;
+    const newEvents = logAfter.slice(logLengthBefore);
+    const ownWriteAfterCap = newEvents.find(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "own-write");
+    expect(ownWriteAfterCap).toBeUndefined();
+  });
+
+  it("resume clears value-heal cap so healing works again", async () => {
+    const gs = makeGlobalState();
+    gs._store.set("nexus.settingsGuard.lastKnownGoodValues", { "nexus.terminal.passthroughKeys": ["b"] });
+
+    const controller = new SettingsGuardController(fakeContext(gs), []);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // Set showWarning to resolve "Resume Guard" so resume() is called when toast fires
+    mockState.showWarning.mockResolvedValue("Resume Guard");
+
+    // Exhaust the value heal cap (3 heals) + trigger 4th to hit cap + toast
+    for (let i = 0; i < 3; i++) {
+      mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [{}, {}] });
+      capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+      await new Promise(r => setTimeout(r, 0));
+      mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: ["b"] });
+      capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    // 4th corrupt → cap → toast fires → mockResolvedValue("Resume Guard") → resume() called
+    mockConfig.update.mockClear();
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [{}, {}] });
+    capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+    await new Promise(r => setTimeout(r, 10)); // time for the toast promise to resolve and resume() to run
+
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; detail?: string; key: string }>;
+    const pausedEvent = log.find(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "paused");
+    expect(pausedEvent).toBeDefined();
+    const resumedEvent = log.find(e => e.kind === "resumed");
+    expect(resumedEvent).toBeDefined();
+
+    // After resume, heal works again — trigger another corrupt event
+    mockConfig.update.mockClear();
+    // valueShadows in-memory still has ["b"] from the healthy captures in the loop
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [{}, {}] });
+    capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+    await new Promise(r => setTimeout(r, 0));
+
+    // Heal should fire again (cap was cleared by resume)
+    expect(mockConfig.update).toHaveBeenCalled();
   });
 });

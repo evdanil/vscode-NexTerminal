@@ -15,7 +15,6 @@ import {
   formatEventLine,
   EVENT_LOG_CAP,
   GuardEvent,
-  shouldRemoveCorruptNexusValue,
   assessWatchedValue,
   HEALABLE_KEYS,
   WatchedValuePolicy,
