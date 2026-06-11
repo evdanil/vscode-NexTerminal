@@ -16,6 +16,9 @@ import {
   EVENT_LOG_CAP,
   GuardEvent,
   shouldRemoveCorruptNexusValue,
+  assessWatchedValue,
+  HEALABLE_KEYS,
+  WatchedValuePolicy,
 } from "../../src/services/terminal/settingsGuard";
 
 const REQUIRED = ["nexus.macro.run", "nexus.macro.runBinding"];
@@ -334,35 +337,6 @@ describe("sanitizeShadow (global-scope-only guard)", () => {
   });
 });
 
-describe("shouldRemoveCorruptNexusValue", () => {
-  const PK = "nexus.terminal.passthroughKeys";
-  const HR = "nexus.terminal.highlighting.rules";
-
-  it("never removes an absent override", () => {
-    expect(shouldRemoveCorruptNexusValue(PK, undefined)).toBe(false);
-    expect(shouldRemoveCorruptNexusValue(HR, undefined)).toBe(false);
-  });
-
-  it("removes empty or non-array passthroughKeys", () => {
-    expect(shouldRemoveCorruptNexusValue(PK, [])).toBe(true);
-    expect(shouldRemoveCorruptNexusValue(PK, "junk")).toBe(true);
-    expect(shouldRemoveCorruptNexusValue(PK, { a: 1 })).toBe(true);
-  });
-
-  it("keeps a non-empty passthroughKeys array", () => {
-    expect(shouldRemoveCorruptNexusValue(PK, ["b"])).toBe(false);
-  });
-
-  it("removes only type-corrupt highlighting rules, keeps empty array", () => {
-    expect(shouldRemoveCorruptNexusValue(HR, "junk")).toBe(true);
-    expect(shouldRemoveCorruptNexusValue(HR, [])).toBe(false);
-    expect(shouldRemoveCorruptNexusValue(HR, [{ pattern: "x" }])).toBe(false);
-  });
-
-  it("ignores unknown keys", () => {
-    expect(shouldRemoveCorruptNexusValue("nexus.other", [])).toBe(false);
-  });
-});
 
 describe("formatEventLine focus marker", () => {
   it("appends focused/unfocused when set and omits when undefined", () => {
@@ -371,5 +345,59 @@ describe("formatEventLine focus marker", () => {
     expect(formatEventLine({ ...base, focused: false })).toContain("{unfocused}");
     expect(formatEventLine(base)).not.toContain("{focused}");
     expect(formatEventLine(base)).not.toContain("{unfocused}");
+  });
+});
+
+describe("classifyWatchedChange element-replacement detection", () => {
+  it("classifies same-length {}-replacement as external-strip", () => {
+    expect(classifyWatchedChange("k", ["b", "e"], [{}, {}])?.kind).toBe("external-strip");
+  });
+  it("classifies partial string loss as external-strip", () => {
+    expect(classifyWatchedChange("k", ["b", "e", "g"], ["b", {}, {}])?.kind).toBe("external-strip");
+  });
+  it("keeps object-array edits (zero prior strings) as external-other", () => {
+    expect(classifyWatchedChange("k", [{ pattern: "a" }], [{ pattern: "b" }, { pattern: "c" }])?.kind).toBe("external-other");
+  });
+  it("string additions stay external-other", () => {
+    expect(classifyWatchedChange("k", ["b"], ["b", "e"])?.kind).toBe("external-other");
+  });
+});
+
+describe("assessScopes full restore when every entry destroyed", () => {
+  const GOOD = ["workbench.action.quickOpen", ...REQUIRED];
+  it("restores the full shadow when all surviving entries are non-strings", () => {
+    const result = assessScopes({ global: GOOD }, current([{}, {}]), REQUIRED, NO_OWN_WRITES);
+    const g = result.find((a) => a.scope === "global");
+    expect(g?.classification).toBe("emptied");
+    expect(g?.restoreValue).toEqual(GOOD);
+  });
+  it("still appends conservatively when some user strings survive", () => {
+    const result = assessScopes({ global: GOOD }, current(["keep.me", {}]), REQUIRED, NO_OWN_WRITES);
+    const g = result.find((a) => a.scope === "global");
+    expect(g?.classification).toBe("stripped");
+    expect(g?.restoreValue).toEqual(["keep.me", ...REQUIRED]);
+  });
+});
+
+describe("assessWatchedValue", () => {
+  const PK = HEALABLE_KEYS.find((p) => p.key === "nexus.terminal.passthroughKeys")!;
+  const HR = HEALABLE_KEYS.find((p) => p.key === "nexus.terminal.highlighting.rules")!;
+
+  it("absent override", () => {
+    expect(assessWatchedValue(PK, undefined)).toEqual({ state: "absent" });
+  });
+  it("passthroughKeys: corrupt on non-array, empty, or all-{} arrays", () => {
+    expect(assessWatchedValue(PK, "junk").state).toBe("corrupt");
+    expect(assessWatchedValue(PK, []).state).toBe("corrupt");
+    expect(assessWatchedValue(PK, [{}, {}, {}]).state).toBe("corrupt");
+  });
+  it("passthroughKeys: healthy mixed array captures only strings", () => {
+    expect(assessWatchedValue(PK, ["b", {}, "e"])).toEqual({ state: "healthy", captureValue: ["b", "e"] });
+  });
+  it("rules: empty array is healthy, all-{} is corrupt, valid rules captured", () => {
+    expect(assessWatchedValue(HR, [])).toEqual({ state: "healthy", captureValue: [] });
+    expect(assessWatchedValue(HR, [{}, {}]).state).toBe("corrupt");
+    const rule = { pattern: "x", color: "red" };
+    expect(assessWatchedValue(HR, [rule, {}])).toEqual({ state: "healthy", captureValue: [rule] });
   });
 });

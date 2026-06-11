@@ -104,6 +104,11 @@ export function assessScopes(
       const surviving = cur.filter(
         (v): v is string => typeof v === "string" && !(ORPHAN_COMMANDS as readonly string[]).includes(v)
       );
+      // Every entry was destroyed (e.g. {}-replacement) — restore the full shadow
+      // so the user's non-Nexus entries are recovered too, same as vanished/emptied.
+      if (surviving.length === 0) {
+        return { scope, classification: "emptied" as const, restoreValue: [...goodShadow] };
+      }
       const missing = requiredCommands.filter((c) => !surviving.includes(c));
       return { scope, classification: "stripped" as const, restoreValue: [...surviving, ...missing] };
     }
@@ -215,30 +220,66 @@ export function renderValue(value: unknown, maxLength = 200): string {
   return rendered.length > maxLength ? `${rendered.slice(0, maxLength - 1)}…` : rendered;
 }
 
+/** Validity/heal policy for a watched Nexus-own setting (global scope). */
+export interface WatchedValuePolicy {
+  key: string;
+  /** Is a single array entry meaningful for this setting? */
+  isValidEntry: (entry: unknown) => boolean;
+  /** Is an empty array a legitimate user choice (vs corruption)? */
+  emptyArrayIsValid: boolean;
+}
+
+export const HEALABLE_KEYS: readonly WatchedValuePolicy[] = [
+  {
+    key: "nexus.terminal.passthroughKeys",
+    // The runtime sanitizer accepts known key letters; anything non-string is
+    // destroyed data. Validity here is just "is a string" — unknown strings
+    // are dropped at capture, not treated as corruption.
+    isValidEntry: (e) => typeof e === "string",
+    emptyArrayIsValid: false,
+  },
+  {
+    key: "nexus.terminal.highlighting.rules",
+    // A rule must at least carry a string pattern; the {}-corruption destroys it.
+    isValidEntry: (e) =>
+      typeof e === "object" && e !== null && typeof (e as { pattern?: unknown }).pattern === "string",
+    emptyArrayIsValid: true,
+  },
+];
+
+export type WatchedValueState =
+  | { state: "absent" }                            // no global override
+  | { state: "healthy"; captureValue: unknown[] }  // valid entries to shadow
+  | { state: "corrupt" };                          // heal: restore shadow or remove key
+
 /**
- * Startup-healing policy for Nexus-own settings: should a raw GLOBAL value
- * found at activation be removed so the package default applies again?
+ * Assess the raw GLOBAL value of a healable watched setting.
  *
- * Only keys whose corrupt shape is unambiguous are healed:
- *  - passthroughKeys: an empty or non-array override is never a valid user
- *    choice (the runtime sanitizer already treats it as "all keys") — removing
- *    it heals settings.json AND the native settings UI, which otherwise shows
- *    the broken raw value.
- *  - highlighting.rules: only a non-array (type-corrupt) value — an empty
- *    rules array is a legitimate "no rules" choice and must be kept.
- *
- * The value passed must be the raw per-scope value (inspect().globalValue),
- * never the effective value.
+ * healthy  — array whose entries include at least one valid entry (or a
+ *            legitimately-empty array); captureValue is the valid subset,
+ *            suitable for the last-known-good value shadow.
+ * corrupt  — defined but non-array, an invalid empty array, or a non-empty
+ *            array with ZERO valid entries (the {}-replacement signature).
+ *            Mixed arrays (some valid, some garbage) are treated as healthy
+ *            and captured filtered — conservative: never heal what still
+ *            carries user data.
  */
+export function assessWatchedValue(policy: WatchedValuePolicy, raw: unknown): WatchedValueState {
+  if (raw === undefined) return { state: "absent" };
+  if (!Array.isArray(raw)) return { state: "corrupt" };
+  if (raw.length === 0) {
+    return policy.emptyArrayIsValid ? { state: "healthy", captureValue: [] } : { state: "corrupt" };
+  }
+  const valid = raw.filter(policy.isValidEntry);
+  if (valid.length === 0) return { state: "corrupt" };
+  return { state: "healthy", captureValue: valid };
+}
+
+/** @deprecated superseded by assessWatchedValue; removed once the controller migrates. */
 export function shouldRemoveCorruptNexusValue(key: string, raw: unknown): boolean {
-  if (raw === undefined) return false;
-  if (key === "nexus.terminal.passthroughKeys") {
-    return !Array.isArray(raw) || raw.length === 0;
-  }
-  if (key === "nexus.terminal.highlighting.rules") {
-    return !Array.isArray(raw);
-  }
-  return false;
+  const policy = HEALABLE_KEYS.find((p) => p.key === key);
+  if (!policy) return false;
+  return assessWatchedValue(policy, raw).state === "corrupt";
 }
 
 /**
@@ -252,15 +293,21 @@ export function classifyWatchedChange(
   after: unknown
 ): { kind: "external-strip" | "external-other"; before: string; after: string } | undefined {
   if (jsonEqual(before, after)) return undefined;
-  const wasNonEmptyArray = Array.isArray(before) && before.length > 0;
-  // Deliberately count-based: the observed external-tool signature is
-  // drop-to-empty/shorter. Entry-membership comparison was considered and
-  // rejected — for object-array settings (e.g. highlighting.rules) it would
-  // misclassify ordinary user edits as strips and pollute the IT report.
-  const shrank = wasNonEmptyArray && Array.isArray(after) && after.length < (before as unknown[]).length;
-  const vanished = wasNonEmptyArray && (after === undefined || (Array.isArray(after) && after.length === 0));
+  // Strip detection counts STRING entries, not array length: the observed
+  // external tool replaces every element with {} (depth-limited JSON
+  // re-serialization), leaving length unchanged. Object-array settings
+  // (e.g. highlighting.rules) have zero string entries to begin with, so
+  // ordinary user edits to them still classify as external-other.
+  const countStrings = (v: unknown): number =>
+    Array.isArray(v) ? v.filter((e) => typeof e === "string").length : 0;
+  const beforeStrings = countStrings(before);
+  const wasStringArray = Array.isArray(before) && before.length > 0 && beforeStrings > 0;
+  const stripped =
+    wasStringArray &&
+    (after === undefined ||
+      (Array.isArray(after) && (after.length === 0 || countStrings(after) < beforeStrings)));
   return {
-    kind: shrank || vanished ? "external-strip" : "external-other",
+    kind: stripped ? "external-strip" : "external-other",
     before: renderValue(before),
     after: renderValue(after),
   };
