@@ -5,6 +5,7 @@ import { SETTINGS_META, CATEGORY_LABELS } from "./settingsMetadata";
 import { validateSettingUpdate } from "./settingsValidation";
 import { createWebviewNonce } from "./shared/webviewNonce";
 import { resetSettings } from "./settingsReset";
+import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
 
 /**
  * Pick a sensible `defaultUri` for `vscode.window.showOpenDialog` when the
@@ -199,6 +200,7 @@ export class SettingsPanel {
         }
         try {
           const config = vscode.workspace.getConfiguration(validation.meta.section);
+          recordNexusConfigWrite(`${validation.meta.section}.${validation.meta.key}`, validation.value, Date.now());
           await config.update(validation.meta.key, validation.value, vscode.ConfigurationTarget.Global);
           void this.panel.webview.postMessage({
             type: "saveResult",

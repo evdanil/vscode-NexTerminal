@@ -9,11 +9,13 @@ import {
   formatGuardReport,
   renderValue,
   sanitizeShadow,
+  shouldRemoveCorruptNexusValue,
   type GuardEvent,
   type GuardScope,
   type ScopeAssessment,
   type SkipShellShadow,
 } from "./settingsGuard";
+import { consumeNexusConfigWrite, recordNexusConfigWrite } from "./settingsWriteRegistry";
 
 const SHADOW_KEY = "nexus.settingsGuard.lastKnownGood";
 const EVENT_LOG_KEY = "nexus.settingsGuard.eventLog";
@@ -99,6 +101,7 @@ export class SettingsGuardController implements vscode.Disposable {
     this.disposables.push(
       vscode.workspace.onDidChangeConfiguration((e) => this.onConfigChange(e))
     );
+    void this.scanStartupCorruption();
     this.enqueueCheck();
   }
 
@@ -108,6 +111,19 @@ export class SettingsGuardController implements vscode.Disposable {
   }
 
   showReport(): void {
+    const termInspect = vscode.workspace
+      .getConfiguration("terminal.integrated")
+      .inspect<string[]>("commandsToSkipShell");
+    const lines: string[] = ["", "Current values (VS Code's view — compare against settings.json on disk):"];
+    lines.push(`  terminal.integrated.commandsToSkipShell globalValue:    ${renderValue(termInspect?.globalValue)}`);
+    lines.push(`  terminal.integrated.commandsToSkipShell workspaceValue: ${renderValue(termInspect?.workspaceValue)}`);
+    lines.push(`  terminal.integrated.commandsToSkipShell effective:      ${renderValue(vscode.workspace.getConfiguration("terminal.integrated").get("commandsToSkipShell"))}`);
+    for (const key of ["nexus.terminal.passthroughKeys", "nexus.terminal.highlighting.rules", "terminal.integrated.sendKeybindingsToShell", "window.enableMenuBarMnemonics"]) {
+      const dot = key.lastIndexOf(".");
+      const cfg = vscode.workspace.getConfiguration(key.slice(0, dot));
+      lines.push(`  ${key} globalValue: ${renderValue(cfg.inspect(key.slice(dot + 1))?.globalValue)}`);
+    }
+    this.output.appendLine(lines.join("\n"));
     this.output.appendLine(formatGuardReport(this.eventLog, this.isEnabled(), new Date().toISOString()));
     this.output.show(true);
   }
@@ -116,6 +132,56 @@ export class SettingsGuardController implements vscode.Disposable {
     this.disposed = true;
     for (const d of this.disposables) d.dispose();
     this.output.dispose();
+  }
+
+  /**
+   * Activation-time scan for corruption that predates this session (the
+   * external tool also runs while VS Code is closed). Read-time sanitization
+   * keeps runtime behavior correct, but the corrupt raw value stays in
+   * settings.json and in the native settings UI — confusing and evidence-free.
+   * Detection is logged always; healing (removing the corrupt override so the
+   * package default applies) is gated on the guard toggle. Raw GLOBAL values
+   * only — never effective values.
+   */
+  private async scanStartupCorruption(): Promise<void> {
+    if (this.disposed) return;
+    const healable = ["nexus.terminal.passthroughKeys", "nexus.terminal.highlighting.rules"];
+    for (const fullKey of healable) {
+      const dot = fullKey.lastIndexOf(".");
+      const section = fullKey.slice(0, dot);
+      const leaf = fullKey.slice(dot + 1);
+      const config = vscode.workspace.getConfiguration(section);
+      const raw = config.inspect(leaf)?.globalValue;
+      if (!shouldRemoveCorruptNexusValue(fullKey, raw)) continue;
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: fullKey,
+        scope: "global",
+        kind: "external-strip",
+        detail: "found-at-startup",
+        before: renderValue(raw),
+      });
+      if (!this.isEnabled()) continue;
+      try {
+        recordNexusConfigWrite(fullKey, undefined, Date.now());
+        await config.update(leaf, undefined, vscode.ConfigurationTarget.Global);
+        this.recordEvent({
+          timestamp: new Date().toISOString(),
+          key: fullKey,
+          scope: "global",
+          kind: "restore",
+          detail: "removed-corrupt-key",
+        });
+      } catch (err) {
+        this.recordEvent({
+          timestamp: new Date().toISOString(),
+          key: fullKey,
+          scope: "global",
+          kind: "restore-failed",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   private isEnabled(): boolean {
@@ -136,6 +202,17 @@ export class SettingsGuardController implements vscode.Disposable {
       const before = this.watchedSnapshot.get(key);
       const after = this.readEffective(key);
       this.watchedSnapshot.set(key, after);
+      if (consumeNexusConfigWrite(key, after, Date.now())) {
+        this.recordEvent({
+          timestamp: new Date().toISOString(),
+          key,
+          kind: "own-write",
+          detail: "nexus-ui",
+          before: renderValue(before),
+          after: renderValue(after),
+        });
+        continue;
+      }
       const change = classifyWatchedChange(key, before, after);
       if (change) {
         this.recordEvent({
@@ -144,6 +221,7 @@ export class SettingsGuardController implements vscode.Disposable {
           kind: change.kind,
           before: change.before,
           after: change.after,
+          focused: vscode.window.state.focused,
         });
       }
     }

@@ -64,6 +64,7 @@ import { planSkipShellRepair } from "./services/terminal/skipShellRepair";
 import { detectMacroKeybindingBlockers } from "./services/terminal/macroKeybindingBlockers";
 import { getMacros } from "./macroSettings";
 import { SettingsGuardController, targetToScope } from "./services/terminal/settingsGuardController";
+import { recordNexusConfigWrite } from "./services/terminal/settingsWriteRegistry";
 
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
 /** Set during activate(); lets repairMacroKeybindings mark its writes as Nexus-own. */
@@ -120,8 +121,10 @@ async function repairMacroKeybindings(): Promise<void> {
   // When true the terminal shell receives matched keybindings before VS Code, swallowing macro shortcuts.
   const sendInspect = termConfig.inspect<boolean>("sendKeybindingsToShell");
   if (sendInspect?.globalValue === true) {
+    recordNexusConfigWrite("terminal.integrated.sendKeybindingsToShell", false, Date.now());
     await termConfig.update("sendKeybindingsToShell", false, vscode.ConfigurationTarget.Global);
   } else if (sendInspect?.globalValue === undefined && termConfig.get<boolean>("sendKeybindingsToShell") === true) {
+    recordNexusConfigWrite("terminal.integrated.sendKeybindingsToShell", false, Date.now());
     await termConfig.update("sendKeybindingsToShell", false, vscode.ConfigurationTarget.Global);
   }
 
@@ -130,8 +133,10 @@ async function repairMacroKeybindings(): Promise<void> {
   const winConfig = vscode.workspace.getConfiguration("window");
   const mnemonicInspect = winConfig.inspect<boolean>("enableMenuBarMnemonics");
   if (mnemonicInspect?.globalValue === true) {
+    recordNexusConfigWrite("window.enableMenuBarMnemonics", false, Date.now());
     await winConfig.update("enableMenuBarMnemonics", false, vscode.ConfigurationTarget.Global);
   } else if (mnemonicInspect?.globalValue === undefined && winConfig.get<boolean>("enableMenuBarMnemonics") === true) {
+    recordNexusConfigWrite("window.enableMenuBarMnemonics", false, Date.now());
     await winConfig.update("enableMenuBarMnemonics", false, vscode.ConfigurationTarget.Global);
   }
 }

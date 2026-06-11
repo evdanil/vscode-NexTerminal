@@ -28,6 +28,7 @@ import { isValidBinding } from "../macroBindings";
 import { getMacros, saveMacros, getActiveMacroStore } from "../macroSettings";
 import { validateSettingUpdate } from "../ui/settingsValidation";
 import { SETTINGS_META } from "../ui/settingsMetadata";
+import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
 import { validateAndSanitizeHighlightRules } from "../utils/highlightRuleValidation";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
@@ -199,6 +200,7 @@ async function applySettings(settings: Record<string, unknown>): Promise<void> {
     }
 
     const config = vscode.workspace.getConfiguration(section);
+    recordNexusConfigWrite(fullKey, validation.value, Date.now());
     await config.update(key, validation.value, vscode.ConfigurationTarget.Global);
   }
   if (invalidCount > 0) {
@@ -1295,6 +1297,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // Reset all settings to defaults
     for (const { section, key } of SETTINGS_KEYS) {
       const config = vscode.workspace.getConfiguration(section);
+      recordNexusConfigWrite(`${section}.${key}`, undefined, Date.now());
       await config.update(key, undefined, vscode.ConfigurationTarget.Global);
     }
 

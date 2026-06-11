@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { SettingMeta } from "./settingsMetadata";
+import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
 
 /**
  * Reset the given settings to their defaults by clearing their global-scope
@@ -13,6 +14,7 @@ import type { SettingMeta } from "./settingsMetadata";
 export async function resetSettings(metas: SettingMeta[]): Promise<void> {
   for (const meta of metas) {
     const config = vscode.workspace.getConfiguration(meta.section);
+    recordNexusConfigWrite(`${meta.section}.${meta.key}`, undefined, Date.now());
     await config.update(meta.key, undefined, vscode.ConfigurationTarget.Global);
   }
 }

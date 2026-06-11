@@ -6,6 +6,7 @@ import {
   validateAndSanitizeHighlightRulesWithError,
   type HighlightRule
 } from "../utils/highlightRuleValidation";
+import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
 
 export class HighlightRuleEditorPanel {
   private static instance: HighlightRuleEditorPanel | undefined;
@@ -77,6 +78,7 @@ export class HighlightRuleEditorPanel {
         }
         try {
           const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
+          recordNexusConfigWrite("nexus.terminal.highlighting.rules", validation.rules, Date.now());
           await config.update("rules", validation.rules, vscode.ConfigurationTarget.Global);
           void this.panel.webview.postMessage({ type: "saveResult", ok: true });
         } catch {
@@ -96,6 +98,7 @@ export class HighlightRuleEditorPanel {
         );
         if (confirm === "Reset") {
           const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
+          recordNexusConfigWrite("nexus.terminal.highlighting.rules", undefined, Date.now());
           await config.update("rules", undefined, vscode.ConfigurationTarget.Global);
           this.render();
         }
