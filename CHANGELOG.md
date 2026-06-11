@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [2.8.57] — 2026-06-11
+
+### Fixed
+
+- **The Settings Guard now recognizes and heals the real corruption signature: array elements replaced with `{}`.** Live observation showed the external tool does not drop array keys — it rewrites them with every element turned into an empty object (`["b","e"]` → `[{},{}]`, consistent with depth-limited JSON re-serialization, e.g. PowerShell `ConvertTo-Json` with a low `-Depth`). Strip detection now counts string entries instead of array length, so these rewrites are classified `external-strip` instead of `external-other`, and a skip-shell list whose entries were all destroyed is restored from the full last-known-good copy.
+- **`nexus.terminal.passthroughKeys` and `nexus.terminal.highlighting.rules` are now restored, not just tolerated.** The guard keeps a last-known-good copy of each (globalState `nexus.settingsGuard.lastKnownGoodValues`) and writes it back when the value is destroyed — on live change events as well as at startup. Without a stored copy the corrupt override is removed so package defaults apply. Healing is capped at 3 attempts per setting per session; hitting the cap shows a warning toast with a Resume button. Partially corrupt arrays that still carry user entries are left untouched (only the valid entries are shadowed).
+- One forensic `external-strip` event per corruption (previously the report could double-count healable keys), carrying the window-focus marker.
+
 ## [2.8.56] — 2026-06-11
 
 ### Fixed
