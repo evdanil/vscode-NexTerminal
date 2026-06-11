@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [2.8.56] — 2026-06-11
+
+### Fixed
+
+- **Settings changed through Nexus's own UI are no longer logged as "external" in the Settings Guard report.** All Nexus write paths (settings panel, reset-to-defaults, backup import, highlight rule editor, the keybinding repair) now register their writes, so the forensic report only flags genuinely external modifications. Remaining external events carry a `{focused}`/`{unfocused}` marker — background agent rewrites typically surface while the window is unfocused, helping IT separate them from interactive edits.
+- **Corruption that happened while VS Code was closed is now detected and healed at startup.** A corrupt global override of `nexus.terminal.passthroughKeys` (empty or non-array — e.g. stripped by an external tool overnight) or a type-corrupt `nexus.terminal.highlighting.rules` is logged as evidence and removed so the package defaults apply again. This also fixes the native VS Code settings UI showing an empty passthrough key list that users felt compelled to rebuild by hand. Healing respects `nexus.settingsGuard.enabled`; an empty `highlighting.rules` array is a valid "no rules" choice and is never touched.
+- **"Nexus: Show Settings Guard Report" now prints current per-scope values** of the watched settings (VS Code's live view), so a mismatch against the `settings.json` on disk — e.g. corporate folder redirection or an external rewrite race — is diagnosable on the affected machine.
+
 ## [2.8.55] — 2026-06-11
 
 ### Added
