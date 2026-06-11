@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   assessScopes,
+  computeShadowUpdate,
+  evaluateRateLimit,
+  SESSION_RESTORE_CAP,
+  BURST_CAP,
+  BURST_WINDOW_MS,
   GuardScope,
 } from "../../src/services/terminal/settingsGuard";
 
@@ -93,5 +98,70 @@ describe("assessScopes", () => {
     expect(result.find((a) => a.scope === "global")?.classification).toBe("healthy");
     expect(result.find((a) => a.scope === "workspace")?.classification).toBe("vanished");
     expect(result.find((a) => a.scope === "workspaceFolder")?.classification).toBe("none");
+  });
+});
+
+describe("computeShadowUpdate", () => {
+  const GOOD = ["workbench.action.quickOpen", ...REQUIRED];
+
+  it("captures all defined healthy scopes", () => {
+    const shadow = computeShadowUpdate(current(GOOD, GOOD), REQUIRED, "2026-06-11T00:00:00.000Z");
+    expect(shadow).toEqual({
+      values: { global: GOOD, workspace: GOOD },
+      updatedAt: "2026-06-11T00:00:00.000Z",
+    });
+  });
+
+  it("returns undefined when any defined scope is unhealthy (keep old shadow)", () => {
+    expect(computeShadowUpdate(current(GOOD, []), REQUIRED, "t")).toBeUndefined();
+    expect(computeShadowUpdate(current(["other"]), REQUIRED, "t")).toBeUndefined();
+    expect(computeShadowUpdate(current("corrupt"), REQUIRED, "t")).toBeUndefined();
+  });
+
+  it("returns undefined when no scope has an override (nothing to shadow)", () => {
+    expect(computeShadowUpdate(current(), REQUIRED, "t")).toBeUndefined();
+  });
+
+  it("drops non-string entries when capturing", () => {
+    const shadow = computeShadowUpdate(current([...GOOD, 42 as unknown as string]), REQUIRED, "t");
+    expect(shadow?.values.global).toEqual(GOOD);
+  });
+});
+
+describe("evaluateRateLimit", () => {
+  const MIN = 60_000;
+
+  it("allows restores under both limits", () => {
+    expect(evaluateRateLimit([], 0)).toBeNull();
+    expect(evaluateRateLimit([0, 20 * MIN], 40 * MIN)).toBeNull();
+  });
+
+  it("pauses at the session cap", () => {
+    // 12 prior restores spread far apart (no burst) → 13th blocked by session cap.
+    const stamps = Array.from({ length: SESSION_RESTORE_CAP }, (_, i) => i * 3 * 60 * MIN);
+    expect(evaluateRateLimit(stamps, stamps[stamps.length - 1] + 3 * 60 * MIN)).toBe("session-cap");
+  });
+
+  it("allows exactly the session cap minus one to pass without burst", () => {
+    const stamps = Array.from({ length: SESSION_RESTORE_CAP - 1 }, (_, i) => i * 3 * 60 * MIN);
+    expect(evaluateRateLimit(stamps, stamps[stamps.length - 1] + 3 * 60 * MIN)).toBeNull();
+  });
+
+  it("pauses on a burst: BURST_CAP restores inside the window", () => {
+    const now = 100 * MIN;
+    const stamps = [now - 9 * MIN, now - 5 * MIN, now - MIN]; // 3 within 10 min
+    expect(evaluateRateLimit(stamps, now)).toBe("burst");
+  });
+
+  it("does not count restores older than the burst window", () => {
+    const now = 100 * MIN;
+    const stamps = [now - BURST_WINDOW_MS - MIN, now - 5 * MIN, now - MIN]; // only 2 recent
+    expect(evaluateRateLimit(stamps, now)).toBeNull();
+  });
+
+  it("never triggers burst on a ~3-hour external rewrite cycle", () => {
+    const cycle = 3 * 60 * MIN;
+    const stamps = Array.from({ length: BURST_CAP + 2 }, (_, i) => i * cycle);
+    expect(evaluateRateLimit(stamps, stamps[stamps.length - 1] + 1000)).toBeNull();
   });
 });

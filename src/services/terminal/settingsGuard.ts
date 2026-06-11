@@ -120,3 +120,55 @@ export function jsonEqual(a: unknown, b: unknown): boolean {
     return false;
   }
 }
+
+/** Session-wide restore cap. Sized for multi-day sessions against a ~3 h external rewrite cycle. */
+export const SESSION_RESTORE_CAP = 12;
+/** Burst guard: this many restores inside BURST_WINDOW_MS means a write-war — pause. */
+export const BURST_CAP = 3;
+export const BURST_WINDOW_MS = 10 * 60 * 1000;
+
+export type PauseReason = "session-cap" | "burst";
+
+/**
+ * Decide whether the NEXT restore is allowed, given the timestamps (ms) of
+ * restores already performed this session. Returns the pause reason, or null
+ * if the restore may proceed.
+ */
+export function evaluateRateLimit(
+  restoreTimestampsMs: readonly number[],
+  nowMs: number
+): PauseReason | null {
+  if (restoreTimestampsMs.length >= SESSION_RESTORE_CAP) return "session-cap";
+  const windowStart = nowMs - BURST_WINDOW_MS;
+  const recent = restoreTimestampsMs.filter((t) => t > windowStart);
+  if (recent.length >= BURST_CAP) return "burst";
+  return null;
+}
+
+/**
+ * Compute a refreshed last-known-good shadow from the current per-scope values.
+ *
+ * Returns the new shadow only when the observed state is fully healthy: at
+ * least one scope has an override, and EVERY defined scope is a string array
+ * containing all required commands. Any other state returns undefined, meaning
+ * "keep the existing shadow" — the shadow is never updated from a corrupt or
+ * partially-corrupt state, and is never cleared here (only an explicit Undo
+ * clears a scope, in the controller).
+ */
+export function computeShadowUpdate(
+  current: Record<GuardScope, unknown>,
+  requiredCommands: readonly string[],
+  nowIso: string
+): SkipShellShadow | undefined {
+  const values: Partial<Record<GuardScope, string[]>> = {};
+  let anyDefined = false;
+  for (const scope of GUARD_SCOPES) {
+    const cur = current[scope];
+    if (cur === undefined) continue;
+    if (!Array.isArray(cur) || !containsAll(cur, requiredCommands)) return undefined;
+    values[scope] = cur.filter((v): v is string => typeof v === "string");
+    anyDefined = true;
+  }
+  if (!anyDefined) return undefined;
+  return { values, updatedAt: nowIso };
+}
