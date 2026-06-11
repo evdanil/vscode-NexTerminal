@@ -167,9 +167,9 @@ describe("SettingsGuardController", () => {
     );
   });
 
-  it("startup no-op: healthy passthroughKeys globalValue produces no events and no update call", async () => {
+  it("startup no-op: healthy passthroughKeys globalValue produces no events and no config.update call", async () => {
     const gs = makeGlobalState();
-    // Non-empty array → shouldRemoveCorruptNexusValue returns false
+    // Non-empty array → healthy, captures shadow but does NOT write config
     mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: ["b"] });
 
     const controller = new SettingsGuardController(fakeContext(gs), []);
@@ -178,7 +178,125 @@ describe("SettingsGuardController", () => {
 
     const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<unknown> | undefined;
     expect(log ?? []).toHaveLength(0);
+    // mockConfig.update is vscode.workspace.getConfiguration(...).update — should NOT be called
+    // (gs.update IS called for shadow capture, but that's globalState.update, not config.update)
     expect(mockConfig.update).not.toHaveBeenCalled();
+  });
+
+  it("capture then restore-from-shadow: healthy then corrupt fires restored-from-shadow", async () => {
+    const gs = makeGlobalState();
+    // 1) Set healthy value BEFORE start so scanStartupCorruption captures the shadow
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: ["b", "e"] });
+    const controller = new SettingsGuardController(fakeContext(gs), []);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // Verify shadow was stored
+    const shadows = gs._store.get("nexus.settingsGuard.lastKnownGoodValues") as Record<string, unknown[]> | undefined;
+    expect(shadows?.["nexus.terminal.passthroughKeys"]).toEqual(["b", "e"]);
+
+    mockConfig.update.mockClear();
+
+    // 2) Corrupt value — {}-element replacement
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [{}, {}] });
+    // Fire change event for passthroughKeys
+    capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+    await new Promise(r => setTimeout(r, 0));
+
+    // config.update called with restored shadow value
+    expect(mockConfig.update).toHaveBeenCalledWith("passthroughKeys", ["b", "e"], vscode.ConfigurationTarget.Global);
+
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; detail?: string; key: string }>;
+    const stripEvent = log?.find(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "external-strip" && e.detail === "corrupt-value");
+    expect(stripEvent).toBeDefined();
+    const restoreEvent = log?.find(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "restore" && e.detail === "restored-from-shadow");
+    expect(restoreEvent).toBeDefined();
+  });
+
+  it("no shadow → removes corrupt key", async () => {
+    const gs = makeGlobalState();
+    // No shadow in globalState, corrupt value
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [{}, {}] });
+
+    const controller = new SettingsGuardController(fakeContext(gs), []);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(mockConfig.update).toHaveBeenCalledWith("passthroughKeys", undefined, vscode.ConfigurationTarget.Global);
+
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; detail?: string; key: string }>;
+    const restoreEvent = log?.find(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "restore" && e.detail === "removed-corrupt-key");
+    expect(restoreEvent).toBeDefined();
+  });
+
+  it("heal cap: 4th corruption does not call update, emits paused event", async () => {
+    const gs = makeGlobalState();
+    // Pre-seed a shadow so heals use restore-from-shadow path
+    gs._store.set("nexus.settingsGuard.lastKnownGoodValues", { "nexus.terminal.passthroughKeys": ["b"] });
+
+    const controller = new SettingsGuardController(fakeContext(gs), []);
+    controller.start();
+
+    for (let i = 0; i < 3; i++) {
+      mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [{}, {}] });
+      capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+      await new Promise(r => setTimeout(r, 0));
+      // Reset to healthy so next iteration starts fresh
+      mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: ["b"] });
+      capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    // 4th corruption
+    mockConfig.update.mockClear();
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [{}, {}] });
+    capturedListener!({ affectsConfiguration: (key: string) => key === "nexus.terminal.passthroughKeys" });
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(mockConfig.update).not.toHaveBeenCalled();
+
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; detail?: string; key: string }>;
+    const pausedEvent = log?.find(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "paused" && e.detail === "value-heal-cap");
+    expect(pausedEvent).toBeDefined();
+  });
+
+  it("mixed array captured filtered: healthy with invalid entries captures only valid subset", async () => {
+    const gs = makeGlobalState();
+    // Mixed array: strings + objects
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: ["b", {}, "e"] });
+
+    const controller = new SettingsGuardController(fakeContext(gs), []);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // Shadow should contain only the valid (string) entries
+    const shadows = gs._store.get("nexus.settingsGuard.lastKnownGoodValues") as Record<string, unknown[]> | undefined;
+    expect(shadows?.["nexus.terminal.passthroughKeys"]).toEqual(["b", "e"]);
+
+    // No heal should have occurred (healthy with valid entries)
+    expect(mockConfig.update).not.toHaveBeenCalled();
+  });
+
+  it("rules empty array: highlighting.rules with [] captures shadow, no heal", async () => {
+    const gs = makeGlobalState();
+    // Empty array is valid for highlighting.rules (emptyArrayIsValid=true)
+    mockConfig.inspectValues.set("nexus.terminal.highlighting.rules", { globalValue: [] });
+
+    const controller = new SettingsGuardController(fakeContext(gs), []);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // Shadow should capture empty array
+    const shadows = gs._store.get("nexus.settingsGuard.lastKnownGoodValues") as Record<string, unknown[]> | undefined;
+    expect(shadows?.["nexus.terminal.highlighting.rules"]).toEqual([]);
+
+    // No heal write
+    expect(mockConfig.update).not.toHaveBeenCalled();
+
+    // No external-strip event
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; key: string }> | undefined;
+    const stripEvent = log?.find(e => e.key === "nexus.terminal.highlighting.rules" && e.kind === "external-strip");
+    expect(stripEvent).toBeUndefined();
   });
 
   it("classifies structurally equal but distinct highlighting.rules objects as own-write", async () => {

@@ -275,12 +275,6 @@ export function assessWatchedValue(policy: WatchedValuePolicy, raw: unknown): Wa
   return { state: "healthy", captureValue: valid };
 }
 
-/** @deprecated superseded by assessWatchedValue; removed once the controller migrates. */
-export function shouldRemoveCorruptNexusValue(key: string, raw: unknown): boolean {
-  const policy = HEALABLE_KEYS.find((p) => p.key === key);
-  if (!policy) return false;
-  return assessWatchedValue(policy, raw).state === "corrupt";
-}
 
 /**
  * Classify a change to a log-only watched key (everything except the

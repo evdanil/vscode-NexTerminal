@@ -2,22 +2,26 @@ import * as vscode from "vscode";
 import {
   appendEvent,
   assessScopes,
+  assessWatchedValue,
   classifyWatchedChange,
   computeShadowUpdate,
   evaluateRateLimit,
   formatEventLine,
   formatGuardReport,
+  HEALABLE_KEYS,
+  jsonEqual,
   renderValue,
   sanitizeShadow,
-  shouldRemoveCorruptNexusValue,
   type GuardEvent,
   type GuardScope,
   type ScopeAssessment,
   type SkipShellShadow,
+  type WatchedValuePolicy,
 } from "./settingsGuard";
 import { consumeNexusConfigWrite, recordNexusConfigWrite } from "./settingsWriteRegistry";
 
 const SHADOW_KEY = "nexus.settingsGuard.lastKnownGood";
+const VALUE_SHADOW_KEY = "nexus.settingsGuard.lastKnownGoodValues";
 const EVENT_LOG_KEY = "nexus.settingsGuard.eventLog";
 const SKIP_SHELL_SECTION = "terminal.integrated";
 const SKIP_SHELL_LEAF = "commandsToSkipShell";
@@ -84,6 +88,9 @@ export class SettingsGuardController implements vscode.Disposable {
   private eventLog: GuardEvent[] = [];
   /** Serializes checkSkipShell runs so a restore's own change event can't interleave. */
   private checkChain: Promise<void> = Promise.resolve();
+  /** Per-key, per-session heal cap — a write-war on a nexus.* key pauses healing for that key. */
+  private readonly valueHealCounts = new Map<string, number>();
+  private static readonly MAX_VALUE_HEALS_PER_KEY = 3;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -134,57 +141,115 @@ export class SettingsGuardController implements vscode.Disposable {
     this.output.dispose();
   }
 
+  private loadValueShadows(): Record<string, unknown[]> {
+    const raw = this.context.globalState.get<unknown>(VALUE_SHADOW_KEY);
+    if (typeof raw !== "object" || raw === null) return {};
+    const result: Record<string, unknown[]> = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (Array.isArray(v)) result[k] = v;
+    }
+    return result;
+  }
+
+  /**
+   * Capture-or-heal one healable Nexus-own setting (global scope only).
+   * healthy → refresh the value shadow (filtered to valid entries).
+   * corrupt → log evidence; when the guard is enabled, restore the shadowed
+   * value, or remove the override when no shadow exists (package defaults
+   * apply). Healing also runs on live change events — the external tool
+   * rewrites settings.json while VS Code is running.
+   */
+  private async captureOrHealWatchedValue(
+    policy: WatchedValuePolicy,
+    trigger: "startup" | "change-event"
+  ): Promise<void> {
+    if (this.disposed) return;
+    const dot = policy.key.lastIndexOf(".");
+    const section = policy.key.slice(0, dot);
+    const leaf = policy.key.slice(dot + 1);
+    const config = vscode.workspace.getConfiguration(section);
+    const raw = config.inspect(leaf)?.globalValue;
+    const assessment = assessWatchedValue(policy, raw);
+
+    if (assessment.state === "absent") return;
+
+    if (assessment.state === "healthy") {
+      const shadows = this.loadValueShadows();
+      if (!jsonEqual(shadows[policy.key], assessment.captureValue)) {
+        shadows[policy.key] = assessment.captureValue;
+        await this.context.globalState.update(VALUE_SHADOW_KEY, shadows);
+      }
+      return;
+    }
+
+    // corrupt
+    this.recordEvent({
+      timestamp: new Date().toISOString(),
+      key: policy.key,
+      scope: "global",
+      kind: "external-strip",
+      detail: trigger === "startup" ? "found-at-startup" : "corrupt-value",
+      before: renderValue(raw),
+    });
+    if (!this.isEnabled()) return;
+    const healCount = this.valueHealCounts.get(policy.key) ?? 0;
+    if (healCount >= SettingsGuardController.MAX_VALUE_HEALS_PER_KEY) {
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: policy.key,
+        scope: "global",
+        kind: "paused",
+        detail: "value-heal-cap",
+      });
+      return;
+    }
+    const shadow = this.loadValueShadows()[policy.key];
+    const restoreValue = shadow !== undefined ? shadow : undefined;
+    try {
+      recordNexusConfigWrite(policy.key, restoreValue, Date.now());
+      await config.update(leaf, restoreValue, vscode.ConfigurationTarget.Global);
+      this.valueHealCounts.set(policy.key, healCount + 1);
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: policy.key,
+        scope: "global",
+        kind: "restore",
+        detail: restoreValue !== undefined ? "restored-from-shadow" : "removed-corrupt-key",
+        after: renderValue(restoreValue),
+      });
+    } catch (err) {
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: policy.key,
+        scope: "global",
+        kind: "restore-failed",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   /**
    * Activation-time scan for corruption that predates this session (the
    * external tool also runs while VS Code is closed). Read-time sanitization
    * keeps runtime behavior correct, but the corrupt raw value stays in
    * settings.json and in the native settings UI — confusing and evidence-free.
-   * Detection is logged always; healing (removing the corrupt override so the
-   * package default applies) is gated on the guard toggle. Raw GLOBAL values
-   * only — never effective values.
+   * Detection is logged always; healing (restoring from shadow, or removing the
+   * corrupt override so the package default applies) is gated on the guard
+   * toggle. Raw GLOBAL values only — never effective values.
+   *
+   * Also captures healthy values into the value shadow so the restore path
+   * has material to work with. Healing also runs on live change events via
+   * captureOrHealWatchedValue.
    *
    * A heal produces three log lines by design: the external-strip evidence,
-   * the restore (removed-corrupt-key), and the own-write echo when the
-   * removal's change event consumes its wildcard registry entry.
+   * the restore (removed-corrupt-key or restored-from-shadow), and the
+   * own-write echo when the removal's change event consumes its wildcard
+   * registry entry.
    */
   private async scanStartupCorruption(): Promise<void> {
     if (this.disposed) return;
-    const healable = ["nexus.terminal.passthroughKeys", "nexus.terminal.highlighting.rules"];
-    for (const fullKey of healable) {
-      const dot = fullKey.lastIndexOf(".");
-      const section = fullKey.slice(0, dot);
-      const leaf = fullKey.slice(dot + 1);
-      const config = vscode.workspace.getConfiguration(section);
-      const raw = config.inspect(leaf)?.globalValue;
-      if (!shouldRemoveCorruptNexusValue(fullKey, raw)) continue;
-      this.recordEvent({
-        timestamp: new Date().toISOString(),
-        key: fullKey,
-        scope: "global",
-        kind: "external-strip",
-        detail: "found-at-startup",
-        before: renderValue(raw),
-      });
-      if (!this.isEnabled()) continue;
-      try {
-        recordNexusConfigWrite(fullKey, undefined, Date.now());
-        await config.update(leaf, undefined, vscode.ConfigurationTarget.Global);
-        this.recordEvent({
-          timestamp: new Date().toISOString(),
-          key: fullKey,
-          scope: "global",
-          kind: "restore",
-          detail: "removed-corrupt-key",
-        });
-      } catch (err) {
-        this.recordEvent({
-          timestamp: new Date().toISOString(),
-          key: fullKey,
-          scope: "global",
-          kind: "restore-failed",
-          detail: err instanceof Error ? err.message : String(err),
-        });
-      }
+    for (const policy of HEALABLE_KEYS) {
+      await this.captureOrHealWatchedValue(policy, "startup");
     }
   }
 
@@ -215,6 +280,8 @@ export class SettingsGuardController implements vscode.Disposable {
           before: renderValue(before),
           after: renderValue(after),
         });
+        const healableOwn = HEALABLE_KEYS.find((p) => p.key === key);
+        if (healableOwn) void this.captureOrHealWatchedValue(healableOwn, "change-event");
         continue;
       }
       const change = classifyWatchedChange(key, before, after);
@@ -228,6 +295,8 @@ export class SettingsGuardController implements vscode.Disposable {
           focused: vscode.window.state.focused,
         });
       }
+      const healable = HEALABLE_KEYS.find((p) => p.key === key);
+      if (healable) void this.captureOrHealWatchedValue(healable, "change-event");
     }
   }
 
