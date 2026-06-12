@@ -61,7 +61,7 @@ import type { SshConnectionOptions } from "./services/ssh/ssh2Connector";
 import { resolveScriptMaxRuntimeMs } from "./services/scripts/maxRuntime";
 import { ALL_PASSTHROUGH_KEYS, sanitizePassthroughKeys } from "./services/terminal/passthroughKeys";
 import { planSkipShellRepair } from "./services/terminal/skipShellRepair";
-import { detectMacroKeybindingBlockers } from "./services/terminal/macroKeybindingBlockers";
+import { detectMacroKeybindingBlockers, SKIP_SHELL_BLOCKER } from "./services/terminal/macroKeybindingBlockers";
 import { getMacros } from "./macroSettings";
 import { SettingsGuardController, targetToScope } from "./services/terminal/settingsGuardController";
 import { recordNexusConfigWrite } from "./services/terminal/settingsWriteRegistry";
@@ -181,11 +181,21 @@ async function maybeWarnMacroKeybindingsBlocked(context: vscode.ExtensionContext
     enableMenuBarMnemonics: winConfig.get("enableMenuBarMnemonics"),
     requiredCommands: MACRO_SKIP_SHELL_COMMANDS
   });
-  if (blockers.length === 0) return;
+  // The Settings Guard auto-repairs commandsToSkipShell when enabled, so warning
+  // about that specific blocker here is redundant — drop it unless the guard is off.
+  // The two boolean blockers (sendKeybindingsToShell, enableMenuBarMnemonics) are
+  // NOT auto-fixed by the guard, so they are always kept.
+  const guardEnabled = vscode.workspace
+    .getConfiguration("nexus.settingsGuard")
+    .get<boolean>("enabled", true);
+  const shownBlockers = guardEnabled
+    ? blockers.filter((b) => b !== SKIP_SHELL_BLOCKER)
+    : blockers;
+  if (shownBlockers.length === 0) return;
 
   macroBlockerHintShownThisSession = true;
   const choice = await vscode.window.showWarningMessage(
-    `Nexus macro shortcuts are blocked by VS Code settings: ${blockers[0]}. Fix now?`,
+    `Nexus macro shortcuts are blocked by VS Code settings: ${shownBlockers[0]}. Fix now?`,
     "Fix Keybindings",
     "Don't Show Again"
   );

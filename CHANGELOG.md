@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.59] — 2026-06-12
+
+### Fixed
+
+- **No more redundant "macro shortcuts are blocked — Fix now?" prompt for the skip-shell list.** Since the Settings Guard now auto-repairs `terminal.integrated.commandsToSkipShell`, the proactive hint no longer warns about that blocker while the guard is enabled. It still appears for the settings the guard does not auto-fix (`terminal.integrated.sendKeybindingsToShell`, `window.enableMenuBarMnemonics`), and still appears for the skip-shell list if you have disabled the guard (`nexus.settingsGuard.enabled`).
+
 ## [2.8.58] — 2026-06-12
 
 ### Fixed
