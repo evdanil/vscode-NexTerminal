@@ -2,7 +2,12 @@
 
 ## [Unreleased]
 
-## [2.8.57] — 2026-06-11
+## [2.8.58] — 2026-06-12
+
+### Fixed
+
+- **The Settings Guard now recovers `terminal.integrated.commandsToSkipShell` even with no prior backup.** Previously it could only restore the macro skip-shell entries if it had earlier captured a healthy copy — so damage that happened while VS Code was closed (or on a fresh install) left it with nothing to restore and it silently did nothing, and macros stayed dead. It now rebuilds the list from VS Code's own default skip-shell commands plus the Nexus macro commands (`nexus.macro.run` / `nexus.macro.runBinding`), so recovery no longer depends on a snapshot. This only runs when you have macros defined. Unlike `nexus.terminal.passthroughKeys` — which has an all-keys default and therefore self-heals when corrupted — `commandsToSkipShell` has no default containing the Nexus commands, which is why it needs to be written back explicitly.
+- **The manual "Fix Macro Keybindings" repair no longer writes corrupted entries back.** When the skip-shell list had been mangled into `[{}, {}]`, the repair preserved those empty-object entries; it now drops all non-string entries before writing.
 
 ### Fixed
 

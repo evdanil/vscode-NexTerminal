@@ -359,10 +359,11 @@ export class SettingsGuardController implements vscode.Disposable {
     // Gate required commands and fallback base on whether macros are defined.
     // Empty required makes assessScopes classify everything none — guard stays
     // inert for skip-shell when there are no macros, and captures no shadow.
-    const required = this.hasMacros() ? this.requiredCommands : [];
+    const macrosPresent = this.hasMacros();
+    const required = macrosPresent ? this.requiredCommands : [];
     const rawDefault = inspect?.defaultValue;
     const fallbackBases =
-      this.hasMacros() && Array.isArray(rawDefault)
+      macrosPresent && Array.isArray(rawDefault)
         ? { global: rawDefault.filter((c): c is string => typeof c === "string") }
         : undefined;
 
