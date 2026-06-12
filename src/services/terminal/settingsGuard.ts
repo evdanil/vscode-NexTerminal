@@ -70,12 +70,19 @@ export interface ScopeAssessment {
  *
  * An empty `requiredCommands` disables the guard entirely (all scopes classify
  * as none) — the guard never acts without a stake.
+ *
+ * Shadow-free recovery: when no healthy shadow exists for a scope, an optional
+ * `fallbackBases` map can supply a VS Code default skip-shell list (read from
+ * the resolved effective value). The guard then rebuilds the scope from that
+ * base plus the required commands — enabling recovery for damage-while-closed
+ * and fresh installs where no shadow has ever been captured.
  */
 export function assessScopes(
   shadowValues: Partial<Record<GuardScope, string[]>> | undefined,
   current: Record<GuardScope, unknown>,
   requiredCommands: readonly string[],
-  ownWrites: Record<GuardScope, string[] | null>
+  ownWrites: Record<GuardScope, string[] | null>,
+  fallbackBases?: Partial<Record<GuardScope, string[]>>
 ): ScopeAssessment[] {
   if (requiredCommands.length === 0) {
     return GUARD_SCOPES.map((scope) => ({ scope, classification: "none" as const }));
@@ -93,29 +100,54 @@ export function assessScopes(
         ? rawShadow
         : undefined;
 
+    const rawFallback = fallbackBases?.[scope];
+    const fallbackBase = rawFallback
+      ? rawFallback.filter((v): v is string => typeof v === "string")
+      : undefined;
+
     if (Array.isArray(cur)) {
       if (containsAll(cur, requiredCommands)) {
         return { scope, classification: "healthy" as const };
       }
-      if (!goodShadow) return { scope, classification: "none" as const };
-      if (cur.length === 0) {
-        return { scope, classification: "emptied" as const, restoreValue: [...goodShadow] };
-      }
+      // Compute surviving strings (non-string entries and orphans dropped).
       const surviving = cur.filter(
         (v): v is string => typeof v === "string" && !(ORPHAN_COMMANDS as readonly string[]).includes(v)
       );
-      // Every entry was destroyed (e.g. {}-replacement) — restore the full shadow
-      // so the user's non-Nexus entries are recovered too, same as vanished/emptied.
-      if (surviving.length === 0) {
-        return { scope, classification: "emptied" as const, restoreValue: [...goodShadow] };
+      if (goodShadow) {
+        // Shadow takes precedence.
+        if (cur.length === 0 || surviving.length === 0) {
+          return { scope, classification: "emptied" as const, restoreValue: [...goodShadow] };
+        }
+        const missing = requiredCommands.filter((c) => !surviving.includes(c));
+        return { scope, classification: "stripped" as const, restoreValue: [...surviving, ...missing] };
       }
-      const missing = requiredCommands.filter((c) => !surviving.includes(c));
-      return { scope, classification: "stripped" as const, restoreValue: [...surviving, ...missing] };
+      // No shadow — try fallback base.
+      if (surviving.length > 0) {
+        const missing = requiredCommands.filter((c) => !surviving.includes(c));
+        return { scope, classification: "stripped" as const, restoreValue: [...surviving, ...missing] };
+      }
+      if (fallbackBase) {
+        const missingFromFallback = requiredCommands.filter((c) => !fallbackBase.includes(c));
+        return {
+          scope,
+          classification: "emptied" as const,
+          restoreValue: [...fallbackBase, ...missingFromFallback],
+        };
+      }
+      return { scope, classification: "none" as const };
     }
 
     if (cur === undefined) {
       if (goodShadow) {
         return { scope, classification: "vanished" as const, restoreValue: [...goodShadow] };
+      }
+      if (fallbackBase) {
+        const missingFromFallback = requiredCommands.filter((c) => !fallbackBase.includes(c));
+        return {
+          scope,
+          classification: "vanished" as const,
+          restoreValue: [...fallbackBase, ...missingFromFallback],
+        };
       }
       return { scope, classification: "none" as const };
     }
@@ -123,6 +155,14 @@ export function assessScopes(
     // Defined but not an array — corrupt type (string, object, null, …).
     if (goodShadow) {
       return { scope, classification: "corrupt-type" as const, restoreValue: [...goodShadow] };
+    }
+    if (fallbackBase) {
+      const missingFromFallback = requiredCommands.filter((c) => !fallbackBase.includes(c));
+      return {
+        scope,
+        classification: "corrupt-type" as const,
+        restoreValue: [...fallbackBase, ...missingFromFallback],
+      };
     }
     return { scope, classification: "none" as const };
   });

@@ -6,6 +6,8 @@
  *    NOTE: `nexus.macro.slot` is still a registered back-compat command alias
  *    (macroCommands.ts) — we remove it only from the skip-shell list during an
  *    explicit confirm-gated repair; the command itself is not unregistered.
+ *  - Drop non-string entries (e.g. `{}` objects from DLP {}-replacement corruption)
+ *    so the repaired array is always a clean `string[]`.
  *  - Append any `commands` that are missing from each user-level value.
  *  - Emit a write action only when the resulting array differs from the current value.
  *  - Fallback path (no user-level value at any inspected level): if one or more
@@ -54,8 +56,11 @@ export function planSkipShellRepair<T>(
     if (value === undefined) continue;
     patchedAny = true;
 
-    // Drop all orphaned entries, then add any missing required commands.
-    const cleaned = value.filter((cmd) => !(ORPHAN_COMMANDS as readonly string[]).includes(cmd));
+    // Drop non-string entries and all orphaned entries, then add any missing required commands.
+    const cleaned = value.filter(
+      (cmd): cmd is string =>
+        typeof cmd === "string" && !(ORPHAN_COMMANDS as readonly string[]).includes(cmd)
+    );
     const missing = commands.filter((cmd) => !cleaned.includes(cmd));
     const next = missing.length > 0 ? [...cleaned, ...missing] : cleaned;
 
