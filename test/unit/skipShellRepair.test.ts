@@ -200,4 +200,17 @@ describe("planSkipShellRepair", () => {
       expect(writes).toHaveLength(0);
     });
   });
+
+  describe("non-string entry sanitization", () => {
+    it("drops non-string entries when repairing a corrupted level", () => {
+      const writes = planSkipShellRepair(
+        levels([{}, {}, "nexus.macro.run"] as unknown as string[]),
+        ["nexus.macro.run"],
+        REQUIRED
+      );
+      expect(writes).toHaveLength(1);
+      expect(writes[0].value).toEqual(["nexus.macro.run", "nexus.macro.runBinding"]);
+      expect(writes[0].value.every((v) => typeof v === "string")).toBe(true);
+    });
+  });
 });

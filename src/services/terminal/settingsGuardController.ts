@@ -102,7 +102,8 @@ export class SettingsGuardController implements vscode.Disposable {
 
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly requiredCommands: readonly string[]
+    private readonly requiredCommands: readonly string[],
+    private readonly hasMacros: () => boolean = () => true
   ) {
     this.output = vscode.window.createOutputChannel("Nexus Settings Guard");
   }
@@ -354,7 +355,19 @@ export class SettingsGuardController implements vscode.Disposable {
       workspaceFolder: undefined,
     };
     const shadow = sanitizeShadow(this.context.globalState.get(SHADOW_KEY));
-    const assessments = assessScopes(shadow?.values, current, this.requiredCommands, this.ownWrites);
+
+    // Gate required commands and fallback base on whether macros are defined.
+    // Empty required makes assessScopes classify everything none — guard stays
+    // inert for skip-shell when there are no macros, and captures no shadow.
+    const macrosPresent = this.hasMacros();
+    const required = macrosPresent ? this.requiredCommands : [];
+    const rawDefault = inspect?.defaultValue;
+    const fallbackBases =
+      macrosPresent && Array.isArray(rawDefault)
+        ? { global: rawDefault.filter((c): c is string => typeof c === "string") }
+        : undefined;
+
+    const assessments = assessScopes(shadow?.values, current, required, this.ownWrites, fallbackBases);
 
     // Consume own-write markers once observed.
     for (const a of assessments) {
@@ -371,7 +384,7 @@ export class SettingsGuardController implements vscode.Disposable {
 
     const restores = assessments.filter((a) => a.restoreValue !== undefined);
     if (restores.length === 0) {
-      const update = computeShadowUpdate(current, this.requiredCommands, new Date().toISOString());
+      const update = computeShadowUpdate(current, required, new Date().toISOString());
       if (update) await this.context.globalState.update(SHADOW_KEY, update);
       return;
     }

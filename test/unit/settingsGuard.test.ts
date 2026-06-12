@@ -400,3 +400,54 @@ describe("assessWatchedValue", () => {
     expect(assessWatchedValue(HR, [rule, {}])).toEqual({ state: "healthy", captureValue: [rule] });
   });
 });
+
+describe("assessScopes shadow-free recovery via fallbackBase", () => {
+  const VSCODE_DEFAULT = ["workbench.action.terminal.focusNext", "workbench.action.quickOpen"];
+  const fb = { global: VSCODE_DEFAULT };
+
+  it("recovers {}-mangled global with no shadow: vscode default + macro commands", () => {
+    // The exact field signature: ["nexus.macro.run","nexus.macro.runBinding"] -> [{},{}]
+    const result = assessScopes(undefined, current([{}, {}]), REQUIRED, NO_OWN_WRITES, fb);
+    const g = result.find((a) => a.scope === "global");
+    expect(g?.classification).toBe("emptied");
+    expect(g?.restoreValue).toEqual([...VSCODE_DEFAULT, ...REQUIRED]);
+  });
+
+  it("recovers a vanished key with no shadow from the fallback base", () => {
+    const result = assessScopes(undefined, current(undefined), REQUIRED, NO_OWN_WRITES, fb);
+    const g = result.find((a) => a.scope === "global");
+    expect(g?.classification).toBe("vanished");
+    expect(g?.restoreValue).toEqual([...VSCODE_DEFAULT, ...REQUIRED]);
+  });
+
+  it("recovers a corrupt non-array with no shadow from the fallback base", () => {
+    const result = assessScopes(undefined, current("garbage"), REQUIRED, NO_OWN_WRITES, fb);
+    expect(result.find((a) => a.scope === "global")?.restoreValue).toEqual([...VSCODE_DEFAULT, ...REQUIRED]);
+  });
+
+  it("prefers the user's surviving custom entries over the fallback base", () => {
+    const result = assessScopes(undefined, current(["my.custom.cmd", {}]), REQUIRED, NO_OWN_WRITES, fb);
+    const g = result.find((a) => a.scope === "global");
+    expect(g?.classification).toBe("stripped");
+    expect(g?.restoreValue).toEqual(["my.custom.cmd", ...REQUIRED]);
+  });
+
+  it("a healthy shadow still takes precedence over the fallback base", () => {
+    const shadow = { global: ["shadow.cmd", ...REQUIRED] };
+    const result = assessScopes(shadow, current([{}, {}]), REQUIRED, NO_OWN_WRITES, fb);
+    expect(result.find((a) => a.scope === "global")?.restoreValue).toEqual(["shadow.cmd", ...REQUIRED]);
+  });
+
+  it("without a fallback base AND without a shadow, still classifies none (unchanged)", () => {
+    const result = assessScopes(undefined, current([{}, {}]), REQUIRED, NO_OWN_WRITES);
+    expect(result.find((a) => a.scope === "global")?.classification).toBe("none");
+  });
+
+  it("does not duplicate a macro command already present in the fallback base", () => {
+    const fbWithMacro = { global: ["workbench.action.quickOpen", "nexus.macro.run"] };
+    const result = assessScopes(undefined, current(undefined), REQUIRED, NO_OWN_WRITES, fbWithMacro);
+    expect(result.find((a) => a.scope === "global")?.restoreValue).toEqual([
+      "workbench.action.quickOpen", "nexus.macro.run", "nexus.macro.runBinding",
+    ]);
+  });
+});
