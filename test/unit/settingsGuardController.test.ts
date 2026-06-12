@@ -9,7 +9,7 @@ const mockState = {
 
 const mockConfig = {
   effectiveValues: new Map<string, unknown>(),
-  inspectValues: new Map<string, { globalValue?: unknown }>(),
+  inspectValues: new Map<string, { globalValue?: unknown; defaultValue?: unknown }>(),
   update: vi.fn(async () => {}),
 };
 
@@ -446,6 +446,60 @@ describe("SettingsGuardController", () => {
     const newEvents = logAfter.slice(logLengthBefore);
     const ownWriteAfterCap = newEvents.find(e => e.key === "nexus.terminal.passthroughKeys" && e.kind === "own-write");
     expect(ownWriteAfterCap).toBeUndefined();
+  });
+
+  it("shadow-free recovery: no shadow + mangled global + hasMacros=true => writes fallback+required", async () => {
+    const gs = makeGlobalState();
+    // No shadow. Global value is corrupt ({},{} = mangled). VS Code default is known.
+    mockConfig.inspectValues.set("terminal.integrated.commandsToSkipShell", {
+      globalValue: [{}, {}],
+      defaultValue: ["workbench.action.quickOpen"],
+    });
+
+    const requiredCommands = ["nexus.macro.run", "nexus.macro.runBinding"];
+    const controller = new SettingsGuardController(fakeContext(gs), requiredCommands, () => true);
+    controller.start();
+
+    // Allow checkSkipShell (via enqueueCheck on start) to complete
+    await new Promise(r => setTimeout(r, 0));
+
+    // config.update must write the fallback default + required commands
+    expect(mockConfig.update).toHaveBeenCalledWith(
+      "commandsToSkipShell",
+      ["workbench.action.quickOpen", "nexus.macro.run", "nexus.macro.runBinding"],
+      vscode.ConfigurationTarget.Global
+    );
+
+    // A restore event must be logged
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; scope?: string; key: string }>;
+    const restoreEvent = log?.find(e => e.key === "terminal.integrated.commandsToSkipShell" && e.kind === "restore");
+    expect(restoreEvent).toBeDefined();
+  });
+
+  it("shadow-free recovery: no shadow + mangled global + hasMacros=false => guard inert, no config.update", async () => {
+    const gs = makeGlobalState();
+    // Same mangled state as above but no macros.
+    mockConfig.inspectValues.set("terminal.integrated.commandsToSkipShell", {
+      globalValue: [{}, {}],
+      defaultValue: ["workbench.action.quickOpen"],
+    });
+
+    const requiredCommands = ["nexus.macro.run", "nexus.macro.runBinding"];
+    const controller = new SettingsGuardController(fakeContext(gs), requiredCommands, () => false);
+    controller.start();
+
+    await new Promise(r => setTimeout(r, 0));
+
+    // No config.update for commandsToSkipShell — guard is inert without macros
+    const skipShellCalls = mockConfig.update.mock.calls.filter(
+      (args) => args[0] === "commandsToSkipShell"
+    );
+    expect(skipShellCalls).toHaveLength(0);
+
+    // No restore event logged
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; key: string }> | undefined;
+    const restoreEvent = (log ?? []).find(e => e.key === "terminal.integrated.commandsToSkipShell" && e.kind === "restore");
+    expect(restoreEvent).toBeUndefined();
   });
 
   it("resume clears value-heal cap so healing works again", async () => {

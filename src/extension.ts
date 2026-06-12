@@ -296,7 +296,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Started before the macro-blocker hint as a best-effort head start. The hint
   // reads config synchronously, so on overnight damage both notifications can
   // still appear once: the stale hint plus the guard's restore toast.
-  const settingsGuard = new SettingsGuardController(context, MACRO_SKIP_SHELL_COMMANDS);
+  const settingsGuard = new SettingsGuardController(
+    context,
+    MACRO_SKIP_SHELL_COMMANDS,
+    () => getMacros().length > 0
+  );
   activeSettingsGuard = settingsGuard;
   settingsGuard.start();
   const settingsGuardReportCommand = vscode.commands.registerCommand(
