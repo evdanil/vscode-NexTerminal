@@ -18,6 +18,7 @@ import {
   type WatchedValuePolicy,
 } from "./settingsGuard";
 import { consumeNexusConfigWrite, recordNexusConfigWrite } from "./settingsWriteRegistry";
+import { deriveUserSettingsPath, hasUtf8Bom, stripUtf8Bom } from "./settingsFileBom";
 
 const SHADOW_KEY = "nexus.settingsGuard.lastKnownGood";
 const VALUE_SHADOW_KEY = "nexus.settingsGuard.lastKnownGoodValues";
@@ -162,6 +163,96 @@ export class SettingsGuardController implements vscode.Disposable {
   }
 
   /**
+   * Remove a leading UTF-8 BOM from the active-profile user settings.json.
+   *
+   * The corporate DLP rewrites settings.json as UTF-8-with-BOM; VS Code's
+   * settings writer refuses to persist into a file whose JSON has a parse error,
+   * and a leading BOM is exactly such an error (InvalidSymbol at offset 0). The
+   * in-memory heal still works (macros keep functioning), but the disk write
+   * silently never lands. Stripping the BOM first lets the subsequent
+   * config.update heal persist. The strip changes no config value, so it cannot
+   * be done after the write (no change event would re-trigger the heal).
+   *
+   * PROFILE-SAFETY: `ExtensionContext.globalStorageUri` always resolves to the
+   * DEFAULT profile's path, never a named profile's path (VS Code issue #160466).
+   * To avoid writing to the wrong file, we parse the BOM-stripped bytes and
+   * verify that the value for `verifyKey` matches `expectedGlobalValue` (what
+   * VS Code is actually reading). On a mismatch we record a "bom-strip-skipped"
+   * event and return false without writing. This check is sound because:
+   *   - DLP output is strict JSON modulo the BOM (no comments, no trailing
+   *     commas) so JSON.parse succeeds on exactly the files we care about.
+   *   - Comment-bearing user-authored settings.json is saved WITHOUT a BOM and
+   *     therefore never reaches this code.
+   *   - On any parse failure or value mismatch we decline to write.
+   *
+   * Best-effort and quiet on the common path: a missing/unreadable settings.json
+   * (fresh user, in-memory test context) returns false with no event. Only a
+   * failed WRITE — the interesting forensic case — is logged.
+   * Returns true when a BOM was found and removed.
+   */
+  private async stripSettingsBomIfPresent(
+    reason: string,
+    verifyKey: string,
+    expectedGlobalValue: unknown
+  ): Promise<boolean> {
+    if (this.disposed) return false;
+    let uri: vscode.Uri;
+    let bytes: Uint8Array;
+    try {
+      uri = vscode.Uri.file(deriveUserSettingsPath(this.context.globalStorageUri.fsPath));
+      bytes = await vscode.workspace.fs.readFile(uri);
+    } catch {
+      return false; // missing/unreadable — nothing to do, not noteworthy
+    }
+    if (!hasUtf8Bom(bytes)) return false;
+    // Profile-safety: parse the BOM-stripped content and confirm the key's
+    // value matches what VS Code reports. If they diverge, the derived path
+    // points to a different profile's settings.json — do not write.
+    const stripped = stripUtf8Bom(bytes);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(Buffer.from(stripped).toString("utf8"));
+    } catch {
+      return false; // unparseable after BOM strip — not a DLP-rewritten file
+    }
+    const fileValue =
+      parsed && typeof parsed === "object"
+        ? (parsed as Record<string, unknown>)[verifyKey]
+        : undefined;
+    // When the key vanished entirely both sides are undefined and this matches —
+    // intentional: the legitimate same-profile "vanished" heal still needs the BOM
+    // gone so config.update can re-add the key. The only action is BOM removal
+    // (value-preserving), so the loosened match in that edge is harmless.
+    if (!jsonEqual(fileValue, expectedGlobalValue)) {
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: "settings.json",
+        kind: "bom-strip-skipped",
+        detail: "profile-mismatch:" + reason,
+      });
+      return false;
+    }
+    try {
+      await vscode.workspace.fs.writeFile(uri, stripped);
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: "settings.json",
+        kind: "bom-stripped",
+        detail: reason,
+      });
+      return true;
+    } catch (err) {
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: "settings.json",
+        kind: "bom-strip-failed",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
+  /**
    * Capture-or-heal one healable Nexus-own setting (global scope only).
    * healthy → refresh the value shadow (filtered to valid entries).
    * corrupt → log evidence; when the guard is enabled, restore the shadowed
@@ -230,6 +321,7 @@ export class SettingsGuardController implements vscode.Disposable {
       }
       return;
     }
+    await this.stripSettingsBomIfPresent(`value-heal:${policy.key}`, policy.key, raw);
     const restoreValue = this.valueShadows[policy.key];
     try {
       recordNexusConfigWrite(policy.key, restoreValue, Date.now());
@@ -410,6 +502,7 @@ export class SettingsGuardController implements vscode.Disposable {
       return;
     }
 
+    await this.stripSettingsBomIfPresent("skip-shell-restore", SKIP_SHELL_FULL, current.global);
     const succeeded: ScopeAssessment[] = [];
     for (const a of restores) {
       const value = a.restoreValue as string[];

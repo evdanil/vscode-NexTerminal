@@ -214,7 +214,10 @@ export type GuardEventKind =
   | "restore-failed"   // the guard's repair write was rejected (e.g. settings.json locked)
   | "undo"             // the user clicked Undo on a restore toast
   | "paused"           // rate limit tripped; auto-repair suspended
-  | "resumed";         // the user clicked Resume Guard
+  | "resumed"          // the user clicked Resume Guard
+  | "bom-stripped"      // the guard removed a UTF-8 BOM from settings.json so heal writes can persist
+  | "bom-strip-failed"  // the BOM-removal write was rejected
+  | "bom-strip-skipped"; // derived settings.json isn't the active profile's file — declined to write
 
 export interface GuardEvent {
   timestamp: string;
