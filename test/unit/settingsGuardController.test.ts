@@ -13,6 +13,8 @@ const mockConfig = {
   update: vi.fn(async () => {}),
 };
 
+const mockFs = { files: new Map<string, Uint8Array>() };
+
 let capturedListener: ((e: { affectsConfiguration: (key: string) => boolean }) => void) | undefined;
 
 vi.mock("vscode", () => ({
@@ -29,6 +31,16 @@ vi.mock("vscode", () => ({
       inspect: (leaf: string) => mockConfig.inspectValues.get(`${section}.${leaf}`),
       update: mockConfig.update,
     }),
+    fs: {
+      readFile: vi.fn(async (uri: { fsPath: string }) => {
+        const b = mockFs.files.get(uri.fsPath);
+        if (!b) throw new Error("ENOENT");
+        return b;
+      }),
+      writeFile: vi.fn(async (uri: { fsPath: string }, data: Uint8Array) => {
+        mockFs.files.set(uri.fsPath, data);
+      }),
+    },
   },
   window: {
     get state() {
@@ -46,6 +58,9 @@ vi.mock("vscode", () => ({
     Global: 1,
     Workspace: 2,
     WorkspaceFolder: 3,
+  },
+  Uri: {
+    file: (p: string) => ({ fsPath: p, path: p }),
   },
 }));
 
@@ -69,6 +84,7 @@ function fakeContext(gs: ReturnType<typeof makeGlobalState>): vscode.ExtensionCo
   return {
     globalState: gs,
     subscriptions: [],
+    globalStorageUri: { fsPath: "/userdata/User/globalStorage/sentriflow.vscode-nexterminal" } as never,
   } as never;
 }
 
@@ -79,6 +95,9 @@ describe("SettingsGuardController", () => {
     mockConfig.inspectValues.clear();
     mockConfig.update.mockClear();
     (vscode.workspace.onDidChangeConfiguration as ReturnType<typeof vi.fn>).mockClear();
+    (vscode.workspace.fs.readFile as ReturnType<typeof vi.fn>).mockClear();
+    (vscode.workspace.fs.writeFile as ReturnType<typeof vi.fn>).mockClear();
+    mockFs.files.clear();
     capturedListener = undefined;
     mockState.windowFocused = true;
     mockState.showWarning.mockClear();
@@ -544,5 +563,273 @@ describe("SettingsGuardController", () => {
 
     // Heal should fire again (cap was cleared by resume)
     expect(mockConfig.update).toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------------
+  // BOM-stripping tests
+  // ---------------------------------------------------------------------------
+
+  it("skip-shell heal strips BOM before persisting", async () => {
+    const gs = makeGlobalState();
+    // Corrupt skip-shell: no shadow, but fallback default gives recovery material
+    mockConfig.inspectValues.set("terminal.integrated.commandsToSkipShell", {
+      globalValue: [{}, {}],
+      defaultValue: ["workbench.action.quickOpen"],
+    });
+    // Seed settings.json with BOM prefix — content must match inspect globalValue for profile-safety check
+    const fileContent = '{"terminal.integrated.commandsToSkipShell":[{},{}]}';
+    mockFs.files.set(
+      "/userdata/User/settings.json",
+      new Uint8Array([0xef, 0xbb, 0xbf, ...Buffer.from(fileContent, "utf8")])
+    );
+
+    const requiredCommands = ["nexus.macro.run", "nexus.macro.runBinding"];
+    const controller = new SettingsGuardController(fakeContext(gs), requiredCommands, () => true);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // writeFile must have been called for the settings.json path with no BOM
+    const writeCalls = (vscode.workspace.fs.writeFile as ReturnType<typeof vi.fn>).mock.calls as [{ fsPath: string }, Uint8Array][];
+    const bomWriteCall = writeCalls.find(([uri]) => uri.fsPath === "/userdata/User/settings.json");
+    expect(bomWriteCall).toBeDefined();
+    // First byte of the written data must not be 0xef (BOM removed)
+    expect(bomWriteCall![1][0]).toBe(0x7b);
+    // Full content check: written bytes should equal the file content without BOM
+    expect(Buffer.from(bomWriteCall![1]).toString("utf8")).toBe(fileContent);
+
+    // config.update must have been called for commandsToSkipShell
+    expect(mockConfig.update).toHaveBeenCalledWith(
+      "commandsToSkipShell",
+      expect.arrayContaining(["nexus.macro.run", "nexus.macro.runBinding"]),
+      vscode.ConfigurationTarget.Global
+    );
+
+    // Event log must contain a bom-stripped event
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; key: string }>;
+    const bomEvent = log?.find(e => e.kind === "bom-stripped" && e.key === "settings.json");
+    expect(bomEvent).toBeDefined();
+  });
+
+  it("no BOM → no fs write, heal still calls config.update for commandsToSkipShell", async () => {
+    const gs = makeGlobalState();
+    mockConfig.inspectValues.set("terminal.integrated.commandsToSkipShell", {
+      globalValue: [{}, {}],
+      defaultValue: ["workbench.action.quickOpen"],
+    });
+    // Seed settings.json WITHOUT a BOM
+    mockFs.files.set("/userdata/User/settings.json", new Uint8Array([0x7b, 0x7d]));
+
+    const requiredCommands = ["nexus.macro.run", "nexus.macro.runBinding"];
+    const controller = new SettingsGuardController(fakeContext(gs), requiredCommands, () => true);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // writeFile must NOT have been called (no BOM to strip)
+    expect(vscode.workspace.fs.writeFile).not.toHaveBeenCalled();
+
+    // config.update still called to restore commandsToSkipShell
+    expect(mockConfig.update).toHaveBeenCalledWith(
+      "commandsToSkipShell",
+      expect.arrayContaining(["nexus.macro.run", "nexus.macro.runBinding"]),
+      vscode.ConfigurationTarget.Global
+    );
+  });
+
+  it("value heal (passthroughKeys) strips BOM before persisting", async () => {
+    const gs = makeGlobalState();
+    // Seed shadow so heal can restore from it
+    gs._store.set("nexus.settingsGuard.lastKnownGoodValues", { "nexus.terminal.passthroughKeys": ["b"] });
+    // Corrupt passthroughKeys via inspect
+    mockConfig.inspectValues.set("nexus.terminal.passthroughKeys", { globalValue: [{}, {}] });
+    // Seed settings.json with BOM — content must match inspect globalValue for profile-safety check
+    const fileContent = '{"nexus.terminal.passthroughKeys":[{},{}]}';
+    mockFs.files.set(
+      "/userdata/User/settings.json",
+      new Uint8Array([0xef, 0xbb, 0xbf, ...Buffer.from(fileContent, "utf8")])
+    );
+
+    const controller = new SettingsGuardController(fakeContext(gs), []);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // writeFile called with stripped bytes
+    const writeCalls = (vscode.workspace.fs.writeFile as ReturnType<typeof vi.fn>).mock.calls as [{ fsPath: string }, Uint8Array][];
+    const bomWriteCall = writeCalls.find(([uri]) => uri.fsPath === "/userdata/User/settings.json");
+    expect(bomWriteCall).toBeDefined();
+    expect(bomWriteCall![1][0]).toBe(0x7b);
+    // Full content check: written bytes should equal the file content without BOM
+    expect(Buffer.from(bomWriteCall![1]).toString("utf8")).toBe(fileContent);
+
+    // config.update called for passthroughKeys
+    expect(mockConfig.update).toHaveBeenCalledWith(
+      "passthroughKeys",
+      ["b"],
+      vscode.ConfigurationTarget.Global
+    );
+
+    // bom-stripped event in log
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; key: string }>;
+    const bomEvent = log?.find(e => e.kind === "bom-stripped" && e.key === "settings.json");
+    expect(bomEvent).toBeDefined();
+  });
+
+  it("settings.json unreadable → no crash, heal still attempts config.update, no bom events", async () => {
+    const gs = makeGlobalState();
+    mockConfig.inspectValues.set("terminal.integrated.commandsToSkipShell", {
+      globalValue: [{}, {}],
+      defaultValue: ["workbench.action.quickOpen"],
+    });
+    // Do NOT seed any file in mockFs — readFile will throw ENOENT
+
+    const requiredCommands = ["nexus.macro.run", "nexus.macro.runBinding"];
+    const controller = new SettingsGuardController(fakeContext(gs), requiredCommands, () => true);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // Must not throw; config.update still called for skip-shell restore
+    expect(mockConfig.update).toHaveBeenCalledWith(
+      "commandsToSkipShell",
+      expect.arrayContaining(["nexus.macro.run", "nexus.macro.runBinding"]),
+      vscode.ConfigurationTarget.Global
+    );
+
+    // No bom-stripped or bom-strip-failed events
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string }> | undefined;
+    const bomEvents = (log ?? []).filter(e => e.kind === "bom-stripped" || e.kind === "bom-strip-failed");
+    expect(bomEvents).toHaveLength(0);
+  });
+
+  it("guard disabled → no BOM strip and no config.update for commandsToSkipShell", async () => {
+    const gs = makeGlobalState();
+    mockConfig.effectiveValues.set("nexus.settingsGuard.enabled", false);
+    mockConfig.inspectValues.set("terminal.integrated.commandsToSkipShell", {
+      globalValue: [{}, {}],
+      defaultValue: ["workbench.action.quickOpen"],
+    });
+    // Seed settings.json with BOM — matching-content so the profile-safety check would pass if reached
+    const fileContent = '{"terminal.integrated.commandsToSkipShell":[{},{}]}';
+    mockFs.files.set(
+      "/userdata/User/settings.json",
+      new Uint8Array([0xef, 0xbb, 0xbf, ...Buffer.from(fileContent, "utf8")])
+    );
+
+    const requiredCommands = ["nexus.macro.run", "nexus.macro.runBinding"];
+    const controller = new SettingsGuardController(fakeContext(gs), requiredCommands, () => true);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // writeFile must NOT be called — guard is disabled
+    expect(vscode.workspace.fs.writeFile).not.toHaveBeenCalled();
+
+    // config.update must NOT be called for commandsToSkipShell — guard is disabled
+    const skipShellCalls = mockConfig.update.mock.calls.filter(
+      (args) => args[0] === "commandsToSkipShell"
+    );
+    expect(skipShellCalls).toHaveLength(0);
+  });
+
+  it("profile mismatch → declines to write, bom-strip-skipped event logged", async () => {
+    const gs = makeGlobalState();
+    // Corrupt skip-shell: inspect globalValue is [{},{}], fallback gives recovery material
+    mockConfig.inspectValues.set("terminal.integrated.commandsToSkipShell", {
+      globalValue: [{}, {}],
+      defaultValue: ["workbench.action.quickOpen"],
+    });
+    // macros present
+    mockConfig.effectiveValues.set("nexus.settingsGuard.enabled", true);
+    // Seed a BOM file whose value for commandsToSkipShell DIFFERS from inspect globalValue
+    // This simulates a named-profile scenario where globalStorageUri points to the default profile's file
+    const fileContent = '{"terminal.integrated.commandsToSkipShell":["something.else"]}';
+    mockFs.files.set(
+      "/userdata/User/settings.json",
+      new Uint8Array([0xef, 0xbb, 0xbf, ...Buffer.from(fileContent, "utf8")])
+    );
+
+    const requiredCommands = ["nexus.macro.run", "nexus.macro.runBinding"];
+    const controller = new SettingsGuardController(fakeContext(gs), requiredCommands, () => true);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // writeFile must NOT have been called — profile mismatch detected
+    expect(vscode.workspace.fs.writeFile).not.toHaveBeenCalled();
+
+    // bom-strip-skipped event must be logged
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; detail?: string; key: string }>;
+    const skippedEvent = log?.find(e => e.kind === "bom-strip-skipped" && e.key === "settings.json");
+    expect(skippedEvent).toBeDefined();
+    expect(skippedEvent?.detail).toContain("profile-mismatch");
+
+    // config.update for commandsToSkipShell is still called (in-memory heal is unaffected)
+    expect(mockConfig.update).toHaveBeenCalledWith(
+      "commandsToSkipShell",
+      expect.arrayContaining(["nexus.macro.run", "nexus.macro.runBinding"]),
+      vscode.ConfigurationTarget.Global
+    );
+  });
+
+  it("write failure logged as bom-strip-failed, no throw escapes", async () => {
+    const gs = makeGlobalState();
+    mockConfig.inspectValues.set("terminal.integrated.commandsToSkipShell", {
+      globalValue: [{}, {}],
+      defaultValue: ["workbench.action.quickOpen"],
+    });
+    // Matching-content BOM file so the profile-safety check passes
+    const fileContent = '{"terminal.integrated.commandsToSkipShell":[{},{}]}';
+    mockFs.files.set(
+      "/userdata/User/settings.json",
+      new Uint8Array([0xef, 0xbb, 0xbf, ...Buffer.from(fileContent, "utf8")])
+    );
+    // Make writeFile fail once (for the BOM strip attempt)
+    (vscode.workspace.fs.writeFile as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("EACCES"));
+
+    const requiredCommands = ["nexus.macro.run", "nexus.macro.runBinding"];
+    const controller = new SettingsGuardController(fakeContext(gs), requiredCommands, () => true);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // bom-strip-failed event must be logged
+    const log = gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string; detail?: string; key: string }>;
+    const failedEvent = log?.find(e => e.kind === "bom-strip-failed" && e.key === "settings.json");
+    expect(failedEvent).toBeDefined();
+    expect(failedEvent?.detail).toContain("EACCES");
+
+    // config.update still called (BOM strip failure doesn't block heal)
+    expect(mockConfig.update).toHaveBeenCalledWith(
+      "commandsToSkipShell",
+      expect.arrayContaining(["nexus.macro.run", "nexus.macro.runBinding"]),
+      vscode.ConfigurationTarget.Global
+    );
+  });
+
+  it("BOM file that is not parseable (trailing comma) → declines to write, no bom event", async () => {
+    const gs = makeGlobalState();
+    mockConfig.inspectValues.set("terminal.integrated.commandsToSkipShell", {
+      globalValue: [{}, {}],
+      defaultValue: ["workbench.action.quickOpen"],
+    });
+    // BOM file whose content is NOT strict JSON (trailing comma) — JSON.parse fails,
+    // so the profile-safety check cannot confirm this is the active file and declines.
+    const fileContent = '{"terminal.integrated.commandsToSkipShell":[{},{}],}';
+    mockFs.files.set(
+      "/userdata/User/settings.json",
+      new Uint8Array([0xef, 0xbb, 0xbf, ...Buffer.from(fileContent, "utf8")])
+    );
+
+    const requiredCommands = ["nexus.macro.run", "nexus.macro.runBinding"];
+    const controller = new SettingsGuardController(fakeContext(gs), requiredCommands, () => true);
+    controller.start();
+    await new Promise(r => setTimeout(r, 0));
+
+    // No write, and no bom event of any kind (silent decline on unparseable content)
+    expect(vscode.workspace.fs.writeFile).not.toHaveBeenCalled();
+    const log = (gs._store.get("nexus.settingsGuard.eventLog") as Array<{ kind: string }>) ?? [];
+    expect(log.some(e => e.kind === "bom-stripped" || e.kind === "bom-strip-skipped" || e.kind === "bom-strip-failed")).toBe(false);
+
+    // In-memory heal unaffected
+    expect(mockConfig.update).toHaveBeenCalledWith(
+      "commandsToSkipShell",
+      expect.arrayContaining(["nexus.macro.run", "nexus.macro.runBinding"]),
+      vscode.ConfigurationTarget.Global
+    );
   });
 });

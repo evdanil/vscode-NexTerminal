@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.60] — 2026-06-16
+
+### Fixed
+
+- **Settings Guard now strips a UTF-8 BOM from settings.json before healing.** The corporate DLP rewrites settings.json as UTF-8-with-BOM (bytes EF BB BF), which caused VS Code's settings writer to silently refuse to persist the guard's repair — the in-memory heal still kept macros working session-wide, but the on-disk file remained corrupt and was re-corrupted again at every save. VS Code's settings writer uses jsonc-parser under the hood, which treats a leading BOM as an `InvalidSymbol` parse error at offset 0 and refuses to write into a file with any parse error. The guard now removes the BOM first (all other bytes, including CRLF line endings and indentation, are preserved exactly), so the subsequent `config.update` repair lands on disk normally and also unblocks future writes by VS Code's own settings UI.
+
 ## [2.8.59] — 2026-06-12
 
 ### Fixed
