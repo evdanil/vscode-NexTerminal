@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.61] — 2026-06-16
+
+### Fixed
+
+- **Settings Guard now recovers ALL Nexus keys together, written directly to settings.json in one pass.** Previously the guard healed each key on its own and relied on VS Code's settings writer to persist — which left `nexus.terminal.passthroughKeys` stranded corrupt on disk in some cases (a per-key heal cap could pause one key, `Resume` only re-checked the macro keybinding list, and VS Code's writer races on reload after the BOM is stripped). Now, whenever any corruption is detected — and on startup and on Resume — the guard recomputes the correct value for every Nexus-required key (`terminal.integrated.commandsToSkipShell`, `nexus.terminal.passthroughKeys`, `nexus.terminal.highlighting.rules`) and writes them all with a single surgical, BOM-free edit to settings.json (via `jsonc-parser`, preserving every other key, comment, and line ending). This direct write is the authoritative persistence, so it no longer depends on VS Code's settings writer landing the change. **Resume now always re-checks state and heals every key.** The write-war rate limiter now counts these direct repairs, so a tool that keeps re-corrupting settings.json is still bounded and pauses with a Resume prompt.
+
 ## [2.8.60] — 2026-06-16
 
 ### Fixed
