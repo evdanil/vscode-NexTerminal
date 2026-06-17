@@ -18,7 +18,7 @@ import {
   type WatchedValuePolicy,
 } from "./settingsGuard";
 import { consumeNexusConfigWrite, recordNexusConfigWrite } from "./settingsWriteRegistry";
-import { applyJsonKeyEdits, deriveUserSettingsPath, stripUtf8Bom, type JsonKeyEdit } from "./settingsFileBom";
+import { deriveUserSettingsPath, hasUtf8Bom, stripUtf8Bom } from "./settingsFileBom";
 
 const SHADOW_KEY = "nexus.settingsGuard.lastKnownGood";
 const VALUE_SHADOW_KEY = "nexus.settingsGuard.lastKnownGoodValues";
@@ -57,42 +57,12 @@ export function targetToScope(target: vscode.ConfigurationTarget): GuardScope {
   }
 }
 
-/** Per-key desired repair state computed by computeDesiredState. */
-interface KeyRepairPlan {
-  /** The full dotted key name. */
-  fullKey: string;
-  /** The leaf name (after last dot) — used for config.update. */
-  leaf: string;
-  /** The section (before last dot) — used for config.update. */
-  section: string;
-  /** True when the current global value is corrupt and needs repair. */
-  corrupt: boolean;
-  /** The raw corrupt global value (for forensics / profile-safety verify). */
-  corruptGlobalValue: unknown;
-  /** The edit to apply to settings.json. */
-  edit: JsonKeyEdit;
-  /** The value config.update should write. undefined = remove key. */
-  inMemoryValue: unknown;
-  /**
-   * Expected effective value after repair (for own-write marking):
-   * - "set": the repair value
-   * - "delete": the package default value (inspect().defaultValue)
-   */
-  expectedEffective: unknown;
-  /** For skip-shell: the ScopeAssessment that drove the repair. */
-  skipShellAssessment?: ScopeAssessment;
-}
-
 /**
- * Orchestrates the Settings Guard.
+ * Orchestrates the Settings Guard (spec: docs/superpowers/specs/2026-06-11-settings-guard-design.md).
  *
  * - Auto-restores externally-stripped `terminal.integrated.commandsToSkipShell`
  *   values from a last-known-good shadow kept in globalState (opt-out via
  *   `nexus.settingsGuard.enabled`).
- * - Auto-restores corrupt `nexus.terminal.passthroughKeys` and
- *   `nexus.terminal.highlighting.rules` from their value shadows.
- * - On ANY corruption, recovers ALL corrupt Nexus keys together with ONE direct
- *   surgical file write (race-free) in addition to in-memory config.update calls.
  * - Logs every external mutation of the watched keys to a persisted ring buffer
  *   and the "Nexus Settings Guard" output channel — always on, even when the
  *   guard itself is disabled or paused.
@@ -117,14 +87,19 @@ export class SettingsGuardController implements vscode.Disposable {
    */
   private eventLog: GuardEvent[] = [];
   /**
-   * In-memory mirror of the persisted value shadows. computeDesiredState
+   * In-memory mirror of the persisted value shadows. captureOrHealWatchedValue
    * mutates this synchronously and persists fire-and-forget — same class as the
    * eventLog mirror: a stale read-modify-write races when concurrent captures
    * for sibling keys arrive in the same change event.
    */
   private valueShadows: Record<string, unknown[]> = {};
-  /** Serializes recoverAll runs so a restore's own change event can't interleave. */
+  /** Serializes checkSkipShell runs so a restore's own change event can't interleave. */
   private checkChain: Promise<void> = Promise.resolve();
+  /** Per-key, per-session heal cap — a write-war on a nexus.* key pauses healing for that key. */
+  private readonly valueHealCounts = new Map<string, number>();
+  private static readonly MAX_VALUE_HEALS_PER_KEY = 3;
+  /** Tracks keys for which the value-heal-cap warning toast has already been shown this session. */
+  private readonly valueHealPauseToastShown = new Set<string>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -144,7 +119,8 @@ export class SettingsGuardController implements vscode.Disposable {
     this.disposables.push(
       vscode.workspace.onDidChangeConfiguration((e) => this.onConfigChange(e))
     );
-    this.enqueueCheck(() => this.recoverAll("startup"));
+    void this.scanStartupCorruption();
+    this.enqueueCheck();
   }
 
   /** Called by repairMacroKeybindings so its writes classify as own-write, not external. */
@@ -186,6 +162,217 @@ export class SettingsGuardController implements vscode.Disposable {
     return result;
   }
 
+  /**
+   * Remove a leading UTF-8 BOM from the active-profile user settings.json.
+   *
+   * The corporate DLP rewrites settings.json as UTF-8-with-BOM; VS Code's
+   * settings writer refuses to persist into a file whose JSON has a parse error,
+   * and a leading BOM is exactly such an error (InvalidSymbol at offset 0). The
+   * in-memory heal still works (macros keep functioning), but the disk write
+   * silently never lands. Stripping the BOM first lets the subsequent
+   * config.update heal persist. The strip changes no config value, so it cannot
+   * be done after the write (no change event would re-trigger the heal).
+   *
+   * PROFILE-SAFETY: `ExtensionContext.globalStorageUri` always resolves to the
+   * DEFAULT profile's path, never a named profile's path (VS Code issue #160466).
+   * To avoid writing to the wrong file, we parse the BOM-stripped bytes and
+   * verify that the value for `verifyKey` matches `expectedGlobalValue` (what
+   * VS Code is actually reading). On a mismatch we record a "bom-strip-skipped"
+   * event and return false without writing. This check is sound because:
+   *   - DLP output is strict JSON modulo the BOM (no comments, no trailing
+   *     commas) so JSON.parse succeeds on exactly the files we care about.
+   *   - Comment-bearing user-authored settings.json is saved WITHOUT a BOM and
+   *     therefore never reaches this code.
+   *   - On any parse failure or value mismatch we decline to write.
+   *
+   * Best-effort and quiet on the common path: a missing/unreadable settings.json
+   * (fresh user, in-memory test context) returns false with no event. Only a
+   * failed WRITE — the interesting forensic case — is logged.
+   * Returns true when a BOM was found and removed.
+   */
+  private async stripSettingsBomIfPresent(
+    reason: string,
+    verifyKey: string,
+    expectedGlobalValue: unknown
+  ): Promise<boolean> {
+    if (this.disposed) return false;
+    let uri: vscode.Uri;
+    let bytes: Uint8Array;
+    try {
+      uri = vscode.Uri.file(deriveUserSettingsPath(this.context.globalStorageUri.fsPath));
+      bytes = await vscode.workspace.fs.readFile(uri);
+    } catch {
+      return false; // missing/unreadable — nothing to do, not noteworthy
+    }
+    if (!hasUtf8Bom(bytes)) return false;
+    // Profile-safety: parse the BOM-stripped content and confirm the key's
+    // value matches what VS Code reports. If they diverge, the derived path
+    // points to a different profile's settings.json — do not write.
+    const stripped = stripUtf8Bom(bytes);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(Buffer.from(stripped).toString("utf8"));
+    } catch {
+      return false; // unparseable after BOM strip — not a DLP-rewritten file
+    }
+    const fileValue =
+      parsed && typeof parsed === "object"
+        ? (parsed as Record<string, unknown>)[verifyKey]
+        : undefined;
+    // When the key vanished entirely both sides are undefined and this matches —
+    // intentional: the legitimate same-profile "vanished" heal still needs the BOM
+    // gone so config.update can re-add the key. The only action is BOM removal
+    // (value-preserving), so the loosened match in that edge is harmless.
+    if (!jsonEqual(fileValue, expectedGlobalValue)) {
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: "settings.json",
+        kind: "bom-strip-skipped",
+        detail: "profile-mismatch:" + reason,
+      });
+      return false;
+    }
+    try {
+      await vscode.workspace.fs.writeFile(uri, stripped);
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: "settings.json",
+        kind: "bom-stripped",
+        detail: reason,
+      });
+      return true;
+    } catch (err) {
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: "settings.json",
+        kind: "bom-strip-failed",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Capture-or-heal one healable Nexus-own setting (global scope only).
+   * healthy → refresh the value shadow (filtered to valid entries).
+   * corrupt → log evidence; when the guard is enabled, restore the shadowed
+   * value, or remove the override when no shadow exists (package defaults
+   * apply). Healing also runs on live change events — the external tool
+   * rewrites settings.json while VS Code is running.
+   */
+  private async captureOrHealWatchedValue(
+    policy: WatchedValuePolicy,
+    trigger: "startup" | "change-event"
+  ): Promise<void> {
+    if (this.disposed) return;
+    const dot = policy.key.lastIndexOf(".");
+    const section = policy.key.slice(0, dot);
+    const leaf = policy.key.slice(dot + 1);
+    const config = vscode.workspace.getConfiguration(section);
+    const raw = config.inspect(leaf)?.globalValue;
+    const assessment = assessWatchedValue(policy, raw);
+
+    if (assessment.state === "absent") return;
+
+    if (assessment.state === "healthy") {
+      if (!jsonEqual(this.valueShadows[policy.key], assessment.captureValue)) {
+        // In-memory mirror prevents race: fresh globalState reads per event race
+        // (stale read-modify-write drops sibling keys when one event covers both
+        // healable settings) — same class as the eventLog mirror.
+        this.valueShadows = { ...this.valueShadows, [policy.key]: assessment.captureValue };
+        void this.context.globalState.update(VALUE_SHADOW_KEY, this.valueShadows);
+      }
+      return;
+    }
+
+    // corrupt
+    this.recordEvent({
+      timestamp: new Date().toISOString(),
+      key: policy.key,
+      scope: "global",
+      kind: "external-strip",
+      detail: trigger === "startup" ? "found-at-startup" : "corrupt-value",
+      before: renderValue(raw),
+      ...(trigger === "change-event" ? { focused: vscode.window.state.focused } : {}),
+    });
+    if (!this.isEnabled()) return;
+    const healCount = this.valueHealCounts.get(policy.key) ?? 0;
+    if (healCount >= SettingsGuardController.MAX_VALUE_HEALS_PER_KEY) {
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: policy.key,
+        scope: "global",
+        kind: "paused",
+        detail: "value-heal-cap",
+      });
+      if (!this.valueHealPauseToastShown.has(policy.key)) {
+        this.valueHealPauseToastShown.add(policy.key);
+        void vscode.window
+          .showWarningMessage(
+            `An external program keeps corrupting ${policy.key} — Nexus auto-heal for this setting is paused.`,
+            "Resume Guard",
+            "Show Report"
+          )
+          .then((choice) => {
+            if (this.disposed) return;
+            if (choice === "Resume Guard") this.resume();
+            else if (choice === "Show Report") this.showReport();
+          });
+      }
+      return;
+    }
+    await this.stripSettingsBomIfPresent(`value-heal:${policy.key}`, policy.key, raw);
+    const restoreValue = this.valueShadows[policy.key];
+    try {
+      recordNexusConfigWrite(policy.key, restoreValue, Date.now());
+      await config.update(leaf, restoreValue, vscode.ConfigurationTarget.Global);
+      this.valueHealCounts.set(policy.key, healCount + 1);
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: policy.key,
+        scope: "global",
+        kind: "restore",
+        detail: restoreValue !== undefined ? "restored-from-shadow" : "removed-corrupt-key",
+        after: renderValue(restoreValue),
+      });
+    } catch (err) {
+      this.valueHealCounts.set(policy.key, healCount + 1); // failures count toward the cap — bounds retry against a locked file
+      consumeNexusConfigWrite(policy.key, restoreValue, Date.now()); // reclaim the unconsumed marker so it can't mask a real external change
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: policy.key,
+        scope: "global",
+        kind: "restore-failed",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Activation-time scan for corruption that predates this session (the
+   * external tool also runs while VS Code is closed). Read-time sanitization
+   * keeps runtime behavior correct, but the corrupt raw value stays in
+   * settings.json and in the native settings UI — confusing and evidence-free.
+   * Detection is logged always; healing (restoring from shadow, or removing the
+   * corrupt override so the package default applies) is gated on the guard
+   * toggle. Raw GLOBAL values only — never effective values.
+   *
+   * Also captures healthy values into the value shadow so the restore path
+   * has material to work with. Healing also runs on live change events via
+   * captureOrHealWatchedValue.
+   *
+   * A heal produces three log lines by design: the external-strip evidence,
+   * the restore (removed-corrupt-key or restored-from-shadow), and the
+   * own-write echo when the removal's change event consumes its wildcard
+   * registry entry.
+   */
+  private async scanStartupCorruption(): Promise<void> {
+    if (this.disposed) return;
+    for (const policy of HEALABLE_KEYS) {
+      await this.captureOrHealWatchedValue(policy, "startup");
+    }
+  }
+
   private isEnabled(): boolean {
     return vscode.workspace.getConfiguration("nexus.settingsGuard").get<boolean>("enabled", true);
   }
@@ -200,371 +387,15 @@ export class SettingsGuardController implements vscode.Disposable {
     return vscode.workspace.getConfiguration(fullKey.slice(0, dot)).inspect(fullKey.slice(dot + 1))?.globalValue;
   }
 
-  /**
-   * Compute what every Nexus key SHOULD be, building repair plans for corrupt keys
-   * and capturing healthy shadows.
-   * Returns an array of KeyRepairPlan (one per Nexus-owned key that has a global override
-   * or is corrupt).
-   */
-  private computeDesiredState(): KeyRepairPlan[] {
-    const plans: KeyRepairPlan[] = [];
-
-    // --- Skip-shell ---
-    const skipConfig = vscode.workspace.getConfiguration(SKIP_SHELL_SECTION);
-    const skipInspect = skipConfig.inspect<string[]>(SKIP_SHELL_LEAF);
-    const current: Record<GuardScope, unknown> = {
-      global: skipInspect?.globalValue,
-      workspace: undefined,
-      workspaceFolder: undefined,
-    };
-    const shadow = sanitizeShadow(this.context.globalState.get(SHADOW_KEY));
-    const macrosPresent = this.hasMacros();
-    const required = macrosPresent ? this.requiredCommands : [];
-    const rawDefault = skipInspect?.defaultValue;
-    const fallbackBases =
-      macrosPresent && Array.isArray(rawDefault)
-        ? { global: rawDefault.filter((c): c is string => typeof c === "string") }
-        : undefined;
-
-    const assessments = assessScopes(shadow?.values, current, required, this.ownWrites, fallbackBases);
-
-    // Consume own-write markers
-    for (const a of assessments) {
-      if (a.classification === "own-write") {
-        this.ownWrites[a.scope] = null;
-        this.recordEvent({
-          timestamp: new Date().toISOString(),
-          key: SKIP_SHELL_FULL,
-          scope: a.scope,
-          kind: "own-write",
-        });
-      }
-    }
-
-    const restores = assessments.filter((a) => a.restoreValue !== undefined);
-    if (restores.length === 0) {
-      // Healthy: update shadow
-      const update = computeShadowUpdate(current, required, new Date().toISOString());
-      if (update) void this.context.globalState.update(SHADOW_KEY, update);
-    } else {
-      // Only the global scope is handled for file repair
-      const globalRestore = restores.find((a) => a.scope === "global");
-      if (globalRestore && globalRestore.restoreValue !== undefined) {
-        const value = globalRestore.restoreValue as string[];
-        plans.push({
-          fullKey: SKIP_SHELL_FULL,
-          leaf: SKIP_SHELL_LEAF,
-          section: SKIP_SHELL_SECTION,
-          corrupt: true,
-          corruptGlobalValue: current.global,
-          edit: { key: SKIP_SHELL_FULL, action: "set", value },
-          inMemoryValue: value,
-          expectedEffective: value,
-          skipShellAssessment: globalRestore,
-        });
-      }
-    }
-
-    // --- Healable watched keys ---
-    for (const policy of HEALABLE_KEYS) {
-      const dot = policy.key.lastIndexOf(".");
-      const section = policy.key.slice(0, dot);
-      const leaf = policy.key.slice(dot + 1);
-      const config = vscode.workspace.getConfiguration(section);
-      const inspect = config.inspect(leaf);
-      const raw = inspect?.globalValue;
-      const assessment = assessWatchedValue(policy, raw);
-
-      if (assessment.state === "absent") continue;
-
-      if (assessment.state === "healthy") {
-        if (!jsonEqual(this.valueShadows[policy.key], assessment.captureValue)) {
-          this.valueShadows = { ...this.valueShadows, [policy.key]: assessment.captureValue };
-          void this.context.globalState.update(VALUE_SHADOW_KEY, this.valueShadows);
-        }
-        continue;
-      }
-
-      // corrupt
-      const shadow = this.valueShadows[policy.key];
-      const repairValue = shadow !== undefined ? shadow : undefined;
-      const edit: JsonKeyEdit =
-        repairValue !== undefined
-          ? { key: policy.key, action: "set", value: repairValue }
-          : { key: policy.key, action: "delete" };
-      const expectedEffective =
-        repairValue !== undefined ? repairValue : inspect?.defaultValue;
-
-      plans.push({
-        fullKey: policy.key,
-        leaf,
-        section,
-        corrupt: true,
-        corruptGlobalValue: raw,
-        edit,
-        inMemoryValue: repairValue,
-        expectedEffective,
-      });
-    }
-
-    return plans;
-  }
-
-  /**
-   * Write surgical repairs to settings.json on disk (race-free, no BOM).
-   * Returns true on success, false if skipped or failed.
-   */
-  private async repairNexusKeysOnDisk(
-    edits: readonly JsonKeyEdit[],
-    ownWriteMarks: Array<{ fullKey: string; expectedEffective: unknown }>,
-    verifyKey: string,
-    expectedGlobalValue: unknown,
-    reason: string
-  ): Promise<boolean> {
-    if (this.disposed) return false;
-    let uri: vscode.Uri;
-    let bytes: Uint8Array;
-    try {
-      uri = vscode.Uri.file(deriveUserSettingsPath(this.context.globalStorageUri.fsPath));
-      bytes = await vscode.workspace.fs.readFile(uri);
-    } catch {
-      return false;
-    }
-
-    const stripped = stripUtf8Bom(bytes);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(Buffer.from(stripped).toString("utf8"));
-    } catch {
-      return false;
-    }
-
-    const fileValue =
-      parsed && typeof parsed === "object"
-        ? (parsed as Record<string, unknown>)[verifyKey]
-        : undefined;
-    // Profile-safety tripwire: verify the first corrupt key's on-disk value matches VS Code's
-    // live globalValue. A wrong-profile file is very unlikely to coincidentally hold that
-    // exact corrupt value, so this one check gates the entire write.
-    if (!jsonEqual(fileValue, expectedGlobalValue)) {
-      this.recordEvent({
-        timestamp: new Date().toISOString(),
-        key: "settings.json",
-        kind: "file-repair-failed",
-        detail: `profile-mismatch:${reason}`,
-      });
-      return false;
-    }
-
-    // Mark own-writes BEFORE writing
-    for (const mark of ownWriteMarks) {
-      if (mark.fullKey === SKIP_SHELL_FULL) {
-        // skip-shell uses the ownWrites record
-        this.ownWrites.global = mark.expectedEffective as string[];
-      } else {
-        recordNexusConfigWrite(mark.fullKey, mark.expectedEffective, Date.now());
-      }
-    }
-
-    let newText: string;
-    try {
-      const textIn = Buffer.from(stripped).toString("utf8");
-      newText = applyJsonKeyEdits(textIn, edits);
-    } catch (err) {
-      // Reclaim markers
-      for (const mark of ownWriteMarks) {
-        if (mark.fullKey === SKIP_SHELL_FULL) {
-          this.ownWrites.global = null;
-        } else {
-          consumeNexusConfigWrite(mark.fullKey, mark.expectedEffective, Date.now());
-        }
-      }
-      this.recordEvent({
-        timestamp: new Date().toISOString(),
-        key: "settings.json",
-        kind: "file-repair-failed",
-        detail: err instanceof Error ? err.message : String(err),
-      });
-      return false;
-    }
-
-    if (this.disposed) return false;
-    try {
-      await vscode.workspace.fs.writeFile(uri, Buffer.from(newText, "utf8"));
-      this.recordEvent({
-        timestamp: new Date().toISOString(),
-        key: "settings.json",
-        kind: "file-repaired",
-        detail: `${reason} [${ownWriteMarks.map((m) => m.fullKey).join(", ")}]`,
-      });
-      return true;
-    } catch (err) {
-      // Reclaim markers
-      for (const mark of ownWriteMarks) {
-        if (mark.fullKey === SKIP_SHELL_FULL) {
-          this.ownWrites.global = null;
-        } else {
-          consumeNexusConfigWrite(mark.fullKey, mark.expectedEffective, Date.now());
-        }
-      }
-      this.recordEvent({
-        timestamp: new Date().toISOString(),
-        key: "settings.json",
-        kind: "file-repair-failed",
-        detail: err instanceof Error ? err.message : String(err),
-      });
-      return false;
-    }
-  }
-
-  /**
-   * Unified recovery orchestrator. Computes desired state for ALL Nexus keys,
-   * logs forensics, applies in-memory heals (config.update), and writes
-   * disk repairs in ONE atomic file write.
-   */
-  private async recoverAll(trigger: "startup" | "change-event" | "resume"): Promise<void> {
-    if (this.disposed) return;
-
-    const plans = this.computeDesiredState();
-    const corrupt = plans.filter((p) => p.corrupt);
-    if (corrupt.length === 0) return;
-
-    // Forensics (always logged, even when disabled/paused)
-    for (const plan of corrupt) {
-      if (plan.fullKey === SKIP_SHELL_FULL && plan.skipShellAssessment) {
-        const a = plan.skipShellAssessment;
-        const shadow = sanitizeShadow(this.context.globalState.get(SHADOW_KEY));
-        this.recordEvent({
-          timestamp: new Date().toISOString(),
-          key: SKIP_SHELL_FULL,
-          scope: a.scope,
-          kind: "external-strip",
-          detail: a.classification,
-          before: renderValue(shadow?.values?.[a.scope]),
-          after: renderValue(plan.corruptGlobalValue),
-          ...(trigger !== "startup" ? { focused: vscode.window.state.focused } : {}),
-        });
-      } else {
-        this.recordEvent({
-          timestamp: new Date().toISOString(),
-          key: plan.fullKey,
-          scope: "global",
-          kind: "external-strip",
-          detail: trigger === "startup" ? "found-at-startup" : "corrupt-value",
-          before: renderValue(plan.corruptGlobalValue),
-          ...(trigger !== "startup" ? { focused: vscode.window.state.focused } : {}),
-        });
-      }
-    }
-
-    if (!this.isEnabled() || this.paused) return;
-
-    const pauseReason = evaluateRateLimit(this.restoreTimestamps, Date.now());
-    if (pauseReason) {
-      this.pause(pauseReason);
-      return;
-    }
-
-    // --- Disk repair FIRST (one write for all corrupt keys) ---
-    const first = corrupt[0];
-    const fileRepaired = await this.repairNexusKeysOnDisk(
-      corrupt.map((p) => p.edit),
-      corrupt.map((p) => ({ fullKey: p.fullKey, expectedEffective: p.expectedEffective })),
-      first.fullKey,
-      first.corruptGlobalValue,
-      trigger
-    );
-
-    // --- In-memory heals (config.update) ---
-    const succeeded: KeyRepairPlan[] = [];
-    const skipShellRestores: ScopeAssessment[] = [];
-    for (const plan of corrupt) {
-      const dot = plan.fullKey.lastIndexOf(".");
-      const config = vscode.workspace.getConfiguration(plan.fullKey.slice(0, dot));
-      const leaf = plan.fullKey.slice(dot + 1);
-
-      if (plan.fullKey === SKIP_SHELL_FULL && plan.skipShellAssessment) {
-        // Skip-shell uses ownWrites record for in-memory classification
-        this.ownWrites.global = plan.inMemoryValue as string[];
-        try {
-          await config.update(leaf, plan.inMemoryValue, vscode.ConfigurationTarget.Global);
-          this.recordEvent({
-            timestamp: new Date().toISOString(),
-            key: SKIP_SHELL_FULL,
-            scope: "global",
-            kind: "restore",
-            after: renderValue(plan.inMemoryValue),
-          });
-          succeeded.push(plan);
-          skipShellRestores.push(plan.skipShellAssessment);
-        } catch (err) {
-          this.ownWrites.global = null;
-          this.recordEvent({
-            timestamp: new Date().toISOString(),
-            key: SKIP_SHELL_FULL,
-            scope: "global",
-            kind: "restore-failed",
-            detail: err instanceof Error ? err.message : String(err),
-          });
-        }
-      } else {
-        // Watched keys
-        try {
-          recordNexusConfigWrite(plan.fullKey, plan.expectedEffective, Date.now());
-          await config.update(leaf, plan.inMemoryValue, vscode.ConfigurationTarget.Global);
-          this.recordEvent({
-            timestamp: new Date().toISOString(),
-            key: plan.fullKey,
-            scope: "global",
-            kind: "restore",
-            detail: plan.inMemoryValue !== undefined ? "restored-from-shadow" : "removed-corrupt-key",
-            after: renderValue(plan.inMemoryValue),
-          });
-          succeeded.push(plan);
-        } catch (err) {
-          consumeNexusConfigWrite(plan.fullKey, plan.expectedEffective, Date.now());
-          this.recordEvent({
-            timestamp: new Date().toISOString(),
-            key: plan.fullKey,
-            scope: "global",
-            kind: "restore-failed",
-            detail: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-    }
-
-    if (!fileRepaired && succeeded.length === 0) return;
-    this.restoreTimestamps.push(Date.now());
-
-    // Show restore toast
-    const skipShellCurrent: Record<GuardScope, unknown> = {
-      global: vscode.workspace.getConfiguration(SKIP_SHELL_SECTION).inspect<string[]>(SKIP_SHELL_LEAF)?.globalValue,
-      workspace: undefined,
-      workspaceFolder: undefined,
-    };
-    // Use corrupt values as preValues (what was there before)
-    const preValues: Record<GuardScope, unknown> = {
-      global: corrupt.find((p) => p.fullKey === SKIP_SHELL_FULL)?.corruptGlobalValue,
-      workspace: undefined,
-      workspaceFolder: undefined,
-    };
-    this.showRestoreToast(skipShellRestores, preValues.global !== undefined ? preValues as Record<GuardScope, unknown> : skipShellCurrent);
-  }
-
   private onConfigChange(e: vscode.ConfigurationChangeEvent): void {
-    let needsRecovery = false;
-
     if (e.affectsConfiguration(SKIP_SHELL_FULL)) {
-      needsRecovery = true;
+      this.enqueueCheck();
     }
-
     for (const key of WATCHED_KEYS) {
       if (!e.affectsConfiguration(key)) continue;
       const before = this.watchedSnapshot.get(key);
       const after = this.readEffective(key);
       this.watchedSnapshot.set(key, after);
-
       if (consumeNexusConfigWrite(key, after, Date.now())) {
         this.recordEvent({
           timestamp: new Date().toISOString(),
@@ -574,10 +405,10 @@ export class SettingsGuardController implements vscode.Disposable {
           before: renderValue(before),
           after: renderValue(after),
         });
-        // own-write: still check if there's something to capture (healthy after own write)
+        const healableOwn = HEALABLE_KEYS.find((p) => p.key === key);
+        if (healableOwn) void this.captureOrHealWatchedValue(healableOwn, "change-event");
         continue;
       }
-
       const healable = HEALABLE_KEYS.find((p) => p.key === key);
       const rawGlobal = healable ? this.readGlobalValue(key) : undefined;
       const healAssessment = healable ? assessWatchedValue(healable, rawGlobal) : undefined;
@@ -592,32 +423,129 @@ export class SettingsGuardController implements vscode.Disposable {
           focused: vscode.window.state.focused,
         });
       }
-
-      if (healable) {
-        needsRecovery = true;
-      }
-    }
-
-    if (needsRecovery) {
-      this.enqueueCheck(() => this.recoverAll("change-event"));
+      if (healable) void this.captureOrHealWatchedValue(healable, "change-event");
     }
   }
 
-  private enqueueCheck(fn: () => Promise<void>): void {
-    this.checkChain = this.checkChain.then(() => fn()).catch(() => undefined);
+  private enqueueCheck(): void {
+    this.checkChain = this.checkChain.then(() => this.checkSkipShell()).catch(() => undefined);
+  }
+
+  private async checkSkipShell(): Promise<void> {
+    if (this.disposed) return;
+    const config = vscode.workspace.getConfiguration(SKIP_SHELL_SECTION);
+    const inspect = config.inspect<string[]>(SKIP_SHELL_LEAF);
+    // The guard handles ONLY the global (user-level) scope. The shadow is
+    // machine-global, while workspace/workspaceFolder values are per-workspace —
+    // capturing those would bleed one workspace's list into other workspaces'
+    // .vscode/settings.json. The external tool rewrites the user-level
+    // settings.json only; workspace-level issues stay with the existing
+    // confirm-gated "Fix Macro Keybindings" repair.
+    const current: Record<GuardScope, unknown> = {
+      global: inspect?.globalValue,
+      workspace: undefined,
+      workspaceFolder: undefined,
+    };
+    const shadow = sanitizeShadow(this.context.globalState.get(SHADOW_KEY));
+
+    // Gate required commands and fallback base on whether macros are defined.
+    // Empty required makes assessScopes classify everything none — guard stays
+    // inert for skip-shell when there are no macros, and captures no shadow.
+    const macrosPresent = this.hasMacros();
+    const required = macrosPresent ? this.requiredCommands : [];
+    const rawDefault = inspect?.defaultValue;
+    const fallbackBases =
+      macrosPresent && Array.isArray(rawDefault)
+        ? { global: rawDefault.filter((c): c is string => typeof c === "string") }
+        : undefined;
+
+    const assessments = assessScopes(shadow?.values, current, required, this.ownWrites, fallbackBases);
+
+    // Consume own-write markers once observed.
+    for (const a of assessments) {
+      if (a.classification === "own-write") {
+        this.ownWrites[a.scope] = null;
+        this.recordEvent({
+          timestamp: new Date().toISOString(),
+          key: SKIP_SHELL_FULL,
+          scope: a.scope,
+          kind: "own-write",
+        });
+      }
+    }
+
+    const restores = assessments.filter((a) => a.restoreValue !== undefined);
+    if (restores.length === 0) {
+      const update = computeShadowUpdate(current, required, new Date().toISOString());
+      if (update) await this.context.globalState.update(SHADOW_KEY, update);
+      return;
+    }
+
+    // Forensics first — logged even when the guard is disabled or paused.
+    for (const a of restores) {
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: SKIP_SHELL_FULL,
+        scope: a.scope,
+        kind: "external-strip",
+        detail: a.classification,
+        before: renderValue(shadow?.values?.[a.scope]),
+        after: renderValue(current[a.scope]),
+      });
+    }
+
+    if (!this.isEnabled() || this.paused) return;
+
+    const pauseReason = evaluateRateLimit(this.restoreTimestamps, Date.now());
+    if (pauseReason) {
+      this.pause(pauseReason);
+      return;
+    }
+
+    await this.stripSettingsBomIfPresent("skip-shell-restore", SKIP_SHELL_FULL, current.global);
+    const succeeded: ScopeAssessment[] = [];
+    for (const a of restores) {
+      const value = a.restoreValue as string[];
+      this.ownWrites[a.scope] = value;
+      try {
+        await config.update(SKIP_SHELL_LEAF, value, scopeToTarget(a.scope));
+      } catch (err) {
+        // Write rejected (e.g. the external tool holds settings.json). Clear the
+        // phantom marker and log it — the next change event retries naturally.
+        this.ownWrites[a.scope] = null;
+        this.recordEvent({
+          timestamp: new Date().toISOString(),
+          key: SKIP_SHELL_FULL,
+          scope: a.scope,
+          kind: "restore-failed",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
+      this.recordEvent({
+        timestamp: new Date().toISOString(),
+        key: SKIP_SHELL_FULL,
+        scope: a.scope,
+        kind: "restore",
+        after: renderValue(value),
+      });
+      succeeded.push(a);
+    }
+    if (succeeded.length === 0) return;
+    this.restoreTimestamps.push(Date.now());
+    this.showRestoreToast(succeeded, current);
   }
 
   private showRestoreToast(
     restores: ScopeAssessment[],
     preValues: Record<GuardScope, unknown>
   ): void {
-    const buttons: string[] = restores.length > 0
-      ? ["Undo", "Disable Guard", "Show Report"]
-      : ["Disable Guard", "Show Report"];
     void vscode.window
       .showWarningMessage(
         "Nexus restored terminal settings modified by an external program.",
-        ...buttons
+        "Undo",
+        "Disable Guard",
+        "Show Report"
       )
       .then(async (choice) => {
         if (this.disposed) return;
@@ -642,6 +570,8 @@ export class SettingsGuardController implements vscode.Disposable {
   ): Promise<void> {
     const config = vscode.workspace.getConfiguration(SKIP_SHELL_SECTION);
 
+    // Clear the shadow for undone scopes FIRST so the undo write cannot be
+    // re-detected as a fresh corruption and immediately re-restored.
     const shadow = sanitizeShadow(this.context.globalState.get(SHADOW_KEY));
     if (shadow) {
       const values = { ...shadow.values };
@@ -653,7 +583,7 @@ export class SettingsGuardController implements vscode.Disposable {
       const prev = preValues[a.scope];
       const value = Array.isArray(prev)
         ? prev.filter((v): v is string => typeof v === "string")
-        : undefined;
+        : undefined; // vanished / corrupt-type → remove the override entirely
       this.ownWrites[a.scope] = value ?? null;
       await config.update(SKIP_SHELL_LEAF, value, scopeToTarget(a.scope));
       this.recordEvent({
@@ -691,12 +621,13 @@ export class SettingsGuardController implements vscode.Disposable {
   private resume(): void {
     this.paused = false;
     this.restoreTimestamps = [];
+    this.valueHealCounts.clear(); // Re-arms both the session-cap and the per-key value-heal cap.
     this.recordEvent({
       timestamp: new Date().toISOString(),
       key: SKIP_SHELL_FULL,
       kind: "resumed",
     });
-    this.enqueueCheck(() => this.recoverAll("resume")); // repair immediately if settings are still corrupt
+    this.enqueueCheck(); // repair immediately if settings are still corrupt
   }
 
   private recordEvent(event: GuardEvent): void {

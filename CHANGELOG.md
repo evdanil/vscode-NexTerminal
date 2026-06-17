@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.62] — 2026-06-17
+
+### Reverted
+
+- **Rolled back the v2.8.61 Settings Guard rewrite** (unified all-keys recovery + direct `settings.json` file write + `jsonc-parser` dependency). v2.8.61 was reported to leave the Connectivity Hub empty after auto-update. The Settings Guard reverts to the proven v2.8.60 behavior (in-memory `config.update` heal + BOM strip). Note: Nexus profiles (servers, tunnels, serial) are stored in VS Code's globalState, which the guard never writes — this rollback restores the known-good extension code; existing profile data is unaffected by the guard either way.
+
 ## [2.8.61] — 2026-06-16
 
 ### Fixed

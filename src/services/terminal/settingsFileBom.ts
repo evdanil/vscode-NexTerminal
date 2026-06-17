@@ -14,7 +14,6 @@
  */
 
 import * as path from "node:path";
-import { modify, applyEdits } from "jsonc-parser";
 
 /** UTF-8 BOM byte sequence (EF BB BF). */
 export const UTF8_BOM_BYTES = [0xef, 0xbb, 0xbf] as const;
@@ -44,28 +43,4 @@ export function hasUtf8Bom(bytes: Uint8Array): boolean {
  */
 export function stripUtf8Bom(bytes: Uint8Array): Uint8Array {
   return hasUtf8Bom(bytes) ? bytes.subarray(3) : bytes;
-}
-
-export type JsonKeyEdit =
-  | { key: string; action: "set"; value: unknown }
-  | { key: string; action: "delete" };
-
-/**
- * Apply surgical edits to settings.json TEXT (BOM already stripped). VS Code
- * settings keys are FLAT dotted strings (e.g. "terminal.integrated.commandsToSkipShell"),
- * so each edit targets a single top-level JSON property — the jsonc path is the
- * one-element array [key]. "delete" removes the property (passes undefined to
- * modify). Returns the edited text; all other content/formatting/comments are
- * preserved by jsonc-parser. Throws only if the input text is not parseable.
- */
-export function applyJsonKeyEdits(text: string, edits: readonly JsonKeyEdit[]): string {
-  let out = text;
-  for (const e of edits) {
-    const newValue = e.action === "delete" ? undefined : e.value;
-    const editOps = modify(out, [e.key], newValue, {
-      formattingOptions: { insertSpaces: true, tabSize: 4 },
-    });
-    out = applyEdits(out, editOps);
-  }
-  return out;
 }

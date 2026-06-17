@@ -215,8 +215,9 @@ export type GuardEventKind =
   | "undo"             // the user clicked Undo on a restore toast
   | "paused"           // rate limit tripped; auto-repair suspended
   | "resumed"          // the user clicked Resume Guard
-  | "file-repaired"    // the guard wrote all corrupt Nexus keys directly to settings.json in one pass
-  | "file-repair-failed"; // the direct settings.json write was rejected or skipped (profile mismatch, parse error, fs error)
+  | "bom-stripped"      // the guard removed a UTF-8 BOM from settings.json so heal writes can persist
+  | "bom-strip-failed"  // the BOM-removal write was rejected
+  | "bom-strip-skipped"; // derived settings.json isn't the active profile's file — declined to write
 
 export interface GuardEvent {
   timestamp: string;
