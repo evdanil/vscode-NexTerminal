@@ -1,7 +1,18 @@
 import * as esbuild from "esbuild";
 import { cp, mkdir } from "node:fs/promises";
+import { createRequire } from "node:module";
 
 const production = process.argv.includes("--production");
+
+// jsonc-parser ships a UMD `main` whose factory calls require("./impl/format")
+// through a runtime-passed `require` esbuild can't statically resolve — esbuild
+// then keeps the UMD wrapper verbatim and the deep requires dangle, so the
+// packaged bundle throws "Cannot find module './impl/format'" at load (this
+// silently shipped in v2.8.61 and bricked activation). Pin resolution to the
+// package's ESM `module` build instead: its `import './impl/...'` statements
+// ARE followed and inlined, so the bundle loads cleanly. Scoped to this one
+// package via alias so no other dependency's resolution changes.
+const jsoncParserEsm = createRequire(import.meta.url).resolve("jsonc-parser/lib/esm/main.js");
 
 const common = {
   bundle: true,
@@ -23,6 +34,7 @@ await esbuild.build({
   // catches require failures at runtime. Keep it external so local package
   // builds do not depend on a platform-specific cpufeatures.node artifact.
   external: ["vscode", "cpu-features"],
+  alias: { "jsonc-parser": jsoncParserEsm },
 });
 
 // Web extension (browser fallback — no Node deps)

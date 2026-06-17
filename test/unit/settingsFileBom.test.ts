@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deriveUserSettingsPath, hasUtf8Bom, stripUtf8Bom } from "../../src/services/terminal/settingsFileBom";
+import { applyJsonKeyEdits, deriveUserSettingsPath, hasUtf8Bom, stripUtf8Bom } from "../../src/services/terminal/settingsFileBom";
 
 describe("deriveUserSettingsPath", () => {
   it("derives settings.json from a default-profile globalStorage path", () => {
@@ -46,5 +46,49 @@ describe("stripUtf8Bom", () => {
     const result = stripUtf8Bom(bytes);
     // Same content
     expect(result).toEqual(bytes);
+  });
+});
+
+describe("applyJsonKeyEdits", () => {
+  it("sets a flat dotted key to a new array value, preserving other keys", () => {
+    const input = JSON.stringify({
+      "terminal.integrated.commandsToSkipShell": ["old"],
+      "editor.fontSize": 14,
+    }, null, 4);
+    const result = applyJsonKeyEdits(input, [
+      { key: "terminal.integrated.commandsToSkipShell", action: "set", value: ["new1", "new2"] },
+    ]);
+    const parsed = JSON.parse(result) as Record<string, unknown>;
+    expect(parsed["terminal.integrated.commandsToSkipShell"]).toEqual(["new1", "new2"]);
+    expect(parsed["editor.fontSize"]).toBe(14);
+  });
+
+  it("deletes a flat dotted key, preserving other keys", () => {
+    const input = JSON.stringify({
+      "nexus.terminal.passthroughKeys": ["b", "e"],
+      "editor.fontSize": 14,
+    }, null, 4);
+    const result = applyJsonKeyEdits(input, [
+      { key: "nexus.terminal.passthroughKeys", action: "delete" },
+    ]);
+    const parsed = JSON.parse(result) as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(parsed, "nexus.terminal.passthroughKeys")).toBe(false);
+    expect(parsed["editor.fontSize"]).toBe(14);
+  });
+
+  it("applies multiple edits in sequence (set + delete), preserving untouched keys", () => {
+    const input = JSON.stringify({
+      "terminal.integrated.commandsToSkipShell": ["old"],
+      "nexus.terminal.passthroughKeys": ["b"],
+      "editor.fontSize": 14,
+    }, null, 4);
+    const result = applyJsonKeyEdits(input, [
+      { key: "terminal.integrated.commandsToSkipShell", action: "set", value: ["macro1", "macro2"] },
+      { key: "nexus.terminal.passthroughKeys", action: "delete" },
+    ]);
+    const parsed = JSON.parse(result) as Record<string, unknown>;
+    expect(parsed["terminal.integrated.commandsToSkipShell"]).toEqual(["macro1", "macro2"]);
+    expect(Object.prototype.hasOwnProperty.call(parsed, "nexus.terminal.passthroughKeys")).toBe(false);
+    expect(parsed["editor.fontSize"]).toBe(14);
   });
 });
