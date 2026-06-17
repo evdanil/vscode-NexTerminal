@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [2.8.63] — 2026-06-17
+
+### Fixed
+
+- **Settings Guard recovers ALL Nexus keys together in one direct settings.json write — re-shipped from v2.8.61 with the bundling defect that broke it now fixed.** Whenever any corruption is detected, and on startup and on Resume, the guard recomputes the correct value for every Nexus-required key (`terminal.integrated.commandsToSkipShell`, `nexus.terminal.passthroughKeys`, `nexus.terminal.highlighting.rules`) and persists them with a single surgical, BOM-free edit to settings.json (preserving every other key, comment, and line ending). This direct write is the authoritative persistence — it no longer depends on VS Code's settings writer landing the change — and **Resume now always re-checks state and heals every key.** The write-war rate limiter counts these direct repairs, so a tool that keeps re-corrupting settings.json is still bounded and pauses with a Resume prompt.
+- **Root-cause fix for the v2.8.61 "empty Connectivity Hub after auto-update" regression.** v2.8.61 added the `jsonc-parser` dependency for the surgical write, but its UMD build calls `require("./impl/format")` through a runtime-passed `require` that esbuild cannot statically resolve — esbuild kept the UMD wrapper verbatim and the deep require dangled, so the packaged extension threw `Cannot find module './impl/format'` at load and **failed to activate at all** (which presented as a blank hub; profile data in globalState was never touched). The bundler now pins `jsonc-parser` to its ESM build (whose `import` statements esbuild inlines correctly), scoped to that one package so no other dependency's resolution changes.
+- **New release smoke test prevents this entire class of bug from shipping again.** `npm run build:production` (the path CI uses for both Marketplace and Open VSX) now loads the production-bundled `dist/extension.js` exactly as the extension host does and fails the build if it throws at load or does not export `activate()`/`deactivate()`. Unit tests and a green esbuild build exercise source against `node_modules`; they never loaded the packaged bundle — which is why v2.8.61 passed CI yet bricked on install.
+
 ## [2.8.62] — 2026-06-17
 
 ### Reverted
