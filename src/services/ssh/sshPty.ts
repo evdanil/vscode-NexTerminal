@@ -9,6 +9,7 @@ import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminal
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
+import { OscContextFilter } from "../terminal/oscContextFilter";
 
 export interface SshPtyCallbacks {
   onSessionOpened(sessionId: string): void;
@@ -35,6 +36,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   private readonly highlighterStream?: TerminalHighlighterStream;
 
   private readonly observerHub: PtyObserverHub;
+  private readonly oscFilter = new OscContextFilter();
 
   public constructor(
     private readonly serverConfig: ServerConfig,
@@ -153,6 +155,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.disposed = true;
+    this.oscFilter.reset();
     this.highlighterStream?.dispose();
     this.stream?.destroy();
     this.connection?.dispose();
@@ -227,6 +230,10 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
 
   private async start(dimensions?: vscode.TerminalDimensions): Promise<void> {
     const generation = ++this.connectionGeneration;
+    // Clear any OSC-3008 carry held from a previous session so a partial
+    // sequence stranded by a disconnect cannot prepend to this session's first
+    // chunk. No-op on first connect; idempotent with the dispose() reset.
+    this.oscFilter.reset();
     let connection: SshConnection | undefined;
     try {
       connection = await this.sshFactory.connect(this.serverConfig);
@@ -260,7 +267,8 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
 
       connection.onClose(() => this.handleDisconnect(generation));
       stream.on("data", (data: Buffer | string) => {
-        const text = typeof data === "string" ? data : data.toString("utf8");
+        const rawText = typeof data === "string" ? data : data.toString("utf8");
+        const text = this.oscFilter.filter(rawText);
         this.logger.log(`stdout ${JSON.stringify(text)}`);
         this.transcript?.write(text);
         this.observerHub.notifyOutput(text, this.highlighterStream, this.highlighter, (rendered) =>

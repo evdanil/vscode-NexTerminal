@@ -542,4 +542,103 @@ describe("TerminalHighlighter", () => {
     // The CSI sequence should be preserved, ERROR should be highlighted
     expect(result).toBe("\x1b[15~\x1b[31;1mERROR\x1b[39;22m");
   });
+
+  // ─── safeCutIndex / escape-safe stream cuts ──────────────────────────────
+
+  it("stream never emits a slice that cuts inside a CSI sequence at the retention boundary", () => {
+    // Use a rule that highlights digits so the highlighter could corrupt CSI params
+    setConfig(true, [{ pattern: "\\d+", color: "red", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    // STREAM_MAX_PENDING_LENGTH = 16384, STREAM_RETAIN_MARGIN = 256.
+    // When pending.length >= 16384, emitWithRetention fires with cut = pending.length - 256.
+    // To guarantee the cut lands INSIDE a CSI, make payload exactly 16384 bytes:
+    //   cut = 16384 - 256 = 16128
+    //   CSI "\x1b[31m" (5 bytes) starts at 16126 → cut at offset 2 inside CSI
+    //   tail = 16384 - 16126 - 5 = 253 bytes
+    const TOTAL = 16384;
+    const RETAIN = 256;
+    const cutPos = TOTAL - RETAIN;   // 16128
+    const csi = "\x1b[31m";          // 5 bytes
+    const csiStart = cutPos - 2;     // 16126 — cut lands 2 bytes into CSI
+    const tailLen = TOTAL - csiStart - csi.length; // 253
+    const padding = ".".repeat(csiStart);
+    const payload = padding + csi + ".".repeat(tailLen);
+
+    // Sanity: payload is exactly TOTAL and cut straddles the CSI
+    expect(payload.length).toBe(TOTAL);
+    expect(csiStart < cutPos && csiStart + csi.length > cutPos).toBe(true);
+
+    stream.push(payload);
+
+    // emitWithRetention fires synchronously during push(); check what was emitted
+    expect(emitted.length).toBeGreaterThan(0); // must have emitted something
+    for (const chunk of emitted) {
+      // A chunk that ends with a partial CSI is broken (\\x1b or \\x1b[ at tail)
+      expect(chunk).not.toMatch(/\x1b$/);
+      expect(chunk).not.toMatch(/\x1b\[$/);
+      expect(chunk).not.toMatch(/\x1b\[[0-9;]*$/);
+    }
+
+    // Flush remaining output and collect everything
+    stream.flush();
+    const full = emitted.join("");
+
+    // The original CSI must be present verbatim in the reassembled output
+    expect(full).toContain(csi);
+  });
+
+  it("stream never emits a slice that cuts inside an OSC sequence at the retention boundary", () => {
+    // Use a rule that could match chars inside OSC payload
+    setConfig(true, [{ pattern: "\\w+", color: "magenta", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    // OSC "\x1b]0;Title\x07" (13 bytes). Place it so the cut at (TOTAL - 256) lands inside it.
+    const TOTAL = 16384;
+    const RETAIN = 256;
+    const cutPos = TOTAL - RETAIN; // 16128
+    const osc = "\x1b]0;Title\x07"; // 13 bytes
+    const oscStart = cutPos - 4;    // cut at byte 4 of osc
+    const tailLen = TOTAL - oscStart - osc.length;
+    const padding = ".".repeat(oscStart);
+    const payload = padding + osc + ".".repeat(tailLen);
+
+    expect(payload.length).toBe(TOTAL);
+    expect(oscStart < cutPos && oscStart + osc.length > cutPos).toBe(true);
+
+    stream.push(payload);
+
+    expect(emitted.length).toBeGreaterThan(0);
+    for (const chunk of emitted) {
+      expect(chunk).not.toMatch(/\x1b$/);
+      expect(chunk).not.toMatch(/\x1b\]$/);
+      // An incomplete OSC (no BEL or ST yet) at end of chunk
+      expect(chunk).not.toMatch(/\x1b\][^\x07\x1b]*$/);
+    }
+
+    stream.flush();
+    const full = emitted.join("");
+    expect(full).toContain(osc);
+  });
+
+  it("stream makes forward progress even when an unterminated escape starts near position 0", () => {
+    setConfig(true, []);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    // An unterminated CSI opener "\x1b[" followed by a large payload shouldn't cause
+    // infinite loop — the fallback in safeCutIndex must allow progress.
+    const payload = "\x1b[" + ".".repeat(16400);
+    stream.push(payload);
+
+    // Must not hang; flush everything
+    stream.flush();
+    const full = emitted.join("");
+    expect(full.length).toBeGreaterThan(0);
+  });
 });
