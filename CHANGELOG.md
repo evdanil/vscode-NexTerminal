@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [2.8.64] — 2026-06-23
+
+### Added
+
+- **Open any saved profile from the command line or a link via a `vscode://` URI handler (issue #11).** `code --open-url "vscode://sentriflow.vscode-nexterminal/<name>"` opens the profile named `<name>` — the kind (SSH, Serial, or Local Shell) is auto-detected from whatever the name resolves to. `?sftp` connects an SSH profile and opens the File Explorer; `?id=<uuid>` disambiguates when names collide. The handler acts only on **existing saved profiles** — the URI never carries a host, username, or password (lookup keys only). The README documents bash/zsh and PowerShell `nexterm` aliases, and the `--open-url` vs `--file-uri` distinction.
+
+### Fixed
+
+- **Strip systemd OSC 3008 "context" sequences that garbled the terminal on Ubuntu 26.04 / systemd 258.** The remote shell's `/etc/profile.d/80-systemd-osc-context.sh` emits an OSC 3008 sequence (`…;pid=…;type=shell;cwd=…`) before every prompt; no terminal consumes it (per systemd's docs). Combined with chunked SSH reads and the terminal highlighter splitting the sequence and injecting SGR codes into its payload, it surfaced as literal garbage in front of the prompt (e.g. `<uuid>;pid=…;type=shell;cwd=/home/user user@host:~$`). Nexus now strips OSC 3008 from SSH and Local Shell output before display (with cross-chunk buffering), and the highlighter never emits a slice that ends inside an escape sequence. Servers can also disable the emission with `sudo rm /etc/profile.d/80-systemd-osc-context.sh`.
+
 ## [2.8.63] — 2026-06-17
 
 ### Fixed
