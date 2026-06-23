@@ -113,9 +113,21 @@ describe("parseNexusUri", () => {
     expect(result).toEqual({ name: undefined, id: "abc-123", sftp: false });
   });
 
-  it("URL-encoded name is decoded (%20 → space)", () => {
-    const result = parseNexusUri(makeUri("/my%20server"));
+  it("uses uri.path verbatim (VS Code already decoded it)", () => {
+    // VS Code delivers an already percent-decoded path, so a link to
+    // "my%20server" arrives here as "/my server".
+    const result = parseNexusUri(makeUri("/my server"));
     expect(result).toEqual({ name: "my server", id: undefined, sftp: false });
+  });
+
+  it("preserves a literal percent in the name without throwing (100%)", () => {
+    const result = parseNexusUri(makeUri("/100%"));
+    expect(result).toEqual({ name: "100%", id: undefined, sftp: false });
+  });
+
+  it("does not re-decode percent escapes in the name (db%2Fprod stays intact)", () => {
+    const result = parseNexusUri(makeUri("/db%2Fprod"));
+    expect(result).toEqual({ name: "db%2Fprod", id: undefined, sftp: false });
   });
 
   it("empty path and no id returns error", () => {

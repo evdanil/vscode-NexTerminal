@@ -22,9 +22,12 @@ export type ParsedNexusUri =
  * is derived from which saved profile the name/id resolves to.
  */
 export function parseNexusUri(uri: vscode.Uri): ParsedNexusUri {
-  // Strip leading/trailing slash and URL-decode the name from the path.
+  // VS Code delivers `uri.path` already percent-decoded, so use it verbatim.
+  // Decoding it a second time corrupts profile names that contain a literal
+  // "%": e.g. "100%" makes decodeURIComponent throw "URI malformed" and abort
+  // the handler, and "db%2Fprod" would collapse to "db/prod".
   const rawPath = uri.path.replace(/^\//, "").replace(/\/$/, "");
-  const name = rawPath ? decodeURIComponent(rawPath) : undefined;
+  const name = rawPath || undefined;
 
   const params = new URLSearchParams(uri.query ?? "");
 
