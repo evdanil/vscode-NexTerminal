@@ -32,6 +32,9 @@ function toServerFromArg(
   if (arg instanceof ServerTreeItem) {
     return arg.server;
   }
+  if (typeof arg === "string") {
+    return ctx.core.getServer(arg);
+  }
   return undefined;
 }
 

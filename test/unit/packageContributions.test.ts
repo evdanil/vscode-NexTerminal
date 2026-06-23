@@ -7,6 +7,7 @@ const readmePath = path.resolve(__dirname, "..", "..", "README.md");
 const functionalDocsPath = path.resolve(__dirname, "..", "..", "docs", "functional-documentation.md");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
   dependencies: Record<string, string>;
+  activationEvents?: string[];
   configurationDefaults?: Record<string, unknown>;
   contributes: {
     commands: Array<{ command: string; title: string; category?: string; enablement?: string; icon?: string }>;
@@ -20,6 +21,10 @@ const readme = readFileSync(readmePath, "utf8");
 const functionalDocs = readFileSync(functionalDocsPath, "utf8");
 
 describe("package contributions", () => {
+  it("includes onUri in activationEvents for URI handler support", () => {
+    expect(packageJson.activationEvents).toContain("onUri");
+  });
+
   it("includes serialport runtime dependency", () => {
     expect(packageJson.dependencies.serialport).toBeDefined();
   });

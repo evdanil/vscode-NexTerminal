@@ -65,6 +65,7 @@ import { detectMacroKeybindingBlockers, SKIP_SHELL_BLOCKER } from "./services/te
 import { getMacros } from "./macroSettings";
 import { SettingsGuardController, targetToScope } from "./services/terminal/settingsGuardController";
 import { recordNexusConfigWrite } from "./services/terminal/settingsWriteRegistry";
+import { createNexusUriHandler } from "./uri/nexusUriHandler";
 
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
 /** Set during activate(); lets repairMacroKeybindings mark its writes as Nexus-own. */
@@ -1013,6 +1014,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   const fileDisposables = registerFileCommands(ctx);
 
+  const uriHandlerRegistration = vscode.window.registerUriHandler(createNexusUriHandler({ core }));
+
   const appearanceCommand = vscode.commands.registerCommand("nexus.terminal.appearance", () => {
     TerminalAppearancePanel.open(colorSchemeService);
   });
@@ -1056,6 +1059,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     settingsGuard,
     settingsGuardReportCommand,
     fixMacroKeybindingsCommand,
+    uriHandlerRegistration,
     focusSessionCommand,
     filterCommand,
     filterClearCommand,

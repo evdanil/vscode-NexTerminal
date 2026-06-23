@@ -57,7 +57,8 @@
     "onCommand:nexus.localShell.connect",
     "onCommand:nexus.localShell.runWithScript",
     "onCommand:nexus.profile.add",
-    "onFileSystem:nexterm"
+    "onFileSystem:nexterm",
+    "onUri"
   ],
   "contributes": {
     "viewsContainers": {
