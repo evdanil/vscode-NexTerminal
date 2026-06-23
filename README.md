@@ -160,6 +160,55 @@ You can also drag a tunnel profile onto a server in the Connectivity Hub to star
 
 In an SSH profile's advanced options, enable **Open File Explorer on first connection** to start SFTP automatically after normal Connect when the File Explorer is not already showing that server. Saving it checked disables it on any other SSH profile, and it does not run when that profile is used as a jump host, tunnel connection, group connect item, or script-started connection.
 
+### Open a profile from the command line
+
+Nexus registers a `vscode://` URI handler so you can open any saved profile — **SSH, Serial, or Local Shell** — from a terminal, a script, a browser link, or a CI job. The profile type is detected automatically from the name (or id) you give, and Nexus runs the matching connect action.
+
+**URI forms:**
+
+```
+vscode://sentriflow.vscode-nexterminal/<name>            # open the named profile (SSH / Serial / Local Shell)
+vscode://sentriflow.vscode-nexterminal/<name>?sftp       # SSH only: connect + open File Explorer (SFTP)
+vscode://sentriflow.vscode-nexterminal/<name>?id=<uuid>  # use profile id instead of name
+```
+
+- `<name>` is case-insensitive and matched across all profile types; the first match is used when multiple profiles share a name (a warning suggests `?id=` to disambiguate).
+- `?id=<uuid>` overrides the name for unambiguous lookup. Find a profile's id in **Nexus → Settings → Export Configuration**.
+- `?sftp` is **SSH-only** — it opens the SSH terminal **and** the File Explorer for SFTP browsing in one click. Requesting `?sftp` on a Serial or Local Shell profile shows an error.
+
+**Open from the command line:**
+
+```bash
+code --open-url "vscode://sentriflow.vscode-nexterminal/Production"
+```
+
+> **Note:** Use `--open-url`, not `--file-uri` or `--folder-uri` — those open local files/folders and do not route to the extension's URI handler.
+
+**Shell alias (bash / zsh):**
+
+```bash
+nexterm() { code --open-url "vscode://sentriflow.vscode-nexterminal/$1"; }
+# Usage (works for SSH, Serial, and Local Shell profiles by name):
+nexterm Production
+nexterm "My Server"
+nexterm "Lab Console"      # a saved Serial profile
+nexterm Production?sftp     # SSH only
+```
+
+Add this to your `~/.bashrc` or `~/.zshrc` to make it permanent.
+
+**PowerShell function:**
+
+```powershell
+function nexterm($p) { code --open-url "vscode://sentriflow.vscode-nexterminal/$p" }
+# Usage:
+nexterm Production
+nexterm "My Server"
+nexterm "Production?sftp"
+```
+
+Add this to your PowerShell profile (`$PROFILE`) to make it permanent.
+
 ### Export / Import Configuration
 
 - **Encrypted Backup**: Run `Nexus: Export Backup` to create a master-password-protected backup including all profiles, settings, saved credentials, the user `.ssh` folder, and the configured Nexus scripts folder
