@@ -7,6 +7,7 @@ import type { PtyOutputObserver } from "../macroAutoTrigger";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { CLEAR_SCREEN_AND_SCROLLBACK } from "../terminal/terminalEscapes";
+import { OscContextFilter } from "../terminal/oscContextFilter";
 
 const MAX_FRAME_LENGTH = 1024 * 1024;
 const EARLY_TERMINATION_WINDOW_MS = 5_000;
@@ -93,6 +94,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   private readonly earlyTerminateEmitter = new vscode.EventEmitter<LocalShellEarlyTerminationEvent>();
   private readonly startupCompleteEmitter = new vscode.EventEmitter<void>();
   private readonly observerHub = new PtyObserverHub(undefined, false);
+  private readonly oscFilter = new OscContextFilter();
   private readonly queuedInput: string[] = [];
   private readonly spawnSidecar: LocalPtySidecarSpawner;
   private readonly highlighterStream?: TerminalHighlighterStream;
@@ -273,7 +275,8 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
         break;
       case "data": {
         const output = decodeBase64(frame.data);
-        this.observerHub.notifyOutput(output, this.highlighterStream, this.options.highlighter, (rendered) =>
+        const filtered = this.oscFilter.filter(output);
+        this.observerHub.notifyOutput(filtered, this.highlighterStream, this.options.highlighter, (rendered) =>
           this.writeEmitter.fire(rendered)
         );
         break;
@@ -411,6 +414,7 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
     this.sendFrame({ type: "kill" });
     this.sidecar?.kill();
     this.sidecar = undefined;
+    this.oscFilter.reset();
     this.highlighterStream?.dispose();
     this.disposeObservers();
     this.state = "disposed";

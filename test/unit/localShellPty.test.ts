@@ -354,6 +354,36 @@ describe("LocalShellPty", () => {
     }
   });
 
+  it("strips OSC 3008 context sequences from sidecar data before forwarding to writeEmitter", () => {
+    const observer = { onOutput: vi.fn(), pauseIntervalMacros: vi.fn(), dispose: vi.fn() };
+    const pty = new LocalShellPty({
+      sidecarPath: "/ext/dist/native/local-pty/linux-x64/nexus-local-pty",
+      shellPath: "/bin/bash",
+      shellArgs: [],
+      terminalName: "Nexus Local Shell: Bash",
+      spawnSidecar
+    });
+    const writes: string[] = [];
+    pty.onDidWrite((text) => writes.push(text));
+    pty.addOutputObserver(observer);
+
+    pty.open({ rows: 24, columns: 80 });
+    sidecar.emitStdout({ type: "ready" });
+
+    // Emit data with an OSC 3008 sequence (BEL-terminated)
+    const osc3008 = "\x1b]3008;start=abc;user=dev;pid=1234\x07";
+    sidecar.emitStdout({ type: "data", data: encode(`prompt> ${osc3008}$ `) });
+
+    const allOutput = writes.join("");
+    expect(allOutput).not.toContain("\x1b]3008;");
+    expect(allOutput).toContain("prompt> ");
+    expect(allOutput).toContain("$ ");
+
+    // Observer also receives filtered output
+    const observerOutput = (observer.onOutput.mock.calls as string[][]).map((c) => c[0]).join("");
+    expect(observerOutput).not.toContain("\x1b]3008;");
+  });
+
   it("does not classify exits after the startup window as early termination", () => {
     vi.useFakeTimers();
     try {

@@ -145,6 +145,74 @@ function findStableBoundary(text: string): number {
   return Math.max(lastLf, lastCr) + 1;
 }
 
+/**
+ * Return the largest index <= `desired` that does not fall strictly inside a
+ * complete or incomplete escape sequence.
+ *
+ * - If `desired` lands inside a *complete* escape sequence span [start, end),
+ *   back off to `start` so the whole sequence stays in the retained tail.
+ * - If there is a *trailing incomplete* escape (an \x1b that is not covered by
+ *   any complete span and has no terminator before text.length), back off to
+ *   the start of that escape.
+ * - If backing off would reach 0 (the escape starts at 0, making forward
+ *   progress impossible), fall back to returning `desired` unchanged so the
+ *   stream never stalls.
+ */
+function safeCutIndex(text: string, desired: number): number {
+  if (desired <= 0 || desired >= text.length) {
+    return desired;
+  }
+
+  const ansiRe = createAnsiRegex();
+  let lastCompleteEnd = 0;
+  let m: RegExpExecArray | null;
+
+  // Walk all complete escape sequences, check if desired falls inside one.
+  while ((m = ansiRe.exec(text)) !== null) {
+    const start = m.index;
+    const end = m.index + m[0].length;
+
+    if (start >= desired) {
+      // All remaining sequences start at or after desired — stop scanning
+      break;
+    }
+
+    if (desired < end) {
+      // desired falls strictly inside this complete span — back off to start
+      if (start === 0) {
+        // Escape sequence starts at 0; can't back off further — keep desired
+        return desired;
+      }
+      return start;
+    }
+
+    lastCompleteEnd = end;
+  }
+
+  // Check for a trailing incomplete escape: an \x1b in [lastCompleteEnd, desired)
+  // that is not covered by any complete sequence.
+  const escIdx = text.lastIndexOf("\x1b", desired - 1);
+  if (escIdx >= lastCompleteEnd && escIdx < desired) {
+    // Verify it's not the start of a complete sequence within text
+    // (if it were, the main loop above would have caught it).
+    // Re-check with a fresh regex to be safe.
+    const checkRe = createAnsiRegex();
+    checkRe.lastIndex = escIdx;
+    const checkMatch = checkRe.exec(text);
+    const isComplete = checkMatch !== null && checkMatch.index === escIdx && checkMatch.index + checkMatch[0].length <= desired;
+
+    if (!isComplete) {
+      // Trailing incomplete escape — back off to its start
+      if (escIdx === 0) {
+        return desired; // can't back off; fallback to avoid stalling
+      }
+      return escIdx;
+    }
+  }
+
+  return desired;
+}
+
 // Single-pass rule matching: find all matches against original text, resolve overlaps, build result
 function applyRulesToPlainText(text: string, rules: CompiledRule[]): string {
   // Collect all matches from all rules against the original text
@@ -287,10 +355,13 @@ export class TerminalHighlighterStream implements vscode.Disposable {
 
   public push(text: string): void {
     this.pending += text;
-    const boundary = findStableBoundary(this.pending);
-    if (boundary > 0) {
-      this.emit(this.highlighter.apply(this.pending.slice(0, boundary)));
-      this.pending = this.pending.slice(boundary);
+    const rawBoundary = findStableBoundary(this.pending);
+    if (rawBoundary > 0) {
+      const boundary = safeCutIndex(this.pending, rawBoundary);
+      if (boundary > 0) {
+        this.emit(this.highlighter.apply(this.pending.slice(0, boundary)));
+        this.pending = this.pending.slice(boundary);
+      }
       this.clearFlushTimer();
     }
     if (this.pending.length >= STREAM_MAX_PENDING_LENGTH) {
@@ -321,7 +392,10 @@ export class TerminalHighlighterStream implements vscode.Disposable {
     if (this.pending.length <= STREAM_RETAIN_MARGIN) {
       return;
     }
-    const emitUpTo = this.pending.length - STREAM_RETAIN_MARGIN;
+    const rawCut = this.pending.length - STREAM_RETAIN_MARGIN;
+    // Back off from the cut if it would split an escape sequence.
+    // safeCutIndex falls back to rawCut when backing off would reach 0.
+    const emitUpTo = safeCutIndex(this.pending, rawCut);
     this.emit(this.highlighter.apply(this.pending.slice(0, emitUpTo)));
     this.pending = this.pending.slice(emitUpTo);
   }

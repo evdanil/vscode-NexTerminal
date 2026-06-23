@@ -434,6 +434,96 @@ describe("SshPty", () => {
     expect(closes).toHaveLength(0);
   });
 
+  it("strips OSC 3008 context sequences from inbound SSH data before forwarding to writeEmitter", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => connection) };
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn()
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const writes: string[] = [];
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open();
+    await flushAsync();
+
+    // Emit a line with an OSC 3008 sequence embedded (ST-terminated)
+    const osc3008 = "\x1b]3008;start=abc;user=dev;pid=42\x1b\\";
+    stream.push(`prompt> ${osc3008}$ `);
+    await flushAsync();
+
+    // The writeEmitter should have received text WITHOUT the OSC 3008 sequence
+    const allOutput = writes.join("");
+    expect(allOutput).not.toContain("\x1b]3008;");
+    expect(allOutput).toContain("prompt> ");
+    expect(allOutput).toContain("$ ");
+
+    pty.dispose();
+  });
+
+  it("clears stale OSC 3008 carry on reconnect so the next session's leading output survives", async () => {
+    const stream1 = new PassThrough();
+    const first = createConnection(stream1);
+    const stream2 = new PassThrough();
+    const second = createConnection(stream2);
+    const sshFactory = {
+      connect: vi
+        .fn()
+        .mockResolvedValueOnce(first.connection)
+        .mockResolvedValueOnce(second.connection)
+    };
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn(),
+      onDisconnected: vi.fn()
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    const writes: string[] = [];
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open();
+    await flushAsync();
+
+    // Session A emits a chunk ending in an UNTERMINATED partial OSC 3008.
+    // The filter holds the partial in carry — it must NOT reach the terminal.
+    stream1.push("hello\x1b]3008;start=A;pid=1");
+    await flushAsync();
+    expect(writes.join("")).not.toContain("\x1b]3008;");
+    expect(writes.join("")).toContain("hello");
+
+    // Session A disconnects with that partial still held in carry.
+    first.emitClose();
+    await flushAsync();
+
+    // Clear captured output so we only assess session B's bytes.
+    writes.length = 0;
+
+    // User presses R to reconnect — start() runs again on the SAME instance.
+    pty.handleInput("R");
+    await flushAsync();
+
+    // Session B's first chunk: visible banner, then B's own BEL-terminated
+    // OSC 3008 (its first prompt context line), then the prompt. If stale-A
+    // carry survived, findTerminator fuses "<stale A partial>BANNER-B...<B's BEL>"
+    // into ONE sequence and silently deletes B's leading visible output.
+    stream2.push("BANNER-B\r\n\x1b]3008;start=B;pid=9\x07user@host:~$ ");
+    await flushAsync();
+
+    const sessionBOutput = writes.join("");
+    expect(sessionBOutput).toContain("BANNER-B");
+    expect(sessionBOutput).toContain("user@host:~$ ");
+    // B's own 3008 is correctly stripped; no 3008 marker survives.
+    expect(sessionBOutput).not.toContain("\x1b]3008;");
+    // The stale-A partial must never resurface either.
+    expect(sessionBOutput).not.toContain("start=A");
+
+    pty.dispose();
+  });
+
   it("markShuttingDown() is idempotent and safe to call twice", async () => {
     const stream = new PassThrough();
     const { connection } = createConnection(stream);
