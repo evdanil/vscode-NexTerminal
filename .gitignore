@@ -154,3 +154,7 @@ specs/001-scripting-support/contracts/*
 
 # Rust build output
 native/**/target/
+
+# Internal design/planning docs (kept local, not published)
+docs/plans/
+docs/superpowers/
