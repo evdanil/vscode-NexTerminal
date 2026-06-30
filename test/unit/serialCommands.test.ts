@@ -58,11 +58,11 @@ vi.mock("vscode", () => ({
 }));
 
 vi.mock("../../src/services/serial/serialPty", () => ({
-  SerialPty: vi.fn(() => ({}))
+  SerialPty: vi.fn(function () { return {}; })
 }));
 
 vi.mock("../../src/services/serial/smartSerialPty", () => ({
-  SmartSerialPty: vi.fn(() => ({})),
+  SmartSerialPty: vi.fn(function () { return {}; }),
   normalizePortPath: vi.fn((p: string) => p)
 }));
 

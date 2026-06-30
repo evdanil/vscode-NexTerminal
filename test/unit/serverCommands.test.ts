@@ -28,7 +28,7 @@ vi.mock("../../src/services/ssh/deploySshKey", () => ({
 }));
 
 vi.mock("../../src/services/ssh/sshPty", () => ({
-  SshPty: vi.fn(() => ({}))
+  SshPty: vi.fn(function () { return {}; })
 }));
 
 vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
