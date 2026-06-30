@@ -3299,7 +3299,7 @@
     "generate:keybindings": "node scripts/generateKeybindings.mjs"
   },
   "dependencies": {
-    "fast-xml-parser": "^5.3.7",
+    "fast-xml-parser": "^5.7.0",
     "jsonc-parser": "^3.3.1",
     "serialport": "^13.0.0",
     "socks": "^2.8.7",
