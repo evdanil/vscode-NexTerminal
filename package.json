@@ -3295,7 +3295,7 @@
     "test:integration": "vitest run test/integration",
     "package:vsix": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty:required && vsce package",
     "package:ovsx": "npm run package:vsix",
-    "publish:ovsx": "ovsx publish \"vscode-nexterminal-${npm_package_version}.vsix\" --pat \"$OVSX_PAT\"",
+    "publish:ovsx": "ovsx publish \"vscode-nexterminal-${npm_package_version}.vsix\" --pat \"$OVSX_PAT\" --skip-duplicate",
     "generate:keybindings": "node scripts/generateKeybindings.mjs"
   },
   "dependencies": {
