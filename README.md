@@ -2,7 +2,7 @@
 
 A full SSH + serial + port-forwarding client inside VS Code — without Remote-SSH's 300MB server payload on the box.
 
-[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/sentriflow.vscode-nexterminal?label=VS%20Code%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=sentriflow.vscode-nexterminal)
+[![VS Code Marketplace](https://vsmarketplacebadges.dev/version-short/sentriflow.vscode-nexterminal.svg?label=VS%20Code%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=sentriflow.vscode-nexterminal)
 [![Open VSX](https://img.shields.io/open-vsx/v/sentriflow/vscode-nexterminal?label=Open%20VSX)](https://open-vsx.org/extension/sentriflow/vscode-nexterminal)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
