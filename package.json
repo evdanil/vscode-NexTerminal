@@ -3310,9 +3310,9 @@
     "@types/ssh2": "^1.15.5",
     "@types/vscode": "^1.95.0",
     "@vitest/coverage-v8": "^4.1.9",
-    "@vscode/vsce": "^3.3.2",
-    "esbuild": "^0.27.3",
-    "ovsx": "0.10.5",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.1",
+    "ovsx": "^1.0.2",
     "rimraf": "^6.0.1",
     "typescript": "^5.8.2",
     "vitest": "^4.1.9"
