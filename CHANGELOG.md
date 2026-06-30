@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [2.8.65] — 2026-06-30
+
+Dependency and security maintenance release. No user-facing feature or behavior changes.
+
+### Security
+
+- **Cleared all 15 `npm audit` findings (6 high, 8 moderate, 1 low → 0).** Every advisory lived in the `@vscode/vsce` / `ovsx` publish-and-package toolchain (dev-only, never shipped in the VSIX, never processes untrusted input): bumped `@vscode/vsce` to `^3.9.2` (pulls fixed `tmp`, `underscore`, `uuid`, `@azure/*`, `form-data`, `fast-uri`, `linkify-it`, `markdown-it`, `minimatch`, `brace-expansion`, `ip-address`, `js-yaml`, `qs`), `ovsx` to `^1.0.2`, and `esbuild` to `^0.28.1` (clears GHSA-g7r4-m6w7-qqqr, a dev-server file-read issue; esbuild is used only as a library bundler here, never its dev server).
+
+### Changed
+
+- **Batched the open Dependabot updates.** Runtime: `fast-xml-parser` `5.3.7` → `5.9.3` (the SecureCRT XML import dependency; its import tests pass unchanged). Dev/test: `vitest` + `@vitest/coverage-v8` `3.x` → `4.1.9` and the `picomatch` / `undici` / `lodash` transitives. Migrated the test suite for Vitest 4 (constructor mocks must use `function`/`class`, not arrow functions); 116 files / 1759 tests pass.
+- **Made the Open VSX publish step idempotent** by adding `--skip-duplicate` to `publish:ovsx`, so re-running a release on an already-published version no longer errors.
+
+### Fixed
+
+- **The VS Code Marketplace version badge in the README no longer shows "retired".** shields.io retired its `visual-studio-marketplace/*` badge family; swapped to `vsmarketplacebadges.dev`, which reads the live published version. The Open VSX badge was unaffected.
+
 ## [2.8.64] — 2026-06-23
 
 ### Added
