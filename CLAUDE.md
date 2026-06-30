@@ -107,6 +107,7 @@ Graceful degradation — registers stub commands showing "not available in brows
 
 - Feature development uses git worktrees in the `.worktrees/` directory for isolation from the main working tree
 - **Coding delegation:** Delegate implementation work (fixes, features, refactors) to a Sonnet-based expert sub-agent (`Agent` tool with `model: "sonnet"`) unless the user explicitly requests otherwise. Research, planning, and code-review agents may use their default models.
+- **Repository hygiene (public repo):** Internal planning/design/implementation docs and local/agent config are **local-only — never commit them**. This includes `docs/plans/`, `docs/superpowers/`, `.claude/` (e.g. `settings.local.json`), `.specify/`, and `specs/*` (except the whitelisted `specs/001-scripting-support/contracts/`). All are in `.gitignore`; if any are found tracked, untrack with `git rm --cached` (keep the local copy). Author new planning docs outside version control.
 
 ## Testing Patterns
 
