@@ -6,7 +6,7 @@ const { mockGetConfiguration, mockOnDidChangeConfiguration } = vi.hoisted(() => 
 }));
 
 vi.mock("vscode", () => {
-  const EventEmitter = vi.fn().mockImplementation(() => {
+  const EventEmitter = vi.fn().mockImplementation(function () {
     const listeners: Array<(e: unknown) => void> = [];
     return {
       event: (listener: (e: unknown) => void) => { listeners.push(listener); },
