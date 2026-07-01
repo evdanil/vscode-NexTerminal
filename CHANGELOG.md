@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.66] — 2026-07-01
+
+### Added
+
+- **Maintainer contact and optional funding.** The manifest now carries an `author` contact (`evgeny@netsectech.com.au`), a `bugs` link to GitHub Issues, and a `sponsor` URL so the VS Code Marketplace shows a **Sponsor** button. Added `.github/FUNDING.yml` (Buy Me a Coffee) for the GitHub **Sponsor** button, and **Support** + **Contact** sections to the README. Nexus Terminal stays free and open source — donations are appreciated but never required, and no feature is gated behind them.
+
 ## [2.8.65] — 2026-06-30
 
 Dependency and security maintenance release. No user-facing feature or behavior changes.

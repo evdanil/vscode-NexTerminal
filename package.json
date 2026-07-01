@@ -2,13 +2,24 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, and tunnels in one sidebar. Import from MobaXterm/SecureCRT, 2FA, legacy KEX for old Cisco gear. On VS Code Marketplace and Open VSX.",
-  "version": "2.8.65",
+  "version": "2.8.66",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/evdanil/vscode-NexTerminal.git"
+  },
+  "author": {
+    "name": "Evgeny D.",
+    "email": "evgeny@netsectech.com.au"
+  },
+  "homepage": "https://github.com/evdanil/vscode-NexTerminal#readme",
+  "bugs": {
+    "url": "https://github.com/evdanil/vscode-NexTerminal/issues"
+  },
+  "sponsor": {
+    "url": "https://buymeacoffee.com/evgeny_danilchenko"
   },
   "engines": {
     "vscode": "^1.95.0"

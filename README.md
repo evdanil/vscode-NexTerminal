@@ -5,6 +5,7 @@ A full SSH + serial + port-forwarding client inside VS Code — without Remote-S
 [![VS Code Marketplace](https://vsmarketplacebadges.dev/version-short/sentriflow.vscode-nexterminal.svg?label=VS%20Code%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=sentriflow.vscode-nexterminal)
 [![Open VSX](https://img.shields.io/open-vsx/v/sentriflow/vscode-nexterminal?label=Open%20VSX)](https://open-vsx.org/extension/sentriflow/vscode-nexterminal)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/evgeny_danilchenko)
 
 - **Replaces PuTTY + MobaXterm + SecureCRT + TeraTerm** — SSH, serial consoles, local shells, port forwarding, and SFTP live in one VS Code sidebar instead of four separate windows.
 - **Unlike Remote-SSH, nothing is installed on the remote.** It's a pure client: no `vscode-server` unpacked into the target, no node process running on the far end. That matters when the far end is a Cisco switch, a bastion you only get a shell on, or a change-controlled box where you can't drop an agent.
@@ -286,6 +287,18 @@ npm run package:vsix
 ## Documentation
 
 See [docs/functional-documentation.md](docs/functional-documentation.md) for detailed architecture and design documentation.
+
+## Support
+
+Nexus Terminal is free and open source. If it saves you time, you can say thanks with a coffee — it's appreciated but never expected, and every feature stays free regardless.
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/evgeny_danilchenko)
+
+- **Found a bug or have a feature request?** Open an issue: https://github.com/evdanil/vscode-NexTerminal/issues
+
+## Contact
+
+Evgeny D. — [evgeny@netsectech.com.au](mailto:evgeny@netsectech.com.au)
 
 ## License
 
