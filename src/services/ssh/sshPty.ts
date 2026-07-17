@@ -5,11 +5,21 @@ import type { ServerConfig } from "../../models/config";
 import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { SshConnection, SshFactory } from "./contracts";
+import { hasContextAwareConnect } from "./contracts";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { OscContextFilter } from "../terminal/oscContextFilter";
+import { createAnsiRegex } from "../../utils/ansi";
+
+// Pre-auth server messages (USERAUTH_BANNER, keyboard-interactive
+// name/instructions) are attacker-controlled text rendered before any trust
+// decision has been made. Strip ANSI escapes and C0 control chars (except
+// \n, \r, \t) the same way TerminalCaptureBuffer does on ingest, so a
+// malicious banner can't manipulate terminal state or spoof the prompt.
+const AUTH_MESSAGE_ANSI_RE = createAnsiRegex();
+const AUTH_MESSAGE_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 
 export interface SshPtyCallbacks {
   onSessionOpened(sessionId: string): void;
@@ -235,8 +245,36 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     // chunk. No-op on first connect; idempotent with the dispose() reset.
     this.oscFilter.reset();
     let connection: SshConnection | undefined;
+    // Relays live auth messages (USERAUTH_BANNER, keyboard-interactive
+    // name/instructions — e.g. Duo's option menu) to the terminal while the
+    // MFA popup is showing, instead of only the post-ready banner flush
+    // below. Guarded against firing after dispose/shutdown or once a newer
+    // connection attempt (reconnect) has superseded this one.
+    const onAuthMessage = (text: string): void => {
+      if (this.disposed || this.shuttingDown || generation !== this.connectionGeneration) {
+        return;
+      }
+      AUTH_MESSAGE_ANSI_RE.lastIndex = 0;
+      AUTH_MESSAGE_CONTROL_CHAR_RE.lastIndex = 0;
+      const sanitized = text.replace(AUTH_MESSAGE_ANSI_RE, "").replace(AUTH_MESSAGE_CONTROL_CHAR_RE, "");
+      if (!sanitized.trim()) {
+        return;
+      }
+      // Normalize every CR variant (CRLF and lone CR) to LF first, then LF to
+      // CRLF. A lone CR left un-normalized is bare carriage-return, which
+      // VS Code's terminal treats as cursor-to-column-0 — server-controlled
+      // pre-auth text could otherwise overwrite/spoof an already-rendered
+      // line despite the ANSI/control-char stripping above.
+      let normalized = sanitized.replace(/\r\n?/g, "\n").replace(/\n/g, "\r\n");
+      if (!normalized.endsWith("\r\n")) {
+        normalized += "\r\n";
+      }
+      this.writeEmitter.fire(normalized);
+    };
     try {
-      connection = await this.sshFactory.connect(this.serverConfig);
+      connection = hasContextAwareConnect(this.sshFactory)
+        ? await this.sshFactory.connectWithContext(this.serverConfig, { onAuthMessage })
+        : await this.sshFactory.connect(this.serverConfig);
       if (this.disposed || this.shuttingDown || generation !== this.connectionGeneration) {
         connection.dispose();
         return;

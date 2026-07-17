@@ -136,6 +136,226 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
+  it("uses connectWithContext with an onAuthMessage sink when the factory is context-aware", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    const sshFactory = {
+      connect: vi.fn(async () => connection),
+      connectWithContext: vi.fn(async () => connection)
+    };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const server = makeServer();
+    const pty = new SshPty(server, sshFactory as any, callbacks, logger as any);
+
+    pty.open();
+    await flushAsync();
+
+    expect(sshFactory.connectWithContext).toHaveBeenCalledWith(
+      server,
+      expect.objectContaining({ onAuthMessage: expect.any(Function) })
+    );
+    expect(sshFactory.connect).not.toHaveBeenCalled();
+
+    pty.dispose();
+  });
+
+  it("writes MFA auth messages (banner / keyboard-interactive name+instructions) via the onAuthMessage sink with CRLF normalization", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    let capturedSink: ((text: string) => void) | undefined;
+    const sshFactory = {
+      connect: vi.fn(async () => connection),
+      connectWithContext: vi.fn(async (_server: ServerConfig, context?: { onAuthMessage?: (text: string) => void }) => {
+        capturedSink = context?.onAuthMessage;
+        // Simulate the server pushing MFA context before the prompt resolves,
+        // i.e. while auth is still in flight (before the connect() promise settles).
+        capturedSink?.("Duo two-factor login\nEnter a passcode or select one of the following options:");
+        capturedSink?.("Already CRLF-terminated\r\n");
+        return connection;
+      })
+    };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const writes: string[] = [];
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open();
+    await flushAsync();
+
+    expect(writes).toContain(
+      "Duo two-factor login\r\nEnter a passcode or select one of the following options:\r\n"
+    );
+    expect(writes).toContain("Already CRLF-terminated\r\n");
+
+    pty.dispose();
+  });
+
+  it("normalizes a lone CR (not followed by LF) to CRLF instead of leaving a bare cursor-to-column-0", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    let capturedSink: ((text: string) => void) | undefined;
+    const sshFactory = {
+      connect: vi.fn(async () => connection),
+      connectWithContext: vi.fn(async (_server: ServerConfig, context?: { onAuthMessage?: (text: string) => void }) => {
+        capturedSink = context?.onAuthMessage;
+        // A bare CR left un-normalized is cursor-to-column-0 in VS Code's
+        // terminal — a malicious server could use it to overwrite/spoof an
+        // already-rendered line.
+        capturedSink?.("REAL PROMPT\rFAKE");
+        return connection;
+      })
+    };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const writes: string[] = [];
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open();
+    await flushAsync();
+
+    expect(writes).toContain("REAL PROMPT\r\nFAKE\r\n");
+    // No bare CR should survive — every CR must be part of a CRLF pair.
+    const combined = writes.join("");
+    expect(combined.replace(/\r\n/g, "")).not.toContain("\r");
+
+    pty.dispose();
+  });
+
+  it("strips ANSI escapes and C0 control chars from auth messages before writing (server-controlled text)", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    let capturedSink: ((text: string) => void) | undefined;
+    const sshFactory = {
+      connect: vi.fn(async () => connection),
+      connectWithContext: vi.fn(async (_server: ServerConfig, context?: { onAuthMessage?: (text: string) => void }) => {
+        capturedSink = context?.onAuthMessage;
+        // A malicious/misbehaving server could smuggle a cursor-move + bell
+        // + other C0 control bytes into the banner or KI name/instructions.
+        capturedSink?.("\x1b[2J\x1b[HFake login prompt\x07\x01\x0bstill here");
+        return connection;
+      })
+    };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const writes: string[] = [];
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open();
+    await flushAsync();
+
+    const combined = writes.join("");
+    expect(combined).not.toContain("\x1b");
+    expect(combined).not.toContain("\x07");
+    expect(combined).not.toContain("\x01");
+    expect(combined).not.toContain("\x0b");
+    expect(combined).toContain("Fake login promptstill here");
+
+    pty.dispose();
+  });
+
+  it("suppresses an auth message that is blank after ANSI/control-char stripping", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    let capturedSink: ((text: string) => void) | undefined;
+    const sshFactory = {
+      connect: vi.fn(async () => connection),
+      connectWithContext: vi.fn(async (_server: ServerConfig, context?: { onAuthMessage?: (text: string) => void }) => {
+        capturedSink = context?.onAuthMessage;
+        // Nothing left after stripping the escape sequence and control chars.
+        capturedSink?.("\x1b[2J\x07\x01  ");
+        return connection;
+      })
+    };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const writes: string[] = [];
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open();
+    await flushAsync();
+
+    expect(writes).toEqual([]);
+
+    pty.dispose();
+  });
+
+  it("auth-message sink is a no-op once markShuttingDown() has fired", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    let capturedSink: ((text: string) => void) | undefined;
+    const sshFactory = {
+      connect: vi.fn(async () => connection),
+      connectWithContext: vi.fn(async (_server: ServerConfig, context?: { onAuthMessage?: (text: string) => void }) => {
+        capturedSink = context?.onAuthMessage;
+        return connection;
+      })
+    };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onDisconnected: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    const writes: string[] = [];
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open();
+    await flushAsync();
+
+    pty.markShuttingDown("shutting down");
+    writes.length = 0;
+
+    capturedSink?.("late MFA message");
+    expect(writes).toEqual([]);
+  });
+
+  it("ignores stale onAuthMessage sink invocations from a superseded (reconnected) connection attempt", async () => {
+    const stream1 = new PassThrough();
+    const first = createConnection(stream1);
+    const stream2 = new PassThrough();
+    const second = createConnection(stream2);
+    let firstSink: ((text: string) => void) | undefined;
+    let secondSink: ((text: string) => void) | undefined;
+    let callCount = 0;
+    const sshFactory = {
+      connect: vi.fn(),
+      connectWithContext: vi.fn(async (_server: ServerConfig, context?: { onAuthMessage?: (text: string) => void }) => {
+        callCount += 1;
+        if (callCount === 1) {
+          firstSink = context?.onAuthMessage;
+          return first.connection;
+        }
+        secondSink = context?.onAuthMessage;
+        return second.connection;
+      })
+    };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onDisconnected: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    const writes: string[] = [];
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open();
+    await flushAsync();
+
+    first.emitClose();
+    await flushAsync();
+
+    pty.handleInput("R");
+    await flushAsync();
+
+    writes.length = 0;
+    firstSink?.("stale message");
+    expect(writes).toEqual([]);
+
+    secondSink?.("fresh message");
+    expect(writes).toContain("fresh message\r\n");
+
+    pty.dispose();
+  });
+
   it("fires onDataReceived callback when stream data arrives", async () => {
     const stream = new PassThrough();
     const { connection } = createConnection(stream);

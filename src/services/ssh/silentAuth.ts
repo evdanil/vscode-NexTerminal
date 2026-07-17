@@ -84,12 +84,35 @@ export class SilentAuthSshFactory implements SshFactory {
     };
   }
 
-  private buildKeyboardInteractiveHandler(password?: string): KeyboardInteractiveHandler | undefined {
+  private buildKeyboardInteractiveHandler(
+    password?: string,
+    onAuthMessage?: (text: string) => void
+  ): KeyboardInteractiveHandler | undefined {
     if (!this.inputPromptFn) {
       return undefined;
     }
     const promptFn = this.inputPromptFn;
-    return async (_name, _instructions, prompts) => {
+    return async (name, instructions, prompts) => {
+      // OpenSSH delivers MFA context (e.g. Duo's option menu) via these two
+      // fields ahead of the prompts. Surface them before prompting so the
+      // user isn't shown a bare input box with no context. Display is
+      // best-effort — a throwing sink must not abort authentication.
+      if (onAuthMessage) {
+        if (name.trim()) {
+          try {
+            onAuthMessage(name);
+          } catch {
+            // ignore — see comment above
+          }
+        }
+        if (instructions.trim()) {
+          try {
+            onAuthMessage(instructions);
+          } catch {
+            // ignore — see comment above
+          }
+        }
+      }
       const responses: string[] = [];
       for (const p of prompts) {
         const isPasswordPrompt = /password/i.test(p.prompt);
@@ -124,11 +147,14 @@ export class SilentAuthSshFactory implements SshFactory {
    * is started or the error is rethrown; the sock that backs a successful
    * `connector.connect` is retained by the returned `SshConnection`.
    */
-  public async connect(server: ServerConfig, options?: { sockFactory?: () => Promise<Duplex> }): Promise<SshConnection> {
+  public async connect(
+    server: ServerConfig,
+    options?: { sockFactory?: () => Promise<Duplex>; onAuthMessage?: (text: string) => void }
+  ): Promise<SshConnection> {
     const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey } = this.resolveServer(server);
 
     if (resolved.authType === "key") {
-      const handler = this.buildKeyboardInteractiveHandler();
+      const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage);
       const savedPassphrase = await this.vault.get(passphraseKey);
 
       // Try saved passphrase (or no passphrase on first attempt).
@@ -137,7 +163,8 @@ export class SilentAuthSshFactory implements SshFactory {
         return await this.connector.connect(resolved, {
           ...(savedPassphrase && { passphrase: savedPassphrase }),
           ...(handler && { onKeyboardInteractive: handler }),
-          ...(firstSock && { sock: firstSock })
+          ...(firstSock && { sock: firstSock }),
+          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
         });
       } catch (error) {
         firstSock?.destroy();
@@ -163,12 +190,16 @@ export class SilentAuthSshFactory implements SshFactory {
 
       // Stage A — establish connection. Narrow try scope so vault ops cannot
       // trigger the catch that destroys the live sock.
+      // Note: onAuthMessage may render the banner/KI context a second time
+      // here (once for the failed saved-passphrase attempt, once for this
+      // prompted retry) — intentional, mirrors re-running ssh by hand.
       let connection: SshConnection;
       try {
         connection = await this.connector.connect(resolved, {
           passphrase: promptResult.password,
           ...(handler && { onKeyboardInteractive: handler }),
-          ...(secondSock && { sock: secondSock })
+          ...(secondSock && { sock: secondSock }),
+          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
         });
       } catch (error) {
         secondSock?.destroy();
@@ -203,12 +234,13 @@ export class SilentAuthSshFactory implements SshFactory {
     }
 
     if (resolved.authType !== "password") {
-      const handler = this.buildKeyboardInteractiveHandler();
+      const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage);
       const sock = await options?.sockFactory?.();
       try {
         return await this.connector.connect(resolved, {
           ...(handler && { onKeyboardInteractive: handler }),
-          ...(sock && { sock })
+          ...(sock && { sock }),
+          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
         });
       } catch (error) {
         sock?.destroy();
@@ -218,13 +250,14 @@ export class SilentAuthSshFactory implements SshFactory {
 
     const savedPassword = await this.vault.get(passwordKey);
     if (savedPassword) {
-      const handler = this.buildKeyboardInteractiveHandler(savedPassword);
+      const handler = this.buildKeyboardInteractiveHandler(savedPassword, options?.onAuthMessage);
       const firstSock = await options?.sockFactory?.();
       try {
         return await this.connector.connect(resolved, {
           password: savedPassword,
           ...(handler && { onKeyboardInteractive: handler }),
-          ...(firstSock && { sock: firstSock })
+          ...(firstSock && { sock: firstSock }),
+          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
         });
       } catch (error) {
         firstSock?.destroy();
@@ -240,17 +273,21 @@ export class SilentAuthSshFactory implements SshFactory {
       throw new Error(`Password entry canceled for ${server.name}`);
     }
 
-    const handler = this.buildKeyboardInteractiveHandler(promptResult.password);
+    const handler = this.buildKeyboardInteractiveHandler(promptResult.password, options?.onAuthMessage);
     const secondSock = await options?.sockFactory?.();
 
     // Stage A — establish connection. Narrow try scope so vault ops cannot
     // trigger the catch that destroys the live sock.
+    // Note: onAuthMessage may render the banner/KI context a second time
+    // here (once for the failed saved-password attempt, once for this
+    // prompted retry) — intentional, mirrors re-running ssh by hand.
     let connection: SshConnection;
     try {
       connection = await this.connector.connect(resolved, {
         password: promptResult.password,
         ...(handler && { onKeyboardInteractive: handler }),
-        ...(secondSock && { sock: secondSock })
+        ...(secondSock && { sock: secondSock }),
+        ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
       });
     } catch (error) {
       secondSock?.destroy();

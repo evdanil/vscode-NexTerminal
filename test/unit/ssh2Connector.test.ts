@@ -1,6 +1,33 @@
-import { describe, expect, it } from "vitest";
-import { buildConnectConfig, LEGACY_ALGORITHMS } from "../../src/services/ssh/ssh2Connector";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerConfig } from "../../src/models/config";
+
+// Minimal fake for ssh2's `Client`: a bare event emitter with the handful of
+// methods Ssh2Connector.connect() calls (`connect`, `end`). Real ssh2 would
+// require a live TCP handshake, so we swap the module for this test file.
+const { mockClients } = vi.hoisted(() => ({ mockClients: [] as any[] }));
+
+vi.mock("ssh2", () => {
+  class MockClient {
+    private handlers: Record<string, Array<(...args: any[]) => void>> = {};
+    public connect = vi.fn();
+    public end = vi.fn();
+    public on(event: string, cb: (...args: any[]) => void): this {
+      (this.handlers[event] ??= []).push(cb);
+      return this;
+    }
+    public emit(event: string, ...args: any[]): void {
+      for (const cb of this.handlers[event] ?? []) {
+        cb(...args);
+      }
+    }
+    constructor() {
+      mockClients.push(this);
+    }
+  }
+  return { Client: MockClient };
+});
+
+import { buildConnectConfig, LEGACY_ALGORITHMS, Ssh2Connector } from "../../src/services/ssh/ssh2Connector";
 
 function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
   return {
@@ -87,5 +114,108 @@ describe("buildConnectConfig", () => {
     // Dropped by OpenSSL 3.x - cause silent handshake timeouts
     expect(ciphers).not.toContain("cast128-cbc");
     expect(ciphers).not.toContain("blowfish-cbc");
+  });
+});
+
+// setImmediate runs after the microtask queue drains, so this reliably waits
+// past buildConnectConfig()'s internal await before `new Client()` runs.
+function flushMicrotasks(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+describe("Ssh2Connector.connect banner handling", () => {
+  beforeEach(() => {
+    mockClients.length = 0;
+  });
+
+  it("routes the banner to onAuthMessage immediately and does not buffer it when a callback is provided", async () => {
+    const connector = new Ssh2Connector();
+    const onAuthMessage = vi.fn();
+
+    const connectPromise = connector.connect(makeServer(), { password: "pw", onAuthMessage });
+    await flushMicrotasks();
+
+    const client = mockClients.at(-1);
+    expect(client).toBeDefined();
+    client.emit("banner", "Authorized use only");
+    client.emit("ready");
+
+    const connection = await connectPromise;
+
+    expect(onAuthMessage).toHaveBeenCalledWith("Authorized use only");
+    // Must NOT also be buffered — sshPty's post-ready getBanner() flush would
+    // otherwise print the same banner a second time.
+    expect(connection.getBanner()).toBeUndefined();
+  });
+
+  it("still buffers the banner for getBanner() when no onAuthMessage callback is provided (legacy behavior unchanged)", async () => {
+    const connector = new Ssh2Connector();
+
+    const connectPromise = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+
+    const client = mockClients.at(-1);
+    expect(client).toBeDefined();
+    client.emit("banner", "Authorized use only");
+    client.emit("ready");
+
+    const connection = await connectPromise;
+
+    expect(connection.getBanner()).toBe("Authorized use only");
+  });
+
+  it("supports multiple onAuthMessage calls (e.g. banner then keyboard-interactive context) without buffering any of them", async () => {
+    const connector = new Ssh2Connector();
+    const onAuthMessage = vi.fn();
+
+    const connectPromise = connector.connect(makeServer(), { password: "pw", onAuthMessage });
+    await flushMicrotasks();
+
+    const client = mockClients.at(-1);
+    client.emit("banner", "Authorized use only");
+    client.emit("banner", "Second banner line");
+    client.emit("ready");
+
+    const connection = await connectPromise;
+
+    expect(onAuthMessage).toHaveBeenNthCalledWith(1, "Authorized use only");
+    expect(onAuthMessage).toHaveBeenNthCalledWith(2, "Second banner line");
+    expect(connection.getBanner()).toBeUndefined();
+  });
+
+  it("does not relay a blank banner to onAuthMessage", async () => {
+    const connector = new Ssh2Connector();
+    const onAuthMessage = vi.fn();
+
+    const connectPromise = connector.connect(makeServer(), { password: "pw", onAuthMessage });
+    await flushMicrotasks();
+
+    const client = mockClients.at(-1);
+    client.emit("banner", "   ");
+    client.emit("ready");
+
+    await connectPromise;
+
+    expect(onAuthMessage).not.toHaveBeenCalled();
+  });
+
+  it("swallows an onAuthMessage callback that throws instead of aborting the handshake", async () => {
+    const connector = new Ssh2Connector();
+    const onAuthMessage = vi.fn(() => {
+      throw new Error("boom");
+    });
+
+    const connectPromise = connector.connect(makeServer(), { password: "pw", onAuthMessage });
+    await flushMicrotasks();
+
+    const client = mockClients.at(-1);
+    // Must not throw / reject the connect promise even though the sink throws.
+    expect(() => client.emit("banner", "Authorized use only")).not.toThrow();
+    client.emit("ready");
+
+    const connection = await connectPromise;
+
+    expect(onAuthMessage).toHaveBeenCalledWith("Authorized use only");
+    expect(connection).toBeDefined();
   });
 });

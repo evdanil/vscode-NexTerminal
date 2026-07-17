@@ -1,5 +1,10 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import type { SshConnection, SshFactory } from "../../src/services/ssh/contracts";
+import type {
+  ContextAwareSshFactory,
+  SshConnectContext,
+  SshConnection,
+  SshFactory
+} from "../../src/services/ssh/contracts";
 import { SshConnectionPool, type PoolEvent } from "../../src/services/ssh/sshConnectionPool";
 import type { ServerConfig } from "../../src/models/config";
 
@@ -169,6 +174,44 @@ describe("SshConnectionPool", () => {
 
     const [lease1, lease2] = await Promise.all([p1, p2]);
     expect(delayedFactory.connect).toHaveBeenCalledTimes(1);
+    expect(lease1).toBeDefined();
+    expect(lease2).toBeDefined();
+  });
+
+  it("a joiner of an in-flight connect gets the first caller's context — its own onAuthMessage is discarded", async () => {
+    let resolveConnect: ((conn: SshConnection) => void) | undefined;
+    const capturedContexts: Array<SshConnectContext | undefined> = [];
+    const delayedFactory: ContextAwareSshFactory = {
+      connect: vi.fn(async () => {
+        throw new Error("connect() should not be called directly by the pool — connectWithContext should be used");
+      }),
+      connectWithContext: vi.fn((_server: ServerConfig, context?: SshConnectContext) => {
+        capturedContexts.push(context);
+        return new Promise<SshConnection>((resolve) => { resolveConnect = resolve; });
+      })
+    };
+    const p = new SshConnectionPool(delayedFactory, { enabled: true, idleTimeoutMs: 5000 });
+
+    const firstSink = vi.fn();
+    const secondSink = vi.fn();
+
+    // Both calls race for the same server before the underlying handshake settles.
+    const p1 = p.connectWithContext(testServer, { onAuthMessage: firstSink });
+    const p2 = p.connectWithContext(testServer, { onAuthMessage: secondSink });
+
+    const conn = createMockConnection();
+    resolveConnect!(conn);
+
+    const [lease1, lease2] = await Promise.all([p1, p2]);
+
+    // Only one underlying connect attempt is made...
+    expect(delayedFactory.connectWithContext).toHaveBeenCalledTimes(1);
+    // ...and it only ever saw the first caller's context/sink. The second
+    // caller's onAuthMessage never reaches the handshake — by design (see
+    // SshConnectContext.onAuthMessage doc comment in contracts.ts).
+    expect(capturedContexts).toHaveLength(1);
+    expect(capturedContexts[0]?.onAuthMessage).toBe(firstSink);
+    expect(capturedContexts[0]?.onAuthMessage).not.toBe(secondSink);
     expect(lease1).toBeDefined();
     expect(lease2).toBeDefined();
   });
