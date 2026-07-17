@@ -192,6 +192,38 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
+  it("normalizes a lone CR (not followed by LF) to CRLF instead of leaving a bare cursor-to-column-0", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    let capturedSink: ((text: string) => void) | undefined;
+    const sshFactory = {
+      connect: vi.fn(async () => connection),
+      connectWithContext: vi.fn(async (_server: ServerConfig, context?: { onAuthMessage?: (text: string) => void }) => {
+        capturedSink = context?.onAuthMessage;
+        // A bare CR left un-normalized is cursor-to-column-0 in VS Code's
+        // terminal — a malicious server could use it to overwrite/spoof an
+        // already-rendered line.
+        capturedSink?.("REAL PROMPT\rFAKE");
+        return connection;
+      })
+    };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const writes: string[] = [];
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open();
+    await flushAsync();
+
+    expect(writes).toContain("REAL PROMPT\r\nFAKE\r\n");
+    // No bare CR should survive — every CR must be part of a CRLF pair.
+    const combined = writes.join("");
+    expect(combined.replace(/\r\n/g, "")).not.toContain("\r");
+
+    pty.dispose();
+  });
+
   it("strips ANSI escapes and C0 control chars from auth messages before writing (server-controlled text)", async () => {
     const stream = new PassThrough();
     const { connection } = createConnection(stream);

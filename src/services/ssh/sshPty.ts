@@ -260,7 +260,12 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       if (!sanitized.trim()) {
         return;
       }
-      let normalized = sanitized.replace(/\r?\n/g, "\r\n");
+      // Normalize every CR variant (CRLF and lone CR) to LF first, then LF to
+      // CRLF. A lone CR left un-normalized is bare carriage-return, which
+      // VS Code's terminal treats as cursor-to-column-0 — server-controlled
+      // pre-auth text could otherwise overwrite/spoof an already-rendered
+      // line despite the ANSI/control-char stripping above.
+      let normalized = sanitized.replace(/\r\n?/g, "\n").replace(/\n/g, "\r\n");
       if (!normalized.endsWith("\r\n")) {
         normalized += "\r\n";
       }
