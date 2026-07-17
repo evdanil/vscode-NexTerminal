@@ -49,30 +49,34 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     context?: SshConnectContext
   ): Promise<SshConnection> {
     if (!server.proxy) {
-      return this.authFactory.connect(server);
+      return context?.onAuthMessage
+        ? this.authFactory.connect(server, { onAuthMessage: context.onAuthMessage })
+        : this.authFactory.connect(server);
     }
-    return this.connectViaProxy(server, server.proxy, context?.proxyVisited ?? new Set<string>());
+    return this.connectViaProxy(server, server.proxy, context?.proxyVisited ?? new Set<string>(), context?.onAuthMessage);
   }
 
   private async connectViaProxy(
     server: ServerConfig,
     proxy: ProxyConfig,
-    visited: ReadonlySet<string>
+    visited: ReadonlySet<string>,
+    onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
     switch (proxy.type) {
       case "ssh":
-        return this.connectViaSshJump(server, proxy.jumpHostId, visited);
+        return this.connectViaSshJump(server, proxy.jumpHostId, visited, onAuthMessage);
       case "socks5":
-        return this.connectViaSocks5(server, proxy);
+        return this.connectViaSocks5(server, proxy, onAuthMessage);
       case "http":
-        return this.connectViaHttpConnect(server, proxy);
+        return this.connectViaHttpConnect(server, proxy, onAuthMessage);
     }
   }
 
   private async connectViaSshJump(
     target: ServerConfig,
     jumpHostId: string,
-    visited: ReadonlySet<string>
+    visited: ReadonlySet<string>,
+    onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
     const nextVisited = this.addToVisited(visited, target);
     const jumpServer = this.serverLookup(jumpHostId);
@@ -81,7 +85,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     }
 
     this.assertNoCircularProxyChain(jumpServer, nextVisited);
-    const jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited);
+    const jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited, onAuthMessage);
 
     // Each auth attempt gets its own TCP tunnel through the jump host.
     const sockFactory = async (): Promise<Duplex> => {
@@ -96,7 +100,10 @@ export class ProxySshFactory implements ContextAwareSshFactory {
 
     let targetConnection: SshConnection;
     try {
-      targetConnection = await this.authFactory.connect(target, { sockFactory });
+      targetConnection = await this.authFactory.connect(target, {
+        sockFactory,
+        ...(onAuthMessage && { onAuthMessage })
+      });
     } catch (error) {
       jumpConnection.dispose();
       throw error;
@@ -111,7 +118,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
 
   private async connectViaSocks5(
     target: ServerConfig,
-    proxy: { host: string; port: number; username?: string }
+    proxy: { host: string; port: number; username?: string },
+    onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
     const proxyPassword = proxy.username
       ? await this.vault.get(proxyPasswordSecretKey(target.id))
@@ -153,7 +161,10 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       return socket;
     };
 
-    const connection = await this.authFactory.connect(target, { sockFactory });
+    const connection = await this.authFactory.connect(target, {
+      sockFactory,
+      ...(onAuthMessage && { onAuthMessage })
+    });
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
@@ -161,7 +172,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
 
   private async connectViaHttpConnect(
     target: ServerConfig,
-    proxy: { host: string; port: number; username?: string }
+    proxy: { host: string; port: number; username?: string },
+    onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
     const proxyPassword = proxy.username
       ? await this.vault.get(proxyPasswordSecretKey(target.id))
@@ -184,7 +196,10 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       return socket;
     };
 
-    const connection = await this.authFactory.connect(target, { sockFactory });
+    const connection = await this.authFactory.connect(target, {
+      sockFactory,
+      ...(onAuthMessage && { onAuthMessage })
+    });
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
@@ -225,15 +240,16 @@ export class ProxySshFactory implements ContextAwareSshFactory {
 
   private connectToJumpHost(
     jumpServer: ServerConfig,
-    visited: ReadonlySet<string>
+    visited: ReadonlySet<string>,
+    onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
     if (this.jumpHostFactory) {
-      return this.jumpHostFactory.connectWithContext(jumpServer, { proxyVisited: visited });
+      return this.jumpHostFactory.connectWithContext(jumpServer, { proxyVisited: visited, ...(onAuthMessage && { onAuthMessage }) });
     }
     if (jumpServer.proxy) {
-      return this.connectWithContext(jumpServer, { proxyVisited: visited });
+      return this.connectWithContext(jumpServer, { proxyVisited: visited, ...(onAuthMessage && { onAuthMessage }) });
     }
-    return this.authFactory.connect(jumpServer);
+    return onAuthMessage ? this.authFactory.connect(jumpServer, { onAuthMessage }) : this.authFactory.connect(jumpServer);
   }
 
   private httpConnectHandshake(

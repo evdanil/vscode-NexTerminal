@@ -255,7 +255,13 @@ export class Ssh2Connector implements SshConnector {
 
   public async connect(
     server: ServerConfig,
-    auth: { password?: string; passphrase?: string; sock?: Duplex; onKeyboardInteractive?: KeyboardInteractiveHandler }
+    auth: {
+      password?: string;
+      passphrase?: string;
+      sock?: Duplex;
+      onKeyboardInteractive?: KeyboardInteractiveHandler;
+      onAuthMessage?: (text: string) => void;
+    }
   ): Promise<SshConnection> {
     const config = await buildConnectConfig(server, auth.password, auth.passphrase, auth.sock, this.connectionOptions);
     if (this.hostKeyVerifier) {
@@ -272,6 +278,23 @@ export class Ssh2Connector implements SshConnector {
       let settled = false;
       let banner: string | undefined;
       client.on("banner", (message: string) => {
+        // If the caller wants live auth messages (e.g. to render pre-auth
+        // banners in the terminal before the MFA prompt), hand it off
+        // immediately and don't buffer — getBanner() must stay undefined so
+        // sshPty.ts doesn't print it a second time after ready.
+        if (auth.onAuthMessage) {
+          // Legacy getBanner() consumers still see blank banners (unchanged
+          // buffering below); the live sink only wants non-blank messages.
+          if (message.trim()) {
+            try {
+              auth.onAuthMessage(message);
+            } catch {
+              // Display is best-effort — a throwing sink must not unwind
+              // ssh2's protocol handler mid-handshake or abort auth.
+            }
+          }
+          return;
+        }
         banner = message;
       });
       client.on("keyboard-interactive", (name, instructions, _lang, prompts, finish) => {

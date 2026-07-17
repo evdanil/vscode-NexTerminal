@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
-import type { PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
+import type { KeyboardInteractiveHandler, PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
 import {
   SilentAuthSshFactory,
   passwordSecretKey,
@@ -270,6 +270,117 @@ describe("SilentAuthSshFactory", () => {
       server,
       expect.objectContaining({ password: "server-pw" })
     );
+  });
+});
+
+describe("SilentAuthSshFactory onAuthMessage (MFA banner surfacing)", () => {
+  it("keyboard-interactive handler emits name then instructions via onAuthMessage before prompting", async () => {
+    let handler: KeyboardInteractiveHandler | undefined;
+    const connector: SshConnector = {
+      connect: vi.fn(async (_server, auth) => {
+        handler = auth.onKeyboardInteractive;
+        return fakeConnection;
+      })
+    };
+    // authType "agent" hits the single-attempt connect branch — no
+    // password/passphrase prompting to route around, keeping this test
+    // focused purely on the keyboard-interactive handler's message ordering.
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const vault = createVault();
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const inputPromptFn = vi.fn(async () => "123456");
+    const onAuthMessage = vi.fn();
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, inputPromptFn);
+
+    await factory.connect(server, { onAuthMessage });
+
+    expect(handler).toBeDefined();
+    const responses = await handler!(
+      "Duo two-factor login",
+      "Enter a passcode or select one of the following options:\n1. Duo Push\n2. Phone call",
+      [{ prompt: "Passcode or option (1-2): ", echo: true }]
+    );
+
+    expect(onAuthMessage).toHaveBeenNthCalledWith(1, "Duo two-factor login");
+    expect(onAuthMessage).toHaveBeenNthCalledWith(
+      2,
+      "Enter a passcode or select one of the following options:\n1. Duo Push\n2. Phone call"
+    );
+    // Both auth messages must fire before the user is prompted.
+    expect(Math.max(...onAuthMessage.mock.invocationCallOrder)).toBeLessThan(
+      Math.min(...inputPromptFn.mock.invocationCallOrder)
+    );
+    expect(responses).toEqual(["123456"]);
+  });
+
+  it("does not emit blank (whitespace-only) name/instructions", async () => {
+    let handler: KeyboardInteractiveHandler | undefined;
+    const connector: SshConnector = {
+      connect: vi.fn(async (_server, auth) => {
+        handler = auth.onKeyboardInteractive;
+        return fakeConnection;
+      })
+    };
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const vault = createVault();
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const inputPromptFn = vi.fn(async () => "answer");
+    const onAuthMessage = vi.fn();
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, inputPromptFn);
+
+    await factory.connect(server, { onAuthMessage });
+    await handler!("   ", "\n\t ", [{ prompt: "Password: ", echo: false }]);
+
+    expect(onAuthMessage).not.toHaveBeenCalled();
+  });
+
+  it("password autofill for /password/i prompts still works when onAuthMessage is provided", async () => {
+    let handler: KeyboardInteractiveHandler | undefined;
+    const connector: SshConnector = {
+      connect: vi.fn(async (_server, auth) => {
+        handler = auth.onKeyboardInteractive;
+        return fakeConnection;
+      })
+    };
+    const vault = createVault({ [passwordSecretKey(baseServer.id)]: "saved-secret" });
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const inputPromptFn = vi.fn(async () => "should-not-be-used");
+    const onAuthMessage = vi.fn();
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, inputPromptFn);
+
+    await factory.connect(baseServer, { onAuthMessage });
+    const responses = await handler!("", "", [{ prompt: "Password: ", echo: false }]);
+
+    expect(responses).toEqual(["saved-secret"]);
+    expect(inputPromptFn).not.toHaveBeenCalled();
+    expect(onAuthMessage).not.toHaveBeenCalled();
+  });
+
+  it("forwards onAuthMessage to connector.connect's auth object", async () => {
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const vault = createVault({ [passwordSecretKey(baseServer.id)]: "saved-secret" });
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const onAuthMessage = vi.fn();
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+    await factory.connect(baseServer, { onAuthMessage });
+
+    expect(connector.connect).toHaveBeenCalledWith(baseServer, expect.objectContaining({ onAuthMessage }));
+  });
+
+  it("does not add an onAuthMessage key to connector.connect's auth object when none is provided (no regression)", async () => {
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const vault = createVault({ [passwordSecretKey(baseServer.id)]: "saved-secret" });
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+    await factory.connect(baseServer);
+
+    expect(connector.connect).toHaveBeenCalledWith(baseServer, { password: "saved-secret" });
   });
 });
 

@@ -50,6 +50,26 @@ export interface SshConnection {
 
 export interface SshConnectContext {
   proxyVisited?: ReadonlySet<string>;
+  /**
+   * Called during authentication with human-readable server messages
+   * (USERAUTH_BANNER, keyboard-interactive `name`/`instructions`). May be
+   * called multiple times before the connection is established. The caller
+   * (the terminal owning this connection attempt) renders these to its
+   * screen so MFA prompts (e.g. Duo) show their context instead of a bare
+   * input box. The text is server-controlled and unsanitized at this layer —
+   * consumers rendering it to a terminal must strip ANSI/control sequences
+   * themselves (see `SshPty`'s sink).
+   *
+   * Pooled/multiplexed connections (`SshConnectionPool`): only the FIRST
+   * caller to trigger a given server's connect gets its sink wired to the
+   * in-flight handshake. A second caller that joins an already-pending
+   * connect (or reuses an already-established one) has its `onAuthMessage`
+   * silently discarded — there is only one underlying handshake, so only
+   * one sink can observe it. This is acceptable because the MFA popup this
+   * is meant to contextualize is itself global to the connection, not
+   * per-lease.
+   */
+  onAuthMessage?: (text: string) => void;
 }
 
 export type KeyboardInteractiveHandler = (
@@ -61,7 +81,13 @@ export type KeyboardInteractiveHandler = (
 export interface SshConnector {
   connect(
     server: ServerConfig,
-    auth: { password?: string; passphrase?: string; sock?: Duplex; onKeyboardInteractive?: KeyboardInteractiveHandler }
+    auth: {
+      password?: string;
+      passphrase?: string;
+      sock?: Duplex;
+      onKeyboardInteractive?: KeyboardInteractiveHandler;
+      onAuthMessage?: (text: string) => void;
+    }
   ): Promise<SshConnection>;
 }
 

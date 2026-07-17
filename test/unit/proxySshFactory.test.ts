@@ -296,6 +296,93 @@ describe("ProxySshFactory", () => {
     expect(connection).toBeDefined();
   });
 
+  it("threads context.onAuthMessage into authFactory.connect when server has no proxy", async () => {
+    const factory = await createFactory();
+    const server = makeServer();
+    const onAuthMessage = vi.fn();
+
+    await factory.connectWithContext(server, { onAuthMessage });
+
+    expect(authFactory.connect).toHaveBeenCalledWith(server, { onAuthMessage });
+  });
+
+  it("threads onAuthMessage into both the jump-host and target authFactory.connect calls", async () => {
+    const jumpServer = makeServer({ id: "srv-jump", name: "Jump Host", host: "jump.example.com" });
+    const targetServer = makeServer({
+      proxy: { type: "ssh", jumpHostId: "srv-jump" }
+    });
+    servers.set("srv-jump", jumpServer);
+
+    const jumpConn = makeFakeConnection();
+    const tunnelStream = { pause: vi.fn() } as unknown as Duplex;
+    jumpConn.openDirectTcp = vi.fn(async () => tunnelStream);
+    const targetConn = makeFakeConnection();
+
+    const results = [jumpConn, targetConn];
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return results.shift()!;
+    });
+
+    const factory = await createFactory();
+    const onAuthMessage = vi.fn();
+    await factory.connectWithContext(targetServer, { onAuthMessage });
+
+    // Jump-host auth (no pool/jumpHostFactory configured) also gets the sink,
+    // so MFA banners on the jump host surface too.
+    expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer, { onAuthMessage });
+    // Target auth gets it alongside the proxy sockFactory.
+    expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, {
+      sockFactory: expect.any(Function),
+      onAuthMessage
+    });
+  });
+
+  it("threads onAuthMessage through a pooled jump-host connection", async () => {
+    const jumpServer = makeServer({ id: "srv-jump", name: "Jump Host", host: "jump.example.com" });
+    const targetServer = makeServer({
+      proxy: { type: "ssh", jumpHostId: "srv-jump" }
+    });
+    servers.set("srv-jump", jumpServer);
+
+    const jumpConn = makeFakeConnection();
+    const tunnelStream = { pause: vi.fn() } as unknown as Duplex;
+    jumpConn.openDirectTcp = vi.fn(async () => tunnelStream);
+    const targetConn = makeFakeConnection();
+
+    const results = [jumpConn, targetConn];
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return results.shift()!;
+    });
+
+    const { factory } = await createPooledFactory();
+    const onAuthMessage = vi.fn();
+    await factory.connectWithContext(targetServer, { onAuthMessage });
+
+    expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer, { onAuthMessage });
+    expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, {
+      sockFactory: expect.any(Function),
+      onAuthMessage
+    });
+  });
+
+  it("threads onAuthMessage into authFactory.connect for SOCKS5 proxy targets", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080 } });
+    const socket = { pause: vi.fn(), on: vi.fn(() => socket), removeListener: vi.fn(() => socket) };
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const factory = await createFactory();
+    const onAuthMessage = vi.fn();
+    await factory.connectWithContext(server, { onAuthMessage });
+
+    expect(authFactory.connect).toHaveBeenCalledWith(server, {
+      sockFactory: expect.any(Function),
+      onAuthMessage
+    });
+  });
+
   it("connects through SSH jump host", async () => {
     const jumpServer = makeServer({ id: "srv-jump", name: "Jump Host", host: "jump.example.com" });
     const targetServer = makeServer({
