@@ -795,8 +795,16 @@ describe("SftpService", () => {
 
     it("collects stdout/stderr/exitCode through copyRemote", async () => {
       const { PassThrough } = await import("node:stream");
-      const stdout = new PassThrough();
-      const stderr = new PassThrough();
+      // emitClose/autoDestroy: false everywhere in this file's exec-stream doubles,
+      // matching ssh2's own WriteStream guard (SFTP.js) — a bare PassThrough
+      // auto-emits "close" ~1 tick after end(), but a real ssh2 exec channel's
+      // "close" instead reflects the remote process's exit-status message,
+      // independent of when the local writable side is ended. execCommand always
+      // ends the stream's stdin now (sudo -S needs EOF to fail fast rather than
+      // hang); without this option the fixture's own auto-close would race the
+      // exit code these tests emit manually below.
+      const stdout = new PassThrough({ emitClose: false, autoDestroy: false });
+      const stderr = new PassThrough({ emitClose: false, autoDestroy: false });
       const stream = Object.assign(stdout, { stderr }) as any;
 
       (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
@@ -817,8 +825,8 @@ describe("SftpService", () => {
 
     it("times out when command hangs", async () => {
       const { PassThrough } = await import("node:stream");
-      const stdout = new PassThrough();
-      const stderr = new PassThrough();
+      const stdout = new PassThrough({ emitClose: false, autoDestroy: false });
+      const stderr = new PassThrough({ emitClose: false, autoDestroy: false });
       const stream = Object.assign(stdout, { stderr, destroy: vi.fn() }) as any;
 
       (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
@@ -836,8 +844,8 @@ describe("SftpService", () => {
 
     it("calls cp -p for files", async () => {
       const { PassThrough } = await import("node:stream");
-      const stdout = new PassThrough();
-      const stderr = new PassThrough();
+      const stdout = new PassThrough({ emitClose: false, autoDestroy: false });
+      const stderr = new PassThrough({ emitClose: false, autoDestroy: false });
       const stream = Object.assign(stdout, { stderr }) as any;
 
       (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
@@ -853,8 +861,8 @@ describe("SftpService", () => {
 
     it("calls cp -rp for directories", async () => {
       const { PassThrough } = await import("node:stream");
-      const stdout = new PassThrough();
-      const stderr = new PassThrough();
+      const stdout = new PassThrough({ emitClose: false, autoDestroy: false });
+      const stderr = new PassThrough({ emitClose: false, autoDestroy: false });
       const stream = Object.assign(stdout, { stderr }) as any;
 
       (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
@@ -870,8 +878,8 @@ describe("SftpService", () => {
 
     it("throws on non-zero exit code with stderr message", async () => {
       const { PassThrough } = await import("node:stream");
-      const stdout = new PassThrough();
-      const stderr = new PassThrough();
+      const stdout = new PassThrough({ emitClose: false, autoDestroy: false });
+      const stderr = new PassThrough({ emitClose: false, autoDestroy: false });
       const stream = Object.assign(stdout, { stderr }) as any;
 
       (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
@@ -887,8 +895,8 @@ describe("SftpService", () => {
 
     it("shell-escapes paths with single quotes", async () => {
       const { PassThrough } = await import("node:stream");
-      const stdout = new PassThrough();
-      const stderr = new PassThrough();
+      const stdout = new PassThrough({ emitClose: false, autoDestroy: false });
+      const stderr = new PassThrough({ emitClose: false, autoDestroy: false });
       const stream = Object.assign(stdout, { stderr }) as any;
 
       (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
@@ -915,8 +923,8 @@ describe("SftpService", () => {
 
     it("treats signal-terminated commands as errors", async () => {
       const { PassThrough } = await import("node:stream");
-      const stdout = new PassThrough();
-      const stderr = new PassThrough();
+      const stdout = new PassThrough({ emitClose: false, autoDestroy: false });
+      const stderr = new PassThrough({ emitClose: false, autoDestroy: false });
       const stream = Object.assign(stdout, { stderr }) as any;
 
       (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(stream);
