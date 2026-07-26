@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [2.8.68] — 2026-07-26
+
+Closes the two open GitHub issues: bulk connection import and editing root-owned remote files (#29, #30).
+
+### Added
+
+- **Bulk import servers from a device list (CSV or plain text).** Run `Nexus: Import Servers from List (CSV/Text)` and paste from the clipboard or pick a `.csv` / `.txt` / `.tsv` file. Accepts a bare hostname list, positional `host,name,user,port,folder` rows, a header row whose columns are matched by name (`Mgmt IP`, `Device Name`, `Site`, …), tab- or whitespace-separated input, quoted fields containing commas, and `user@host:port` shorthand. Rows that duplicate an existing server (host + port + username, host compared case-insensitively) are skipped, unparsable lines are reported per line with a reason, and folders named in the list are created as groups. Imported servers default to password authentication. Addresses #29.
+- **Save remote files that need root (`sudo`).** Editing a root-owned file over SFTP now offers to complete the save with `sudo` on the remote host instead of failing. Two paths: a file the SSH user cannot write prompts **Save as Root** when the save is denied, and a file VS Code marks read-only can be opened for editing with **Edit as Root (sudo)** from the File Explorer context menu. The content is staged to a `0600` temp file and written through the target's existing inode, so owner, mode, ACLs, SELinux context, and hard links are preserved. The `sudo` password is read from stdin (never placed in a command line), kept in memory only, and never written to disk or to VS Code's secret storage. New settings: `nexus.sftp.sudo.enabled` (default `true`) and `nexus.sftp.sudo.rememberPasswordForSession` (default `false`). Addresses #30.
+
+### Fixed
+
+- **Numbered devices now sort in natural numeric order.** Servers, serial and local-shell profiles, tunnels, folders, and remote files previously ordered as `A1, A10, A11, A2` because every comparator used a plain `localeCompare`. All display sorts now use a shared numeric-aware collator, so `A1, A2, A10, A11` — including segment-wise ordering for folder paths (`Site2/Rack1` before `Site10/Rack1`) and for serial device paths (`COM2` before `COM10`). Reported in #29.
+- **Four quick pickers now sort at all.** The server picker, tunnel picker, auth-profile picker, and the connected-server picker used for browsing files presented entries in arbitrary snapshot order.
+- **Stopped mutating cached tree state while sorting.** The Connectivity Hub sorted its cached child-folder array in place on every refresh.
+- **Boolean settings defaulting to `false` rendered as enabled** in the Settings panel when the value was unset, because the renderer ignored the declared default.
+
+## [2.8.67] — 2026-07-25
+
+### Fixed
+
+- **SSH auth banners and MFA prompts now appear in the terminal.** Servers using MFA (e.g. Duo) deliver the login banner and option menu ("1. Duo Push / 2. SMS") through the keyboard-interactive `name`/`instructions` fields, which were dropped — users saw only a bare "Passcode or option (1-2)" input box with no context. The sshd `Banner` (USERAUTH_BANNER) was also buffered until after `ready`, so it appeared after login instead of before the prompt. Both are now relayed live to the terminal through every connect path (direct, SSH jump host, SOCKS5, HTTP CONNECT, and pooled), with ANSI and control sequences stripped from the server-controlled text.
+
 ## [2.8.66] — 2026-07-01
 
 ### Added
