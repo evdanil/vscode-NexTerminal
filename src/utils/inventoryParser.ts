@@ -246,7 +246,13 @@ function resolvePositional(fields: string[]): PositionalFields {
   return { host, name: "", username: "", port: "", folder: "" };
 }
 
-/** Pulls `user@host:port` shorthand out of a raw host field. IPv6 literals in `[...]` are left intact. */
+/**
+ * Pulls `user@host:port` shorthand out of a raw host field. `[...]` around an
+ * IPv6 literal is endpoint-notation input syntax only — it exists solely to
+ * disambiguate the address's own colons from a trailing `:port` — so the
+ * brackets are stripped here; the stored host is the bare literal a
+ * hand-entered IPv6 server would use. Do not "restore" them later.
+ */
 function parseHostShorthand(raw: string): HostShorthand {
   let rest = raw;
   let username: string | undefined;
@@ -258,7 +264,7 @@ function parseHostShorthand(raw: string): HostShorthand {
   if (rest.startsWith("[")) {
     const closeIdx = rest.indexOf("]");
     if (closeIdx !== -1) {
-      const host = rest.slice(0, closeIdx + 1);
+      const host = rest.slice(1, closeIdx);
       const remainder = rest.slice(closeIdx + 1);
       if (remainder.startsWith(":") && isPortLike(remainder.slice(1))) {
         return { host, username, port: parseInt(remainder.slice(1), 10) };

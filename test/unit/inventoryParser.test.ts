@@ -208,15 +208,15 @@ describe("parseInventoryList", () => {
       expect(r.issues).toHaveLength(0);
     });
 
-    it("parses a bracketed IPv6 literal with a port", () => {
+    it("parses a bracketed IPv6 literal with a port, storing the bare literal without brackets (Codex round 2 finding A)", () => {
       const r = parseInventoryList("[2001:db8::1]:2022\n", { defaultUsername: "admin" });
-      expect(r.sessions[0]).toMatchObject({ host: "[2001:db8::1]", port: 2022 });
+      expect(r.sessions[0]).toMatchObject({ host: "2001:db8::1", port: 2022 });
       expect(r.issues).toHaveLength(0);
     });
 
-    it("parses a bracketed IPv6 literal with no port, defaulting the port", () => {
+    it("parses a bracketed IPv6 literal with no port, storing the bare literal and defaulting the port (Codex round 2 finding A)", () => {
       const r = parseInventoryList("[2001:db8::1]\n", { defaultUsername: "admin" });
-      expect(r.sessions[0]).toMatchObject({ host: "[2001:db8::1]", port: 22 });
+      expect(r.sessions[0]).toMatchObject({ host: "2001:db8::1", port: 22 });
       expect(r.issues).toHaveLength(0);
     });
 
