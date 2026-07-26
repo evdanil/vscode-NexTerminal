@@ -479,6 +479,11 @@
         "category": "Nexus"
       },
       {
+        "command": "nexus.config.import.inventory",
+        "title": "Import Servers from List (CSV/Text)",
+        "category": "Nexus"
+      },
+      {
         "command": "nexus.config.completeReset",
         "title": "Delete All Data",
         "category": "Nexus"
@@ -1608,6 +1613,10 @@
         },
         {
           "command": "nexus.config.import.securecrt",
+          "when": "true"
+        },
+        {
+          "command": "nexus.config.import.inventory",
           "when": "true"
         },
         {

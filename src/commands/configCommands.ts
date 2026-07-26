@@ -16,6 +16,7 @@ import {
 import { validateAuthProfile } from "../utils/validation";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
+import { parseInventoryList } from "../utils/inventoryParser";
 import { defaultSshDir } from "../services/ssh/deploySshKey";
 import {
   parseSecureCrtDirectory,
@@ -1304,24 +1305,44 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     void vscode.window.showInformationMessage("All Nexus data has been deleted.");
   }
 
-  // Shared tail for MobaXterm / SecureCRT imports: no-sessions warning, confirm modal,
-  // group + server creation, success toast. `noSessionsLocation` and `sourceName` are the
-  // only per-source differences in the user-facing strings.
+  /** Most frequently used username among existing servers, or "" if there are none. */
+  function mostCommonUsername(servers: ServerConfig[]): string {
+    const counts = new Map<string, number>();
+    for (const server of servers) {
+      if (!server.username) continue;
+      counts.set(server.username, (counts.get(server.username) ?? 0) + 1);
+    }
+    let best = "";
+    let bestCount = 0;
+    for (const [username, count] of counts) {
+      if (count > bestCount) {
+        best = username;
+        bestCount = count;
+      }
+    }
+    return best;
+  }
+
+  // Shared tail for MobaXterm / SecureCRT / inventory imports: no-sessions warning, confirm
+  // modal, group + server creation, success toast. `noSessionsLocation` and `sourceName` are
+  // the only per-source differences in the user-facing strings; `skipLabel` describes what
+  // was skipped ("non-SSH" for the session-format importers, "unparsable" for inventory rows).
   async function applyImportedSessions(
     result: ImportParseResult,
     sourceName: string,
-    noSessionsLocation: string
+    noSessionsLocation: string,
+    skipLabel: string = "non-SSH"
   ): Promise<void> {
     if (result.sessions.length === 0) {
       const note = result.skippedCount > 0
-        ? `No SSH sessions found (${result.skippedCount} non-SSH skipped).`
+        ? `No SSH sessions found (${result.skippedCount} ${skipLabel} skipped).`
         : `No SSH sessions found in the selected ${noSessionsLocation}.`;
       void vscode.window.showWarningMessage(note);
       return;
     }
 
     const folderNote = result.folders.length > 0 ? ` in ${result.folders.length} folder(s)` : "";
-    const skipNote = result.skippedCount > 0 ? ` (${result.skippedCount} non-SSH skipped)` : "";
+    const skipNote = result.skippedCount > 0 ? ` (${result.skippedCount} ${skipLabel} skipped)` : "";
     const confirm = await vscode.window.showInformationMessage(
       `Found ${result.sessions.length} SSH session(s)${folderNote}${skipNote}. Import?`,
       { modal: true },
@@ -1364,6 +1385,96 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     const result = parseMobaxtermSessions(text);
 
     await applyImportedSessions(result, "MobaXterm", "file");
+  }
+
+  const INVENTORY_MAX_BYTES = 2 * 1024 * 1024;
+
+  async function importInventory(): Promise<void> {
+    const sourcePick = await vscode.window.showQuickPick(
+      [
+        { label: "Paste from Clipboard", value: "clipboard" as const },
+        { label: "Choose File…", value: "file" as const }
+      ],
+      { title: "Import Servers from List" }
+    );
+    if (!sourcePick) return;
+
+    let text: string;
+    if (sourcePick.value === "clipboard") {
+      text = (await vscode.env.clipboard.readText()) ?? "";
+      if (!text.trim()) {
+        void vscode.window.showWarningMessage("Clipboard is empty.");
+        return;
+      }
+    } else {
+      const uris = await vscode.window.showOpenDialog({
+        canSelectFiles: true,
+        canSelectMany: false,
+        filters: { "Inventory Lists": ["csv", "txt", "tsv"], "All Files": ["*"] },
+        title: "Import Servers from List"
+      });
+      if (!uris || uris.length === 0) return;
+
+      const raw = await vscode.workspace.fs.readFile(uris[0]);
+      text = Buffer.from(raw).toString("utf8");
+    }
+
+    if (Buffer.byteLength(text, "utf8") > INVENTORY_MAX_BYTES) {
+      void vscode.window.showErrorMessage("Inventory file exceeds the 2 MB size limit.");
+      return;
+    }
+
+    let result = parseInventoryList(text);
+
+    let defaultUsername: string | undefined;
+    if (result.needsDefaultUsername) {
+      const suggested = mostCommonUsername(core.getSnapshot().servers);
+      const username = await vscode.window.showInputBox({
+        title: "Default SSH username",
+        prompt: "Used for rows that don't specify one",
+        value: suggested,
+        ignoreFocusOut: true
+      });
+      if (!username || !username.trim()) {
+        void vscode.window.showWarningMessage("Import cancelled — a username is required.");
+        return;
+      }
+      defaultUsername = username.trim();
+    }
+
+    const folderInput = await vscode.window.showInputBox({
+      title: "Folder for imported servers (optional)",
+      placeHolder: "e.g. Site7/Access",
+      ignoreFocusOut: true
+    });
+    const defaultFolder = folderInput && folderInput.trim() ? folderInput.trim() : undefined;
+
+    result = parseInventoryList(text, { defaultUsername, defaultFolder });
+
+    const existingKeys = new Set(
+      core.getSnapshot().servers.map((server) => `${server.host.toLowerCase()}|${server.port}|${server.username}`)
+    );
+    const sessions = result.sessions.filter(
+      (session) => !existingKeys.has(`${session.host.toLowerCase()}|${session.port}|${session.username}`)
+    );
+    const dedupedCount = result.sessions.length - sessions.length;
+    if (dedupedCount > 0) {
+      void vscode.window.showInformationMessage(`${dedupedCount} already in your list were skipped.`);
+    }
+
+    if (result.issues.length > 0) {
+      const choice = await vscode.window.showWarningMessage(
+        `${result.issues.length} line(s) could not be imported.`,
+        "Show Details"
+      );
+      if (choice === "Show Details") {
+        const content = result.issues.map((issue) => `line ${issue.line}: ${issue.text} — ${issue.reason}`).join("\n");
+        const doc = await vscode.workspace.openTextDocument({ content, language: "log" });
+        await vscode.window.showTextDocument(doc, { preview: true });
+      }
+    }
+
+    await applyImportedSessions({ ...result, sessions }, "the inventory list", "list", "unparsable");
   }
 
   async function importSecureCrt(): Promise<void> {
@@ -1448,6 +1559,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     vscode.commands.registerCommand("nexus.config.import", importConfig),
     vscode.commands.registerCommand("nexus.config.import.mobaxterm", importMobaxterm),
     vscode.commands.registerCommand("nexus.config.import.securecrt", importSecureCrt),
+    vscode.commands.registerCommand("nexus.config.import.inventory", importInventory),
     vscode.commands.registerCommand("nexus.config.completeReset", completeReset)
   ];
 }

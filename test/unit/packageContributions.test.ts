@@ -526,4 +526,15 @@ describe("package contributions", () => {
       }
     });
   });
+
+  it("contributes nexus.config.import.inventory as a palette-invocable Nexus command", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.config.import.inventory");
+    expect(command).toBeDefined();
+    expect(command?.title).toBe("Import Servers from List (CSV/Text)");
+    expect(command?.category).toBe("Nexus");
+
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    const paletteEntry = paletteMenu.find((item) => item.command === "nexus.config.import.inventory");
+    expect(paletteEntry?.when).not.toBe("false");
+  });
 });

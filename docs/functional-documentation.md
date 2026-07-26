@@ -166,6 +166,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 - `Nexus: Export Backup` creates an encrypted backup that includes profiles, settings, saved credentials, the user `.ssh` folder, and the configured Nexus scripts folder.
 - `Nexus: Import Configuration` restores from either format with merge or replace options. For encrypted folder payloads, merge skips existing local `.ssh` / script files; replace overwrites files present in the backup but does not delete extra local files.
 - `Nexus: Import from MobaXterm` and `Nexus: Import from SecureCRT` migrate external SSH profiles while preserving folder hierarchy where possible.
+- `Nexus: Import Servers from List (CSV/Text)` bulk-creates servers from a pasted or file-based device inventory (`src/utils/inventoryParser.ts`). Accepts an optional header row (columns matched by alias, e.g. `hostname`/`address`/`ip` → host), or a positional `host[,name[,username[,port[,folder]]]]` fallback with `user@host:port` shorthand in the host field; comma, tab, or whitespace-run delimited; capped at 2 MB and 5000 rows. Rows missing a username trigger a single default-username prompt (pre-filled with the most common username among existing servers); an optional folder prefix applies to every row. Rows whose host+port+username (host compared case-insensitively) already exist are skipped and counted; unparsable rows are reported in a scratch document rather than aborting the import. Imported servers always get `authType: "password"`, same as the MobaXterm/SecureCRT importers — all three funnel through the shared `applyImportedSessions` tail in `configCommands.ts`, which also mints a fresh server `id` per row. `Nexus: Import Configuration` separately accepts a minimal hand-written JSON file (`{ "version": 2, "servers": [...] }`) for a single connection or a quick script, without going through any importer.
 
 #### 4.10.1 Security & Data Settings
 - The Settings view includes a **Security & Data** category for host trust, credential storage, backups, exports, imports, resets, and data deletion.
@@ -337,7 +338,7 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 
 **Config:**
 - `nexus.config.export`, `nexus.config.export.backup`
-- `nexus.config.import`, `nexus.config.import.mobaxterm`, `nexus.config.import.securecrt`
+- `nexus.config.import`, `nexus.config.import.mobaxterm`, `nexus.config.import.securecrt`, `nexus.config.import.inventory`
 - `nexus.config.completeReset`
 
 **Settings and Appearance:**

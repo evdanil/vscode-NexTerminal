@@ -21,6 +21,9 @@ const mockStat = vi.fn();
 const mockCreateDirectory = vi.fn();
 const mockWithProgress = vi.fn();
 const mockConfigUpdate = vi.fn();
+const mockClipboardReadText = vi.fn();
+const mockOpenTextDocument = vi.fn();
+const mockShowTextDocument = vi.fn();
 const configStore = new Map<string, unknown>();
 const configDefaults = new Map<string, unknown>();
 
@@ -39,9 +42,15 @@ vi.mock("vscode", () => ({
     showSaveDialog: (...args: unknown[]) => mockShowSaveDialog(...args),
     showOpenDialog: (...args: unknown[]) => mockShowOpenDialog(...args),
     showInputBox: (...args: unknown[]) => mockShowInputBox(...args),
+    showTextDocument: (...args: unknown[]) => mockShowTextDocument(...args),
     withProgress: (_opts: unknown, task: (progress: unknown) => Promise<void>) => {
       mockWithProgress(_opts);
       return task({ report: vi.fn() });
+    }
+  },
+  env: {
+    clipboard: {
+      readText: (...args: unknown[]) => mockClipboardReadText(...args)
     }
   },
   workspace: {
@@ -52,6 +61,7 @@ vi.mock("vscode", () => ({
       stat: (...args: unknown[]) => mockStat(...args),
       createDirectory: (...args: unknown[]) => mockCreateDirectory(...args)
     },
+    openTextDocument: (...args: unknown[]) => mockOpenTextDocument(...args),
     workspaceFolders: [
       { uri: { fsPath: "/workspace", scheme: "file", path: "/workspace" }, name: "workspace", index: 0 }
     ],
@@ -1626,6 +1636,180 @@ describe("import from SecureCRT command", () => {
 
     expect(core.getSnapshot().servers).toHaveLength(0);
     expect(mockShowOpenDialog).not.toHaveBeenCalled();
+  });
+});
+
+describe("import inventory list command", () => {
+  let core: NexusCore;
+  let vault: MockVault;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+  });
+
+  it("registers nexus.config.import.inventory", () => {
+    expect(registeredCommands.has("nexus.config.import.inventory")).toBe(true);
+  });
+
+  it("imports servers pasted from the clipboard", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "Paste from Clipboard", value: "clipboard" });
+    mockClipboardReadText.mockResolvedValue(
+      "10.0.0.1,core-sw1,netadmin,22,DC1/Core\n10.0.0.2,core-sw2,netadmin,22,DC1/Core\n"
+    );
+    mockShowInputBox.mockResolvedValue(undefined); // folder prompt skipped; no username prompt needed
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
+    await cmd();
+
+    expect(mockClipboardReadText).toHaveBeenCalled();
+    expect(mockShowInputBox).toHaveBeenCalledTimes(1); // only the folder prompt
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(2);
+    expect(snapshot.servers[0]).toMatchObject({
+      host: "10.0.0.1",
+      name: "core-sw1",
+      username: "netadmin",
+      port: 22,
+      group: "DC1/Core"
+    });
+    expect(snapshot.servers[0].authType).toBe("password");
+    expect(snapshot.explicitGroups).toContain("DC1/Core");
+  });
+
+  it("reads the file chosen in the open dialog", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "Choose File…", value: "file" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/inventory.csv", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from("Host,User\nsw1.lab.example.com,admin\n", "utf8"));
+    mockShowInputBox.mockResolvedValue(undefined);
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
+    await cmd();
+
+    expect(mockShowOpenDialog).toHaveBeenCalled();
+    expect(mockReadFile).toHaveBeenCalledWith({ fsPath: "/fake/inventory.csv", scheme: "file" });
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0]).toMatchObject({ host: "sw1.lab.example.com", username: "admin", name: "sw1", port: 22 });
+  });
+
+  it("prompts for a default username only when rows omit one", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "Paste from Clipboard", value: "clipboard" });
+    mockClipboardReadText.mockResolvedValue("sw1.lab.example.com\n");
+    mockShowInputBox.mockResolvedValueOnce("netadmin"); // default username prompt
+    mockShowInputBox.mockResolvedValueOnce(undefined); // folder prompt
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
+    await cmd();
+
+    expect(mockShowInputBox).toHaveBeenNthCalledWith(1, expect.objectContaining({ title: "Default SSH username" }));
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0].username).toBe("netadmin");
+  });
+
+  it("applies the optional folder prefix and creates the group", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "Paste from Clipboard", value: "clipboard" });
+    mockClipboardReadText.mockResolvedValue("sw1.lab.example.com,,admin,,RackA\n");
+    mockShowInputBox.mockResolvedValueOnce("Site7"); // folder prompt; no username prompt needed
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
+    await cmd();
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers[0].group).toBe("Site7/RackA");
+    expect(snapshot.explicitGroups).toContain("Site7/RackA");
+  });
+
+  it("skips rows that duplicate an existing server and reports the count", async () => {
+    await core.addOrUpdateServer(
+      makeServer({ id: "existing1", host: "sw1.lab.example.com", port: 22, username: "admin" })
+    );
+
+    mockShowQuickPick.mockResolvedValue({ label: "Paste from Clipboard", value: "clipboard" });
+    mockClipboardReadText.mockResolvedValue(
+      "sw1.lab.example.com,,admin\nsw2.lab.example.com,,admin\n"
+    );
+    mockShowInputBox.mockResolvedValue(undefined);
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
+    await cmd();
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(2); // the pre-existing one + the new sw2
+    expect(snapshot.servers.filter((s) => s.host === "sw1.lab.example.com")).toHaveLength(1);
+    expect(snapshot.servers.filter((s) => s.host === "sw2.lab.example.com")).toHaveLength(1);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("1 already in your list were skipped.");
+  });
+
+  it("logs unparsable lines and still imports the valid ones", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "Paste from Clipboard", value: "clipboard" });
+    mockClipboardReadText.mockResolvedValue("sw1.lab.example.com,,admin\nbad host name\n");
+    mockShowInputBox.mockResolvedValue(undefined);
+    mockShowInformationMessage.mockResolvedValue("Import");
+    mockShowWarningMessage.mockResolvedValue("Show Details");
+    mockOpenTextDocument.mockResolvedValue({ uri: { fsPath: "untitled:issues" } });
+
+    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
+    await cmd();
+
+    expect(core.getSnapshot().servers).toHaveLength(1);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("1 line(s) could not be imported.", "Show Details");
+    expect(mockOpenTextDocument).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("line 2: bad host name"), language: "log" })
+    );
+    expect(mockShowTextDocument).toHaveBeenCalled();
+  });
+
+  it("aborts silently when the user cancels the source pick", async () => {
+    mockShowQuickPick.mockResolvedValue(undefined);
+
+    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
+    await cmd();
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
+    expect(mockClipboardReadText).not.toHaveBeenCalled();
+    expect(mockShowOpenDialog).not.toHaveBeenCalled();
+  });
+
+  it("rejects files over 2 MB", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "Choose File…", value: "file" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/big.csv", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.alloc(2 * 1024 * 1024 + 1, "a"));
+
+    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
+    await cmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("Inventory file exceeds the 2 MB size limit.");
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("keeps the existing 'non-SSH skipped' wording for the MobaXterm importer", async () => {
+    const ini = `[Bookmarks]
+SubRep=
+ImgNum=42
+RDP=#91#3%rdp.example.com%3389%user%%-1%
+`;
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/mobafile.ini", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(ini, "utf8"));
+
+    const cmd = registeredCommands.get("nexus.config.import.mobaxterm")!;
+    await cmd();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("No SSH sessions found (1 non-SSH skipped).");
   });
 });
 
