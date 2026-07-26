@@ -36,6 +36,32 @@ export class SudoPasswordRequiredError extends Error {
   }
 }
 
+/**
+ * Thrown when sudo's own policy check refuses the install outright (sudoers denial).
+ * This happens before the target's `cat` redirect ever runs, so the target path is
+ * never touched — no partial-write risk, unlike ElevatedInstallFailedError below.
+ */
+export class SudoNotPermittedError extends Error {
+  public constructor(public readonly detail: string) {
+    super("Elevation refused: this account is not permitted to run sudo on the remote host.");
+    this.name = "SudoNotPermittedError";
+  }
+}
+
+/**
+ * Thrown for install-phase failures with no specific sudo-policy classification: an
+ * unrecognized non-zero exit (the `cat` redirect itself may have started and failed
+ * partway — disk full, target directory gone, etc.) or the exec channel throwing
+ * outright (timeout, dropped connection) before any exit status was even observed.
+ * Either way the target may already be partially written.
+ */
+export class ElevatedInstallFailedError extends Error {
+  public constructor(detail: string) {
+    super(`Elevated save failed: ${detail}`);
+    this.name = "ElevatedInstallFailedError";
+  }
+}
+
 function assertValidRemotePath(remotePath: string, label: string): void {
   if (!remotePath || !remotePath.startsWith("/")) {
     throw new Error(`Invalid ${label} path: must be a non-empty absolute path`);
@@ -43,7 +69,7 @@ function assertValidRemotePath(remotePath: string, label: string): void {
 }
 
 /** Builds the /tmp staging path for an elevated write. Always /tmp: the target's own directory may itself be root-owned. */
-export function buildTempStagePath(remotePath: string, token: string): string {
+export function buildTempStagePath(token: string): string {
   return `/tmp/.nexus-elevated-${token}`;
 }
 
@@ -51,7 +77,8 @@ export function buildTempStagePath(remotePath: string, token: string): string {
  * Builds the sudo command that installs the staged temp file over the target path.
  * `cat < temp > target` writes through the target's existing inode when it already
  * exists, so mode, owner, ACLs, and hard links survive; a brand new file has no
- * inode to preserve, so it is chmod'd 644 afterward.
+ * inode to preserve, so it is chmod'd to `createMode` afterward (the mode last
+ * observed for this path, or 644 when none is known — see writeFileElevated).
  *
  * The inner `cat` script is escaped once for its own path arguments, then the whole
  * inner script is escaped again as a single argument to `/bin/sh -c`. This second
@@ -61,15 +88,27 @@ export function buildTempStagePath(remotePath: string, token: string): string {
  * would reach `/bin/sh -c` unquoted (a root command-injection hole for any path
  * containing shell metacharacters, e.g. `;`).
  */
-export function buildSudoInstallCommand(tempPath: string, targetPath: string, targetExists: boolean): string {
+export function buildSudoInstallCommand(
+  tempPath: string,
+  targetPath: string,
+  targetExists: boolean,
+  createMode = 0o644
+): string {
   assertValidRemotePath(tempPath, "temp");
   assertValidRemotePath(targetPath, "target");
   const temp = shellEscape(tempPath);
   const target = shellEscape(targetPath);
   const inner = targetExists
     ? `cat < ${temp} > ${target}`
-    : `cat < ${temp} > ${target} && chmod 644 ${target}`;
+    : `cat < ${temp} > ${target} && chmod ${createMode.toString(8)} ${target}`;
   return `sudo -S -p '' -- /bin/sh -c ${shellEscape(inner)}`;
+}
+
+/** Defence in depth: the password should only ever travel over stdin, but a remote
+ * PAM module or shell could in principle echo it into stderr. Strip it from any
+ * detail string before it reaches an Error that ends up in a showErrorMessage toast. */
+function redactPassword(text: string, password?: string): string {
+  return password ? text.split(password).join("***") : text;
 }
 
 /** Classifies a completed sudo invocation's result by matching known sudo/PAM stderr phrasing. */
@@ -108,11 +147,20 @@ export async function probeSudoNonInteractive(exec: ElevatedExec): Promise<SudoF
 /** Runs the sudo install, piping the password on stdin only — never in the command string or argv. */
 export async function runElevatedInstall(
   exec: ElevatedExec,
-  args: { tempPath: string; targetPath: string; targetExists: boolean; password?: string }
+  args: { tempPath: string; targetPath: string; targetExists: boolean; password?: string; createMode?: number }
 ): Promise<void> {
-  const command = buildSudoInstallCommand(args.tempPath, args.targetPath, args.targetExists);
+  const command = buildSudoInstallCommand(args.tempPath, args.targetPath, args.targetExists, args.createMode);
   const stdin = args.password ? `${args.password}\n` : undefined;
-  const result = await exec(command, stdin);
+  let result: ElevatedExecResult;
+  try {
+    result = await exec(command, stdin);
+  } catch (error) {
+    // The exec channel itself failed (timeout, dropped connection) before any exit
+    // status came back — we can't tell whether the target's cat redirect started.
+    throw new ElevatedInstallFailedError(
+      redactPassword(error instanceof Error ? error.message : String(error), args.password)
+    );
+  }
   const failure = classifySudoFailure(result);
   switch (failure.kind) {
     case "none":
@@ -120,15 +168,18 @@ export async function runElevatedInstall(
     case "password-required":
       throw new SudoPasswordRequiredError();
     case "not-permitted":
-      throw new Error("Elevation refused: this account is not permitted to run sudo on the remote host.");
+      throw new SudoNotPermittedError(redactPassword(failure.detail, args.password));
     case "no-sudo":
       throw new Error("sudo is not available on the remote host.");
     case "requires-tty":
       throw new Error(
-        "The remote sudoers policy requires a TTY (requiretty). Elevated save is not possible over SFTP."
+        "The remote sudoers policy requires a TTY (requiretty), so an elevated save can't run over SFTP. " +
+        "Ask an admin to add \"Defaults:<username> !requiretty\" for this account, or edit the file from a terminal on the remote host instead."
       );
     case "unknown":
-      throw new Error(`Elevated save failed: ${failure.detail || "sudo exited with code " + result.exitCode}`);
+      throw new ElevatedInstallFailedError(
+        redactPassword(failure.detail, args.password) || `sudo exited with code ${result.exitCode}`
+      );
   }
 }
 

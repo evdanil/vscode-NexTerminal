@@ -4,15 +4,17 @@ import {
   buildSudoInstallCommand,
   buildTempStagePath,
   classifySudoFailure,
+  ElevatedInstallFailedError,
   isPermissionDeniedError,
   probeSudoNonInteractive,
   runElevatedInstall,
+  SudoNotPermittedError,
   SudoPasswordRequiredError,
 } from "../../src/services/sftp/elevatedWrite";
 
 describe("buildTempStagePath", () => {
-  it("stages in /tmp regardless of target directory", () => {
-    expect(buildTempStagePath("/etc/nginx/nginx.conf", "abc123")).toBe("/tmp/.nexus-elevated-abc123");
+  it("stages in /tmp keyed only by the random token", () => {
+    expect(buildTempStagePath("abc123")).toBe("/tmp/.nexus-elevated-abc123");
   });
 });
 
@@ -25,10 +27,17 @@ describe("buildSudoInstallCommand", () => {
     expect(cmd).not.toContain("chmod");
   });
 
-  it("chmods only when creating a new file", () => {
+  it("chmods only when creating a new file, defaulting to 644 when no mode is given", () => {
     const cmd = buildSudoInstallCommand("/tmp/.nexus-elevated-t", "/etc/new.conf", false);
     expect(cmd).toBe(
       "sudo -S -p '' -- /bin/sh -c 'cat < '\\''/tmp/.nexus-elevated-t'\\'' > '\\''/etc/new.conf'\\'' && chmod 644 '\\''/etc/new.conf'\\'''"
+    );
+  });
+
+  it("chmods to the caller-supplied createMode when creating a new file (P3: preserves a vanished target's prior mode)", () => {
+    const cmd = buildSudoInstallCommand("/tmp/.nexus-elevated-t", "/etc/rotated.log", false, 0o640);
+    expect(cmd).toBe(
+      "sudo -S -p '' -- /bin/sh -c 'cat < '\\''/tmp/.nexus-elevated-t'\\'' > '\\''/etc/rotated.log'\\'' && chmod 640 '\\''/etc/rotated.log'\\'''"
     );
   });
 
@@ -154,15 +163,18 @@ describe("runElevatedInstall", () => {
     ).rejects.toBeInstanceOf(SudoPasswordRequiredError);
   });
 
-  it("surfaces a sudoers rejection with a plain-language message", async () => {
+  it("surfaces a sudoers rejection as a SudoNotPermittedError with a plain-language message and the raw detail", async () => {
     const exec = vi.fn().mockResolvedValue({
       exitCode: 1,
       stdout: "",
       stderr: "nexus is not in the sudoers file.",
     });
-    await expect(
-      runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts", targetExists: true })
-    ).rejects.toThrow(/not permitted to run sudo/i);
+    const promise = runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts", targetExists: true });
+    await expect(promise).rejects.toBeInstanceOf(SudoNotPermittedError);
+    await expect(promise).rejects.toThrow(/not permitted to run sudo/i);
+    await promise.catch((error: SudoNotPermittedError) => {
+      expect(error.detail).toBe("nexus is not in the sudoers file.");
+    });
   });
 
   it("surfaces a missing-sudo failure with a plain-language message", async () => {
@@ -172,7 +184,7 @@ describe("runElevatedInstall", () => {
     ).rejects.toThrow(/sudo is not available/i);
   });
 
-  it("surfaces a requiretty failure with a plain-language message", async () => {
+  it("surfaces a requiretty failure with a plain-language message and a next step (P5)", async () => {
     const exec = vi.fn().mockResolvedValue({
       exitCode: 1,
       stdout: "",
@@ -181,13 +193,35 @@ describe("runElevatedInstall", () => {
     await expect(
       runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts", targetExists: true })
     ).rejects.toThrow(/requires a tty/i);
-  });
-
-  it("surfaces an unknown failure including the exit code when stderr is empty", async () => {
-    const exec = vi.fn().mockResolvedValue({ exitCode: 7, stdout: "", stderr: "" });
     await expect(
       runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts", targetExists: true })
-    ).rejects.toThrow("Elevated save failed: sudo exited with code 7");
+    ).rejects.toThrow(/requiretty|terminal on the remote host/i);
+  });
+
+  it("surfaces an unknown failure as ElevatedInstallFailedError, including the exit code when stderr is empty", async () => {
+    const exec = vi.fn().mockResolvedValue({ exitCode: 7, stdout: "", stderr: "" });
+    const promise = runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts", targetExists: true });
+    await expect(promise).rejects.toBeInstanceOf(ElevatedInstallFailedError);
+    await expect(promise).rejects.toThrow("Elevated save failed: sudo exited with code 7");
+  });
+
+  it("wraps an exec-channel throw (no exit status at all) as ElevatedInstallFailedError (P5: install-phase, partial-write risk)", async () => {
+    const exec = vi.fn().mockRejectedValue(new Error("Command timed out after 30000ms"));
+    await expect(
+      runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts", targetExists: true })
+    ).rejects.toBeInstanceOf(ElevatedInstallFailedError);
+  });
+
+  it("redacts the password out of an unknown failure's detail (P8 defence in depth)", async () => {
+    const exec = vi.fn().mockResolvedValue({ exitCode: 1, stdout: "", stderr: "weird failure near s3cret-value" });
+    await expect(
+      runElevatedInstall(exec, {
+        tempPath: "/tmp/a",
+        targetPath: "/etc/hosts",
+        targetExists: true,
+        password: "s3cret-value",
+      })
+    ).rejects.toThrow(/\*\*\*/);
   });
 
   it("resolves without throwing on success", async () => {

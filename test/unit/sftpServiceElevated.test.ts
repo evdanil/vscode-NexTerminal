@@ -113,7 +113,7 @@ describe("SftpService elevated writes", () => {
   let connection: SshConnection;
   let factory: SshFactory;
   let service: SftpService;
-  const expectedTempPath = buildTempStagePath("/etc/hosts", "test-token");
+  const expectedTempPath = buildTempStagePath("test-token");
 
   beforeEach(async () => {
     sftp = createMockSftp();
@@ -241,6 +241,29 @@ describe("SftpService elevated writes", () => {
 
     expect(sftp.lstat).not.toHaveBeenCalled();
     expect(capturedCommand).toContain("chmod 644");
+  });
+
+  it("recreates a vanished target using the caller-supplied createMode instead of 644 (P3)", async () => {
+    sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
+    sftp.stat.mockImplementation((_remotePath: string, cb: (err: unknown, stats?: unknown) => void) => {
+      cb(missingPathError());
+    });
+    sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
+
+    let capturedCommand = "";
+    const execStream = createExecStream();
+    (connection.exec as ReturnType<typeof vi.fn>).mockImplementation((command: string) => {
+      capturedCommand = command;
+      return Promise.resolve(execStream);
+    });
+
+    const promise = service.writeFileElevated("srv-1", "/etc/rotated.log", Buffer.from("hi"), { createMode: 0o640 });
+    await flush();
+    execStream.emit("close", 0);
+    await promise;
+
+    expect(capturedCommand).toContain("chmod 640");
+    expect(capturedCommand).not.toContain("chmod 644");
   });
 
   it("probeElevation runs sudo -n -v using the operation timeout, not the default command timeout", async () => {

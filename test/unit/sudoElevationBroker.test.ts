@@ -4,6 +4,7 @@ const mockShowWarningMessage = vi.fn();
 const mockShowInputBox = vi.fn();
 const mockShowErrorMessage = vi.fn();
 const mockSetStatusBarMessage = vi.fn();
+const mockExecuteCommand = vi.fn();
 
 let sudoEnabled = true;
 let rememberPassword = false;
@@ -14,6 +15,9 @@ vi.mock("vscode", () => ({
     showInputBox: (...args: unknown[]) => mockShowInputBox(...args),
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
     setStatusBarMessage: (...args: unknown[]) => mockSetStatusBarMessage(...args),
+  },
+  commands: {
+    executeCommand: (...args: unknown[]) => mockExecuteCommand(...args),
   },
   workspace: {
     getConfiguration: vi.fn(() => ({
@@ -27,7 +31,11 @@ vi.mock("vscode", () => ({
 }));
 
 import { SudoElevationBroker } from "../../src/services/sftp/sudoElevationBroker";
-import { SudoPasswordRequiredError } from "../../src/services/sftp/elevatedWrite";
+import {
+  ElevatedInstallFailedError,
+  SudoNotPermittedError,
+  SudoPasswordRequiredError,
+} from "../../src/services/sftp/elevatedWrite";
 import type { ServerConfig } from "../../src/models/config";
 
 const testServer: ServerConfig = {
@@ -63,7 +71,7 @@ describe("SudoElevationBroker", () => {
     it("shows a modal warning and resolves true only when 'Save as Root' is chosen", async () => {
       mockShowWarningMessage.mockResolvedValue("Save as Root");
 
-      await expect(broker.confirmElevation("/etc/hosts")).resolves.toBe(true);
+      await expect(broker.confirmElevation("srv-1", "/etc/hosts")).resolves.toBe(true);
 
       expect(mockShowWarningMessage).toHaveBeenCalledWith(
         expect.stringContaining("/etc/hosts"),
@@ -72,16 +80,40 @@ describe("SudoElevationBroker", () => {
       );
     });
 
+    it("names the server, not just 'the remote host', so a multi-server user knows which file (P5)", async () => {
+      mockShowWarningMessage.mockResolvedValue(undefined);
+
+      await broker.confirmElevation("srv-1", "/etc/hosts");
+
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        "Permission denied writing /etc/hosts on Test Server. Retry the save with sudo?",
+        { modal: true },
+        "Save as Root"
+      );
+    });
+
+    it("falls back to the raw serverId when the server is unknown", async () => {
+      mockShowWarningMessage.mockResolvedValue(undefined);
+
+      await broker.confirmElevation("unknown-server", "/etc/hosts");
+
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("unknown-server"),
+        { modal: true },
+        "Save as Root"
+      );
+    });
+
     it("resolves false when the user dismisses the modal", async () => {
       mockShowWarningMessage.mockResolvedValue(undefined);
 
-      await expect(broker.confirmElevation("/etc/hosts")).resolves.toBe(false);
+      await expect(broker.confirmElevation("srv-1", "/etc/hosts")).resolves.toBe(false);
     });
 
     it("skips the modal entirely (returns false) when sudo.enabled is false", async () => {
       sudoEnabled = false;
 
-      await expect(broker.confirmElevation("/etc/hosts")).resolves.toBe(false);
+      await expect(broker.confirmElevation("srv-1", "/etc/hosts")).resolves.toBe(false);
       expect(mockShowWarningMessage).not.toHaveBeenCalled();
     });
   });
@@ -94,8 +126,17 @@ describe("SudoElevationBroker", () => {
       await expect(broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"))).resolves.toBe(true);
 
       expect(mockShowInputBox).not.toHaveBeenCalled();
-      expect(sftp.writeFileElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer));
+      expect(sftp.writeFileElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer), { createMode: undefined });
       expect(mockSetStatusBarMessage).toHaveBeenCalledWith(expect.stringContaining("hosts"), 4000);
+    });
+
+    it("passes the caller-supplied knownMode through as createMode when sudo -n reports none needed (P3)", async () => {
+      sftp.probeElevation.mockResolvedValue({ kind: "none" });
+      sftp.writeFileElevated.mockResolvedValue(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"), 0o640);
+
+      expect(sftp.writeFileElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer), { createMode: 0o640 });
     });
 
     it("prompts for a sudo password only when sudo -n reports one is required", async () => {
@@ -109,7 +150,22 @@ describe("SudoElevationBroker", () => {
       expect(mockShowInputBox).toHaveBeenCalledWith(
         expect.objectContaining({ password: true, ignoreFocusOut: true, prompt: expect.stringContaining("dev@example.com") })
       );
-      expect(sftp.writeFileElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer), { password: "s3cret" });
+      expect(sftp.writeFileElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer), { password: "s3cret", createMode: undefined });
+    });
+
+    it("uses the house password-prompt style: 'Sudo Password: <server name>' title, and explains why a second password is needed (P5)", async () => {
+      sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValue("s3cret");
+      sftp.writeFileElevated.mockResolvedValue(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+
+      expect(mockShowInputBox).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Sudo Password: Test Server",
+          prompt: "Enter the sudo password for dev@example.com to save this file as root",
+        })
+      );
     });
 
     it("falls back to the raw serverId in the prompt when the server is unknown", async () => {
@@ -132,8 +188,23 @@ describe("SudoElevationBroker", () => {
       await expect(broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"))).resolves.toBe(true);
 
       expect(mockShowInputBox).toHaveBeenCalledTimes(2);
-      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(1, "srv-1", "/etc/hosts", expect.any(Buffer), { password: "bad" });
-      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(2, "srv-1", "/etc/hosts", expect.any(Buffer), { password: "good" });
+      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(1, "srv-1", "/etc/hosts", expect.any(Buffer), { password: "bad", createMode: undefined });
+      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(2, "srv-1", "/etc/hosts", expect.any(Buffer), { password: "good", createMode: undefined });
+    });
+
+    it("labels the retry prompt as a rejected password, not an identical unlabelled re-ask (P4a)", async () => {
+      sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValueOnce("bad").mockResolvedValueOnce("good");
+      sftp.writeFileElevated
+        .mockRejectedValueOnce(new SudoPasswordRequiredError())
+        .mockResolvedValueOnce(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+
+      const [firstPrompt] = mockShowInputBox.mock.calls[0];
+      const [secondPrompt] = mockShowInputBox.mock.calls[1];
+      expect(firstPrompt.prompt).not.toContain("Incorrect password");
+      expect(secondPrompt.prompt).toBe("Incorrect password. Enter the sudo password for dev@example.com to save this file as root");
     });
 
     it("gives up with an error notification after the retry also fails, without re-prompting a third time", async () => {
@@ -175,7 +246,7 @@ describe("SudoElevationBroker", () => {
       await broker.saveElevated("srv-1", "/etc/other", Buffer.from("y"));
 
       expect(mockShowInputBox).toHaveBeenCalledTimes(1);
-      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(2, "srv-1", "/etc/other", expect.any(Buffer), { password: "s3cret" });
+      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(2, "srv-1", "/etc/other", expect.any(Buffer), { password: "s3cret", createMode: undefined });
     });
 
     it("does not cache the password when rememberPasswordForSession is false", async () => {
@@ -190,25 +261,77 @@ describe("SudoElevationBroker", () => {
       expect(mockShowInputBox).toHaveBeenCalledTimes(2);
     });
 
-    it("reports that elevated saves are disabled and never probes when nexus.sftp.sudo.enabled is false", async () => {
+    it("reports that elevated saves are disabled, offering an Open Settings button (P5), and never probes", async () => {
       sudoEnabled = false;
+      mockShowErrorMessage.mockResolvedValue(undefined);
 
       await expect(broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"))).resolves.toBe(false);
 
       expect(sftp.probeElevation).not.toHaveBeenCalled();
-      expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        "Elevated saves are disabled (nexus.sftp.sudo.enabled is off).",
+        "Open Settings"
+      );
+      expect(mockExecuteCommand).not.toHaveBeenCalled();
     });
 
-    it("surfaces a non-password sudo failure (e.g. not permitted) without ever prompting for a password", async () => {
+    it("opens the sudo.enabled setting when the disabled toast's Open Settings button is clicked (P5)", async () => {
+      sudoEnabled = false;
+      mockShowErrorMessage.mockResolvedValue("Open Settings");
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+
+      expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.openSettings", "nexus.sftp.sudo.enabled");
+    });
+
+    it("surfaces a not-permitted sudo failure naming the user and host, with the real detail appended, and no double prefix (P5)", async () => {
       sftp.probeElevation.mockResolvedValue({ kind: "not-permitted", detail: "not in sudoers" });
-      sftp.writeFileElevated.mockRejectedValue(
-        new Error("Elevation refused: this account is not permitted to run sudo on the remote host.")
-      );
+      sftp.writeFileElevated.mockRejectedValue(new SudoNotPermittedError("not in sudoers"));
 
       await expect(broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"))).resolves.toBe(false);
 
       expect(mockShowInputBox).not.toHaveBeenCalled();
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("not permitted to run sudo"));
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        "dev@example.com is not permitted to run sudo for this file on Test Server. Check the remote sudoers policy — " +
+        "this can also happen with per-command restrictions rather than a full ban. not in sudoers"
+      );
+      const [message] = mockShowErrorMessage.mock.calls[0];
+      expect(message).not.toMatch(/^Elevated save failed:/);
+    });
+
+    it("appends a partial-write warning for install-phase (unclassified) failures, since the temp file was already staged (P5)", async () => {
+      sftp.probeElevation.mockResolvedValue({ kind: "none" });
+      sftp.writeFileElevated.mockRejectedValue(new ElevatedInstallFailedError("sudo exited with code 1"));
+
+      await expect(broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"))).resolves.toBe(false);
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        "Elevated save failed: sudo exited with code 1 The file may be partially written — keep the editor open and retry the save."
+      );
+    });
+
+    it("does not append a partial-write warning to a generic (staging-phase) failure", async () => {
+      sftp.probeElevation.mockResolvedValue({ kind: "none" });
+      sftp.writeFileElevated.mockRejectedValue(new Error("ENOSPC: no space left on device"));
+
+      await expect(broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"))).resolves.toBe(false);
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith("Elevated save failed: ENOSPC: no space left on device");
+    });
+
+    it("falls through to an interactive password prompt when the probed 'none' timestamp expires before the install runs (P4b)", async () => {
+      sftp.probeElevation.mockResolvedValue({ kind: "none" });
+      sftp.writeFileElevated
+        .mockRejectedValueOnce(new SudoPasswordRequiredError())
+        .mockResolvedValueOnce(undefined);
+      mockShowInputBox.mockResolvedValue("s3cret");
+
+      await expect(broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"))).resolves.toBe(true);
+
+      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(1, "srv-1", "/etc/hosts", expect.any(Buffer), { createMode: undefined });
+      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(2, "srv-1", "/etc/hosts", expect.any(Buffer), { password: "s3cret", createMode: undefined });
+      expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+      expect(mockShowErrorMessage).not.toHaveBeenCalled();
     });
 
     it("never includes the password in any error message shown to the user", async () => {
@@ -233,6 +356,21 @@ describe("SudoElevationBroker", () => {
 
       await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
       broker.clearCachedPassword("srv-1");
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("dispose (P8)", () => {
+    it("clears every cached password, forcing a re-prompt for any server on the next save", async () => {
+      rememberPassword = true;
+      sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValue("s3cret");
+      sftp.writeFileElevated.mockResolvedValue(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+      broker.dispose();
       await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
 
       expect(mockShowInputBox).toHaveBeenCalledTimes(2);

@@ -6,6 +6,7 @@ vi.mock("vscode", () => {
     return {
       event: (listener: (e: unknown) => void) => { listeners.push(listener); },
       fire: (e: unknown) => { for (const l of listeners) { l(e); } },
+      dispose: vi.fn(),
       _listeners: listeners
     };
   });
@@ -299,8 +300,8 @@ describe("NexusFileSystemProvider", () => {
 
       await providerWithBroker.writeFile(uri, new Uint8Array([1]));
 
-      expect(broker.confirmElevation).toHaveBeenCalledWith("/etc/hosts");
-      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer));
+      expect(broker.confirmElevation).toHaveBeenCalledWith("srv-1", "/etc/hosts");
+      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer), undefined);
       expect(providerWithBroker.isElevated(uri)).toBe(true);
     });
 
@@ -334,7 +335,29 @@ describe("NexusFileSystemProvider", () => {
       await providerWithBroker.writeFile(uri, new Uint8Array([1]));
 
       expect(sftp.writeFile).not.toHaveBeenCalled();
-      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer));
+      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer), undefined);
+    });
+
+    it("passes the mode observed at the last readFile as knownMode to an elevated save (P3)", async () => {
+      const uri = buildUri("srv-1", "/etc/hosts");
+      const entryAt0640: DirectoryEntry = { ...fileEntry, permissions: 0o640 };
+      (sftp.stat as any).mockResolvedValue(entryAt0640);
+      (sftp.readFile as any).mockResolvedValue(Buffer.from("hi"));
+      await providerWithBroker.readFile(uri);
+
+      providerWithBroker.markElevated(uri);
+      await providerWithBroker.writeFile(uri, new Uint8Array([1]));
+
+      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer), 0o640);
+    });
+
+    it("passes no knownMode when the file was never read this session", async () => {
+      const uri = buildUri("srv-1", "/etc/new.conf");
+      providerWithBroker.markElevated(uri);
+
+      await providerWithBroker.writeFile(uri, new Uint8Array([1]));
+
+      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/new.conf", expect.any(Buffer), undefined);
     });
 
     it("writeFile keeps its original behaviour when no ElevationBroker is injected", async () => {
@@ -377,7 +400,7 @@ describe("NexusFileSystemProvider", () => {
       // Simulates the nexus.files.editAsRoot command handler.
       providerWithBroker.markElevated(uri);
       await providerWithBroker.writeFile(uri, new Uint8Array([1]));
-      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer));
+      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer), undefined);
       expect(broker.confirmElevation).toHaveBeenCalledTimes(1); // straight to elevated path, no re-prompt
 
       // Proves decline memory was actually reset (not just bypassed while elevated):
@@ -434,15 +457,45 @@ describe("NexusFileSystemProvider", () => {
       expect(broker.confirmElevation).toHaveBeenCalledTimes(2);
     });
 
-    it("dispose() cleans up the onDidCloseTextDocument subscription", async () => {
+    it("closing the document also clears elevation, so a later ordinary save after reopen isn't silently sudo'd (P1)", async () => {
+      const vscode = await import("vscode");
+      let closeHandler: ((doc: { uri: { scheme: string; toString(): string } }) => void) | undefined;
+      (vscode.workspace.onDidCloseTextDocument as any).mockImplementationOnce((cb: any) => {
+        closeHandler = cb;
+        return { dispose: vi.fn() };
+      });
+      const p = new NexusFileSystemProvider(sftp, broker);
+      const uri = buildUri("srv-1", "/etc/nginx/nginx.conf");
+
+      // Proactive "Edit as Root", then a successful elevated save.
+      p.markElevated(uri);
+      expect(p.isElevated(uri)).toBe(true);
+      await p.writeFile(uri, new Uint8Array([1]));
+      expect(broker.saveElevated).toHaveBeenCalledTimes(1);
+
+      // Close the tab.
+      closeHandler!({ uri: { scheme: NEXTERM_SCHEME, toString: () => uri.toString() } });
+      expect(p.isElevated(uri)).toBe(false);
+
+      // Reopen normally and save again: must go through the plain path, not sudo.
+      (sftp.writeFile as any).mockResolvedValue(undefined);
+      await p.writeFile(uri, new Uint8Array([2]));
+
+      expect(sftp.writeFile).toHaveBeenCalledWith("srv-1", "/etc/nginx/nginx.conf", expect.any(Buffer));
+      expect(broker.saveElevated).toHaveBeenCalledTimes(1); // still just the one, pre-close save
+    });
+
+    it("dispose() cleans up the onDidCloseTextDocument subscription and the change emitter", async () => {
       const vscode = await import("vscode");
       const disposeSpy = vi.fn();
       (vscode.workspace.onDidCloseTextDocument as any).mockReturnValueOnce({ dispose: disposeSpy });
       const p = new NexusFileSystemProvider(sftp, broker);
+      const emitterDisposeSpy = (p as any).onDidChangeFileEmitter.dispose as ReturnType<typeof vi.fn>;
 
       p.dispose();
 
       expect(disposeSpy).toHaveBeenCalled();
+      expect(emitterDisposeSpy).toHaveBeenCalled();
     });
   });
 
