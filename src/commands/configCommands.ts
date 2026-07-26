@@ -1829,9 +1829,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
     // parseSecureCrtXmlExport returns the same empty shape whether the root lacks
     // a <VanDyke><key name="Sessions"> structure entirely, or has one with zero
-    // SSH entries inside it. Only the former gets this message; the latter still
-    // reaches applyImportedSessions's generic "No SSH sessions found".
-    if (!hasSecureCrtSessionsRoot(text)) {
+    // SSH entries inside it. Only call the extra validate+parse pass below when the
+    // result is fully empty (no sessions AND nothing skipped) — any non-empty
+    // result, even one that's all skipped entries, already proves the Sessions
+    // root exists, so re-checking it would just re-validate and re-parse for free.
+    if (result.sessions.length === 0 && result.skippedCount === 0 && !hasSecureCrtSessionsRoot(text)) {
       void vscode.window.showErrorMessage(
         "This XML isn't a SecureCRT export — expected a <VanDyke> document with a Sessions section. In SecureCRT, use Tools → Export Settings."
       );
@@ -1895,13 +1897,17 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       return;
     }
 
+    // Extension is not the gate here — content validation exists
+    // (parseSecureCrtXmlExport / hasSecureCrtSessionsRoot below), so a renamed
+    // export (e.g. picked via the "All Files" filter) must still import; a non-XML
+    // file gets the named content error from applySecureCrtXmlText instead.
     const isFile = (stat.type & vscode.FileType.File) === vscode.FileType.File;
-    if (!isFile || !inputUri.fsPath.toLowerCase().endsWith(".xml")) {
+    if (!isFile) {
       void vscode.window.showErrorMessage(unsupportedMsg);
       return;
     }
     const raw = await vscode.workspace.fs.readFile(inputUri);
-    if (raw.byteLength > 10 * 1024 * 1024) {
+    if (raw.byteLength > SECURECRT_XML_MAX_BYTES) {
       void vscode.window.showErrorMessage("SecureCRT XML file exceeds the 10 MB size limit.");
       return;
     }
