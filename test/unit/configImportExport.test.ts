@@ -1972,6 +1972,28 @@ describe("import inventory list command", () => {
     expect(core.getSnapshot().servers).toHaveLength(0);
   });
 
+  it("reports 'Import canceled.' instead of a success message, and suppresses the skipped-lines toast too, when the progress notification is cancelled (Codex finding 2)", async () => {
+    const saveServersSpy = vi.spyOn(repo, "saveServers");
+    mockShowQuickPick.mockResolvedValue({ label: "Paste from Clipboard", value: "clipboard" });
+    // One importable row plus one row with a parse issue, so both the success
+    // toast and the "N line(s) were skipped" toast would normally fire.
+    mockClipboardReadText.mockResolvedValue("sw1.lab.example.com,,admin\nbad host name\n");
+    mockShowInputBox.mockResolvedValue("");
+    mockShowInformationMessage.mockResolvedValue("Import");
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    saveServersSpy.mockClear();
+    progressCancellationRequested = true;
+
+    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
+    await cmd();
+
+    expect(saveServersSpy).not.toHaveBeenCalled();
+    expect(core.getSnapshot().servers).toHaveLength(0);
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith(expect.stringMatching(/^Imported /));
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("Import canceled.");
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringMatching(/was skipped\.|were skipped\./), expect.anything());
+  });
+
   it("does not create an empty folder group for a folder whose only row was deduped (P9)", async () => {
     await core.addOrUpdateServer(
       makeServer({ id: "existing1", host: "sw1.lab.example.com", port: 22, username: "admin", group: "DC1/Core" })

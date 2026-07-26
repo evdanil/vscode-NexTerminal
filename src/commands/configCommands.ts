@@ -1581,6 +1581,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       group: session.folder || undefined
     }));
 
+    // withProgress's own return value doesn't distinguish "ran the callback and it
+    // returned early" from "ran the callback and it did the write" — track that
+    // ourselves so the notifications below can tell a cancelled import from a
+    // completed one instead of always reporting success.
+    let imported = false;
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
@@ -1596,8 +1601,14 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           return;
         }
         await core.addServersBatch(serverConfigs, folders);
+        imported = true;
       }
     );
+
+    if (!imported) {
+      void vscode.window.showWarningMessage("Import canceled.");
+      return;
+    }
 
     void vscode.window.showInformationMessage(
       `Imported ${serverConfigs.length} ${pluralizeNoun("server", serverConfigs.length)}.`
