@@ -225,6 +225,51 @@ Power users migrating from other SSH clients can import their connection profile
 
 Both importers extract hostname, port, and username from each SSH session. Non-SSH sessions (RDP, Telnet, etc.) are skipped. Imported servers default to password authentication.
 
+#### Import a device list (CSV / text)
+
+For everyone else — a spreadsheet export, a device inventory, or just a list of hostnames — run `Nexus: Import Servers from List (CSV/Text)` and choose **Paste from Clipboard** or **Choose File…** (`.csv`, `.txt`, `.tsv`, up to 2 MB).
+
+Accepted formats:
+
+- **A header row** naming columns in any order: `host`/`hostname`/`address`/`ip`, `name`/`label`/`device`, `user`/`username`, `port`, `folder`/`group`/`site`.
+- **No header**, positional: `host[,name[,username[,port[,folder]]]]`. The delimiter is a comma if the line has one, otherwise a tab, otherwise a run of whitespace.
+- **Shorthand** in the host field: `user@host`, `host:port`, `user@host:port`.
+- Lines starting with `#` and blank lines are ignored.
+
+```csv
+# host, name, user, port, folder
+10.0.0.1, core-sw1, netadmin, 22, DC1/Core
+10.0.0.2, core-sw2, netadmin, 22, DC1/Core
+sw3.lab.example.com
+netadmin@sw4.lab.example.com:2022
+```
+
+If any row omits a username you're prompted once for a default (pre-filled with your most common existing username). An optional folder prefix is prepended to every row's folder. Rows that already match an existing server (same host, port, and username — host compared case-insensitively) are skipped and the count is reported; rows Nexus can't parse are listed in a scratch document rather than aborting the whole import. Imported servers always use password authentication — switch to key-based auth afterward via **Edit Server** if needed.
+
+#### Hand-writing an import file
+
+`Nexus: Import Configuration` also accepts a minimal hand-written JSON file — useful for one connection or a quick script, without going through any importer:
+
+```json
+{
+  "version": 2,
+  "servers": [
+    {
+      "id": "8400e8b0-8b3e-4b8a-9b1a-000000000001",
+      "name": "core-sw1",
+      "host": "10.0.0.1",
+      "port": 22,
+      "username": "netadmin",
+      "authType": "password",
+      "isHidden": false,
+      "group": "DC1/Core"
+    }
+  ]
+}
+```
+
+`id`, `name`, `host`, `port`, `username`, `authType`, and `isHidden` are required; `group` is optional (omit it for a top-level server). `id` just needs to be unique — Nexus fills one in for you if you leave it blank.
+
 ## Development
 
 ```bash
