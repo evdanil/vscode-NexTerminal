@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, readFileSync, statSync, chmodSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { shellEscape } from "../../src/utils/shellEscape";
 import {
   buildSudoInstallCommand,
@@ -19,69 +23,66 @@ describe("buildTempStagePath", () => {
 });
 
 describe("buildSudoInstallCommand", () => {
-  // Codex finding 1: existence used to be a boolean the caller resolved via a
-  // separate `stat` before the (possibly slow) staging upload, leaving a window
-  // where a deleted/rotated target would still take the "exists" branch and lose
-  // its chmod. buildSudoInstallCommand no longer takes a targetExists argument at
-  // all — every command below performs the same `[ -e target ]` check inside the
-  // remote shell, at install time, where there is no cross-network race window.
+  // History: round 3 (Codex finding 1) moved the existence check from a boolean the
+  // caller resolved via a separate `stat` (done before the possibly-slow staging
+  // upload) into `[ -e target ]` run inside this same sudo shell, closing the
+  // cross-network race. Round 4 finding A found that the moved check still races,
+  // just over a much smaller window: if the target is deleted/rotated away between
+  // `[ -e ]` succeeding and the `>` redirect opening the file microseconds later, the
+  // redirect creates the file itself under root's *default* umask — so a target that
+  // should come back at a narrow createMode (0600, 0640, ...) can come back 0644.
+  // The fix removes the existence check entirely: the shell's umask is set to
+  // `0666 & ~createMode` before the redirect runs. umask only ever affects a file
+  // the redirect *creates* and has zero effect on a file that already exists, so
+  // there is no branch left to race. buildSudoInstallCommand still never takes a
+  // targetExists argument (removed in round 3).
 
-  // These four tests split on plain shell-syntax tokens (no quote characters of
-  // their own), which survive the outer double-escape unmangled regardless of how
-  // the quoted paths in between get escaped — unlike a hand-built expected string,
-  // which would have to reproduce that escaping exactly (see the regression-pin and
-  // "wraps the whole inner script" tests below for that approach).
-  it("decides existence inside the sudo shell, not from a caller-supplied flag", () => {
+  it("does not perform any existence check — umask alone decides the outcome, closing the round-4 race window", () => {
     const cmd = buildSudoInstallCommand("/tmp/.nexus-elevated-t", "/etc/hosts");
-    expect(cmd).toMatch(/if \[ -e [^\]]*\/etc\/hosts[^\]]*\]; then cat < /);
+    expect(cmd).not.toContain("[ -e");
+    expect(cmd).not.toContain("if ");
+    expect(cmd).not.toContain("chmod");
   });
 
-  it("redirects through the existing inode when the shell finds the target present, without a chmod on that branch", () => {
-    const cmd = buildSudoInstallCommand("/tmp/.nexus-elevated-t", "/etc/hosts");
-    const thenBranch = cmd.split("]; then cat <")[1]?.split("; else cat <")[0] ?? "";
-    expect(thenBranch).toContain("/etc/hosts");
-    expect(thenBranch).not.toContain("chmod");
-  });
-
-  it("chmods only on the create branch, defaulting to 644 when no mode is given", () => {
+  it("sets the shell umask derived from the default createMode (644) when none is given", () => {
     const cmd = buildSudoInstallCommand("/tmp/.nexus-elevated-t", "/etc/new.conf");
-    const elseBranch = cmd.split("; else cat <")[1] ?? "";
-    expect(elseBranch).toContain("&& chmod 644 ");
-    expect(elseBranch.trimEnd().endsWith("; fi'")).toBe(true);
+    expect(cmd).toContain("umask 22");
   });
 
-  it("chmods to the caller-supplied createMode on the create branch (P3: preserves a vanished target's prior mode)", () => {
+  it("sets the shell umask derived from the caller-supplied createMode instead of the default (P3: preserves a vanished target's prior mode)", () => {
     const cmd = buildSudoInstallCommand("/tmp/.nexus-elevated-t", "/etc/rotated.log", 0o640);
-    const elseBranch = cmd.split("; else cat <")[1] ?? "";
-    expect(elseBranch).toContain("&& chmod 640 ");
-    expect(elseBranch).not.toContain("644");
+    expect(cmd).toContain("umask 26");
+    expect(cmd).not.toContain("umask 22");
+  });
+
+  it.each([
+    [0o600, "66"],
+    [0o640, "26"],
+    [0o644, "22"],
+  ])("derives the umask for mode 0o%o as %s (0666 & ~createMode, regression pin for the formula)", (mode, expectedUmask) => {
+    const cmd = buildSudoInstallCommand("/tmp/x", "/etc/hosts", mode);
+    expect(cmd).toContain(`umask ${expectedUmask}`);
   });
 
   it("produces the exact command for the default-mode case (regression pin)", () => {
     const cmd = buildSudoInstallCommand("/tmp/.nexus-elevated-t", "/etc/hosts");
-    const inner =
-      `if [ -e ${shellEscape("/etc/hosts")} ]; then cat < ${shellEscape("/tmp/.nexus-elevated-t")} > ${shellEscape("/etc/hosts")}; ` +
-      `else cat < ${shellEscape("/tmp/.nexus-elevated-t")} > ${shellEscape("/etc/hosts")} && chmod 644 ${shellEscape("/etc/hosts")}; fi`;
+    const inner = `(umask 22; cat < ${shellEscape("/tmp/.nexus-elevated-t")} > ${shellEscape("/etc/hosts")})`;
     expect(cmd).toBe(`sudo -S -p '' -- /bin/sh -c ${shellEscape(inner)}`);
   });
 
   it("wraps the whole inner script in a single outer escape, not the raw shellEscape of each path", () => {
     // The command must be safe against the OUTER shell (sshd's login-shell parse of
     // the whole exec string) stripping one layer of quoting before /bin/sh -c ever
-    // sees it. That means the inner if/else script — itself built from per-path
+    // sees it. That means the inner umask/cat script — itself built from per-path
     // shellEscape() calls — must be escaped again as a single argument.
-    const inner =
-      `if [ -e ${shellEscape("/etc/hosts")} ]; then cat < ${shellEscape("/tmp/.nexus-elevated-t")} > ${shellEscape("/etc/hosts")}; ` +
-      `else cat < ${shellEscape("/tmp/.nexus-elevated-t")} > ${shellEscape("/etc/hosts")} && chmod 644 ${shellEscape("/etc/hosts")}; fi`;
+    const inner = `(umask 22; cat < ${shellEscape("/tmp/.nexus-elevated-t")} > ${shellEscape("/etc/hosts")})`;
     const cmd = buildSudoInstallCommand("/tmp/.nexus-elevated-t", "/etc/hosts");
     expect(cmd).toBe(`sudo -S -p '' -- /bin/sh -c ${shellEscape(inner)}`);
   });
 
   it("keeps an embedded single quote in a target path inert under the outer escape", () => {
     const cmd = buildSudoInstallCommand("/tmp/x", "/etc/it's.conf");
-    const inner =
-      `if [ -e ${shellEscape("/etc/it's.conf")} ]; then cat < ${shellEscape("/tmp/x")} > ${shellEscape("/etc/it's.conf")}; ` +
-      `else cat < ${shellEscape("/tmp/x")} > ${shellEscape("/etc/it's.conf")} && chmod 644 ${shellEscape("/etc/it's.conf")}; fi`;
+    const inner = `(umask 22; cat < ${shellEscape("/tmp/x")} > ${shellEscape("/etc/it's.conf")})`;
     expect(cmd).toBe(`sudo -S -p '' -- /bin/sh -c ${shellEscape(inner)}`);
   });
 
@@ -100,22 +101,21 @@ describe("buildSudoInstallCommand", () => {
     expect(cmd).toContain(shellEscape(targetPath));
   });
 
-  it("keeps a target path with a semicolon, spaces, AND a quote inert through both the existence check and the install (new if/else shape)", () => {
-    // Same injection concern as above, but exercising the new `[ -e ... ]` existence
-    // test too — a payload could in principle try to break out through either the
-    // `[ -e ]` test or the `cat`/`chmod` invocations that follow it. The target's own
-    // embedded quote also has to survive the double escape, on top of the semicolon
-    // and spaces, so this is checked by full recomputation rather than substring
-    // search: a single-escape substring search would false-negative here even on
-    // correct output, because the target's internal quote gets doubly re-escaped by
-    // the outer pass just like the boundary quotes are.
+  it("keeps a target path with a semicolon, spaces, AND a quote inert through the install (umask-only shape)", () => {
+    // Same injection concern as above, exercised against the umask-only inner
+    // script now that the `[ -e ]` existence branch is gone. The target's own
+    // embedded quote also has to survive the double escape, on top of the
+    // semicolon and spaces, so this is checked by full recomputation rather than
+    // substring search: a single-escape substring search would false-negative here
+    // even on correct output, because the target's internal quote gets doubly
+    // re-escaped by the outer pass just like the boundary quotes are.
     const targetPath = "/etc/weird; rm -rf / #'s dir/log.txt";
     const cmd = buildSudoInstallCommand("/tmp/x", targetPath);
     const outerArg = cmd.slice(cmd.indexOf("/bin/sh -c ") + "/bin/sh -c ".length);
     expect(outerArg.startsWith("'") && outerArg.endsWith("'")).toBe(true);
     const target = shellEscape(targetPath);
     const temp = shellEscape("/tmp/x");
-    const inner = `if [ -e ${target} ]; then cat < ${temp} > ${target}; else cat < ${temp} > ${target} && chmod 644 ${target}; fi`;
+    const inner = `(umask 22; cat < ${temp} > ${target})`;
     expect(cmd).toBe(`sudo -S -p '' -- /bin/sh -c ${shellEscape(inner)}`);
   });
 
@@ -126,6 +126,58 @@ describe("buildSudoInstallCommand", () => {
   it("rejects empty or non-absolute paths", () => {
     expect(() => buildSudoInstallCommand("", "/etc/hosts")).toThrow();
     expect(() => buildSudoInstallCommand("/tmp/x", "relative/path")).toThrow();
+  });
+});
+
+describe("buildSudoInstallCommand — real shell behavior (Codex round 4 finding A)", () => {
+  // These run the generated *inner* script (the part after `/bin/sh -c`, i.e. what
+  // sudo would hand to root's shell) through a real /bin/sh against real files on
+  // disk — no sudo involved. The property under test is the umask/redirect
+  // interaction itself, which doesn't need root to observe: an unprivileged user's
+  // shell umask governs files that same user's redirect creates exactly the same
+  // way root's umask governs files root's redirect creates.
+  function innerScriptFor(tempPath: string, targetPath: string, createMode = 0o644): string {
+    const umask = (0o666 & ~createMode).toString(8);
+    return `(umask ${umask}; cat < ${shellEscape(tempPath)} > ${shellEscape(targetPath)})`;
+  }
+
+  it("leaves an existing target's inode and mode untouched: umask has no effect once the file already exists", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nexus-elevated-"));
+    try {
+      const tempPath = join(dir, "staged");
+      const targetPath = join(dir, "target");
+      writeFileSync(tempPath, "new content");
+      writeFileSync(targetPath, "old content");
+      chmodSync(targetPath, 0o600);
+      const inodeBefore = statSync(targetPath).ino;
+
+      // umask 022 (createMode 644) would widen a 0600 file if it were applied to
+      // it — it isn't, because the redirect writes through the existing inode.
+      execFileSync("/bin/sh", ["-c", innerScriptFor(tempPath, targetPath, 0o644)]);
+
+      const after = statSync(targetPath);
+      expect(after.ino).toBe(inodeBefore);
+      expect(after.mode & 0o777).toBe(0o600);
+      expect(readFileSync(targetPath, "utf8")).toBe("new content");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("creates a new target at exactly createMode via the derived umask when the target doesn't exist", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nexus-elevated-"));
+    try {
+      const tempPath = join(dir, "staged");
+      const targetPath = join(dir, "target");
+      writeFileSync(tempPath, "content");
+
+      execFileSync("/bin/sh", ["-c", innerScriptFor(tempPath, targetPath, 0o640)]);
+
+      expect(statSync(targetPath).mode & 0o777).toBe(0o640);
+      expect(readFileSync(targetPath, "utf8")).toBe("content");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

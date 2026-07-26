@@ -397,17 +397,17 @@ export class SftpService {
   /**
    * Writes content to a root-owned (or otherwise permission-denied) remote file by
    * staging it to a user-writable /tmp path over SFTP, then moving it into place with
-   * sudo over an SSH exec channel. Whether the target already exists is decided by
-   * `buildSudoInstallCommand`'s own `[ -e ]` check inside the sudo shell at install
-   * time — deliberately NOT resolved here via an up-front `stat`: this staging upload
-   * can be slow, and a stat done before it started would leave a window where the
-   * target is deleted or log-rotated before the install runs, so a chmod that should
-   * apply (because the shell would now find the target gone) silently wouldn't.
+   * sudo over an SSH exec channel. Whether the target already exists is never
+   * resolved here via an up-front `stat` — this staging upload can be slow, and a
+   * stat done before it started would leave a window where the target is deleted or
+   * log-rotated before the install runs. See `buildSudoInstallCommand` for how the
+   * install itself now avoids that race without an existence check at all.
    *
    * If the target has vanished since it was last read (log rotation, a concurrent
    * delete), this recreates it: `options.createMode` — the mode the caller last
-   * observed via stat/readFile — is used for the chmod instead of a hardcoded 644, so
-   * a recreate can't silently widen a root-owned file's permissions.
+   * observed via stat/readFile — governs the umask used for that recreate instead of
+   * a hardcoded 644, so a recreate can't silently widen a root-owned file's
+   * permissions.
    */
   public async writeFileElevated(
     serverId: string,

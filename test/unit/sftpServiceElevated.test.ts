@@ -147,7 +147,7 @@ describe("SftpService elevated writes", () => {
     expect(capturedCommand).toBe(buildSudoInstallCommand(expectedTempPath, "/etc/hosts"));
   });
 
-  it("does not probe the target's existence before staging: closing that window is the point (Codex finding 1 — the old stat-then-upload gap let a deleted/rotated target lose its chmod)", async () => {
+  it("does not probe the target's existence before staging: closing that window is the point (Codex round 4 finding A — even the in-shell `[ -e ]` check still raced the redirect; umask alone decides the outcome now)", async () => {
     sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
     sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
 
@@ -165,7 +165,8 @@ describe("SftpService elevated writes", () => {
 
     expect(sftp.stat).not.toHaveBeenCalled();
     expect(sftp.lstat).not.toHaveBeenCalled();
-    expect(capturedCommand).toMatch(/if \[ -e [^\]]*\/etc\/hosts[^\]]*\]; then cat < /);
+    expect(capturedCommand).not.toContain("[ -e");
+    expect(capturedCommand).toMatch(/umask \d+; cat < .*\/etc\/hosts/);
   });
 
   it("removes the temp file even when the sudo install fails", async () => {
@@ -222,7 +223,7 @@ describe("SftpService elevated writes", () => {
     expect(endSpy).toHaveBeenCalled();
   });
 
-  it("defaults the create-branch chmod to 644 when the caller supplies no createMode (the shell — not a pre-resolved stat — decides at install time whether that branch even runs)", async () => {
+  it("defaults the shell umask to 022 (createMode 644) when the caller supplies no createMode (the shell — not a pre-resolved stat — decides at install time whether the file is created at all)", async () => {
     sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
     sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
 
@@ -240,10 +241,10 @@ describe("SftpService elevated writes", () => {
 
     expect(sftp.stat).not.toHaveBeenCalled();
     expect(sftp.lstat).not.toHaveBeenCalled();
-    expect(capturedCommand).toContain("chmod 644");
+    expect(capturedCommand).toContain("umask 22");
   });
 
-  it("uses the caller-supplied createMode instead of 644 for the create branch (P3: preserves a vanished target's prior mode)", async () => {
+  it("uses the caller-supplied createMode instead of 644 to derive the shell umask (P3: preserves a vanished target's prior mode)", async () => {
     sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
     sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
 
@@ -259,8 +260,8 @@ describe("SftpService elevated writes", () => {
     execStream.emit("close", 0);
     await promise;
 
-    expect(capturedCommand).toContain("chmod 640");
-    expect(capturedCommand).not.toContain("chmod 644");
+    expect(capturedCommand).toContain("umask 26");
+    expect(capturedCommand).not.toContain("umask 22");
   });
 
   it("probeElevation runs sudo -n -v using the operation timeout, not the default command timeout", async () => {

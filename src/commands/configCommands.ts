@@ -1591,34 +1591,21 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       group: session.folder || undefined
     }));
 
-    // withProgress's own return value doesn't distinguish "ran the callback and it
-    // returned early" from "ran the callback and it did the write" — track that
-    // ourselves so the notifications below can tell a cancelled import from a
-    // completed one instead of always reporting success.
-    let imported = false;
+    // Not cancellable: addServersBatch is a single atomic persisted write (see
+    // NexusCore), so there is no per-row loop left to check a token against
+    // mid-flight — a Cancel button here could only ever fire after the write had
+    // already started, leaving every server persisted anyway. Offering a control
+    // that can't do what it promises would be worse than not offering one.
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
         title: `Importing ${serverConfigs.length} ${pluralizeNoun("server", serverConfigs.length)}…`,
-        cancellable: true
+        cancellable: false
       },
-      async (_progress, token) => {
-        // addServersBatch does one persisted write for the whole import (see
-        // NexusCore), so there's no per-row loop left to check the token
-        // against mid-flight — this is the one point where cancelling still
-        // means something: before that write starts.
-        if (token?.isCancellationRequested) {
-          return;
-        }
+      async () => {
         await core.addServersBatch(serverConfigs, folders);
-        imported = true;
       }
     );
-
-    if (!imported) {
-      void vscode.window.showWarningMessage("Import canceled.");
-      return;
-    }
 
     void vscode.window.showInformationMessage(
       `Imported ${serverConfigs.length} ${pluralizeNoun("server", serverConfigs.length)}.`
