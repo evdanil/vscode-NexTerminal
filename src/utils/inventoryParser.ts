@@ -265,24 +265,30 @@ function parseHostShorthand(raw: string): HostShorthand {
   }
   if (rest.startsWith("[")) {
     const closeIdx = rest.indexOf("]");
-    if (closeIdx !== -1) {
-      const host = rest.slice(1, closeIdx);
-      const remainder = rest.slice(closeIdx + 1);
-      if (remainder === "") {
-        return { host, username };
-      }
-      if (remainder.startsWith(":")) {
-        const portPart = remainder.slice(1);
-        if (isPortLike(portPart)) {
-          return { host, username, port: parseInt(portPart, 10) };
-        }
-        return { host, username, invalidPortSuffix: portPart };
-      }
-      // Non-empty remainder that isn't even a ":port" attempt (e.g. "[::1]junk") —
-      // same invalid-port treatment as a malformed numeric suffix, rather than
-      // silently discarding it.
-      return { host, username, invalidPortSuffix: remainder };
+    if (closeIdx === -1) {
+      // Unterminated bracket ("[2001:db8::1" with no closing "]") is not a valid
+      // endpoint literal — report it as an invalid host instead of falling through
+      // to the colon-tolerant generic host path below, which exists only to admit
+      // real bracketed/bare IPv6 literals and would otherwise pass this straight
+      // through as an unconnectable bracket-bearing host.
+      return { host: "", username };
     }
+    const host = rest.slice(1, closeIdx);
+    const remainder = rest.slice(closeIdx + 1);
+    if (remainder === "") {
+      return { host, username };
+    }
+    if (remainder.startsWith(":")) {
+      const portPart = remainder.slice(1);
+      if (isPortLike(portPart)) {
+        return { host, username, port: parseInt(portPart, 10) };
+      }
+      return { host, username, invalidPortSuffix: portPart };
+    }
+    // Non-empty remainder that isn't even a ":port" attempt (e.g. "[::1]junk") —
+    // same invalid-port treatment as a malformed numeric suffix, rather than
+    // silently discarding it.
+    return { host, username, invalidPortSuffix: remainder };
   }
   const colonIdx = rest.lastIndexOf(":");
   if (colonIdx > 0) {
