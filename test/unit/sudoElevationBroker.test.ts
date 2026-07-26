@@ -209,7 +209,26 @@ describe("SudoElevationBroker", () => {
       const [firstPrompt] = mockShowInputBox.mock.calls[0];
       const [secondPrompt] = mockShowInputBox.mock.calls[1];
       expect(firstPrompt.prompt).not.toContain("Incorrect password");
-      expect(secondPrompt.prompt).toBe("Incorrect password. Enter the sudo password for dev@example.com to save this file as root");
+      expect(secondPrompt.prompt).toBe(
+        "Incorrect password. If this host is configured with rootpw (or targetpw), sudo wants the root password, not yours. " +
+        "Enter the sudo password for dev@example.com to save this file as root"
+      );
+    });
+
+    it("mentions the rootpw/targetpw hint on the retry prompt only, not the first prompt (#31 live-testing follow-up)", async () => {
+      mockShowInputBox.mockResolvedValueOnce("bad").mockResolvedValueOnce("good");
+      sftp.writeFileElevated
+        .mockRejectedValueOnce(new SudoPasswordRequiredError())
+        .mockRejectedValueOnce(new SudoPasswordRequiredError())
+        .mockResolvedValueOnce(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+
+      const [firstPrompt] = mockShowInputBox.mock.calls[0];
+      const [secondPrompt] = mockShowInputBox.mock.calls[1];
+      expect(firstPrompt.prompt).not.toMatch(/rootpw|targetpw/i);
+      expect(secondPrompt.prompt).toContain("Incorrect password.");
+      expect(secondPrompt.prompt).toMatch(/rootpw/i);
     });
 
     it("gives up with an error notification after the retry also fails, without re-prompting a third time", async () => {

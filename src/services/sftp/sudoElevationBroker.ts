@@ -220,7 +220,12 @@ export class SudoElevationBroker implements ElevationBroker {
     const server = this.getServer(serverId);
     const target = server ? `${server.username}@${server.host}` : serverId;
     const title = `Sudo Password: ${server ? server.name : serverId}`;
-    const reason = retry ? "Incorrect password. " : "";
+    // The rootpw/targetpw hint belongs on the retry prompt only: it's a plausible
+    // explanation for a *rejected* password, but would be noise (and misleadingly
+    // suggest something's already wrong) on the first, clean ask.
+    const reason = retry
+      ? "Incorrect password. If this host is configured with rootpw (or targetpw), sudo wants the root password, not yours. "
+      : "";
     const password = await vscode.window.showInputBox({
       title,
       prompt: `${reason}Enter the sudo password for ${target} to save this file as root`,
