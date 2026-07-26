@@ -9,6 +9,10 @@ vi.mock("vscode", () => {
       _listeners: listeners
     };
   });
+  // toString() matters here: NexusFileSystemProvider keys its elevated/declined
+  // URI sets on uri.toString(). A real vscode.Uri stringifies distinctly per URI;
+  // without this the mock would collapse every URI to the same "[object Object]"
+  // key and elevation state would leak across unrelated files.
   return {
     Uri: {
       from: vi.fn((components: { scheme: string; authority: string; path: string }) => ({
@@ -16,12 +20,14 @@ vi.mock("vscode", () => {
         authority: components.authority,
         path: components.path,
         fsPath: components.path,
+        toString: () => `${components.scheme}://${components.authority}${components.path}`,
       })),
       file: vi.fn((filePath: string) => ({
         scheme: "file",
         authority: "",
         path: filePath,
         fsPath: filePath,
+        toString: () => `file://${filePath}`,
       })),
       joinPath: vi.fn((base: { scheme: string; authority: string; path: string; fsPath: string }, ...segments: string[]) => {
         const basePath = base.path.endsWith("/") ? base.path.slice(0, -1) : base.path;
@@ -31,6 +37,7 @@ vi.mock("vscode", () => {
           authority: base.authority,
           path: joinedPath,
           fsPath: joinedPath,
+          toString: () => `${base.scheme}://${base.authority}${joinedPath}`,
         };
       }),
     },
@@ -49,6 +56,7 @@ vi.mock("vscode", () => {
         delete: vi.fn(),
       },
       getConfiguration: vi.fn(() => ({ get: (_key: string, def: unknown) => def })),
+      onDidCloseTextDocument: vi.fn(() => ({ dispose: vi.fn() })),
     },
     Disposable: class { constructor(private cb: () => void) {} dispose() { this.cb(); } },
     EventEmitter,
@@ -92,6 +100,10 @@ const dirEntry: DirectoryEntry = {
 
 function missingRemoteError(message = "No such file"): Error & { code: number } {
   return Object.assign(new Error(message), { code: 2 });
+}
+
+function permissionDeniedError(message = "Permission denied"): Error & { code: number } {
+  return Object.assign(new Error(message), { code: 3 }); // SSH_FX_PERMISSION_DENIED
 }
 
 function createMockSftp() {
@@ -246,6 +258,192 @@ describe("NexusFileSystemProvider", () => {
     expect(events).toHaveLength(1);
     // FileChangeType.Changed = 2
     expect(events[0].type).toBe(2);
+  });
+
+  describe("elevated (sudo) saves", () => {
+    let broker: { confirmElevation: ReturnType<typeof vi.fn>; saveElevated: ReturnType<typeof vi.fn> };
+    let providerWithBroker: NexusFileSystemProvider;
+
+    beforeEach(() => {
+      broker = {
+        confirmElevation: vi.fn(async () => true),
+        saveElevated: vi.fn(async () => true),
+      };
+      providerWithBroker = new NexusFileSystemProvider(sftp, broker);
+    });
+
+    it("stat drops the readonly permission for URIs marked elevated", async () => {
+      const readonlyEntry: DirectoryEntry = { ...fileEntry, permissions: 0o444 };
+      (sftp.stat as any).mockResolvedValue(readonlyEntry);
+      const uri = buildUri("srv-1", "/etc/readonly.conf");
+
+      providerWithBroker.markElevated(uri);
+      const stat = await providerWithBroker.stat(uri);
+
+      expect(stat.permissions).toBeUndefined();
+    });
+
+    it("markElevated fires a Changed event so an already-open readonly editor re-resolves", () => {
+      const events: any[] = [];
+      providerWithBroker.onDidChangeFile((e) => events.push(...e));
+      const uri = buildUri("srv-1", "/etc/readonly.conf");
+
+      providerWithBroker.markElevated(uri);
+
+      expect(events).toEqual([{ type: 2, uri }]); // FileChangeType.Changed = 2
+    });
+
+    it("writeFile offers elevation when the plain save is denied", async () => {
+      (sftp.writeFile as any).mockRejectedValue(permissionDeniedError());
+      const uri = buildUri("srv-1", "/etc/hosts");
+
+      await providerWithBroker.writeFile(uri, new Uint8Array([1]));
+
+      expect(broker.confirmElevation).toHaveBeenCalledWith("/etc/hosts");
+      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer));
+      expect(providerWithBroker.isElevated(uri)).toBe(true);
+    });
+
+    it("writeFile's elevated branch fires a Changed event on success, like the normal branch", async () => {
+      (sftp.writeFile as any).mockRejectedValue(permissionDeniedError());
+      const events: any[] = [];
+      providerWithBroker.onDidChangeFile((e) => events.push(...e));
+      const uri = buildUri("srv-1", "/etc/hosts");
+
+      await providerWithBroker.writeFile(uri, new Uint8Array([1]));
+
+      // One Changed from markElevated (re-resolve trigger), one from the successful save.
+      expect(events.filter((e) => e.type === 2)).toHaveLength(2);
+    });
+
+    it("writeFile rethrows NoPermissions when the user declines elevation", async () => {
+      (sftp.writeFile as any).mockRejectedValue(permissionDeniedError());
+      broker.confirmElevation.mockResolvedValue(false);
+      const uri = buildUri("srv-1", "/etc/hosts");
+
+      await expect(providerWithBroker.writeFile(uri, new Uint8Array([1]))).rejects.toThrow();
+
+      expect(broker.saveElevated).not.toHaveBeenCalled();
+      expect(providerWithBroker.isElevated(uri)).toBe(false);
+    });
+
+    it("writeFile goes straight to the elevated path for an elevated URI", async () => {
+      const uri = buildUri("srv-1", "/etc/hosts");
+      providerWithBroker.markElevated(uri);
+
+      await providerWithBroker.writeFile(uri, new Uint8Array([1]));
+
+      expect(sftp.writeFile).not.toHaveBeenCalled();
+      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer));
+    });
+
+    it("writeFile keeps its original behaviour when no ElevationBroker is injected", async () => {
+      const deniedError = permissionDeniedError();
+      (sftp.writeFile as any).mockRejectedValue(deniedError);
+      const uri = buildUri("srv-1", "/etc/hosts");
+
+      // `provider` (outer beforeEach) was constructed with no broker argument.
+      await expect(provider.writeFile(uri, new Uint8Array([1]))).rejects.toBe(deniedError);
+    });
+
+    it("does not offer elevation for non-permission-denied errors", async () => {
+      (sftp.writeFile as any).mockRejectedValue(new Error("ECONNRESET"));
+      const uri = buildUri("srv-1", "/etc/hosts");
+
+      await expect(providerWithBroker.writeFile(uri, new Uint8Array([1]))).rejects.toThrow("ECONNRESET");
+      expect(broker.confirmElevation).not.toHaveBeenCalled();
+    });
+
+    it("prompts exactly once across repeated denied saves after a decline (autosave storm)", async () => {
+      (sftp.writeFile as any).mockRejectedValue(permissionDeniedError());
+      broker.confirmElevation.mockResolvedValue(false);
+      const uri = buildUri("srv-1", "/etc/hosts");
+
+      await expect(providerWithBroker.writeFile(uri, new Uint8Array([1]))).rejects.toThrow();
+      await expect(providerWithBroker.writeFile(uri, new Uint8Array([1]))).rejects.toThrow();
+      await expect(providerWithBroker.writeFile(uri, new Uint8Array([1]))).rejects.toThrow();
+
+      expect(broker.confirmElevation).toHaveBeenCalledTimes(1);
+    });
+
+    it("editAsRoot (markElevated) re-arms the offer after a decline", async () => {
+      (sftp.writeFile as any).mockRejectedValue(permissionDeniedError());
+      broker.confirmElevation.mockResolvedValue(false);
+      const uri = buildUri("srv-1", "/etc/hosts");
+
+      await expect(providerWithBroker.writeFile(uri, new Uint8Array([1]))).rejects.toThrow();
+      expect(broker.confirmElevation).toHaveBeenCalledTimes(1);
+
+      // Simulates the nexus.files.editAsRoot command handler.
+      providerWithBroker.markElevated(uri);
+      await providerWithBroker.writeFile(uri, new Uint8Array([1]));
+      expect(broker.saveElevated).toHaveBeenCalledWith("srv-1", "/etc/hosts", expect.any(Buffer));
+      expect(broker.confirmElevation).toHaveBeenCalledTimes(1); // straight to elevated path, no re-prompt
+
+      // Proves decline memory was actually reset (not just bypassed while elevated):
+      // clear elevation, deny again, and the offer must reappear.
+      providerWithBroker.clearElevated(uri);
+      (sftp.writeFile as any).mockRejectedValue(permissionDeniedError());
+      await expect(providerWithBroker.writeFile(uri, new Uint8Array([1]))).rejects.toThrow();
+      expect(broker.confirmElevation).toHaveBeenCalledTimes(2);
+    });
+
+    it("clearElevated stops routing writeFile through the elevated path", async () => {
+      (sftp.writeFile as any).mockResolvedValue(undefined);
+      const uri = buildUri("srv-1", "/etc/hosts");
+      providerWithBroker.markElevated(uri);
+      providerWithBroker.clearElevated(uri);
+
+      await providerWithBroker.writeFile(uri, new Uint8Array([1]));
+
+      expect(sftp.writeFile).toHaveBeenCalled();
+      expect(broker.saveElevated).not.toHaveBeenCalled();
+    });
+
+    it("clearElevatedForServer drops only that server's elevated URIs", async () => {
+      (sftp.writeFile as any).mockResolvedValue(undefined);
+      const uriA = buildUri("srv-1", "/etc/hosts");
+      const uriB = buildUri("srv-2", "/etc/hosts");
+      providerWithBroker.markElevated(uriA);
+      providerWithBroker.markElevated(uriB);
+
+      providerWithBroker.clearElevatedForServer("srv-1");
+
+      expect(providerWithBroker.isElevated(uriA)).toBe(false);
+      expect(providerWithBroker.isElevated(uriB)).toBe(true);
+    });
+
+    it("closing the document clears decline memory", async () => {
+      const vscode = await import("vscode");
+      let closeHandler: ((doc: { uri: { scheme: string; toString(): string } }) => void) | undefined;
+      (vscode.workspace.onDidCloseTextDocument as any).mockImplementationOnce((cb: any) => {
+        closeHandler = cb;
+        return { dispose: vi.fn() };
+      });
+      const p = new NexusFileSystemProvider(sftp, broker);
+      (sftp.writeFile as any).mockRejectedValue(permissionDeniedError());
+      broker.confirmElevation.mockResolvedValue(false);
+      const uri = buildUri("srv-1", "/etc/hosts");
+
+      await expect(p.writeFile(uri, new Uint8Array([1]))).rejects.toThrow();
+      expect(broker.confirmElevation).toHaveBeenCalledTimes(1);
+
+      closeHandler!({ uri: { scheme: NEXTERM_SCHEME, toString: () => uri.toString() } });
+
+      await expect(p.writeFile(uri, new Uint8Array([1]))).rejects.toThrow();
+      expect(broker.confirmElevation).toHaveBeenCalledTimes(2);
+    });
+
+    it("dispose() cleans up the onDidCloseTextDocument subscription", async () => {
+      const vscode = await import("vscode");
+      const disposeSpy = vi.fn();
+      (vscode.workspace.onDidCloseTextDocument as any).mockReturnValueOnce({ dispose: disposeSpy });
+      const p = new NexusFileSystemProvider(sftp, broker);
+
+      p.dispose();
+
+      expect(disposeSpy).toHaveBeenCalled();
+    });
   });
 
   it("delete uses lstat and fires delete event", async () => {

@@ -11,6 +11,7 @@ import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
 import type { FileExplorerTreeProvider } from "../ui/fileExplorerTreeProvider";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 import type { TerminalRegistry } from "../services/terminal/terminalRegistry";
+import type { ElevationBroker, NexusFileSystemProvider } from "../services/sftp/nexusFileSystemProvider";
 
 export type ServerTerminalMap = Map<string, Set<vscode.Terminal>>;
 export type SessionTerminalMap = Map<string, vscode.Terminal>;
@@ -51,6 +52,8 @@ export interface CommandContext {
   macroAutoTrigger: MacroAutoTrigger;
   sftpService: SftpService;
   fileExplorerProvider: FileExplorerTreeProvider;
+  fileSystemProvider?: NexusFileSystemProvider;
+  elevationBroker?: ElevationBroker;
   secretVault?: SecretVault;
   registrySync?: TunnelRegistrySync;
   focusedTerminal?: vscode.Terminal;

@@ -3,8 +3,24 @@ import * as vscode from "vscode";
 import type { SftpService, DirectoryEntry } from "./sftpService";
 import { isSafeEntryName, joinRemoteEntryPath } from "../../utils/pathSafety";
 import { readBoundedNumber } from "../../utils/boundedConfig";
+import { isPermissionDeniedError } from "./elevatedWrite";
 
 export const NEXTERM_SCHEME = "nexterm";
+
+/**
+ * Owns the password UI and the sudo write for a permission-denied save. Kept out of
+ * this provider so it stays UI-agnostic and unit-testable without a real vscode host.
+ */
+export interface ElevationBroker {
+  /** Returns true if the elevated write completed; false if the user declined. */
+  saveElevated(serverId: string, remotePath: string, content: Buffer): Promise<boolean>;
+  /** Ask the user whether to retry the failed save with sudo. */
+  confirmElevation(remotePath: string): Promise<boolean>;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 function getMaxFileSize(): number {
   return readBoundedNumber("nexus.sftp", "maxOpenFileSizeMB", 5, 1, 200) * 1024 * 1024;
@@ -28,26 +44,77 @@ function toFileType(entry: DirectoryEntry): vscode.FileType {
   return entry.isDirectory ? vscode.FileType.Directory : vscode.FileType.File;
 }
 
-export class NexusFileSystemProvider implements vscode.FileSystemProvider {
+export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscode.Disposable {
   private readonly onDidChangeFileEmitter = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
   public readonly onDidChangeFile = this.onDidChangeFileEmitter.event;
+  // uri.toString() -> serverId. The serverId side lets clearElevatedForServer drop
+  // exactly that server's entries on disconnect without parsing/prefix-matching keys.
+  private readonly elevatedUris = new Map<string, string>();
+  // Tracks URIs where the user has already said "no" to the sudo offer, so autosave
+  // (files.autoSave: afterDelay) re-entering writeFile on the same permission-denied
+  // file doesn't pop a modal on every retry. Cleared on document close or editAsRoot.
+  private readonly declinedUris = new Set<string>();
+  private readonly closeListener: vscode.Disposable;
 
-  public constructor(private readonly sftp: SftpService) {}
+  public constructor(
+    private readonly sftp: SftpService,
+    private readonly elevation?: ElevationBroker
+  ) {
+    this.closeListener = vscode.workspace.onDidCloseTextDocument((doc) => {
+      if (doc.uri.scheme === NEXTERM_SCHEME) {
+        this.declinedUris.delete(doc.uri.toString());
+      }
+    });
+  }
+
+  public dispose(): void {
+    this.closeListener.dispose();
+  }
 
   public watch(): vscode.Disposable {
     // Remote watch not feasible over SFTP — no-op
     return new vscode.Disposable(() => {});
   }
 
+  /** Marks a URI as sudo-writable: stat drops Readonly and writeFile routes to the elevated path. */
+  public markElevated(uri: vscode.Uri): void {
+    const key = uri.toString();
+    this.elevatedUris.set(key, uri.authority);
+    this.declinedUris.delete(key); // explicit "Edit as Root" re-arms a previously declined offer
+    // For a file already open (the 0444 proactive case), VS Code has cached
+    // FilePermission.Readonly in the text model; dropping it in stat() only takes
+    // effect once the model re-resolves. A Changed event on a non-dirty model
+    // triggers that re-resolve (re-stat -> readonly cleared) without a reopen.
+    this.onDidChangeFileEmitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
+  }
+
+  public clearElevated(uri: vscode.Uri): void {
+    this.elevatedUris.delete(uri.toString());
+  }
+
+  /** Drops elevation for every URI belonging to a server — call on SSH disconnect so a file reopened later doesn't silently stay in sudo mode. */
+  public clearElevatedForServer(serverId: string): void {
+    for (const [key, sid] of this.elevatedUris) {
+      if (sid === serverId) {
+        this.elevatedUris.delete(key);
+      }
+    }
+  }
+
+  public isElevated(uri: vscode.Uri): boolean {
+    return this.elevatedUris.has(uri.toString());
+  }
+
   public async stat(uri: vscode.Uri): Promise<vscode.FileStat> {
     const { serverId, remotePath } = parseUri(uri);
     const entry = await this.sftp.stat(serverId, remotePath);
+    const readonly = (entry.permissions & 0o200) === 0 && !this.isElevated(uri);
     return {
       type: toFileType(entry),
       ctime: entry.modifiedAt * 1000,
       mtime: entry.modifiedAt * 1000,
       size: entry.size,
-      permissions: (entry.permissions & 0o200) === 0 ? vscode.FilePermission.Readonly : undefined,
+      permissions: readonly ? vscode.FilePermission.Readonly : undefined,
     };
   }
 
@@ -70,9 +137,57 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider {
     return this.sftp.readFile(serverId, remotePath, maxSize);
   }
 
+  // Deliberately a modal prompt inside writeFile, not a fail-then-notify pattern:
+  // VS Code applies no timeout to FileSystemProvider.writeFile, saves to a single
+  // resource are sequentialized (a second Ctrl+S joins the pending save rather than
+  // double-firing), and the editor stays dirty until this promise settles. Failing
+  // the save instead would stack VS Code's own "Failed to save" dialog on top of ours.
   public async writeFile(uri: vscode.Uri, content: Uint8Array): Promise<void> {
     const { serverId, remotePath } = parseUri(uri);
-    await this.sftp.writeFile(serverId, remotePath, Buffer.from(content));
+    const buffer = Buffer.from(content);
+
+    if (this.isElevated(uri)) {
+      await this.performElevatedSave(serverId, remotePath, buffer, uri);
+      return;
+    }
+
+    try {
+      await this.sftp.writeFile(serverId, remotePath, buffer);
+    } catch (error) {
+      if (!this.elevation || !isPermissionDeniedError(error)) {
+        throw error;
+      }
+      const key = uri.toString();
+      if (this.declinedUris.has(key)) {
+        throw vscode.FileSystemError.NoPermissions(errorMessage(error));
+      }
+      const accepted = await this.elevation.confirmElevation(remotePath);
+      if (!accepted) {
+        this.declinedUris.add(key);
+        throw vscode.FileSystemError.NoPermissions(errorMessage(error));
+      }
+      this.markElevated(uri);
+      await this.performElevatedSave(serverId, remotePath, buffer, uri);
+      return;
+    }
+    this.onDidChangeFileEmitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
+  }
+
+  private async performElevatedSave(
+    serverId: string,
+    remotePath: string,
+    content: Buffer,
+    uri: vscode.Uri
+  ): Promise<void> {
+    if (!this.elevation) {
+      throw vscode.FileSystemError.NoPermissions(
+        `Elevated save of ${remotePath} requires sudo support, which is not configured.`
+      );
+    }
+    const completed = await this.elevation.saveElevated(serverId, remotePath, content);
+    if (!completed) {
+      throw vscode.FileSystemError.NoPermissions(`Elevated save of ${remotePath} was not completed.`);
+    }
     this.onDidChangeFileEmitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
   }
 

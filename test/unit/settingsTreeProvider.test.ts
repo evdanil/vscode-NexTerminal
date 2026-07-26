@@ -173,11 +173,11 @@ describe("SettingsTreeProvider", () => {
       expect(children).toHaveLength(7);
     });
 
-    it("returns 9 children for sftp", () => {
+    it("returns 11 children for sftp", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("sftp");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(9);
+      expect(children).toHaveLength(11);
     });
 
     it("includes the operation timeout setting in the sftp category", () => {

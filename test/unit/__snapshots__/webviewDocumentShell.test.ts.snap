@@ -4869,6 +4869,25 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="validation-error" data-for="nexus.sftp.deleteOperationLimit"></span>
   <span class="save-indicator" aria-live="polite" data-for="nexus.sftp.deleteOperationLimit"></span>
 </div>
+  <h4 class="settings-subgroup">Sudo</h4>
+  <div class="form-group form-group-checkbox">
+  <label for="setting-nexus-sftp-sudo-enabled">
+    <input type="checkbox" id="setting-nexus-sftp-sudo-enabled" data-section="nexus.sftp" data-key="sudo.enabled" checked />
+    Enable Elevated (sudo) Saves
+  </label>
+  
+  <div class="setting-desc">Offer to save remote files with sudo when the SSH user lacks write permission.</div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.sftp.sudo.enabled"></span>
+</div>
+  <div class="form-group form-group-checkbox">
+  <label for="setting-nexus-sftp-sudo-rememberPasswordForSession">
+    <input type="checkbox" id="setting-nexus-sftp-sudo-rememberPasswordForSession" data-section="nexus.sftp" data-key="sudo.rememberPasswordForSession" />
+    Remember Sudo Password for Session
+  </label>
+  
+  <div class="setting-desc">Keep the sudo password in memory for the duration of the session. Never written to disk or to VS Code&#39;s secret storage.</div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.sftp.sudo.rememberPasswordForSession"></span>
+</div>
 
   <h3 id="section-serial">Serial</h3>
   <div class="form-group">

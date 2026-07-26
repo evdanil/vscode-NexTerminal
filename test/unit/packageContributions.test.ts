@@ -537,4 +537,37 @@ describe("package contributions", () => {
     const paletteEntry = paletteMenu.find((item) => item.command === "nexus.config.import.inventory");
     expect(paletteEntry?.when).not.toBe("false");
   });
+
+  describe("Edit as Root (nexus.files.editAsRoot)", () => {
+    it("contributes the command with a Nexus category and shield icon", () => {
+      const cmd = packageJson.contributes.commands.find((c) => c.command === "nexus.files.editAsRoot");
+      expect(cmd).toBeDefined();
+      expect(cmd?.title).toMatch(/edit as root/i);
+      expect(cmd?.category).toBe("Nexus");
+      expect((cmd as unknown as { icon?: string })?.icon).toBe("$(shield)");
+    });
+
+    it("binds a view/item/context entry scoped to file (not directory) items", () => {
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      const entry = menuItems.find((m) => m.command === "nexus.files.editAsRoot");
+      expect(entry).toBeDefined();
+      expect(entry?.when).toBe("view == nexusFileExplorer && viewItem == nexus.fileExplorer.file");
+    });
+
+    it("hides the command from the command palette (requires a tree item)", () => {
+      const paletteItems = packageJson.contributes.menus.commandPalette ?? [];
+      const entry = paletteItems.find((m) => m.command === "nexus.files.editAsRoot");
+      expect(entry).toBeDefined();
+      expect(entry?.when).toBe("false");
+    });
+
+    it("contributes the two nexus.sftp.sudo.* settings with distinct order values", () => {
+      const props = packageJson.contributes.configuration?.properties ?? {};
+      expect(props["nexus.sftp.sudo.enabled"]).toMatchObject({ type: "boolean", default: true });
+      expect(props["nexus.sftp.sudo.rememberPasswordForSession"]).toMatchObject({ type: "boolean", default: false });
+      const enabledOrder = props["nexus.sftp.sudo.enabled"].order;
+      const rememberOrder = props["nexus.sftp.sudo.rememberPasswordForSession"].order;
+      expect(enabledOrder).not.toBe(rememberOrder);
+    });
+  });
 });

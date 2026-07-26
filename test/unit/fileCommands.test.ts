@@ -15,6 +15,7 @@ const mockWithProgress = vi.fn(async (_opts: unknown, task: (progress: { report:
   task({ report: vi.fn() })
 );
 const mockBuildUri = vi.fn((serverId: string, remotePath: string) => ({ scheme: "nexterm", serverId, remotePath }));
+const mockGetConfiguration = vi.fn(() => ({ get: (_key: string, def: unknown) => def }));
 
 function createFileTreeItem(overrides: {
   serverId?: string;
@@ -54,7 +55,8 @@ vi.mock("vscode", () => ({
       stat: vi.fn(),
       createDirectory: vi.fn(),
       delete: vi.fn()
-    }
+    },
+    getConfiguration: (...args: unknown[]) => mockGetConfiguration(...args)
   },
   env: {
     clipboard: { writeText: vi.fn() }
@@ -726,5 +728,93 @@ describe("fileCommands title bar actions", () => {
 
     const items = vi.mocked(vscode.window.showQuickPick).mock.calls[0][0] as Array<{ label: string }>;
     expect(items.map((item) => item.label)).toEqual(["A1", "A2", "A10"]);
+  });
+
+  describe("editAsRoot command", () => {
+    beforeEach(() => {
+      mockGetConfiguration.mockReturnValue({ get: (_key: string, def: unknown) => def });
+    });
+
+    function fileItem(overrides?: { serverId?: string; remotePath?: string }): FileTreeItem {
+      return createFileTreeItem({
+        serverId: overrides?.serverId,
+        remotePath: overrides?.remotePath ?? "/etc",
+        entry: {
+          name: "hosts",
+          isDirectory: false,
+          isSymlink: false,
+          size: 10,
+          modifiedAt: 1700000000,
+          permissions: 0o644,
+        },
+      });
+    }
+
+    it("registers nexus.files.editAsRoot", () => {
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated: vi.fn() };
+      registerFileCommands(ctx);
+
+      expect(registeredCommands.has("nexus.files.editAsRoot")).toBe(true);
+    });
+
+    it("marks the URI elevated and opens it", async () => {
+      const markElevated = vi.fn();
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+
+      await handler(fileItem());
+
+      // FileTreeItem.remotePath is the containing directory, not the file — the
+      // path must be joined with the entry name before building the URI.
+      expect(mockBuildUri).toHaveBeenCalledWith("srv-1", "/etc/hosts");
+      expect(markElevated).toHaveBeenCalledTimes(1);
+      expect(mockExecuteCommand).toHaveBeenCalledWith("vscode.open", expect.anything());
+    });
+
+    it("reports that elevated saves are disabled when nexus.sftp.sudo.enabled is false", async () => {
+      mockGetConfiguration.mockReturnValue({
+        get: (key: string, def: unknown) => (key === "sudo.enabled" ? false : def),
+      });
+      const markElevated = vi.fn();
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+
+      await handler(fileItem());
+
+      expect(markElevated).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("vscode.open", expect.anything());
+      expect(mockShowWarningMessage).toHaveBeenCalled();
+    });
+
+    it("does nothing when no fileSystemProvider is wired", async () => {
+      const ctx = createContext(); // fileSystemProvider left unset (optional field)
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+
+      await expect(handler(fileItem())).resolves.toBeUndefined();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("vscode.open", expect.anything());
+    });
+
+    it("ignores non-FileTreeItem and directory arguments", async () => {
+      const markElevated = vi.fn();
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+
+      await handler(undefined);
+      const dirItem = createFileTreeItem({
+        entry: { name: "subdir", isDirectory: true, isSymlink: false, size: 0, modifiedAt: 0, permissions: 0o755 },
+      });
+      await handler(dirItem);
+
+      expect(markElevated).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("vscode.open", expect.anything());
+    });
   });
 });
