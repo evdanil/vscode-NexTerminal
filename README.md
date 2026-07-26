@@ -161,6 +161,17 @@ You can also drag a tunnel profile onto a server in the Connectivity Hub to star
 
 In an SSH profile's advanced options, enable **Open File Explorer on first connection** to start SFTP automatically after normal Connect when the File Explorer is not already showing that server. Saving it checked disables it on any other SSH profile, and it does not run when that profile is used as a jump host, tunnel connection, group connect item, or script-started connection.
 
+#### Save as Root
+
+SFTP writes as the logged-in SSH user, so editing a root-owned file normally fails. If your SSH user has sudo rights on the remote host, Nexus can save it anyway:
+
+- **Reactive**: edit and save a root-owned file as usual. If the write is denied, Nexus offers to retry with `sudo`.
+- **Proactive**: right-click a file in the File Explorer and choose **Edit as Root (sudo)** to mark it editable up front — needed for files with no write bits at all (e.g. `0444`), which VS Code otherwise blocks from editing before the save is ever attempted.
+
+The file is staged to a temporary path over SFTP and then moved into place with `sudo` over an SSH exec channel. Your sudo password (only asked if the account needs one) is piped directly to that channel — it is never written to disk, VS Code's secret storage, or any log. By default you're asked every time; enable `nexus.sftp.sudo.rememberPasswordForSession` to keep it in memory for the rest of the session instead.
+
+For an existing file, the write goes through the file's own inode, so its owner, mode, ACLs, and hard links are preserved exactly. A brand-new file is created `644`. **The write is not atomic** — a disk-full condition or a dropped connection partway through can leave the target partially written with no backup, so if a save fails, keep the editor open and retry rather than closing it. Sudoers policies requiring a TTY (`requiretty`) are not supported over this path — a plain-language error explains that up front. Elevated saves can be turned off entirely with `nexus.sftp.sudo.enabled`.
+
 ### Open a profile from the command line
 
 Nexus registers a `vscode://` URI handler so you can open any saved profile — **SSH, Serial, or Local Shell** — from a terminal, a script, a browser link, or a CI job. The profile type is detected automatically from the name (or id) you give, and Nexus runs the matching connect action.
@@ -273,6 +284,8 @@ npm run package:vsix
 | `nexus.sftp.commandTimeout` | `300` | Timeout for remote SFTP commands, file transfers, and editor file open/save; upload/download use it as an inactivity timeout rather than a total duration cap |
 | `nexus.sftp.deleteDepthLimit` | `100` | Safety limit for recursive delete directory depth |
 | `nexus.sftp.deleteOperationLimit` | `10000` | Safety limit for items removed by one recursive delete |
+| `nexus.sftp.sudo.enabled` | `true` | Offer to save remote files with sudo when the SSH user lacks write permission |
+| `nexus.sftp.sudo.rememberPasswordForSession` | `false` | Keep the sudo password in memory for the session instead of prompting every save; never written to disk or secret storage |
 | `nexus.serial.rpcTimeout` | `10` | Timeout for serial sidecar commands in seconds |
 | `nexus.scripts.path` | `.nexus/scripts` | Directory where Nexus scripts live. Absolute paths are used as-is. Relative paths resolve against the workspace root when a folder is open, otherwise the extension's global storage. Pick a folder via *Nexus Settings → Scripts → Scripts Folder* |
 | `nexus.scripts.defaultTimeoutSeconds` | `30` | Default per-wait timeout in seconds for `waitFor` / `expect` / `waitAny` when not specified |
