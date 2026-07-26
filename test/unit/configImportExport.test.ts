@@ -1031,6 +1031,77 @@ describe("import chooser (nexus.config.import)", () => {
   });
 });
 
+describe("guard equivalence with main across reroutes (Finding 1)", () => {
+  let core: NexusCore;
+  let vault: MockVault;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+  });
+
+  it("Nexus Export File…'s 'Import as Host List' reroute is capped at 2 MB — a renamed oversized CSV never reaches the inventory parser", async () => {
+    const oversizedCsv = "10.0.0.1,sw1,admin\n".repeat(150_000); // ~2.85 MB, sniffs as host-list
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/hosts.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(oversizedCsv, "utf8"));
+    mockShowErrorMessage.mockResolvedValueOnce("Import as Host List");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("The list exceeds the 2 MB size limit.");
+    expect(mockShowInputBox).not.toHaveBeenCalled();
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("MobaXterm INI File…'s 'Import as SecureCRT XML' reroute is capped at 10 MB — an oversized renamed XML never reaches the XML parser", async () => {
+    const oversizedXml = `<VanDyke>${"a".repeat(11 * 1024 * 1024)}`;
+    mockShowQuickPick.mockResolvedValueOnce({ value: "mobaxterm" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/export.xml", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(oversizedXml, "utf8"));
+    mockShowErrorMessage.mockResolvedValueOnce("Import as SecureCRT XML");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("SecureCRT XML file exceeds the 10 MB size limit.");
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("the direct Host List File… route still rejects at 2 MB (unchanged)", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
+    mockStat.mockResolvedValueOnce({ type: 1, size: 2 * 1024 * 1024 + 1 });
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("The list exceeds the 2 MB size limit.");
+    expect(mockReadFile).not.toHaveBeenCalled();
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("the direct SecureCRT XML Export… route still rejects at 10 MB (unchanged)", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "securecrtXml" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/export.xml", scheme: "file" }]);
+    mockStat.mockResolvedValueOnce({ type: 1 });
+    mockReadFile.mockResolvedValueOnce(Buffer.from("a".repeat(10 * 1024 * 1024 + 1), "utf8"));
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("SecureCRT XML file exceeds the 10 MB size limit.");
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+});
+
 describe("share export command", () => {
   let core: NexusCore;
   let vault: MockVault;

@@ -1542,6 +1542,16 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
   // every cross-branch "Import as Host List" reroute — all funnel already-acquired
   // text here rather than re-running a source pick.
   async function applyInventoryText(text: string): Promise<void> {
+    // Guard here, not just upstream: this is the shared tail every route funnels
+    // into — the direct dialog's own stat-first/backstop guard, and every current
+    // and future cross-branch "Import as Host List" reroute that hands over bytes
+    // already read past a different (unguarded) dialog. A per-caller check cannot
+    // cover a reroute it doesn't know about; this one does.
+    if (Buffer.byteLength(text, "utf8") > INVENTORY_MAX_BYTES) {
+      void vscode.window.showErrorMessage("The list exceeds the 2 MB size limit.");
+      return;
+    }
+
     // No-options pass first: tells us whether the list carries its own folder
     // data and how many rows are missing a username, before deciding which of
     // the two prompts below are even necessary.
@@ -1780,8 +1790,20 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     await applyInventoryText(text);
   }
 
+  const SECURECRT_XML_MAX_BYTES = 10 * 1024 * 1024;
+
   /** Branch 4 tail: parse already-acquired XML text and apply it. */
   async function applySecureCrtXmlText(text: string): Promise<void> {
+    // Guard here, not just upstream: this is the shared tail every route funnels
+    // into — the direct dialog's own post-read guard below, and every current and
+    // future cross-branch "Import as SecureCRT XML" reroute that hands over bytes
+    // already read past a different (unguarded) dialog. A per-caller check cannot
+    // cover a reroute it doesn't know about; this one does.
+    if (Buffer.byteLength(text, "utf8") > SECURECRT_XML_MAX_BYTES) {
+      void vscode.window.showErrorMessage("SecureCRT XML file exceeds the 10 MB size limit.");
+      return;
+    }
+
     let result: ImportParseResult;
     try {
       result = parseSecureCrtXmlExport(text);
