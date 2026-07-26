@@ -20,7 +20,13 @@ const MOBAXTERM_BOOKMARKS_RE = /^[ \t]*\[Bookmarks(_\d+)?\][ \t]*\r?$/m;
  * not a false confidence.
  */
 export function sniffImportFormat(text: string): SniffedFormat {
-  const firstNonWhitespace = text.match(/\S/)?.[0];
+  // Strip a leading UTF-8 BOM once, up front, so every rule below is BOM-agnostic by
+  // construction. parseIniSections() strips the same BOM (mobaxtermParser.ts) before
+  // matching sections — without this, a BOM'd MobaXterm export sniffs as host-list
+  // (MOBAXTERM_BOOKMARKS_RE only tolerates `[ \t]*` before `[`, not U+FEFF) and
+  // importMobaxterm() aborts before the parser, which handles the BOM fine, ever runs.
+  const withoutBom = text.replace(/^\uFEFF/, "");
+  const firstNonWhitespace = withoutBom.match(/\S/)?.[0];
   // A brace is checked whether or not the JSON actually parses — a broken Nexus
   // export is still not a host list, so callers must not reroute it into one.
   if (firstNonWhitespace === "{") {
@@ -29,7 +35,7 @@ export function sniffImportFormat(text: string): SniffedFormat {
   if (firstNonWhitespace === "<") {
     return "xml";
   }
-  if (MOBAXTERM_BOOKMARKS_RE.test(text)) {
+  if (MOBAXTERM_BOOKMARKS_RE.test(withoutBom)) {
     return "mobaxterm";
   }
   return "host-list";

@@ -42,6 +42,26 @@ describe("sniffImportFormat", () => {
     expect(sniffImportFormat("  [Bookmarks]\nSubRep=\nServer=#109#0%h%22%u%%-1%\n")).toBe("mobaxterm");
   });
 
+  // Regression: parseIniSections() strips a leading UTF-8 BOM before matching sections
+  // (mobaxtermParser.ts) — a real MobaXterm export can start with one. The old sniffer's
+  // MOBAXTERM_BOOKMARKS_RE only tolerates `[ \t]*` before `[`, which does not match `﻿`,
+  // so a BOM'd export sniffed as host-list and importMobaxterm() aborted before the parser
+  // (which handles the BOM fine) ever ran.
+  it("detects mobaxterm when the file starts with a UTF-8 BOM before [Bookmarks]", () => {
+    expect(sniffImportFormat("﻿[Bookmarks]\nSubRep=\n")).toBe("mobaxterm");
+  });
+
+  // Pins the BOM-agnostic property for the other two positive rules too, since both already
+  // pass today (they key off `firstNonWhitespace` via `\s`, which matches `﻿`) — a future
+  // refactor of the leading-whitespace handling must not silently regress these.
+  it("detects nexus-json when the file starts with a UTF-8 BOM before the brace", () => {
+    expect(sniffImportFormat('﻿{"version":2}')).toBe("nexus-json");
+  });
+
+  it("detects xml when the file starts with a UTF-8 BOM before the angle bracket", () => {
+    expect(sniffImportFormat("﻿<VanDyke></VanDyke>")).toBe("xml");
+  });
+
   it("falls back to host-list for plain CSV rows", () => {
     expect(sniffImportFormat("10.0.0.1,sw1,admin\n10.0.0.2,sw2,admin\n")).toBe("host-list");
   });
