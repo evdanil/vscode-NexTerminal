@@ -9,6 +9,14 @@ const OPEN_SETTINGS = "Open Settings";
 const DISABLED_MESSAGE = "Elevated saves are disabled (nexus.sftp.sudo.enabled is off).";
 const PARTIAL_WRITE_NOTE = "The file may be partially written — keep the editor open and retry the save.";
 
+// VS Code's Save As issues two writeFile calls (create, then content) for one
+// user-visible save; the second reuses this class's elevation but, with
+// rememberPasswordForSession off (the default), had nothing to reuse for the
+// password itself and prompted a second time. 30s covers that pair (including a
+// slow /tmp staging upload before the second write even starts) without
+// resembling session-long retention.
+export const GRACE_WINDOW_MS = 30_000;
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -33,6 +41,9 @@ async function reportSudoDisabled(): Promise<void> {
  */
 export class SudoElevationBroker implements ElevationBroker {
   private readonly passwordCache = new Map<string, string>();
+  // Fixed window from the moment a password is entered, not refreshed on reuse —
+  // see GRACE_WINDOW_MS. Applies regardless of rememberPasswordForSession.
+  private readonly graceCache = new Map<string, { password: string; expiresAt: number }>();
 
   public constructor(
     private readonly sftp: SftpService,
@@ -62,35 +73,36 @@ export class SudoElevationBroker implements ElevationBroker {
     }
 
     // Authoritative place for the "remembrance off drops the cache" rule: the passwordless
-    // fast path below (probe -> "none") writes and returns without ever reaching
+    // fast path below (the optimistic attempt) writes and returns without ever reaching
     // saveWithPassword, so clearing only there (as before) left a stale password cached
-    // whenever the remote sudo timestamp was still valid. Clearing here, ahead of the probe,
-    // covers every path.
-    if (!readSudoSetting("sudo.rememberPasswordForSession", false)) {
+    // whenever the remote sudo timestamp was still valid. Clearing here, ahead of the
+    // attempt, covers every path.
+    const remember = readSudoSetting("sudo.rememberPasswordForSession", false);
+    if (!remember) {
       this.passwordCache.delete(serverId);
     }
 
+    // Skip the optimistic no-password attempt when a password is already on hand
+    // (session cache, or the grace window above): that account is already known to
+    // need one for this server, so the extra round trip just to watch sudo -n fail
+    // again buys nothing.
+    const hasUsablePassword = (remember && this.passwordCache.has(serverId)) || this.peekGracePassword(serverId) !== undefined;
+
     try {
-      const failure = await this.sftp.probeElevation(serverId);
-      if (failure.kind !== "password-required") {
-        // "none" needs no password; the other kinds (not-permitted / no-sudo /
-        // requires-tty) are not password problems — let writeFileElevated surface
-        // the same plain-language message runElevatedInstall already produces for
-        // them rather than re-deriving it here.
+      if (!hasUsablePassword) {
         try {
+          // The attempt itself is the probe: sudo -n refuses before the target is
+          // ever touched if a password is required, so this safely tests the exact
+          // install command's authorization instead of a separate `sudo -n -v`
+          // probe, which can't see command-scoped sudoers rules (Codex round 6).
           await this.sftp.writeFileElevated(serverId, remotePath, content, { createMode: knownMode });
+          this.announceSuccess(remotePath);
+          return true;
         } catch (error) {
           if (!(error instanceof SudoPasswordRequiredError)) {
             throw error;
           }
-          // The non-interactive probe said "none" (a valid cached sudo timestamp),
-          // but that timestamp lapsed in the moment before the install actually ran.
-          // Fall through to the interactive path instead of failing a save the user
-          // would just have to retry anyway.
-          return await this.saveWithPassword(serverId, remotePath, content, knownMode);
         }
-        this.announceSuccess(remotePath);
-        return true;
       }
       return await this.saveWithPassword(serverId, remotePath, content, knownMode);
     } catch (error) {
@@ -102,11 +114,25 @@ export class SudoElevationBroker implements ElevationBroker {
   /** Drops any cached sudo password for a server. Call on SSH disconnect. */
   public clearCachedPassword(serverId: string): void {
     this.passwordCache.delete(serverId);
+    this.graceCache.delete(serverId);
   }
 
   /** Clears the in-memory password cache. Call on extension deactivate. */
   public dispose(): void {
     this.passwordCache.clear();
+    this.graceCache.clear();
+  }
+
+  private peekGracePassword(serverId: string): string | undefined {
+    const entry = this.graceCache.get(serverId);
+    if (!entry) {
+      return undefined;
+    }
+    if (Date.now() > entry.expiresAt) {
+      this.graceCache.delete(serverId);
+      return undefined;
+    }
+    return entry.password;
   }
 
   private async saveWithPassword(
@@ -119,9 +145,18 @@ export class SudoElevationBroker implements ElevationBroker {
     // method is only ever reached after that clear has already run. `remember` is still
     // needed here to gate whether a successful password gets cached below.
     const remember = readSudoSetting("sudo.rememberPasswordForSession", false);
-    let password = remember ? this.passwordCache.get(serverId) ?? (await this.promptPassword(serverId)) : await this.promptPassword(serverId);
-    if (!password) {
-      return false;
+    const cached = (remember ? this.passwordCache.get(serverId) : undefined) ?? this.peekGracePassword(serverId);
+    let password: string;
+    let enteredFresh = false;
+    if (cached !== undefined) {
+      password = cached;
+    } else {
+      const entered = await this.promptPassword(serverId);
+      if (!entered) {
+        return false;
+      }
+      password = entered;
+      enteredFresh = true;
     }
 
     try {
@@ -131,10 +166,13 @@ export class SudoElevationBroker implements ElevationBroker {
         throw error;
       }
       this.passwordCache.delete(serverId);
-      password = await this.promptPassword(serverId, true);
-      if (!password) {
+      this.graceCache.delete(serverId);
+      const entered = await this.promptPassword(serverId, true);
+      if (!entered) {
         return false;
       }
+      password = entered;
+      enteredFresh = true;
       try {
         await this.sftp.writeFileElevated(serverId, remotePath, content, { password, createMode: knownMode });
       } catch (retryError) {
@@ -148,6 +186,12 @@ export class SudoElevationBroker implements ElevationBroker {
 
     if (remember) {
       this.passwordCache.set(serverId, password);
+    }
+    if (enteredFresh) {
+      // Only a freshly-typed password (re)starts the window — a cache hit above
+      // must never land here, or reuse would keep pushing the expiry out and the
+      // window would become sliding (explicitly disallowed).
+      this.graceCache.set(serverId, { password, expiresAt: Date.now() + GRACE_WINDOW_MS });
     }
     this.announceSuccess(remotePath);
     return true;

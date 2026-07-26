@@ -24,7 +24,6 @@ export function createMockSftpService(): SftpService {
     readFile: vi.fn(),
     writeFile: vi.fn(),
     writeFileElevated: vi.fn(),
-    probeElevation: vi.fn(),
     delete: vi.fn(),
     rename: vi.fn(),
     createDirectory: vi.fn(),

@@ -107,15 +107,23 @@ export function buildTempStagePath(token: string): string {
  * strips one layer of literal quoting, so without the second escape the paths would
  * reach `/bin/sh -c` unquoted (a root command-injection hole for any path containing
  * shell metacharacters, e.g. `;`).
+ *
+ * `interactive` picks the sudo auth flag: `-S` reads a password from stdin if sudo
+ * asks for one; `-n` refuses immediately instead of asking. Defaults to `true` (`-S`)
+ * so every existing caller that doesn't pass this argument keeps its prior behavior.
  */
-export function buildSudoInstallCommand(tempPath: string, targetPath: string, createMode = 0o644): string {
+export function buildSudoInstallCommand(tempPath: string, targetPath: string, createMode = 0o644, interactive = true): string {
   assertValidRemotePath(tempPath, "temp");
   assertValidRemotePath(targetPath, "target");
   const temp = shellEscape(tempPath);
   const target = shellEscape(targetPath);
   const umask = (0o666 & ~createMode).toString(8);
   const inner = `(umask ${umask}; cat < ${temp} > ${target})`;
-  return `sudo -S -p '' -- /bin/sh -c ${shellEscape(inner)}`;
+  // -S reads a password from stdin if sudo asks for one; -n refuses immediately
+  // instead of asking, which is exactly what makes the no-password attempt below
+  // safe to use as its own probe (see runElevatedInstall).
+  const authFlag = interactive ? "-S" : "-n";
+  return `sudo ${authFlag} -p '' -- /bin/sh -c ${shellEscape(inner)}`;
 }
 
 /** Defence in depth: the password should only ever travel over stdin, but a remote
@@ -146,25 +154,19 @@ export function classifySudoFailure(result: ElevatedExecResult): SudoFailure {
   return { kind: "unknown", detail: stderr.trim() };
 }
 
-/**
- * Runs `sudo -n -v` to check whether elevation is possible without prompting for a
- * password. An unrecognized non-zero exit is treated as password-required rather
- * than unknown: stderr wording varies by locale/distro, and password-required is
- * the correct retryable guess for a failing non-interactive probe.
- */
-export async function probeSudoNonInteractive(exec: ElevatedExec): Promise<SudoFailure> {
-  const result = await exec("sudo -n -v");
-  const failure = classifySudoFailure(result);
-  return failure.kind === "unknown" ? { kind: "password-required" } : failure;
-}
-
 /** Runs the sudo install, piping the password on stdin only — never in the command string or argv. */
 export async function runElevatedInstall(
   exec: ElevatedExec,
   args: { tempPath: string; targetPath: string; password?: string; createMode?: number }
 ): Promise<void> {
-  const command = buildSudoInstallCommand(args.tempPath, args.targetPath, args.createMode);
-  const stdin = args.password ? `${args.password}\n` : undefined;
+  // Whether a password was supplied IS the probe: with none, -n makes sudo refuse
+  // up front (before the target is ever touched) instead of asking, so the caller
+  // can safely attempt the install non-interactively and treat a password-required
+  // failure as "now prompt and retry" rather than needing a separate probe command
+  // (see sudoElevationBroker.saveElevated, Codex round 6 finding 2).
+  const interactive = args.password !== undefined;
+  const command = buildSudoInstallCommand(args.tempPath, args.targetPath, args.createMode, interactive);
+  const stdin = interactive ? `${args.password}\n` : undefined;
   let result: ElevatedExecResult;
   try {
     result = await exec(command, stdin);
