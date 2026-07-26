@@ -4,6 +4,7 @@ import { FolderTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { AuthProfileEditorPanel } from "../ui/authProfileEditorPanel";
 import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import { isDescendantOrSelf } from "../utils/folderPaths";
+import { naturalCompare } from "../utils/naturalCompare";
 import type { CommandContext } from "./types";
 
 async function pickAuthProfile(ctx: CommandContext): Promise<AuthProfile | undefined> {
@@ -13,10 +14,13 @@ async function pickAuthProfile(ctx: CommandContext): Promise<AuthProfile | undef
     return undefined;
   }
   const pick = await vscode.window.showQuickPick(
-    profiles.map((p) => ({
-      label: formatAuthProfileLabel(p),
-      profile: p
-    })),
+    profiles
+      .slice()
+      .sort((a, b) => naturalCompare(a.name, b.name))
+      .map((p) => ({
+        label: formatAuthProfileLabel(p),
+        profile: p
+      })),
     { title: "Select Auth Profile" }
   );
   return pick?.profile;

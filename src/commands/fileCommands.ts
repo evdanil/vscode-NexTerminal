@@ -7,6 +7,7 @@ import { ServerTreeItem } from "../ui/nexusTreeProvider";
 import { FileTreeItem } from "../ui/fileExplorerTreeProvider";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "../ui/conflictResolution";
 import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
+import { naturalCompare } from "../utils/naturalCompare";
 import type { CommandContext } from "./types";
 
 const MAX_DOWNLOAD_DEPTH = 100;
@@ -47,11 +48,14 @@ async function pickConnectedServer(ctx: CommandContext): Promise<ServerConfig | 
     return undefined;
   }
   const pick = await vscode.window.showQuickPick(
-    servers.map((s) => ({
-      label: s.name,
-      description: `${s.username}@${s.host}:${s.port}`,
-      server: s,
-    })),
+    servers
+      .slice()
+      .sort((a, b) => naturalCompare(a.name, b.name))
+      .map((s) => ({
+        label: s.name,
+        description: `${s.username}@${s.host}:${s.port}`,
+        server: s,
+      })),
     { title: "Select server to browse files" }
   );
   return pick?.server;

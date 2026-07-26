@@ -1,3 +1,5 @@
+import { naturalCompare } from "../utils/naturalCompare";
+
 export type MacroProfileKind = "server" | "serial" | "localShell" | "profile";
 
 export interface MacroProfileSourceSnapshot {
@@ -89,7 +91,7 @@ export function buildMacroProfileSelectOptions(
       ...option,
       label: displayLabel(option, (nameCounts.get(option.name.toLocaleLowerCase()) ?? 0) > 1)
     }))
-    .sort((a, b) => a.label.localeCompare(b.label));
+    .sort((a, b) => naturalCompare(a.label, b.label));
 }
 
 export function buildMacroProfileInputsFromSnapshot(snapshot: MacroProfileSourceSnapshot): MacroProfileOption[] {

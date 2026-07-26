@@ -12,6 +12,7 @@ import type { FormValues } from "../ui/formTypes";
 import { LocalShellProfileTreeItem, LocalShellSessionTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { INVALID_FOLDER_PATH_MESSAGE, normalizeOptionalFolderPath } from "../utils/folderPaths";
+import { naturalCompare } from "../utils/naturalCompare";
 import { collectGroups } from "./serverCommands";
 import type { CommandContext, LocalShellTerminalEntry } from "./types";
 
@@ -53,7 +54,7 @@ function getConfiguredVscodeTerminalProfiles(): Record<string, VscodeTerminalPro
 }
 
 export function getConfiguredVscodeTerminalProfileNames(): string[] {
-  return Array.from(getLaunchableVscodeTerminalProfiles().keys()).sort((a, b) => a.localeCompare(b));
+  return Array.from(getLaunchableVscodeTerminalProfiles().keys()).sort((a, b) => naturalCompare(a, b));
 }
 
 function readString(value: FormValues[string]): string {
@@ -458,7 +459,7 @@ async function pickLocalShellProfile(core: import("../core/nexusCore").NexusCore
   const pick = await vscode.window.showQuickPick(
     profiles
       .slice()
-      .sort((a, b) => a.name.localeCompare(b.name))
+      .sort((a, b) => naturalCompare(a.name, b.name))
       .map((profile) => ({
         label: profile.name,
         description: localShellDescription(profile),

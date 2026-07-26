@@ -25,6 +25,7 @@ import {
   INVALID_FOLDER_PATH_MESSAGE
 } from "../utils/folderPaths";
 import { formatAuthProfileLabel, formatKeyPathDisplayName, normalizeKeyPathForComparison } from "../utils/authProfileLabel";
+import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 
@@ -35,11 +36,14 @@ async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<
     return undefined;
   }
   const pick = await vscode.window.showQuickPick(
-    servers.map((server) => ({
-      label: server.name,
-      description: `${server.username}@${server.host}:${server.port}`,
-      server
-    })),
+    servers
+      .slice()
+      .sort((a, b) => naturalCompare(a.name, b.name))
+      .map((server) => ({
+        label: server.name,
+        description: `${server.username}@${server.host}:${server.port}`,
+        server
+      })),
     { title: "Select Nexus Server" }
   );
   return pick?.server;
@@ -120,7 +124,7 @@ function collectGroups(ctx: CommandContext): string[] {
       }
     }
   }
-  return [...groups].sort((a, b) => a.localeCompare(b));
+  return [...groups].sort((a, b) => naturalComparePath(a, b));
 }
 
 const VALID_AUTH_TYPES = new Set<string>(["password", "key", "agent"]);

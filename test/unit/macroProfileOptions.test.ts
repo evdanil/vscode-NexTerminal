@@ -14,6 +14,11 @@ describe("buildMacroProfileSelectOptions", () => {
       }
     ]);
   });
+
+  it("orders labels numerically instead of lexicographically", () => {
+    const labels = buildMacroProfileSelectOptions(["Profile10", "Profile2"]).map((option) => option.label);
+    expect(labels).toEqual(["Profile2", "Profile10"]);
+  });
 });
 
 describe("buildMacroProfileInputsFromSnapshot", () => {

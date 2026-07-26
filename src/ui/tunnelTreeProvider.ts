@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
 import type { TunnelProfile } from "../models/config";
 import { formatBytes } from "../utils/helpers";
+import { naturalCompare } from "../utils/naturalCompare";
 import { formatTunnelRoute } from "../utils/tunnelProfile";
 import { TUNNEL_DRAG_MIME } from "./dndMimeTypes";
 
@@ -88,7 +89,7 @@ export class TunnelTreeProvider
   public getChildren(): vscode.ProviderResult<TunnelTreeItem[]> {
     return this.snapshot.tunnels
       .slice()
-      .sort((a, b) => a.name.localeCompare(b.name))
+      .sort((a, b) => naturalCompare(a.name, b.name))
       .map((profile) => this.toTunnelItem(profile));
   }
 

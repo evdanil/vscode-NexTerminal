@@ -703,4 +703,28 @@ describe("fileCommands title bar actions", () => {
     expect(vscode.env.clipboard.writeText).not.toHaveBeenCalled();
     expect(mockShowInformationMessage).not.toHaveBeenCalled();
   });
+
+  it("offers the connected-server QuickPick in natural (numeric) name order", async () => {
+    const vscode = await import("vscode");
+    const ctx = createContext();
+    ctx.core = {
+      getSnapshot: () => ({
+        activeSessions: [{ serverId: "s10" }, { serverId: "s2" }, { serverId: "s1" }],
+        servers: [
+          { id: "s10", name: "A10", host: "h", port: 22, username: "u", authType: "password", isHidden: false },
+          { id: "s2", name: "A2", host: "h", port: 22, username: "u", authType: "password", isHidden: false },
+          { id: "s1", name: "A1", host: "h", port: 22, username: "u", authType: "password", isHidden: false }
+        ]
+      })
+    } as any;
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValueOnce(undefined);
+    registerFileCommands(ctx);
+
+    const browse = registeredCommands.get("nexus.files.browse");
+    expect(browse).toBeDefined();
+    await browse!();
+
+    const items = vi.mocked(vscode.window.showQuickPick).mock.calls[0][0] as Array<{ label: string }>;
+    expect(items.map((item) => item.label)).toEqual(["A1", "A2", "A10"]);
+  });
 });

@@ -22,6 +22,7 @@ import {
 } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { toParityCode } from "../utils/helpers";
+import { naturalCompare } from "../utils/naturalCompare";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { collectGroups } from "./serverCommands";
 import type { CommandContext, SerialTerminalEntry } from "./types";
@@ -38,7 +39,7 @@ async function pickSerialProfile(
   const pick = await vscode.window.showQuickPick(
     profiles
       .slice()
-      .sort((a, b) => a.name.localeCompare(b.name))
+      .sort((a, b) => naturalCompare(a.name, b.name))
       .map((profile) => ({
         label: profile.name,
         description: `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`,
@@ -164,7 +165,7 @@ async function promptSmartSerialPortChoice(
   type Item = vscode.QuickPickItem & { port?: SerialPortInfo; wait?: boolean };
   const items: Item[] = [];
 
-  const sortedHints = [...input.hintMatches].sort((a, b) => a.path.localeCompare(b.path));
+  const sortedHints = [...input.hintMatches].sort((a, b) => naturalCompare(a.path, b.path));
   for (const port of sortedHints) {
     items.push({
       label: `$(plug) ${port.path}`,
@@ -174,7 +175,7 @@ async function promptSmartSerialPortChoice(
     });
   }
 
-  const sortedOthers = [...input.otherCandidates].sort((a, b) => a.path.localeCompare(b.path));
+  const sortedOthers = [...input.otherCandidates].sort((a, b) => naturalCompare(a.path, b.path));
   for (const port of sortedOthers) {
     const detail = input.hasHint
       ? "New device — does not match saved device"
