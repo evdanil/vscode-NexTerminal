@@ -554,11 +554,11 @@ describe("package contributions", () => {
       expect(entry?.when).toBe("view == nexusFileExplorer && viewItem == nexus.fileExplorer.file");
     });
 
-    it("hides the command from the command palette (requires a tree item)", () => {
+    it("enables the command from the command palette only when a nexterm:// file is the active editor (P6a)", () => {
       const paletteItems = packageJson.contributes.menus.commandPalette ?? [];
       const entry = paletteItems.find((m) => m.command === "nexus.files.editAsRoot");
       expect(entry).toBeDefined();
-      expect(entry?.when).toBe("false");
+      expect(entry?.when).toBe("resourceScheme == nexterm");
     });
 
     it("contributes the two nexus.sftp.sudo.* settings with distinct order values", () => {

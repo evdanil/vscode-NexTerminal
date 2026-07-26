@@ -1748,7 +1748,7 @@
         },
         {
           "command": "nexus.files.editAsRoot",
-          "when": "false"
+          "when": "resourceScheme == nexterm"
         },
         {
           "command": "nexus.script.delete",
