@@ -239,5 +239,26 @@ describe("parseInventoryList", () => {
       expect(r.skippedCount).toBe(1);
       expect(r.issues[0].reason).toMatch(/invalid port "notaport"/);
     });
+
+    it("rejects a bracketed IPv6 literal with an out-of-range port suffix instead of silently defaulting the port (Codex round 2 finding B)", () => {
+      const r = parseInventoryList("[2001:db8::1]:70000\n", { defaultUsername: "admin" });
+      expect(r.sessions).toHaveLength(0);
+      expect(r.skippedCount).toBe(1);
+      expect(r.issues[0].reason).toMatch(/invalid port "70000"/);
+    });
+
+    it("rejects a bracketed IPv6 literal with a non-numeric port suffix instead of silently defaulting the port (Codex round 2 finding B)", () => {
+      const r = parseInventoryList("[2001:db8::1]:notaport\n", { defaultUsername: "admin" });
+      expect(r.sessions).toHaveLength(0);
+      expect(r.skippedCount).toBe(1);
+      expect(r.issues[0].reason).toMatch(/invalid port "notaport"/);
+    });
+
+    it("rejects garbage trailing a bracketed IPv6 literal's closing bracket instead of silently discarding it (Codex round 2 finding B)", () => {
+      const r = parseInventoryList("[2001:db8::1]junk\n", { defaultUsername: "admin" });
+      expect(r.sessions).toHaveLength(0);
+      expect(r.skippedCount).toBe(1);
+      expect(r.issues[0].reason).toMatch(/invalid (port|host) "junk"/);
+    });
   });
 });
