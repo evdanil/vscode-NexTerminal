@@ -4,6 +4,10 @@ import * as path from "node:path";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
 const mockChmod = vi.hoisted(() => vi.fn(async () => {}));
+// Spies on the real hasSecureCrtSessionsRoot (forwarded to its actual implementation
+// below) so Finding 6 — "don't re-validate+re-parse XML that already parsed a
+// session" — can assert the call is skipped, not just that behavior is unchanged.
+const mockHasSecureCrtSessionsRoot = vi.hoisted(() => vi.fn());
 
 // Capture registered command handlers
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
@@ -107,6 +111,15 @@ vi.mock("node:fs/promises", async () => {
   return {
     ...actual,
     chmod: mockChmod
+  };
+});
+
+vi.mock("../../src/utils/securecrtParser", async () => {
+  const actual = await vi.importActual<typeof import("../../src/utils/securecrtParser")>("../../src/utils/securecrtParser");
+  mockHasSecureCrtSessionsRoot.mockImplementation(actual.hasSecureCrtSessionsRoot);
+  return {
+    ...actual,
+    hasSecureCrtSessionsRoot: mockHasSecureCrtSessionsRoot
   };
 });
 
@@ -857,7 +870,7 @@ describe("import chooser (nexus.config.import)", () => {
     ["xml", "<VanDyke><key name=\"Sessions\"/></VanDyke>", "This is an XML file. If it came from SecureCRT, import it as a SecureCRT export.", "Import as SecureCRT XML"],
     ["mobaxterm", "[Bookmarks]\nSubRep=\n", "This looks like a MobaXterm INI file.", "Import as MobaXterm"]
   ] as const)(
-    "Host List File… contradicted by a %s signature stops with a named error and a reroute button",
+    "Host List File… contradicted by a %s signature stops with a named error, a reroute button, and a non-terminal 'Import as Host List Anyway' escape hatch (Finding 5)",
     async (_sniff, content, message, button) => {
       mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
       mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
@@ -868,9 +881,32 @@ describe("import chooser (nexus.config.import)", () => {
       const importCmd = registeredCommands.get("nexus.config.import")!;
       await importCmd();
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(message, button);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(message, button, "Import as Host List Anyway");
     }
   );
+
+  it("Host List File… contradicted by a nexus-json signature: picking 'Import as Host List Anyway' proceeds into the inventory tail with the same bytes — no second dialog (Finding 5)", async () => {
+    // A genuine host list whose first line happens to start with "{" — the sniffer
+    // mis-flags the whole file as nexus-json (first non-whitespace char), even
+    // though the file is really one bad row (that HOST_RE rejects) followed by a
+    // perfectly good one. The escape hatch must still import the good row.
+    const misflaggedHostList = "{not actually json\n10.0.0.1,sw1,admin\n";
+    mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
+    mockStat.mockResolvedValueOnce({ type: 1, size: misflaggedHostList.length });
+    mockReadFile.mockResolvedValueOnce(Buffer.from(misflaggedHostList, "utf8"));
+    mockShowErrorMessage.mockResolvedValueOnce("Import as Host List Anyway");
+    mockShowInputBox.mockResolvedValue(""); // folder prompt: skip (no folder column)
+    mockShowInformationMessage.mockResolvedValue("Import");
+    mockShowWarningMessage.mockResolvedValue(undefined); // non-awaited "N lines skipped" toast
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowOpenDialog).toHaveBeenCalledTimes(1);
+    expect(core.getSnapshot().servers).toHaveLength(1);
+    expect(core.getSnapshot().servers[0].host).toBe("10.0.0.1");
+  });
 
   it("Host List File… reroute button reuses the same bytes — no second dialog", async () => {
     const nexusJson = '{"version":2,"servers":[{"id":"a","name":"a","host":"10.0.0.1","port":22,"username":"u","authType":"password","isHidden":false}]}';
@@ -1028,6 +1064,77 @@ describe("import chooser (nexus.config.import)", () => {
       title: "Import Nexus Configuration"
     });
     expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+});
+
+describe("guard equivalence with main across reroutes (Finding 1)", () => {
+  let core: NexusCore;
+  let vault: MockVault;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+  });
+
+  it("Nexus Export File…'s 'Import as Host List' reroute is capped at 2 MB — a renamed oversized CSV never reaches the inventory parser", async () => {
+    const oversizedCsv = "10.0.0.1,sw1,admin\n".repeat(150_000); // ~2.85 MB, sniffs as host-list
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/hosts.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(oversizedCsv, "utf8"));
+    mockShowErrorMessage.mockResolvedValueOnce("Import as Host List");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("The list exceeds the 2 MB size limit.");
+    expect(mockShowInputBox).not.toHaveBeenCalled();
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("MobaXterm INI File…'s 'Import as SecureCRT XML' reroute is capped at 10 MB — an oversized renamed XML never reaches the XML parser", async () => {
+    const oversizedXml = `<VanDyke>${"a".repeat(11 * 1024 * 1024)}`;
+    mockShowQuickPick.mockResolvedValueOnce({ value: "mobaxterm" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/export.xml", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(oversizedXml, "utf8"));
+    mockShowErrorMessage.mockResolvedValueOnce("Import as SecureCRT XML");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("SecureCRT XML file exceeds the 10 MB size limit.");
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("the direct Host List File… route still rejects at 2 MB (unchanged)", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
+    mockStat.mockResolvedValueOnce({ type: 1, size: 2 * 1024 * 1024 + 1 });
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("The list exceeds the 2 MB size limit.");
+    expect(mockReadFile).not.toHaveBeenCalled();
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("the direct SecureCRT XML Export… route still rejects at 10 MB (unchanged)", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "securecrtXml" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/export.xml", scheme: "file" }]);
+    mockStat.mockResolvedValueOnce({ type: 1 });
+    mockReadFile.mockResolvedValueOnce(Buffer.from("a".repeat(10 * 1024 * 1024 + 1), "utf8"));
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("SecureCRT XML file exceeds the 10 MB size limit.");
+    expect(core.getSnapshot().servers).toHaveLength(0);
   });
 });
 
@@ -1932,10 +2039,69 @@ describe("import from SecureCRT command", () => {
     expect(core.getSnapshot().servers).toHaveLength(0);
   });
 
-  it("shows error for unsupported file extension", async () => {
+  it("does not call hasSecureCrtSessionsRoot when the parse already found a session — no redundant re-validate+re-parse (Finding 6)", async () => {
     mockShowQuickPick.mockResolvedValue({ label: "SecureCRT XML Export File (.xml)", value: "xml" });
-    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/not-securecrt.txt", scheme: "file" }]);
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/SecureCRTSessions.xml", scheme: "file" }]);
     mockStat.mockResolvedValue({ type: 1 });
+    mockReadFile.mockResolvedValue(Buffer.from(
+      `<VanDyke><key name="Sessions"><key name="Srv"><dword name="Is Session">1</dword><string name="Protocol Name">SSH2</string><string name="Hostname">srv.example.com</string></key></key></VanDyke>`,
+      "utf8"
+    ));
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    expect(core.getSnapshot().servers).toHaveLength(1);
+    expect(mockHasSecureCrtSessionsRoot).not.toHaveBeenCalled();
+  });
+
+  it("does not call hasSecureCrtSessionsRoot when the parse result is non-empty but every session was skipped (Finding 6)", async () => {
+    // Sessions root present, one non-SSH entry skipped — skippedCount > 0 already
+    // proves the root exists, so the extra validate+parse pass would be pure waste.
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="RDP">
+      <key name="Desk">
+        <dword name="Is Session">1</dword>
+        <string name="Protocol Name">RDP</string>
+        <string name="Hostname">rdp.example.com</string>
+      </key>
+    </key>
+  </key>
+</VanDyke>`;
+    mockShowQuickPick.mockResolvedValue({ label: "SecureCRT XML Export File (.xml)", value: "xml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/SecureCRTSessions.xml", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1 });
+    mockReadFile.mockResolvedValue(Buffer.from(xml, "utf8"));
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("No SSH sessions found (1 non-SSH skipped).");
+    expect(mockHasSecureCrtSessionsRoot).not.toHaveBeenCalled();
+  });
+
+  it("still calls hasSecureCrtSessionsRoot to distinguish 'not a SecureCRT export' from 'valid, fully empty export' only when the parse is fully empty (Finding 6)", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "SecureCRT XML Export File (.xml)", value: "xml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/other.xml", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1 });
+    mockReadFile.mockResolvedValue(Buffer.from(`<VanDyke><key name="Security"/></VanDyke>`, "utf8"));
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      "This XML isn't a SecureCRT export — expected a <VanDyke> document with a Sessions section. In SecureCRT, use Tools → Export Settings."
+    );
+    expect(mockHasSecureCrtSessionsRoot).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the unsupported-input error for a selected directory, not an extension check (Finding 2)", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "SecureCRT XML Export File (.xml)", value: "xml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/not-a-file", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 2 }); // Directory, not File — the only case this arm now rejects
 
     const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
     await cmd();
@@ -1944,6 +2110,43 @@ describe("import from SecureCRT command", () => {
       "Unsupported SecureCRT input. Select a SecureCRT XML export file or Sessions folder."
     );
     expect(mockReadFile).not.toHaveBeenCalled();
+  });
+
+  it("a non-XML file with non-XML content gets the content-based parse error, not the old extension gate (Finding 2)", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "SecureCRT XML Export File (.xml)", value: "xml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/not-securecrt.txt", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1 });
+    mockReadFile.mockResolvedValue(Buffer.from("just some plain text, not xml at all", "utf8"));
+
+    const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
+    await cmd();
+
+    // The file IS read now — extension is no longer the gate — and rejected on content.
+    expect(mockReadFile).toHaveBeenCalled();
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Failed to parse SecureCRT XML"));
+  });
+
+  // The exact regression the "All Files" filter (Finding 2 in the review) was added
+  // for: a user who renamed their SecureCRT export still gets to import it via the
+  // chooser's "SecureCRT XML Export…" row, instead of a dead end from an extension
+  // check that content validation (parseSecureCrtXmlExport / hasSecureCrtSessionsRoot)
+  // already makes redundant.
+  it("imports a renamed SecureCRT export whose extension isn't .xml, picked via the chooser's SecureCRT XML Export… row (Finding 2)", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "securecrtXml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/SecureCRT-export.txt", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1 });
+    mockReadFile.mockResolvedValue(Buffer.from(
+      `<VanDyke><key name="Sessions"><key name="Srv"><dword name="Is Session">1</dword><string name="Protocol Name">SSH2</string><string name="Hostname">srv.example.com</string></key></key></VanDyke>`,
+      "utf8"
+    ));
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).not.toHaveBeenCalled();
+    expect(core.getSnapshot().servers).toHaveLength(1);
+    expect(core.getSnapshot().servers[0].host).toBe("srv.example.com");
   });
 
   it("does nothing when user cancels source picker", async () => {

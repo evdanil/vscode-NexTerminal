@@ -34,6 +34,14 @@ describe("sniffImportFormat", () => {
     expect(sniffImportFormat("[Bookmarks]\r\nSubRep=\r\n")).toBe("mobaxterm");
   });
 
+  // Regression: parseIniSections() trims every line before matching (mobaxtermParser.ts),
+  // so an indented [Bookmarks] header still parses fine — but the old sniffer required
+  // `[` at column 0 and would sniff this as host-list, making importMobaxterm() reject a
+  // file the parser itself accepts with a message claiming no [Bookmarks] section exists.
+  it("detects mobaxterm when the section header is indented — the parser trims lines before matching, so the sniffer must too", () => {
+    expect(sniffImportFormat("  [Bookmarks]\nSubRep=\nServer=#109#0%h%22%u%%-1%\n")).toBe("mobaxterm");
+  });
+
   it("falls back to host-list for plain CSV rows", () => {
     expect(sniffImportFormat("10.0.0.1,sw1,admin\n10.0.0.2,sw2,admin\n")).toBe("host-list");
   });

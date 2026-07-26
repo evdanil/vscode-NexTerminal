@@ -1542,6 +1542,16 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
   // every cross-branch "Import as Host List" reroute — all funnel already-acquired
   // text here rather than re-running a source pick.
   async function applyInventoryText(text: string): Promise<void> {
+    // Guard here, not just upstream: this is the shared tail every route funnels
+    // into — the direct dialog's own stat-first/backstop guard, and every current
+    // and future cross-branch "Import as Host List" reroute that hands over bytes
+    // already read past a different (unguarded) dialog. A per-caller check cannot
+    // cover a reroute it doesn't know about; this one does.
+    if (Buffer.byteLength(text, "utf8") > INVENTORY_MAX_BYTES) {
+      void vscode.window.showErrorMessage("The list exceeds the 2 MB size limit.");
+      return;
+    }
+
     // No-options pass first: tells us whether the list carries its own folder
     // data and how many rows are missing a username, before deciding which of
     // the two prompts below are even necessary.
@@ -1712,11 +1722,13 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
   /**
    * Chooser row 2 (Host List File…): file source, then sniff — and if the content
-   * confidently indicates a different declared format, stop with a named error
-   * plus a one-click reroute into that format's own tail (same bytes, no re-pick).
-   * A generic INI or a bare host list both sniff as "host-list" and fall through
-   * to the inventory parser exactly as before; see importFormatSniffer for why
-   * that class has no positive signature of its own.
+   * confidently indicates a different declared format, stop with a named error, a
+   * one-click reroute into that format's own tail, and a second "Import as Host
+   * List Anyway" button that proceeds into the inventory tail regardless (the
+   * sniff is a heuristic, not proof — a real escape hatch beats a dead end). A
+   * generic INI or a bare host list both sniff as "host-list" and fall through to
+   * the inventory parser exactly as before; see importFormatSniffer for why that
+   * class has no positive signature of its own.
    */
   async function importHostListFile(): Promise<void> {
     const text = await acquireFileText({
@@ -1727,29 +1739,41 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     });
     if (text === undefined) return;
 
+    // Non-terminal on purpose: the sniff is a heuristic, and a genuine host list
+    // can trip it (e.g. a hostname list whose first line happens to start with
+    // "{"). "Import as Host List Anyway" proceeds into the same inventory tail
+    // with the bytes already in hand — the only other way through a false
+    // contradiction would be discovering a different command, which no user
+    // will deduce. Dismissing the toast without a choice still aborts, same as before.
     const sniff = sniffImportFormat(text);
     if (sniff === "nexus-json") {
       const choice = await vscode.window.showErrorMessage(
         "This looks like a Nexus JSON export, not a host list.",
-        "Import as Nexus Export"
+        "Import as Nexus Export",
+        "Import as Host List Anyway"
       );
       if (choice === "Import as Nexus Export") await applyNexusExportText(text);
+      else if (choice === "Import as Host List Anyway") await applyInventoryText(text);
       return;
     }
     if (sniff === "xml") {
       const choice = await vscode.window.showErrorMessage(
         "This is an XML file. If it came from SecureCRT, import it as a SecureCRT export.",
-        "Import as SecureCRT XML"
+        "Import as SecureCRT XML",
+        "Import as Host List Anyway"
       );
       if (choice === "Import as SecureCRT XML") await applySecureCrtXmlText(text);
+      else if (choice === "Import as Host List Anyway") await applyInventoryText(text);
       return;
     }
     if (sniff === "mobaxterm") {
       const choice = await vscode.window.showErrorMessage(
         "This looks like a MobaXterm INI file.",
-        "Import as MobaXterm"
+        "Import as MobaXterm",
+        "Import as Host List Anyway"
       );
       if (choice === "Import as MobaXterm") await applyMobaxtermText(text);
+      else if (choice === "Import as Host List Anyway") await applyInventoryText(text);
       return;
     }
 
@@ -1780,8 +1804,20 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     await applyInventoryText(text);
   }
 
+  const SECURECRT_XML_MAX_BYTES = 10 * 1024 * 1024;
+
   /** Branch 4 tail: parse already-acquired XML text and apply it. */
   async function applySecureCrtXmlText(text: string): Promise<void> {
+    // Guard here, not just upstream: this is the shared tail every route funnels
+    // into — the direct dialog's own post-read guard below, and every current and
+    // future cross-branch "Import as SecureCRT XML" reroute that hands over bytes
+    // already read past a different (unguarded) dialog. A per-caller check cannot
+    // cover a reroute it doesn't know about; this one does.
+    if (Buffer.byteLength(text, "utf8") > SECURECRT_XML_MAX_BYTES) {
+      void vscode.window.showErrorMessage("SecureCRT XML file exceeds the 10 MB size limit.");
+      return;
+    }
+
     let result: ImportParseResult;
     try {
       result = parseSecureCrtXmlExport(text);
@@ -1793,9 +1829,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
     // parseSecureCrtXmlExport returns the same empty shape whether the root lacks
     // a <VanDyke><key name="Sessions"> structure entirely, or has one with zero
-    // SSH entries inside it. Only the former gets this message; the latter still
-    // reaches applyImportedSessions's generic "No SSH sessions found".
-    if (!hasSecureCrtSessionsRoot(text)) {
+    // SSH entries inside it. Only call the extra validate+parse pass below when the
+    // result is fully empty (no sessions AND nothing skipped) — any non-empty
+    // result, even one that's all skipped entries, already proves the Sessions
+    // root exists, so re-checking it would just re-validate and re-parse for free.
+    if (result.sessions.length === 0 && result.skippedCount === 0 && !hasSecureCrtSessionsRoot(text)) {
       void vscode.window.showErrorMessage(
         "This XML isn't a SecureCRT export — expected a <VanDyke> document with a Sessions section. In SecureCRT, use Tools → Export Settings."
       );
@@ -1859,13 +1897,17 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       return;
     }
 
+    // Extension is not the gate here — content validation exists
+    // (parseSecureCrtXmlExport / hasSecureCrtSessionsRoot below), so a renamed
+    // export (e.g. picked via the "All Files" filter) must still import; a non-XML
+    // file gets the named content error from applySecureCrtXmlText instead.
     const isFile = (stat.type & vscode.FileType.File) === vscode.FileType.File;
-    if (!isFile || !inputUri.fsPath.toLowerCase().endsWith(".xml")) {
+    if (!isFile) {
       void vscode.window.showErrorMessage(unsupportedMsg);
       return;
     }
     const raw = await vscode.workspace.fs.readFile(inputUri);
-    if (raw.byteLength > 10 * 1024 * 1024) {
+    if (raw.byteLength > SECURECRT_XML_MAX_BYTES) {
       void vscode.window.showErrorMessage("SecureCRT XML file exceeds the 10 MB size limit.");
       return;
     }
