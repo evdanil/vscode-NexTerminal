@@ -751,6 +751,286 @@ describe("config import command (legacy)", () => {
   });
 });
 
+interface ChooserItem {
+  label: string;
+  description?: string;
+  kind?: number;
+  value?: string;
+}
+
+describe("import chooser (nexus.config.import)", () => {
+  let core: NexusCore;
+  let vault: MockVault;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+  });
+
+  function chooserItems(): ChooserItem[] {
+    return mockShowQuickPick.mock.calls[0][0] as ChooserItem[];
+  }
+
+  it("shows the documented rows, in order, under three separators, with the right descriptions", async () => {
+    mockShowQuickPick.mockResolvedValue(undefined);
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowQuickPick).toHaveBeenCalledWith(expect.any(Array), {
+      title: "Import",
+      placeHolder: "What are you importing?"
+    });
+
+    const items = chooserItems();
+    expect(items.map((i) => i.label)).toEqual([
+      "add servers in bulk",
+      "$(clippy) Paste Host List from Clipboard",
+      "$(list-flat) Host List File…",
+      "migrate from another client",
+      "$(file-code) MobaXterm INI File…",
+      "$(file-code) SecureCRT XML Export…",
+      "$(folder-opened) SecureCRT Sessions Folder…",
+      "nexus",
+      "$(json) Nexus Export File…"
+    ]);
+
+    const byLabel = (fragment: string) => items.find((i) => i.label.includes(fragment));
+    expect(byLabel("Paste Host List")?.description).toBe("Hostnames or CSV rows copied from a spreadsheet");
+    expect(byLabel("Host List File")?.description).toBe(".csv, .tsv, or .txt — one device per line");
+    expect(byLabel("MobaXterm INI")?.description).toBe("Sessions from a MobaXterm .ini bookmarks export");
+    expect(byLabel("SecureCRT XML")?.description).toBe("Created in SecureCRT via Tools → Export Settings");
+    expect(byLabel("SecureCRT Sessions Folder")?.description).toBe("SecureCRT's Config/Sessions directory");
+    expect(byLabel("Nexus Export File")?.description).toBe("An encrypted backup or a shared config (.json)");
+  });
+
+  it("does nothing when the chooser is canceled", async () => {
+    mockShowQuickPick.mockResolvedValue(undefined);
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowOpenDialog).not.toHaveBeenCalled();
+    expect(mockClipboardReadText).not.toHaveBeenCalled();
+  });
+
+  it("Paste Host List from Clipboard skips the internal clipboard-vs-file pick entirely", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "clipboard" });
+    mockClipboardReadText.mockResolvedValue("10.0.0.1,sw1,admin\n");
+    mockShowInputBox.mockResolvedValue(""); // folder prompt: skip (no folder column)
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockClipboardReadText).toHaveBeenCalled();
+    expect(mockShowQuickPick).toHaveBeenCalledTimes(1); // only the chooser itself
+    expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+
+  it("Host List File… opens a dialog titled 'Import Host List' with a Host Lists filter, and a clean list imports normally", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1, size: 20 });
+    mockReadFile.mockResolvedValue(Buffer.from("10.0.0.1,sw1,admin\n", "utf8"));
+    mockShowInputBox.mockResolvedValue(""); // folder prompt: skip (no folder column)
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowOpenDialog).toHaveBeenCalledWith({
+      canSelectFiles: true,
+      canSelectMany: false,
+      filters: { "Host Lists": ["csv", "tsv", "txt"], "All Files": ["*"] },
+      title: "Import Host List"
+    });
+    expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+
+  it.each([
+    ["nexus-json", '{"version":2,"servers":[]}', "This looks like a Nexus JSON export, not a host list.", "Import as Nexus Export"],
+    ["xml", "<VanDyke><key name=\"Sessions\"/></VanDyke>", "This is an XML file. If it came from SecureCRT, import it as a SecureCRT export.", "Import as SecureCRT XML"],
+    ["mobaxterm", "[Bookmarks]\nSubRep=\n", "This looks like a MobaXterm INI file.", "Import as MobaXterm"]
+  ] as const)(
+    "Host List File… contradicted by a %s signature stops with a named error and a reroute button",
+    async (_sniff, content, message, button) => {
+      mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
+      mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
+      mockStat.mockResolvedValue({ type: 1, size: content.length });
+      mockReadFile.mockResolvedValue(Buffer.from(content, "utf8"));
+      mockShowErrorMessage.mockResolvedValue(undefined);
+
+      const importCmd = registeredCommands.get("nexus.config.import")!;
+      await importCmd();
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(message, button);
+    }
+  );
+
+  it("Host List File… reroute button reuses the same bytes — no second dialog", async () => {
+    const nexusJson = '{"version":2,"servers":[{"id":"a","name":"a","host":"10.0.0.1","port":22,"username":"u","authType":"password","isHidden":false}]}';
+    mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1, size: nexusJson.length });
+    mockReadFile.mockResolvedValue(Buffer.from(nexusJson, "utf8"));
+    mockShowErrorMessage.mockResolvedValueOnce("Import as Nexus Export");
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" }); // Import Mode pick
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowOpenDialog).toHaveBeenCalledTimes(1);
+    expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+
+  it("MobaXterm INI File… opens the dialog with an All Files fallback filter", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "mobaxterm" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/moba.ini", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from("[Bookmarks]\nSubRep=\nServer=#109#0%host.test%22%user%%-1%\n", "utf8"));
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowOpenDialog).toHaveBeenCalledWith({
+      canSelectFiles: true,
+      canSelectMany: false,
+      filters: { "MobaXterm INI Files": ["ini"], "All Files": ["*"] },
+      title: "Import from MobaXterm"
+    });
+    expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+
+  it.each([
+    ["nexus-json", '{"version":2}', "Import as Nexus Export"],
+    ["xml", "<foo/>", "Import as SecureCRT XML"]
+  ] as const)(
+    "MobaXterm INI File… with no [Bookmarks] section and a %s signature offers a reroute",
+    async (_sniff, content, button) => {
+      mockShowQuickPick.mockResolvedValueOnce({ value: "mobaxterm" });
+      mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/moba.ini", scheme: "file" }]);
+      mockReadFile.mockResolvedValue(Buffer.from(content, "utf8"));
+      mockShowErrorMessage.mockResolvedValue(undefined);
+
+      const importCmd = registeredCommands.get("nexus.config.import")!;
+      await importCmd();
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        "This doesn't look like a MobaXterm sessions file — no [Bookmarks] section found.",
+        button
+      );
+    }
+  );
+
+  it("MobaXterm INI File… with no [Bookmarks] section and no other signature gets the plain error, no button", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "mobaxterm" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/moba.ini", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from("just a hostname\n", "utf8"));
+    mockShowErrorMessage.mockResolvedValue(undefined);
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      "This doesn't look like a MobaXterm sessions file — no [Bookmarks] section found."
+    );
+    expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
+    expect(mockShowErrorMessage.mock.calls[0]).toHaveLength(1); // no button argument
+  });
+
+  it("SecureCRT XML Export… opens the file dialog directly, without the .securecrt deep link's own source pick", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "securecrtXml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/SecureCRTSessions.xml", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1 });
+    mockReadFile.mockResolvedValue(Buffer.from(
+      `<VanDyke><key name="Sessions"><key name="Srv"><dword name="Is Session">1</dword><string name="Protocol Name">SSH2</string><string name="Hostname">srv.example.com</string></key></key></VanDyke>`,
+      "utf8"
+    ));
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowQuickPick).toHaveBeenCalledTimes(1); // only the chooser — no "SecureCRT Import Source" prompt
+    expect(mockShowOpenDialog).toHaveBeenCalledWith(
+      expect.objectContaining({ canSelectFiles: true, canSelectFolders: false, title: "Select SecureCRT XML Export File" })
+    );
+    expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+
+  it("SecureCRT XML Export… names a document that isn't a SecureCRT export at all, distinct from a valid-but-empty one", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "securecrtXml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/other.xml", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1 });
+    mockReadFile.mockResolvedValue(Buffer.from(`<VanDyke><key name="Security"/></VanDyke>`, "utf8"));
+    mockShowErrorMessage.mockResolvedValue(undefined);
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      "This XML isn't a SecureCRT export — expected a <VanDyke> document with a Sessions section. In SecureCRT, use Tools → Export Settings."
+    );
+  });
+
+  it("SecureCRT Sessions Folder… opens the folder dialog directly, without the .securecrt deep link's own source pick", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "securecrtFolder" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/Sessions", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 2 });
+    mockReadDirectory.mockResolvedValue([["Srv.ini", 1]]);
+    mockReadFile.mockResolvedValue(Buffer.from(`S:"Protocol Name"=SSH2\nS:"Hostname"=srv.example.com`, "utf8"));
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowQuickPick).toHaveBeenCalledTimes(1); // only the chooser
+    expect(mockShowOpenDialog).toHaveBeenCalledWith(
+      expect.objectContaining({ canSelectFiles: false, canSelectFolders: true, title: "Select SecureCRT Sessions Folder" })
+    );
+    expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+
+  it("SecureCRT Sessions Folder… with zero .ini files names the expected Windows path instead of a generic 'no sessions' warning", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "securecrtFolder" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/NotSessions", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 2 });
+    mockReadDirectory.mockResolvedValue([["readme.txt", 1]]);
+    mockShowErrorMessage.mockResolvedValue(undefined);
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      "No .ini session files found under this folder. Select SecureCRT's Sessions directory (on Windows usually %APPDATA%\\VanDyke\\Config\\Sessions)."
+    );
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("Nexus Export File… opens the same JSON dialog the legacy direct command used", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/config.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(makeExportData()), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" });
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowOpenDialog).toHaveBeenCalledWith({
+      canSelectFiles: true,
+      canSelectMany: false,
+      filters: { "JSON Files": ["json"] },
+      title: "Import Nexus Configuration"
+    });
+    expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+});
+
 describe("share export command", () => {
   let core: NexusCore;
   let vault: MockVault;
