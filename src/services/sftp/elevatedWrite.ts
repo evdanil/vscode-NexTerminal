@@ -80,27 +80,30 @@ export function buildTempStagePath(token: string): string {
  * inode to preserve, so it is chmod'd to `createMode` afterward (the mode last
  * observed for this path, or 644 when none is known — see writeFileElevated).
  *
- * The inner `cat` script is escaped once for its own path arguments, then the whole
- * inner script is escaped again as a single argument to `/bin/sh -c`. This second
- * pass is required because `SshConnection.exec` sends this whole string through the
- * remote login shell exactly once before `/bin/sh -c` ever sees it — that outer
- * parse strips one layer of literal quoting, so without the second escape the paths
- * would reach `/bin/sh -c` unquoted (a root command-injection hole for any path
- * containing shell metacharacters, e.g. `;`).
+ * Existence is decided with `[ -e target ]` INSIDE this shell script, not by a
+ * boolean the caller resolved earlier over SFTP: a stat done ahead of the (possibly
+ * slow) staging upload leaves a window where the target can be deleted or rotated
+ * before the install runs, so an earlier "exists" would take the no-chmod branch and
+ * hand the file root's umask-derived mode instead of the caller's intended one. `[
+ * -e ]` follows symlinks the same way `stat` does, so a dangling-symlink target is
+ * still resolved consistently with the plain (non-elevated) write path.
+ *
+ * The inner script is escaped once for its own path arguments, then the whole inner
+ * script is escaped again as a single argument to `/bin/sh -c`. This second pass is
+ * required because `SshConnection.exec` sends this whole string through the remote
+ * login shell exactly once before `/bin/sh -c` ever sees it — that outer parse
+ * strips one layer of literal quoting, so without the second escape the paths would
+ * reach `/bin/sh -c` unquoted (a root command-injection hole for any path containing
+ * shell metacharacters, e.g. `;`).
  */
-export function buildSudoInstallCommand(
-  tempPath: string,
-  targetPath: string,
-  targetExists: boolean,
-  createMode = 0o644
-): string {
+export function buildSudoInstallCommand(tempPath: string, targetPath: string, createMode = 0o644): string {
   assertValidRemotePath(tempPath, "temp");
   assertValidRemotePath(targetPath, "target");
   const temp = shellEscape(tempPath);
   const target = shellEscape(targetPath);
-  const inner = targetExists
-    ? `cat < ${temp} > ${target}`
-    : `cat < ${temp} > ${target} && chmod ${createMode.toString(8)} ${target}`;
+  const inner =
+    `if [ -e ${target} ]; then cat < ${temp} > ${target}; ` +
+    `else cat < ${temp} > ${target} && chmod ${createMode.toString(8)} ${target}; fi`;
   return `sudo -S -p '' -- /bin/sh -c ${shellEscape(inner)}`;
 }
 
@@ -147,9 +150,9 @@ export async function probeSudoNonInteractive(exec: ElevatedExec): Promise<SudoF
 /** Runs the sudo install, piping the password on stdin only — never in the command string or argv. */
 export async function runElevatedInstall(
   exec: ElevatedExec,
-  args: { tempPath: string; targetPath: string; targetExists: boolean; password?: string; createMode?: number }
+  args: { tempPath: string; targetPath: string; password?: string; createMode?: number }
 ): Promise<void> {
-  const command = buildSudoInstallCommand(args.tempPath, args.targetPath, args.targetExists, args.createMode);
+  const command = buildSudoInstallCommand(args.tempPath, args.targetPath, args.createMode);
   const stdin = args.password ? `${args.password}\n` : undefined;
   let result: ElevatedExecResult;
   try {

@@ -195,4 +195,49 @@ describe("parseInventoryList", () => {
     expect(r.sessions).toHaveLength(0);
     expect(r.issues[0].reason).toMatch(/invalid folder/);
   });
+
+  describe("host:port shorthand edge cases (Codex finding 3)", () => {
+    it("parses a plain hostname with no colon at all", () => {
+      const r = parseInventoryList("router.example.com\n", { defaultUsername: "admin" });
+      expect(r.sessions[0]).toMatchObject({ host: "router.example.com", port: 22 });
+    });
+
+    it("parses host:port shorthand", () => {
+      const r = parseInventoryList("router.example.com:2022\n", { defaultUsername: "admin" });
+      expect(r.sessions[0]).toMatchObject({ host: "router.example.com", port: 2022 });
+      expect(r.issues).toHaveLength(0);
+    });
+
+    it("parses a bracketed IPv6 literal with a port", () => {
+      const r = parseInventoryList("[2001:db8::1]:2022\n", { defaultUsername: "admin" });
+      expect(r.sessions[0]).toMatchObject({ host: "[2001:db8::1]", port: 2022 });
+      expect(r.issues).toHaveLength(0);
+    });
+
+    it("parses a bracketed IPv6 literal with no port, defaulting the port", () => {
+      const r = parseInventoryList("[2001:db8::1]\n", { defaultUsername: "admin" });
+      expect(r.sessions[0]).toMatchObject({ host: "[2001:db8::1]", port: 22 });
+      expect(r.issues).toHaveLength(0);
+    });
+
+    it("parses a bare unbracketed IPv6 literal as a host with the default port", () => {
+      const r = parseInventoryList("2001:db8::1\n", { defaultUsername: "admin" });
+      expect(r.sessions[0]).toMatchObject({ host: "2001:db8::1", port: 22 });
+      expect(r.issues).toHaveLength(0);
+    });
+
+    it("rejects a host:port shorthand with an out-of-range port instead of folding it into the hostname", () => {
+      const r = parseInventoryList("router.example.com:70000\n", { defaultUsername: "admin" });
+      expect(r.sessions).toHaveLength(0);
+      expect(r.skippedCount).toBe(1);
+      expect(r.issues[0].reason).toMatch(/invalid port "70000"/);
+    });
+
+    it("rejects a host:port shorthand with a non-numeric port instead of folding it into the hostname", () => {
+      const r = parseInventoryList("router.example.com:notaport\n", { defaultUsername: "admin" });
+      expect(r.sessions).toHaveLength(0);
+      expect(r.skippedCount).toBe(1);
+      expect(r.issues[0].reason).toMatch(/invalid port "notaport"/);
+    });
+  });
 });

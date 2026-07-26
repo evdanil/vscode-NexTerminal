@@ -397,10 +397,12 @@ export class SftpService {
   /**
    * Writes content to a root-owned (or otherwise permission-denied) remote file by
    * staging it to a user-writable /tmp path over SFTP, then moving it into place with
-   * sudo over an SSH exec channel. `targetExists` is resolved via `stat` (not `lstat`):
-   * a dangling symlink must be followed the same way the plain write would follow it,
-   * otherwise the chmod-on-create branch is skipped and the symlink target is created
-   * under root's umask instead of the intended mode.
+   * sudo over an SSH exec channel. Whether the target already exists is decided by
+   * `buildSudoInstallCommand`'s own `[ -e ]` check inside the sudo shell at install
+   * time — deliberately NOT resolved here via an up-front `stat`: this staging upload
+   * can be slow, and a stat done before it started would leave a window where the
+   * target is deleted or log-rotated before the install runs, so a chmod that should
+   * apply (because the shell would now find the target gone) silently wouldn't.
    *
    * If the target has vanished since it was last read (log rotation, a concurrent
    * delete), this recreates it: `options.createMode` — the mode the caller last
@@ -415,7 +417,6 @@ export class SftpService {
   ): Promise<void> {
     const session = this.getSession(serverId);
     const tempPath = buildTempStagePath(randomUUID());
-    const targetExists = (await this.tryStat(serverId, remotePath)) !== undefined;
 
     try {
       await this.writeFileWithTimeout(
@@ -433,7 +434,6 @@ export class SftpService {
       await runElevatedInstall(this.makeElevatedExec(serverId), {
         tempPath,
         targetPath: remotePath,
-        targetExists,
         password: options?.password,
         createMode: options?.createMode,
       });
