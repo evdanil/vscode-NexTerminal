@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockShowWarningMessage = vi.fn();
 const mockShowInputBox = vi.fn();
@@ -30,7 +30,7 @@ vi.mock("vscode", () => ({
   },
 }));
 
-import { SudoElevationBroker } from "../../src/services/sftp/sudoElevationBroker";
+import { SudoElevationBroker, GRACE_WINDOW_MS } from "../../src/services/sftp/sudoElevationBroker";
 import {
   ElevatedInstallFailedError,
   SudoNotPermittedError,
@@ -60,11 +60,16 @@ describe("SudoElevationBroker", () => {
   let broker: SudoElevationBroker;
 
   beforeEach(() => {
+    vi.useFakeTimers();
     vi.clearAllMocks();
     sudoEnabled = true;
     rememberPassword = false;
     sftp = createMockSftp();
     broker = new SudoElevationBroker(sftp as any, (id: string) => (id === testServer.id ? testServer : undefined));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   describe("confirmElevation", () => {
@@ -249,13 +254,14 @@ describe("SudoElevationBroker", () => {
       expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(2, "srv-1", "/etc/other", expect.any(Buffer), { password: "s3cret", createMode: undefined });
     });
 
-    it("does not cache the password when rememberPasswordForSession is false", async () => {
+    it("does not cache the password past the grace window when rememberPasswordForSession is false", async () => {
       rememberPassword = false;
       sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
       mockShowInputBox.mockResolvedValue("s3cret");
       sftp.writeFileElevated.mockResolvedValue(undefined);
 
       await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+      vi.advanceTimersByTime(GRACE_WINDOW_MS + 1);
       await broker.saveElevated("srv-1", "/etc/other", Buffer.from("y"));
 
       expect(mockShowInputBox).toHaveBeenCalledTimes(2);
@@ -358,6 +364,7 @@ describe("SudoElevationBroker", () => {
       expect(mockShowInputBox).toHaveBeenCalledTimes(1);
 
       rememberPassword = false;
+      vi.advanceTimersByTime(GRACE_WINDOW_MS + 1);
       await broker.saveElevated("srv-1", "/etc/other", Buffer.from("y"));
 
       expect(mockShowInputBox).toHaveBeenCalledTimes(2);
@@ -372,9 +379,11 @@ describe("SudoElevationBroker", () => {
       await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x")); // caches "first"
 
       rememberPassword = false;
+      vi.advanceTimersByTime(GRACE_WINDOW_MS + 1);
       await broker.saveElevated("srv-1", "/etc/a", Buffer.from("y")); // must re-prompt, must not cache "second"
 
       rememberPassword = true;
+      vi.advanceTimersByTime(GRACE_WINDOW_MS + 1);
       await broker.saveElevated("srv-1", "/etc/b", Buffer.from("z")); // cache must be empty -> re-prompt for "third"
 
       expect(mockShowInputBox).toHaveBeenCalledTimes(3);
@@ -405,6 +414,7 @@ describe("SudoElevationBroker", () => {
       expect(mockShowInputBox).toHaveBeenCalledTimes(1); // fast path itself never prompts
 
       rememberPassword = true;
+      vi.advanceTimersByTime(GRACE_WINDOW_MS + 1); // past the grace window from call 1's "first" entry
       sftp.probeElevation.mockResolvedValueOnce({ kind: "password-required" });
       mockShowInputBox.mockResolvedValueOnce("second");
       sftp.writeFileElevated.mockResolvedValueOnce(undefined);
@@ -462,6 +472,75 @@ describe("SudoElevationBroker", () => {
       await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
       broker.dispose();
       await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("grace window (Codex round 6 finding 1)", () => {
+    it("does not re-prompt for a second elevated write on the same server within the grace window, even when rememberPasswordForSession is off", async () => {
+      rememberPassword = false;
+      sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValue("s3cret");
+      sftp.writeFileElevated.mockResolvedValue(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/sshd_config2", Buffer.from("create"));
+      await broker.saveElevated("srv-1", "/etc/sshd_config2", Buffer.from("content"));
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(2, "srv-1", "/etc/sshd_config2", expect.any(Buffer), { password: "s3cret", createMode: undefined });
+    });
+
+    it("prompts again for an elevated write more than the grace window after the previous one", async () => {
+      rememberPassword = false;
+      sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValue("s3cret");
+      sftp.writeFileElevated.mockResolvedValue(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+      vi.advanceTimersByTime(GRACE_WINDOW_MS + 1);
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("y"));
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not extend the window on reuse — it is fixed from entry time, not sliding", async () => {
+      rememberPassword = false;
+      sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValue("s3cret");
+      sftp.writeFileElevated.mockResolvedValue(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x")); // t=0, prompts, window opens
+      vi.advanceTimersByTime(GRACE_WINDOW_MS - 10_000);
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("y")); // reuses; must NOT push expiry out
+      vi.advanceTimersByTime(11_000); // now well past the ORIGINAL window if it weren't extended
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("z"));
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(2); // 1 initial + 1 re-prompt after true expiry
+    });
+
+    it("clears the grace entry on clearCachedPassword (disconnect), forcing a re-prompt even inside the window", async () => {
+      rememberPassword = false;
+      sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValue("s3cret");
+      sftp.writeFileElevated.mockResolvedValue(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+      broker.clearCachedPassword("srv-1");
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("y"));
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(2);
+    });
+
+    it("clears the grace entry on dispose, forcing a re-prompt even inside the window", async () => {
+      rememberPassword = false;
+      sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValue("s3cret");
+      sftp.writeFileElevated.mockResolvedValue(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+      broker.dispose();
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("y"));
 
       expect(mockShowInputBox).toHaveBeenCalledTimes(2);
     });
