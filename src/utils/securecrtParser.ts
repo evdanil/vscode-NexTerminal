@@ -162,6 +162,21 @@ export function parseSecureCrtDirectory(files: SecureCrtFileEntry[]): ImportPars
 }
 
 /**
+ * True when the XML has SecureCRT's `<VanDyke><key name="Sessions">` root shape.
+ * parseSecureCrtXmlExport() returns the same empty result both when this shape is
+ * absent and when it's present but contains zero SSH sessions — callers that need
+ * to tell "not a SecureCRT export at all" apart from "a valid, empty one" use this.
+ */
+export function hasSecureCrtSessionsRoot(xmlText: string): boolean {
+  if (XMLValidator.validate(xmlText) !== true) {
+    return false;
+  }
+  const root = secureCrtXmlParser.parse(xmlText) as SecureCrtXmlRoot;
+  const topKeys = toArray(root.VanDyke?.key);
+  return topKeys.some((node) => node["@_name"] === "Sessions");
+}
+
+/**
  * Parse a SecureCRT XML export (`SecureCRTSessions.xml`).
  *
  * Traverses `<key name="Sessions">` recursively and imports entries where:

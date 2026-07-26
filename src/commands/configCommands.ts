@@ -22,9 +22,11 @@ import { defaultSshDir } from "../services/ssh/deploySshKey";
 import {
   parseSecureCrtDirectory,
   parseSecureCrtXmlExport,
+  hasSecureCrtSessionsRoot,
   type ImportParseResult,
   type SecureCrtFileEntry
 } from "../utils/securecrtParser";
+import { sniffImportFormat, type SniffedFormat } from "../utils/importFormatSniffer";
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateLocalShellProfile } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import { getMacros, saveMacros, getActiveMacroStore } from "../macroSettings";
@@ -929,39 +931,23 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     void vscode.window.showInformationMessage(`${base}${suffix}.`);
   }
 
-  // nexus.config.import only accepts Nexus's own JSON export format. A CSV or plain
-  // host list (by far the most common thing people try to feed it) fails here with
-  // no pointer onward — offer the bulk inventory importer instead of a dead end.
-  async function offerInventoryImportFallback(): Promise<void> {
-    const choice = await vscode.window.showErrorMessage(
-      "That file isn't a Nexus JSON export. For a CSV or plain host list, use Import Servers from List.",
-      "Import Servers from List"
-    );
-    if (choice === "Import Servers from List") {
-      void importInventory();
-    }
-  }
-
-  async function importConfig(): Promise<void> {
-    const uris = await vscode.window.showOpenDialog({
-      canSelectFiles: true,
-      canSelectMany: false,
-      filters: { "JSON Files": ["json"] },
-      title: "Import Nexus Configuration"
-    });
-    if (!uris || uris.length === 0) return;
-
-    const raw = await vscode.workspace.fs.readFile(uris[0]);
+  /**
+   * Branch 6 tail (Nexus Export File…): parse already-acquired text as a Nexus
+   * export and apply it. Shared by the direct dialog flow below and by every
+   * cross-branch reroute that lands here with bytes it already read — never a
+   * fresh file dialog, so a wrong-format detour is always exactly one click.
+   */
+  async function applyNexusExportText(text: string): Promise<void> {
     let data: unknown;
+    let parseError = false;
     try {
-      data = JSON.parse(Buffer.from(raw).toString("utf8"));
+      data = JSON.parse(text);
     } catch {
-      await offerInventoryImportFallback();
-      return;
+      parseError = true;
     }
 
-    if (!isValidExport(data)) {
-      await offerInventoryImportFallback();
+    if (parseError || !isValidExport(data)) {
+      await reportNexusExportFormatMismatch(text, parseError);
       return;
     }
 
@@ -1007,6 +993,71 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     }
 
     await importMergeReplace(data, mode.value, decryptedSecrets);
+  }
+
+  /**
+   * Branch 6's "declared Nexus export but the content disagrees" fallback. Same
+   * contract as every other branch: the sniffer only ever contradicts — a
+   * confidently different signature gets a one-click reroute using the same
+   * bytes, never a fresh dialog. Syntactically broken text that still starts
+   * with "{" is named as broken rather than offered a host-list reroute it
+   * cannot be (see importFormatSniffer's own "still not a host list" rule).
+   */
+  async function reportNexusExportFormatMismatch(text: string, isMalformedJson: boolean): Promise<void> {
+    const sniff = sniffImportFormat(text);
+
+    if (sniff === "host-list") {
+      const choice = await vscode.window.showErrorMessage(
+        "That file isn't a Nexus JSON export.",
+        "Import as Host List"
+      );
+      if (choice === "Import as Host List") await applyInventoryText(text);
+      return;
+    }
+    if (sniff === "mobaxterm") {
+      const choice = await vscode.window.showErrorMessage(
+        "That file isn't a Nexus export — it looks like a MobaXterm INI.",
+        "Import as MobaXterm"
+      );
+      if (choice === "Import as MobaXterm") await applyMobaxtermText(text);
+      return;
+    }
+    if (sniff === "xml") {
+      const choice = await vscode.window.showErrorMessage(
+        "This is an XML file. If it came from SecureCRT, import it as a SecureCRT export.",
+        "Import as SecureCRT XML"
+      );
+      if (choice === "Import as SecureCRT XML") await applySecureCrtXmlText(text);
+      return;
+    }
+
+    // sniff === "nexus-json": starts with "{" but either didn't parse at all, or
+    // parsed to JSON that isn't shaped like an export. These get different
+    // wording — claiming "this is valid JSON" about text that failed JSON.parse
+    // would be false.
+    if (isMalformedJson) {
+      void vscode.window.showErrorMessage(
+        "This looks like a Nexus export, but the file could not be parsed as JSON."
+      );
+      return;
+    }
+    void vscode.window.showErrorMessage(
+      "This is valid JSON, but not a Nexus export — expected a version field and at least one profile list (servers, tunnels, …)."
+    );
+  }
+
+  /** Branch 6 (Nexus Export File…): the dialog + read wrapper around applyNexusExportText. */
+  async function importNexusExport(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectMany: false,
+      filters: { "JSON Files": ["json"] },
+      title: "Import Nexus Configuration"
+    });
+    if (!uris || uris.length === 0) return;
+
+    const raw = await vscode.workspace.fs.readFile(uris[0]);
+    await applyNexusExportText(Buffer.from(raw).toString("utf8"));
   }
 
   async function importShareData(data: NexusConfigExport): Promise<void> {
@@ -1393,20 +1444,53 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     );
   }
 
+  /** Branch 3 tail: no dialog left to run, just parse-and-apply already-acquired text. */
+  async function applyMobaxtermText(text: string): Promise<void> {
+    const result = parseMobaxtermSessions(text);
+    await applyImportedSessions(result, "MobaXterm", "file");
+  }
+
+  /**
+   * Branch 3's "declared MobaXterm but no [Bookmarks] section" fallback. Same
+   * contract as every other branch: a confidently different signature gets a
+   * one-click reroute with the same bytes; anything else (including a merely
+   * malformed Bookmarks file) gets the plain error with no button to press.
+   */
+  async function reportMobaxtermFormatMismatch(text: string, sniff: SniffedFormat): Promise<void> {
+    const message = "This doesn't look like a MobaXterm sessions file — no [Bookmarks] section found.";
+    if (sniff === "nexus-json") {
+      const choice = await vscode.window.showErrorMessage(message, "Import as Nexus Export");
+      if (choice === "Import as Nexus Export") await applyNexusExportText(text);
+      return;
+    }
+    if (sniff === "xml") {
+      const choice = await vscode.window.showErrorMessage(message, "Import as SecureCRT XML");
+      if (choice === "Import as SecureCRT XML") await applySecureCrtXmlText(text);
+      return;
+    }
+    // host-list (the everything-else class): no other signature to reroute to.
+    void vscode.window.showErrorMessage(message);
+  }
+
   async function importMobaxterm(): Promise<void> {
     const uris = await vscode.window.showOpenDialog({
       canSelectFiles: true,
       canSelectMany: false,
-      filters: { "MobaXterm INI Files": ["ini"] },
+      filters: { "MobaXterm INI Files": ["ini"], "All Files": ["*"] },
       title: "Import from MobaXterm"
     });
     if (!uris || uris.length === 0) return;
 
     const raw = await vscode.workspace.fs.readFile(uris[0]);
     const text = Buffer.from(raw).toString("utf8");
-    const result = parseMobaxtermSessions(text);
 
-    await applyImportedSessions(result, "MobaXterm", "file");
+    const sniff = sniffImportFormat(text);
+    if (sniff !== "mobaxterm") {
+      await reportMobaxtermFormatMismatch(text, sniff);
+      return;
+    }
+
+    await applyMobaxtermText(text);
   }
 
   const INVENTORY_MAX_BYTES = 2 * 1024 * 1024;
@@ -1417,55 +1501,47 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     await vscode.window.showTextDocument(doc, { preview: true });
   }
 
+  /** Branch 1 / .inventory clipboard source: empty-clipboard warning + 2 MB backstop. */
+  async function acquireClipboardText(): Promise<string | undefined> {
+    const text = (await vscode.env.clipboard.readText()) ?? "";
+    if (!text.trim()) {
+      void vscode.window.showWarningMessage("Clipboard is empty.");
+      return undefined;
+    }
+    // Backstop for the clipboard path, which has no URI to stat ahead of time.
+    if (Buffer.byteLength(text, "utf8") > INVENTORY_MAX_BYTES) {
+      void vscode.window.showErrorMessage("The list exceeds the 2 MB size limit.");
+      return undefined;
+    }
+    return text;
+  }
+
+  /** Branch 2 / .inventory file source: stat-first 2 MB guard, then read. */
+  async function acquireFileText(dialogOptions: vscode.OpenDialogOptions): Promise<string | undefined> {
+    const uris = await vscode.window.showOpenDialog(dialogOptions);
+    if (!uris || uris.length === 0) return undefined;
+
+    // Stat before reading: rejects an over-limit file (an accidental large
+    // selection, or a file on a remote/virtual filesystem) without loading it
+    // — and the Buffer/string copies decoding it would take — into memory.
+    const stat = await vscode.workspace.fs.stat(uris[0]);
+    if (stat.size > INVENTORY_MAX_BYTES) {
+      void vscode.window.showErrorMessage("The list exceeds the 2 MB size limit.");
+      return undefined;
+    }
+
+    const raw = await vscode.workspace.fs.readFile(uris[0]);
+    return Buffer.from(raw).toString("utf8");
+  }
+
   // Bespoke tail for the inventory importer — deliberately not funneled through
   // applyImportedSessions. It needs a single confirm modal (detail breakdown,
   // dedupe-aware wording, a "Show Skipped Lines" escape hatch) and a batched,
   // progress-reported apply step that the MobaXterm/SecureCRT tail has no need for.
-  async function importInventory(): Promise<void> {
-    const sourcePick = await vscode.window.showQuickPick(
-      [
-        { label: "Paste from Clipboard", value: "clipboard" as const },
-        { label: "Choose File…", value: "file" as const }
-      ],
-      { title: "Import Servers from List" }
-    );
-    if (!sourcePick) return;
-
-    let text: string;
-    if (sourcePick.value === "clipboard") {
-      text = (await vscode.env.clipboard.readText()) ?? "";
-      if (!text.trim()) {
-        void vscode.window.showWarningMessage("Clipboard is empty.");
-        return;
-      }
-    } else {
-      const uris = await vscode.window.showOpenDialog({
-        canSelectFiles: true,
-        canSelectMany: false,
-        filters: { "Inventory Lists": ["csv", "txt", "tsv"], "All Files": ["*"] },
-        title: "Import Servers from List"
-      });
-      if (!uris || uris.length === 0) return;
-
-      // Stat before reading: rejects an over-limit file (an accidental large
-      // selection, or a file on a remote/virtual filesystem) without loading it
-      // — and the Buffer/string copies decoding it would take — into memory.
-      const stat = await vscode.workspace.fs.stat(uris[0]);
-      if (stat.size > INVENTORY_MAX_BYTES) {
-        void vscode.window.showErrorMessage("The list exceeds the 2 MB size limit.");
-        return;
-      }
-
-      const raw = await vscode.workspace.fs.readFile(uris[0]);
-      text = Buffer.from(raw).toString("utf8");
-    }
-
-    // Backstop for the clipboard path, which has no URI to stat ahead of time.
-    if (Buffer.byteLength(text, "utf8") > INVENTORY_MAX_BYTES) {
-      void vscode.window.showErrorMessage("The list exceeds the 2 MB size limit.");
-      return;
-    }
-
+  // Shared by the chooser's clipboard/file branches, the .inventory deep link, and
+  // every cross-branch "Import as Host List" reroute — all funnel already-acquired
+  // text here rather than re-running a source pick.
+  async function applyInventoryText(text: string): Promise<void> {
     // No-options pass first: tells us whether the list carries its own folder
     // data and how many rows are missing a username, before deciding which of
     // the two prompts below are even necessary.
@@ -1627,32 +1703,124 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     }
   }
 
-  async function importSecureCrt(): Promise<void> {
+  /** Chooser row 1 (Paste Host List from Clipboard): clipboard source, straight into the tail. */
+  async function importHostListFromClipboard(): Promise<void> {
+    const text = await acquireClipboardText();
+    if (text === undefined) return;
+    await applyInventoryText(text);
+  }
+
+  /**
+   * Chooser row 2 (Host List File…): file source, then sniff — and if the content
+   * confidently indicates a different declared format, stop with a named error
+   * plus a one-click reroute into that format's own tail (same bytes, no re-pick).
+   * A generic INI or a bare host list both sniff as "host-list" and fall through
+   * to the inventory parser exactly as before; see importFormatSniffer for why
+   * that class has no positive signature of its own.
+   */
+  async function importHostListFile(): Promise<void> {
+    const text = await acquireFileText({
+      canSelectFiles: true,
+      canSelectMany: false,
+      filters: { "Host Lists": ["csv", "tsv", "txt"], "All Files": ["*"] },
+      title: "Import Host List"
+    });
+    if (text === undefined) return;
+
+    const sniff = sniffImportFormat(text);
+    if (sniff === "nexus-json") {
+      const choice = await vscode.window.showErrorMessage(
+        "This looks like a Nexus JSON export, not a host list.",
+        "Import as Nexus Export"
+      );
+      if (choice === "Import as Nexus Export") await applyNexusExportText(text);
+      return;
+    }
+    if (sniff === "xml") {
+      const choice = await vscode.window.showErrorMessage(
+        "This is an XML file. If it came from SecureCRT, import it as a SecureCRT export.",
+        "Import as SecureCRT XML"
+      );
+      if (choice === "Import as SecureCRT XML") await applySecureCrtXmlText(text);
+      return;
+    }
+    if (sniff === "mobaxterm") {
+      const choice = await vscode.window.showErrorMessage(
+        "This looks like a MobaXterm INI file.",
+        "Import as MobaXterm"
+      );
+      if (choice === "Import as MobaXterm") await applyMobaxtermText(text);
+      return;
+    }
+
+    await applyInventoryText(text);
+  }
+
+  /** .inventory deep link: keeps its own clipboard/file source pick, then shares the tail. */
+  async function importInventory(): Promise<void> {
     const sourcePick = await vscode.window.showQuickPick(
       [
-        { label: "SecureCRT XML Export File (.xml)", value: "xml" as const },
-        { label: "SecureCRT Sessions Folder", value: "folder" as const }
+        { label: "Paste from Clipboard", value: "clipboard" as const },
+        { label: "Choose File…", value: "file" as const }
       ],
-      { title: "SecureCRT Import Source" }
+      { title: "Import Servers from List" }
     );
     if (!sourcePick) return;
 
+    const text = sourcePick.value === "clipboard"
+      ? await acquireClipboardText()
+      : await acquireFileText({
+          canSelectFiles: true,
+          canSelectMany: false,
+          filters: { "Inventory Lists": ["csv", "txt", "tsv"], "All Files": ["*"] },
+          title: "Import Servers from List"
+        });
+    if (text === undefined) return;
+
+    await applyInventoryText(text);
+  }
+
+  /** Branch 4 tail: parse already-acquired XML text and apply it. */
+  async function applySecureCrtXmlText(text: string): Promise<void> {
+    let result: ImportParseResult;
+    try {
+      result = parseSecureCrtXmlExport(text);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown parse error";
+      void vscode.window.showErrorMessage(`Failed to parse SecureCRT XML: ${message}`);
+      return;
+    }
+
+    // parseSecureCrtXmlExport returns the same empty shape whether the root lacks
+    // a <VanDyke><key name="Sessions"> structure entirely, or has one with zero
+    // SSH entries inside it. Only the former gets this message; the latter still
+    // reaches applyImportedSessions's generic "No SSH sessions found".
+    if (!hasSecureCrtSessionsRoot(text)) {
+      void vscode.window.showErrorMessage(
+        "This XML isn't a SecureCRT export — expected a <VanDyke> document with a Sessions section. In SecureCRT, use Tools → Export Settings."
+      );
+      return;
+    }
+
+    await applyImportedSessions(result, "SecureCRT", "file");
+  }
+
+  /** Branches 4 (xml) and 5 (folder): dialog + guards + parser, shared by the chooser rows and the .securecrt deep link. */
+  async function runSecureCrtImport(source: "xml" | "folder"): Promise<void> {
     const uris = await vscode.window.showOpenDialog({
-      canSelectFiles: sourcePick.value === "xml",
-      canSelectFolders: sourcePick.value === "folder",
+      canSelectFiles: source === "xml",
+      canSelectFolders: source === "folder",
       canSelectMany: false,
-      filters: sourcePick.value === "xml" ? { "SecureCRT XML Files": ["xml"] } : undefined,
-      title: sourcePick.value === "xml" ? "Select SecureCRT XML Export File" : "Select SecureCRT Sessions Folder"
+      filters: source === "xml" ? { "SecureCRT XML Files": ["xml"], "All Files": ["*"] } : undefined,
+      title: source === "xml" ? "Select SecureCRT XML Export File" : "Select SecureCRT Sessions Folder"
     });
     if (!uris || uris.length === 0) return;
 
     const inputUri = uris[0];
     const stat = await vscode.workspace.fs.stat(inputUri);
-
-    let result: ImportParseResult;
     const unsupportedMsg = "Unsupported SecureCRT input. Select a SecureCRT XML export file or Sessions folder.";
 
-    if (sourcePick.value === "folder") {
+    if (source === "folder") {
       const isDirectory = (stat.type & vscode.FileType.Directory) === vscode.FileType.Directory;
       if (!isDirectory) {
         void vscode.window.showErrorMessage(unsupportedMsg);
@@ -1678,29 +1846,120 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       }
 
       await walkDirectory(inputUri, "");
-      result = parseSecureCrtDirectory(files);
-    } else {
-      const isFile = (stat.type & vscode.FileType.File) === vscode.FileType.File;
-      if (!isFile || !inputUri.fsPath.toLowerCase().endsWith(".xml")) {
-        void vscode.window.showErrorMessage(unsupportedMsg);
+
+      if (files.length === 0) {
+        void vscode.window.showErrorMessage(
+          "No .ini session files found under this folder. Select SecureCRT's Sessions directory (on Windows usually %APPDATA%\\VanDyke\\Config\\Sessions)."
+        );
         return;
       }
-      const raw = await vscode.workspace.fs.readFile(inputUri);
-      if (raw.byteLength > 10 * 1024 * 1024) {
-        void vscode.window.showErrorMessage("SecureCRT XML file exceeds the 10 MB size limit.");
-        return;
-      }
-      const text = Buffer.from(raw).toString("utf8");
-      try {
-        result = parseSecureCrtXmlExport(text);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "unknown parse error";
-        void vscode.window.showErrorMessage(`Failed to parse SecureCRT XML: ${message}`);
-        return;
-      }
+
+      const result = parseSecureCrtDirectory(files);
+      await applyImportedSessions(result, "SecureCRT", "folder");
+      return;
     }
 
-    await applyImportedSessions(result, "SecureCRT", sourcePick.value === "xml" ? "file" : "folder");
+    const isFile = (stat.type & vscode.FileType.File) === vscode.FileType.File;
+    if (!isFile || !inputUri.fsPath.toLowerCase().endsWith(".xml")) {
+      void vscode.window.showErrorMessage(unsupportedMsg);
+      return;
+    }
+    const raw = await vscode.workspace.fs.readFile(inputUri);
+    if (raw.byteLength > 10 * 1024 * 1024) {
+      void vscode.window.showErrorMessage("SecureCRT XML file exceeds the 10 MB size limit.");
+      return;
+    }
+    await applySecureCrtXmlText(Buffer.from(raw).toString("utf8"));
+  }
+
+  /** .securecrt deep link: keeps its own XML/folder source pick, then shares runSecureCrtImport. */
+  async function importSecureCrt(): Promise<void> {
+    const sourcePick = await vscode.window.showQuickPick(
+      [
+        { label: "SecureCRT XML Export File (.xml)", value: "xml" as const },
+        { label: "SecureCRT Sessions Folder", value: "folder" as const }
+      ],
+      { title: "SecureCRT Import Source" }
+    );
+    if (!sourcePick) return;
+
+    await runSecureCrtImport(sourcePick.value);
+  }
+
+  interface ImportChooserItem extends vscode.QuickPickItem {
+    value?: "clipboard" | "hostListFile" | "mobaxterm" | "securecrtXml" | "securecrtFolder" | "nexusExport";
+  }
+
+  // Row order is deliberate, not alphabetical: bulk host-list add is the lead
+  // persona action (README headline, and issue #29's exact need), migration from
+  // another client is a once-per-user action, and the Nexus export row — the only
+  // one with a destructive Replace mode — is last so it is never the
+  // default-focused item; those users already know the product and can
+  // type-to-filter straight to it.
+  const IMPORT_CHOOSER_ITEMS: ImportChooserItem[] = [
+    { label: "add servers in bulk", kind: vscode.QuickPickItemKind.Separator },
+    {
+      label: "$(clippy) Paste Host List from Clipboard",
+      description: "Hostnames or CSV rows copied from a spreadsheet",
+      value: "clipboard"
+    },
+    {
+      label: "$(list-flat) Host List File…",
+      description: ".csv, .tsv, or .txt — one device per line",
+      value: "hostListFile"
+    },
+    { label: "migrate from another client", kind: vscode.QuickPickItemKind.Separator },
+    {
+      label: "$(file-code) MobaXterm INI File…",
+      description: "Sessions from a MobaXterm .ini bookmarks export",
+      value: "mobaxterm"
+    },
+    {
+      label: "$(file-code) SecureCRT XML Export…",
+      description: "Created in SecureCRT via Tools → Export Settings",
+      value: "securecrtXml"
+    },
+    {
+      label: "$(folder-opened) SecureCRT Sessions Folder…",
+      description: "SecureCRT's Config/Sessions directory",
+      value: "securecrtFolder"
+    },
+    { label: "nexus", kind: vscode.QuickPickItemKind.Separator },
+    {
+      label: "$(json) Nexus Export File…",
+      description: "An encrypted backup or a shared config (.json)",
+      value: "nexusExport"
+    }
+  ];
+
+  /** nexus.config.import: the universal chooser. Asks what the user is importing, then branches. */
+  async function importConfig(): Promise<void> {
+    const pick = await vscode.window.showQuickPick(IMPORT_CHOOSER_ITEMS, {
+      title: "Import",
+      placeHolder: "What are you importing?"
+    });
+    if (!pick?.value) return;
+
+    switch (pick.value) {
+      case "clipboard":
+        await importHostListFromClipboard();
+        break;
+      case "hostListFile":
+        await importHostListFile();
+        break;
+      case "mobaxterm":
+        await importMobaxterm();
+        break;
+      case "securecrtXml":
+        await runSecureCrtImport("xml");
+        break;
+      case "securecrtFolder":
+        await runSecureCrtImport("folder");
+        break;
+      case "nexusExport":
+        await importNexusExport();
+        break;
+    }
   }
 
   return [

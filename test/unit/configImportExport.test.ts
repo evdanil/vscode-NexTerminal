@@ -98,7 +98,8 @@ vi.mock("vscode", () => ({
   },
   FileType: { File: 1, Directory: 2 },
   ConfigurationTarget: { Global: 1 },
-  ProgressLocation: { Notification: 15 }
+  ProgressLocation: { Notification: 15 },
+  QuickPickItemKind: { Separator: -1, Default: 0 }
 }));
 
 vi.mock("node:fs/promises", async () => {
@@ -366,6 +367,7 @@ describe("config import command (legacy)", () => {
     mockReadFile.mockResolvedValue(Buffer.from(json, "utf8"));
     mockShowQuickPick.mockResolvedValue({ label: mode === "merge" ? "Merge" : "Replace", value: mode });
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
   }
@@ -474,46 +476,50 @@ describe("config import command (legacy)", () => {
     expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 0 profiles (1 skipped).");
   });
 
-  it("rejects invalid JSON and offers the inventory importer instead of a dead end", async () => {
+  it("rejects invalid JSON that sniffs as a host list and offers a one-click reroute", async () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/config.json", scheme: "file" }]);
     mockReadFile.mockResolvedValue(Buffer.from("not json!", "utf8"));
     mockShowErrorMessage.mockResolvedValue(undefined);
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
     expect(mockShowErrorMessage).toHaveBeenCalledWith(
-      "That file isn't a Nexus JSON export. For a CSV or plain host list, use Import Servers from List.",
-      "Import Servers from List"
+      "That file isn't a Nexus JSON export.",
+      "Import as Host List"
     );
   });
 
-  it("invokes the inventory importer when the user follows the offer from invalid JSON", async () => {
+  it("routes 'Import as Host List' straight into the host-list parser using the same bytes — no re-opened dialog or source pick", async () => {
     mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/config.json", scheme: "file" }]);
     mockReadFile.mockResolvedValueOnce(Buffer.from("not json!", "utf8"));
-    mockShowErrorMessage.mockResolvedValueOnce("Import Servers from List");
-    mockShowQuickPick.mockResolvedValue(undefined); // abort the follow-up import at the source pick
+    mockShowErrorMessage.mockResolvedValueOnce("Import as Host List");
+    mockShowInputBox.mockResolvedValue(""); // folder prompt: skip
+    mockShowWarningMessage.mockResolvedValue(undefined);
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
-    expect(mockShowQuickPick).toHaveBeenCalledWith(
-      expect.any(Array),
-      expect.objectContaining({ title: "Import Servers from List" })
-    );
+    // "not json!" fails HOST_RE (contains a space and "!"), so the reused bytes
+    // parse to zero valid sessions — the point being *no second dialog ran*.
+    expect(mockShowOpenDialog).toHaveBeenCalledTimes(1);
+    expect(mockClipboardReadText).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("No servers found (1 skipped).");
   });
 
-  it("rejects non-NexusConfigExport data and offers the inventory importer too", async () => {
+  it("rejects valid JSON that isn't shaped like a Nexus export, with no reroute button", async () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/config.json", scheme: "file" }]);
     mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify({ foo: "bar" }), "utf8"));
     mockShowErrorMessage.mockResolvedValue(undefined);
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
     expect(mockShowErrorMessage).toHaveBeenCalledWith(
-      "That file isn't a Nexus JSON export. For a CSV or plain host list, use Import Servers from List.",
-      "Import Servers from List"
+      "This is valid JSON, but not a Nexus export — expected a version field and at least one profile list (servers, tunnels, …)."
     );
   });
 
@@ -1037,6 +1043,7 @@ describe("backup import", () => {
     mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
     mockShowInputBox.mockResolvedValueOnce("testpass"); // decrypt password
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -1065,6 +1072,7 @@ describe("backup import", () => {
     mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
     mockShowInputBox.mockResolvedValueOnce("wrong");
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -1088,6 +1096,7 @@ describe("backup import", () => {
     mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
     mockShowQuickPick.mockResolvedValue({ label: "Merge", value: "merge" });
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -1137,6 +1146,7 @@ describe("backup import", () => {
       throw new Error(`ENOENT: ${uri.fsPath}`);
     });
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -1181,6 +1191,7 @@ describe("backup import", () => {
     mockShowInputBox.mockResolvedValueOnce("testpass");
     mockStat.mockResolvedValue({ type: 1 });
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -1232,6 +1243,7 @@ describe("backup import", () => {
     mockShowInputBox.mockResolvedValueOnce("testpass");
     mockStat.mockResolvedValue(undefined);
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -1269,6 +1281,7 @@ describe("share import", () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/config.json", scheme: "file" }]);
     mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -1291,6 +1304,7 @@ describe("share import", () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/config.json", scheme: "file" }]);
     mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -1321,6 +1335,7 @@ describe("share import", () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/v1share.json", scheme: "file" }]);
     mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(v1ShareData), "utf8"));
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -2302,6 +2317,7 @@ describe("share export round-trip", () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/config.json", scheme: "file" }]);
     mockReadFile.mockResolvedValue(Buffer.from(exportedJson, "utf8"));
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -2354,6 +2370,7 @@ describe("share export round-trip", () => {
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share.json", scheme: "file" }]);
     mockReadFile.mockResolvedValue(Buffer.from(exportedJson, "utf8"));
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -2415,6 +2432,7 @@ describe("backup export round-trip", () => {
     mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
     mockShowInputBox.mockResolvedValueOnce("masterpass1");
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -2491,6 +2509,7 @@ describe("backup export round-trip", () => {
     mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
     mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -2557,6 +2576,7 @@ describe("backup export round-trip", () => {
     mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
     mockShowInputBox.mockResolvedValueOnce("masterpass1");
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
@@ -2591,6 +2611,7 @@ describe("backup export round-trip", () => {
     mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
     mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
 
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
