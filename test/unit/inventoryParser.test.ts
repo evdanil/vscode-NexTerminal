@@ -173,13 +173,29 @@ describe("parseInventoryList", () => {
     expect(r.sessions[0]).toMatchObject({ host: "core_sw1" });
   });
 
-  it("collapses runs of tabs but keeps empty CSV fields meaningful", () => {
-    const tabs = parseInventoryList("r1\t\tcore sw\tadmin\n");
-    expect(tabs.sessions[0]).toMatchObject({ host: "r1", name: "core sw", username: "admin" });
+  it("keeps an empty tab-separated column meaningful instead of collapsing the run (Codex round 6 finding 3: an earlier round's tab-collapsing for aligned input is reverted — real TSV wins)", () => {
+    // Previously (aligned-tab collapsing) this parsed as {host:"r1", name:"core sw",
+    // username:"admin"}. That silently shifted every column past the empty one and
+    // is now gone: \t\t is a real empty column, so this is 4 positional fields
+    // (host="r1", name="", username="core sw", port="admin") and the row is
+    // correctly rejected on the non-numeric "admin" port instead of silently
+    // mis-assigning data into the wrong columns.
+    const r = parseInventoryList("r1\t\tcore sw\tadmin\n");
+    expect(r.sessions).toHaveLength(0);
+    expect(r.skippedCount).toBe(1);
+    expect(r.issues[0].reason).toMatch(/invalid port "admin"/);
+  });
 
-    // A doubled comma delimiter must still be read as an explicit empty field.
+  it("keeps CSV's doubled-comma empty field meaningful (unchanged)", () => {
     const csv = parseInventoryList("10.0.0.1,,admin,22\n");
     expect(csv.sessions[0]).toMatchObject({ host: "10.0.0.1", username: "admin", port: 22 });
+  });
+
+  it("takes the prompted default username instead of rejecting the row when a TSV export has a genuinely empty username column", () => {
+    const r = parseInventoryList("sw1\tSwitch One\t\t22\tSite\n", { defaultUsername: "admin" });
+    expect(r.sessions[0]).toEqual({ name: "Switch One", host: "sw1", port: 22, username: "admin", folder: "Site" });
+    expect(r.needsDefaultUsername).toBe(true);
+    expect(r.missingUsernameCount).toBe(1);
   });
 
   it("reports an issue instead of silently discarding an invalid row-level folder", () => {

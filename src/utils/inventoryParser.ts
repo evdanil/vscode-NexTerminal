@@ -156,10 +156,13 @@ function splitFields(lineText: string, delimiter: DelimiterKind): string[] {
     return lineText.split(/\s{2,}/);
   }
   if (delimiter === "\t") {
-    // Tab-aligned exports pad columns with runs of tabs; collapse them like the
-    // whitespace delimiter does. Unlike commas, a run of tabs is never meant to
-    // encode an empty field.
-    return lineText.split(/\t+/);
+    // Real TSV: an empty column between two tabs is meaningful data (e.g. a
+    // blank username field ahead of port/folder), not a run to collapse —
+    // collapsing here silently shifts every later column. Split on each
+    // individual tab so empty fields keep their position. (Space-run collapsing
+    // just below is unaffected and intentionally different: a run of spaces in
+    // hand-aligned input genuinely is one separator, never an empty column.)
+    return lineText.split("\t");
   }
   return splitCsvLike(lineText, delimiter);
 }
