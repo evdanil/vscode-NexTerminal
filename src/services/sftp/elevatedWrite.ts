@@ -76,17 +76,29 @@ export function buildTempStagePath(token: string): string {
 /**
  * Builds the sudo command that installs the staged temp file over the target path.
  * `cat < temp > target` writes through the target's existing inode when it already
- * exists, so mode, owner, ACLs, and hard links survive; a brand new file has no
- * inode to preserve, so it is chmod'd to `createMode` afterward (the mode last
- * observed for this path, or 644 when none is known — see writeFileElevated).
+ * exists, so mode, owner, ACLs, SELinux context, and hard links all survive
+ * untouched — a umask has no effect on a file the redirect doesn't create.
  *
- * Existence is decided with `[ -e target ]` INSIDE this shell script, not by a
- * boolean the caller resolved earlier over SFTP: a stat done ahead of the (possibly
- * slow) staging upload leaves a window where the target can be deleted or rotated
- * before the install runs, so an earlier "exists" would take the no-chmod branch and
- * hand the file root's umask-derived mode instead of the caller's intended one. `[
- * -e ]` follows symlinks the same way `stat` does, so a dangling-symlink target is
- * still resolved consistently with the plain (non-elevated) write path.
+ * There is deliberately no `[ -e target ]` existence check anymore. An earlier round
+ * moved that check from a boolean the caller resolved via a separate `stat` (done
+ * before the possibly-slow staging upload — a cross-network race) into `[ -e ]` run
+ * inside this same shell, which shrank the window but didn't close it: if the target
+ * is deleted or log-rotated away between `[ -e ]` succeeding and the `>` redirect
+ * opening the file microseconds later, the redirect creates the file itself under
+ * root's *default* umask, so the "exists" branch's no-chmod path never applies and a
+ * target that should come back at `createMode` (0600, 0640, ...) can come back 0644.
+ * Setting the shell's own umask to `0666 & ~createMode` before the redirect runs
+ * closes this for good: umask only ever governs permission bits on a file the
+ * redirect *creates*, and has zero effect on one that already exists — there is no
+ * longer a branch to race, because there is no longer a branch.
+ *
+ * Known limitation, intentionally not solved here: umask's own base is 0666, so this
+ * can only ever narrow or preserve read/write bits — it can never grant execute. If
+ * a target that had mode 0755 is concurrently deleted/rotated away and this recreates
+ * it, the file comes back at `createMode` (644 by default) rather than 0755: strictly
+ * narrower, never wider, and only in the already-anomalous concurrently-deleted case.
+ * Do not "fix" this by resurrecting an existence check — that's exactly the race this
+ * replaced.
  *
  * The inner script is escaped once for its own path arguments, then the whole inner
  * script is escaped again as a single argument to `/bin/sh -c`. This second pass is
@@ -101,9 +113,8 @@ export function buildSudoInstallCommand(tempPath: string, targetPath: string, cr
   assertValidRemotePath(targetPath, "target");
   const temp = shellEscape(tempPath);
   const target = shellEscape(targetPath);
-  const inner =
-    `if [ -e ${target} ]; then cat < ${temp} > ${target}; ` +
-    `else cat < ${temp} > ${target} && chmod ${createMode.toString(8)} ${target}; fi`;
+  const umask = (0o666 & ~createMode).toString(8);
+  const inner = `(umask ${umask}; cat < ${temp} > ${target})`;
   return `sudo -S -p '' -- /bin/sh -c ${shellEscape(inner)}`;
 }
 
