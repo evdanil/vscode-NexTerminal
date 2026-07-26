@@ -1722,11 +1722,13 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
   /**
    * Chooser row 2 (Host List File…): file source, then sniff — and if the content
-   * confidently indicates a different declared format, stop with a named error
-   * plus a one-click reroute into that format's own tail (same bytes, no re-pick).
-   * A generic INI or a bare host list both sniff as "host-list" and fall through
-   * to the inventory parser exactly as before; see importFormatSniffer for why
-   * that class has no positive signature of its own.
+   * confidently indicates a different declared format, stop with a named error, a
+   * one-click reroute into that format's own tail, and a second "Import as Host
+   * List Anyway" button that proceeds into the inventory tail regardless (the
+   * sniff is a heuristic, not proof — a real escape hatch beats a dead end). A
+   * generic INI or a bare host list both sniff as "host-list" and fall through to
+   * the inventory parser exactly as before; see importFormatSniffer for why that
+   * class has no positive signature of its own.
    */
   async function importHostListFile(): Promise<void> {
     const text = await acquireFileText({
@@ -1737,29 +1739,41 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     });
     if (text === undefined) return;
 
+    // Non-terminal on purpose: the sniff is a heuristic, and a genuine host list
+    // can trip it (e.g. a hostname list whose first line happens to start with
+    // "{"). "Import as Host List Anyway" proceeds into the same inventory tail
+    // with the bytes already in hand — the only other way through a false
+    // contradiction would be discovering a different command, which no user
+    // will deduce. Dismissing the toast without a choice still aborts, same as before.
     const sniff = sniffImportFormat(text);
     if (sniff === "nexus-json") {
       const choice = await vscode.window.showErrorMessage(
         "This looks like a Nexus JSON export, not a host list.",
-        "Import as Nexus Export"
+        "Import as Nexus Export",
+        "Import as Host List Anyway"
       );
       if (choice === "Import as Nexus Export") await applyNexusExportText(text);
+      else if (choice === "Import as Host List Anyway") await applyInventoryText(text);
       return;
     }
     if (sniff === "xml") {
       const choice = await vscode.window.showErrorMessage(
         "This is an XML file. If it came from SecureCRT, import it as a SecureCRT export.",
-        "Import as SecureCRT XML"
+        "Import as SecureCRT XML",
+        "Import as Host List Anyway"
       );
       if (choice === "Import as SecureCRT XML") await applySecureCrtXmlText(text);
+      else if (choice === "Import as Host List Anyway") await applyInventoryText(text);
       return;
     }
     if (sniff === "mobaxterm") {
       const choice = await vscode.window.showErrorMessage(
         "This looks like a MobaXterm INI file.",
-        "Import as MobaXterm"
+        "Import as MobaXterm",
+        "Import as Host List Anyway"
       );
       if (choice === "Import as MobaXterm") await applyMobaxtermText(text);
+      else if (choice === "Import as Host List Anyway") await applyInventoryText(text);
       return;
     }
 

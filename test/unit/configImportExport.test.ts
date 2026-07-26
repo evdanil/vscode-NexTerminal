@@ -857,7 +857,7 @@ describe("import chooser (nexus.config.import)", () => {
     ["xml", "<VanDyke><key name=\"Sessions\"/></VanDyke>", "This is an XML file. If it came from SecureCRT, import it as a SecureCRT export.", "Import as SecureCRT XML"],
     ["mobaxterm", "[Bookmarks]\nSubRep=\n", "This looks like a MobaXterm INI file.", "Import as MobaXterm"]
   ] as const)(
-    "Host List File… contradicted by a %s signature stops with a named error and a reroute button",
+    "Host List File… contradicted by a %s signature stops with a named error, a reroute button, and a non-terminal 'Import as Host List Anyway' escape hatch (Finding 5)",
     async (_sniff, content, message, button) => {
       mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
       mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
@@ -868,9 +868,32 @@ describe("import chooser (nexus.config.import)", () => {
       const importCmd = registeredCommands.get("nexus.config.import")!;
       await importCmd();
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(message, button);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(message, button, "Import as Host List Anyway");
     }
   );
+
+  it("Host List File… contradicted by a nexus-json signature: picking 'Import as Host List Anyway' proceeds into the inventory tail with the same bytes — no second dialog (Finding 5)", async () => {
+    // A genuine host list whose first line happens to start with "{" — the sniffer
+    // mis-flags the whole file as nexus-json (first non-whitespace char), even
+    // though the file is really one bad row (that HOST_RE rejects) followed by a
+    // perfectly good one. The escape hatch must still import the good row.
+    const misflaggedHostList = "{not actually json\n10.0.0.1,sw1,admin\n";
+    mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
+    mockStat.mockResolvedValueOnce({ type: 1, size: misflaggedHostList.length });
+    mockReadFile.mockResolvedValueOnce(Buffer.from(misflaggedHostList, "utf8"));
+    mockShowErrorMessage.mockResolvedValueOnce("Import as Host List Anyway");
+    mockShowInputBox.mockResolvedValue(""); // folder prompt: skip (no folder column)
+    mockShowInformationMessage.mockResolvedValue("Import");
+    mockShowWarningMessage.mockResolvedValue(undefined); // non-awaited "N lines skipped" toast
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockShowOpenDialog).toHaveBeenCalledTimes(1);
+    expect(core.getSnapshot().servers).toHaveLength(1);
+    expect(core.getSnapshot().servers[0].host).toBe("10.0.0.1");
+  });
 
   it("Host List File… reroute button reuses the same bytes — no second dialog", async () => {
     const nexusJson = '{"version":2,"servers":[{"id":"a","name":"a","host":"10.0.0.1","port":22,"username":"u","authType":"password","isHidden":false}]}';
