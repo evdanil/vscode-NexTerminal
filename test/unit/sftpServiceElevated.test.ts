@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { PassThrough } from "node:stream";
 import { SftpService } from "../../src/services/sftp/sftpService";
-import { buildTempStagePath } from "../../src/services/sftp/elevatedWrite";
+import { buildSudoInstallCommand, buildTempStagePath } from "../../src/services/sftp/elevatedWrite";
 import type { SshConnection, SshFactory } from "../../src/services/ssh/contracts";
 import type { ServerConfig } from "../../src/models/config";
 
@@ -79,14 +79,6 @@ function createFakeWriteStream() {
   return stream;
 }
 
-function existingFileStats() {
-  return { mode: 0o100644, size: 3, mtime: 0, uid: 0, gid: 0 };
-}
-
-function missingPathError(): Error & { code: number } {
-  return Object.assign(new Error("No such file"), { code: 2 });
-}
-
 function createExecStream(): PassThrough & { stderr: PassThrough } {
   // emitClose/autoDestroy: false — matches ssh2's own WriteStream guard (SFTP.js). A
   // bare PassThrough auto-emits "close" ~1 tick after end(), but a real ssh2 exec
@@ -130,9 +122,6 @@ describe("SftpService elevated writes", () => {
       order.push(`write:${remotePath}:${options?.mode?.toString(8)}`);
       return writeStream;
     });
-    sftp.stat.mockImplementation((_remotePath: string, cb: (err: unknown, stats?: unknown) => void) => {
-      cb(null, existingFileStats());
-    });
     sftp.unlink.mockImplementation((remotePath: string, cb: (err?: Error) => void) => {
       order.push(`unlink:${remotePath}`);
       cb();
@@ -153,14 +142,34 @@ describe("SftpService elevated writes", () => {
 
     expect(order).toEqual([`write:${expectedTempPath}:600`, "sudo-install", `unlink:${expectedTempPath}`]);
     expect(capturedCommand).toContain("sudo -S -p ''");
-    expect(capturedCommand).not.toContain("chmod");
+    // Existence is decided by the remote shell, not a pre-resolved boolean — the
+    // command is identical whether the caller thinks the target exists or not.
+    expect(capturedCommand).toBe(buildSudoInstallCommand(expectedTempPath, "/etc/hosts"));
+  });
+
+  it("does not probe the target's existence before staging: closing that window is the point (Codex finding 1 — the old stat-then-upload gap let a deleted/rotated target lose its chmod)", async () => {
+    sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
+    sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
+
+    let capturedCommand = "";
+    const execStream = createExecStream();
+    (connection.exec as ReturnType<typeof vi.fn>).mockImplementation((command: string) => {
+      capturedCommand = command;
+      return Promise.resolve(execStream);
+    });
+
+    const promise = service.writeFileElevated("srv-1", "/etc/hosts", Buffer.from("hi"));
+    await flush();
+    execStream.emit("close", 0);
+    await promise;
+
+    expect(sftp.stat).not.toHaveBeenCalled();
+    expect(sftp.lstat).not.toHaveBeenCalled();
+    expect(capturedCommand).toMatch(/if \[ -e [^\]]*\/etc\/hosts[^\]]*\]; then cat < /);
   });
 
   it("removes the temp file even when the sudo install fails", async () => {
     sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
-    sftp.stat.mockImplementation((_remotePath: string, cb: (err: unknown, stats?: unknown) => void) => {
-      cb(null, existingFileStats());
-    });
     let unlinkedPath: string | undefined;
     sftp.unlink.mockImplementation((remotePath: string, cb: (err?: Error) => void) => {
       unlinkedPath = remotePath;
@@ -181,9 +190,6 @@ describe("SftpService elevated writes", () => {
 
   it("pipes the sudo password on stdin to the exec channel", async () => {
     sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
-    sftp.stat.mockImplementation((_remotePath: string, cb: (err: unknown, stats?: unknown) => void) => {
-      cb(null, existingFileStats());
-    });
     sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
 
     const execStream = createExecStream();
@@ -200,9 +206,6 @@ describe("SftpService elevated writes", () => {
 
   it("closes the exec channel's stdin even when no password is supplied", async () => {
     sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
-    sftp.stat.mockImplementation((_remotePath: string, cb: (err: unknown, stats?: unknown) => void) => {
-      cb(null, existingFileStats());
-    });
     sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
 
     const execStream = createExecStream();
@@ -219,13 +222,9 @@ describe("SftpService elevated writes", () => {
     expect(endSpy).toHaveBeenCalled();
   });
 
-  it("creates a new root-owned file with chmod 644 when the target is absent (resolved via stat, not lstat)", async () => {
+  it("defaults the create-branch chmod to 644 when the caller supplies no createMode (the shell — not a pre-resolved stat — decides at install time whether that branch even runs)", async () => {
     sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
-    sftp.stat.mockImplementation((_remotePath: string, cb: (err: unknown, stats?: unknown) => void) => {
-      cb(missingPathError());
-    });
     sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
-    expect(sftp.lstat).not.toHaveBeenCalled();
 
     let capturedCommand = "";
     const execStream = createExecStream();
@@ -239,15 +238,13 @@ describe("SftpService elevated writes", () => {
     execStream.emit("close", 0);
     await promise;
 
+    expect(sftp.stat).not.toHaveBeenCalled();
     expect(sftp.lstat).not.toHaveBeenCalled();
     expect(capturedCommand).toContain("chmod 644");
   });
 
-  it("recreates a vanished target using the caller-supplied createMode instead of 644 (P3)", async () => {
+  it("uses the caller-supplied createMode instead of 644 for the create branch (P3: preserves a vanished target's prior mode)", async () => {
     sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
-    sftp.stat.mockImplementation((_remotePath: string, cb: (err: unknown, stats?: unknown) => void) => {
-      cb(missingPathError());
-    });
     sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
 
     let capturedCommand = "";
@@ -279,9 +276,6 @@ describe("SftpService elevated writes", () => {
 
   it("writeFileElevated installs via sudo using the operation timeout, not the default command timeout", async () => {
     sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
-    sftp.stat.mockImplementation((_remotePath: string, cb: (err: unknown, stats?: unknown) => void) => {
-      cb(null, existingFileStats());
-    });
     sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
     const execSpy = vi.spyOn(service as any, "execCommand").mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
 
