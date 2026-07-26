@@ -116,7 +116,7 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "Start by adding a connection profile.\n[Add Profile](command:nexus.profile.add)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+        "contents": "Start by adding a connection profile.\n[Add Profile](command:nexus.profile.add)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)\n[Import Servers from a List](command:nexus.config.import.inventory)"
       },
       {
         "view": "nexusTunnels",
