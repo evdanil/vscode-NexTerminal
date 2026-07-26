@@ -26,8 +26,6 @@ const mockOpenTextDocument = vi.fn();
 const mockShowTextDocument = vi.fn();
 const configStore = new Map<string, unknown>();
 const configDefaults = new Map<string, unknown>();
-// Mutable so individual tests can simulate the user cancelling a withProgress task.
-let progressCancellationRequested = false;
 
 vi.mock("vscode", () => ({
   commands: {
@@ -47,10 +45,7 @@ vi.mock("vscode", () => ({
     showTextDocument: (...args: unknown[]) => mockShowTextDocument(...args),
     withProgress: (_opts: unknown, task: (progress: unknown, token: unknown) => Promise<void>) => {
       mockWithProgress(_opts);
-      return task(
-        { report: vi.fn() },
-        { isCancellationRequested: progressCancellationRequested, onCancellationRequested: vi.fn() }
-      );
+      return task({ report: vi.fn() }, { isCancellationRequested: false, onCancellationRequested: vi.fn() });
     }
   },
   env: {
@@ -1682,7 +1677,6 @@ describe("import inventory list command", () => {
     vi.clearAllMocks();
     registeredCommands.clear();
     configStore.clear();
-    progressCancellationRequested = false;
     vault = new MockVault();
     repo = new InMemoryConfigRepository();
     core = new NexusCore(repo);
@@ -1938,7 +1932,7 @@ describe("import inventory list command", () => {
     );
   });
 
-  it("wraps the apply step in a cancellable progress notification and writes once (P6)", async () => {
+  it("wraps the apply step in a non-cancellable progress notification and writes once (Codex round 4 finding B: the Cancel button couldn't actually stop the write, so it's no longer offered)", async () => {
     const saveServersSpy = vi.spyOn(repo, "saveServers");
     mockShowQuickPick.mockResolvedValue({ label: "Paste from Clipboard", value: "clipboard" });
     mockClipboardReadText.mockResolvedValue("sw1.lab.example.com,,admin\nsw2.lab.example.com,,admin\n");
@@ -1950,48 +1944,11 @@ describe("import inventory list command", () => {
     await cmd();
 
     expect(mockWithProgress).toHaveBeenCalledWith(
-      expect.objectContaining({ cancellable: true, title: expect.stringContaining("Importing 2 servers") })
+      expect.objectContaining({ cancellable: false, title: expect.stringContaining("Importing 2 servers") })
     );
     expect(saveServersSpy).toHaveBeenCalledTimes(1); // one write for the whole batch, not one per row
     expect(core.getSnapshot().servers).toHaveLength(2);
-  });
-
-  it("does not persist anything when the progress notification is cancelled (P6)", async () => {
-    const saveServersSpy = vi.spyOn(repo, "saveServers");
-    mockShowQuickPick.mockResolvedValue({ label: "Paste from Clipboard", value: "clipboard" });
-    mockClipboardReadText.mockResolvedValue("sw1.lab.example.com,,admin\n");
-    mockShowInputBox.mockResolvedValue("");
-    mockShowInformationMessage.mockResolvedValue("Import");
-    saveServersSpy.mockClear();
-    progressCancellationRequested = true;
-
-    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
-    await cmd();
-
-    expect(saveServersSpy).not.toHaveBeenCalled();
-    expect(core.getSnapshot().servers).toHaveLength(0);
-  });
-
-  it("reports 'Import canceled.' instead of a success message, and suppresses the skipped-lines toast too, when the progress notification is cancelled (Codex finding 2)", async () => {
-    const saveServersSpy = vi.spyOn(repo, "saveServers");
-    mockShowQuickPick.mockResolvedValue({ label: "Paste from Clipboard", value: "clipboard" });
-    // One importable row plus one row with a parse issue, so both the success
-    // toast and the "N line(s) were skipped" toast would normally fire.
-    mockClipboardReadText.mockResolvedValue("sw1.lab.example.com,,admin\nbad host name\n");
-    mockShowInputBox.mockResolvedValue("");
-    mockShowInformationMessage.mockResolvedValue("Import");
-    mockShowWarningMessage.mockResolvedValue(undefined);
-    saveServersSpy.mockClear();
-    progressCancellationRequested = true;
-
-    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
-    await cmd();
-
-    expect(saveServersSpy).not.toHaveBeenCalled();
-    expect(core.getSnapshot().servers).toHaveLength(0);
-    expect(mockShowInformationMessage).not.toHaveBeenCalledWith(expect.stringMatching(/^Imported /));
-    expect(mockShowWarningMessage).toHaveBeenCalledWith("Import canceled.");
-    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringMatching(/was skipped\.|were skipped\./), expect.anything());
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 2 servers.");
   });
 
   it("does not create an empty folder group for a folder whose only row was deduped (P9)", async () => {
