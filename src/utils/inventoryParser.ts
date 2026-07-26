@@ -1,0 +1,377 @@
+import { normalizeFolderPath } from "./folderPaths";
+import type { ImportedSession, ImportParseResult } from "./mobaxtermParser";
+
+export interface InventoryParseOptions {
+  defaultUsername?: string;
+  defaultPort?: number; // defaults to 22
+  defaultFolder?: string; // prefix applied to every row's folder
+}
+
+export interface InventoryParseIssue {
+  line: number;
+  text: string;
+  reason: string;
+}
+
+export interface InventoryParseResult extends ImportParseResult {
+  issues: InventoryParseIssue[];
+  /** true when at least one row resolved without an explicit username */
+  needsDefaultUsername: boolean;
+}
+
+type HeaderRole = "host" | "name" | "username" | "port" | "folder";
+type DelimiterKind = "," | "\t" | "ws";
+
+interface Row {
+  line: number;
+  text: string;
+}
+
+interface PositionalFields {
+  host: string;
+  name: string;
+  username: string;
+  port: string;
+  folder: string;
+}
+
+interface HostShorthand {
+  host: string;
+  username?: string;
+  port?: number;
+}
+
+const MAX_DATA_ROWS = 5000;
+const HOST_RE = /^[A-Za-z0-9._:\-[\]%]+$/;
+
+const HEADER_ALIASES: Record<HeaderRole, string[]> = {
+  host: ["host", "hostname", "address", "ip", "ipaddress", "mgmtip"],
+  name: ["name", "label", "device", "devicename", "alias"],
+  username: ["user", "username", "login"],
+  port: ["port", "sshport"],
+  folder: ["folder", "group", "site", "location"]
+};
+
+function isPortLike(value: string): boolean {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return false;
+  }
+  const n = parseInt(trimmed, 10);
+  return n >= 1 && n <= 65_535;
+}
+
+/** Quote-aware split: a `"` starting an otherwise-empty field opens quoting; `""` unescapes to `"`. */
+function splitCsvLike(line: string, delimiter: string): string[] {
+  const fields: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '"' && current.trim() === "") {
+      current = "";
+      inQuotes = true;
+      continue;
+    }
+    if (ch === delimiter) {
+      fields.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  fields.push(current);
+  return fields;
+}
+
+function pickDelimiter(lineText: string): DelimiterKind {
+  if (lineText.includes(",")) {
+    return ",";
+  }
+  if (lineText.includes("\t")) {
+    return "\t";
+  }
+  return "ws";
+}
+
+function cleanField(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed.slice(1, -1).replace(/""/g, '"');
+  }
+  return trimmed;
+}
+
+function splitFields(lineText: string, delimiter: DelimiterKind): string[] {
+  if (delimiter === "ws") {
+    // Two-or-more whitespace chars act as a column separator; a lone space stays
+    // inside a field so "First Last" survives as one name column.
+    return lineText.split(/\s{2,}/);
+  }
+  return splitCsvLike(lineText, delimiter);
+}
+
+function normalizeHeaderToken(raw: string): string {
+  return raw.trim().toLowerCase().replace(/[\s_]+/g, "");
+}
+
+/**
+ * Detect a header row: at least one normalized field is an exact host-alias match
+ * (a substring check would swallow bare hostnames like `host1` or `ipmi1` as headers),
+ * and no field looks like data (a dot, `@`, `:`, or an all-digit value).
+ */
+function detectHeader(fields: string[]): Partial<Record<HeaderRole, number>> | undefined {
+  const normalized = fields.map((f) => normalizeHeaderToken(f));
+  const hasHostAliasMatch = normalized.some((token) => HEADER_ALIASES.host.includes(token));
+  if (!hasHostAliasMatch) {
+    return undefined;
+  }
+  const looksLikeDataField = fields.some((f) => {
+    const trimmed = f.trim();
+    return trimmed.includes(".") || trimmed.includes("@") || trimmed.includes(":") || /^\d+$/.test(trimmed);
+  });
+  if (looksLikeDataField) {
+    return undefined;
+  }
+
+  const map: Partial<Record<HeaderRole, number>> = {};
+  fields.forEach((raw, idx) => {
+    const token = normalizeHeaderToken(raw);
+    for (const role of Object.keys(HEADER_ALIASES) as HeaderRole[]) {
+      if (map[role] !== undefined) {
+        continue;
+      }
+      if (HEADER_ALIASES[role].includes(token)) {
+        map[role] = idx;
+        break;
+      }
+    }
+  });
+  return map.host !== undefined ? map : undefined;
+}
+
+/** Positional fallback: `host[,name[,username[,port[,folder]]]]`, tolerating `host,port` and `host,name,port`. */
+function resolvePositional(fields: string[]): PositionalFields {
+  const host = fields[0] ?? "";
+  if (fields.length >= 5) {
+    return { host, name: fields[1] ?? "", username: fields[2] ?? "", port: fields[3] ?? "", folder: fields[4] ?? "" };
+  }
+  if (fields.length === 4) {
+    return { host, name: fields[1] ?? "", username: fields[2] ?? "", port: fields[3] ?? "", folder: "" };
+  }
+  if (fields.length === 3) {
+    if (isPortLike(fields[2])) {
+      return { host, name: fields[1] ?? "", username: "", port: fields[2], folder: "" };
+    }
+    return { host, name: fields[1] ?? "", username: fields[2] ?? "", port: "", folder: "" };
+  }
+  if (fields.length === 2) {
+    if (isPortLike(fields[1])) {
+      return { host, name: "", username: "", port: fields[1], folder: "" };
+    }
+    return { host, name: fields[1] ?? "", username: "", port: "", folder: "" };
+  }
+  return { host, name: "", username: "", port: "", folder: "" };
+}
+
+/** Pulls `user@host:port` shorthand out of a raw host field. IPv6 literals in `[...]` are left intact. */
+function parseHostShorthand(raw: string): HostShorthand {
+  let rest = raw;
+  let username: string | undefined;
+  const atIdx = rest.indexOf("@");
+  if (atIdx > 0) {
+    username = rest.slice(0, atIdx);
+    rest = rest.slice(atIdx + 1);
+  }
+  if (rest.startsWith("[")) {
+    const closeIdx = rest.indexOf("]");
+    if (closeIdx !== -1) {
+      const host = rest.slice(0, closeIdx + 1);
+      const remainder = rest.slice(closeIdx + 1);
+      if (remainder.startsWith(":") && isPortLike(remainder.slice(1))) {
+        return { host, username, port: parseInt(remainder.slice(1), 10) };
+      }
+      return { host, username };
+    }
+  }
+  const colonIdx = rest.lastIndexOf(":");
+  if (colonIdx > 0) {
+    const hostPart = rest.slice(0, colonIdx);
+    const portPart = rest.slice(colonIdx + 1);
+    if (!hostPart.includes(":") && isPortLike(portPart)) {
+      return { host: hostPart, username, port: parseInt(portPart, 10) };
+    }
+  }
+  return { host: rest, username };
+}
+
+function firstDnsLabel(host: string): string {
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    return host;
+  }
+  const dotIdx = host.indexOf(".");
+  return dotIdx === -1 ? host : host.slice(0, dotIdx);
+}
+
+function joinFolderSegments(prefix: string | undefined, rowFolder: string): string {
+  const segments: string[] = [];
+  if (prefix && prefix.trim()) {
+    segments.push(prefix.trim());
+  }
+  if (rowFolder && rowFolder.trim()) {
+    segments.push(rowFolder.trim());
+  }
+  return segments.join("/");
+}
+
+/**
+ * Parse a CSV export or plain hostname list into importable SSH sessions.
+ *
+ * Supports an optional header row (mapped by column-name aliases), a positional
+ * `host[,name[,username[,port[,folder]]]]` fallback, and `user@host:port` shorthand
+ * in the host field. Invalid or duplicate rows are reported as issues rather than
+ * aborting the whole import.
+ */
+export function parseInventoryList(text: string, options: InventoryParseOptions = {}): InventoryParseResult {
+  const defaultPort = options.defaultPort ?? 22;
+  const defaultUsername = options.defaultUsername ?? "";
+
+  const cleaned = text.replace(/^﻿/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const rawLines = cleaned.split("\n");
+
+  const rows: Row[] = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    const trimmed = rawLines[i].trim();
+    if (trimmed === "" || trimmed.startsWith("#")) {
+      continue;
+    }
+    rows.push({ line: i + 1, text: trimmed });
+  }
+
+  const sessions: ImportedSession[] = [];
+  const issues: InventoryParseIssue[] = [];
+  const folderSet = new Set<string>();
+  const seen = new Map<string, number>();
+  let skippedCount = 0;
+  let needsDefaultUsername = false;
+
+  if (rows.length === 0) {
+    return { sessions, skippedCount, folders: [], issues, needsDefaultUsername };
+  }
+
+  let dataRows = rows;
+  let headerMap: Partial<Record<HeaderRole, number>> | undefined;
+  const firstDelimiter = pickDelimiter(rows[0].text);
+  const firstFields = splitFields(rows[0].text, firstDelimiter).map(cleanField);
+  const detectedHeader = detectHeader(firstFields);
+  if (detectedHeader) {
+    headerMap = detectedHeader;
+    dataRows = rows.slice(1);
+  }
+
+  const truncated = dataRows.length > MAX_DATA_ROWS;
+  const rowsToProcess = dataRows.slice(0, MAX_DATA_ROWS);
+
+  for (const row of rowsToProcess) {
+    const delimiter = pickDelimiter(row.text);
+    const fields = splitFields(row.text, delimiter).map(cleanField);
+
+    let hostRaw: string;
+    let nameRaw: string;
+    let usernameRaw: string;
+    let portRaw: string;
+    let folderRaw: string;
+
+    if (headerMap) {
+      hostRaw = headerMap.host !== undefined ? fields[headerMap.host] ?? "" : "";
+      nameRaw = headerMap.name !== undefined ? fields[headerMap.name] ?? "" : "";
+      usernameRaw = headerMap.username !== undefined ? fields[headerMap.username] ?? "" : "";
+      portRaw = headerMap.port !== undefined ? fields[headerMap.port] ?? "" : "";
+      folderRaw = headerMap.folder !== undefined ? fields[headerMap.folder] ?? "" : "";
+    } else {
+      const positional = resolvePositional(fields);
+      hostRaw = positional.host;
+      nameRaw = positional.name;
+      usernameRaw = positional.username;
+      portRaw = positional.port;
+      folderRaw = positional.folder;
+    }
+
+    const shorthand = parseHostShorthand(hostRaw.trim());
+    const host = shorthand.host;
+
+    if (!host || !HOST_RE.test(host)) {
+      issues.push({ line: row.line, text: row.text, reason: `invalid host "${hostRaw.trim()}"` });
+      skippedCount++;
+      continue;
+    }
+
+    const explicitPort = portRaw.trim();
+    let port: number;
+    if (explicitPort !== "") {
+      if (!isPortLike(explicitPort)) {
+        issues.push({ line: row.line, text: row.text, reason: `invalid port "${explicitPort}"` });
+        skippedCount++;
+        continue;
+      }
+      port = parseInt(explicitPort, 10);
+    } else if (shorthand.port !== undefined) {
+      port = shorthand.port;
+    } else {
+      port = defaultPort;
+    }
+
+    const explicitUsername = usernameRaw.trim();
+    const hadExplicitUsername = explicitUsername !== "" || shorthand.username !== undefined;
+    const username = explicitUsername || shorthand.username || defaultUsername;
+
+    const name = nameRaw.trim() || firstDnsLabel(host);
+
+    const folderJoined = joinFolderSegments(options.defaultFolder, folderRaw);
+    const folder = folderJoined ? normalizeFolderPath(folderJoined) ?? "" : "";
+
+    const key = `${host.toLowerCase()}|${port}|${username}`;
+    const duplicateOfLine = seen.get(key);
+    if (duplicateOfLine !== undefined) {
+      issues.push({ line: row.line, text: row.text, reason: `duplicate of line ${duplicateOfLine}` });
+      skippedCount++;
+      continue;
+    }
+    seen.set(key, row.line);
+
+    if (!hadExplicitUsername) {
+      needsDefaultUsername = true;
+    }
+    if (folder) {
+      folderSet.add(folder);
+    }
+
+    sessions.push({ name, host, port, username, folder });
+  }
+
+  if (truncated) {
+    const firstSkippedLine = dataRows[MAX_DATA_ROWS]?.line ?? rows[rows.length - 1].line;
+    issues.push({ line: firstSkippedLine, text: "", reason: "input truncated at 5000 rows" });
+  }
+
+  return {
+    sessions,
+    skippedCount,
+    folders: [...folderSet].sort(),
+    issues,
+    needsDefaultUsername
+  };
+}
