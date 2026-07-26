@@ -260,5 +260,29 @@ describe("parseInventoryList", () => {
       expect(r.skippedCount).toBe(1);
       expect(r.issues[0].reason).toMatch(/invalid (port|host) "junk"/);
     });
+
+    it("rejects an unterminated bracketed IPv6 endpoint instead of importing it as a bracket-bearing host (Codex round 3 finding B)", () => {
+      const r1 = parseInventoryList("[2001:db8::1\n", { defaultUsername: "admin" });
+      expect(r1.sessions).toHaveLength(0);
+      expect(r1.skippedCount).toBe(1);
+      expect(r1.issues[0].reason).toMatch(/invalid host/);
+
+      const r2 = parseInventoryList("[2001:db8::1:2022\n", { defaultUsername: "admin" });
+      expect(r2.sessions).toHaveLength(0);
+      expect(r2.skippedCount).toBe(1);
+      expect(r2.issues[0].reason).toMatch(/invalid host/);
+
+      const r3 = parseInventoryList("[\n", { defaultUsername: "admin" });
+      expect(r3.sessions).toHaveLength(0);
+      expect(r3.skippedCount).toBe(1);
+      expect(r3.issues[0].reason).toMatch(/invalid host/);
+    });
+
+    it("still rejects an empty bracket pair as an invalid host (regression guard)", () => {
+      const r = parseInventoryList("[]\n", { defaultUsername: "admin" });
+      expect(r.sessions).toHaveLength(0);
+      expect(r.skippedCount).toBe(1);
+      expect(r.issues[0].reason).toMatch(/invalid host "\[\]"/);
+    });
   });
 });

@@ -347,6 +347,41 @@ describe("SudoElevationBroker", () => {
     });
   });
 
+  describe("rememberPasswordForSession toggled off mid-session (Codex round 3 finding A)", () => {
+    it("re-prompts immediately instead of reusing a password cached while remembrance was on", async () => {
+      rememberPassword = true;
+      sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValue("s3cret");
+      sftp.writeFileElevated.mockResolvedValue(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x"));
+      expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+
+      rememberPassword = false;
+      await broker.saveElevated("srv-1", "/etc/other", Buffer.from("y"));
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(2);
+    });
+
+    it("drops the previously cached password (not just skips reading it), so re-enabling remembrance does not resurrect it", async () => {
+      rememberPassword = true;
+      sftp.probeElevation.mockResolvedValue({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValueOnce("first").mockResolvedValueOnce("second").mockResolvedValueOnce("third");
+      sftp.writeFileElevated.mockResolvedValue(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x")); // caches "first"
+
+      rememberPassword = false;
+      await broker.saveElevated("srv-1", "/etc/a", Buffer.from("y")); // must re-prompt, must not cache "second"
+
+      rememberPassword = true;
+      await broker.saveElevated("srv-1", "/etc/b", Buffer.from("z")); // cache must be empty -> re-prompt for "third"
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(3);
+      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(3, "srv-1", "/etc/b", expect.any(Buffer), { password: "third", createMode: undefined });
+    });
+  });
+
   describe("clearCachedPassword", () => {
     it("drops the cached password for a server, forcing a re-prompt on the next save", async () => {
       rememberPassword = true;
