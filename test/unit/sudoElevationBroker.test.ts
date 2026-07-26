@@ -382,6 +382,61 @@ describe("SudoElevationBroker", () => {
     });
   });
 
+  describe("passwordless fast path (probeElevation \"none\") and the remember-off cache clear (Codex round 5)", () => {
+    it("drops a cached password before the fast path runs, so re-enabling remembrance does not resurrect it", async () => {
+      // Defensive: a failing assertion partway through this test (expected pre-fix) can leave a
+      // queued mockResolvedValueOnce unconsumed on this shared mock — clearAllMocks() in beforeEach
+      // does not drain pending "once" implementations, only call history. Reset it so this test
+      // can't leak state into whichever test runs next.
+      mockShowInputBox.mockReset();
+      rememberPassword = true;
+      sftp.probeElevation.mockResolvedValueOnce({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValueOnce("first");
+      sftp.writeFileElevated.mockResolvedValueOnce(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x")); // caches "first"
+      expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+
+      rememberPassword = false;
+      sftp.probeElevation.mockResolvedValueOnce({ kind: "none" }); // passwordless fast path
+      sftp.writeFileElevated.mockResolvedValueOnce(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/other", Buffer.from("y")); // must drop the cache, not just skip it
+      expect(mockShowInputBox).toHaveBeenCalledTimes(1); // fast path itself never prompts
+
+      rememberPassword = true;
+      sftp.probeElevation.mockResolvedValueOnce({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValueOnce("second");
+      sftp.writeFileElevated.mockResolvedValueOnce(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/b", Buffer.from("z")); // cache must be empty -> re-prompt, not reuse "first"
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(2);
+      expect(sftp.writeFileElevated).toHaveBeenLastCalledWith("srv-1", "/etc/b", expect.any(Buffer), { password: "second", createMode: undefined });
+    });
+
+    it("leaves a cached password intact across the fast path when remembrance stays on (no regression)", async () => {
+      mockShowInputBox.mockReset();
+      rememberPassword = true;
+      sftp.probeElevation.mockResolvedValueOnce({ kind: "password-required" });
+      mockShowInputBox.mockResolvedValueOnce("s3cret");
+      sftp.writeFileElevated.mockResolvedValueOnce(undefined);
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x")); // caches "s3cret"
+
+      sftp.probeElevation.mockResolvedValueOnce({ kind: "none" });
+      sftp.writeFileElevated.mockResolvedValueOnce(undefined);
+      await broker.saveElevated("srv-1", "/etc/other", Buffer.from("y")); // fast path, remembrance still on
+
+      sftp.probeElevation.mockResolvedValueOnce({ kind: "password-required" });
+      sftp.writeFileElevated.mockResolvedValueOnce(undefined);
+      await broker.saveElevated("srv-1", "/etc/b", Buffer.from("z")); // should reuse the cache, no new prompt
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+      expect(sftp.writeFileElevated).toHaveBeenLastCalledWith("srv-1", "/etc/b", expect.any(Buffer), { password: "s3cret", createMode: undefined });
+    });
+  });
+
   describe("clearCachedPassword", () => {
     it("drops the cached password for a server, forcing a re-prompt on the next save", async () => {
       rememberPassword = true;

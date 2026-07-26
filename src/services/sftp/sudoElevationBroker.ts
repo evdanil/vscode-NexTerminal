@@ -61,6 +61,15 @@ export class SudoElevationBroker implements ElevationBroker {
       return false;
     }
 
+    // Authoritative place for the "remembrance off drops the cache" rule: the passwordless
+    // fast path below (probe -> "none") writes and returns without ever reaching
+    // saveWithPassword, so clearing only there (as before) left a stale password cached
+    // whenever the remote sudo timestamp was still valid. Clearing here, ahead of the probe,
+    // covers every path.
+    if (!readSudoSetting("sudo.rememberPasswordForSession", false)) {
+      this.passwordCache.delete(serverId);
+    }
+
     try {
       const failure = await this.sftp.probeElevation(serverId);
       if (failure.kind !== "password-required") {
@@ -106,13 +115,10 @@ export class SudoElevationBroker implements ElevationBroker {
     content: Buffer,
     knownMode?: number
   ): Promise<boolean> {
+    // The remembrance-off cache clear is handled once, up front, in saveElevated — this
+    // method is only ever reached after that clear has already run. `remember` is still
+    // needed here to gate whether a successful password gets cached below.
     const remember = readSudoSetting("sudo.rememberPasswordForSession", false);
-    if (!remember) {
-      // Consent for reuse is only valid while the setting is on. Drop any entry
-      // already held for this server so turning the setting off takes effect on
-      // the very next save, not at disconnect.
-      this.passwordCache.delete(serverId);
-    }
     let password = remember ? this.passwordCache.get(serverId) ?? (await this.promptPassword(serverId)) : await this.promptPassword(serverId);
     if (!password) {
       return false;
