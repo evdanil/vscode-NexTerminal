@@ -231,20 +231,28 @@ Add this to your PowerShell profile (`$PROFILE`) to make it permanent.
 
 - **Encrypted Backup**: Run `Nexus: Export Backup` to create a master-password-protected backup including all profiles, settings, saved credentials, the user `.ssh` folder, and the configured Nexus scripts folder
 - **Share Export**: Run `Nexus: Export Configuration` to create a sanitized export safe for sharing (credentials stripped, learned hardware identifiers removed, IDs remapped)
-- **Import**: Run `Nexus: Import Configuration` to restore from either format. Merge skips existing local `.ssh` / script files; Replace overwrites files present in the backup but does not delete extra local files.
+- **Import**: Run `Nexus: Import…` — also reachable from the Command Center's `...` overflow menu, the Command Center welcome view, and the Data Management section of Settings. It asks what you're importing, then opens the matching picker:
+  - **Paste Host List from Clipboard** / **Host List File…** — a CSV export, a device inventory, or a plain hostname list
+  - **MobaXterm INI File…** — sessions from a MobaXterm `.ini` bookmarks export
+  - **SecureCRT XML Export…** / **SecureCRT Sessions Folder…** — sessions from SecureCRT
+  - **Nexus Export File…** — an encrypted backup or a shared config (`.json`). Merge skips existing local `.ssh` / script files; Replace overwrites files present in the backup but does not delete extra local files.
+
+  If the file you picked doesn't match what you told the picker — say, you chose "Host List File…" but selected a MobaXterm export — Nexus names the mismatch and offers a one-click button to re-import it as the format it actually looks like, instead of a dead end.
+
+  `Nexus: Import from MobaXterm`, `Nexus: Import from SecureCRT`, and `Nexus: Import Servers from List (CSV/Text)` remain available in the command palette as direct shortcuts into those same pickers, for anyone who already knows exactly what they're importing.
 
 #### Import from MobaXterm or SecureCRT
 
 Power users migrating from other SSH clients can import their connection profiles directly:
 
-- **MobaXterm**: Run `Nexus: Import from MobaXterm` and select your MobaXterm `.ini` configuration file. SSH sessions are imported with their folder organization preserved.
-- **SecureCRT**: Run `Nexus: Import from SecureCRT` and select either your SecureCRT XML export file or your `Sessions/` directory. SSH sessions are imported with their hierarchy as folder groups.
+- **MobaXterm**: choose **MobaXterm INI File…** and select your MobaXterm `.ini` configuration file. SSH sessions are imported with their folder organization preserved.
+- **SecureCRT**: choose **SecureCRT XML Export…** or **SecureCRT Sessions Folder…** and select the corresponding export file or `Sessions/` directory. SSH sessions are imported with their hierarchy as folder groups.
 
 Both importers extract hostname, port, and username from each SSH session. Non-SSH sessions (RDP, Telnet, etc.) are skipped. Imported servers default to password authentication.
 
 #### Import a device list (CSV / text)
 
-For everyone else — a spreadsheet export, a device inventory, or just a list of hostnames — run `Nexus: Import Servers from List (CSV/Text)` and choose **Paste from Clipboard** or **Choose File…** (`.csv`, `.txt`, `.tsv`, up to 2 MB and 5,000 rows; anything beyond the row cap is reported, not silently dropped). It's also linked from the empty Command Center welcome view and the Data Management section of Settings, and `Nexus: Import Configuration` offers to hand off to it if you point it at a CSV instead of a Nexus JSON export.
+For everyone else — a spreadsheet export, a device inventory, or just a list of hostnames — choose **Paste Host List from Clipboard** or **Host List File…** (`.csv`, `.txt`, `.tsv`, up to 2 MB and 5,000 rows; anything beyond the row cap is reported, not silently dropped).
 
 Accepted formats:
 
@@ -265,7 +273,7 @@ If any row omits a username you're prompted once for a default (pre-filled with 
 
 #### Hand-writing an import file
 
-`Nexus: Import Configuration` also accepts a minimal hand-written JSON file — useful for one connection or a quick script, without going through any importer:
+Choosing **Nexus Export File…** also accepts a minimal hand-written JSON file — useful for one connection or a quick script, without going through any other importer:
 
 ```json
 {
