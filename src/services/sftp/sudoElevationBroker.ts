@@ -148,6 +148,9 @@ export class SudoElevationBroker implements ElevationBroker {
     const cached = (remember ? this.passwordCache.get(serverId) : undefined) ?? this.peekGracePassword(serverId);
     let password: string;
     let enteredFresh = false;
+    // Timestamped the instant promptPassword resolves — see the graceCache.set below for why
+    // this can't be Date.now() taken after the write.
+    let enteredAt = 0;
     if (cached !== undefined) {
       password = cached;
     } else {
@@ -157,6 +160,7 @@ export class SudoElevationBroker implements ElevationBroker {
       }
       password = entered;
       enteredFresh = true;
+      enteredAt = Date.now();
     }
 
     try {
@@ -173,6 +177,7 @@ export class SudoElevationBroker implements ElevationBroker {
       }
       password = entered;
       enteredFresh = true;
+      enteredAt = Date.now();
       try {
         await this.sftp.writeFileElevated(serverId, remotePath, content, { password, createMode: knownMode });
       } catch (retryError) {
@@ -190,8 +195,17 @@ export class SudoElevationBroker implements ElevationBroker {
     if (enteredFresh) {
       // Only a freshly-typed password (re)starts the window — a cache hit above
       // must never land here, or reuse would keep pushing the expiry out and the
-      // window would become sliding (explicitly disallowed).
-      this.graceCache.set(serverId, { password, expiresAt: Date.now() + GRACE_WINDOW_MS });
+      // window would become sliding (explicitly disallowed). The window is anchored to
+      // enteredAt (captured the moment promptPassword resolved), never to Date.now() here:
+      // the elevated write above (SFTP staging + sudo) can take up to commandTimeoutMs
+      // (default 300s), and starting the clock only after it finishes would let the grace
+      // window run long past the promised 30s. If the write alone already outlasted the
+      // window, the entry would be dead on arrival — skip storing it rather than caching
+      // something already expired.
+      const expiresAt = enteredAt + GRACE_WINDOW_MS;
+      if (Date.now() < expiresAt) {
+        this.graceCache.set(serverId, { password, expiresAt });
+      }
     }
     this.announceSuccess(remotePath);
     return true;
