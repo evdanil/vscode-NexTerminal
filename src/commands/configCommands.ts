@@ -1447,10 +1447,20 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       });
       if (!uris || uris.length === 0) return;
 
+      // Stat before reading: rejects an over-limit file (an accidental large
+      // selection, or a file on a remote/virtual filesystem) without loading it
+      // — and the Buffer/string copies decoding it would take — into memory.
+      const stat = await vscode.workspace.fs.stat(uris[0]);
+      if (stat.size > INVENTORY_MAX_BYTES) {
+        void vscode.window.showErrorMessage("The list exceeds the 2 MB size limit.");
+        return;
+      }
+
       const raw = await vscode.workspace.fs.readFile(uris[0]);
       text = Buffer.from(raw).toString("utf8");
     }
 
+    // Backstop for the clipboard path, which has no URI to stat ahead of time.
     if (Buffer.byteLength(text, "utf8") > INVENTORY_MAX_BYTES) {
       void vscode.window.showErrorMessage("The list exceeds the 2 MB size limit.");
       return;

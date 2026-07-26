@@ -208,15 +208,15 @@ describe("parseInventoryList", () => {
       expect(r.issues).toHaveLength(0);
     });
 
-    it("parses a bracketed IPv6 literal with a port", () => {
+    it("parses a bracketed IPv6 literal with a port, storing the bare literal without brackets (Codex round 2 finding A)", () => {
       const r = parseInventoryList("[2001:db8::1]:2022\n", { defaultUsername: "admin" });
-      expect(r.sessions[0]).toMatchObject({ host: "[2001:db8::1]", port: 2022 });
+      expect(r.sessions[0]).toMatchObject({ host: "2001:db8::1", port: 2022 });
       expect(r.issues).toHaveLength(0);
     });
 
-    it("parses a bracketed IPv6 literal with no port, defaulting the port", () => {
+    it("parses a bracketed IPv6 literal with no port, storing the bare literal and defaulting the port (Codex round 2 finding A)", () => {
       const r = parseInventoryList("[2001:db8::1]\n", { defaultUsername: "admin" });
-      expect(r.sessions[0]).toMatchObject({ host: "[2001:db8::1]", port: 22 });
+      expect(r.sessions[0]).toMatchObject({ host: "2001:db8::1", port: 22 });
       expect(r.issues).toHaveLength(0);
     });
 
@@ -238,6 +238,27 @@ describe("parseInventoryList", () => {
       expect(r.sessions).toHaveLength(0);
       expect(r.skippedCount).toBe(1);
       expect(r.issues[0].reason).toMatch(/invalid port "notaport"/);
+    });
+
+    it("rejects a bracketed IPv6 literal with an out-of-range port suffix instead of silently defaulting the port (Codex round 2 finding B)", () => {
+      const r = parseInventoryList("[2001:db8::1]:70000\n", { defaultUsername: "admin" });
+      expect(r.sessions).toHaveLength(0);
+      expect(r.skippedCount).toBe(1);
+      expect(r.issues[0].reason).toMatch(/invalid port "70000"/);
+    });
+
+    it("rejects a bracketed IPv6 literal with a non-numeric port suffix instead of silently defaulting the port (Codex round 2 finding B)", () => {
+      const r = parseInventoryList("[2001:db8::1]:notaport\n", { defaultUsername: "admin" });
+      expect(r.sessions).toHaveLength(0);
+      expect(r.skippedCount).toBe(1);
+      expect(r.issues[0].reason).toMatch(/invalid port "notaport"/);
+    });
+
+    it("rejects garbage trailing a bracketed IPv6 literal's closing bracket instead of silently discarding it (Codex round 2 finding B)", () => {
+      const r = parseInventoryList("[2001:db8::1]junk\n", { defaultUsername: "admin" });
+      expect(r.sessions).toHaveLength(0);
+      expect(r.skippedCount).toBe(1);
+      expect(r.issues[0].reason).toMatch(/invalid (port|host) "junk"/);
     });
   });
 });

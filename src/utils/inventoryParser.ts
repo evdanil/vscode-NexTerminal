@@ -44,12 +44,14 @@ interface HostShorthand {
   username?: string;
   port?: number;
   /**
-   * Raw text after a single trailing colon that looked like an attempted port but
-   * failed isPortLike (out of range or non-numeric). Only set when the host side of
-   * that colon is unambiguously not an IPv6 literal (no further colons) — a bare or
-   * bracketed IPv6 host is left untouched. Surfaced by the caller as an invalid-port
-   * issue instead of silently folding "host:garbage" into HOST_RE's colon-tolerant
-   * hostname grammar (which exists only to permit literal IPv6 addresses).
+   * Raw text after a trailing colon that looked like an attempted port but failed
+   * isPortLike (out of range or non-numeric); also set for any non-empty text
+   * trailing a bracketed IPv6 literal's closing `]` that isn't a `:port` at all
+   * (e.g. "[::1]junk"). Only set when the host side is unambiguous — a bare,
+   * unsuffixed host (bracketed or not) is left untouched. Surfaced by the caller
+   * as an invalid-port issue instead of silently folding "host:garbage" (or
+   * "[ipv6]garbage") into HOST_RE's colon-tolerant hostname grammar (which
+   * exists only to permit literal IPv6 addresses).
    */
   invalidPortSuffix?: string;
 }
@@ -246,7 +248,13 @@ function resolvePositional(fields: string[]): PositionalFields {
   return { host, name: "", username: "", port: "", folder: "" };
 }
 
-/** Pulls `user@host:port` shorthand out of a raw host field. IPv6 literals in `[...]` are left intact. */
+/**
+ * Pulls `user@host:port` shorthand out of a raw host field. `[...]` around an
+ * IPv6 literal is endpoint-notation input syntax only — it exists solely to
+ * disambiguate the address's own colons from a trailing `:port` — so the
+ * brackets are stripped here; the stored host is the bare literal a
+ * hand-entered IPv6 server would use. Do not "restore" them later.
+ */
 function parseHostShorthand(raw: string): HostShorthand {
   let rest = raw;
   let username: string | undefined;
@@ -258,12 +266,22 @@ function parseHostShorthand(raw: string): HostShorthand {
   if (rest.startsWith("[")) {
     const closeIdx = rest.indexOf("]");
     if (closeIdx !== -1) {
-      const host = rest.slice(0, closeIdx + 1);
+      const host = rest.slice(1, closeIdx);
       const remainder = rest.slice(closeIdx + 1);
-      if (remainder.startsWith(":") && isPortLike(remainder.slice(1))) {
-        return { host, username, port: parseInt(remainder.slice(1), 10) };
+      if (remainder === "") {
+        return { host, username };
       }
-      return { host, username };
+      if (remainder.startsWith(":")) {
+        const portPart = remainder.slice(1);
+        if (isPortLike(portPart)) {
+          return { host, username, port: parseInt(portPart, 10) };
+        }
+        return { host, username, invalidPortSuffix: portPart };
+      }
+      // Non-empty remainder that isn't even a ":port" attempt (e.g. "[::1]junk") —
+      // same invalid-port treatment as a malformed numeric suffix, rather than
+      // silently discarding it.
+      return { host, username, invalidPortSuffix: remainder };
     }
   }
   const colonIdx = rest.lastIndexOf(":");
