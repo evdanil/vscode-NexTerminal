@@ -141,10 +141,12 @@ describe("SftpService elevated writes", () => {
     await promise;
 
     expect(order).toEqual([`write:${expectedTempPath}:600`, "sudo-install", `unlink:${expectedTempPath}`]);
-    expect(capturedCommand).toContain("sudo -S -p ''");
+    // No password supplied here — this is the non-interactive optimistic attempt
+    // (Codex round 6 finding 2), so sudo gets -n, not -S.
+    expect(capturedCommand).toContain("sudo -n -p ''");
     // Existence is decided by the remote shell, not a pre-resolved boolean — the
     // command is identical whether the caller thinks the target exists or not.
-    expect(capturedCommand).toBe(buildSudoInstallCommand(expectedTempPath, "/etc/hosts"));
+    expect(capturedCommand).toBe(buildSudoInstallCommand(expectedTempPath, "/etc/hosts", undefined, false));
   });
 
   it("does not probe the target's existence before staging: closing that window is the point (Codex round 4 finding A — even the in-shell `[ -e ]` check still raced the redirect; umask alone decides the outcome now)", async () => {
@@ -264,17 +266,6 @@ describe("SftpService elevated writes", () => {
     expect(capturedCommand).not.toContain("umask 22");
   });
 
-  it("probeElevation runs sudo -n -v using the operation timeout, not the default command timeout", async () => {
-    const execSpy = vi.spyOn(service as any, "execCommand").mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
-
-    await expect(service.probeElevation("srv-1")).resolves.toEqual({ kind: "none" });
-
-    const operationTimeoutMs = (service as any).operationTimeoutMs;
-    const commandTimeoutMs = (service as any).commandTimeoutMs;
-    expect(operationTimeoutMs).not.toBe(commandTimeoutMs);
-    expect(execSpy).toHaveBeenCalledWith("srv-1", "sudo -n -v", operationTimeoutMs, undefined);
-  });
-
   it("writeFileElevated installs via sudo using the operation timeout, not the default command timeout", async () => {
     sftp.createWriteStream.mockReturnValue(createFakeWriteStream());
     sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
@@ -285,7 +276,7 @@ describe("SftpService elevated writes", () => {
     const operationTimeoutMs = (service as any).operationTimeoutMs;
     expect(execSpy).toHaveBeenCalledWith(
       "srv-1",
-      expect.stringContaining("sudo -S -p ''"),
+      expect.stringContaining("sudo -n -p ''"),
       operationTimeoutMs,
       undefined
     );

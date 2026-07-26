@@ -73,35 +73,36 @@ export class SudoElevationBroker implements ElevationBroker {
     }
 
     // Authoritative place for the "remembrance off drops the cache" rule: the passwordless
-    // fast path below (probe -> "none") writes and returns without ever reaching
+    // fast path below (the optimistic attempt) writes and returns without ever reaching
     // saveWithPassword, so clearing only there (as before) left a stale password cached
-    // whenever the remote sudo timestamp was still valid. Clearing here, ahead of the probe,
-    // covers every path.
-    if (!readSudoSetting("sudo.rememberPasswordForSession", false)) {
+    // whenever the remote sudo timestamp was still valid. Clearing here, ahead of the
+    // attempt, covers every path.
+    const remember = readSudoSetting("sudo.rememberPasswordForSession", false);
+    if (!remember) {
       this.passwordCache.delete(serverId);
     }
 
+    // Skip the optimistic no-password attempt when a password is already on hand
+    // (session cache, or the grace window above): that account is already known to
+    // need one for this server, so the extra round trip just to watch sudo -n fail
+    // again buys nothing.
+    const hasUsablePassword = (remember && this.passwordCache.has(serverId)) || this.peekGracePassword(serverId) !== undefined;
+
     try {
-      const failure = await this.sftp.probeElevation(serverId);
-      if (failure.kind !== "password-required") {
-        // "none" needs no password; the other kinds (not-permitted / no-sudo /
-        // requires-tty) are not password problems — let writeFileElevated surface
-        // the same plain-language message runElevatedInstall already produces for
-        // them rather than re-deriving it here.
+      if (!hasUsablePassword) {
         try {
+          // The attempt itself is the probe: sudo -n refuses before the target is
+          // ever touched if a password is required, so this safely tests the exact
+          // install command's authorization instead of a separate `sudo -n -v`
+          // probe, which can't see command-scoped sudoers rules (Codex round 6).
           await this.sftp.writeFileElevated(serverId, remotePath, content, { createMode: knownMode });
+          this.announceSuccess(remotePath);
+          return true;
         } catch (error) {
           if (!(error instanceof SudoPasswordRequiredError)) {
             throw error;
           }
-          // The non-interactive probe said "none" (a valid cached sudo timestamp),
-          // but that timestamp lapsed in the moment before the install actually ran.
-          // Fall through to the interactive path instead of failing a save the user
-          // would just have to retry anyway.
-          return await this.saveWithPassword(serverId, remotePath, content, knownMode);
         }
-        this.announceSuccess(remotePath);
-        return true;
       }
       return await this.saveWithPassword(serverId, remotePath, content, knownMode);
     } catch (error) {

@@ -10,7 +10,6 @@ import {
   classifySudoFailure,
   ElevatedInstallFailedError,
   isPermissionDeniedError,
-  probeSudoNonInteractive,
   runElevatedInstall,
   SudoNotPermittedError,
   SudoPasswordRequiredError,
@@ -127,6 +126,11 @@ describe("buildSudoInstallCommand", () => {
     expect(() => buildSudoInstallCommand("", "/etc/hosts")).toThrow();
     expect(() => buildSudoInstallCommand("/tmp/x", "relative/path")).toThrow();
   });
+
+  it("uses -n (non-interactive) when no password is supplied, and -S when one is (Codex round 6 finding 2: the install attempt is its own probe)", () => {
+    expect(buildSudoInstallCommand("/tmp/x", "/etc/hosts", 0o644, false)).toContain("sudo -n -p ''");
+    expect(buildSudoInstallCommand("/tmp/x", "/etc/hosts", 0o644, true)).toContain("sudo -S -p ''");
+  });
 });
 
 describe("buildSudoInstallCommand — real shell behavior (Codex round 4 finding A)", () => {
@@ -197,39 +201,6 @@ describe("classifySudoFailure", () => {
 
   it("returns none on success", () => {
     expect(classifySudoFailure({ exitCode: 0, stdout: "", stderr: "" }).kind).toBe("none");
-  });
-});
-
-describe("probeSudoNonInteractive", () => {
-  it("reports none when sudo -n succeeds", async () => {
-    const exec = vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
-    await expect(probeSudoNonInteractive(exec)).resolves.toEqual({ kind: "none" });
-    expect(exec).toHaveBeenCalledWith("sudo -n -v");
-  });
-
-  it("reports password-required when sudo -n needs a password", async () => {
-    const exec = vi.fn().mockResolvedValue({ exitCode: 1, stdout: "", stderr: "sudo: a password is required" });
-    await expect(probeSudoNonInteractive(exec)).resolves.toEqual({ kind: "password-required" });
-  });
-
-  it("treats an unrecognized non-zero exit as password-required, not unknown", async () => {
-    // Stderr wording is locale/distro-dependent; for a failing non-interactive probe
-    // specifically, password-required is the correct retryable guess even when the
-    // text doesn't match a known pattern.
-    const exec = vi.fn().mockResolvedValue({ exitCode: 1, stdout: "", stderr: "" });
-    await expect(probeSudoNonInteractive(exec)).resolves.toEqual({ kind: "password-required" });
-  });
-
-  it("still reports a specific failure kind when stderr matches a known pattern", async () => {
-    const exec = vi.fn().mockResolvedValue({
-      exitCode: 1,
-      stdout: "",
-      stderr: "user is not in the sudoers file.",
-    });
-    await expect(probeSudoNonInteractive(exec)).resolves.toEqual({
-      kind: "not-permitted",
-      detail: "user is not in the sudoers file.",
-    });
   });
 });
 
@@ -324,6 +295,16 @@ describe("runElevatedInstall", () => {
     await expect(
       runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts" })
     ).resolves.toBeUndefined();
+  });
+
+  it("picks -n with no password and -S with one, deriving interactive from password presence (Codex round 6 finding 2)", async () => {
+    const exec = vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    await runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts" });
+    expect(exec.mock.calls[0][0]).toContain("sudo -n");
+
+    exec.mockClear();
+    await runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts", password: "x" });
+    expect(exec.mock.calls[0][0]).toContain("sudo -S");
   });
 });
 

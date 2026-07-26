@@ -9,10 +9,8 @@ import type { SshConnection, SshFactory } from "../ssh/contracts";
 import { RemoteDirectoryWatcher, type RemoteChangeEvent, type WatchMode } from "./remoteDirectoryWatcher";
 import {
   buildTempStagePath,
-  probeSudoNonInteractive,
   runElevatedInstall,
   type ElevatedExec,
-  type SudoFailure,
 } from "./elevatedWrite";
 
 export interface DirectoryEntry {
@@ -446,11 +444,6 @@ export class SftpService {
       }
     }
     this.invalidateCache(serverId, parentDir(remotePath));
-  }
-
-  /** Checks whether elevation is possible without prompting (NOPASSWD or cached sudo credentials). */
-  public async probeElevation(serverId: string): Promise<SudoFailure> {
-    return probeSudoNonInteractive(this.makeElevatedExec(serverId));
   }
 
   private makeElevatedExec(serverId: string): ElevatedExec {
