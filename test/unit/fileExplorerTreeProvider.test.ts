@@ -224,6 +224,21 @@ describe("FileExplorerTreeProvider", () => {
     expect(items[3].entry.name).toBe("zebra.txt");
   });
 
+  it("sorts numbered file names in numeric order, not lexicographic", async () => {
+    const entries: DirectoryEntry[] = [
+      { ...fileEntry, name: "file10.log" },
+      { ...fileEntry, name: "file2.log" },
+      { ...fileEntry, name: "file1.log" },
+    ];
+    (sftp.readDirectory as any).mockResolvedValue(entries);
+
+    provider.setActiveServer(testServer, "/home/dev");
+    const children = await provider.getChildren();
+    const items = children.filter((c) => c instanceof FileTreeItem && c.label !== ".") as FileTreeItem[];
+
+    expect(items.map((i) => i.entry.name)).toEqual(["file1.log", "file2.log", "file10.log"]);
+  });
+
   it("expands directory items into child entries", async () => {
     const childEntries: DirectoryEntry[] = [
       { ...fileEntry, name: "nested.txt" },

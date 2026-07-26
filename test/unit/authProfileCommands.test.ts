@@ -249,4 +249,25 @@ describe("authProfileCommands", () => {
       expect.any(Object)
     );
   });
+
+  it("offers the auth profile QuickPick in natural (numeric) name order", async () => {
+    const server = makeServer({ id: "s1", username: "old" });
+    const { ctx } = await setupContext({
+      servers: [server],
+      authProfiles: [
+        makeAuthProfile({ id: "ap10", name: "A10", username: "u" }),
+        makeAuthProfile({ id: "ap2", name: "A2", username: "u" }),
+        makeAuthProfile({ id: "ap1", name: "A1", username: "u" })
+      ]
+    });
+    registerAuthProfileCommands(ctx);
+    mockShowQuickPick.mockResolvedValue(undefined);
+
+    const applyToServer = registeredCommands.get("nexus.authProfile.applyToServer");
+    expect(applyToServer).toBeDefined();
+    await applyToServer!(new ServerTreeItem(server));
+
+    const items = mockShowQuickPick.mock.calls[0][0] as Array<{ profile: AuthProfile }>;
+    expect(items.map((item) => item.profile.name)).toEqual(["A1", "A2", "A10"]);
+  });
 });

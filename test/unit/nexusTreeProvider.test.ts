@@ -377,6 +377,31 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
     expect(childFolders).toContain("Team/Prod");
     expect(childFolders).not.toContain("Team/Dev");
   });
+
+  it("orders servers and sibling folders numerically instead of lexicographically", () => {
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [
+        makeServer({ id: "s10", name: "A10" }),
+        makeServer({ id: "s2", name: "A2" }),
+        makeServer({ id: "s1", name: "A1" }),
+        makeServer({ id: "s-site10", name: "site10-router", group: "Site10" }),
+        makeServer({ id: "s-site2", name: "site2-router", group: "Site2" })
+      ]
+    });
+
+    const rootChildren = provider.getChildren(undefined);
+    const serverNames = rootChildren
+      .filter((c): c is ServerTreeItem => c instanceof ServerTreeItem)
+      .map((c) => c.server.name);
+    expect(serverNames).toEqual(["A1", "A2", "A10"]);
+
+    const folderPaths = rootChildren
+      .filter((c): c is FolderTreeItem => c instanceof FolderTreeItem)
+      .map((c) => c.folderPath);
+    expect(folderPaths).toEqual(["Site2", "Site10"]);
+  });
 });
 
 function makeSerial(overrides: Partial<SerialProfile> = {}): SerialProfile {
