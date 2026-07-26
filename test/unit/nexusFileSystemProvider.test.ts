@@ -587,6 +587,28 @@ describe("NexusFileSystemProvider", () => {
     service.disconnect("srv-1");
   });
 
+  it("delete shapes a permission-denied failure into a parent-directory NoPermissions error", async () => {
+    (sftp.lstat as any).mockResolvedValue(fileEntry);
+    (sftp.delete as any).mockRejectedValue(permissionDeniedError());
+
+    const uri = buildUri("srv-1", "/etc/ssh/sshd_config2");
+    const error = await provider.delete(uri, { recursive: false }).catch((e) => e);
+
+    expect(error.message).toMatch(/parent directory/i);
+    expect(error.message).toMatch(/not writable/i);
+    expect(error.message).toMatch(/sudo|elevat/i);
+    expect(error.message).toMatch(/terminal/i);
+  });
+
+  it("delete propagates a non-permission failure unchanged", async () => {
+    (sftp.lstat as any).mockResolvedValue(fileEntry);
+    const original = new Error("ECONNRESET");
+    (sftp.delete as any).mockRejectedValue(original);
+
+    const uri = buildUri("srv-1", "/home/dev/test.txt");
+    await expect(provider.delete(uri, { recursive: false })).rejects.toBe(original);
+  });
+
   it("rename rejects cross-server operations", async () => {
     const oldUri = buildUri("srv-1", "/home/dev/old.txt");
     const newUri = buildUri("srv-2", "/home/dev/new.txt");
@@ -621,6 +643,28 @@ describe("NexusFileSystemProvider", () => {
     expect(events[1].type).toBe(1); // Created
   });
 
+  it("rename shapes a permission-denied failure into a parent-directory NoPermissions error", async () => {
+    (sftp.rename as any).mockRejectedValue(permissionDeniedError());
+
+    const oldUri = buildUri("srv-1", "/etc/ssh/sshd_config2");
+    const newUri = buildUri("srv-1", "/etc/ssh/sshd_config2.bak");
+    const error = await provider.rename(oldUri, newUri).catch((e) => e);
+
+    expect(error.message).toMatch(/parent directory/i);
+    expect(error.message).toMatch(/not writable/i);
+    expect(error.message).toMatch(/sudo|elevat/i);
+    expect(error.message).toMatch(/terminal/i);
+  });
+
+  it("rename propagates a non-permission failure unchanged", async () => {
+    const original = new Error("ECONNRESET");
+    (sftp.rename as any).mockRejectedValue(original);
+
+    const oldUri = buildUri("srv-1", "/home/dev/old.txt");
+    const newUri = buildUri("srv-1", "/home/dev/new.txt");
+    await expect(provider.rename(oldUri, newUri)).rejects.toBe(original);
+  });
+
   it("createDirectory delegates and fires create event", async () => {
     (sftp.createDirectory as any).mockResolvedValue(undefined);
 
@@ -632,6 +676,26 @@ describe("NexusFileSystemProvider", () => {
 
     expect(sftp.createDirectory).toHaveBeenCalledWith("srv-1", "/home/dev/newdir");
     expect(events[0].type).toBe(1); // Created
+  });
+
+  it("createDirectory shapes a permission-denied failure into a parent-directory NoPermissions error", async () => {
+    (sftp.createDirectory as any).mockRejectedValue(permissionDeniedError());
+
+    const uri = buildUri("srv-1", "/etc/ssh/newdir");
+    const error = await provider.createDirectory(uri).catch((e) => e);
+
+    expect(error.message).toMatch(/parent directory/i);
+    expect(error.message).toMatch(/not writable/i);
+    expect(error.message).toMatch(/sudo|elevat/i);
+    expect(error.message).toMatch(/terminal/i);
+  });
+
+  it("createDirectory propagates a non-permission failure unchanged", async () => {
+    const original = new Error("ECONNRESET");
+    (sftp.createDirectory as any).mockRejectedValue(original);
+
+    const uri = buildUri("srv-1", "/home/dev/newdir");
+    await expect(provider.createDirectory(uri)).rejects.toBe(original);
   });
 
   it("copy delegates nexterm->nexterm to copyRemote", async () => {

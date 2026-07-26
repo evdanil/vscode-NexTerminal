@@ -29,6 +29,21 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * delete/rename/createDirectory all fail on permission grounds because of the
+ * *parent* directory's write bit, not the target's — the opposite of writeFile,
+ * whose sudo elevation only ever rewrites file contents through the target's
+ * existing inode. There is no elevation path for these three (tracked separately,
+ * issue #32), so shape the error to say so instead of surfacing the raw ssh2 text.
+ */
+function parentNotWritableMessage(description: string): string {
+  return (
+    `Cannot ${description}: the parent directory is not writable by the SSH user — this needs write ` +
+    "access to the directory, not the file. Elevated (sudo) saves apply only to file contents, so this " +
+    "isn't elevated; run it from a terminal on the host instead (Nexus has terminals)."
+  );
+}
+
 function getMaxFileSize(): number {
   return readBoundedNumber("nexus.sftp", "maxOpenFileSizeMB", 5, 1, 200) * 1024 * 1024;
 }
@@ -220,13 +235,24 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscod
     const entry = await this.sftp.lstat(serverId, remotePath);
     if (entry.isSymlink) {
       // Always unlink symlinks directly — never recurse into their targets
-      await this.sftp.delete(serverId, remotePath, options);
+      await this.deleteRemote(serverId, remotePath, options);
     } else if (entry.isDirectory && !options.recursive) {
       throw vscode.FileSystemError.NoPermissions("Directory is not empty (use recursive delete)");
     } else {
-      await this.sftp.delete(serverId, remotePath, options);
+      await this.deleteRemote(serverId, remotePath, options);
     }
     this.onDidChangeFileEmitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
+  }
+
+  private async deleteRemote(serverId: string, remotePath: string, options: { recursive: boolean }): Promise<void> {
+    try {
+      await this.sftp.delete(serverId, remotePath, options);
+    } catch (error) {
+      if (isPermissionDeniedError(error)) {
+        throw vscode.FileSystemError.NoPermissions(parentNotWritableMessage(`delete ${remotePath}`));
+      }
+      throw error;
+    }
   }
 
   public async rename(oldUri: vscode.Uri, newUri: vscode.Uri): Promise<void> {
@@ -235,7 +261,16 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscod
     if (oldParsed.serverId !== newParsed.serverId) {
       throw vscode.FileSystemError.NoPermissions("Cannot rename across servers");
     }
-    await this.sftp.rename(oldParsed.serverId, oldParsed.remotePath, newParsed.remotePath);
+    try {
+      await this.sftp.rename(oldParsed.serverId, oldParsed.remotePath, newParsed.remotePath);
+    } catch (error) {
+      if (isPermissionDeniedError(error)) {
+        throw vscode.FileSystemError.NoPermissions(
+          parentNotWritableMessage(`rename ${oldParsed.remotePath} to ${newParsed.remotePath}`)
+        );
+      }
+      throw error;
+    }
     this.onDidChangeFileEmitter.fire([
       { type: vscode.FileChangeType.Deleted, uri: oldUri },
       { type: vscode.FileChangeType.Created, uri: newUri },
@@ -293,7 +328,14 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscod
 
   public async createDirectory(uri: vscode.Uri): Promise<void> {
     const { serverId, remotePath } = parseUri(uri);
-    await this.sftp.createDirectory(serverId, remotePath);
+    try {
+      await this.sftp.createDirectory(serverId, remotePath);
+    } catch (error) {
+      if (isPermissionDeniedError(error)) {
+        throw vscode.FileSystemError.NoPermissions(parentNotWritableMessage(`create directory ${remotePath}`));
+      }
+      throw error;
+    }
     this.onDidChangeFileEmitter.fire([{ type: vscode.FileChangeType.Created, uri }]);
   }
 
