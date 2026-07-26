@@ -4885,7 +4885,7 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
     Remember Sudo Password for Session
   </label>
   
-  <div class="setting-desc">Keep the sudo password in memory for the duration of the session. Never written to disk or to VS Code&#39;s secret storage.</div>
+  <div class="setting-desc">Keep the sudo password in memory until that server disconnects or the window closes, instead of for the rest of the VS Code session. Never written to disk or to VS Code&#39;s secret storage. Turning this off does not guarantee a prompt on every save — the remote host&#39;s own sudo credential timestamp (~5 minutes) can still skip it.</div>
   <span class="save-indicator" aria-live="polite" data-for="nexus.sftp.sudo.rememberPasswordForSession"></span>
 </div>
 
