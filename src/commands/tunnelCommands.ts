@@ -17,6 +17,7 @@ import { serverFormDefinition, tunnelFormDefinition } from "../ui/formDefinition
 import type { FormValues } from "../ui/formTypes";
 import { TunnelTreeItem, formatTunnelRoute } from "../ui/tunnelTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import { naturalCompare } from "../utils/naturalCompare";
 import { isTunnelRouteChanged, resolveBrowserUrl } from "../utils/tunnelProfile";
 import { browseForKey, collectGroups, formValuesToServer } from "./serverCommands";
 import type { CommandContext } from "./types";
@@ -101,7 +102,7 @@ export async function resolveServerForTunnel(
   const servers = core
     .getSnapshot()
     .servers.slice()
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .sort((a, b) => naturalCompare(a.name, b.name));
   if (servers.length === 0) {
     vscode.window.showWarningMessage("No Nexus servers configured. Add a server first.");
     return undefined;
@@ -203,11 +204,14 @@ async function pickTunnel(core: NexusCore): Promise<TunnelProfile | undefined> {
     return undefined;
   }
   const pick = await vscode.window.showQuickPick(
-    tunnels.map((profile) => ({
-      label: profile.name,
-      description: formatTunnelRoute(profile),
-      profile
-    })),
+    tunnels
+      .slice()
+      .sort((a, b) => naturalCompare(a.name, b.name))
+      .map((profile) => ({
+        label: profile.name,
+        description: formatTunnelRoute(profile),
+        profile
+      })),
     { title: "Select Tunnel Profile" }
   );
   return pick?.profile;

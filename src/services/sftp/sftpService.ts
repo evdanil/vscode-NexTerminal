@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { SFTPWrapper, FileEntry, Stats, TransferOptions } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import { clamp } from "../../utils/helpers";
@@ -6,6 +7,11 @@ import { shellEscape } from "../../utils/shellEscape";
 import { isSafeEntryName, joinRemoteEntryPath } from "../../utils/pathSafety";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
 import { RemoteDirectoryWatcher, type RemoteChangeEvent, type WatchMode } from "./remoteDirectoryWatcher";
+import {
+  buildTempStagePath,
+  runElevatedInstall,
+  type ElevatedExec,
+} from "./elevatedWrite";
 
 export interface DirectoryEntry {
   name: string;
@@ -33,6 +39,7 @@ const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
 const MAX_DELETE_DEPTH = 100;
 const MAX_DELETE_OPS = 10_000;
 const SSH_FX_NO_SUCH_FILE = 2;
+const SSH_FX_PERMISSION_DENIED = 3;
 
 function createTimeoutError(label: string, timeoutMs: number): Error {
   return new Error(`SFTP ${label} timed out after ${Math.round(timeoutMs / 1000)}s`);
@@ -385,6 +392,67 @@ export class SftpService {
     this.invalidateCache(serverId, parentDir(remotePath));
   }
 
+  /**
+   * Writes content to a root-owned (or otherwise permission-denied) remote file by
+   * staging it to a user-writable /tmp path over SFTP, then moving it into place with
+   * sudo over an SSH exec channel. Whether the target already exists is never
+   * resolved here via an up-front `stat` — this staging upload can be slow, and a
+   * stat done before it started would leave a window where the target is deleted or
+   * log-rotated before the install runs. See `buildSudoInstallCommand` for how the
+   * install itself now avoids that race without an existence check at all.
+   *
+   * If the target has vanished since it was last read (log rotation, a concurrent
+   * delete), this recreates it: `options.createMode` — the mode the caller last
+   * observed via stat/readFile — governs the umask used for that recreate instead of
+   * a hardcoded 644, so a recreate can't silently widen a root-owned file's
+   * permissions.
+   */
+  public async writeFileElevated(
+    serverId: string,
+    remotePath: string,
+    content: Buffer,
+    options?: { password?: string; createMode?: number }
+  ): Promise<void> {
+    const session = this.getSession(serverId);
+    const tempPath = buildTempStagePath(randomUUID());
+
+    try {
+      await this.writeFileWithTimeout(
+        this.commandTimeoutMs,
+        content,
+        () =>
+          // mode is set at SSH_FXP_OPEN time, not via a later chmod: createWriteStream
+          // otherwise defaults to 0666 & umask, leaving the staged content readable by
+          // every local user on the remote host for the whole upload window.
+          session.sftp.createWriteStream(tempPath, { mode: 0o600 }) as NodeJS.WritableStream & {
+            destroy(error?: Error): void;
+            end(chunk: Buffer): void;
+          }
+      );
+      await runElevatedInstall(this.makeElevatedExec(serverId), {
+        tempPath,
+        targetPath: remotePath,
+        password: options?.password,
+        createMode: options?.createMode,
+      });
+    } finally {
+      try {
+        await this.unlink(session.sftp, tempPath);
+      } catch {
+        // Best-effort cleanup: a failed removal of the staged temp file must not
+        // mask the primary write/elevation error.
+      }
+    }
+    this.invalidateCache(serverId, parentDir(remotePath));
+  }
+
+  private makeElevatedExec(serverId: string): ElevatedExec {
+    // Elevation exec calls use operationTimeoutMs (30s default), not the much longer
+    // commandTimeoutMs (300s default): a wedged sudo must fail fast rather than block
+    // an interactive save for minutes.
+    return (command, stdin) => this.execCommand(serverId, command, this.operationTimeoutMs, stdin);
+  }
+
   public async delete(
     serverId: string,
     remotePath: string,
@@ -483,7 +551,12 @@ export class SftpService {
     });
   }
 
-  private async execCommand(serverId: string, command: string, timeoutMs?: number): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  private async execCommand(
+    serverId: string,
+    command: string,
+    timeoutMs?: number,
+    stdin?: string
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
     const effectiveTimeout = timeoutMs ?? this.commandTimeoutMs;
     const session = this.sessions.get(serverId);
     if (!session) {
@@ -538,6 +611,14 @@ export class SftpService {
       stderrStream?.on("data", onStderrData);
       stream.on("error", onError);
       stream.on("close", onClose);
+
+      // `sudo -S` reads the password from stdin and needs EOF to stop waiting;
+      // closing stdin unconditionally is a no-op for commands that ignore it (e.g.
+      // copyRemote's `cp`).
+      if (stdin !== undefined) {
+        stream.write(stdin);
+      }
+      stream.end();
     });
   }
 

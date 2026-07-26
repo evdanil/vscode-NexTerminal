@@ -10,6 +10,8 @@ A full SSH + serial + port-forwarding client inside VS Code — without Remote-S
 - **Replaces PuTTY + MobaXterm + SecureCRT + TeraTerm** — SSH, serial consoles, local shells, port forwarding, and SFTP live in one VS Code sidebar instead of four separate windows.
 - **Unlike Remote-SSH, nothing is installed on the remote.** It's a pure client: no `vscode-server` unpacked into the target, no node process running on the far end. That matters when the far end is a Cisco switch, a bastion you only get a shell on, or a change-controlled box where you can't drop an agent.
 - **Bring your existing connections** — import session profiles straight from MobaXterm `.ini` and SecureCRT XML exports, folder hierarchy preserved, so switching costs you minutes, not a weekend.
+- **Onboard a whole rack in one paste** — feed it a CSV export or a plain list of hostnames and it creates the connections in bulk, with folders, ports, and usernames picked up from the columns. Duplicates are skipped and unparsable lines are reported with their line numbers instead of failing the batch.
+- **Edit root-owned files without dropping to a shell** — save `/etc/*` over SFTP with `sudo`, writing through the file's existing inode so owner, mode, and ACLs are preserved. Your sudo password goes to the SSH channel's stdin only: never to disk, never to secret storage, never to a log.
 
 <!-- TODO: record GIF — jump-host A→B→C chain. ~15s, loopable. -->
 ![Nexus Terminal connecting through a multi-hop jump-host chain (A → B → C) and opening a remote shell](media/demo-jump-host.gif)
@@ -161,6 +163,21 @@ You can also drag a tunnel profile onto a server in the Connectivity Hub to star
 
 In an SSH profile's advanced options, enable **Open File Explorer on first connection** to start SFTP automatically after normal Connect when the File Explorer is not already showing that server. Saving it checked disables it on any other SSH profile, and it does not run when that profile is used as a jump host, tunnel connection, group connect item, or script-started connection.
 
+#### Save as Root
+
+SFTP writes as the logged-in SSH user, so editing a root-owned file normally fails. If your SSH user has sudo rights on the remote host, Nexus can save it anyway:
+
+- **Reactive**: edit and save a root-owned file as usual. If the write is denied, Nexus offers to retry with `sudo`. Declining suppresses the offer for that file until you close its editor tab or explicitly choose **Edit as Root (sudo)**.
+- **Proactive**: right-click a file in the File Explorer and choose **Edit as Root (sudo)** to mark it editable up front — needed for files with no write bits at all (e.g. `0444`), which VS Code otherwise blocks from editing before the save is ever attempted. This only helps with *writes*: elevated reads are not supported, so a file you can't even read as your SSH user (e.g. `0440 root:root` on `/etc/sudoers`) still fails to open, Edit as Root notwithstanding.
+
+Elevation covers saving file *contents* only — deleting, renaming, and creating directories are not elevated, because those need write access to the **parent directory** rather than to the file. So you can save a new file into a root-owned directory and then find you can't remove it from the File Explorer; do that from a terminal on the host. Extending elevation to those operations is tracked in [#32](https://github.com/evdanil/vscode-NexTerminal/issues/32).
+
+The file is staged to a temporary path over SFTP and then moved into place with `sudo` over an SSH exec channel. Your sudo password (only asked if the account needs one) is piped directly to that channel — it is never written to disk, VS Code's secret storage, or any log. By default the password isn't kept between saves; enable `nexus.sftp.sudo.rememberPasswordForSession` to keep it in memory until that server disconnects or the window closes. Either way, the remote host's own sudo credential timestamp (typically ~5 minutes) can let consecutive saves skip the password prompt regardless of this setting. A short grace window (30 seconds) after you type the password also covers an immediately-following elevated write to the same server — such as VS Code's own Save As, which issues two writes for one save — without prompting twice.
+
+For an existing file, the write goes through the file's own inode, so its owner, mode, ACLs, and hard links are preserved exactly. A brand-new file — or an existing one recreated because it vanished remotely between open and save (log rotation, a concurrent delete) — is created using the mode last observed for it, or `644` if none was ever observed. That restoration is read/write bits only — a recreated file never comes back with execute or setuid/setgid/sticky bits, which can be narrowed but never restored. **The write is not atomic** — a disk-full condition or a dropped connection partway through can leave the target partially written with no backup, so if a save fails, keep the editor open and retry rather than closing it. Sudoers policies requiring a TTY (`requiretty`) are not supported over this path — a plain-language error explains that up front, along with how to work around it. The install writes through a shell redirect (`cat < temp > target`), which follows symlinks and does not check the target's type first: if another local, non-root account on the remote host can write to the target's parent directory, it can swap the target for a symlink between your open and your save, and the elevated write lands root-owned content wherever that link points — the same exposure as the common `sudo tee /path` idiom. Elevated saves can be turned off entirely with `nexus.sftp.sudo.enabled`.
+
+Elevation depends on the SSH account actually having sudo rights on the remote host (sudoers membership, or a group like `wheel`/`sudo`) — the password Nexus asks for is normally **your own** login password, the same one a `sudo` prompt at a real terminal would ask for. If you're not in sudoers but happen to know the root password, elevation can't use it: sudo authenticates the invoking user, not root, so the root password isn't accepted in its place. The practical workaround is to add a second Nexus server profile that logs in **as root** over SSH and edit the file directly through that connection — only possible if the remote host's SSH server permits root login. Elevating with the root password via `su` instead of `sudo` is not supported and isn't planned: unlike `sudo -S`, `su` on Linux reads its password from `/dev/tty` rather than stdin, and Nexus has no PTY channel available to drive that prompt. One host-configuration wrinkle worth knowing: if the remote sudoers file sets `Defaults rootpw` (or `targetpw`), sudo actually wants **root's** password instead of yours — a password rejected on such a host isn't necessarily wrong, just the wrong *kind*, and the retry prompt calls this out.
+
 ### Open a profile from the command line
 
 Nexus registers a `vscode://` URI handler so you can open any saved profile — **SSH, Serial, or Local Shell** — from a terminal, a script, a browser link, or a CI job. The profile type is detected automatically from the name (or id) you give, and Nexus runs the matching connect action.
@@ -225,6 +242,51 @@ Power users migrating from other SSH clients can import their connection profile
 
 Both importers extract hostname, port, and username from each SSH session. Non-SSH sessions (RDP, Telnet, etc.) are skipped. Imported servers default to password authentication.
 
+#### Import a device list (CSV / text)
+
+For everyone else — a spreadsheet export, a device inventory, or just a list of hostnames — run `Nexus: Import Servers from List (CSV/Text)` and choose **Paste from Clipboard** or **Choose File…** (`.csv`, `.txt`, `.tsv`, up to 2 MB and 5,000 rows; anything beyond the row cap is reported, not silently dropped). It's also linked from the empty Command Center welcome view and the Data Management section of Settings, and `Nexus: Import Configuration` offers to hand off to it if you point it at a CSV instead of a Nexus JSON export.
+
+Accepted formats:
+
+- **A header row** naming columns in any order: `host`/`hostname`/`address`/`ip`, `name`/`label`/`device`, `user`/`username`, `port`, `folder`/`group`/`site`.
+- **No header**, positional: `host[,name[,username[,port[,folder]]]]` — note the third field is read as a **username**, not a folder. A bare `host,name,folder` list needs a header row (e.g. `host,name,folder`) so the columns are matched by name instead of position.
+- **Shorthand** in the host field: `user@host`, `host:port`, `user@host:port`.
+- Lines starting with `#` and blank lines are ignored.
+
+```csv
+# host, name, user, port, folder
+10.0.0.1, core-sw1, netadmin, 22, DC1/Core
+10.0.0.2, core-sw2, netadmin, 22, DC1/Core
+sw3.lab.example.com
+netadmin@sw4.lab.example.com:2022
+```
+
+If any row omits a username you're prompted once for a default (pre-filled with your most common existing username). If the list has no folder column of its own you're then prompted for an optional folder prefix, applied to every row. A single confirm dialog then summarizes what's about to happen — how many servers, how many folders will be created, how many rows already exist and will be skipped, how many lines couldn't be parsed — before anything is written; a **Show Skipped Lines** button opens the unparsable rows in a scratch document without importing. Rows that already match an existing server (same host, port, and username — host compared case-insensitively) are skipped and the count is reported. Imported servers always use password authentication — switch to key-based auth afterward via **Edit Server** if needed.
+
+#### Hand-writing an import file
+
+`Nexus: Import Configuration` also accepts a minimal hand-written JSON file — useful for one connection or a quick script, without going through any importer:
+
+```json
+{
+  "version": 2,
+  "servers": [
+    {
+      "id": "8400e8b0-8b3e-4b8a-9b1a-000000000001",
+      "name": "core-sw1",
+      "host": "10.0.0.1",
+      "port": 22,
+      "username": "netadmin",
+      "authType": "password",
+      "isHidden": false,
+      "group": "DC1/Core"
+    }
+  ]
+}
+```
+
+`name`, `host`, `port`, `username`, `authType`, and `isHidden` are required. `group` is optional (omit it for a top-level server), and so is `id` — Nexus fills one in for you if it's left blank or omitted; it just needs to be unique if you do supply it.
+
 ## Development
 
 ```bash
@@ -273,6 +335,8 @@ npm run package:vsix
 | `nexus.sftp.commandTimeout` | `300` | Timeout for remote SFTP commands, file transfers, and editor file open/save; upload/download use it as an inactivity timeout rather than a total duration cap |
 | `nexus.sftp.deleteDepthLimit` | `100` | Safety limit for recursive delete directory depth |
 | `nexus.sftp.deleteOperationLimit` | `10000` | Safety limit for items removed by one recursive delete |
+| `nexus.sftp.sudo.enabled` | `true` | Offer to save remote files with sudo when the SSH user lacks write permission |
+| `nexus.sftp.sudo.rememberPasswordForSession` | `false` | Keep the sudo password in memory until that server disconnects or the window closes, rather than clearing it after each save; never written to disk or secret storage. Turning this off doesn't guarantee a prompt every time — the remote host's own sudo credential timestamp can skip it regardless, and a short grace window (30 seconds) after each password entry applies either way |
 | `nexus.serial.rpcTimeout` | `10` | Timeout for serial sidecar commands in seconds |
 | `nexus.scripts.path` | `.nexus/scripts` | Directory where Nexus scripts live. Absolute paths are used as-is. Relative paths resolve against the workspace root when a folder is open, otherwise the extension's global storage. Pick a folder via *Nexus Settings → Scripts → Scripts Folder* |
 | `nexus.scripts.defaultTimeoutSeconds` | `30` | Default per-wait timeout in seconds for `waitFor` / `expect` / `waitAny` when not specified |

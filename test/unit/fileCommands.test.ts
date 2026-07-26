@@ -15,6 +15,7 @@ const mockWithProgress = vi.fn(async (_opts: unknown, task: (progress: { report:
   task({ report: vi.fn() })
 );
 const mockBuildUri = vi.fn((serverId: string, remotePath: string) => ({ scheme: "nexterm", serverId, remotePath }));
+const mockGetConfiguration = vi.fn(() => ({ get: (_key: string, def: unknown) => def }));
 
 function createFileTreeItem(overrides: {
   serverId?: string;
@@ -46,7 +47,8 @@ vi.mock("vscode", () => ({
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
     showQuickPick: vi.fn(),
-    showSaveDialog: vi.fn()
+    showSaveDialog: vi.fn(),
+    activeTextEditor: undefined as { document: { uri: { scheme: string; toString(): string } } } | undefined
   },
   workspace: {
     fs: {
@@ -54,7 +56,8 @@ vi.mock("vscode", () => ({
       stat: vi.fn(),
       createDirectory: vi.fn(),
       delete: vi.fn()
-    }
+    },
+    getConfiguration: (...args: unknown[]) => mockGetConfiguration(...args)
   },
   env: {
     clipboard: { writeText: vi.fn() }
@@ -87,7 +90,8 @@ vi.mock("vscode", () => ({
 }));
 
 vi.mock("../../src/services/sftp/nexusFileSystemProvider", () => ({
-  buildUri: (...args: unknown[]) => mockBuildUri(...args as [string, string])
+  buildUri: (...args: unknown[]) => mockBuildUri(...args as [string, string]),
+  NEXTERM_SCHEME: "nexterm"
 }));
 
 function createContext(overrides?: {
@@ -702,5 +706,217 @@ describe("fileCommands title bar actions", () => {
 
     expect(vscode.env.clipboard.writeText).not.toHaveBeenCalled();
     expect(mockShowInformationMessage).not.toHaveBeenCalled();
+  });
+
+  it("offers the connected-server QuickPick in natural (numeric) name order", async () => {
+    const vscode = await import("vscode");
+    const ctx = createContext();
+    ctx.core = {
+      getSnapshot: () => ({
+        activeSessions: [{ serverId: "s10" }, { serverId: "s2" }, { serverId: "s1" }],
+        servers: [
+          { id: "s10", name: "A10", host: "h", port: 22, username: "u", authType: "password", isHidden: false },
+          { id: "s2", name: "A2", host: "h", port: 22, username: "u", authType: "password", isHidden: false },
+          { id: "s1", name: "A1", host: "h", port: 22, username: "u", authType: "password", isHidden: false }
+        ]
+      })
+    } as any;
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValueOnce(undefined);
+    registerFileCommands(ctx);
+
+    const browse = registeredCommands.get("nexus.files.browse");
+    expect(browse).toBeDefined();
+    await browse!();
+
+    const items = vi.mocked(vscode.window.showQuickPick).mock.calls[0][0] as Array<{ label: string }>;
+    expect(items.map((item) => item.label)).toEqual(["A1", "A2", "A10"]);
+  });
+
+  describe("disconnect command (P2)", () => {
+    it("clears the cached sudo password and elevated marks for the active server, alongside the SFTP disconnect", async () => {
+      const ctx = createContext({ activeServerId: "srv-1" });
+      const clearCachedPassword = vi.fn();
+      const clearElevatedForServer = vi.fn();
+      (ctx as any).elevationBroker = { clearCachedPassword };
+      (ctx as any).fileSystemProvider = { clearElevatedForServer, markElevated: vi.fn() };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.disconnect")!;
+
+      handler();
+
+      expect(ctx.sftpService.disconnect).toHaveBeenCalledWith("srv-1");
+      expect(clearCachedPassword).toHaveBeenCalledWith("srv-1");
+      expect(clearElevatedForServer).toHaveBeenCalledWith("srv-1");
+      expect(ctx.fileExplorerProvider.clearActiveServer).toHaveBeenCalled();
+    });
+
+    it("does nothing sudo-related when there is no active server", async () => {
+      const ctx = createContext({ activeServerId: undefined });
+      const clearCachedPassword = vi.fn();
+      const clearElevatedForServer = vi.fn();
+      (ctx as any).elevationBroker = { clearCachedPassword };
+      (ctx as any).fileSystemProvider = { clearElevatedForServer, markElevated: vi.fn() };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.disconnect")!;
+
+      handler();
+
+      expect(clearCachedPassword).not.toHaveBeenCalled();
+      expect(clearElevatedForServer).not.toHaveBeenCalled();
+      expect(ctx.fileExplorerProvider.clearActiveServer).toHaveBeenCalled();
+    });
+
+    it("tolerates a missing elevationBroker/fileSystemProvider (e.g. web extension fallback)", async () => {
+      const ctx = createContext({ activeServerId: "srv-1" }); // both left unset
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.disconnect")!;
+
+      expect(() => handler()).not.toThrow();
+      expect(ctx.sftpService.disconnect).toHaveBeenCalledWith("srv-1");
+    });
+  });
+
+  describe("editAsRoot command", () => {
+    beforeEach(() => {
+      mockGetConfiguration.mockReturnValue({ get: (_key: string, def: unknown) => def });
+    });
+
+    function fileItem(overrides?: { serverId?: string; remotePath?: string }): FileTreeItem {
+      return createFileTreeItem({
+        serverId: overrides?.serverId,
+        remotePath: overrides?.remotePath ?? "/etc",
+        entry: {
+          name: "hosts",
+          isDirectory: false,
+          isSymlink: false,
+          size: 10,
+          modifiedAt: 1700000000,
+          permissions: 0o644,
+        },
+      });
+    }
+
+    it("registers nexus.files.editAsRoot", () => {
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated: vi.fn() };
+      registerFileCommands(ctx);
+
+      expect(registeredCommands.has("nexus.files.editAsRoot")).toBe(true);
+    });
+
+    it("marks the URI elevated and opens it", async () => {
+      const markElevated = vi.fn();
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+
+      await handler(fileItem());
+
+      // FileTreeItem.remotePath is the containing directory, not the file — the
+      // path must be joined with the entry name before building the URI.
+      expect(mockBuildUri).toHaveBeenCalledWith("srv-1", "/etc/hosts");
+      expect(markElevated).toHaveBeenCalledTimes(1);
+      expect(mockExecuteCommand).toHaveBeenCalledWith("vscode.open", expect.anything());
+    });
+
+    it("reports that elevated saves are disabled, with an Open Settings button (P5), when nexus.sftp.sudo.enabled is false", async () => {
+      mockGetConfiguration.mockReturnValue({
+        get: (key: string, def: unknown) => (key === "sudo.enabled" ? false : def),
+      });
+      mockShowWarningMessage.mockResolvedValue(undefined);
+      const markElevated = vi.fn();
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+
+      await handler(fileItem());
+
+      expect(markElevated).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("vscode.open", expect.anything());
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        "Elevated saves are disabled (nexus.sftp.sudo.enabled is off).",
+        "Open Settings"
+      );
+    });
+
+    it("opens the sudo.enabled setting when the disabled warning's Open Settings button is clicked (P5)", async () => {
+      mockGetConfiguration.mockReturnValue({
+        get: (key: string, def: unknown) => (key === "sudo.enabled" ? false : def),
+      });
+      mockShowWarningMessage.mockResolvedValue("Open Settings");
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated: vi.fn() };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+
+      await handler(fileItem());
+
+      expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.openSettings", "nexus.sftp.sudo.enabled");
+    });
+
+    it("falls back to the active editor's nexterm:// document when invoked with no tree item (P6: palette invocation)", async () => {
+      const vscode = await import("vscode");
+      const markElevated = vi.fn();
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+      const activeUri = { scheme: "nexterm", toString: () => "nexterm://srv-1/etc/hosts" };
+      (vscode.window as any).activeTextEditor = { document: { uri: activeUri } };
+
+      await handler();
+
+      expect(markElevated).toHaveBeenCalledWith(activeUri);
+      expect(mockExecuteCommand).toHaveBeenCalledWith("vscode.open", activeUri);
+
+      (vscode.window as any).activeTextEditor = undefined;
+    });
+
+    it("does not fall back to a non-nexterm active editor (e.g. a local file)", async () => {
+      const vscode = await import("vscode");
+      const markElevated = vi.fn();
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+      (vscode.window as any).activeTextEditor = {
+        document: { uri: { scheme: "file", toString: () => "file:///etc/hosts" } }
+      };
+
+      await handler();
+
+      expect(markElevated).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("vscode.open", expect.anything());
+
+      (vscode.window as any).activeTextEditor = undefined;
+    });
+
+    it("does nothing when no fileSystemProvider is wired", async () => {
+      const ctx = createContext(); // fileSystemProvider left unset (optional field)
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+
+      await expect(handler(fileItem())).resolves.toBeUndefined();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("vscode.open", expect.anything());
+    });
+
+    it("ignores non-FileTreeItem and directory arguments", async () => {
+      const markElevated = vi.fn();
+      const ctx = createContext();
+      (ctx as any).fileSystemProvider = { markElevated };
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.editAsRoot")!;
+
+      await handler(undefined);
+      const dirItem = createFileTreeItem({
+        entry: { name: "subdir", isDirectory: true, isSymlink: false, size: 0, modifiedAt: 0, permissions: 0o755 },
+      });
+      await handler(dirItem);
+
+      expect(markElevated).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("vscode.open", expect.anything());
+    });
   });
 });

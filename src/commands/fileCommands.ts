@@ -2,11 +2,12 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
 import type { DirectoryEntry, SftpService } from "../services/sftp/sftpService";
-import { buildUri } from "../services/sftp/nexusFileSystemProvider";
+import { buildUri, NEXTERM_SCHEME } from "../services/sftp/nexusFileSystemProvider";
 import { ServerTreeItem } from "../ui/nexusTreeProvider";
 import { FileTreeItem } from "../ui/fileExplorerTreeProvider";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "../ui/conflictResolution";
 import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
+import { naturalCompare } from "../utils/naturalCompare";
 import type { CommandContext } from "./types";
 
 const MAX_DOWNLOAD_DEPTH = 100;
@@ -47,11 +48,14 @@ async function pickConnectedServer(ctx: CommandContext): Promise<ServerConfig | 
     return undefined;
   }
   const pick = await vscode.window.showQuickPick(
-    servers.map((s) => ({
-      label: s.name,
-      description: `${s.username}@${s.host}:${s.port}`,
-      server: s,
-    })),
+    servers
+      .slice()
+      .sort((a, b) => naturalCompare(a.name, b.name))
+      .map((s) => ({
+        label: s.name,
+        description: `${s.username}@${s.host}:${s.port}`,
+        server: s,
+      })),
     { title: "Select server to browse files" }
   );
   return pick?.server;
@@ -77,6 +81,27 @@ function resolveTargetDirectory(
     return undefined;
   }
   return { serverId, dirPath };
+}
+
+/**
+ * Resolves the target of nexus.files.editAsRoot. From the File Explorer context menu
+ * `arg` is a FileTreeItem; from the command palette (or a keybinding) there is no
+ * tree item at all, so this falls back to whatever nexterm:// document is active —
+ * the case a user staring at VS Code's generic read-only error most needs, since
+ * they have no tree item in hand at all.
+ */
+function resolveEditAsRootTarget(arg: unknown): vscode.Uri | undefined {
+  if (arg instanceof FileTreeItem) {
+    if (arg.entry.isDirectory) {
+      return undefined;
+    }
+    // FileTreeItem.remotePath is the containing directory, not the file — same as
+    // nexus.files.open, the full path must be joined with the entry name first.
+    const filePath = joinRemoteEntryPath(arg.remotePath, arg.entry.name);
+    return filePath ? buildUri(arg.serverId, filePath) : undefined;
+  }
+  const activeUri = vscode.window.activeTextEditor?.document.uri;
+  return activeUri?.scheme === NEXTERM_SCHEME ? activeUri : undefined;
 }
 
 function resolveSelectedItems(arg: unknown, allSelected: unknown): FileTreeItem[] {
@@ -787,9 +812,39 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     const activeId = ctx.fileExplorerProvider.getActiveServerId();
     if (activeId) {
       ctx.sftpService.disconnect(activeId);
+      // SftpService.disconnect() itself emits no event: for a pooled lease it only
+      // starts an idle timer (or, with nexus.ssh.multiplexing.idleTimeout: 0, never
+      // even that), so the pool's own "disconnected" teardown listener in
+      // extension.ts can't be relied on to fire here. Clear directly as well so a
+      // cached sudo password and any elevated marks don't outlive this disconnect.
+      ctx.elevationBroker?.clearCachedPassword?.(activeId);
+      ctx.fileSystemProvider?.clearElevatedForServer(activeId);
     }
     ctx.fileExplorerProvider.clearActiveServer();
   });
 
-  return [browse, open, createFile, upload, download, deleteCmd, rename, createDir, goToPath, goHome, copyPath, refresh, disconnect];
+  const editAsRoot = vscode.commands.registerCommand("nexus.files.editAsRoot", async (arg?: unknown) => {
+    if (!ctx.fileSystemProvider) {
+      return;
+    }
+    const uri = resolveEditAsRootTarget(arg);
+    if (!uri) {
+      return;
+    }
+    const sudoEnabled = vscode.workspace.getConfiguration("nexus.sftp").get<boolean>("sudo.enabled", true);
+    if (!sudoEnabled) {
+      const choice = await vscode.window.showWarningMessage(
+        "Elevated saves are disabled (nexus.sftp.sudo.enabled is off).",
+        "Open Settings"
+      );
+      if (choice === "Open Settings") {
+        await vscode.commands.executeCommand("workbench.action.openSettings", "nexus.sftp.sudo.enabled");
+      }
+      return;
+    }
+    ctx.fileSystemProvider.markElevated(uri);
+    await vscode.commands.executeCommand("vscode.open", uri);
+  });
+
+  return [browse, open, createFile, upload, download, deleteCmd, rename, createDir, goToPath, goHome, copyPath, refresh, disconnect, editAsRoot];
 }

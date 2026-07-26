@@ -6,6 +6,7 @@ import type { SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
 import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
 import { readBoundedNumber } from "../utils/boundedConfig";
+import { naturalCompare } from "../utils/naturalCompare";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "./conflictResolution";
 
 const FILE_DRAG_MIME = "application/vnd.nexus.fileitem";
@@ -833,7 +834,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
           if (a.isDirectory !== b.isDirectory) {
             return a.isDirectory ? -1 : 1;
           }
-          return a.name.localeCompare(b.name);
+          return naturalCompare(a.name, b.name);
         })
         .map((entry) => new FileTreeItem(serverId, dirPath, entry));
     } catch {

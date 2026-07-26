@@ -1,8 +1,8 @@
 {
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
-  "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, and tunnels in one sidebar. Import from MobaXterm/SecureCRT, 2FA, legacy KEX for old Cisco gear. On VS Code Marketplace and Open VSX.",
-  "version": "2.8.67",
+  "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, and tunnels in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, 2FA, legacy KEX for old Cisco gear.",
+  "version": "2.8.68",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -52,7 +52,12 @@
     "socks5",
     "keyboard interactive",
     "embedded",
-    "expect"
+    "expect",
+    "sudo",
+    "csv import",
+    "bulk import",
+    "inventory",
+    "root"
   ],
   "main": "./dist/extension.js",
   "browser": "./dist/webExtension.js",
@@ -116,7 +121,7 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "Start by adding a connection profile.\n[Add Profile](command:nexus.profile.add)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+        "contents": "Start by adding a connection profile.\n[Add Profile](command:nexus.profile.add)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)\n[Import Servers from a List](command:nexus.config.import.inventory)"
       },
       {
         "view": "nexusTunnels",
@@ -479,6 +484,11 @@
         "category": "Nexus"
       },
       {
+        "command": "nexus.config.import.inventory",
+        "title": "Import Servers from List (CSV/Text)",
+        "category": "Nexus"
+      },
+      {
         "command": "nexus.config.completeReset",
         "title": "Delete All Data",
         "category": "Nexus"
@@ -647,6 +657,12 @@
         "command": "nexus.files.disconnect",
         "title": "Disconnect",
         "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "nexus.files.editAsRoot",
+        "title": "Edit as Root (sudo)",
+        "category": "Nexus",
+        "icon": "$(shield)"
       },
       {
         "command": "nexus.terminal.appearance",
@@ -1342,6 +1358,11 @@
           "group": "3_destructive"
         },
         {
+          "command": "nexus.files.editAsRoot",
+          "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.file",
+          "group": "1_manage@6"
+        },
+        {
           "command": "nexus.script.runQuick",
           "when": "view == nexusScripts && viewItem == nexus.script.file",
           "group": "inline"
@@ -1611,6 +1632,10 @@
           "when": "true"
         },
         {
+          "command": "nexus.config.import.inventory",
+          "when": "true"
+        },
+        {
           "command": "nexus.config.completeReset",
           "when": "true"
         },
@@ -1725,6 +1750,10 @@
         {
           "command": "nexus.files.disconnect",
           "when": "true"
+        },
+        {
+          "command": "nexus.files.editAsRoot",
+          "when": "resourceScheme == nexterm"
         },
         {
           "command": "nexus.script.delete",
@@ -3199,6 +3228,18 @@
           "maximum": 100000,
           "order": 26,
           "markdownDescription": "⚠ **Safety limit** — Maximum number of files and directories that can be deleted in a single recursive delete."
+        },
+        "nexus.sftp.sudo.enabled": {
+          "type": "boolean",
+          "default": true,
+          "order": 27,
+          "description": "Offer to save remote files with sudo when the SSH user lacks write permission."
+        },
+        "nexus.sftp.sudo.rememberPasswordForSession": {
+          "type": "boolean",
+          "default": false,
+          "order": 28,
+          "description": "Keep the sudo password in memory until that server disconnects or the window closes, rather than clearing it after each save. Never written to disk or to VS Code's secret storage. Turning this off does not guarantee a prompt on every save: the remote host's own sudo credential timestamp (~5 minutes) can skip it regardless, and a short grace window (30 seconds) after you enter a password also covers an immediately-following elevated save on the same server either way."
         },
         "nexus.tunnel.socks5HandshakeTimeout": {
           "type": "number",

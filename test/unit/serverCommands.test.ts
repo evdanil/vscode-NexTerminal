@@ -526,6 +526,24 @@ describe("server test connection command", () => {
     expect((ctx.sshFactory as any).connect).toHaveBeenCalledWith(expect.objectContaining({ id: "srv-b" }));
     expect(connection.dispose).toHaveBeenCalledTimes(1);
   });
+
+  it("offers the server QuickPick in natural (numeric) name order", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [
+        makeServer({ id: "srv-10", name: "A10", host: "a10.example.com" }),
+        makeServer({ id: "srv-2", name: "A2", host: "a2.example.com" }),
+        makeServer({ id: "srv-1", name: "A1", host: "a1.example.com" })
+      ]
+    });
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.testConnection")!();
+
+    const items = vi.mocked(vscode.window.showQuickPick as any).mock.calls[0][0];
+    expect(items.map((item: { label: string }) => item.label)).toEqual(["A1", "A2", "A10"]);
+  });
 });
 
 describe("formValuesToProxy", () => {

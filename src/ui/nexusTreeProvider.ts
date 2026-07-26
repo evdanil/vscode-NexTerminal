@@ -3,6 +3,7 @@ import type { SessionSnapshot } from "../core/contracts";
 import { resolveSerialProfileMode, type ActiveLocalShellSession, type ActiveSerialSession, type ActiveSession, type AuthProfile, type LocalShellProfile, type ProxyConfig, type SerialProfile, type SerialSessionStatus, type ServerConfig } from "../models/config";
 import { getAncestorPaths, folderDisplayName, isDescendantOrSelf, parentPath as folderParentPath } from "../utils/folderPaths";
 import { toParityCode } from "../utils/helpers";
+import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
 
 export class FolderTreeItem extends vscode.TreeItem {
@@ -506,7 +507,7 @@ export class NexusTreeProvider
         }
         return true;
       })
-      .sort((a, b) => a.name.localeCompare(b.name))
+      .sort((a, b) => naturalCompare(a.name, b.name))
       .map((server) => this.toServerItem(server));
 
     const directSerialProfiles = this.snapshot.serialProfiles
@@ -521,7 +522,7 @@ export class NexusTreeProvider
         }
         return true;
       })
-      .sort((a, b) => a.name.localeCompare(b.name))
+      .sort((a, b) => naturalCompare(a.name, b.name))
       .map((profile) => this.toSerialProfileItem(profile));
 
     const directLocalShellProfiles = this.snapshot.localShellProfiles
@@ -536,15 +537,19 @@ export class NexusTreeProvider
         }
         return true;
       })
-      .sort((a, b) => a.name.localeCompare(b.name))
+      .sort((a, b) => naturalCompare(a.name, b.name))
       .map((profile) => this.toLocalShellProfileItem(profile));
 
     const filteredFolders = this.filterText
       ? childFolderPaths.filter((p) => this.folderHasMatchingDescendant(p))
       : childFolderPaths;
 
+    // .slice() before sorting: when no filter is active, filteredFolders aliases
+    // the cached array from this.cachedChildFolderMap, and sorting in place would
+    // mutate shared cached state.
     const folderItems = filteredFolders
-      .sort((a, b) => a.localeCompare(b))
+      .slice()
+      .sort((a, b) => naturalComparePath(a, b))
       .map((p) => this.makeFolderItem(p));
 
     return [...folderItems, ...directServers, ...directSerialProfiles, ...directLocalShellProfiles];

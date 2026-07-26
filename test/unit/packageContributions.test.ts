@@ -245,6 +245,12 @@ describe("package contributions", () => {
     expect(settings).toContain("command:nexus.config.import");
   });
 
+  it("links the bulk inventory importer from the empty Command Center welcome view", () => {
+    const welcome = packageJson.contributes.viewsWelcome ?? [];
+    const hub = welcome.find((item) => item.view === "nexusCommandCenter");
+    expect(hub?.contents).toContain("command:nexus.config.import.inventory");
+  });
+
   it("surfaces local shell actions without terminal-tab command contexts", () => {
     const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
     expect(menuItems).toEqual(expect.arrayContaining([
@@ -524,6 +530,66 @@ describe("package contributions", () => {
       for (const m of [reset, clear, copy]) {
         expect(m?.when).toBe("resourceScheme == 'vscode-terminal'");
       }
+    });
+  });
+
+  it("contributes nexus.config.import.inventory as a palette-invocable Nexus command", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.config.import.inventory");
+    expect(command).toBeDefined();
+    expect(command?.title).toBe("Import Servers from List (CSV/Text)");
+    expect(command?.category).toBe("Nexus");
+
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    const paletteEntry = paletteMenu.find((item) => item.command === "nexus.config.import.inventory");
+    expect(paletteEntry?.when).not.toBe("false");
+  });
+
+  describe("Edit as Root (nexus.files.editAsRoot)", () => {
+    it("contributes the command with a Nexus category and shield icon", () => {
+      const cmd = packageJson.contributes.commands.find((c) => c.command === "nexus.files.editAsRoot");
+      expect(cmd).toBeDefined();
+      expect(cmd?.title).toMatch(/edit as root/i);
+      expect(cmd?.category).toBe("Nexus");
+      expect((cmd as unknown as { icon?: string })?.icon).toBe("$(shield)");
+    });
+
+    it("binds a view/item/context entry scoped to file (not directory) items", () => {
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      const entry = menuItems.find((m) => m.command === "nexus.files.editAsRoot");
+      expect(entry).toBeDefined();
+      expect(entry?.when).toBe("view == nexusFileExplorer && viewItem == nexus.fileExplorer.file");
+    });
+
+    it("enables the command from the command palette only when a nexterm:// file is the active editor (P6a)", () => {
+      const paletteItems = packageJson.contributes.menus.commandPalette ?? [];
+      const entry = paletteItems.find((m) => m.command === "nexus.files.editAsRoot");
+      expect(entry).toBeDefined();
+      expect(entry?.when).toBe("resourceScheme == nexterm");
+    });
+
+    it("contributes the two nexus.sftp.sudo.* settings with distinct order values", () => {
+      const props = packageJson.contributes.configuration?.properties ?? {};
+      expect(props["nexus.sftp.sudo.enabled"]).toMatchObject({ type: "boolean", default: true });
+      expect(props["nexus.sftp.sudo.rememberPasswordForSession"]).toMatchObject({ type: "boolean", default: false });
+      const enabledOrder = props["nexus.sftp.sudo.enabled"].order;
+      const rememberOrder = props["nexus.sftp.sudo.rememberPasswordForSession"].order;
+      expect(enabledOrder).not.toBe(rememberOrder);
+    });
+
+    it("does not overstate what rememberPasswordForSession does, and stays in sync with the Settings UI copy (P7)", async () => {
+      const props = packageJson.contributes.configuration?.properties ?? {};
+      const description: string = props["nexus.sftp.sudo.rememberPasswordForSession"].description;
+
+      // Not "for the duration of the session" — it's cleared earlier, on disconnect
+      // or window close.
+      expect(description).toMatch(/disconnects or the window closes/i);
+      // Turning it off does not mean "prompted every time" — sudo's own credential
+      // timestamp can still skip the prompt.
+      expect(description).toMatch(/does not guarantee a prompt/i);
+
+      const { SETTINGS_META } = await import("../../src/ui/settingsMetadata");
+      const meta = SETTINGS_META.find((m) => m.section === "nexus.sftp" && m.key === "sudo.rememberPasswordForSession");
+      expect(meta?.description).toBe(description);
     });
   });
 });

@@ -78,6 +78,7 @@ const unsupportedCommands = [
   "nexus.config.import",
   "nexus.config.import.mobaxterm",
   "nexus.config.import.securecrt",
+  "nexus.config.import.inventory",
   "nexus.config.completeReset",
   "nexus.macro.editor",
   "nexus.macro.add",
@@ -132,7 +133,8 @@ const unsupportedCommands = [
   "nexus.serial.testConnection",
   "nexus.terminal.reset",
   "nexus.terminal.clearScrollback",
-  "nexus.terminal.copyAll"
+  "nexus.terminal.copyAll",
+  "nexus.files.editAsRoot"
 ];
 
 export function activate(context: vscode.ExtensionContext): void {

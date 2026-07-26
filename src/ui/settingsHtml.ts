@@ -147,8 +147,14 @@ function renderSetting(meta: SettingMeta, values: SettingValues): string {
   const fullKey = `${meta.section}.${meta.key}`;
   const raw = values[fullKey];
   switch (meta.type) {
-    case "boolean":
-      return renderToggle(meta, raw !== false);
+    case "boolean": {
+      // Most booleans here don't set meta.default and have always defaulted to
+      // checked when unset (raw !== false); preserve that. Only a setting that
+      // explicitly opts into default:false (e.g. sudo.rememberPasswordForSession)
+      // should render unchecked before any value has been saved.
+      const fallbackChecked = meta.default !== false;
+      return renderToggle(meta, raw === undefined ? fallbackChecked : raw !== false);
+    }
     case "number":
       return renderNumber(meta, typeof raw === "number" ? raw : (meta.min ?? 0));
     case "string":

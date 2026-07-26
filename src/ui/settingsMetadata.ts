@@ -353,6 +353,27 @@ export const SETTINGS_META: SettingMeta[] = [
     badge: "Safety limit",
     badgeClass: "setting-badge-safety"
   },
+  // --- SFTP > Sudo (elevated saves) ---
+  {
+    key: "sudo.enabled",
+    section: "nexus.sftp",
+    label: "Enable Elevated (sudo) Saves",
+    type: "boolean",
+    category: "sftp",
+    subgroup: "Sudo",
+    description: "Offer to save remote files with sudo when the SSH user lacks write permission.",
+    default: true
+  },
+  {
+    key: "sudo.rememberPasswordForSession",
+    section: "nexus.sftp",
+    label: "Remember Sudo Password for Session",
+    type: "boolean",
+    category: "sftp",
+    subgroup: "Sudo",
+    description: "Keep the sudo password in memory until that server disconnects or the window closes, rather than clearing it after each save. Never written to disk or to VS Code's secret storage. Turning this off does not guarantee a prompt on every save: the remote host's own sudo credential timestamp (~5 minutes) can skip it regardless, and a short grace window (30 seconds) after you enter a password also covers an immediately-following elevated save on the same server either way.",
+    default: false
+  },
   // --- Highlighting ---
   {
     key: "enabled",
