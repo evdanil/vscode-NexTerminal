@@ -43,6 +43,15 @@ interface HostShorthand {
   host: string;
   username?: string;
   port?: number;
+  /**
+   * Raw text after a single trailing colon that looked like an attempted port but
+   * failed isPortLike (out of range or non-numeric). Only set when the host side of
+   * that colon is unambiguously not an IPv6 literal (no further colons) — a bare or
+   * bracketed IPv6 host is left untouched. Surfaced by the caller as an invalid-port
+   * issue instead of silently folding "host:garbage" into HOST_RE's colon-tolerant
+   * hostname grammar (which exists only to permit literal IPv6 addresses).
+   */
+  invalidPortSuffix?: string;
 }
 
 interface HeaderDetection {
@@ -261,8 +270,15 @@ function parseHostShorthand(raw: string): HostShorthand {
   if (colonIdx > 0) {
     const hostPart = rest.slice(0, colonIdx);
     const portPart = rest.slice(colonIdx + 1);
-    if (!hostPart.includes(":") && isPortLike(portPart)) {
-      return { host: hostPart, username, port: parseInt(portPart, 10) };
+    if (!hostPart.includes(":")) {
+      if (isPortLike(portPart)) {
+        return { host: hostPart, username, port: parseInt(portPart, 10) };
+      }
+      // Single colon, host side has no further colons: this is a malformed
+      // host:port attempt, not a literal hostname — flag it rather than falling
+      // through to `return { host: rest, ... }`, which HOST_RE would silently accept
+      // (it allows colons so bare/bracketed IPv6 literals still pass).
+      return { host: hostPart, username, invalidPortSuffix: portPart };
     }
   }
   return { host: rest, username };
@@ -383,6 +399,11 @@ export function parseInventoryList(text: string, options: InventoryParseOptions 
     }
 
     const shorthand = parseHostShorthand(hostRaw.trim());
+    if (shorthand.invalidPortSuffix !== undefined) {
+      issues.push({ line: row.line, text: row.text, reason: `invalid port "${shorthand.invalidPortSuffix}"` });
+      skippedCount++;
+      continue;
+    }
     const host = shorthand.host;
 
     if (!host) {
