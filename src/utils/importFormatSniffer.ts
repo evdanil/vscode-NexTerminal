@@ -1,10 +1,13 @@
-/** Signature a piece of import text appears to carry. `"unknown"` is reserved for a
- * future stronger signal; the rules below never emit it — every input that isn't
- * confidently one of the other three still resolves to `"host-list"`. */
-export type SniffedFormat = "nexus-json" | "mobaxterm" | "xml" | "host-list" | "unknown";
+/** Signature a piece of import text appears to carry. Every input that isn't
+ * confidently one of the other three resolves to `"host-list"` — see the doc
+ * comment on `sniffImportFormat` for why that class has no positive signature. */
+export type SniffedFormat = "nexus-json" | "mobaxterm" | "xml" | "host-list";
 
 // MobaXterm's own signature: a `[Bookmarks]` or `[Bookmarks_N]` section header line.
-const MOBAXTERM_BOOKMARKS_RE = /^\[Bookmarks(_\d+)?\]\s*$/m;
+// parseIniSections() trims every line and matches sections by startsWith("Bookmarks")
+// (mobaxtermParser.ts) — so this must tolerate the same leading/trailing horizontal
+// whitespace and a bare CR, or a file the parser accepts sniffs as "not mobaxterm".
+const MOBAXTERM_BOOKMARKS_RE = /^[ \t]*\[Bookmarks(_\d+)?\][ \t]*\r?$/m;
 
 /**
  * Cheaply guesses the format of import text from its shape alone.
