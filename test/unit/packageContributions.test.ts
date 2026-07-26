@@ -554,11 +554,11 @@ describe("package contributions", () => {
       expect(entry?.when).toBe("view == nexusFileExplorer && viewItem == nexus.fileExplorer.file");
     });
 
-    it("hides the command from the command palette (requires a tree item)", () => {
+    it("enables the command from the command palette only when a nexterm:// file is the active editor (P6a)", () => {
       const paletteItems = packageJson.contributes.menus.commandPalette ?? [];
       const entry = paletteItems.find((m) => m.command === "nexus.files.editAsRoot");
       expect(entry).toBeDefined();
-      expect(entry?.when).toBe("false");
+      expect(entry?.when).toBe("resourceScheme == nexterm");
     });
 
     it("contributes the two nexus.sftp.sudo.* settings with distinct order values", () => {
@@ -568,6 +568,22 @@ describe("package contributions", () => {
       const enabledOrder = props["nexus.sftp.sudo.enabled"].order;
       const rememberOrder = props["nexus.sftp.sudo.rememberPasswordForSession"].order;
       expect(enabledOrder).not.toBe(rememberOrder);
+    });
+
+    it("does not overstate what rememberPasswordForSession does, and stays in sync with the Settings UI copy (P7)", async () => {
+      const props = packageJson.contributes.configuration?.properties ?? {};
+      const description: string = props["nexus.sftp.sudo.rememberPasswordForSession"].description;
+
+      // Not "for the duration of the session" — it's cleared earlier, on disconnect
+      // or window close.
+      expect(description).toMatch(/disconnects or the window closes/i);
+      // Turning it off does not mean "prompted every time" — sudo's own credential
+      // timestamp can still skip the prompt.
+      expect(description).toMatch(/does not guarantee a prompt/i);
+
+      const { SETTINGS_META } = await import("../../src/ui/settingsMetadata");
+      const meta = SETTINGS_META.find((m) => m.section === "nexus.sftp" && m.key === "sudo.rememberPasswordForSession");
+      expect(meta?.description).toBe(description);
     });
   });
 });

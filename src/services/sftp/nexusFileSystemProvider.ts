@@ -12,10 +12,17 @@ export const NEXTERM_SCHEME = "nexterm";
  * this provider so it stays UI-agnostic and unit-testable without a real vscode host.
  */
 export interface ElevationBroker {
-  /** Returns true if the elevated write completed; false if the user declined. */
-  saveElevated(serverId: string, remotePath: string, content: Buffer): Promise<boolean>;
+  /**
+   * Returns true if the elevated write completed; false if the user declined.
+   * `knownMode` is the permission bits last observed via `stat`/`readFile` for this
+   * URI (if any) — passed through so a save that recreates a target which vanished
+   * between open and write can restore its prior mode instead of guessing 644.
+   */
+  saveElevated(serverId: string, remotePath: string, content: Buffer, knownMode?: number): Promise<boolean>;
   /** Ask the user whether to retry the failed save with sudo. */
-  confirmElevation(remotePath: string): Promise<boolean>;
+  confirmElevation(serverId: string, remotePath: string): Promise<boolean>;
+  /** Drops any cached sudo password for a server. Call on disconnect. */
+  clearCachedPassword?(serverId: string): void;
 }
 
 function errorMessage(error: unknown): string {
@@ -54,6 +61,10 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscod
   // (files.autoSave: afterDelay) re-entering writeFile on the same permission-denied
   // file doesn't pop a modal on every retry. Cleared on document close or editAsRoot.
   private readonly declinedUris = new Set<string>();
+  // Permission bits last observed via stat/readFile, keyed by uri.toString(). Lets an
+  // elevated save that recreates a target deleted out from under it (log rotation,
+  // etc.) restore the mode it had instead of the create-branch's 644 default.
+  private readonly lastKnownModes = new Map<string, number>();
   private readonly closeListener: vscode.Disposable;
 
   public constructor(
@@ -63,12 +74,18 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscod
     this.closeListener = vscode.workspace.onDidCloseTextDocument((doc) => {
       if (doc.uri.scheme === NEXTERM_SCHEME) {
         this.declinedUris.delete(doc.uri.toString());
+        // Elevation must not outlive the tab: without this, closing an elevated
+        // file and reopening it normally left a stale elevatedUris entry, so the
+        // next ordinary Ctrl+S silently went through sudo again.
+        this.clearElevated(doc.uri);
+        this.lastKnownModes.delete(doc.uri.toString());
       }
     });
   }
 
   public dispose(): void {
     this.closeListener.dispose();
+    this.onDidChangeFileEmitter.dispose();
   }
 
   public watch(): vscode.Disposable {
@@ -128,6 +145,7 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscod
     const { serverId, remotePath } = parseUri(uri);
     const maxSize = getMaxFileSize();
     const entry = await this.sftp.stat(serverId, remotePath);
+    this.lastKnownModes.set(uri.toString(), entry.permissions);
     if (entry.size > maxSize) {
       const limitMB = Math.round(maxSize / 1024 / 1024);
       throw vscode.FileSystemError.Unavailable(
@@ -161,7 +179,7 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscod
       if (this.declinedUris.has(key)) {
         throw vscode.FileSystemError.NoPermissions(errorMessage(error));
       }
-      const accepted = await this.elevation.confirmElevation(remotePath);
+      const accepted = await this.elevation.confirmElevation(serverId, remotePath);
       if (!accepted) {
         this.declinedUris.add(key);
         throw vscode.FileSystemError.NoPermissions(errorMessage(error));
@@ -184,9 +202,14 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscod
         `Elevated save of ${remotePath} requires sudo support, which is not configured.`
       );
     }
-    const completed = await this.elevation.saveElevated(serverId, remotePath, content);
+    const knownMode = this.lastKnownModes.get(uri.toString());
+    const completed = await this.elevation.saveElevated(serverId, remotePath, content, knownMode);
     if (!completed) {
-      throw vscode.FileSystemError.NoPermissions(`Elevated save of ${remotePath} was not completed.`);
+      // A cancelled password prompt and a broker failure (which already showed its
+      // own detailed toast) both land here, so this is deliberately the neutral
+      // "canceled" reading rather than a second, possibly-contradictory error — VS
+      // Code wraps whatever we throw in its own "Failed to save" dialog on top of ours.
+      throw vscode.FileSystemError.NoPermissions("Save as root was canceled.");
     }
     this.onDidChangeFileEmitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
   }

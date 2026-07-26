@@ -371,7 +371,7 @@ export const SETTINGS_META: SettingMeta[] = [
     type: "boolean",
     category: "sftp",
     subgroup: "Sudo",
-    description: "Keep the sudo password in memory for the duration of the session. Never written to disk or to VS Code's secret storage.",
+    description: "Keep the sudo password in memory until that server disconnects or the window closes, instead of for the rest of the VS Code session. Never written to disk or to VS Code's secret storage. Turning this off does not guarantee a prompt on every save — the remote host's own sudo credential timestamp (~5 minutes) can still skip it.",
     default: false
   },
   // --- Highlighting ---

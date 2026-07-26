@@ -399,17 +399,22 @@ export class SftpService {
    * staging it to a user-writable /tmp path over SFTP, then moving it into place with
    * sudo over an SSH exec channel. `targetExists` is resolved via `stat` (not `lstat`):
    * a dangling symlink must be followed the same way the plain write would follow it,
-   * otherwise the chmod-644-on-create branch is skipped and the symlink target is
-   * created under root's umask instead of the intended 644.
+   * otherwise the chmod-on-create branch is skipped and the symlink target is created
+   * under root's umask instead of the intended mode.
+   *
+   * If the target has vanished since it was last read (log rotation, a concurrent
+   * delete), this recreates it: `options.createMode` — the mode the caller last
+   * observed via stat/readFile — is used for the chmod instead of a hardcoded 644, so
+   * a recreate can't silently widen a root-owned file's permissions.
    */
   public async writeFileElevated(
     serverId: string,
     remotePath: string,
     content: Buffer,
-    options?: { password?: string }
+    options?: { password?: string; createMode?: number }
   ): Promise<void> {
     const session = this.getSession(serverId);
-    const tempPath = buildTempStagePath(remotePath, randomUUID());
+    const tempPath = buildTempStagePath(randomUUID());
     const targetExists = (await this.tryStat(serverId, remotePath)) !== undefined;
 
     try {
@@ -430,6 +435,7 @@ export class SftpService {
         targetPath: remotePath,
         targetExists,
         password: options?.password,
+        createMode: options?.createMode,
       });
     } finally {
       try {
