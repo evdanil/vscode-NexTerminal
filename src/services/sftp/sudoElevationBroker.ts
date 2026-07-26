@@ -107,7 +107,13 @@ export class SudoElevationBroker implements ElevationBroker {
     knownMode?: number
   ): Promise<boolean> {
     const remember = readSudoSetting("sudo.rememberPasswordForSession", false);
-    let password = this.passwordCache.get(serverId) ?? (await this.promptPassword(serverId));
+    if (!remember) {
+      // Consent for reuse is only valid while the setting is on. Drop any entry
+      // already held for this server so turning the setting off takes effect on
+      // the very next save, not at disconnect.
+      this.passwordCache.delete(serverId);
+    }
+    let password = remember ? this.passwordCache.get(serverId) ?? (await this.promptPassword(serverId)) : await this.promptPassword(serverId);
     if (!password) {
       return false;
     }
