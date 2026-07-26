@@ -16,7 +16,8 @@ import {
 import { validateAuthProfile } from "../utils/validation";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
-import { parseInventoryList } from "../utils/inventoryParser";
+import { parseInventoryList, type InventoryParseIssue, MAX_DATA_ROWS as INVENTORY_MAX_ROWS } from "../utils/inventoryParser";
+import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { defaultSshDir } from "../services/ssh/deploySshKey";
 import {
   parseSecureCrtDirectory,
@@ -784,6 +785,11 @@ export function collectIncomingMacros(
   return undefined;
 }
 
+/** Pluralizes a noun for count-driven messages ("1 server" / "2 servers") without the "(s)" shorthand. */
+function pluralizeNoun(noun: string, count: number): string {
+  return count === 1 ? noun : `${noun}s`;
+}
+
 export function registerConfigCommands(core: NexusCore, vault: SecretVault, context?: import("vscode").ExtensionContext): vscode.Disposable[] {
   async function exportBackup(): Promise<void> {
     const masterPassword = await promptMasterPassword();
@@ -923,6 +929,19 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     void vscode.window.showInformationMessage(`${base}${suffix}.`);
   }
 
+  // nexus.config.import only accepts Nexus's own JSON export format. A CSV or plain
+  // host list (by far the most common thing people try to feed it) fails here with
+  // no pointer onward — offer the bulk inventory importer instead of a dead end.
+  async function offerInventoryImportFallback(): Promise<void> {
+    const choice = await vscode.window.showErrorMessage(
+      "That file isn't a Nexus JSON export. For a CSV or plain host list, use Import Servers from List.",
+      "Import Servers from List"
+    );
+    if (choice === "Import Servers from List") {
+      void importInventory();
+    }
+  }
+
   async function importConfig(): Promise<void> {
     const uris = await vscode.window.showOpenDialog({
       canSelectFiles: true,
@@ -937,12 +956,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     try {
       data = JSON.parse(Buffer.from(raw).toString("utf8"));
     } catch {
-      void vscode.window.showErrorMessage("Invalid JSON file.");
+      await offerInventoryImportFallback();
       return;
     }
 
     if (!isValidExport(data)) {
-      void vscode.window.showErrorMessage("Not a valid Nexus configuration file.");
+      await offerInventoryImportFallback();
       return;
     }
 
@@ -1323,20 +1342,23 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     return best;
   }
 
-  // Shared tail for MobaXterm / SecureCRT / inventory imports: no-sessions warning, confirm
+  // Shared tail for the MobaXterm / SecureCRT importers: no-sessions warning, confirm
   // modal, group + server creation, success toast. `noSessionsLocation` and `sourceName` are
   // the only per-source differences in the user-facing strings; `skipLabel` describes what
-  // was skipped ("non-SSH" for the session-format importers, "unparsable" for inventory rows).
+  // was skipped ("non-SSH" for both current callers). The inventory importer needs a
+  // materially different flow (single modal with a `detail` breakdown, dedupe-aware
+  // messaging, non-blocking issue toast) and has its own tail — see `importInventory`.
   async function applyImportedSessions(
     result: ImportParseResult,
     sourceName: string,
     noSessionsLocation: string,
-    skipLabel: string = "non-SSH"
+    skipLabel: string = "non-SSH",
+    noun: string = "SSH session"
   ): Promise<void> {
     if (result.sessions.length === 0) {
       const note = result.skippedCount > 0
-        ? `No SSH sessions found (${result.skippedCount} ${skipLabel} skipped).`
-        : `No SSH sessions found in the selected ${noSessionsLocation}.`;
+        ? `No ${pluralizeNoun(noun, 0)} found (${result.skippedCount} ${skipLabel} skipped).`
+        : `No ${pluralizeNoun(noun, 0)} found in the selected ${noSessionsLocation}.`;
       void vscode.window.showWarningMessage(note);
       return;
     }
@@ -1344,7 +1366,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     const folderNote = result.folders.length > 0 ? ` in ${result.folders.length} folder(s)` : "";
     const skipNote = result.skippedCount > 0 ? ` (${result.skippedCount} ${skipLabel} skipped)` : "";
     const confirm = await vscode.window.showInformationMessage(
-      `Found ${result.sessions.length} SSH session(s)${folderNote}${skipNote}. Import?`,
+      `Found ${result.sessions.length} ${pluralizeNoun(noun, result.sessions.length)}${folderNote}${skipNote}. Import?`,
       { modal: true },
       "Import"
     );
@@ -1367,7 +1389,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     }
 
     void vscode.window.showInformationMessage(
-      `Imported ${result.sessions.length} SSH session(s) from ${sourceName}.`
+      `Imported ${result.sessions.length} ${pluralizeNoun(noun, result.sessions.length)} from ${sourceName}.`
     );
   }
 
@@ -1389,6 +1411,16 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
   const INVENTORY_MAX_BYTES = 2 * 1024 * 1024;
 
+  async function openInventoryIssuesDocument(issues: InventoryParseIssue[]): Promise<void> {
+    const content = issues.map((issue) => `line ${issue.line}: ${issue.text} — ${issue.reason}`).join("\n");
+    const doc = await vscode.workspace.openTextDocument({ content, language: "log" });
+    await vscode.window.showTextDocument(doc, { preview: true });
+  }
+
+  // Bespoke tail for the inventory importer — deliberately not funneled through
+  // applyImportedSessions. It needs a single confirm modal (detail breakdown,
+  // dedupe-aware wording, a "Show Skipped Lines" escape hatch) and a batched,
+  // progress-reported apply step that the MobaXterm/SecureCRT tail has no need for.
   async function importInventory(): Promise<void> {
     const sourcePick = await vscode.window.showQuickPick(
       [
@@ -1420,36 +1452,59 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     }
 
     if (Buffer.byteLength(text, "utf8") > INVENTORY_MAX_BYTES) {
-      void vscode.window.showErrorMessage("Inventory file exceeds the 2 MB size limit.");
+      void vscode.window.showErrorMessage("The list exceeds the 2 MB size limit.");
       return;
     }
 
-    let result = parseInventoryList(text);
+    // No-options pass first: tells us whether the list carries its own folder
+    // data and how many rows are missing a username, before deciding which of
+    // the two prompts below are even necessary.
+    const initialParse = parseInventoryList(text);
 
     let defaultUsername: string | undefined;
-    if (result.needsDefaultUsername) {
+    if (initialParse.needsDefaultUsername) {
       const suggested = mostCommonUsername(core.getSnapshot().servers);
+      const missingCount = initialParse.missingUsernameCount;
       const username = await vscode.window.showInputBox({
-        title: "Default SSH username",
-        prompt: "Used for rows that don't specify one",
+        title: "Default SSH Username",
+        prompt: `Applied to the ${missingCount} row${missingCount === 1 ? "" : "s"} that don't specify a username`,
         value: suggested,
         ignoreFocusOut: true
       });
-      if (!username || !username.trim()) {
-        void vscode.window.showWarningMessage("Import cancelled — a username is required.");
+      if (username === undefined) {
+        void vscode.window.showWarningMessage("Import canceled.");
+        return;
+      }
+      if (!username.trim()) {
+        void vscode.window.showWarningMessage("Import canceled — a username is required.");
         return;
       }
       defaultUsername = username.trim();
     }
 
-    const folderInput = await vscode.window.showInputBox({
-      title: "Folder for imported servers (optional)",
-      placeHolder: "e.g. Site7/Access",
-      ignoreFocusOut: true
-    });
-    const defaultFolder = folderInput && folderInput.trim() ? folderInput.trim() : undefined;
+    // Skip the folder prompt entirely when the list already has its own folder
+    // column — asking again would be a redundant second back-to-back prompt.
+    let defaultFolder: string | undefined;
+    if (initialParse.folders.length === 0) {
+      const folderInput = await vscode.window.showInputBox({
+        title: "Folder for Imported Servers (Optional)",
+        placeHolder: "e.g. Site7/Access — press Enter to skip",
+        ignoreFocusOut: true,
+        validateInput: (value) => (normalizeOptionalFolderPath(value) === null ? INVALID_FOLDER_PATH_MESSAGE : undefined)
+      });
+      if (folderInput === undefined) {
+        void vscode.window.showWarningMessage("Import canceled.");
+        return;
+      }
+      const normalizedPrefix = normalizeOptionalFolderPath(folderInput);
+      if (normalizedPrefix === null) {
+        void vscode.window.showErrorMessage(INVALID_FOLDER_PATH_MESSAGE);
+        return;
+      }
+      defaultFolder = normalizedPrefix;
+    }
 
-    result = parseInventoryList(text, { defaultUsername, defaultFolder });
+    const result = parseInventoryList(text, { defaultUsername, defaultFolder });
 
     const existingKeys = new Set(
       core.getSnapshot().servers.map((server) => `${server.host.toLowerCase()}|${server.port}|${server.username}`)
@@ -1458,23 +1513,110 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       (session) => !existingKeys.has(`${session.host.toLowerCase()}|${session.port}|${session.username}`)
     );
     const dedupedCount = result.sessions.length - sessions.length;
-    if (dedupedCount > 0) {
-      void vscode.window.showInformationMessage(`${dedupedCount} already in your list were skipped.`);
-    }
+    // Only create groups actually used by the servers that survive dedupe — a
+    // folder whose only rows were all duplicates should not appear as an empty group.
+    const usedFolders = new Set(sessions.map((session) => session.folder).filter((folder): folder is string => !!folder));
+    const folders = result.folders.filter((folder) => usedFolders.has(folder));
+    // The 5000-row cap gets its own sentence in the modal below; don't double-count
+    // it in the generic "N lines could not be parsed" figure.
+    const parseIssues = result.issues.filter((issue) => !issue.reason.startsWith("input truncated"));
 
-    if (result.issues.length > 0) {
-      const choice = await vscode.window.showWarningMessage(
-        `${result.issues.length} line(s) could not be imported.`,
-        "Show Details"
-      );
-      if (choice === "Show Details") {
-        const content = result.issues.map((issue) => `line ${issue.line}: ${issue.text} — ${issue.reason}`).join("\n");
-        const doc = await vscode.workspace.openTextDocument({ content, language: "log" });
-        await vscode.window.showTextDocument(doc, { preview: true });
+    if (sessions.length === 0) {
+      if (dedupedCount > 0) {
+        const verb = dedupedCount === 1 ? "exists" : "exist";
+        void vscode.window.showInformationMessage(
+          `All ${dedupedCount} ${pluralizeNoun("server", dedupedCount)} in the list already ${verb} — nothing to import.`
+        );
+        return;
       }
+      const note = result.skippedCount > 0
+        ? `No servers found (${result.skippedCount} skipped).`
+        : "No servers found in the selected list.";
+      void vscode.window.showWarningMessage(note);
+      return;
     }
 
-    await applyImportedSessions({ ...result, sessions }, "the inventory list", "list", "unparsable");
+    const detailLines: string[] = [];
+    if (folders.length > 0) {
+      detailLines.push(`${folders.length} ${pluralizeNoun("folder", folders.length)} will be created.`);
+    }
+    if (dedupedCount > 0) {
+      detailLines.push(`${dedupedCount} ${pluralizeNoun("server", dedupedCount)} you already have will be skipped.`);
+    }
+    if (parseIssues.length > 0) {
+      detailLines.push(`${parseIssues.length} ${pluralizeNoun("line", parseIssues.length)} could not be parsed.`);
+    }
+    if (result.truncatedCount > 0) {
+      detailLines.push(
+        `Only the first ${INVENTORY_MAX_ROWS.toLocaleString()} rows were read ` +
+          `(${result.truncatedCount.toLocaleString()} ${pluralizeNoun("row", result.truncatedCount)} ignored).`
+      );
+    }
+
+    // One confirm modal carrying everything the user needs to sanity-check the
+    // import, via `detail` — not a chain of toasts a modal can cover before
+    // they're read. "Show Skipped Lines" opens the scratch doc without importing;
+    // re-run the command afterward once the list looks right.
+    const buttons = result.issues.length > 0 ? ["Import", "Show Skipped Lines"] : ["Import"];
+    const choice = await vscode.window.showInformationMessage(
+      `Import ${sessions.length} ${pluralizeNoun("server", sessions.length)}?`,
+      { modal: true, detail: detailLines.join("\n") },
+      ...buttons
+    );
+
+    if (choice === "Show Skipped Lines") {
+      await openInventoryIssuesDocument(result.issues);
+      return;
+    }
+    if (choice !== "Import") return;
+
+    const serverConfigs: ServerConfig[] = sessions.map((session) => ({
+      id: randomUUID(),
+      name: session.name,
+      host: session.host,
+      port: session.port,
+      username: session.username,
+      authType: "password",
+      isHidden: false,
+      group: session.folder || undefined
+    }));
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Importing ${serverConfigs.length} ${pluralizeNoun("server", serverConfigs.length)}…`,
+        cancellable: true
+      },
+      async (_progress, token) => {
+        // addServersBatch does one persisted write for the whole import (see
+        // NexusCore), so there's no per-row loop left to check the token
+        // against mid-flight — this is the one point where cancelling still
+        // means something: before that write starts.
+        if (token?.isCancellationRequested) {
+          return;
+        }
+        await core.addServersBatch(serverConfigs, folders);
+      }
+    );
+
+    void vscode.window.showInformationMessage(
+      `Imported ${serverConfigs.length} ${pluralizeNoun("server", serverConfigs.length)}.`
+    );
+
+    // Never an awaited gate (P1): a notification carrying a button does not
+    // auto-dismiss, and users routinely ignore corner toasts — awaiting this
+    // would silently stall the command on exactly the messy list this feature
+    // exists for. Fire-and-forget with a `.then` for the optional follow-up.
+    if (parseIssues.length > 0) {
+      const verb = parseIssues.length === 1 ? "was" : "were";
+      void vscode.window
+        .showWarningMessage(`${parseIssues.length} ${pluralizeNoun("line", parseIssues.length)} ${verb} skipped.`, "Show Details")
+        .then((detailChoice) => {
+          if (detailChoice === "Show Details") {
+            void openInventoryIssuesDocument(result.issues);
+          }
+        });
+    }
   }
 
   async function importSecureCrt(): Promise<void> {

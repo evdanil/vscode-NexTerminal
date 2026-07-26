@@ -203,12 +203,24 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("data management actions", () => {
-    it("returns 5 data management action items", () => {
+    it("returns 6 data management action items", () => {
       const provider = createProvider();
       const dmGroup = new DataManagementGroupItem();
       const children = provider.getChildren(dmGroup);
-      expect(children).toHaveLength(5);
+      expect(children).toHaveLength(6);
       expect(children.every((c) => c instanceof DataManagementActionItem)).toBe(true);
+    });
+
+    it("offers the bulk inventory importer alongside the JSON importer", () => {
+      const provider = createProvider();
+      const dmGroup = new DataManagementGroupItem();
+      const children = provider.getChildren(dmGroup) as InstanceType<typeof DataManagementActionItem>[];
+      const inventoryAction = children.find((c) => c.id === "settings-action:nexus.config.import.inventory");
+      expect(inventoryAction).toBeDefined();
+      expect(inventoryAction?.command).toEqual({
+        command: "nexus.config.import.inventory",
+        title: "Import Servers from List…"
+      });
     });
   });
 

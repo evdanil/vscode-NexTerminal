@@ -238,12 +238,12 @@ Both importers extract hostname, port, and username from each SSH session. Non-S
 
 #### Import a device list (CSV / text)
 
-For everyone else — a spreadsheet export, a device inventory, or just a list of hostnames — run `Nexus: Import Servers from List (CSV/Text)` and choose **Paste from Clipboard** or **Choose File…** (`.csv`, `.txt`, `.tsv`, up to 2 MB).
+For everyone else — a spreadsheet export, a device inventory, or just a list of hostnames — run `Nexus: Import Servers from List (CSV/Text)` and choose **Paste from Clipboard** or **Choose File…** (`.csv`, `.txt`, `.tsv`, up to 2 MB and 5,000 rows; anything beyond the row cap is reported, not silently dropped). It's also linked from the empty Command Center welcome view and the Data Management section of Settings, and `Nexus: Import Configuration` offers to hand off to it if you point it at a CSV instead of a Nexus JSON export.
 
 Accepted formats:
 
 - **A header row** naming columns in any order: `host`/`hostname`/`address`/`ip`, `name`/`label`/`device`, `user`/`username`, `port`, `folder`/`group`/`site`.
-- **No header**, positional: `host[,name[,username[,port[,folder]]]]`. The delimiter is a comma if the line has one, otherwise a tab, otherwise a run of whitespace.
+- **No header**, positional: `host[,name[,username[,port[,folder]]]]` — note the third field is read as a **username**, not a folder. A bare `host,name,folder` list needs a header row (e.g. `host,name,folder`) so the columns are matched by name instead of position.
 - **Shorthand** in the host field: `user@host`, `host:port`, `user@host:port`.
 - Lines starting with `#` and blank lines are ignored.
 
@@ -255,7 +255,7 @@ sw3.lab.example.com
 netadmin@sw4.lab.example.com:2022
 ```
 
-If any row omits a username you're prompted once for a default (pre-filled with your most common existing username). An optional folder prefix is prepended to every row's folder. Rows that already match an existing server (same host, port, and username — host compared case-insensitively) are skipped and the count is reported; rows Nexus can't parse are listed in a scratch document rather than aborting the whole import. Imported servers always use password authentication — switch to key-based auth afterward via **Edit Server** if needed.
+If any row omits a username you're prompted once for a default (pre-filled with your most common existing username). If the list has no folder column of its own you're then prompted for an optional folder prefix, applied to every row. A single confirm dialog then summarizes what's about to happen — how many servers, how many folders will be created, how many rows already exist and will be skipped, how many lines couldn't be parsed — before anything is written; a **Show Skipped Lines** button opens the unparsable rows in a scratch document without importing. Rows that already match an existing server (same host, port, and username — host compared case-insensitively) are skipped and the count is reported. Imported servers always use password authentication — switch to key-based auth afterward via **Edit Server** if needed.
 
 #### Hand-writing an import file
 
@@ -279,7 +279,7 @@ If any row omits a username you're prompted once for a default (pre-filled with 
 }
 ```
 
-`id`, `name`, `host`, `port`, `username`, `authType`, and `isHidden` are required; `group` is optional (omit it for a top-level server). `id` just needs to be unique — Nexus fills one in for you if you leave it blank.
+`name`, `host`, `port`, `username`, `authType`, and `isHidden` are required. `group` is optional (omit it for a top-level server), and so is `id` — Nexus fills one in for you if it's left blank or omitted; it just needs to be unique if you do supply it.
 
 ## Development
 

@@ -92,6 +92,7 @@ const DATA_ACTIONS: DataAction[] = [
   { label: "Backup\u2026", command: "nexus.config.export.backup", icon: "lock", tooltip: "Create an encrypted backup of all data" },
   { label: "Export for Sharing\u2026", command: "nexus.config.export", icon: "export", tooltip: "Export sanitized configuration for sharing" },
   { label: "Import\u2026", command: "nexus.config.import", icon: "import", tooltip: "Import configuration from file" },
+  { label: "Import Servers from List\u2026", command: "nexus.config.import.inventory", icon: "list-flat", tooltip: "Bulk-create servers from a CSV or plain host list" },
   { label: "Reset All to Defaults", command: "nexus.settings.resetAll", icon: "discard", tooltip: "Reset all settings to their default values" },
   { label: "Delete All Data\u2026", command: "nexus.config.completeReset", icon: "warning", tooltip: "Permanently delete all data. This cannot be undone." }
 ];

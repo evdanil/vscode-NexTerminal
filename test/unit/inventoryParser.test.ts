@@ -106,4 +106,93 @@ describe("parseInventoryList", () => {
     expect(r.sessions).toHaveLength(5000);
     expect(r.issues.some((i) => /truncated/.test(i.reason))).toBe(true);
   });
+
+  it("reports the real dropped-row count when truncated, not just one issue entry", () => {
+    const text = Array.from({ length: 5100 }, (_, i) => `h${i}.example.com`).join("\n");
+    const r = parseInventoryList(text);
+    expect(r.truncatedCount).toBe(100);
+  });
+
+  it("does not truncate a header row plus exactly 5000 data rows", () => {
+    const text = "host\n" + Array.from({ length: 5000 }, (_, i) => `h${i}.example.com`).join("\n");
+    const r = parseInventoryList(text);
+    expect(r.sessions).toHaveLength(5000);
+    expect(r.truncatedCount).toBe(0);
+    expect(r.issues.some((i) => /truncated/.test(i.reason))).toBe(false);
+  });
+
+  it("reports how many rows omit a username", () => {
+    const r = parseInventoryList("sw1\nsw2,,admin\nsw3\n");
+    expect(r.missingUsernameCount).toBe(2);
+  });
+
+  it("does not mistake a header column with punctuation in its own name for a data value", () => {
+    // "mgmt.ip" and "ip:port" would previously veto header detection because they
+    // contain a "." / ":" — even though they're header labels, not data. Two alias
+    // matches (host + user) is decisive evidence this is a header row.
+    const r1 = parseInventoryList("host,mgmt.ip,user\nr1,10.0.0.1,admin\n");
+    expect(r1.sessions).toEqual([{ name: "r1", host: "r1", port: 22, username: "admin", folder: "" }]);
+
+    const r2 = parseInventoryList("host,ip:port,user\nr2,10.0.0.2,admin\n");
+    expect(r2.sessions).toEqual([{ name: "r2", host: "r2", port: 22, username: "admin", folder: "" }]);
+  });
+
+  it("reports an issue instead of silently dropping an ambiguous single-column header", () => {
+    // "hostname" as the sole field on row 1 could be a header OR a device literally
+    // named "hostname" — there's no second column to disambiguate. Default to
+    // treating it as a header (existing/expected behaviour for genuine exports),
+    // but tell the user rather than silently discarding the row.
+    const r = parseInventoryList("hostname\nrouter1\n");
+    expect(r.sessions).toEqual([{ name: "router1", host: "router1", port: 22, username: "", folder: "" }]);
+    expect(r.issues.some((i) => i.line === 1 && /ambiguous header/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects hosts over 253 characters instead of writing them straight through", () => {
+    const hugeHost = "x".repeat(254);
+    const r = parseInventoryList(hugeHost);
+    expect(r.sessions).toHaveLength(0);
+    expect(r.skippedCount).toBe(1);
+    expect(r.issues[0].reason).toMatch(/exceeds 253 characters/);
+  });
+
+  it("accepts a host at exactly the 253 character limit", () => {
+    const maxHost = "x".repeat(253);
+    const r = parseInventoryList(`${maxHost},short-name,admin\n`);
+    expect(r.sessions).toHaveLength(1);
+  });
+
+  it("rejects names over 128 characters", () => {
+    const hugeName = "n".repeat(129);
+    const r = parseInventoryList(`sw1,${hugeName},admin\n`);
+    expect(r.sessions).toHaveLength(0);
+    expect(r.issues[0].reason).toMatch(/exceeds 128 characters/);
+  });
+
+  it("allows underscores in hostnames", () => {
+    const r = parseInventoryList("core_sw1,,admin\n");
+    expect(r.sessions[0]).toMatchObject({ host: "core_sw1" });
+  });
+
+  it("collapses runs of tabs but keeps empty CSV fields meaningful", () => {
+    const tabs = parseInventoryList("r1\t\tcore sw\tadmin\n");
+    expect(tabs.sessions[0]).toMatchObject({ host: "r1", name: "core sw", username: "admin" });
+
+    // A doubled comma delimiter must still be read as an explicit empty field.
+    const csv = parseInventoryList("10.0.0.1,,admin,22\n");
+    expect(csv.sessions[0]).toMatchObject({ host: "10.0.0.1", username: "admin", port: 22 });
+  });
+
+  it("reports an issue instead of silently discarding an invalid row-level folder", () => {
+    const r = parseInventoryList("h1,n,u,22,../../etc\n");
+    expect(r.sessions).toHaveLength(0);
+    expect(r.skippedCount).toBe(1);
+    expect(r.issues[0].reason).toMatch(/invalid folder/);
+  });
+
+  it("reports an issue when the combined default-folder prefix and row folder exceed the max depth", () => {
+    const deepPrefix = Array.from({ length: 10 }, (_, i) => `L${i}`).join("/");
+    const r = parseInventoryList("sw1,,admin,,Extra\n", { defaultFolder: deepPrefix });
+    expect(r.sessions).toHaveLength(0);
+    expect(r.issues[0].reason).toMatch(/invalid folder/);
+  });
 });

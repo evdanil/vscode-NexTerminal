@@ -245,6 +245,12 @@ describe("package contributions", () => {
     expect(settings).toContain("command:nexus.config.import");
   });
 
+  it("links the bulk inventory importer from the empty Command Center welcome view", () => {
+    const welcome = packageJson.contributes.viewsWelcome ?? [];
+    const hub = welcome.find((item) => item.view === "nexusCommandCenter");
+    expect(hub?.contents).toContain("command:nexus.config.import.inventory");
+  });
+
   it("surfaces local shell actions without terminal-tab command contexts", () => {
     const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
     expect(menuItems).toEqual(expect.arrayContaining([
