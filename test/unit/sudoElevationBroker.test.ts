@@ -593,4 +593,61 @@ describe("SudoElevationBroker", () => {
       expect(mockShowInputBox).toHaveBeenCalledTimes(2);
     });
   });
+
+  describe("grace window start point (Codex finding — must anchor to password entry, not save completion)", () => {
+    // A generic implementation (rather than a queue of once-mocks) so the assertion holds
+    // regardless of which branch the broker takes: it rejects with SudoPasswordRequiredError
+    // whenever called without a password (the optimistic no-password attempt — whether that's
+    // save 1's first try or save 2's, if the grace cache was correctly treated as expired) and
+    // succeeds whenever called with one. This way a bug that skips the optimistic attempt
+    // entirely (because it wrongly still finds a usable grace-cached password) surfaces as a
+    // *missing* prompt rather than an accidentally-matching call count.
+    function installDiscriminatingWriteMock(onCall?: (callNumber: number) => void) {
+      let callCount = 0;
+      sftp.writeFileElevated.mockImplementation(async (..._args: unknown[]) => {
+        callCount += 1;
+        onCall?.(callCount);
+        const options = _args[3] as { password?: string } | undefined;
+        if (!options || !("password" in options)) {
+          throw new SudoPasswordRequiredError();
+        }
+      });
+    }
+
+    it("does not let a slow elevated save extend the grace window past entry time: password entered at T=0, save takes 35s (past the 30s window) — the next save must re-prompt", async () => {
+      rememberPassword = false;
+      mockShowInputBox.mockResolvedValue("s3cret");
+      installDiscriminatingWriteMock((callNumber) => {
+        if (callNumber === 2) {
+          // save 1's interactive write: simulate a slow SFTP staging upload (large file /
+          // slow link) that outlasts the grace window entirely before this call resolves.
+          // Advancing the fake clock from inside the mock models wall-clock time elapsing
+          // during the await.
+          vi.advanceTimersByTime(GRACE_WINDOW_MS + 5_000);
+        }
+      });
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x")); // entry at T=0, completion at T=35s
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("y")); // must re-prompt, not reuse
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(2);
+    });
+
+    it("still grants the full grace window measured from entry when the save itself is fast: entry at T=0, save completes at T=1s, a second write at T=5s reuses the cached password", async () => {
+      rememberPassword = false;
+      mockShowInputBox.mockResolvedValue("s3cret");
+      installDiscriminatingWriteMock((callNumber) => {
+        if (callNumber === 2) {
+          vi.advanceTimersByTime(1_000); // fast save: completes 1s after entry
+        }
+      });
+
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("x")); // entry T=0, completion T=1s
+      vi.advanceTimersByTime(4_000); // now T=5s — well within the 30s window from entry
+      await broker.saveElevated("srv-1", "/etc/hosts", Buffer.from("z"));
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+      expect(sftp.writeFileElevated).toHaveBeenNthCalledWith(3, "srv-1", "/etc/hosts", expect.any(Buffer), { password: "s3cret", createMode: undefined });
+    });
+  });
 });
