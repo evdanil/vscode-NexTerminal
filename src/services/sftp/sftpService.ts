@@ -612,11 +612,9 @@ export class SftpService {
       stream.on("error", onError);
       stream.on("close", onClose);
 
-      // Every command here carries -S on the sudo path, which reads a password from
-      // stdin; if nothing ever closes it, a stale `sudo -n -v` probe result would
-      // make an install hang until the exec timeout instead of failing fast. Closing
-      // stdin unconditionally (even with nothing written) is a no-op for commands
-      // that ignore stdin (e.g. copyRemote's `cp`).
+      // `sudo -S` reads the password from stdin and needs EOF to stop waiting;
+      // closing stdin unconditionally is a no-op for commands that ignore it (e.g.
+      // copyRemote's `cp`).
       if (stdin !== undefined) {
         stream.write(stdin);
       }

@@ -193,6 +193,22 @@ export async function runElevatedInstall(
         "Ask an admin to add \"Defaults:<username> !requiretty\" for this account, or edit the file from a terminal on the remote host instead."
       );
     case "unknown":
+      // Non-interactive (-n) reinterpretation: -n's own semantics mean sudo either
+      // succeeds, refuses for a reason we already classified above (sudoers denial,
+      // missing sudo), or refuses because it would otherwise have prompted for a
+      // password — there is no fourth outcome. So an "unknown" failure on this path
+      // can only be the third case, just phrased in stderr our English-only regexes
+      // don't recognize (e.g. a non-English sudo/PAM locale — LANG=de_DE, fr_FR,
+      // ja_JP, ...). Treating it as password-required is also safe from a
+      // partial-write standpoint: -n guarantees sudo refuses before the target's cat
+      // redirect ever opens, so the target is guaranteed untouched — unlike a truly
+      // unknown interactive failure below, where the redirect may already have run.
+      // Do NOT extend this to the interactive (-S, password supplied) path: there an
+      // "unknown" failure really is unknown (the redirect may have started), so the
+      // partial-write warning stays appropriate.
+      if (!interactive) {
+        throw new SudoPasswordRequiredError();
+      }
       throw new ElevatedInstallFailedError(
         redactPassword(failure.detail, args.password) || `sudo exited with code ${result.exitCode}`
       );
