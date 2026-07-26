@@ -265,9 +265,12 @@ describe("runElevatedInstall", () => {
     ).rejects.toThrow(/requiretty|terminal on the remote host/i);
   });
 
-  it("surfaces an unknown failure as ElevatedInstallFailedError, including the exit code when stderr is empty", async () => {
+  it("surfaces an unknown failure as ElevatedInstallFailedError, including the exit code when stderr is empty (interactive path)", async () => {
+    // Interactive (password supplied): unknown stays unknown here, since the
+    // non-interactive reinterpretation below only applies to the -n (no password)
+    // path — see "treats a non-interactive unknown failure..." further down.
     const exec = vi.fn().mockResolvedValue({ exitCode: 7, stdout: "", stderr: "" });
-    const promise = runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts" });
+    const promise = runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts", password: "x" });
     await expect(promise).rejects.toBeInstanceOf(ElevatedInstallFailedError);
     await expect(promise).rejects.toThrow("Elevated save failed: sudo exited with code 7");
   });
@@ -305,6 +308,38 @@ describe("runElevatedInstall", () => {
     exec.mockClear();
     await runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts", password: "x" });
     expect(exec.mock.calls[0][0]).toContain("sudo -S");
+  });
+
+  it("treats a non-interactive unknown failure as password-required, not a partial-write risk (non-English sudo/PAM locales)", async () => {
+    // German sudo NLS phrasing for a missing-password refusal. PASSWORD_REQUIRED_RE
+    // is English-only, so this stderr classifies as "unknown" — but on the
+    // non-interactive (-n) path, -n's own semantics mean an "unknown" refusal that
+    // is neither a sudoers denial nor "sudo not found" can only be a missing
+    // credential, and the target is guaranteed untouched (sudo refuses before
+    // exec'ing anything). The broker must see SudoPasswordRequiredError here so it
+    // prompts for a password instead of reporting the (false) partial-write warning.
+    const exec = vi.fn().mockResolvedValue({
+      exitCode: 1,
+      stdout: "",
+      stderr: "sudo: Ein Passwort ist notwendig",
+    });
+    await expect(
+      runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts" })
+    ).rejects.toBeInstanceOf(SudoPasswordRequiredError);
+  });
+
+  it("still surfaces the same non-English stderr as unknown (ElevatedInstallFailedError) on the interactive path", async () => {
+    // Same stderr, but a password WAS supplied (-S). Here an "unknown" failure
+    // really is unknown — the cat redirect may already have started — so the
+    // partial-write warning stays appropriate and must not be reinterpreted.
+    const exec = vi.fn().mockResolvedValue({
+      exitCode: 1,
+      stdout: "",
+      stderr: "sudo: Ein Passwort ist notwendig",
+    });
+    await expect(
+      runElevatedInstall(exec, { tempPath: "/tmp/a", targetPath: "/etc/hosts", password: "x" })
+    ).rejects.toBeInstanceOf(ElevatedInstallFailedError);
   });
 });
 
