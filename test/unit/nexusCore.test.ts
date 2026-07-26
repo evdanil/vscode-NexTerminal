@@ -447,6 +447,53 @@ describe("NexusCore", () => {
     expect(core.getSnapshot().explicitGroups).toHaveLength(0);
   });
 
+  it("addServersBatch adds all servers and folders with a single persisted write", async () => {
+    const repository = new InMemoryConfigRepository();
+    const saveServersSpy = vi.spyOn(repository, "saveServers");
+    const saveGroupsSpy = vi.spyOn(repository, "saveGroups");
+    const core = new NexusCore(repository);
+    await core.initialize();
+    const changes: number[] = [];
+    core.onDidChange((snapshot) => changes.push(snapshot.servers.length));
+
+    saveServersSpy.mockClear();
+    saveGroupsSpy.mockClear();
+
+    await core.addServersBatch(
+      [
+        { id: "b1", name: "sw1", host: "10.0.0.1", port: 22, username: "admin", authType: "password", isHidden: false, group: "DC1/Core" },
+        { id: "b2", name: "sw2", host: "10.0.0.2", port: 22, username: "admin", authType: "password", isHidden: false, group: "DC1/Core" }
+      ],
+      ["DC1/Core"]
+    );
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(2);
+    expect(snapshot.explicitGroups).toContain("DC1");
+    expect(snapshot.explicitGroups).toContain("DC1/Core");
+
+    // One write and one change notification for the whole batch, not one per row.
+    expect(saveServersSpy).toHaveBeenCalledTimes(1);
+    expect(saveGroupsSpy).toHaveBeenCalledTimes(1);
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toBe(2);
+  });
+
+  it("addServersBatch is a no-op when given nothing", async () => {
+    const repository = new InMemoryConfigRepository();
+    const saveServersSpy = vi.spyOn(repository, "saveServers");
+    const core = new NexusCore(repository);
+    await core.initialize();
+    let changeCount = 0;
+    core.onDidChange(() => changeCount++);
+    saveServersSpy.mockClear();
+
+    await core.addServersBatch([], []);
+
+    expect(saveServersSpy).not.toHaveBeenCalled();
+    expect(changeCount).toBe(0);
+  });
+
   it("moveFolder moves a folder and all descendant items", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

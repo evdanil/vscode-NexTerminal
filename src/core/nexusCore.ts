@@ -181,6 +181,44 @@ export class NexusCore {
     this.emitChanged();
   }
 
+  /**
+   * Bulk-add servers (and the folders they live in) with a single persisted
+   * write and a single change notification, instead of the N sequential
+   * `addOrUpdateServer`/`addGroup` round-trips a per-row loop would cost.
+   * VS Code batches memento flushes, so N awaited `globalState.update` calls
+   * in a row cost roughly N times a flush interval — for a multi-thousand-row
+   * inventory import that reads as a hung window. Intended for bulk import
+   * paths; existing single-server callers should keep using addOrUpdateServer.
+   *
+   * Bulk-imported servers never carry `openFileExplorerOnFirstConnect`, so the
+   * cross-server "single auto-open owner" invariant enforced by
+   * addOrUpdateServer does not need to be replicated here.
+   */
+  public async addServersBatch(servers: ServerConfig[], folders: string[] = []): Promise<void> {
+    if (servers.length === 0 && folders.length === 0) {
+      return;
+    }
+    for (const folder of folders) {
+      const normalized = normalizeFolderPath(folder);
+      if (!normalized) {
+        continue;
+      }
+      for (const ancestor of getAncestorPaths(normalized)) {
+        this.explicitGroups.add(ancestor);
+      }
+    }
+    if (folders.length > 0) {
+      await this.repository.saveGroups([...this.explicitGroups]);
+    }
+    for (const server of servers) {
+      this.servers.set(server.id, server);
+    }
+    if (servers.length > 0) {
+      await this.repository.saveServers([...this.servers.values()]);
+    }
+    this.emitChanged();
+  }
+
   public async removeServer(serverId: string): Promise<void> {
     this.servers.delete(serverId);
     this.removeServerSessions(serverId);
