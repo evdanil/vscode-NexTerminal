@@ -353,6 +353,27 @@ export const SETTINGS_META: SettingMeta[] = [
     badge: "Safety limit",
     badgeClass: "setting-badge-safety"
   },
+  // --- SFTP > Sudo (elevated saves) ---
+  {
+    key: "sudo.enabled",
+    section: "nexus.sftp",
+    label: "Enable Elevated (sudo) Saves",
+    type: "boolean",
+    category: "sftp",
+    subgroup: "Sudo",
+    description: "Offer to save remote files with sudo when the SSH user lacks write permission.",
+    default: true
+  },
+  {
+    key: "sudo.rememberPasswordForSession",
+    section: "nexus.sftp",
+    label: "Remember Sudo Password for Session",
+    type: "boolean",
+    category: "sftp",
+    subgroup: "Sudo",
+    description: "Keep the sudo password in memory for the duration of the session. Never written to disk or to VS Code's secret storage.",
+    default: false
+  },
   // --- Highlighting ---
   {
     key: "enabled",

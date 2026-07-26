@@ -649,6 +649,12 @@
         "icon": "$(debug-disconnect)"
       },
       {
+        "command": "nexus.files.editAsRoot",
+        "title": "Edit as Root (sudo)",
+        "category": "Nexus",
+        "icon": "$(shield)"
+      },
+      {
         "command": "nexus.terminal.appearance",
         "title": "Terminal Appearance",
         "category": "Nexus",
@@ -1342,6 +1348,11 @@
           "group": "3_destructive"
         },
         {
+          "command": "nexus.files.editAsRoot",
+          "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.file",
+          "group": "1_manage@6"
+        },
+        {
           "command": "nexus.script.runQuick",
           "when": "view == nexusScripts && viewItem == nexus.script.file",
           "group": "inline"
@@ -1725,6 +1736,10 @@
         {
           "command": "nexus.files.disconnect",
           "when": "true"
+        },
+        {
+          "command": "nexus.files.editAsRoot",
+          "when": "false"
         },
         {
           "command": "nexus.script.delete",
@@ -3199,6 +3214,18 @@
           "maximum": 100000,
           "order": 26,
           "markdownDescription": "⚠ **Safety limit** — Maximum number of files and directories that can be deleted in a single recursive delete."
+        },
+        "nexus.sftp.sudo.enabled": {
+          "type": "boolean",
+          "default": true,
+          "order": 27,
+          "description": "Offer to save remote files with sudo when the SSH user lacks write permission."
+        },
+        "nexus.sftp.sudo.rememberPasswordForSession": {
+          "type": "boolean",
+          "default": false,
+          "order": 28,
+          "description": "Keep the sudo password in memory for the duration of the session. Never written to disk or to VS Code's secret storage."
         },
         "nexus.tunnel.socks5HandshakeTimeout": {
           "type": "number",

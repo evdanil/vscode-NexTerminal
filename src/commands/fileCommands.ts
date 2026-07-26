@@ -791,5 +791,25 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     ctx.fileExplorerProvider.clearActiveServer();
   });
 
-  return [browse, open, createFile, upload, download, deleteCmd, rename, createDir, goToPath, goHome, copyPath, refresh, disconnect];
+  const editAsRoot = vscode.commands.registerCommand("nexus.files.editAsRoot", async (arg?: unknown) => {
+    if (!(arg instanceof FileTreeItem) || arg.entry.isDirectory || !ctx.fileSystemProvider) {
+      return;
+    }
+    const sudoEnabled = vscode.workspace.getConfiguration("nexus.sftp").get<boolean>("sudo.enabled", true);
+    if (!sudoEnabled) {
+      vscode.window.showWarningMessage("Elevated saves are disabled (nexus.sftp.sudo.enabled is off).");
+      return;
+    }
+    // FileTreeItem.remotePath is the containing directory, not the file — same as
+    // nexus.files.open, the full path must be joined with the entry name first.
+    const filePath = joinRemoteEntryPath(arg.remotePath, arg.entry.name);
+    if (!filePath) {
+      return;
+    }
+    const uri = buildUri(arg.serverId, filePath);
+    ctx.fileSystemProvider.markElevated(uri);
+    await vscode.commands.executeCommand("vscode.open", uri);
+  });
+
+  return [browse, open, createFile, upload, download, deleteCmd, rename, createDir, goToPath, goHome, copyPath, refresh, disconnect, editAsRoot];
 }

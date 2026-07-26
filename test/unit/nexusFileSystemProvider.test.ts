@@ -400,6 +400,19 @@ describe("NexusFileSystemProvider", () => {
       expect(broker.saveElevated).not.toHaveBeenCalled();
     });
 
+    it("clearElevatedForServer drops only that server's elevated URIs", async () => {
+      (sftp.writeFile as any).mockResolvedValue(undefined);
+      const uriA = buildUri("srv-1", "/etc/hosts");
+      const uriB = buildUri("srv-2", "/etc/hosts");
+      providerWithBroker.markElevated(uriA);
+      providerWithBroker.markElevated(uriB);
+
+      providerWithBroker.clearElevatedForServer("srv-1");
+
+      expect(providerWithBroker.isElevated(uriA)).toBe(false);
+      expect(providerWithBroker.isElevated(uriB)).toBe(true);
+    });
+
     it("closing the document clears decline memory", async () => {
       const vscode = await import("vscode");
       let closeHandler: ((doc: { uri: { scheme: string; toString(): string } }) => void) | undefined;

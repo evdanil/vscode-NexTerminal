@@ -47,7 +47,9 @@ function toFileType(entry: DirectoryEntry): vscode.FileType {
 export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscode.Disposable {
   private readonly onDidChangeFileEmitter = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
   public readonly onDidChangeFile = this.onDidChangeFileEmitter.event;
-  private readonly elevatedUris = new Set<string>();
+  // uri.toString() -> serverId. The serverId side lets clearElevatedForServer drop
+  // exactly that server's entries on disconnect without parsing/prefix-matching keys.
+  private readonly elevatedUris = new Map<string, string>();
   // Tracks URIs where the user has already said "no" to the sudo offer, so autosave
   // (files.autoSave: afterDelay) re-entering writeFile on the same permission-denied
   // file doesn't pop a modal on every retry. Cleared on document close or editAsRoot.
@@ -77,7 +79,7 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscod
   /** Marks a URI as sudo-writable: stat drops Readonly and writeFile routes to the elevated path. */
   public markElevated(uri: vscode.Uri): void {
     const key = uri.toString();
-    this.elevatedUris.add(key);
+    this.elevatedUris.set(key, uri.authority);
     this.declinedUris.delete(key); // explicit "Edit as Root" re-arms a previously declined offer
     // For a file already open (the 0444 proactive case), VS Code has cached
     // FilePermission.Readonly in the text model; dropping it in stat() only takes
@@ -88,6 +90,15 @@ export class NexusFileSystemProvider implements vscode.FileSystemProvider, vscod
 
   public clearElevated(uri: vscode.Uri): void {
     this.elevatedUris.delete(uri.toString());
+  }
+
+  /** Drops elevation for every URI belonging to a server — call on SSH disconnect so a file reopened later doesn't silently stay in sudo mode. */
+  public clearElevatedForServer(serverId: string): void {
+    for (const [key, sid] of this.elevatedUris) {
+      if (sid === serverId) {
+        this.elevatedUris.delete(key);
+      }
+    }
   }
 
   public isElevated(uri: vscode.Uri): boolean {

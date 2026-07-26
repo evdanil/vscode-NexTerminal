@@ -16,6 +16,7 @@ import { TerminalLoggerFactory, type LoggerRotationOptions } from "./logging/ter
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
 import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFileSystemProvider";
 import { SftpService } from "./services/sftp/sftpService";
+import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { ProxySshFactory } from "./services/ssh/proxySshFactory";
 import { SshConnectionPool } from "./services/ssh/sshConnectionPool";
@@ -549,8 +550,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
   const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
   const sftpService = new SftpService(pool, readSftpServiceConfig());
-  const fileSystemProvider = new NexusFileSystemProvider(sftpService);
+  const elevationBroker = new SudoElevationBroker(sftpService, (id) => core.getServer(id));
+  const fileSystemProvider = new NexusFileSystemProvider(sftpService, elevationBroker);
   const fsRegistration = vscode.workspace.registerFileSystemProvider(NEXTERM_SCHEME, fileSystemProvider, { isCaseSensitive: true });
+  // Password cache and elevated-URI state are per-server and must not survive a
+  // disconnect — SftpService.disconnect() itself emits no event a broker/provider
+  // could subscribe to, so this listens to the pool's own "disconnected" signal.
+  const elevationTeardownListener = pool.onDidChange((event) => {
+    if (event.type === "disconnected") {
+      elevationBroker.clearCachedPassword(event.serverId);
+      fileSystemProvider.clearElevatedForServer(event.serverId);
+    }
+  });
 
   // Keep nexterm:// labels in POSIX style on Windows.
   tryRegisterResourceLabelFormatter(vscode.workspace, NEXTERM_SCHEME);
@@ -576,6 +587,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     macroAutoTrigger,
     sftpService,
     fileExplorerProvider,
+    fileSystemProvider,
+    elevationBroker,
     secretVault,
     registrySync,
     focusedTerminal: vscode.window.activeTerminal ?? undefined,
@@ -1054,6 +1067,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ...scriptCommandDisposables,
     fileExplorerView,
     fsRegistration,
+    fileSystemProvider,
+    { dispose: elevationTeardownListener },
     statusBarItem,
     refreshCommand,
     settingsGuard,
