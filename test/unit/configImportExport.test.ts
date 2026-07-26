@@ -2021,16 +2021,28 @@ describe("import inventory list command", () => {
     expect(mockShowOpenDialog).not.toHaveBeenCalled();
   });
 
-  it("rejects lists over 2 MB, from either the clipboard or a file", async () => {
-    mockShowQuickPick.mockResolvedValue({ label: "Choose File…", value: "file" });
-    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/big.csv", scheme: "file" }]);
-    mockReadFile.mockResolvedValue(Buffer.alloc(2 * 1024 * 1024 + 1, "a"));
+  it("rejects an over-limit clipboard paste via the post-decode backstop check", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "Paste from Clipboard", value: "clipboard" });
+    mockClipboardReadText.mockResolvedValue("a".repeat(2 * 1024 * 1024 + 1));
 
     const cmd = registeredCommands.get("nexus.config.import.inventory")!;
     await cmd();
 
     expect(mockShowErrorMessage).toHaveBeenCalledWith("The list exceeds the 2 MB size limit.");
     expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("rejects an over-limit file via stat before reading it (Codex round 2 finding C)", async () => {
+    mockShowQuickPick.mockResolvedValue({ label: "Choose File…", value: "file" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/big.csv", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1, size: 2 * 1024 * 1024 + 1 });
+
+    const cmd = registeredCommands.get("nexus.config.import.inventory")!;
+    await cmd();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("The list exceeds the 2 MB size limit.");
+    expect(core.getSnapshot().servers).toHaveLength(0);
+    expect(mockReadFile).not.toHaveBeenCalled();
   });
 
   it("keeps the existing 'non-SSH skipped' wording for the MobaXterm importer", async () => {
