@@ -15,6 +15,7 @@ import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory, type LoggerRotationOptions } from "./logging/terminalLogger";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
 import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFileSystemProvider";
+import { registerEditAsRootHint } from "./services/sftp/editAsRootHint";
 import { SftpService } from "./services/sftp/sftpService";
 import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
@@ -554,14 +555,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const fileSystemProvider = new NexusFileSystemProvider(sftpService, elevationBroker);
   const fsRegistration = vscode.workspace.registerFileSystemProvider(NEXTERM_SCHEME, fileSystemProvider, { isCaseSensitive: true });
   // Password cache and elevated-URI state are per-server and must not survive a
-  // disconnect — SftpService.disconnect() itself emits no event a broker/provider
-  // could subscribe to, so this listens to the pool's own "disconnected" signal.
+  // disconnect. nexus.files.disconnect (fileCommands.ts) already clears both
+  // directly, but this pool listener is the backstop for every OTHER path back to
+  // zero refs on a server's pooled SSH connection (an SSH terminal tab closing, an
+  // idle timeout) — those never go through the File Explorer's Disconnect command.
   const elevationTeardownListener = pool.onDidChange((event) => {
     if (event.type === "disconnected") {
       elevationBroker.clearCachedPassword(event.serverId);
       fileSystemProvider.clearElevatedForServer(event.serverId);
     }
   });
+  const editAsRootHintListener = registerEditAsRootHint(fileSystemProvider);
 
   // Keep nexterm:// labels in POSIX style on Windows.
   tryRegisterResourceLabelFormatter(vscode.workspace, NEXTERM_SCHEME);
@@ -1068,7 +1072,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     fileExplorerView,
     fsRegistration,
     fileSystemProvider,
+    elevationBroker,
     { dispose: elevationTeardownListener },
+    editAsRootHintListener,
     statusBarItem,
     refreshCommand,
     settingsGuard,
