@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`Nexus: Import Configuration` is now `Nexus: Import…` — one entry point for every import format.** It used to accept only Nexus's own JSON export and reject everything else, including the CSV/plain-text importer it now sits alongside; the reporter of #29 never found any importer at all. It now opens a picker asking what you're importing — **Paste Host List from Clipboard**, **Host List File…**, **MobaXterm INI File…**, **SecureCRT XML Export…**, **SecureCRT Sessions Folder…**, or **Nexus Export File…** (an encrypted backup or a shared config) — then branches into the matching format. It's also newly reachable from the Command Center's `...` overflow menu (next to **New Folder**) so it's available even once the tree isn't empty, not just from the empty-state welcome view. The Data Management section of Settings collapses its two former import rows into this one. If the file you picked doesn't match what you told the picker — say, you chose "Host List File…" but selected a MobaXterm export — Nexus names the mismatch and offers a one-click button to re-import it as the format it actually looks like, reusing the same bytes rather than a dead end or a re-opened dialog. `Nexus: Import from MobaXterm`, `Nexus: Import from SecureCRT`, and `Nexus: Import Servers from List (CSV/Text)` remain in the command palette as direct shortcuts into the same pickers, for anyone who already knows what they're importing. One extra keystroke for a keybound or muscle-memory `nexus.config.import` invocation — type-to-filter (e.g. `nex` + Enter) restores near-parity, and Enter-Enter now lands on clipboard paste rather than the JSON importer.
+
 ## [2.8.68] — 2026-07-27
 
 Closes the two open GitHub issues: bulk connection import and editing root-owned remote files (#29, #30).
