@@ -243,12 +243,45 @@ describe("package contributions", () => {
     expect(settings).toContain("command:nexus.settings.openPanel");
     expect(settings).toContain("command:nexus.config.export.backup");
     expect(settings).toContain("command:nexus.config.import");
+    // Relabeled alongside the command's own retitle to "Import…" (was "Import Configuration").
+    expect(settings).toContain("[Import…](command:nexus.config.import)");
   });
 
-  it("links the bulk inventory importer from the empty Command Center welcome view", () => {
+  it("links the unified importer — not the old inventory-only deep link — from the empty Command Center welcome view, second after Add Profile", () => {
     const welcome = packageJson.contributes.viewsWelcome ?? [];
     const hub = welcome.find((item) => item.view === "nexusCommandCenter");
-    expect(hub?.contents).toContain("command:nexus.config.import.inventory");
+    expect(hub?.contents).toContain("command:nexus.config.import");
+    expect(hub?.contents).not.toContain("command:nexus.config.import.inventory");
+
+    // Lead persona action (bulk import) sits right after the first add-profile link,
+    // ahead of the per-type Add Server/Serial/Local Shell links.
+    const contents = hub!.contents;
+    const addProfileIdx = contents.indexOf("command:nexus.profile.add");
+    const importIdx = contents.indexOf("command:nexus.config.import");
+    const addServerIdx = contents.indexOf("command:nexus.server.add");
+    expect(addProfileIdx).toBeGreaterThanOrEqual(0);
+    expect(importIdx).toBeGreaterThan(addProfileIdx);
+    expect(importIdx).toBeLessThan(addServerIdx);
+  });
+
+  it("surfaces the unified importer in the Command Center's overflow menu even once the tree isn't empty (issue #29)", () => {
+    // viewsWelcome only renders while the tree is empty — a user who already has
+    // servers and wants to add 200 more had no import affordance in the Hub at all.
+    const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+    const entry = titleMenuItems.find(
+      (item) => item.command === "nexus.config.import" && item.when === "view == nexusCommandCenter"
+    );
+    expect(entry).toBeDefined();
+    // Lands in the "..." overflow (non-navigation group), beside New Folder (1_manage@1).
+    expect(entry?.group).toBe("1_manage@2");
+  });
+
+  it("retitles nexus.config.import to the universal chooser label", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.config.import");
+    expect(command).toBeDefined();
+    expect(command?.title).toBe("Import…");
+    expect(command?.category).toBe("Nexus");
+    expect((command as unknown as { icon?: string })?.icon).toBe("$(cloud-download)");
   });
 
   it("surfaces local shell actions without terminal-tab command contexts", () => {

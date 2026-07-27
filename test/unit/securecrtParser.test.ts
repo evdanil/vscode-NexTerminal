@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   parseSecureCrtSessionFile,
   parseSecureCrtDirectory,
-  parseSecureCrtXmlExport
+  parseSecureCrtXmlExport,
+  hasSecureCrtSessionsRoot
 } from "../../src/utils/securecrtParser";
 import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 
@@ -415,5 +416,51 @@ describe("parseSecureCrtXmlExport", () => {
     const result = parseSecureCrtXmlExport(xml);
     expect(result.sessions).toHaveLength(1);
     expect(result.sessions[0].host).toBe("safe.example.com");
+  });
+});
+
+describe("hasSecureCrtSessionsRoot", () => {
+  it("returns true for a document with a top-level Sessions key", () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="Server">
+      <dword name="Is Session">1</dword>
+      <string name="Protocol Name">SSH2</string>
+      <string name="Hostname">host.example.com</string>
+    </key>
+  </key>
+</VanDyke>`;
+    expect(hasSecureCrtSessionsRoot(xml)).toBe(true);
+  });
+
+  it("returns true even when the Sessions key has zero SSH entries — distinct from 'no Sessions key at all'", () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="RDP">
+      <dword name="Is Session">1</dword>
+      <string name="Protocol Name">RDP</string>
+      <string name="Hostname">rdp.example.com</string>
+    </key>
+  </key>
+</VanDyke>`;
+    expect(hasSecureCrtSessionsRoot(xml)).toBe(true);
+  });
+
+  it("returns false when the Sessions key is missing", () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Security"/>
+</VanDyke>`;
+    expect(hasSecureCrtSessionsRoot(xml)).toBe(false);
+  });
+
+  it("returns false for a well-formed XML document that isn't a VanDyke export", () => {
+    expect(hasSecureCrtSessionsRoot("<root><item>hello</item></root>")).toBe(false);
+  });
+
+  it("returns false for malformed XML instead of throwing", () => {
+    expect(hasSecureCrtSessionsRoot("<VanDyke><key name=\"Sessions\">")).toBe(false);
   });
 });

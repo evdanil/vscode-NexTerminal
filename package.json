@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, and tunnels in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.68",
+  "version": "2.8.69",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -121,7 +121,7 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "Start by adding a connection profile.\n[Add Profile](command:nexus.profile.add)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)\n[Import Servers from a List](command:nexus.config.import.inventory)"
+        "contents": "Start by adding a connection profile — or import the servers you already have.\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT…)](command:nexus.config.import)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
       },
       {
         "view": "nexusTunnels",
@@ -141,7 +141,7 @@
       },
       {
         "view": "nexusSettings",
-        "contents": "Open Nexus settings or import/export your configuration.\n[Open Settings](command:nexus.settings.openPanel)\n[Encrypted Backup](command:nexus.config.export.backup)\n[Import Configuration](command:nexus.config.import)"
+        "contents": "Open Nexus settings or import/export your configuration.\n[Open Settings](command:nexus.settings.openPanel)\n[Encrypted Backup](command:nexus.config.export.backup)\n[Import…](command:nexus.config.import)"
       }
     ],
     "commands": [
@@ -469,7 +469,7 @@
       },
       {
         "command": "nexus.config.import",
-        "title": "Import Configuration",
+        "title": "Import…",
         "category": "Nexus",
         "icon": "$(cloud-download)"
       },
@@ -789,6 +789,11 @@
           "command": "nexus.group.add",
           "when": "view == nexusCommandCenter",
           "group": "1_manage@1"
+        },
+        {
+          "command": "nexus.config.import",
+          "when": "view == nexusCommandCenter",
+          "group": "1_manage@2"
         },
         {
           "command": "nexus.tunnel.add",

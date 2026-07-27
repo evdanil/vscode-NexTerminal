@@ -203,24 +203,31 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("data management actions", () => {
-    it("returns 6 data management action items", () => {
+    it("returns 5 data management action items", () => {
       const provider = createProvider();
       const dmGroup = new DataManagementGroupItem();
       const children = provider.getChildren(dmGroup);
-      expect(children).toHaveLength(6);
+      expect(children).toHaveLength(5);
       expect(children.every((c) => c instanceof DataManagementActionItem)).toBe(true);
     });
 
-    it("offers the bulk inventory importer alongside the JSON importer", () => {
+    // The JSON-only importer and the bulk inventory importer used to be separate
+    // rows; the unified chooser (nexus.config.import) now covers both, so there is
+    // exactly one Import row and no more nexus.config.import.inventory row here.
+    it("offers a single unified Import row instead of separate JSON/inventory rows", () => {
       const provider = createProvider();
       const dmGroup = new DataManagementGroupItem();
       const children = provider.getChildren(dmGroup) as InstanceType<typeof DataManagementActionItem>[];
-      const inventoryAction = children.find((c) => c.id === "settings-action:nexus.config.import.inventory");
-      expect(inventoryAction).toBeDefined();
-      expect(inventoryAction?.command).toEqual({
-        command: "nexus.config.import.inventory",
-        title: "Import Servers from List…"
+
+      const importAction = children.find((c) => c.id === "settings-action:nexus.config.import");
+      expect(importAction).toBeDefined();
+      expect(importAction?.command).toEqual({
+        command: "nexus.config.import",
+        title: "Import…"
       });
+      expect((importAction?.iconPath as { id: string })?.id).toBe("cloud-download");
+
+      expect(children.find((c) => c.id === "settings-action:nexus.config.import.inventory")).toBeUndefined();
     });
   });
 
