@@ -76,7 +76,13 @@ export class PtyObserverHub {
     highlighter: TerminalHighlighter | undefined,
     emit: (rendered: string) => void
   ): void {
-    this.observers.forEach((o) => o.onOutput(text));
+    this.observers.forEach((o) => {
+      try {
+        o.onOutput(text);
+      } catch {
+        /* tolerate misbehaving observer — one throw must not break delivery to the others */
+      }
+    });
     if (highlighterStream) {
       highlighterStream.push(text);
     } else {

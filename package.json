@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, and tunnels in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.69",
+  "version": "2.8.70",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -665,6 +665,27 @@
         "icon": "$(shield)"
       },
       {
+        "command": "nexus.files.followTerminal",
+        "title": "Follow Terminal Directory",
+        "icon": "$(link)"
+      },
+      {
+        "command": "nexus.files.unfollowTerminal",
+        "title": "Stop Following Terminal Directory",
+        "icon": "$(circle-slash)"
+      },
+      {
+        "command": "nexus.files.resumeFollowTerminal",
+        "title": "Resume Following Terminal Directory",
+        "icon": "$(pinned)"
+      },
+      {
+        "command": "nexus.files.syncFromTerminal",
+        "title": "Go to Terminal Directory",
+        "icon": "$(arrow-circle-down)",
+        "enablement": "nexus.isNexusTerminalConnected"
+      },
+      {
         "command": "nexus.terminal.appearance",
         "title": "Terminal Appearance",
         "category": "Nexus",
@@ -846,44 +867,64 @@
           "group": "navigation@3"
         },
         {
-          "command": "nexus.files.createFile",
-          "when": "view == nexusFileExplorer",
+          "command": "nexus.files.followTerminal",
+          "when": "view == nexusFileExplorer && !nexus.files.followingTerminal",
           "group": "navigation@1"
         },
         {
-          "command": "nexus.files.createDir",
-          "when": "view == nexusFileExplorer",
-          "group": "navigation@2"
+          "command": "nexus.files.unfollowTerminal",
+          "when": "view == nexusFileExplorer && nexus.files.followingTerminal && !nexus.files.followPaused",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nexus.files.resumeFollowTerminal",
+          "when": "view == nexusFileExplorer && nexus.files.followPaused",
+          "group": "navigation@1"
         },
         {
           "command": "nexus.files.upload",
           "when": "view == nexusFileExplorer",
-          "group": "navigation@3"
+          "group": "navigation@2"
         },
         {
           "command": "nexus.files.goHome",
           "when": "view == nexusFileExplorer",
-          "group": "navigation@4"
+          "group": "navigation@3"
         },
         {
           "command": "nexus.files.goToPath",
           "when": "view == nexusFileExplorer",
-          "group": "navigation@5"
+          "group": "navigation@4"
         },
         {
           "command": "nexus.files.refresh",
           "when": "view == nexusFileExplorer",
-          "group": "navigation@6"
+          "group": "navigation@5"
         },
         {
           "command": "nexus.files.browse",
           "when": "view == nexusFileExplorer",
-          "group": "navigation@7"
+          "group": "navigation@6"
+        },
+        {
+          "command": "nexus.files.createFile",
+          "when": "view == nexusFileExplorer",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "nexus.files.createDir",
+          "when": "view == nexusFileExplorer",
+          "group": "1_manage@2"
         },
         {
           "command": "nexus.files.disconnect",
           "when": "view == nexusFileExplorer",
-          "group": "navigation@8"
+          "group": "1_manage@3"
+        },
+        {
+          "command": "nexus.files.syncFromTerminal",
+          "when": "view == nexusFileExplorer",
+          "group": "1_sync@1"
         },
         {
           "command": "nexus.script.new",
@@ -1368,6 +1409,26 @@
           "group": "1_manage@6"
         },
         {
+          "command": "nexus.files.syncFromTerminal",
+          "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.currentDir",
+          "group": "1_sync@1"
+        },
+        {
+          "command": "nexus.files.followTerminal",
+          "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.currentDir && !nexus.files.followingTerminal",
+          "group": "1_sync@2"
+        },
+        {
+          "command": "nexus.files.unfollowTerminal",
+          "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.currentDir && nexus.files.followingTerminal && !nexus.files.followPaused",
+          "group": "1_sync@2"
+        },
+        {
+          "command": "nexus.files.resumeFollowTerminal",
+          "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.currentDir && nexus.files.followPaused",
+          "group": "1_sync@3"
+        },
+        {
           "command": "nexus.script.runQuick",
           "when": "view == nexusScripts && viewItem == nexus.script.file",
           "group": "inline"
@@ -1761,6 +1822,22 @@
           "when": "resourceScheme == nexterm"
         },
         {
+          "command": "nexus.files.followTerminal",
+          "when": "!nexus.files.followingTerminal"
+        },
+        {
+          "command": "nexus.files.unfollowTerminal",
+          "when": "nexus.files.followingTerminal && !nexus.files.followPaused"
+        },
+        {
+          "command": "nexus.files.resumeFollowTerminal",
+          "when": "nexus.files.followPaused"
+        },
+        {
+          "command": "nexus.files.syncFromTerminal",
+          "when": "true"
+        },
+        {
           "command": "nexus.script.delete",
           "when": "false"
         },
@@ -1801,6 +1878,10 @@
         {
           "command": "nexus.terminal.copyAll",
           "group": "nexus@3"
+        },
+        {
+          "command": "nexus.files.syncFromTerminal",
+          "group": "nexus@4"
         }
       ],
       "editor/title/context": [
@@ -1818,6 +1899,11 @@
           "command": "nexus.terminal.copyAll",
           "when": "resourceScheme == 'vscode-terminal'",
           "group": "nexus@3"
+        },
+        {
+          "command": "nexus.files.syncFromTerminal",
+          "when": "resourceScheme == 'vscode-terminal'",
+          "group": "nexus@4"
         }
       ]
     },

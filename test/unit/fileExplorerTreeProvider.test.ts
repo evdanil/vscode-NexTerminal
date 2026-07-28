@@ -379,6 +379,140 @@ describe("FileExplorerTreeProvider", () => {
     expect(provider.getHomeDir()).toBe("/home/dev");
   });
 
+  describe("setRootPath validation and watcher-restart policy (§5.5)", () => {
+    it("rejects a non-normalizable path and leaves currentRootPath unchanged", () => {
+      provider.setActiveServer(testServer, "/home/dev");
+      const listener = vi.fn();
+      provider.onDidChangeTreeData(listener);
+      listener.mockClear();
+
+      provider.setRootPath("");
+      expect(provider.getRootPath()).toBe("/home/dev");
+
+      provider.setRootPath("relative/path");
+      expect(provider.getRootPath()).toBe("/home/dev");
+
+      provider.setRootPath("/has\0null");
+      expect(provider.getRootPath()).toBe("/home/dev");
+
+      expect(listener).not.toHaveBeenCalled();
+    });
+
+    it("same-path setRootPath still fires the tree refresh but does not restart the watcher", () => {
+      provider.setActiveServer(testServer, "/home/dev");
+      (sftp.startWatching as any).mockClear();
+      const listener = vi.fn();
+      provider.onDidChangeTreeData(listener);
+
+      provider.setRootPath("/home/dev");
+
+      expect(listener).toHaveBeenCalled();
+      expect(sftp.startWatching).not.toHaveBeenCalled();
+    });
+
+    it("a changed path with the default (immediate) restart behavior restarts the watcher right away", () => {
+      provider.setActiveServer(testServer, "/home/dev");
+      (sftp.startWatching as any).mockClear();
+
+      provider.setRootPath("/etc");
+
+      expect(sftp.startWatching).toHaveBeenCalledWith("srv-1", "/etc", 0);
+    });
+
+    it("{ restartWatcher: false } defers the respawn past the 2s debounce and coalesces a burst into one restart", () => {
+      vi.useFakeTimers();
+      try {
+        provider.setActiveServer(testServer, "/home/dev");
+        (sftp.startWatching as any).mockClear();
+
+        provider.setRootPath("/var/log", { restartWatcher: false });
+        provider.setRootPath("/var/log/app", { restartWatcher: false });
+        provider.setRootPath("/etc", { restartWatcher: false });
+
+        // No restart yet — still within the debounce window.
+        expect(sftp.startWatching).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(1999);
+        expect(sftp.startWatching).not.toHaveBeenCalled();
+
+        vi.advanceTimersByTime(1);
+        expect(sftp.startWatching).toHaveBeenCalledTimes(1);
+        expect(sftp.startWatching).toHaveBeenCalledWith("srv-1", "/etc", 0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not restart the watcher for a deferred restart whose path was superseded before the debounce fired", () => {
+      vi.useFakeTimers();
+      try {
+        provider.setActiveServer(testServer, "/home/dev");
+        (sftp.startWatching as any).mockClear();
+
+        provider.setRootPath("/var/log", { restartWatcher: false });
+        vi.advanceTimersByTime(1000);
+        // An immediate-restart navigation supersedes currentRootPath before the
+        // deferred timer fires; the stale timer must not respawn a watch for /var/log.
+        provider.setRootPath("/etc");
+        (sftp.startWatching as any).mockClear();
+
+        vi.advanceTimersByTime(2000);
+        expect(sftp.startWatching).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("cancels a pending deferred watcher restart on clearActiveServer", () => {
+      vi.useFakeTimers();
+      try {
+        provider.setActiveServer(testServer, "/home/dev");
+        (sftp.startWatching as any).mockClear();
+
+        provider.setRootPath("/var/log", { restartWatcher: false });
+        provider.clearActiveServer();
+
+        vi.advanceTimersByTime(5000);
+        expect(sftp.startWatching).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("cancels a pending deferred watcher restart on dispose", () => {
+      vi.useFakeTimers();
+      try {
+        provider.setActiveServer(testServer, "/home/dev");
+        (sftp.startWatching as any).mockClear();
+
+        provider.setRootPath("/var/log", { restartWatcher: false });
+        provider.dispose();
+
+        vi.advanceTimersByTime(5000);
+        expect(sftp.startWatching).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("cancels a pending deferred watcher restart when switching active servers", () => {
+      vi.useFakeTimers();
+      try {
+        const secondServer: ServerConfig = { ...testServer, id: "srv-2", name: "Other Server" };
+        provider.setActiveServer(testServer, "/home/dev");
+        provider.setRootPath("/var/log", { restartWatcher: false });
+        (sftp.startWatching as any).mockClear();
+
+        provider.setActiveServer(secondServer, "/srv/other");
+        (sftp.startWatching as any).mockClear();
+
+        vi.advanceTimersByTime(5000);
+        expect(sftp.startWatching).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it("keeps polling in auto mode when only stat watching is available", async () => {
     vi.useFakeTimers();
     try {
@@ -927,6 +1061,104 @@ describe("FileExplorerTreeProvider", () => {
       expect(uriList).toBeDefined();
       expect(uriList!.value).toContain("nexterm");
       expect(uriList!.value).toContain("/home/dev/file.txt");
+    });
+  });
+
+  describe("isBusy / beginBusy (§5.1, §7.4)", () => {
+    it("is false with no active requests or uploads", () => {
+      expect(provider.isBusy()).toBe(false);
+    });
+
+    it("is true while getChildren has a pending request and false again once it resolves", async () => {
+      const deferred = createDeferred<DirectoryEntry[]>();
+      (sftp.readDirectory as any).mockImplementation(() => deferred.promise);
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const childrenPromise = provider.getChildren();
+      expect(provider.isBusy()).toBe(true);
+
+      deferred.resolve([]);
+      await childrenPromise;
+      expect(provider.isBusy()).toBe(false);
+    });
+
+    it("beginBusy()'s disposer is idempotent — calling it twice does not under-count", () => {
+      const release = provider.beginBusy();
+      expect(provider.isBusy()).toBe(true);
+      release();
+      expect(provider.isBusy()).toBe(false);
+      release();
+      expect(provider.isBusy()).toBe(false);
+    });
+
+    it("is true during an in-flight external-drop upload and false after it completes", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.File });
+      (sftp.stat as any).mockRejectedValue(missingRemoteError());
+      const deferred = createDeferred<void>();
+      (sftp.upload as any).mockImplementation(() => deferred.promise);
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem("file:///tmp/local.txt");
+      const mockTransfer = {
+        get: (mime: string) => (mime === "text/uri-list" ? uriListItem : undefined),
+      };
+
+      expect(provider.isBusy()).toBe(false);
+      const dropPromise = provider.handleDrop(targetDir, mockTransfer as any);
+      expect(provider.isBusy()).toBe(true);
+
+      deferred.resolve();
+      await dropPromise;
+      expect(provider.isBusy()).toBe(false);
+    });
+
+    it("releases the busy span even when the external-drop upload throws", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.File });
+      (vscode.window.withProgress as any).mockRejectedValueOnce(new Error("boom"));
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem("file:///tmp/local.txt");
+      const mockTransfer = {
+        get: (mime: string) => (mime === "text/uri-list" ? uriListItem : undefined),
+      };
+
+      await expect(provider.handleDrop(targetDir, mockTransfer as any)).rejects.toThrow("boom");
+      expect(provider.isBusy()).toBe(false);
+    });
+
+    it("is true during an in-flight internal move/copy and false after it completes", async () => {
+      const vscode = await import("vscode");
+      (vscode.window.showQuickPick as any).mockResolvedValue({ label: "Move", value: "move" });
+      const deferred = createDeferred<void>();
+      (sftp.rename as any).mockImplementation(() => deferred.promise);
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const payload = JSON.stringify([
+        { serverId: "srv-1", remotePath: "/home/dev", name: "file.txt", isDirectory: false },
+      ]);
+      const { DataTransferItem } = await import("vscode");
+      const transferItem = new DataTransferItem(payload);
+      const mockTransfer = {
+        get: (mime: string) => (mime === "application/vnd.nexus.fileitem" ? transferItem : undefined),
+      };
+
+      expect(provider.isBusy()).toBe(false);
+      const dropPromise = provider.handleDrop(targetDir, mockTransfer as any);
+      // Let the QuickPick microtask resolve before asserting the busy state.
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(provider.isBusy()).toBe(true);
+
+      deferred.resolve();
+      await dropPromise;
+      expect(provider.isBusy()).toBe(false);
     });
   });
 });

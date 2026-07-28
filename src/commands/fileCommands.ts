@@ -370,6 +370,53 @@ async function downloadDirectoryToLocal(
   }
 }
 
+/**
+ * Shared "Go to Path" prompt: input box (defaulted to `defaultValue`) → validate
+ * with `sftp.stat` → re-root on success. Used by the `nexus.files.goToPath`
+ * command itself (no-arg / palette invocation) and reused verbatim by
+ * `nexus.files.syncFromTerminal`'s resolution-ladder fallback (cwdSyncCommands.ts)
+ * so the two paths never drift.
+ *
+ * Returns the path that was actually applied on success, `undefined` otherwise
+ * (dismissed box, non-directory target, or SFTP error) — callers use this to
+ * decide whether a "first successful sync" nudge should fire.
+ *
+ * This is manual navigation by construction (the user is typing/confirming an
+ * absolute path), so it always pins directory-sync (§8.3) via
+ * `notifyManualNavigation()` on success — including when reached from the
+ * `syncFromTerminal` fallback, where a corrected/typed path is exactly the kind
+ * of user intent §8.3 defines as "manual navigation".
+ */
+export async function promptGoToPath(ctx: CommandContext, defaultValue: string): Promise<string | undefined> {
+  const activeId = ctx.fileExplorerProvider.getActiveServerId();
+  if (!activeId) {
+    return undefined;
+  }
+  const inputPath = await vscode.window.showInputBox({
+    title: "Go to Path",
+    prompt: "Enter absolute remote path",
+    value: defaultValue,
+  });
+  if (!inputPath) {
+    return undefined;
+  }
+  try {
+    const entry = await ctx.sftpService.stat(activeId, inputPath);
+    if (!entry.isDirectory) {
+      vscode.window.showWarningMessage("Path is not a directory.");
+      return undefined;
+    }
+    ctx.sftpService.invalidateCache(activeId, inputPath);
+    ctx.fileExplorerProvider.setRootPath(inputPath);
+    ctx.cwdSyncCoordinator?.notifyManualNavigation();
+    return inputPath;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    vscode.window.showErrorMessage(`Cannot navigate to path: ${message}`);
+    return undefined;
+  }
+}
+
 export async function browseServerFiles(ctx: CommandContext, server: ServerConfig): Promise<void> {
   try {
     await vscode.window.withProgress(
@@ -458,50 +505,61 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       canceled: 0
     };
 
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "Uploading files..." },
-      async (progress) => {
-        for (const file of files) {
-          if (summary.canceled > 0) {
-            break;
-          }
-          const fileName = path.basename(file.fsPath);
-          progress.report({ message: fileName });
-          const remoteDest = path.posix.join(target.dirPath, fileName);
-
-          let existingRemote;
-          try {
-            existingRemote = await tryRemoteDestinationStat(ctx.sftpService, target.serverId, remoteDest);
-          } catch (error) {
-            summary.failed += 1;
-            const message = error instanceof Error ? error.message : String(error);
-            vscode.window.showErrorMessage(`Failed to check remote target "${fileName}": ${message}`);
-            continue;
-          }
-
-          if (existingRemote) {
-            const decision = await resolveUploadConflict(fileName, conflictState, summary);
-            if (decision === "cancel") {
-              summary.canceled += 1;
+    // This command uploads directly via ctx.sftpService rather than through the
+    // provider's own upload path, so isBusy() would otherwise not see it in flight.
+    // Wrapped at the outermost operation (not per file) so a multi-file selection
+    // counts as one busy span — currentRootPath is the fallback write target this
+    // command itself falls back to, and an auto-follow re-root mid-upload would
+    // redirect where later files in the batch land.
+    const endBusy = ctx.fileExplorerProvider.beginBusy();
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "Uploading files..." },
+        async (progress) => {
+          for (const file of files) {
+            if (summary.canceled > 0) {
               break;
             }
-            if (decision === "skip") {
-              summary.skipped += 1;
+            const fileName = path.basename(file.fsPath);
+            progress.report({ message: fileName });
+            const remoteDest = path.posix.join(target.dirPath, fileName);
+
+            let existingRemote;
+            try {
+              existingRemote = await tryRemoteDestinationStat(ctx.sftpService, target.serverId, remoteDest);
+            } catch (error) {
+              summary.failed += 1;
+              const message = error instanceof Error ? error.message : String(error);
+              vscode.window.showErrorMessage(`Failed to check remote target "${fileName}": ${message}`);
               continue;
             }
-          }
 
-          try {
-            await ctx.sftpService.upload(target.serverId, file.fsPath, remoteDest);
-            summary.uploaded += 1;
-          } catch (error) {
-            summary.failed += 1;
-            const message = error instanceof Error ? error.message : String(error);
-            vscode.window.showErrorMessage(`Failed to upload "${fileName}": ${message}`);
+            if (existingRemote) {
+              const decision = await resolveUploadConflict(fileName, conflictState, summary);
+              if (decision === "cancel") {
+                summary.canceled += 1;
+                break;
+              }
+              if (decision === "skip") {
+                summary.skipped += 1;
+                continue;
+              }
+            }
+
+            try {
+              await ctx.sftpService.upload(target.serverId, file.fsPath, remoteDest);
+              summary.uploaded += 1;
+            } catch (error) {
+              summary.failed += 1;
+              const message = error instanceof Error ? error.message : String(error);
+              vscode.window.showErrorMessage(`Failed to upload "${fileName}": ${message}`);
+            }
           }
         }
-      }
-    );
+      );
+    } finally {
+      endBusy();
+    }
 
     if (summary.uploaded > 0) {
       ctx.sftpService.invalidateCache(target.serverId, target.dirPath);
@@ -746,38 +804,26 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     }
 
     if (typeof arg === "string") {
+      // String-arg invocation covers both a direct re-root (rare) and the
+      // synthetic `..` `ParentDirItem` row, whose `command` dispatches here
+      // with `arguments: [parentPath]` (fileExplorerTreeProvider.ts) — so the
+      // `..` row's manual-navigation pin (§8.3) is covered by this branch,
+      // no separate wiring needed there.
       ctx.sftpService.invalidateCache(activeId, arg);
       ctx.fileExplorerProvider.setRootPath(arg);
+      ctx.cwdSyncCoordinator?.notifyManualNavigation();
       return;
     }
 
     const currentRoot = ctx.fileExplorerProvider.getRootPath() ?? "/";
-    const inputPath = await vscode.window.showInputBox({
-      title: "Go to Path",
-      prompt: "Enter absolute remote path",
-      value: currentRoot,
-    });
-    if (!inputPath) {
-      return;
-    }
-    try {
-      const entry = await ctx.sftpService.stat(activeId, inputPath);
-      if (!entry.isDirectory) {
-        vscode.window.showWarningMessage("Path is not a directory.");
-        return;
-      }
-      ctx.sftpService.invalidateCache(activeId, inputPath);
-      ctx.fileExplorerProvider.setRootPath(inputPath);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      vscode.window.showErrorMessage(`Cannot navigate to path: ${message}`);
-    }
+    await promptGoToPath(ctx, currentRoot);
   });
 
   const goHome = vscode.commands.registerCommand("nexus.files.goHome", () => {
     const homeDir = ctx.fileExplorerProvider.getHomeDir();
     if (homeDir) {
       ctx.fileExplorerProvider.setRootPath(homeDir);
+      ctx.cwdSyncCoordinator?.notifyManualNavigation();
     }
   });
 

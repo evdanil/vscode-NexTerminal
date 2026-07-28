@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { registerFileCommands } from "./commands/fileCommands";
+import { registerCwdSyncCommands, FOLLOW_TERMINAL_STATE_KEY } from "./commands/cwdSyncCommands";
 import { registerScriptCommands } from "./commands/scriptCommands";
 import { registerSerialCommands } from "./commands/serialCommands";
 import { registerLocalShellCommands } from "./commands/localShellCommands";
@@ -8,6 +9,9 @@ import { registerServerCommands } from "./commands/serverCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
 import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import { TerminalRegistry } from "./services/terminal/terminalRegistry";
+import { CwdTracker } from "./services/terminal/cwdTracker";
+import { CwdSyncCoordinator } from "./services/sftp/cwdSyncCoordinator";
+import type { CwdSyncState } from "./services/sftp/cwdSyncCoordinator";
 import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
@@ -608,6 +612,39 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(terminalRegistry);
   ctx.terminalRegistry = terminalRegistry;
 
+  // --- Directory sync (issue #35) — CwdTracker + CwdSyncCoordinator wiring ---
+  // No existing generic "Nexus" output channel exists to reuse (only the
+  // feature-scoped "Nexus Scripts" / "Nexus Local Shell" / "Nexus Settings
+  // Guard" channels do) — §7.6 requires somewhere greppable to log
+  // suppressions/failures, so a new channel is created here, following the
+  // same per-feature naming convention as those three.
+  const cwdSyncOutputChannel = vscode.window.createOutputChannel("Nexus Directory Sync");
+  // Per-session last-output timestamp, fed by the OSC 7 observer in
+  // serverCommands.ts on every chunk; read by CwdSyncDeps.lastOutputAt so
+  // CwdTracker.isStale() can use its elapsed-time staleness signal (§7.5)
+  // rather than degrading to authority-change-only staleness detection.
+  const cwdLastOutputAt = new Map<string, number>();
+  const cwdTracker = new CwdTracker();
+  const cwdSyncCoordinator = new CwdSyncCoordinator({
+    tracker: cwdTracker,
+    provider: fileExplorerProvider,
+    sftp: sftpService,
+    core,
+    now: () => Date.now(),
+    log: (message) => cwdSyncOutputChannel.appendLine(message),
+    lastOutputAt: (sessionId) => cwdLastOutputAt.get(sessionId)
+  });
+  ctx.cwdTracker = cwdTracker;
+  ctx.cwdSyncCoordinator = cwdSyncCoordinator;
+  ctx.cwdLastOutputAt = cwdLastOutputAt;
+  ctx.cwdSyncOutputChannel = cwdSyncOutputChannel;
+  context.subscriptions.push(cwdSyncOutputChannel, cwdSyncCoordinator);
+
+  // §9 — Phase 1 ships zero settings; the Follow Terminal Directory toggle is
+  // per-window UI state in globalState (not settings.json), restored here and
+  // persisted by the nexus.files.followTerminal / unfollowTerminal commands.
+  cwdSyncCoordinator.setFollowing(context.globalState.get<boolean>(FOLLOW_TERMINAL_STATE_KEY, false));
+
   const nexusTreeProvider = new NexusTreeProvider({
     async onTunnelDropped(serverId, tunnelProfileId) {
       const profile = core.getTunnel(tunnelProfileId);
@@ -733,6 +770,78 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     canSelectMany: true
   });
 
+  // §8.2 — CwdSyncCoordinator's derived state renders onto the existing
+  // TreeView handle: `description` for the persistent state line (all seven
+  // states), `message` only for the rateLimited state (the one abnormal
+  // condition the user did not cause — it pushes the tree down, so it is
+  // reserved for that case). Both are plain property sets — never a tree
+  // refresh, so repainting this costs nothing.
+  let lastCwdSyncFollowing: boolean | undefined;
+  let lastCwdSyncPaused: boolean | undefined;
+  const renderCwdSyncViewState = (state: CwdSyncState): void => {
+    switch (state.kind) {
+      case "off":
+        fileExplorerView.description = undefined;
+        fileExplorerView.message = undefined;
+        break;
+      case "following":
+        fileExplorerView.description = `Following ${state.terminalName}`;
+        fileExplorerView.message = undefined;
+        break;
+      case "noSource":
+        fileExplorerView.description = `Following ${state.terminalName} — no directory reported`;
+        fileExplorerView.message = undefined;
+        break;
+      case "stale":
+        fileExplorerView.description = `Following ${state.terminalName} — stale`;
+        fileExplorerView.message = undefined;
+        break;
+      case "pinned":
+        fileExplorerView.description = "Paused — manual navigation";
+        fileExplorerView.message = undefined;
+        break;
+      case "otherServer": {
+        const otherServerName = core.getServer(state.otherServerId)?.name ?? state.otherServerId;
+        fileExplorerView.description = `Not following — ${state.terminalName} is on ${otherServerName}`;
+        fileExplorerView.message = undefined;
+        break;
+      }
+      case "rateLimited":
+        fileExplorerView.description = "Following off — too many directory changes";
+        fileExplorerView.message =
+          `"${state.terminalName}" reported directory changes faster than Nexus can follow, so sync was stopped for this session. Use the Follow button to turn it back on.`;
+        break;
+    }
+  };
+  // Context keys for the three-way toolbar toggle (§8.1), driven off the same
+  // derived state — same setContext + change-guard pattern as
+  // TerminalRegistry.refreshContextKeys (only fire setContext when the value
+  // actually changes). `followPaused` is derived from state.kind === "pinned"
+  // since CwdSyncCoordinator exposes no raw isPaused() getter — getState()
+  // already returns "off" whenever no SSH session is focused (regardless of
+  // any internal pin), which is the right UX here: there is nothing to
+  // "Resume" toward without a focused session.
+  const refreshCwdSyncContextKeys = (state: CwdSyncState): void => {
+    const following = cwdSyncCoordinator.isFollowing();
+    const paused = state.kind === "pinned";
+    if (lastCwdSyncFollowing !== following) {
+      lastCwdSyncFollowing = following;
+      void vscode.commands.executeCommand("setContext", "nexus.files.followingTerminal", following);
+    }
+    if (lastCwdSyncPaused !== paused) {
+      lastCwdSyncPaused = paused;
+      void vscode.commands.executeCommand("setContext", "nexus.files.followPaused", paused);
+    }
+  };
+  const renderCwdSyncState = (): void => {
+    const state = cwdSyncCoordinator.getState();
+    renderCwdSyncViewState(state);
+    refreshCwdSyncContextKeys(state);
+  };
+  const cwdSyncStateListener = cwdSyncCoordinator.onDidChangeState(renderCwdSyncState);
+  context.subscriptions.push({ dispose: cwdSyncStateListener });
+  renderCwdSyncState();
+
   const macroTreeProvider = new MacroTreeProvider((_macro, index) => macroAutoTrigger.isDisabled(index));
   const macroView = vscode.window.createTreeView("nexusMacros", {
     treeDataProvider: macroTreeProvider
@@ -757,6 +866,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   fileExplorerProvider.setRemoteWatchMode(remoteWatchMode);
   fileExplorerView.onDidChangeVisibility((e) => {
     fileExplorerProvider.setViewVisibility(e.visible);
+    cwdSyncCoordinator.setViewVisible(e.visible);
     if (e.visible) {
       fileExplorerProvider.refresh();
     }
@@ -1030,6 +1140,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
   const fileDisposables = registerFileCommands(ctx);
+  const cwdSyncDisposables = registerCwdSyncCommands(ctx);
 
   const uriHandlerRegistration = vscode.window.registerUriHandler(createNexusUriHandler({ core }));
 
@@ -1101,6 +1212,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     disableTriggerCmd,
     enableTriggerCmd,
     ...fileDisposables,
+    ...cwdSyncDisposables,
     {
       dispose: () => {
         void collapsedFolderStatePersistence.flush();

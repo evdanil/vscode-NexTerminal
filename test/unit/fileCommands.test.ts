@@ -141,7 +141,16 @@ function createContext(overrides?: {
       setActiveServer: vi.fn(),
       setRootPath: vi.fn(),
       getHomeDir: vi.fn(),
-      clearActiveServer: vi.fn()
+      clearActiveServer: vi.fn(),
+      isBusy: vi.fn(() => false),
+      beginBusy: vi.fn(() => vi.fn())
+    } as any,
+    cwdSyncCoordinator: {
+      notifyManualNavigation: vi.fn(),
+      clearPin: vi.fn(),
+      setFollowing: vi.fn(),
+      resume: vi.fn(),
+      getState: vi.fn()
     } as any
   };
 }
@@ -230,6 +239,40 @@ describe("fileCommands title bar actions", () => {
 
     expect(mockShowErrorMessage).toHaveBeenCalledWith('Failed to upload "a.txt": upload blocked');
     expect(mockShowWarningMessage).toHaveBeenCalledWith("Upload completed with issues (uploaded 0, skipped 0, conflicts 0, failed 1, canceled 0).");
+  });
+
+  it("upload marks the provider busy for the whole batch and always releases it, including on failure (§5.1/§7.4)", async () => {
+    const ctx = createContext({ uploadReject: new Error("upload blocked") });
+    const release = vi.fn();
+    (ctx.fileExplorerProvider.beginBusy as any).mockReturnValue(release);
+    mockShowOpenDialog.mockResolvedValue([
+      { fsPath: "/tmp/a.txt" },
+      { fsPath: "/tmp/b.txt" }
+    ]);
+    registerFileCommands(ctx);
+
+    const upload = registeredCommands.get("nexus.files.upload");
+    await upload!(undefined);
+
+    // One busy span for the whole batch, not one per file.
+    expect(ctx.fileExplorerProvider.beginBusy).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("upload releases the busy span even when withProgress itself throws", async () => {
+    const ctx = createContext();
+    const release = vi.fn();
+    (ctx.fileExplorerProvider.beginBusy as any).mockReturnValue(release);
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/tmp/a.txt" }]);
+    mockWithProgress.mockImplementationOnce(async () => {
+      throw new Error("progress blew up");
+    });
+    registerFileCommands(ctx);
+
+    const upload = registeredCommands.get("nexus.files.upload");
+    await expect(upload!(undefined)).rejects.toThrow("progress blew up");
+
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it("upload overwrites an existing remote file when requested", async () => {
@@ -730,6 +773,151 @@ describe("fileCommands title bar actions", () => {
 
     const items = vi.mocked(vscode.window.showQuickPick).mock.calls[0][0] as Array<{ label: string }>;
     expect(items.map((item) => item.label)).toEqual(["A1", "A2", "A10"]);
+  });
+
+  describe("goToPath / goHome refresh regression guards (§5.5)", () => {
+    it("goToPath with a string arg equal to the current root path still invalidates the cache and calls setRootPath", async () => {
+      const ctx = createContext({ rootPath: "/home" });
+      registerFileCommands(ctx);
+      const goToPath = registeredCommands.get("nexus.files.goToPath");
+      expect(goToPath).toBeDefined();
+
+      await goToPath!("/home");
+
+      expect(ctx.sftpService.invalidateCache).toHaveBeenCalledWith("srv-1", "/home");
+      expect(ctx.fileExplorerProvider.setRootPath).toHaveBeenCalledWith("/home");
+    });
+
+    it("goToPath via the input box still calls setRootPath when the entered path equals the current root", async () => {
+      const ctx = createContext({ rootPath: "/home" });
+      mockShowInputBox.mockResolvedValue("/home");
+      ctx.sftpService.stat = vi.fn(async () => ({
+        name: "home",
+        isDirectory: true,
+        isSymlink: false,
+        size: 0,
+        modifiedAt: 1700000000,
+        permissions: 0o755,
+      }));
+      registerFileCommands(ctx);
+      const goToPath = registeredCommands.get("nexus.files.goToPath");
+      expect(goToPath).toBeDefined();
+
+      await goToPath!(undefined);
+
+      expect(ctx.sftpService.invalidateCache).toHaveBeenCalledWith("srv-1", "/home");
+      expect(ctx.fileExplorerProvider.setRootPath).toHaveBeenCalledWith("/home");
+    });
+
+    it("goHome still calls setRootPath even when already at the home directory", async () => {
+      const ctx = createContext({ rootPath: "/home/dev" });
+      (ctx.fileExplorerProvider.getHomeDir as any).mockReturnValue("/home/dev");
+      registerFileCommands(ctx);
+      const goHome = registeredCommands.get("nexus.files.goHome");
+      expect(goHome).toBeDefined();
+
+      goHome!();
+
+      expect(ctx.fileExplorerProvider.setRootPath).toHaveBeenCalledWith("/home/dev");
+    });
+  });
+
+  describe("manual navigation pins directory sync (§8.3)", () => {
+    it("goToPath with a string arg (the .. ParentDirItem row) notifies manual navigation", async () => {
+      const ctx = createContext({ rootPath: "/home" });
+      registerFileCommands(ctx);
+      const goToPath = registeredCommands.get("nexus.files.goToPath");
+
+      await goToPath!("/home/parent");
+
+      expect(ctx.cwdSyncCoordinator!.notifyManualNavigation).toHaveBeenCalledTimes(1);
+    });
+
+    it("goToPath via the input box notifies manual navigation on a successful navigation", async () => {
+      const ctx = createContext({ rootPath: "/home" });
+      mockShowInputBox.mockResolvedValue("/var/log");
+      ctx.sftpService.stat = vi.fn(async () => ({
+        name: "log",
+        isDirectory: true,
+        isSymlink: false,
+        size: 0,
+        modifiedAt: 1700000000,
+        permissions: 0o755,
+      }));
+      registerFileCommands(ctx);
+      const goToPath = registeredCommands.get("nexus.files.goToPath");
+
+      await goToPath!(undefined);
+
+      expect(ctx.fileExplorerProvider.setRootPath).toHaveBeenCalledWith("/var/log");
+      expect(ctx.cwdSyncCoordinator!.notifyManualNavigation).toHaveBeenCalledTimes(1);
+    });
+
+    it("goToPath via the input box does NOT notify manual navigation when the box is dismissed", async () => {
+      const ctx = createContext({ rootPath: "/home" });
+      mockShowInputBox.mockResolvedValue(undefined);
+      registerFileCommands(ctx);
+      const goToPath = registeredCommands.get("nexus.files.goToPath");
+
+      await goToPath!(undefined);
+
+      expect(ctx.fileExplorerProvider.setRootPath).not.toHaveBeenCalled();
+      expect(ctx.cwdSyncCoordinator!.notifyManualNavigation).not.toHaveBeenCalled();
+    });
+
+    it("goToPath via the input box does NOT notify manual navigation when the target is not a directory", async () => {
+      const ctx = createContext({ rootPath: "/home" });
+      mockShowInputBox.mockResolvedValue("/etc/hosts");
+      ctx.sftpService.stat = vi.fn(async () => ({
+        name: "hosts",
+        isDirectory: false,
+        isSymlink: false,
+        size: 10,
+        modifiedAt: 1700000000,
+        permissions: 0o644,
+      }));
+      registerFileCommands(ctx);
+      const goToPath = registeredCommands.get("nexus.files.goToPath");
+
+      await goToPath!(undefined);
+
+      expect(ctx.fileExplorerProvider.setRootPath).not.toHaveBeenCalled();
+      expect(ctx.cwdSyncCoordinator!.notifyManualNavigation).not.toHaveBeenCalled();
+    });
+
+    it("goHome notifies manual navigation", async () => {
+      const ctx = createContext({ rootPath: "/var/log" });
+      (ctx.fileExplorerProvider.getHomeDir as any).mockReturnValue("/home/dev");
+      registerFileCommands(ctx);
+      const goHome = registeredCommands.get("nexus.files.goHome");
+
+      goHome!();
+
+      expect(ctx.cwdSyncCoordinator!.notifyManualNavigation).toHaveBeenCalledTimes(1);
+    });
+
+    it("goHome does not notify manual navigation when there is no known home directory", async () => {
+      const ctx = createContext({ rootPath: "/var/log" });
+      (ctx.fileExplorerProvider.getHomeDir as any).mockReturnValue(undefined);
+      registerFileCommands(ctx);
+      const goHome = registeredCommands.get("nexus.files.goHome");
+
+      goHome!();
+
+      expect(ctx.cwdSyncCoordinator!.notifyManualNavigation).not.toHaveBeenCalled();
+    });
+
+    it("tolerates a missing cwdSyncCoordinator (optional field)", async () => {
+      const ctx = createContext({ rootPath: "/home" });
+      delete (ctx as any).cwdSyncCoordinator;
+      registerFileCommands(ctx);
+      const goToPath = registeredCommands.get("nexus.files.goToPath");
+      const goHome = registeredCommands.get("nexus.files.goHome");
+      (ctx.fileExplorerProvider.getHomeDir as any).mockReturnValue("/home/dev");
+
+      await expect(goToPath!("/home/parent")).resolves.toBeUndefined();
+      expect(() => goHome!()).not.toThrow();
+    });
   });
 
   describe("disconnect command (P2)", () => {

@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [2.8.70] — 2026-07-29
+
+Phase 1 of directory sync between the SSH terminal and the File Explorer (#35).
+
+### Added
+
+- **File Explorer can now follow your SSH terminal's directory.** Turn it on from the new toggle at the left of the File Explorer title bar, or from the right-click menu on the `.` row that shows your current directory — never from Settings. On shells that announce their own directory via the `OSC 7` escape sequence (`fish` ≥ 3.x, `starship`, and any prompt framework built on it), this is genuinely continuous: the explorer re-roots itself as you `cd` around, with no polling and nothing written to the terminal. Plain bash and zsh don't announce it by default; add one line to `~/.bashrc` (a zsh equivalent goes in `~/.zshrc`) and they will too:
+  ```bash
+  PROMPT_COMMAND='printf "\033]7;file://%s%s\033\\" "$HOSTNAME" "$PWD"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+  ```
+  For anything else — Cisco IOS, Juniper, FortiOS, and other gear that will never emit that escape sequence — a new **Go to Terminal Directory** command (File Explorer overflow menu, `.` row context menu, and any Nexus terminal tab's right-click menu) does a one-shot sync using a best-effort read of the visible prompt, validated with `realpath` before the explorer moves. Manual navigation (Go to Path, Go Home, `..`) pauses following instead of fighting it; **Resume Following Terminal Directory** jumps straight back. A host that never reports a directory gets one explanatory notice per session, not a dead button. Nexus writes zero bytes to any terminal to make this work in this release — the push direction (having Nexus type `cd` for you) is tracked for a future phase. Addresses #35 (continuous coverage; the issue stays open pending automatic coverage for bash/zsh without a manual rc edit).
+
 ## [2.8.69] — 2026-07-27
 
 Follow-up to 2.8.68: one import entry point instead of four, and it is now reachable when the Connectivity Hub already has profiles in it.

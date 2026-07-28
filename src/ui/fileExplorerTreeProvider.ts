@@ -13,6 +13,10 @@ const FILE_DRAG_MIME = "application/vnd.nexus.fileitem";
 const URI_LIST_MIME = "text/uri-list";
 const FILES_MIME = "files";
 const MAX_UPLOAD_DEPTH = 100;
+// Trailing debounce before an auto-follow re-root respawns the remote inotifywait
+// watcher. Every restart tears down and re-spawns the exec channel; at auto-follow
+// rates that walks into MaxSessions -> a brand-new SSH connection with full re-auth.
+const WATCHER_RESTART_DEBOUNCE_MS = 2000;
 const MOVE_COPY_OPTIONS = [
   { label: "Move", value: "move" as const },
   { label: "Copy", value: "copy" as const }
@@ -182,6 +186,8 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   private pendingChildrenRequests = 0;
   private watcherUnsubscribe?: () => void;
   private remoteWatchMode: "auto" | "polling" = "auto";
+  private watcherRestartTimer: ReturnType<typeof setTimeout> | undefined;
+  private busyCount = 0;
 
   public constructor(private readonly sftp: SftpService) {}
 
@@ -218,12 +224,63 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     this.updatePolling();
   }
 
-  public setRootPath(rootPath: string): void {
-    this.currentRootPath = rootPath;
+  /**
+   * Re-roots the explorer to `rootPath`.
+   *
+   * The tree refresh fires unconditionally, even when the normalized path equals
+   * `currentRootPath` — `goToPath(string)` invalidates the cache then re-roots, and
+   * `goHome` at home acts as a refresh; both depend on this call always repainting.
+   *
+   * `opts.restartWatcher === false` (auto-follow) defers the inotify watcher
+   * respawn behind a trailing debounce instead of restarting it immediately:
+   * every restart tears down and re-spawns the remote `inotifywait` exec channel,
+   * and at auto-follow rates that walks into `MaxSessions` -> a brand-new SSH
+   * connection with full re-auth. Explicit navigation (the default) keeps the
+   * immediate restart so a manual jump shows fresh watch state right away.
+   */
+  public setRootPath(rootPath: string, opts?: { restartWatcher?: boolean }): void {
+    const normalized = normalizeRemoteDir(rootPath);
+    if (!normalized) {
+      return;
+    }
+    const changed = normalized !== this.currentRootPath;
+    this.currentRootPath = normalized;
+
     if (this.activeServerId && this.remoteWatchMode === "auto") {
-      this.startRemoteWatch(this.activeServerId, rootPath);
+      if (opts?.restartWatcher === false) {
+        this.scheduleWatcherRestart(this.activeServerId, normalized);
+      } else if (changed) {
+        this.startRemoteWatch(this.activeServerId, normalized);
+      }
     }
     this.onDidChangeTreeDataEmitter.fire(undefined);
+  }
+
+  /**
+   * True while a `getChildren` call is in flight, or while an upload / drag-drop
+   * operation is in flight. `currentRootPath` is the fallback write target for
+   * drag-drop upload and for createFile/createDir, so callers that would redirect
+   * writes (e.g. an auto-follow re-root) must suppress themselves while this is true.
+   */
+  public isBusy(): boolean {
+    return this.pendingChildrenRequests > 0 || this.busyCount > 0;
+  }
+
+  /**
+   * Marks the start of an upload/drag-drop span for `isBusy()`. Returns a disposer
+   * that must be called exactly once (idempotent) — callers should invoke it from a
+   * `finally` block so an exception mid-operation cannot leak the busy count.
+   */
+  public beginBusy(): () => void {
+    this.busyCount += 1;
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      this.busyCount = Math.max(0, this.busyCount - 1);
+    };
   }
 
   public setViewVisibility(visible: boolean): void {
@@ -409,78 +466,86 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       return;
     }
 
-    let items: DraggedFilePayloadItem[];
+    // Wrapped at the outermost operation (not per item) so isBusy() covers the whole
+    // move/copy span — currentRootPath is the fallback write target elsewhere, and a
+    // rename/copy here mutates the same tree an auto-follow re-root would redirect.
+    const endBusy = this.beginBusy();
     try {
-      items = parseDraggedPayload(await transferItem.asString());
-    } catch {
-      return;
-    }
-
-    // Filter valid items: same server, sane names, no path traversal, no self-moves.
-    const validItems: ValidDraggedItem[] = items.flatMap((item) => {
-      if (item.serverId !== this.activeServerId) {
-        return [];
-      }
-      if (!isSafeEntryName(item.name)) {
-        return [];
-      }
-      const sourceDirNormalized = normalizeRemoteDir(item.remotePath);
-      if (!sourceDirNormalized) {
-        return [];
-      }
-      const oldPath = joinRemoteEntryPath(sourceDirNormalized, item.name);
-      if (!oldPath) {
-        return [];
-      }
-      const normalizedOldPath = path.posix.normalize(oldPath);
-      const sourcePrefix = sourceDirNormalized === "/" ? "/" : `${sourceDirNormalized}/`;
-      if (!normalizedOldPath.startsWith(sourcePrefix)) {
-        return [];
-      }
-      const destination = joinRemoteEntryPath(targetDirNormalized, item.name);
-      if (!destination) {
-        return [];
-      }
-      const newPath = path.posix.normalize(destination);
-      if (normalizedOldPath === newPath) {
-        return [];
-      }
-      if (item.isDirectory && (newPath + "/").startsWith(normalizedOldPath + "/")) {
-        return [];
-      }
-      return [{ ...item, oldPath: normalizedOldPath, newPath }];
-    });
-
-    if (validItems.length === 0) {
-      return;
-    }
-
-    const choice = await vscode.window.showQuickPick(
-      MOVE_COPY_OPTIONS,
-      { placeHolder: "Move or copy the selected items?" }
-    );
-    if (!choice) {
-      return;
-    }
-    const operation = choice.value;
-
-    for (const item of validItems) {
+      let items: DraggedFilePayloadItem[];
       try {
-        if (operation === "move") {
-          await this.sftp.rename(this.activeServerId, item.oldPath, item.newPath);
-          this.sftp.invalidateCache(this.activeServerId, item.remotePath);
-        } else {
-          await this.sftp.copyRemote(this.activeServerId, item.oldPath, item.newPath, item.isDirectory);
-        }
-      } catch (err: unknown) {
-        const verb = operation === "move" ? "move" : "copy";
-        const message = err instanceof Error ? err.message : String(err);
-        void vscode.window.showErrorMessage(`Failed to ${verb} ${item.name}: ${message}`);
+        items = parseDraggedPayload(await transferItem.asString());
+      } catch {
+        return;
       }
-    }
 
-    this.sftp.invalidateCache(this.activeServerId, targetDirNormalized);
-    this.onDidChangeTreeDataEmitter.fire(undefined);
+      // Filter valid items: same server, sane names, no path traversal, no self-moves.
+      const validItems: ValidDraggedItem[] = items.flatMap((item) => {
+        if (item.serverId !== this.activeServerId) {
+          return [];
+        }
+        if (!isSafeEntryName(item.name)) {
+          return [];
+        }
+        const sourceDirNormalized = normalizeRemoteDir(item.remotePath);
+        if (!sourceDirNormalized) {
+          return [];
+        }
+        const oldPath = joinRemoteEntryPath(sourceDirNormalized, item.name);
+        if (!oldPath) {
+          return [];
+        }
+        const normalizedOldPath = path.posix.normalize(oldPath);
+        const sourcePrefix = sourceDirNormalized === "/" ? "/" : `${sourceDirNormalized}/`;
+        if (!normalizedOldPath.startsWith(sourcePrefix)) {
+          return [];
+        }
+        const destination = joinRemoteEntryPath(targetDirNormalized, item.name);
+        if (!destination) {
+          return [];
+        }
+        const newPath = path.posix.normalize(destination);
+        if (normalizedOldPath === newPath) {
+          return [];
+        }
+        if (item.isDirectory && (newPath + "/").startsWith(normalizedOldPath + "/")) {
+          return [];
+        }
+        return [{ ...item, oldPath: normalizedOldPath, newPath }];
+      });
+
+      if (validItems.length === 0) {
+        return;
+      }
+
+      const choice = await vscode.window.showQuickPick(
+        MOVE_COPY_OPTIONS,
+        { placeHolder: "Move or copy the selected items?" }
+      );
+      if (!choice) {
+        return;
+      }
+      const operation = choice.value;
+
+      for (const item of validItems) {
+        try {
+          if (operation === "move") {
+            await this.sftp.rename(this.activeServerId, item.oldPath, item.newPath);
+            this.sftp.invalidateCache(this.activeServerId, item.remotePath);
+          } else {
+            await this.sftp.copyRemote(this.activeServerId, item.oldPath, item.newPath, item.isDirectory);
+          }
+        } catch (err: unknown) {
+          const verb = operation === "move" ? "move" : "copy";
+          const message = err instanceof Error ? err.message : String(err);
+          void vscode.window.showErrorMessage(`Failed to ${verb} ${item.name}: ${message}`);
+        }
+      }
+
+      this.sftp.invalidateCache(this.activeServerId, targetDirNormalized);
+      this.onDidChangeTreeDataEmitter.fire(undefined);
+    } finally {
+      endBusy();
+    }
   }
 
   private async handleExternalDrop(dataTransfer: vscode.DataTransfer, targetDirNormalized: string): Promise<void> {
@@ -488,57 +553,65 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       return;
     }
 
-    const { localUris, unsupportedCount } = await this.collectDroppedLocalUris(dataTransfer);
-    if (localUris.length === 0) {
-      if (unsupportedCount > 0) {
-        void vscode.window.showWarningMessage("Only local files can be uploaded. Non-file URIs were ignored.");
-      }
-      return;
-    }
-
-    const summary: UploadSummary = {
-      uploaded: 0,
-      skipped: unsupportedCount,
-      conflicts: 0,
-      canceled: false
-    };
-    const conflictState: { mode: ConflictMode } = { mode: "ask" };
-    const serverId = this.activeServerId;
-
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "Uploading dropped items..." },
-      async (progress) => {
-        for (const uri of localUris) {
-          if (summary.canceled) {
-            break;
-          }
-          const rootName = path.basename(uri.fsPath);
-          if (!isSafeEntryName(rootName)) {
-            summary.skipped += 1;
-            continue;
-          }
-          const remoteDest = path.posix.join(targetDirNormalized, rootName);
-          await this.uploadLocalUri(serverId, uri, remoteDest, progress, conflictState, summary);
+    // Wrapped at the outermost operation (not per file) so a 500-file directory
+    // upload counts as one busy span — currentRootPath is the fallback write target
+    // for drag-drop upload, and an auto-follow re-root mid-drag would redirect it.
+    const endBusy = this.beginBusy();
+    try {
+      const { localUris, unsupportedCount } = await this.collectDroppedLocalUris(dataTransfer);
+      if (localUris.length === 0) {
+        if (unsupportedCount > 0) {
+          void vscode.window.showWarningMessage("Only local files can be uploaded. Non-file URIs were ignored.");
         }
+        return;
       }
-    );
 
-    if (summary.uploaded > 0) {
-      this.sftp.invalidateCache(serverId, targetDirNormalized);
-      this.onDidChangeTreeDataEmitter.fire(undefined);
-    }
+      const summary: UploadSummary = {
+        uploaded: 0,
+        skipped: unsupportedCount,
+        conflicts: 0,
+        canceled: false
+      };
+      const conflictState: { mode: ConflictMode } = { mode: "ask" };
+      const serverId = this.activeServerId;
 
-    const detail = `uploaded ${summary.uploaded}, skipped ${summary.skipped}, conflicts ${summary.conflicts}`;
-    if (summary.canceled) {
-      void vscode.window.showWarningMessage(`Upload canceled (${detail}).`);
-      return;
-    }
-    if (summary.skipped > 0 || summary.conflicts > 0) {
-      void vscode.window.showWarningMessage(`Upload completed with skips (${detail}).`);
-      return;
-    }
-    if (summary.uploaded > 0) {
-      void vscode.window.showInformationMessage(`Upload completed (${detail}).`);
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "Uploading dropped items..." },
+        async (progress) => {
+          for (const uri of localUris) {
+            if (summary.canceled) {
+              break;
+            }
+            const rootName = path.basename(uri.fsPath);
+            if (!isSafeEntryName(rootName)) {
+              summary.skipped += 1;
+              continue;
+            }
+            const remoteDest = path.posix.join(targetDirNormalized, rootName);
+            await this.uploadLocalUri(serverId, uri, remoteDest, progress, conflictState, summary);
+          }
+        }
+      );
+
+      if (summary.uploaded > 0) {
+        this.sftp.invalidateCache(serverId, targetDirNormalized);
+        this.onDidChangeTreeDataEmitter.fire(undefined);
+      }
+
+      const detail = `uploaded ${summary.uploaded}, skipped ${summary.skipped}, conflicts ${summary.conflicts}`;
+      if (summary.canceled) {
+        void vscode.window.showWarningMessage(`Upload canceled (${detail}).`);
+        return;
+      }
+      if (summary.skipped > 0 || summary.conflicts > 0) {
+        void vscode.window.showWarningMessage(`Upload completed with skips (${detail}).`);
+        return;
+      }
+      if (summary.uploaded > 0) {
+        void vscode.window.showInformationMessage(`Upload completed (${detail}).`);
+      }
+    } finally {
+      endBusy();
     }
   }
 
@@ -808,7 +881,30 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     });
   }
 
+  /**
+   * Trailing debounce for a watcher restart deferred via `setRootPath(p, { restartWatcher: false })`.
+   * Re-checks serverId/currentRootPath before firing so a stale timer from a since-abandoned
+   * path (or a since-switched server) is a no-op rather than a wrong-directory watch.
+   */
+  private scheduleWatcherRestart(serverId: string, dirPath: string): void {
+    this.cancelWatcherRestart();
+    this.watcherRestartTimer = setTimeout(() => {
+      this.watcherRestartTimer = undefined;
+      if (serverId === this.activeServerId && dirPath === this.currentRootPath) {
+        this.startRemoteWatch(serverId, dirPath);
+      }
+    }, WATCHER_RESTART_DEBOUNCE_MS);
+  }
+
+  private cancelWatcherRestart(): void {
+    if (this.watcherRestartTimer) {
+      clearTimeout(this.watcherRestartTimer);
+      this.watcherRestartTimer = undefined;
+    }
+  }
+
   private stopRemoteWatch(serverId: string | undefined): void {
+    this.cancelWatcherRestart();
     if (serverId) {
       this.sftp.stopWatching(serverId);
     }
