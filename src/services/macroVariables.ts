@@ -199,30 +199,47 @@ export function getValidMacroVariables(macro: Pick<TerminalMacro, "variables">):
 }
 
 /**
- * Returns a copy of `macro` whose `variables` have been normalized to the storable /
- * shareable shape — invalid entries dropped, duplicates collapsed, and `default` /
- * `remember` stripped from masked entries. The key is removed entirely when nothing
- * survives.
+ * Returns a copy of `macro` with every masked variable's `default` and `remember`
+ * removed, for use at persistence and serialization boundaries.
  *
- * Needed because `getValidMacroVariables()` only protects *read* sites, and not every
- * consumer of a macro is a read site: `Copy All as JSON`, share export, and legacy
- * settings absorption all pass `macro.variables` through verbatim. A masked variable
- * carrying a plaintext `default` — which the editor blocks but a hand-written
+ * Needed because `getValidMacroVariables()` only protects *read* sites, and several
+ * consumers are not read sites — `VscodeMacroStore.save()`/`reloadFromState()`,
+ * `Copy All as JSON`, share export, the encrypted backup's cleartext `macros` array,
+ * and legacy settings absorption all pass `macro.variables` through as-is. A masked
+ * variable carrying a plaintext `default` — which the editor blocks but a hand-written
  * settings.json or share file does not — would otherwise reach globalState, the
- * clipboard, and an exported share file, even though the runtime never uses it.
+ * clipboard, and exported files, even though the runtime never reads it.
+ *
+ * This REDACTS FIELDS ONLY. It deliberately does not drop invalid entries, collapse
+ * duplicates, or remove an emptied `variables` key, because the *length* of the array
+ * is load-bearing elsewhere: `MacroAutoTrigger.reload()` suppresses a macro's
+ * auto-trigger when `variables` is a non-empty array (§6.1). An earlier version of this
+ * function normalized entries away, which deleted `variables` for a macro whose only
+ * declaration was invalid — un-suppressing its trigger. For
+ * `{secret: true, text: "hunter2\n", triggerPattern: "[Pp]assword:",
+ * variables: [{name: "2bad"}]}` that meant the secret text began auto-sending on any
+ * output matching `Password:`. Normalization belongs at read sites
+ * (`getValidMacroVariables`) and on the import path (`sanitizeImportedMacroVariables`),
+ * never here.
  */
-export function withSanitizedVariables<T extends Pick<TerminalMacro, "variables">>(macro: T): T {
-  if (!hasMacroVariables(macro)) {
-    if (macro.variables === undefined) return macro;
-    const stripped = { ...macro };
-    delete stripped.variables;
-    return stripped;
-  }
-  const variables = getValidMacroVariables(macro);
-  const out = { ...macro };
-  if (variables.length > 0) out.variables = variables;
-  else delete out.variables;
-  return out;
+export function withRedactedVariables<T extends Pick<TerminalMacro, "variables">>(macro: T): T {
+  if (!Array.isArray(macro.variables)) return macro;
+
+  let changed = false;
+  const redacted = macro.variables.map((entry) => {
+    if (!entry || typeof entry !== "object") return entry;
+    const raw = entry as unknown as Record<string, unknown>;
+    if (raw.secret !== true) return entry;
+    if (raw.default === undefined && raw.remember === undefined) return entry;
+    changed = true;
+    const copy: Record<string, unknown> = { ...raw };
+    delete copy.default;
+    delete copy.remember;
+    return copy as unknown as MacroVariable;
+  });
+
+  if (!changed) return macro;
+  return { ...macro, variables: redacted as MacroVariable[] };
 }
 
 export interface MacroVariableValidationError {

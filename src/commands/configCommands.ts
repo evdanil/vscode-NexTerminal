@@ -5,7 +5,7 @@ import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
 import type { MacroTriggerScope, MacroVariable, TerminalMacro } from "../models/terminalMacro";
-import { isValidVariableName, MAX_MACRO_VARIABLES, withSanitizedVariables } from "../services/macroVariables";
+import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import type { SecretVault } from "../services/ssh/contracts";
 import {
   passwordSecretKey,
@@ -613,7 +613,7 @@ export function sanitizeForSharing(
     .filter((m) => !m.secret)
     // fresh ids for share exports; variable declarations normalized so a masked
     // variable's plaintext `default` never leaves this machine in a share file.
-    .map((m) => withSanitizedVariables({ ...m, id: randomUUID() }));
+    .map((m) => withRedactedVariables({ ...m, id: randomUUID() }));
 
   // Sanitize paths from the settings snapshot.
   const sanitizedSettings = { ...settings };
@@ -911,7 +911,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         // cleartext — so a masked variable's plaintext `default` here would be
         // readable without the backup password.
         const nonSecretForTopLevel: TerminalMacro[] = allMacros.map((m) =>
-          withSanitizedVariables(m.secret ? { ...m, text: "" } : { ...m })
+          withRedactedVariables(m.secret ? { ...m, text: "" } : { ...m })
         );
         const secretMacroBlobs = allMacros
           .filter((m) => m.secret && m.id)

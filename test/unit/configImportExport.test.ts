@@ -1330,8 +1330,9 @@ describe("backup export command", () => {
     // The InMemoryMacroStore used here does NOT itself sanitize on save() (only
     // VscodeMacroStore does, at its own persistence chokepoint) — so if this
     // assertion passes, it's specifically because configCommands.ts's own
-    // `withSanitizedVariables(nonSecretForTopLevel)` call did the stripping, not
-    // because the store already cleaned the data before we saw it.
+    // `withRedactedVariables(...)` call (applied per-macro when building
+    // `nonSecretForTopLevel`) did the stripping, not because the store already
+    // cleaned the data before we saw it.
     const backupExportStore = new InMemoryMacroStore();
     await backupExportStore.initialize();
     await backupExportStore.save([

@@ -10,7 +10,7 @@ import {
   scanPlaceholders,
   substituteMacroVariables,
   validateMacroVariables,
-  withSanitizedVariables
+  withRedactedVariables
 } from "../../src/services/macroVariables";
 import type { PlaceholderScan } from "../../src/services/macroVariables";
 import { serializeForInlineScript } from "../../src/ui/shared/inlineScriptData";
@@ -329,61 +329,83 @@ describe("getValidMacroVariables", () => {
   });
 });
 
-describe("withSanitizedVariables (Fix 1 — output/persist-path normalization)", () => {
-  it("strips default and remember from a masked entry", () => {
+describe("withRedactedVariables (security fix — redact masked fields only; never drop, dedupe, or delete)", () => {
+  it("strips default and remember from a masked (secret) entry, keeping name and secret", () => {
     const macro = { variables: [{ name: "password", secret: true, default: "hunter2", remember: false }] };
-    const result = withSanitizedVariables(macro);
+    const result = withRedactedVariables(macro);
     expect(result.variables).toEqual([{ name: "password", secret: true }]);
     expect(JSON.stringify(result)).not.toContain("hunter2");
   });
 
-  it("drops invalid-named entries while keeping the rest", () => {
-    const macro = { variables: [{ name: "2bad" }, { name: "ok" }] };
-    const result = withSanitizedVariables(macro);
-    expect(result.variables?.map((v) => v.name)).toEqual(["ok"]);
+  it("leaves a non-masked entry completely untouched, including its default and remember", () => {
+    const macro = { variables: [{ name: "host", label: "Host", default: "10.0.0.1", remember: true }] };
+    const result = withRedactedVariables(macro);
+    expect(result.variables).toEqual([{ name: "host", label: "Host", default: "10.0.0.1", remember: true }]);
   });
 
-  it("collapses duplicate names, first occurrence wins", () => {
+  // Security-critical — do NOT "fix" this back to filtering by name validity.
+  // `MacroAutoTrigger.reload()` suppresses a macro's auto-trigger whenever
+  // `variables` is a non-empty array (§6.1). The predecessor of this function
+  // (`withSanitizedVariables`) dropped invalid-named entries, which could empty
+  // the array for a macro whose only declaration was malformed and un-suppress
+  // its trigger. For `{secret: true, text: "hunter2\n",
+  // triggerPattern: "[Pp]assword:", variables: [{name: "2bad"}]}` that meant the
+  // secret text began auto-sending on any output matching `Password:`. See the
+  // doc comment on `withRedactedVariables` in src/services/macroVariables.ts.
+  it("preserves entries with an invalid name — does not drop them (security property)", () => {
+    const macro = { variables: [{ name: "2bad" }, { name: "ok" }] };
+    const result = withRedactedVariables(macro);
+    expect(result.variables).toEqual([{ name: "2bad" }, { name: "ok" }]);
+  });
+
+  it("preserves duplicate names — does not dedupe", () => {
     const macro = {
       variables: [
         { name: "host", label: "First" },
         { name: "host", label: "Second" }
       ]
     };
-    const result = withSanitizedVariables(macro);
-    expect(result.variables).toEqual([{ name: "host", label: "First" }]);
+    const result = withRedactedVariables(macro);
+    expect(result.variables).toEqual([
+      { name: "host", label: "First" },
+      { name: "host", label: "Second" }
+    ]);
   });
 
-  it("deletes the variables key entirely when nothing survives", () => {
-    const macro = { name: "m", variables: [{ name: "2bad" }, { notAName: true }] };
-    const result = withSanitizedVariables(macro as unknown as { name: string; variables: unknown });
-    expect(result).not.toHaveProperty("variables");
-    expect("variables" in result).toBe(false);
+  // The security property itself: an array that is entirely invalid names must
+  // remain non-empty so the auto-trigger suppression guard
+  // (`Array.isArray(variables) && variables.length > 0`) still reads true.
+  it("an all-invalid, non-empty array stays non-empty", () => {
+    const macro = { variables: [{ name: "2bad" }, { notAName: true }] };
+    const result = withRedactedVariables(macro as unknown as { variables: MacroVariable[] });
+    expect(Array.isArray(result.variables)).toBe(true);
+    expect(result.variables!.length).toBe(2);
   });
 
-  it("returns a macro with no variables key unchanged (identity is fine)", () => {
+  it("returns a non-array `variables` (e.g. a corrupt string) unchanged, not deleted", () => {
+    const macro = { name: "m", variables: "abc" as unknown as MacroVariable[] };
+    const result = withRedactedVariables(macro);
+    expect(result.variables as unknown).toBe("abc");
+    expect(result).toHaveProperty("variables");
+  });
+
+  it("returns the input unchanged when `variables` is absent", () => {
     const macro = { name: "m", text: "echo hi" };
-    const result = withSanitizedVariables(macro);
+    const result = withRedactedVariables(macro);
     expect(result).toBe(macro);
   });
 
-  it("removes the key for a non-array variables shape (Settings-Sync corruption, §4.2)", () => {
-    const macro = { name: "m", variables: "abc" as unknown as MacroVariable[] };
-    const result = withSanitizedVariables(macro);
-    expect(result).not.toHaveProperty("variables");
-  });
-
-  it("removes the key for an empty variables array", () => {
-    const macro = { name: "m", variables: [] as MacroVariable[] };
-    const result = withSanitizedVariables(macro);
-    expect(result).not.toHaveProperty("variables");
-  });
-
-  it("does not mutate the input macro (returns a copy)", () => {
+  it("does not mutate the input macro", () => {
     const macro = { variables: [{ name: "password", secret: true, default: "hunter2" }] };
     const original = JSON.parse(JSON.stringify(macro));
-    withSanitizedVariables(macro);
+    withRedactedVariables(macro);
     expect(macro).toEqual(original);
+  });
+
+  it("returns the SAME object by identity when nothing needed redacting (cheap-path)", () => {
+    const macro = { variables: [{ name: "host" }, { name: "2bad" }] };
+    const result = withRedactedVariables(macro);
+    expect(result).toBe(macro);
   });
 });
 
