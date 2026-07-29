@@ -11,6 +11,7 @@ import {
   substituteMacroVariables,
   validateMacroVariables
 } from "../../src/services/macroVariables";
+import type { PlaceholderScan } from "../../src/services/macroVariables";
 import { serializeForInlineScript } from "../../src/ui/shared/inlineScriptData";
 import type { MacroVariable, TerminalMacro } from "../../src/models/terminalMacro";
 
@@ -388,6 +389,58 @@ describe("macroVariablesWebviewJs", () => {
   it("embeds the exact same placeholder-scan pattern source used by scanPlaceholders — cannot drift (§9.3)", () => {
     const js = macroVariablesWebviewJs();
     expect(js).toContain(serializeForInlineScript(MACRO_PLACEHOLDER_SOURCE));
+  });
+
+  // Matching regex sources is NOT enough: the twin's value is that the editor's live
+  // diagnostics classify placeholders identically to the runtime, and classification
+  // lives in the surrounding logic, not the pattern. Deleting the `if (escaped)
+  // continue` line would keep every string assertion above green while making the
+  // editor demand a prompt for a text whose only occurrence is `$${host}`.
+  // So: execute the generated scanner and diff it against the TypeScript one.
+  describe("behavioural parity with scanPlaceholders", () => {
+    const compiled = new Function(
+      `${macroVariablesWebviewJs()}\nreturn { isValidVariableName: isValidVariableName, scanMacroPlaceholders: scanMacroPlaceholders };`
+    )() as {
+      isValidVariableName(name: unknown): boolean;
+      scanMacroPlaceholders(text: string, declaredNames: readonly string[]): PlaceholderScan;
+    };
+
+    const cases: Array<{ text: string; declared: string[] }> = [
+      { text: "ping ${host}", declared: ["host"] },
+      { text: "ping $host", declared: ["host"] },
+      { text: "$hostname", declared: ["host"] },
+      { text: "$password $host $host $username", declared: ["host", "username", "password"] },
+      { text: "$foo $bar $foo", declared: [] },
+      { text: "no placeholders here", declared: ["port"] },
+      { text: "$${host}", declared: ["host"] },
+      { text: "$$host", declared: ["host"] },
+      { text: "$${aws_region}", declared: [] },
+      { text: "echo $host; echo $${host}", declared: ["host"] },
+      { text: "curl $host:8080 '$${port}'", declared: ["host", "port"] },
+      { text: "$$ $(cmd) ${#arr[@]} $1 ${} ${x", declared: ["cmd", "arr", "x"] },
+      { text: "${a}${b}", declared: ["a", "b"] },
+      { text: "cat > main.tf <<EOF\n$${aws_region}\nEOF", declared: ["aws_region"] },
+      // Prototype-shaped names: the twin uses Object.create(null) maps precisely so
+      // these agree with the Set-based TypeScript scan.
+      { text: "$toString ${constructor} $__proto__ $valueOf", declared: ["host"] },
+      { text: "$toString ${constructor}", declared: ["toString", "constructor"] },
+      { text: "$__proto__", declared: ["__proto__"] }
+    ];
+
+    for (const { text, declared } of cases) {
+      it(`agrees on ${JSON.stringify(text)} with declared ${JSON.stringify(declared)}`, () => {
+        expect(compiled.scanMacroPlaceholders(text, declared)).toEqual(scanPlaceholders(text, declared));
+      });
+    }
+
+    it("agrees on name validity, including length bounds and prototype-shaped names", () => {
+      for (const name of [
+        "host", "_private", "aws_region2", "2host", "host-name", "host name", "host.name",
+        "__proto__", "constructor", "toString", "a".repeat(32), "a".repeat(33), ""
+      ]) {
+        expect(compiled.isValidVariableName(name)).toBe(isValidVariableName(name));
+      }
+    });
   });
 });
 

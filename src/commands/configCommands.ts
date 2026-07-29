@@ -1238,7 +1238,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       const existingByKey = new Set(existing.map(keyOf));
       const merged = [...existing];
       for (const m of incoming) {
-        const remapped: TerminalMacro = { ...m, id: randomUUID() };
+        // Sanitize before dedup and save. A share file is untrusted input from
+        // another machine: without this it can persist a masked variable carrying a
+        // plaintext `default` (which then reaches globalState and `Copy All as JSON`),
+        // an over-cap or malformed `variables` array, or a variables+trigger macro
+        // whose auto-trigger can never compile.
+        const remapped: TerminalMacro = sanitizeImportedMacro({ ...m, id: randomUUID() });
         if (!existingByKey.has(keyOf(remapped))) {
           merged.push(remapped);
         }

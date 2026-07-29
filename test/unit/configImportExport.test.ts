@@ -1731,6 +1731,60 @@ describe("share import", () => {
     expect(macros.find(m => m.name === "hello")?.text).toBe("hi");
   });
 
+  it("share import sanitizes variables — a masked variable's plaintext default never reaches the store", async () => {
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    setActiveMacroStore(macroStore);
+
+    // A share file is untrusted input from another machine. The editor blocks a
+    // default on a masked variable, but nothing stops a hand-written share file
+    // carrying one — and it would then sit in globalState and be picked up by
+    // "Copy All as JSON".
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [
+        {
+          name: "Login",
+          text: "login $password\n",
+          variables: [{ name: "password", secret: true, default: "hunter2" }]
+        },
+        {
+          // Variables + auto-trigger is unsupported: the trigger must be stripped,
+          // the declarations kept (§6.2).
+          name: "Both",
+          text: "connect $host\n",
+          triggerPattern: "[Pp]assword:\\s*$",
+          variables: [{ name: "host" }]
+        },
+        {
+          name: "Malformed",
+          text: "run $ok\n",
+          variables: [{ name: "2bad" }, { name: "ok" }, { name: "ok" }]
+        }
+      ]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-hostile.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    await registeredCommands.get("nexus.config.import")!();
+
+    const macros = macroStore.getAll();
+    const login = macros.find((m) => m.name === "Login")!;
+    expect(login.variables?.[0]).toEqual({ name: "password", secret: true });
+    expect(JSON.stringify(macros)).not.toContain("hunter2");
+
+    const both = macros.find((m) => m.name === "Both")!;
+    expect(both.triggerPattern).toBeUndefined();
+    expect(both.variables?.map((v) => v.name)).toEqual(["host"]);
+
+    const malformed = macros.find((m) => m.name === "Malformed")!;
+    expect(malformed.variables?.map((v) => v.name)).toEqual(["ok"]);
+  });
+
   it("keyOf includes declared variable names — two macros differing only in variables are NOT deduped (§10)", async () => {
     const macroStore = new InMemoryMacroStore();
     await macroStore.initialize();

@@ -429,6 +429,54 @@ describe("renderMacroEditorHtml", () => {
     });
   });
 
+  describe("blank vs partially-filled variable rows", () => {
+    // `collectVariablesForSave()` drops any row with an empty name, so validation has
+    // to be the thing that distinguishes "untouched row the user added by accident"
+    // (skip silently — an extra row must never hard-block Save) from "row where a
+    // label/default was typed and only the name is missing" (must be reported, or the
+    // row vanishes on save with no explanation).
+    //
+    // The repo's vitest environment is "node" with no DOM, so rather than assert on
+    // the source text — which would pass even if the logic were wrong — extract the
+    // guard from the rendered script and run it against a stub row. It only ever
+    // reads `.value` / `.checked` off querySelector results.
+    function extractRowHasContent(html: string): (row: unknown) => boolean {
+      const match = /function rowHasContent\(row\) \{[\s\S]*?\n      \}/.exec(html);
+      if (!match) throw new Error("rowHasContent() not found in the rendered script");
+      return new Function(`${match[0]}\nreturn rowHasContent;`)() as (row: unknown) => boolean;
+    }
+
+    function stubRow(fields: { label?: string; def?: string; secret?: boolean; remember?: boolean }) {
+      const map: Record<string, { value: string; checked: boolean }> = {
+        ".var-label": { value: fields.label ?? "", checked: false },
+        ".var-default": { value: fields.def ?? "", checked: false },
+        ".var-secret": { value: "", checked: !!fields.secret },
+        ".var-remember": { value: "", checked: !!fields.remember }
+      };
+      return { querySelector: (sel: string) => map[sel] };
+    }
+
+    it("treats a wholly untouched row as empty", () => {
+      const rowHasContent = extractRowHasContent(render([], null));
+      expect(rowHasContent(stubRow({}))).toBe(false);
+      expect(rowHasContent(stubRow({ label: "   " }))).toBe(false);
+    });
+
+    it("treats a row with any label, default, or ticked box as filled in", () => {
+      const rowHasContent = extractRowHasContent(render([], null));
+      expect(rowHasContent(stubRow({ label: "Target host" }))).toBe(true);
+      expect(rowHasContent(stubRow({ def: "10.0.0.1" }))).toBe(true);
+      expect(rowHasContent(stubRow({ secret: true }))).toBe(true);
+      expect(rowHasContent(stubRow({ remember: true }))).toBe(true);
+    });
+
+    it("reports a missing name on a filled-in row rather than dropping it silently", () => {
+      const html = render([], null);
+      expect(html).toContain("rowHasContent(row)");
+      expect(html).toContain("Variable name is required.");
+    });
+  });
+
   it("renders matching profile choices by display name instead of raw ids", () => {
     const html = renderMacroEditorHtml([], null, nonce, [
       { id: "52a3b610-f871-462c-9541-20d13c0f7e56", name: "Core Router", kind: "server" },

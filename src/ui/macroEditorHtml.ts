@@ -466,6 +466,16 @@ export function renderMacroEditorHtml(
       // validation instead walks the DOM directly, addressing each row's own
       // error slot by its actual position — a blank row is skipped (no error,
       // never blocks Save) rather than reported as an invalid empty name.
+      /** True when the user has put anything in this row beyond an empty name. */
+      function rowHasContent(row) {
+        return !!(
+          row.querySelector(".var-label").value.trim() ||
+          row.querySelector(".var-default").value ||
+          row.querySelector(".var-secret").checked ||
+          row.querySelector(".var-remember").checked
+        );
+      }
+
       function validateVariablesClientSide(variables) {
         var ok = true;
         var seen = Object.create(null);
@@ -475,7 +485,15 @@ export function renderMacroEditorHtml(
           var errEl = row.querySelector(".field-error");
           var name = row.querySelector(".var-name").value.trim();
           var msg = "";
-          if (name) {
+          if (!name) {
+            // A wholly untouched row is "not yet filled in" — skip it silently so an
+            // accidental Add Variable click never blocks Save. But a row where the
+            // user typed a label/default (or ticked a box) and just missed the name
+            // must NOT be silently dropped by collectVariablesForSave(); report it.
+            if (rowHasContent(row)) {
+              msg = "Variable name is required.";
+            }
+          } else {
             if (!isValidVariableName(name)) {
               msg = '"' + name + '" is not a valid variable name.';
             } else if (seen[name]) {
