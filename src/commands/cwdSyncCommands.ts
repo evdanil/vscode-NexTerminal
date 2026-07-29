@@ -31,6 +31,35 @@ const FOLLOW_NUDGE_DISMISS_ACTION = "No Thanks";
  */
 const noSourceToastShownSessions = new Set<string>();
 
+/**
+ * Bug-2 fix — "turning Follow on with no OSC 7 source says nothing useful".
+ * Distinct from the §8.5(a) toast above: that one fires from
+ * `syncFromTerminal`'s failure path after the *whole* resolution ladder
+ * (tracker + heuristic + manual prompt) comes up empty; this one fires
+ * directly off the Follow-on toggle, the moment the newly-following state
+ * resolves to `noSource`, and offers two concrete next actions instead of
+ * just naming the dead end.
+ */
+const NO_SOURCE_FOLLOW_SHOW_ME_HOW_ACTION = "Show Me How";
+const NO_SOURCE_FOLLOW_GO_TO_TERMINAL_ACTION = "Go to Terminal Directory";
+
+/**
+ * In-memory only, keyed by server id, reset on every extension activation —
+ * deliberately not a `globalState` memento. A user who adds the rc hook and
+ * reconnects wants a fresh shot at seeing it work in the *same* window; a
+ * fresh window/reload should offer the tip again rather than going
+ * permanently silent for a server it happened to see once, long ago.
+ */
+const noSourceFollowNudgeShownServers = new Set<string>();
+
+/**
+ * Byte-for-byte identical to the rc one-liner documented in
+ * `README.md`'s "Directory Sync (Follow Terminal Directory)" section — kept
+ * in sync deliberately so "Show Me How" and the docs can never drift apart.
+ */
+const BASH_ZSH_OSC7_HOOK_SNIPPET =
+  "# ~/.bashrc — let Nexus follow this shell's directory\nPROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"$HOSTNAME\" \"$PWD\"'\"${PROMPT_COMMAND:+; $PROMPT_COMMAND}\"\n# zsh: the equivalent goes in ~/.zshrc via precmd_functions";
+
 interface FocusedSshSession {
   id: string;
   serverId: string;
@@ -183,6 +212,64 @@ async function showNoSourceToastOnce(ctx: CommandContext, session: FocusedSshSes
 }
 
 /**
+ * Bug-2 fix — the actionable half of "turning Follow on with no OSC 7 source
+ * says nothing useful". Fires at most once per explorer server (in-memory
+ * only — see `noSourceFollowNudgeShownServers`). Act-on-click, no second
+ * modal, mirroring the pattern at `extension.ts`'s
+ * `maybeWarnMacroKeybindingsBlocked` (`extension.ts:204-217`):
+ *  - `Show Me How` writes the rc one-liner to the Nexus Directory Sync
+ *    output channel and shows it — the channel already exists as this
+ *    feature's diagnostics sink (§7.6), is plain text a user can select and
+ *    copy, and needs no new UI surface (a webview would be overkill for one
+ *    paragraph of text).
+ *  - `Go to Terminal Directory` runs the existing on-demand sync command,
+ *    the immediate escape hatch for hosts that will never announce a
+ *    directory automatically.
+ */
+function showNoSourceFollowNudge(ctx: CommandContext, session: FocusedSshSession): void {
+  if (noSourceFollowNudgeShownServers.has(session.serverId)) {
+    return;
+  }
+  noSourceFollowNudgeShownServers.add(session.serverId);
+
+  const serverName = ctx.core.getServer(session.serverId)?.name ?? session.serverId;
+  void vscode.window
+    .showInformationMessage(
+      `"${serverName}" hasn't reported its directory yet. Nexus never types into a session, so the shell has to announce where it is. fish and starship already do; bash and zsh need one line in your rc file.`,
+      NO_SOURCE_FOLLOW_SHOW_ME_HOW_ACTION,
+      NO_SOURCE_FOLLOW_GO_TO_TERMINAL_ACTION
+    )
+    .then((choice) => {
+      if (choice === NO_SOURCE_FOLLOW_SHOW_ME_HOW_ACTION) {
+        ctx.cwdSyncOutputChannel?.appendLine(BASH_ZSH_OSC7_HOOK_SNIPPET);
+        ctx.cwdSyncOutputChannel?.show();
+      } else if (choice === NO_SOURCE_FOLLOW_GO_TO_TERMINAL_ACTION) {
+        void vscode.commands.executeCommand("nexus.files.syncFromTerminal");
+      }
+    });
+}
+
+/**
+ * Called from the `nexus.files.followTerminal` handler only — never from a
+ * timer, never from general state recomputation. Fires the nudge only when
+ * the state freshly resolved *after* turning following on is exactly
+ * `noSource` (a focused SSH session, on the explorer's active server, that
+ * has never reported a directory). Every other state — `off`, `following`,
+ * `stale`, `pinned`, `otherServer`, `rateLimited` — has its own header
+ * string (§8.2) and must stay silent here.
+ */
+function maybeShowNoSourceFollowNudge(ctx: CommandContext): void {
+  if (!ctx.cwdSyncCoordinator || ctx.cwdSyncCoordinator.getState().kind !== "noSource") {
+    return;
+  }
+  const session = resolveFocusedSshSession(ctx);
+  if (!session) {
+    return;
+  }
+  showNoSourceFollowNudge(ctx, session);
+}
+
+/**
  * `nexus.files.syncFromTerminal` — the resolution ladder (§8.5(a) inline
  * commentary walks the full flow):
  *  1. A non-stale tracker record for the focused SSH session, if its
@@ -243,6 +330,7 @@ export function registerCwdSyncCommands(ctx: CommandContext): vscode.Disposable[
     ctx.cwdSyncCoordinator.setFollowing(true);
     ctx.cwdSyncCoordinator.clearPin();
     void ctx.globalState.update(FOLLOW_TERMINAL_STATE_KEY, true);
+    maybeShowNoSourceFollowNudge(ctx);
   });
 
   const unfollowTerminal = vscode.commands.registerCommand("nexus.files.unfollowTerminal", () => {

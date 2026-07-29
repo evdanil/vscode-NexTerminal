@@ -790,7 +790,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         fileExplorerView.message = undefined;
         break;
       case "noSource":
-        fileExplorerView.description = `Following ${state.terminalName} — no directory reported`;
+        fileExplorerView.description = `Following ${state.terminalName} — shell not reporting a directory`;
         fileExplorerView.message = undefined;
         break;
       case "stale":

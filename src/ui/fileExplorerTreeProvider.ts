@@ -188,6 +188,9 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   private remoteWatchMode: "auto" | "polling" = "auto";
   private watcherRestartTimer: ReturnType<typeof setTimeout> | undefined;
   private busyCount = 0;
+  /** Cache for `onDidChangeBusy`'s true->false edge detection — see below. */
+  private lastBusy = false;
+  private readonly busyListeners = new Set<() => void>();
 
   public constructor(private readonly sftp: SftpService) {}
 
@@ -273,6 +276,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
    */
   public beginBusy(): () => void {
     this.busyCount += 1;
+    this.notifyBusyIdleIfChanged();
     let released = false;
     return () => {
       if (released) {
@@ -280,7 +284,35 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       }
       released = true;
       this.busyCount = Math.max(0, this.busyCount - 1);
+      this.notifyBusyIdleIfChanged();
     };
+  }
+
+  /**
+   * Fires exactly when `isBusy()` transitions from true to false (never on
+   * false->true, never redundantly while already idle). This is the "the
+   * explorer just went idle" signal `CwdSyncCoordinator` needs to retry a
+   * directory-sync apply it deferred while busy (§7.4) instead of dropping it
+   * — see the bug-1 fix in `cwdSyncCoordinator.ts`. Plain listener set,
+   * matching this file's `onDidChangeTreeData`-adjacent conventions and
+   * `CwdSyncCoordinator.onDidChangeState`'s own style; a `vscode.EventEmitter`
+   * would work too, but nothing here needs its extra API surface.
+   */
+  public onDidChangeBusy(listener: () => void): () => void {
+    this.busyListeners.add(listener);
+    return () => this.busyListeners.delete(listener);
+  }
+
+  private notifyBusyIdleIfChanged(): void {
+    const busy = this.isBusy();
+    const wentIdle = this.lastBusy && !busy;
+    this.lastBusy = busy;
+    if (!wentIdle) {
+      return;
+    }
+    for (const listener of this.busyListeners) {
+      listener();
+    }
   }
 
   public setViewVisibility(visible: boolean): void {
@@ -325,10 +357,12 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     }
 
     this.pendingChildrenRequests += 1;
+    this.notifyBusyIdleIfChanged();
     try {
       return await this.getChildrenInner(element);
     } finally {
       this.pendingChildrenRequests = Math.max(0, this.pendingChildrenRequests - 1);
+      this.notifyBusyIdleIfChanged();
     }
   }
 

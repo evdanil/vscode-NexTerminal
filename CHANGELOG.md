@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [2.8.71] — 2026-07-29
+
+Two fixes for the directory sync feature shipped in 2.8.70 (#35), from real-world use.
+
+### Fixed
+
+- **Directory sync no longer silently drops a `cd` while the File Explorer is busy.** `cd ..` twice in a row could lose the second hop — not path-dependent, timing-dependent: any tree refresh (the 10s safety-net poll, an inotify event, and especially every successful re-root, which itself triggers a refresh) left a short window where the explorer reported itself busy, and a cwd report arriving in that window was discarded outright with no retry. The busy check exists so a re-root can't land mid-upload or mid-listing (the fallback write target for drag-drop and new file/folder creation) — that safety property is unchanged. What's fixed is what happens to the report: it's now buffered (latest wins) and replayed through full arbitration — following, focus, server match, pin, staleness, visibility, busy — the moment the explorer goes idle, via a new `FileExplorerTreeProvider.onDidChangeBusy()` signal. No polling added.
+- **Turning on Follow Terminal Directory for a host with no OSC 7 source now says something.** Previously the only feedback was a small grey line in the File Explorer's title bar (`... — no directory reported`, easy to miss and passive even when noticed) — clicking the toggle on a stock Linux host looked like the feature just didn't work. Turning follow on now shows an actionable, once-per-server notice explaining that Nexus never types into a session (so the shell has to announce its own directory — fish and starship already do; bash/zsh need one rc line), with **Show Me How** (drops the one-liner into the Nexus Directory Sync output channel) and **Go to Terminal Directory** (jumps there manually, immediately) as the two responses. The title-bar text for this state is also more direct now: `shell not reporting a directory` instead of `no directory reported`.
+
 ## [2.8.70] — 2026-07-29
 
 Phase 1 of directory sync between the SSH terminal and the File Explorer (#35).
