@@ -94,6 +94,11 @@ export interface CwdSyncProviderLike {
   getRootPath(): string | undefined;
   setRootPath(rootPath: string, opts?: { restartWatcher?: boolean }): void;
   isBusy(): boolean;
+  /**
+   * Fires exactly when `isBusy()` transitions from true to false (bug 1 fix —
+   * see the `busyBuffer` doc comment below). Never fires on false->true.
+   */
+  onDidChangeBusy(listener: () => void): () => void;
 }
 
 /** The exact subset of `SftpService`'s API this coordinator uses. */
@@ -173,6 +178,17 @@ export class CwdSyncCoordinator {
   /** Latest record withheld while `visible` is false; applied once on re-show. */
   private hiddenBuffer: CwdRecord | undefined;
 
+  /**
+   * Latest record withheld while `provider.isBusy()` is true; applied once
+   * the explorer signals it has gone idle (`provider.onDidChangeBusy`).
+   * Mirrors `hiddenBuffer`'s latest-wins semantics exactly — bug 1 fix
+   * (§7.4): the busy check exists so a re-root cannot land mid-upload or
+   * mid-listing, not so a report gets thrown away. Cleared at the same
+   * lifecycle points as `hiddenBuffer` plus two more (`notifyExplorerServerChanged`,
+   * `dispose`) — see each site's comment.
+   */
+  private busyBuffer: CwdRecord | undefined;
+
   private debounceTimer: ReturnType<typeof setTimeout> | undefined;
   private debouncedRecord: CwdRecord | undefined;
 
@@ -195,6 +211,7 @@ export class CwdSyncCoordinator {
   private readonly stateListeners = new Set<() => void>();
   private readonly unsubscribeTracker: () => void;
   private readonly unsubscribeCore: () => void;
+  private readonly unsubscribeBusy: () => void;
   private disposed = false;
 
   public constructor(private readonly deps: CwdSyncDeps) {
@@ -219,6 +236,8 @@ export class CwdSyncCoordinator {
       this.applyForFocusedSession("focus-changed");
     });
 
+    this.unsubscribeBusy = deps.provider.onDidChangeBusy(() => this.onBusyIdle());
+
     this.freshnessPollTimer = setInterval(() => this.checkFreshnessBoundary(), FRESHNESS_POLL_MS);
   }
 
@@ -233,6 +252,7 @@ export class CwdSyncCoordinator {
     if (!on) {
       this.cancelDebounce();
       this.hiddenBuffer = undefined;
+      this.busyBuffer = undefined;
     } else {
       // §8.3: toggling following off -> on clears any stale pin.
       this.paused = false;
@@ -266,6 +286,28 @@ export class CwdSyncCoordinator {
       this.hiddenBuffer = undefined;
       this.considerApply(record, "view-reshown", { immediate: true });
     }
+  }
+
+  // ─── Busy buffering (§7.4 bug 1) ─────────────────────────────────────────
+
+  /**
+   * The explorer just went idle (`FileExplorerTreeProvider`'s combined busy
+   * state transitioned true->false). Replay whatever was buffered while busy
+   * through `considerApply`, which re-runs the *full* synchronous
+   * arbitration set from scratch (following, record presence, focused
+   * session, server match, pin, rate-limit, stale, busy again, visibility) —
+   * never apply a buffered record blindly, because any of that may have
+   * changed while the explorer was busy. This mirrors `setViewVisible(true)`'s
+   * hidden-buffer replay exactly, including cascading into `hiddenBuffer` if
+   * the view is *also* still hidden by the time this fires.
+   */
+  private onBusyIdle(): void {
+    if (!this.busyBuffer) {
+      return;
+    }
+    const record = this.busyBuffer;
+    this.busyBuffer = undefined;
+    this.considerApply(record, "busy-cleared", { immediate: true });
   }
 
   // ─── Pin / resume (§8.3) ─────────────────────────────────────────────────
@@ -314,6 +356,9 @@ export class CwdSyncCoordinator {
     if (this.hiddenBuffer?.sessionId === sessionId) {
       this.hiddenBuffer = undefined;
     }
+    if (this.busyBuffer?.sessionId === sessionId) {
+      this.busyBuffer = undefined;
+    }
     if (this.debouncedRecord?.sessionId === sessionId) {
       this.cancelDebounce();
     }
@@ -339,6 +384,7 @@ export class CwdSyncCoordinator {
     this.pinnedSessionId = undefined;
     this.generation++;
     this.cancelDebounce();
+    this.busyBuffer = undefined;
     this.emitStateChange();
     this.applyForFocusedSession("explorer-server-changed");
   }
@@ -507,7 +553,13 @@ export class CwdSyncCoordinator {
     }
 
     if (this.deps.provider.isBusy()) {
-      this.deps.log(`Directory sync: skip (${reason}) — explorer is busy`);
+      // Bug 1 fix (§7.4): buffer, don't drop. The busy check exists so a
+      // re-root can't land mid-upload or mid-listing — deferring satisfies
+      // that; silently losing the report was never required. Latest-wins,
+      // exactly like `hiddenBuffer` below. Replayed by `onBusyIdle()` once
+      // `provider.onDidChangeBusy` fires the idle transition.
+      this.busyBuffer = record;
+      this.deps.log(`Directory sync: buffered (${reason}) — explorer is busy`);
       return;
     }
 
@@ -592,6 +644,25 @@ export class CwdSyncCoordinator {
   }
 
   /**
+   * Logs a mid-flight `passesArbitration()` failure and, when the explorer
+   * became busy during the awaited SFTP call (§7.4 bug 1), buffers the
+   * record instead of dropping it — `onBusyIdle()` retries it (through full
+   * arbitration again) once the explorer signals idle. `isBusy()` is
+   * evaluated synchronously right here, immediately after the arbitration
+   * check that already consulted it, so there is no race between the two
+   * reads. A false positive (buffering when the *actual* blocking rule was
+   * something else that happened to coincide with busy, e.g. a pin set in
+   * the same tick) is harmless: the eventual retry re-runs every rule from
+   * scratch and simply skips again if still blocked.
+   */
+  private abandonMidFlight(record: CwdRecord, reason: string, arbitration: { ok: false; reasonMsg: string }): void {
+    this.deps.log(`Directory sync: abandon (${reason}) — ${arbitration.reasonMsg}`);
+    if (this.deps.provider.isBusy()) {
+      this.busyBuffer = record;
+    }
+  }
+
+  /**
    * Rules 8-10 (§5.3). Both SFTP calls are wrapped in try/catch — §5.4 hole
    * (c): the explorer can be torn down mid-flight and `getSftp` throws
    * `No SFTP session for server …`. A failure logs and drops; it must never
@@ -621,7 +692,7 @@ export class CwdSyncCoordinator {
     }
     const afterRealpath = this.passesArbitration(record);
     if (!afterRealpath.ok) {
-      this.deps.log(`Directory sync: abandon (${reason}) — ${afterRealpath.reasonMsg}`);
+      this.abandonMidFlight(record, reason, afterRealpath);
       return;
     }
 
@@ -639,7 +710,7 @@ export class CwdSyncCoordinator {
     }
     const afterStat = this.passesArbitration(record);
     if (!afterStat.ok) {
-      this.deps.log(`Directory sync: abandon (${reason}) — ${afterStat.reasonMsg}`);
+      this.abandonMidFlight(record, reason, afterStat);
       return;
     }
 
@@ -666,7 +737,9 @@ export class CwdSyncCoordinator {
     this.disposed = true;
     this.unsubscribeTracker();
     this.unsubscribeCore();
+    this.unsubscribeBusy();
     this.cancelDebounce();
+    this.busyBuffer = undefined;
     clearInterval(this.freshnessPollTimer);
     this.stateListeners.clear();
   }

@@ -1161,4 +1161,71 @@ describe("FileExplorerTreeProvider", () => {
       expect(provider.isBusy()).toBe(false);
     });
   });
+
+  describe("onDidChangeBusy (busy -> idle signal, issue #35 bug 1)", () => {
+    it("fires once when getChildren's pending request resolves and the explorer goes idle", async () => {
+      const deferred = createDeferred<DirectoryEntry[]>();
+      (sftp.readDirectory as any).mockImplementation(() => deferred.promise);
+      provider.setActiveServer(testServer, "/home/dev");
+
+      const listener = vi.fn();
+      provider.onDidChangeBusy(listener);
+
+      const childrenPromise = provider.getChildren();
+      expect(listener).not.toHaveBeenCalled(); // becoming busy must not fire the idle signal
+
+      deferred.resolve([]);
+      await childrenPromise;
+
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
+    it("fires once when beginBusy()'s disposer releases the last outstanding span", () => {
+      const listener = vi.fn();
+      provider.onDidChangeBusy(listener);
+
+      const release = provider.beginBusy();
+      expect(listener).not.toHaveBeenCalled();
+
+      release();
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not fire again when the disposer is called a second time (idempotent release)", () => {
+      const listener = vi.fn();
+      provider.onDidChangeBusy(listener);
+
+      const release = provider.beginBusy();
+      release();
+      expect(listener).toHaveBeenCalledTimes(1);
+      release();
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not fire when one of two overlapping busy spans ends but the explorer is still busy", () => {
+      const listener = vi.fn();
+      provider.onDidChangeBusy(listener);
+
+      const releaseA = provider.beginBusy();
+      const releaseB = provider.beginBusy();
+      releaseA();
+      expect(provider.isBusy()).toBe(true);
+      expect(listener).not.toHaveBeenCalled();
+
+      releaseB();
+      expect(provider.isBusy()).toBe(false);
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
+    it("unsubscribe stops further notifications", () => {
+      const listener = vi.fn();
+      const unsubscribe = provider.onDidChangeBusy(listener);
+
+      const release = provider.beginBusy();
+      unsubscribe();
+      release();
+
+      expect(listener).not.toHaveBeenCalled();
+    });
+  });
 });

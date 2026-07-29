@@ -4,9 +4,11 @@ import type { CommandContext } from "../../src/commands/types";
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowInformationMessage = vi.fn();
 const mockPromptGoToPath = vi.fn();
+const mockExecuteCommand = vi.fn();
 
 // Hand-rolled vscode mock, kept minimal — cwdSyncCommands.ts itself only
-// touches `commands.registerCommand` and `window.showInformationMessage`.
+// touches `commands.registerCommand`, `commands.executeCommand` (bug-2 fix's
+// "Go to Terminal Directory" button), and `window.showInformationMessage`.
 // `promptGoToPath` (imported from fileCommands.ts) is mocked at the module
 // boundary below instead of pulling in fileExplorerTreeProvider.ts's much
 // larger vscode surface transitively.
@@ -15,7 +17,8 @@ vi.mock("vscode", () => ({
     registerCommand: vi.fn((id: string, handler: (...args: unknown[]) => unknown) => {
       registeredCommands.set(id, handler);
       return { dispose: vi.fn() };
-    })
+    }),
+    executeCommand: (...args: unknown[]) => mockExecuteCommand(...args)
   },
   window: {
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args)
@@ -78,7 +81,8 @@ function makeHarness(overrides?: {
     setFollowing: vi.fn(),
     resume: vi.fn(),
     notifyManualNavigation: vi.fn(),
-    onSessionEnded: vi.fn()
+    onSessionEnded: vi.fn(),
+    getState: vi.fn(() => ({ kind: "off" }) as const)
   };
 
   const ctx: CommandContext = {
@@ -118,7 +122,7 @@ function makeHarness(overrides?: {
     } as any,
     cwdSyncCoordinator: cwdSyncCoordinator as any,
     cwdLastOutputAt: new Map<string, number>(),
-    cwdSyncOutputChannel: { appendLine: vi.fn() } as any
+    cwdSyncOutputChannel: { appendLine: vi.fn(), show: vi.fn() } as any
   };
 
   return { ctx, globalStateStore, sessionId: focusedSessionId };
@@ -128,6 +132,12 @@ describe("cwdSyncCommands", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+    // Default: no button pressed. Individual tests override with
+    // `.mockResolvedValue(...)` when they care about a specific choice.
+    // Needed because `showNoSourceFollowNudge` (bug 2) chains `.then()` off
+    // the call's return value, which would otherwise be `undefined` (a bare
+    // `vi.fn()`'s default) and throw.
+    mockShowInformationMessage.mockResolvedValue(undefined);
   });
 
   describe("follow / unfollow / resume", () => {
@@ -172,6 +182,154 @@ describe("cwdSyncCommands", () => {
         registeredCommands.get("nexus.files.unfollowTerminal")!();
         registeredCommands.get("nexus.files.resumeFollowTerminal")!();
       }).not.toThrow();
+    });
+  });
+
+  describe("nexus.files.followTerminal — no-source nudge (bug 2)", () => {
+    // The nudge's "shown for this server already" tracking is a *module-level*
+    // Set (deliberately — it must survive across `registerCwdSyncCommands`
+    // calls within one extension-host session), so — exactly like this file's
+    // own `sessionIdCounter` convention for `noSourceToastShownSessions` above
+    // — each test that expects the nudge to actually fire must use a server id
+    // no other test in this file ever uses, or an earlier test's "already
+    // shown" state leaks in. `makeHarness()`'s default `activeServerId` only
+    // feeds `fileExplorerProvider.getActiveServerId()`; the nudge's own
+    // server id comes from `resolveFocusedSshSession()` (i.e.
+    // `activeSessions[].serverId`), so both must be overridden together.
+    let nudgeServerIdCounter = 0;
+    function makeNudgeHarness(overrides?: { focusedSessionId?: string | undefined }): Harness {
+      nudgeServerIdCounter += 1;
+      const serverId = `srv-nudge-${nudgeServerIdCounter}`;
+      const sessionId = `session-nudge-${nudgeServerIdCounter}`;
+      const focusedSessionId = overrides && "focusedSessionId" in overrides ? overrides.focusedSessionId : sessionId;
+      return makeHarness({
+        activeServerId: serverId,
+        focusedSessionId,
+        activeSessions: [{ id: sessionId, serverId, terminalName: "Nexus SSH: Test" }]
+      });
+    }
+
+    it("fires when the state after turning following on is 'noSource'", () => {
+      const { ctx } = makeNudgeHarness();
+      (ctx.cwdSyncCoordinator!.getState as any).mockReturnValue({ kind: "noSource", terminalName: "Nexus SSH: Test" });
+
+      registerCwdSyncCommands(ctx);
+      registeredCommands.get("nexus.files.followTerminal")!();
+
+      expect(mockShowInformationMessage).toHaveBeenCalledTimes(1);
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(
+        `"Server srv-nudge-1" hasn't reported its directory yet. Nexus never types into a session, so the shell has to announce where it is. fish and starship already do; bash and zsh need one line in your rc file.`,
+        "Show Me How",
+        "Go to Terminal Directory"
+      );
+    });
+
+    it("does not fire when a tracker record already exists (state 'following')", () => {
+      const { ctx } = makeNudgeHarness();
+      (ctx.cwdSyncCoordinator!.getState as any).mockReturnValue({ kind: "following", terminalName: "Nexus SSH: Test" });
+
+      registerCwdSyncCommands(ctx);
+      registeredCommands.get("nexus.files.followTerminal")!();
+
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { kind: "off" },
+      { kind: "otherServer", terminalName: "t", otherServerId: "srv-2" },
+      { kind: "pinned", terminalName: "t", trackedCwd: undefined },
+      { kind: "rateLimited", terminalName: "t" },
+      { kind: "stale", terminalName: "t", cwd: "/a", ageMs: 1000 }
+    ])("does not fire for state '$kind'", (state) => {
+      const { ctx } = makeNudgeHarness();
+      (ctx.cwdSyncCoordinator!.getState as any).mockReturnValue(state);
+
+      registerCwdSyncCommands(ctx);
+      registeredCommands.get("nexus.files.followTerminal")!();
+
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    });
+
+    it("does not fire twice for the same server in one session, even across repeated follow-on toggles", () => {
+      const { ctx } = makeNudgeHarness();
+      (ctx.cwdSyncCoordinator!.getState as any).mockReturnValue({ kind: "noSource", terminalName: "Nexus SSH: Test" });
+
+      registerCwdSyncCommands(ctx);
+      registeredCommands.get("nexus.files.followTerminal")!();
+      registeredCommands.get("nexus.files.followTerminal")!();
+
+      expect(mockShowInformationMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("fires again for a different server (per-server tracking, not global)", () => {
+      const { ctx: ctxA } = makeNudgeHarness();
+      (ctxA.cwdSyncCoordinator!.getState as any).mockReturnValue({ kind: "noSource", terminalName: "t" });
+      registerCwdSyncCommands(ctxA);
+      registeredCommands.get("nexus.files.followTerminal")!();
+      expect(mockShowInformationMessage).toHaveBeenCalledTimes(1);
+
+      registeredCommands.clear();
+      const { ctx: ctxB } = makeNudgeHarness();
+      (ctxB.cwdSyncCoordinator!.getState as any).mockReturnValue({ kind: "noSource", terminalName: "t" });
+      registerCwdSyncCommands(ctxB);
+      registeredCommands.get("nexus.files.followTerminal")!();
+
+      expect(mockShowInformationMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not fire when there is no focused SSH session, even if getState() somehow reports noSource", () => {
+      const { ctx } = makeNudgeHarness({ focusedSessionId: undefined });
+      (ctx.cwdSyncCoordinator!.getState as any).mockReturnValue({ kind: "noSource", terminalName: "t" });
+
+      registerCwdSyncCommands(ctx);
+      expect(() => registeredCommands.get("nexus.files.followTerminal")!()).not.toThrow();
+
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    });
+
+    it("'Show Me How' writes the rc snippet to the output channel and shows it", async () => {
+      const { ctx } = makeNudgeHarness();
+      (ctx.cwdSyncCoordinator!.getState as any).mockReturnValue({ kind: "noSource", terminalName: "t" });
+      mockShowInformationMessage.mockResolvedValue("Show Me How");
+
+      registerCwdSyncCommands(ctx);
+      registeredCommands.get("nexus.files.followTerminal")!();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(ctx.cwdSyncOutputChannel!.appendLine).toHaveBeenCalledWith(
+        expect.stringContaining("PROMPT_COMMAND=")
+      );
+      expect(ctx.cwdSyncOutputChannel!.show).toHaveBeenCalledTimes(1);
+      expect(mockExecuteCommand).not.toHaveBeenCalled();
+    });
+
+    it("'Go to Terminal Directory' runs nexus.files.syncFromTerminal", async () => {
+      const { ctx } = makeNudgeHarness();
+      (ctx.cwdSyncCoordinator!.getState as any).mockReturnValue({ kind: "noSource", terminalName: "t" });
+      mockShowInformationMessage.mockResolvedValue("Go to Terminal Directory");
+
+      registerCwdSyncCommands(ctx);
+      registeredCommands.get("nexus.files.followTerminal")!();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.files.syncFromTerminal");
+      expect(ctx.cwdSyncOutputChannel!.show).not.toHaveBeenCalled();
+    });
+
+    it("dismissing (undefined choice) does neither action", async () => {
+      const { ctx } = makeNudgeHarness();
+      (ctx.cwdSyncCoordinator!.getState as any).mockReturnValue({ kind: "noSource", terminalName: "t" });
+      mockShowInformationMessage.mockResolvedValue(undefined);
+
+      registerCwdSyncCommands(ctx);
+      registeredCommands.get("nexus.files.followTerminal")!();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(mockExecuteCommand).not.toHaveBeenCalled();
+      expect(ctx.cwdSyncOutputChannel!.show).not.toHaveBeenCalled();
     });
   });
 

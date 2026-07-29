@@ -196,6 +196,8 @@ For anything that isn't a POSIX shell — Cisco IOS, Juniper, FortiOS, or any ot
 
 Turn continuous following on or off from the toggle at the left of the File Explorer title bar, or from the right-click menu on the `.` row that shows your current directory — never from Settings. Navigating manually (Go to Path, Go Home, or `..`) pauses following rather than fighting it; one click on **Resume Following Terminal Directory** jumps straight back to the terminal's directory.
 
+If you turn following on for a terminal that hasn't reported a directory yet, Nexus tells you right away instead of leaving the toggle looking broken: **Show Me How** drops the rc one-liner into the Nexus Directory Sync output channel, and **Go to Terminal Directory** jumps there manually in the meantime. That notice shows once per server per window.
+
 **Nexus never types anything into your session to make this work, in this release.** Every part of this feature only reads what the shell already sends — it either volunteers its own directory, or you ask for it explicitly with Go to Terminal Directory.
 
 ### Open a profile from the command line

@@ -70,6 +70,7 @@ function makeFakeProvider() {
     rootPath: undefined,
     busy: false
   };
+  let idleListener: (() => void) | undefined;
   return {
     state,
     getActiveServerId: vi.fn(() => state.activeServerId),
@@ -77,7 +78,27 @@ function makeFakeProvider() {
     setRootPath: vi.fn((rootPath: string, _opts?: { restartWatcher?: boolean }) => {
       state.rootPath = rootPath;
     }),
-    isBusy: vi.fn(() => state.busy)
+    isBusy: vi.fn(() => state.busy),
+    onDidChangeBusy: vi.fn((l: () => void) => {
+      idleListener = l;
+      return () => {
+        if (idleListener === l) idleListener = undefined;
+      };
+    }),
+    /**
+     * Test-only helper mirroring the real `FileExplorerTreeProvider`'s
+     * true->false edge detection: fires the registered `onDidChangeBusy`
+     * listener exactly when `busy` transitions from true to false, never
+     * otherwise. Tests that only care about `isBusy()`'s return value (not
+     * the edge-triggered retry signal) can still set `state.busy` directly.
+     */
+    setBusy(next: boolean): void {
+      const was = state.busy;
+      state.busy = next;
+      if (was && !next) {
+        idleListener?.();
+      }
+    }
   };
 }
 
@@ -282,18 +303,208 @@ describe("CwdSyncCoordinator", () => {
     expect(provider.setRootPath).not.toHaveBeenCalled();
   });
 
-  it("suppresses apply while the explorer reports itself busy (§7.4)", async () => {
+  it("defers apply while the explorer reports itself busy — never drops it (§7.4 bug 1)", async () => {
     const { tracker, provider, core, coordinator } = setup();
     coordinator.setFollowing(true);
     coordinator.setViewVisible(true);
     provider.state.activeServerId = "srv-1";
-    provider.state.busy = true;
+    provider.setBusy(true);
     core.state.focusedSessionId = "s1";
 
     tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/var/log" }));
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
 
+    // While busy, the report must NOT be dropped — it is deferred.
     expect(provider.setRootPath).not.toHaveBeenCalled();
+
+    // Once the explorer goes idle, the deferred report is applied.
+    provider.setBusy(false);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(provider.setRootPath).toHaveBeenCalledWith("/var/log", { restartWatcher: false });
+  });
+
+  // ─── Busy buffering (§7.4 bug 1 — "cwd reports silently dropped while the
+  // explorer is busy") ───────────────────────────────────────────────────────
+
+  describe("busy buffering (§7.4 bug 1)", () => {
+    it("buffers a burst while busy, latest wins, and applies only the latest once idle", async () => {
+      const { tracker, provider, sftp, core, coordinator } = setup();
+      coordinator.setFollowing(true);
+      coordinator.setViewVisible(true);
+      provider.state.activeServerId = "srv-1";
+      provider.setBusy(true);
+      core.state.focusedSessionId = "s1";
+
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/a" }));
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/b" })); // supersedes the buffer
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+
+      expect(sftp.realpath).not.toHaveBeenCalled();
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+
+      provider.setBusy(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).toHaveBeenCalledTimes(1);
+      expect(provider.setRootPath).toHaveBeenCalledWith("/b", { restartWatcher: false });
+    });
+
+    it("re-runs full arbitration on idle — a busy-buffered record is discarded if the server changed in the meantime", async () => {
+      const { tracker, provider, core, coordinator } = setup();
+      coordinator.setFollowing(true);
+      coordinator.setViewVisible(true);
+      provider.state.activeServerId = "srv-1";
+      provider.setBusy(true);
+      core.state.focusedSessionId = "s1";
+      core.state.activeSessions = [{ id: "s1", serverId: "srv-1", terminalName: "term-1" }];
+
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/var/log" }));
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+
+      // Explorer moves to a different server while still busy.
+      provider.state.activeServerId = "srv-2";
+      coordinator.notifyExplorerServerChanged();
+
+      provider.setBusy(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+    });
+
+    it("discards a busy-buffered record when the owning session ends before idle", async () => {
+      const { tracker, provider, core, coordinator } = setup();
+      coordinator.setFollowing(true);
+      coordinator.setViewVisible(true);
+      provider.state.activeServerId = "srv-1";
+      provider.setBusy(true);
+      core.state.focusedSessionId = "s1";
+
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/var/log" }));
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+
+      coordinator.onSessionEnded("s1");
+
+      provider.setBusy(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+    });
+
+    it("discards a busy-buffered record when following is turned off before idle", async () => {
+      const { tracker, provider, core, coordinator } = setup();
+      coordinator.setFollowing(true);
+      coordinator.setViewVisible(true);
+      provider.state.activeServerId = "srv-1";
+      provider.setBusy(true);
+      core.state.focusedSessionId = "s1";
+
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/var/log" }));
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+
+      coordinator.setFollowing(false);
+      coordinator.setFollowing(true); // back on — must not resurrect the old buffered record
+
+      provider.setBusy(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+    });
+
+    it("discards a busy-buffered record superseded by a newer record that resolves before idle (generation token)", async () => {
+      const { tracker, provider, sftp, core, coordinator } = setup();
+      coordinator.setFollowing(true);
+      coordinator.setViewVisible(true);
+      provider.state.activeServerId = "srv-1";
+      core.state.focusedSessionId = "s1";
+
+      // First record arrives, debounce fires, but realpath() never resolves
+      // before the explorer becomes busy mid-flight.
+      let releaseRealpath: ((path: string) => void) | undefined;
+      (sftp.realpath as any).mockImplementationOnce(
+        () => new Promise<string>((resolve) => { releaseRealpath = resolve; })
+      );
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/a" }));
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // realpath("/a") now pending
+
+      provider.setBusy(true);
+      releaseRealpath?.("/a");
+      await vi.advanceTimersByTimeAsync(0); // arbitration recheck sees busy -> buffers "/a"
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+
+      // A newer record for the same session supersedes the buffered one.
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/b" }));
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // also buffered (still busy) — latest wins
+
+      provider.setBusy(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).toHaveBeenCalledTimes(1);
+      expect(provider.setRootPath).toHaveBeenCalledWith("/b", { restartWatcher: false });
+    });
+
+    it("buffers (rather than drops) a record that becomes stale-context mid-flight because the explorer went busy while realpath() was in flight", async () => {
+      const { tracker, provider, sftp, core, coordinator } = setup();
+      coordinator.setFollowing(true);
+      coordinator.setViewVisible(true);
+      provider.state.activeServerId = "srv-1";
+      core.state.focusedSessionId = "s1";
+
+      let releaseRealpath: ((path: string) => void) | undefined;
+      (sftp.realpath as any).mockImplementationOnce(
+        () => new Promise<string>((resolve) => { releaseRealpath = resolve; })
+      );
+
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/var/log" }));
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // realpath("/var/log") now pending, not yet busy
+
+      // Explorer becomes busy (e.g. a tree refresh) while the realpath call is in flight.
+      provider.setBusy(true);
+      releaseRealpath?.("/var/log");
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Must not be dropped — buffered for retry.
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+
+      provider.setBusy(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).toHaveBeenCalledWith("/var/log", { restartWatcher: false });
+    });
+
+    it("does nothing on idle when nothing was buffered", async () => {
+      const { provider, coordinator } = setup();
+      coordinator.setFollowing(true);
+      coordinator.setViewVisible(true);
+      provider.state.activeServerId = "srv-1";
+
+      provider.setBusy(true);
+      provider.setBusy(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+    });
+
+    it("dispose() clears any busy-buffered record and stops listening for idle", async () => {
+      const { tracker, provider, core, coordinator } = setup();
+      coordinator.setFollowing(true);
+      coordinator.setViewVisible(true);
+      provider.state.activeServerId = "srv-1";
+      provider.setBusy(true);
+      core.state.focusedSessionId = "s1";
+
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/var/log" }));
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+
+      coordinator.dispose();
+      provider.setBusy(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+    });
   });
 
   // ─── Pin / resume (§8.3) ─────────────────────────────────────────────────
