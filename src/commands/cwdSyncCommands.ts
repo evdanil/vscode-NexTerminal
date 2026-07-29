@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { extractLatestPromptPath } from "../services/terminal/promptPathHeuristic";
 import { promptGoToPath } from "./fileCommands";
+import { isTerminalArg } from "./terminalTabCommands";
 import type { CommandContext } from "./types";
 
 /**
@@ -101,6 +102,40 @@ function resolveFocusedSshSession(ctx: CommandContext): FocusedSshSession | unde
   return snapshot.activeSessions.find((session) => session.id === focusedSessionId);
 }
 
+/**
+ * Resolves which SSH session `nexus.files.syncFromTerminal` should act on.
+ *
+ * When the command is invoked from a terminal tab's own context menu
+ * (`terminal/title/context` / `editor/title/context` in `package.json`), VS Code
+ * passes the clicked `vscode.Terminal` as the first argument — the same shape
+ * `terminalTabCommands.ts`'s `resolveTerminal()` sniffs. `isTerminalArg()` is
+ * that module's exported duck-type check, reused here rather than re-derived,
+ * so the two command modules agree on exactly one definition of "this arg is
+ * the clicked terminal." Without honouring it, right-clicking a *non-focused*
+ * Nexus SSH terminal and choosing "Go to Terminal Directory" silently syncs
+ * whichever terminal happens to be focused instead.
+ *
+ * A `vscode.Terminal` that maps to no live Nexus SSH session (a plain shell tab,
+ * a serial tab, a session that has since ended) resolves to `undefined` and the
+ * command no-ops. Falling back to the focused session there would be worse than
+ * doing nothing: the user pointed at a specific tab.
+ *
+ * Every other invocation path (command palette, the File Explorer `.` row, the
+ * bug-2 "Go to Terminal Directory" nudge button) passes no `vscode.Terminal`, so
+ * this collapses to `resolveFocusedSshSession` — today's behaviour, unchanged.
+ */
+function resolveTargetSshSession(ctx: CommandContext, arg?: unknown): FocusedSshSession | undefined {
+  if (isTerminalArg(arg)) {
+    for (const [sessionId, tracked] of ctx.sessionTerminals) {
+      if (tracked === arg) {
+        return ctx.core.getSnapshot().activeSessions.find((session) => session.id === sessionId);
+      }
+    }
+    return undefined;
+  }
+  return resolveFocusedSshSession(ctx);
+}
+
 /** Resolution ladder step 1 — a non-stale tracker record for the focused session. */
 function getTrackedCandidate(ctx: CommandContext, session: FocusedSshSession): string | undefined {
   if (!ctx.cwdTracker) {
@@ -143,11 +178,18 @@ function getHeuristicCandidate(ctx: CommandContext, session: FocusedSshSession):
  * captured at entry closes that cross-server race — otherwise a slower
  * validation for session/server A can land on an explorer that has since
  * moved on to server B.
+ *
+ * The re-check re-resolves the target *the same way it was originally
+ * resolved* (`resolveTargetSshSession(ctx, arg)`), so a terminal-tab
+ * invocation is re-validated against the clicked terminal rather than against
+ * whatever is focused now. With no `arg` this is byte-for-byte the old
+ * focused-session re-check.
  */
 async function validateAndApply(
   ctx: CommandContext,
   session: FocusedSshSession,
-  candidate: string
+  candidate: string,
+  arg?: unknown
 ): Promise<string | undefined> {
   const expectedSessionId = session.id;
   const expectedServerId = session.serverId;
@@ -173,13 +215,13 @@ async function validateAndApply(
     return undefined;
   }
 
-  // Re-check immediately before committing: both the focused session and the
+  // Re-check immediately before committing: both the target session and the
   // explorer's active server must still match what was captured at entry.
   // A slower validation for a since-abandoned session/server pairing must
   // never land on an explorer that has since switched to a different server.
-  const currentFocused = resolveFocusedSshSession(ctx);
+  const currentTarget = resolveTargetSshSession(ctx, arg);
   const currentActiveServerId = ctx.fileExplorerProvider.getActiveServerId();
-  if (currentFocused?.id !== expectedSessionId || currentActiveServerId !== expectedServerId) {
+  if (currentTarget?.id !== expectedSessionId || currentActiveServerId !== expectedServerId) {
     log(
       ctx,
       `syncFromTerminal: discarding stale validation for session ${expectedSessionId} — focused session or explorer server changed`
@@ -294,10 +336,12 @@ function maybeShowNoSourceFollowNudge(ctx: CommandContext): void {
 
 /**
  * `nexus.files.syncFromTerminal` — the resolution ladder (§8.5(a) inline
- * commentary walks the full flow):
- *  1. A non-stale tracker record for the focused SSH session, if its
+ * commentary walks the full flow). `arg` is VS Code's command argument: the
+ * clicked `vscode.Terminal` for a terminal-tab context-menu invocation,
+ * otherwise absent (see `resolveTargetSshSession`).
+ *  1. A non-stale tracker record for the target SSH session, if its
  *     `serverId` matches the explorer's active server.
- *  2. Else the prompt-text heuristic against the focused terminal's scrollback.
+ *  2. Else the prompt-text heuristic against the target terminal's scrollback.
  *  3. Validate whichever candidate step 1/2 produced; on success, re-root.
  *  4. On no candidate or failed validation, open the `goToPath` prompt
  *     prefilled with the best candidate we have (or the current root, matching
@@ -305,23 +349,23 @@ function maybeShowNoSourceFollowNudge(ctx: CommandContext): void {
  *  5. If that also yields nothing, show the once-per-session incapability
  *     toast (§8.5a).
  */
-async function syncFromTerminal(ctx: CommandContext): Promise<void> {
+async function syncFromTerminal(ctx: CommandContext, arg?: unknown): Promise<void> {
   const activeServerId = ctx.fileExplorerProvider.getActiveServerId();
   if (!activeServerId) {
     log(ctx, "syncFromTerminal: no active File Explorer server");
     return;
   }
 
-  const session = resolveFocusedSshSession(ctx);
+  const session = resolveTargetSshSession(ctx, arg);
   if (!session || session.serverId !== activeServerId) {
-    log(ctx, "syncFromTerminal: no focused SSH session for the active explorer server");
+    log(ctx, "syncFromTerminal: no target SSH session for the active explorer server");
     return;
   }
 
   const candidate = getTrackedCandidate(ctx, session) ?? getHeuristicCandidate(ctx, session);
 
   if (candidate) {
-    const resolved = await validateAndApply(ctx, session, candidate);
+    const resolved = await validateAndApply(ctx, session, candidate, arg);
     if (resolved) {
       await maybeShowFirstSyncNudge(ctx, resolved);
       return;
@@ -373,9 +417,12 @@ export function registerCwdSyncCommands(ctx: CommandContext): vscode.Disposable[
     ctx.cwdSyncCoordinator.resume();
   });
 
-  const syncFromTerminalCmd = vscode.commands.registerCommand("nexus.files.syncFromTerminal", async () => {
-    await syncFromTerminal(ctx);
-  });
+  const syncFromTerminalCmd = vscode.commands.registerCommand(
+    "nexus.files.syncFromTerminal",
+    async (arg?: unknown) => {
+      await syncFromTerminal(ctx, arg);
+    }
+  );
 
   return [followTerminal, unfollowTerminal, resumeFollowTerminal, syncFromTerminalCmd];
 }

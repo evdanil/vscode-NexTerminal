@@ -614,6 +614,94 @@ describe("cwdSyncCommands", () => {
     });
   });
 
+  describe("nexus.files.syncFromTerminal — terminal-tab context-menu argument", () => {
+    /**
+     * VS Code passes the clicked `vscode.Terminal` as the command argument for
+     * `terminal/title/context` / `editor/title/context` invocations — the same
+     * shape `terminalTabCommands.ts`'s `resolveTerminal()` sniffs via
+     * `typeof arg.creationOptions === "object"`.
+     */
+    function makeTerminalArg(name: string): unknown {
+      return { name, creationOptions: {} };
+    }
+
+    function makeTwoSessionHarness(): {
+      harness: Harness;
+      focusedId: string;
+      clickedId: string;
+      clickedTerminal: unknown;
+    } {
+      const focusedId = "session-arg-focused";
+      const clickedId = "session-arg-clicked";
+      const harness = makeHarness({
+        activeServerId: "srv-1",
+        focusedSessionId: focusedId,
+        activeSessions: [
+          { id: focusedId, serverId: "srv-1", terminalName: "Nexus SSH: Focused" },
+          { id: clickedId, serverId: "srv-1", terminalName: "Nexus SSH: Clicked" }
+        ]
+      });
+      const clickedTerminal = makeTerminalArg("Nexus SSH: Clicked");
+      harness.ctx.sessionTerminals.set(clickedId, clickedTerminal as any);
+      harness.ctx.sessionTerminals.set(focusedId, makeTerminalArg("Nexus SSH: Focused") as any);
+      (harness.ctx.cwdTracker!.getRecord as any).mockImplementation((id: string) => ({
+        sessionId: id,
+        serverId: "srv-1",
+        cwd: id === clickedId ? "/clicked/dir" : "/focused/dir",
+        source: "osc7",
+        authority: "",
+        updatedAt: 0
+      }));
+      (harness.ctx.cwdTracker!.isStale as any).mockReturnValue(false);
+      harness.ctx.globalState.get = vi.fn(() => true); // nudge already shown
+      return { harness, focusedId, clickedId, clickedTerminal };
+    }
+
+    it("syncs the clicked terminal's session, not the currently focused one", async () => {
+      const { harness, clickedTerminal } = makeTwoSessionHarness();
+      const { ctx } = harness;
+
+      registerCwdSyncCommands(ctx);
+      await registeredCommands.get("nexus.files.syncFromTerminal")!(clickedTerminal);
+
+      expect(ctx.sftpService.realpath).toHaveBeenCalledWith("srv-1", "/clicked/dir");
+      expect(ctx.fileExplorerProvider.setRootPath).toHaveBeenCalledWith("/clicked/dir");
+      expect(ctx.fileExplorerProvider.setRootPath).not.toHaveBeenCalledWith("/focused/dir");
+    });
+
+    it("falls back to the focused session when invoked with no argument (palette / '.' row)", async () => {
+      const { harness } = makeTwoSessionHarness();
+      const { ctx } = harness;
+
+      registerCwdSyncCommands(ctx);
+      await registeredCommands.get("nexus.files.syncFromTerminal")!();
+
+      expect(ctx.fileExplorerProvider.setRootPath).toHaveBeenCalledWith("/focused/dir");
+    });
+
+    it("falls back to the focused session for a non-Terminal argument (e.g. the File Explorer '.' row item)", async () => {
+      const { harness } = makeTwoSessionHarness();
+      const { ctx } = harness;
+
+      registerCwdSyncCommands(ctx);
+      // A FileTreeItem-shaped arg: no `creationOptions`.
+      await registeredCommands.get("nexus.files.syncFromTerminal")!({ remotePath: "/home", label: "." });
+
+      expect(ctx.fileExplorerProvider.setRootPath).toHaveBeenCalledWith("/focused/dir");
+    });
+
+    it("no-ops when the clicked terminal is not a live Nexus SSH session (never silently syncs the focused one)", async () => {
+      const { harness } = makeTwoSessionHarness();
+      const { ctx } = harness;
+
+      registerCwdSyncCommands(ctx);
+      await registeredCommands.get("nexus.files.syncFromTerminal")!(makeTerminalArg("some other terminal"));
+
+      expect(ctx.fileExplorerProvider.setRootPath).not.toHaveBeenCalled();
+      expect(mockPromptGoToPath).not.toHaveBeenCalled();
+    });
+  });
+
   describe("§8.4 first-success nudge", () => {
     function makeSuccessfulHarness(): Harness {
       const harness = makeHarness();

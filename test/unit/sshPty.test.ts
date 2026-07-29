@@ -31,6 +31,16 @@ vi.mock("vscode", () => ({
       this.listeners.clear();
     }
   },
+  // `PtyObserverHub.addOutputObserver` returns `new vscode.Disposable(...)`,
+  // so the mock needs it for any test that attaches an observer the same way
+  // production does (`serverCommands.ts`'s OSC 7 observer).
+  Disposable: class MockDisposable {
+    public constructor(private readonly callOnDispose: () => void) {}
+
+    public dispose(): void {
+      this.callOnDispose();
+    }
+  },
   window: {
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args)
   }
@@ -494,6 +504,80 @@ describe("SshPty", () => {
     expect(highlighterStream.flush).toHaveBeenCalledTimes(1);
     expect(writes[0]).toBe("[hl]ERR");
     expect(writes.slice(1).join("")).toContain("Connection lost");
+
+    pty.dispose();
+  });
+
+  /**
+   * Directory sync (issue #35, §6.3/§10). `serverCommands.ts` attaches its
+   * `Osc7Parser`-backed observer with `pty.addOutputObserver(...)` and depends
+   * on receiving the *raw* stream text: OSC 7 bytes intact, and delivered
+   * synchronously with the chunk rather than behind the highlighter's own
+   * line-buffering/flush timer.
+   *
+   * This test deliberately constructs the PTY **with** a highlighter.
+   * `SshPty`'s `highlighterStream` only exists when one is passed
+   * (`sshPty.ts` constructor), so a highlighter-less variant of this test
+   * would still pass even if OSC 7 handling were wrongly placed downstream of
+   * the highlighter — where it would strip or delay what the observer sees.
+   */
+  it("delivers raw OSC 7 sequences to output observers unmodified, ahead of the highlighter's buffering", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => connection) };
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn(),
+      onDisconnected: vi.fn()
+    };
+    const logger = {
+      log: vi.fn(),
+      close: vi.fn()
+    };
+
+    // A line-buffering highlighter: nothing reaches the renderer until flush.
+    let buffered = "";
+    const highlighterStream = {
+      push: vi.fn((text: string) => {
+        buffered += text;
+      }),
+      flush: vi.fn(() => {
+        buffered = "";
+      }),
+      dispose: vi.fn()
+    };
+    const highlighter = { createStream: vi.fn(() => highlighterStream) };
+
+    const observed: string[] = [];
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any, undefined, highlighter as any);
+    pty.addOutputObserver({
+      onOutput: (text: string) => {
+        observed.push(text);
+      },
+      pauseIntervalMacros: vi.fn(),
+      dispose: vi.fn()
+    } as any);
+
+    pty.open();
+    await flushAsync();
+    expect(highlighter.createStream).toHaveBeenCalledTimes(1);
+
+    // BEL-terminated form.
+    const osc7Bel = "\x1b]7;file://host/tmp/work\x07";
+    stream.push(`before${osc7Bel}after`);
+    await flushAsync();
+
+    expect(observed).toEqual([`before${osc7Bel}after`]);
+    // The observer must not be gated on the highlighter emitting anything.
+    expect(highlighterStream.flush).not.toHaveBeenCalled();
+    expect(highlighterStream.push).toHaveBeenCalledWith(`before${osc7Bel}after`);
+
+    // ST-terminated form (ESC \).
+    const osc7St = "\x1b]7;file://host/etc\x1b\\";
+    stream.push(osc7St);
+    await flushAsync();
+
+    expect(observed[1]).toBe(osc7St);
 
     pty.dispose();
   });

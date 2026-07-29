@@ -842,6 +842,66 @@ describe("fileCommands title bar actions", () => {
     });
   });
 
+  describe("promptGoToPath commit-time re-check (§5.4 hole f)", () => {
+    function directoryStat() {
+      return {
+        name: "log",
+        isDirectory: true,
+        isSymlink: false,
+        size: 0,
+        modifiedAt: 1700000000,
+        permissions: 0o755,
+      };
+    }
+
+    it("discards the navigation when the explorer's active server changes during the awaits (cross-server race)", async () => {
+      const ctx = createContext({ rootPath: "/home" });
+      mockShowInputBox.mockResolvedValue("/var/log");
+      ctx.sftpService.stat = vi.fn(async () => {
+        // The user (or an auto-disconnect) switches the explorer to another
+        // server while the stat call is still in flight.
+        (ctx.fileExplorerProvider.getActiveServerId as any).mockReturnValue("srv-2");
+        return directoryStat();
+      });
+      registerFileCommands(ctx);
+      const goToPath = registeredCommands.get("nexus.files.goToPath");
+
+      await goToPath!(undefined);
+
+      expect(ctx.fileExplorerProvider.setRootPath).not.toHaveBeenCalled();
+      expect(ctx.cwdSyncCoordinator!.notifyManualNavigation).not.toHaveBeenCalled();
+    });
+
+    it("discards the navigation when the explorer is torn down during the awaits (no active server left)", async () => {
+      const ctx = createContext({ rootPath: "/home" });
+      mockShowInputBox.mockResolvedValue("/var/log");
+      ctx.sftpService.stat = vi.fn(async () => {
+        (ctx.fileExplorerProvider.getActiveServerId as any).mockReturnValue(undefined);
+        return directoryStat();
+      });
+      registerFileCommands(ctx);
+      const goToPath = registeredCommands.get("nexus.files.goToPath");
+
+      await goToPath!(undefined);
+
+      expect(ctx.fileExplorerProvider.setRootPath).not.toHaveBeenCalled();
+      expect(ctx.cwdSyncCoordinator!.notifyManualNavigation).not.toHaveBeenCalled();
+    });
+
+    it("still commits when the explorer's active server is unchanged by the time the awaits resolve", async () => {
+      const ctx = createContext({ rootPath: "/home" });
+      mockShowInputBox.mockResolvedValue("/var/log");
+      ctx.sftpService.stat = vi.fn(async () => directoryStat());
+      registerFileCommands(ctx);
+      const goToPath = registeredCommands.get("nexus.files.goToPath");
+
+      await goToPath!(undefined);
+
+      expect(ctx.fileExplorerProvider.setRootPath).toHaveBeenCalledWith("/var/log");
+      expect(ctx.cwdSyncCoordinator!.notifyManualNavigation).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("manual navigation pins directory sync (§8.3)", () => {
     it("goToPath with a string arg (the .. ParentDirItem row) notifies manual navigation", async () => {
       const ctx = createContext({ rootPath: "/home" });
