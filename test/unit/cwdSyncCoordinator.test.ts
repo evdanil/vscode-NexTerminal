@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CwdSyncCoordinator,
+  FRESHNESS_POLL_MS,
   type CwdSyncActiveSessionLike,
   type CwdSyncDeps
 } from "../../src/services/sftp/cwdSyncCoordinator";
@@ -46,6 +47,9 @@ function makeFakeTracker() {
       records.delete(sessionId);
       disabled.delete(sessionId);
       stale.delete(sessionId);
+    }),
+    reenable: vi.fn((sessionId: string) => {
+      disabled.delete(sessionId);
     }),
     onDidChangeCwd: vi.fn((l: (record: CwdRecord) => void) => {
       listener = l;
@@ -370,6 +374,196 @@ describe("CwdSyncCoordinator", () => {
     coordinator.setFollowing(false);
     coordinator.setFollowing(true);
     expect(coordinator.getState().kind).not.toBe("pinned");
+  });
+
+  // ─── Rate-limit recovery (§7.3/§8.2 state 7) ─────────────────────────────
+
+  it("setFollowing(true) re-enables the focused session's tracker, so a rate-limit shutdown does not survive an off/on toggle", () => {
+    const { tracker, provider, core, coordinator } = setup();
+    provider.state.activeServerId = "srv-1";
+    core.state.focusedSessionId = "s1";
+    core.state.activeSessions = [{ id: "s1", serverId: "srv-1", terminalName: "term-1" }];
+    coordinator.setFollowing(true);
+    tracker.disabled.add("s1");
+    expect(coordinator.getState().kind).toBe("rateLimited");
+
+    coordinator.setFollowing(false);
+    coordinator.setFollowing(true);
+
+    expect(tracker.reenable).toHaveBeenCalledWith("s1");
+  });
+
+  it("does not call tracker.reenable() when no session is focused", () => {
+    const { tracker, coordinator } = setup();
+    coordinator.setFollowing(true);
+    coordinator.setFollowing(false);
+    coordinator.setFollowing(true);
+
+    expect(tracker.reenable).not.toHaveBeenCalled();
+  });
+
+  // ─── Explorer-server-change hook (§8.3) ──────────────────────────────────
+
+  it("notifyExplorerServerChanged() clears an existing pin", () => {
+    const { tracker, provider, core, coordinator } = setup();
+    coordinator.setFollowing(true);
+    provider.state.activeServerId = "srv-1";
+    core.state.focusedSessionId = "s1";
+    core.state.activeSessions = [{ id: "s1", serverId: "srv-1", terminalName: "term-1" }];
+    tracker.records.set("s1", makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/pinned" }));
+
+    coordinator.notifyManualNavigation();
+    expect(coordinator.getState().kind).toBe("pinned");
+
+    coordinator.notifyExplorerServerChanged();
+    expect(coordinator.getState().kind).not.toBe("pinned");
+  });
+
+  it("notifyExplorerServerChanged() re-evaluates the focused session's tracked record against the newly active server", async () => {
+    const { tracker, provider, core, coordinator } = setup();
+    coordinator.setFollowing(true);
+    coordinator.setViewVisible(true);
+    core.state.focusedSessionId = "s1";
+    core.state.activeSessions = [{ id: "s1", serverId: "srv-2", terminalName: "term-1" }];
+    tracker.records.set("s1", makeRecord({ sessionId: "s1", serverId: "srv-2", cwd: "/new-server-root" }));
+
+    // Explorer was on srv-1 (mismatch); the user switches it to srv-2.
+    provider.state.activeServerId = "srv-2";
+    coordinator.notifyExplorerServerChanged();
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+
+    expect(provider.setRootPath).toHaveBeenCalledWith("/new-server-root", { restartWatcher: false });
+  });
+
+  it("notifyExplorerServerChanged() invalidates a same-session apply already in flight for the old server", async () => {
+    const { tracker, provider, sftp, core, coordinator } = setup();
+    coordinator.setFollowing(true);
+    coordinator.setViewVisible(true);
+    provider.state.activeServerId = "srv-1";
+    core.state.focusedSessionId = "s1";
+    core.state.activeSessions = [{ id: "s1", serverId: "srv-1", terminalName: "term-1" }];
+
+    let releaseRealpath: ((path: string) => void) | undefined;
+    (sftp.realpath as any).mockImplementationOnce(
+      () => new Promise<string>((resolve) => { releaseRealpath = resolve; })
+    );
+
+    tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/a" }));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // debounce fires, realpath("/a") issued and now pending
+
+    // Explorer switches server while realpath() is still in flight.
+    provider.state.activeServerId = "srv-2";
+    coordinator.notifyExplorerServerChanged();
+
+    releaseRealpath?.("/a");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(provider.setRootPath).not.toHaveBeenCalled();
+  });
+
+  // ─── Generation-token race fix (out-of-order completion) ─────────────────
+
+  it("a slow record and a fast, newer record resolving out of order land on the newer one, never the stale one", async () => {
+    const { tracker, provider, sftp, core, coordinator } = setup();
+    coordinator.setFollowing(true);
+    coordinator.setViewVisible(true);
+    provider.state.activeServerId = "srv-1";
+    core.state.focusedSessionId = "s1";
+
+    let resolveSlow: ((path: string) => void) | undefined;
+    (sftp.realpath as any).mockImplementationOnce(
+      () => new Promise<string>((resolve) => { resolveSlow = resolve; })
+    );
+
+    tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/a" }));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // debounce fires; realpath("/a") pending, held open
+
+    // A newer record for the same session arrives and debounces to
+    // completion before the slow "/a" resolves.
+    (sftp.realpath as any).mockResolvedValueOnce("/b");
+    tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/b" }));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(provider.setRootPath).toHaveBeenCalledWith("/b", { restartWatcher: false });
+
+    provider.setRootPath.mockClear();
+    // Now the slow "/a" resolves — it must be abandoned, not applied.
+    resolveSlow?.("/a");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(provider.setRootPath).not.toHaveBeenCalled();
+  });
+
+  // ─── Reject stale / rate-limit-disabled records (§5.3 rule 2, §7.3) ──────
+
+  it("does not schedule an apply for a record whose session is currently rate-limit-disabled", async () => {
+    const { tracker, provider, core, coordinator } = setup();
+    coordinator.setFollowing(true);
+    coordinator.setViewVisible(true);
+    provider.state.activeServerId = "srv-1";
+    core.state.focusedSessionId = "s1";
+    tracker.disabled.add("s1");
+
+    tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/etc" }));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+
+    expect(provider.setRootPath).not.toHaveBeenCalled();
+  });
+
+  it("does not schedule an apply for a record the tracker reports as stale — the authority-change-mid-burst trigger", async () => {
+    const { tracker, provider, core, coordinator } = setup();
+    coordinator.setFollowing(true);
+    coordinator.setViewVisible(true);
+    provider.state.activeServerId = "srv-1";
+    core.state.focusedSessionId = "s1";
+    // Simulates: ESC]7;file://outer/home/user BEL, then (after an authority
+    // change) ESC]7;file://inner/etc BEL — the tracker marks the record
+    // stale at the same moment it fires the change.
+    tracker.stale.add("s1");
+
+    tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/etc" }));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+
+    expect(provider.setRootPath).not.toHaveBeenCalled();
+  });
+
+  // ─── Freshness-boundary observability (§7.5/§8.2 state 4) ───────────────
+
+  it("emits a state-change on a stale/fresh boundary flip via the periodic poll, without ever calling setRootPath", async () => {
+    const { tracker, provider, core, coordinator } = setup();
+    coordinator.setFollowing(true);
+    provider.state.activeServerId = "srv-1";
+    core.state.focusedSessionId = "s1";
+    core.state.activeSessions = [{ id: "s1", serverId: "srv-1", terminalName: "term-1" }];
+    tracker.records.set("s1", makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/a" }));
+
+    const listener = vi.fn();
+    coordinator.onDidChangeState(listener);
+
+    // The session becomes stale per the tracker, independent of any tracker
+    // event (mirrors "60s of ordinary output with no cwd report").
+    tracker.stale.add("s1");
+
+    await vi.advanceTimersByTimeAsync(FRESHNESS_POLL_MS);
+
+    expect(listener).toHaveBeenCalled();
+    expect(provider.setRootPath).not.toHaveBeenCalled();
+  });
+
+  it("does not emit a redundant state-change on the freshness poll when nothing has changed", async () => {
+    const { tracker, provider, core, coordinator } = setup();
+    coordinator.setFollowing(true);
+    provider.state.activeServerId = "srv-1";
+    core.state.focusedSessionId = "s1";
+    core.state.activeSessions = [{ id: "s1", serverId: "srv-1", terminalName: "term-1" }];
+    tracker.records.set("s1", makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/a" }));
+
+    await vi.advanceTimersByTimeAsync(FRESHNESS_POLL_MS); // first poll establishes the cached baseline
+
+    const listener = vi.fn();
+    coordinator.onDidChangeState(listener);
+    await vi.advanceTimersByTimeAsync(FRESHNESS_POLL_MS); // nothing changed
+
+    expect(listener).not.toHaveBeenCalled();
   });
 
   // ─── Lifecycle holes (§5.4) ──────────────────────────────────────────────

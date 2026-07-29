@@ -139,6 +139,18 @@ function parsePayload(raw: string): Osc7Match | undefined {
   // first ';'" by construction — a later literal ';' in the URI is part of
   // the payload, exactly as required.
 
+  // Step 1.5 (defense in depth, before WHATWG parsing): reject NUL/C0
+  // control characters — including raw HT/LF/CR — in the *raw* payload.
+  // `new URL()` silently strips ASCII tab/CR/LF from its entire input before
+  // doing anything else (WHATWG URL spec, basic URL parser step 1), so a raw
+  // `\n`/`\r`/`\t` embedded in the payload (e.g. "fi\nle:///etc") would
+  // otherwise vanish before `.pathname` is ever read, sailing past the
+  // decoded-path CONTROL_CHAR_RE check below untouched. A percent-encoded
+  // control char (e.g. "%0A") is unaffected by this stripping and is still
+  // caught correctly by that later check; this step only covers the raw-byte
+  // case the decoded check cannot see.
+  if (CONTROL_CHAR_RE.test(raw)) return undefined;
+
   // Step 2: must parse as a URL with scheme file:. Note WHATWG rejects a
   // port in a file: URL — `new URL("file://localhost:22/tmp")` throws — so
   // that case is correctly rejected right here, not by a hostname check.

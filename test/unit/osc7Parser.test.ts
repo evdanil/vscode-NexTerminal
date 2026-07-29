@@ -134,6 +134,21 @@ describe("Osc7Parser", () => {
     expect(parser.feed(seq)).toEqual([]);
   });
 
+  it("rejects a raw (unencoded) newline embedded in the payload, which WHATWG would otherwise silently strip before the decoded-path check ever sees it", () => {
+    const seq = make7("fi\nle:///etc", "bel");
+    expect(parser.feed(seq)).toEqual([]);
+  });
+
+  it("rejects a raw (unencoded) tab embedded in the payload", () => {
+    const seq = make7("file:///et\tc/foo", "bel");
+    expect(parser.feed(seq)).toEqual([]);
+  });
+
+  it("rejects a raw (unencoded) carriage return embedded in the payload", () => {
+    const seq = make7("file:///et\rc/foo", "bel");
+    expect(parser.feed(seq)).toEqual([]);
+  });
+
   it("rejects an over-length decoded path", () => {
     const longPath = "/" + "a".repeat(5000);
     const seq = make7(`file://${longPath}`);

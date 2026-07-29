@@ -241,6 +241,62 @@ describe("cwdSyncCommands", () => {
       expect(mockPromptGoToPath).not.toHaveBeenCalled();
     });
 
+    it("discards the validation when the explorer's active server changes during the awaits (cross-server race)", async () => {
+      const { ctx, sessionId } = makeHarness({ activeServerId: "srv-1" });
+      (ctx.cwdTracker!.getRecord as any).mockReturnValue({
+        sessionId,
+        serverId: "srv-1",
+        cwd: "/var/log",
+        source: "osc7",
+        authority: "",
+        updatedAt: 0
+      });
+      (ctx.cwdTracker!.isStale as any).mockReturnValue(false);
+      (ctx.sftpService.realpath as any).mockImplementation(async (_serverId: string, p: string) => {
+        // Simulate the explorer switching to a different server while
+        // realpath() is still in flight (e.g. the user picked a different
+        // server row in the File Explorer).
+        (ctx.fileExplorerProvider.getActiveServerId as any).mockReturnValue("srv-2");
+        return p;
+      });
+      (ctx.sftpService.tryStat as any).mockResolvedValue({ isDirectory: true });
+      ctx.globalState.get = vi.fn(() => true);
+
+      registerCwdSyncCommands(ctx);
+      await registeredCommands.get("nexus.files.syncFromTerminal")!();
+
+      expect(ctx.fileExplorerProvider.setRootPath).not.toHaveBeenCalled();
+    });
+
+    it("discards the validation when the focused session changes during the awaits (cross-session race)", async () => {
+      const { ctx, sessionId } = makeHarness({ activeServerId: "srv-1" });
+      (ctx.cwdTracker!.getRecord as any).mockReturnValue({
+        sessionId,
+        serverId: "srv-1",
+        cwd: "/var/log",
+        source: "osc7",
+        authority: "",
+        updatedAt: 0
+      });
+      (ctx.cwdTracker!.isStale as any).mockReturnValue(false);
+      (ctx.sftpService.realpath as any).mockImplementation(async (_serverId: string, p: string) => {
+        // Simulate focus moving to a different SSH session (still on the
+        // same server) while realpath() is still in flight.
+        (ctx.core.getSnapshot as any).mockReturnValue({
+          focusedSessionId: "other-session",
+          activeSessions: [{ id: "other-session", serverId: "srv-1", terminalName: "Nexus SSH: Other" }]
+        });
+        return p;
+      });
+      (ctx.sftpService.tryStat as any).mockResolvedValue({ isDirectory: true });
+      ctx.globalState.get = vi.fn(() => true);
+
+      registerCwdSyncCommands(ctx);
+      await registeredCommands.get("nexus.files.syncFromTerminal")!();
+
+      expect(ctx.fileExplorerProvider.setRootPath).not.toHaveBeenCalled();
+    });
+
     it("falls through to the heuristic when the tracker record is stale", async () => {
       const { ctx, sessionId } = makeHarness();
       (ctx.cwdTracker!.getRecord as any).mockReturnValue({

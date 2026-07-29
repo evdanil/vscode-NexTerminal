@@ -13,6 +13,7 @@ import { CwdTracker } from "./services/terminal/cwdTracker";
 import { CwdSyncCoordinator } from "./services/sftp/cwdSyncCoordinator";
 import type { CwdSyncState } from "./services/sftp/cwdSyncCoordinator";
 import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
+import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
@@ -638,7 +639,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   ctx.cwdSyncCoordinator = cwdSyncCoordinator;
   ctx.cwdLastOutputAt = cwdLastOutputAt;
   ctx.cwdSyncOutputChannel = cwdSyncOutputChannel;
-  context.subscriptions.push(cwdSyncOutputChannel, cwdSyncCoordinator);
+  context.subscriptions.push(cwdSyncOutputChannel, cwdSyncCoordinator, cwdTracker);
 
   // §9 — Phase 1 ships zero settings; the Follow Terminal Directory toggle is
   // per-window UI state in globalState (not settings.json), restored here and
@@ -809,7 +810,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       case "rateLimited":
         fileExplorerView.description = "Following off — too many directory changes";
         fileExplorerView.message =
-          `"${state.terminalName}" reported directory changes faster than Nexus can follow, so sync was stopped for this session. Use the Follow button to turn it back on.`;
+          `"${state.terminalName}" reported directory changes faster than Nexus can follow, so sync was stopped for this session. Toggle Follow Terminal Directory off and back on to resume.`;
         break;
     }
   };
@@ -864,13 +865,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   fileExplorerProvider.setAutoRefreshInterval(autoRefreshInterval);
   const remoteWatchMode = sftpConfig.get<string>("remoteWatchMode", "auto") === "polling" ? "polling" as const : "auto" as const;
   fileExplorerProvider.setRemoteWatchMode(remoteWatchMode);
-  fileExplorerView.onDidChangeVisibility((e) => {
-    fileExplorerProvider.setViewVisibility(e.visible);
-    cwdSyncCoordinator.setViewVisible(e.visible);
-    if (e.visible) {
-      fileExplorerProvider.refresh();
-    }
-  });
+  // BLOCKER fix: `createTreeView()` never fires `onDidChangeVisibility` at
+  // registration, so without an explicit seed both `fileExplorerProvider`'s
+  // polling (`isViewVisible`) and `cwdSyncCoordinator`'s buffering
+  // (`visible`) start out believing the view is hidden even in a freshly
+  // opened window where it is already showing — the feature would then do
+  // nothing until the user manually hid and reopened the File Explorer.
+  // `wireViewVisibility` seeds both from `fileExplorerView.visible`
+  // immediately, then keeps them updated via the real event.
+  context.subscriptions.push(
+    wireViewVisibility(fileExplorerView, (visible) => {
+      fileExplorerProvider.setViewVisibility(visible);
+      cwdSyncCoordinator.setViewVisible(visible);
+      if (visible) {
+        fileExplorerProvider.refresh();
+      }
+    })
+  );
 
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   statusBarItem.command = "nexusCommandCenter.focus";
@@ -892,6 +903,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (activeServerId && !core.isServerConnected(activeServerId)) {
       sftpService.disconnect(activeServerId);
       fileExplorerProvider.clearActiveServer();
+      // §8.3: the pin clears automatically on an explorer server change —
+      // this auto-disconnect path changes the explorer's active server just
+      // as much as an explicit disconnect/browse does.
+      cwdSyncCoordinator.notifyExplorerServerChanged();
     }
   };
   const viewSync = createCoalescedInvoker(syncViewsImmediate, 150);

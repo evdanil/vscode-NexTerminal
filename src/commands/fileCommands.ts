@@ -425,6 +425,10 @@ export async function browseServerFiles(ctx: CommandContext, server: ServerConfi
         await ctx.sftpService.connect(server);
         const homeDir = await ctx.sftpService.realpath(server.id, ".");
         ctx.fileExplorerProvider.setActiveServer(server, homeDir);
+        // §8.3: the pin clears automatically on an explorer server change,
+        // and the newly active server's focused-session record (if any)
+        // should be re-evaluated rather than waiting for some later event.
+        ctx.cwdSyncCoordinator?.notifyExplorerServerChanged();
       }
     );
     await vscode.commands.executeCommand("nexusFileExplorer.focus");
@@ -867,6 +871,8 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       ctx.fileSystemProvider?.clearElevatedForServer(activeId);
     }
     ctx.fileExplorerProvider.clearActiveServer();
+    // §8.3: the pin clears automatically on an explorer server change.
+    ctx.cwdSyncCoordinator?.notifyExplorerServerChanged();
   });
 
   const editAsRoot = vscode.commands.registerCommand("nexus.files.editAsRoot", async (arg?: unknown) => {

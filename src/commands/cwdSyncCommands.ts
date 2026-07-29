@@ -88,12 +88,23 @@ function getHeuristicCandidate(ctx: CommandContext, session: FocusedSshSession):
  * re-roots immediately (explicit navigation, so the watcher restarts right
  * away — never pass `{ restartWatcher: false }` here). Returns the resolved
  * path on success, `undefined` on any validation failure (logged, never thrown).
+ *
+ * Both SFTP calls are awaited, which gives the user (or a focus-driven
+ * re-render) time to switch the focused session or the explorer's active
+ * server before this resolves. Re-reading both immediately before the final
+ * `setRootPath` call and discarding on any mismatch against what was
+ * captured at entry closes that cross-server race — otherwise a slower
+ * validation for session/server A can land on an explorer that has since
+ * moved on to server B.
  */
 async function validateAndApply(
   ctx: CommandContext,
   session: FocusedSshSession,
   candidate: string
 ): Promise<string | undefined> {
+  const expectedSessionId = session.id;
+  const expectedServerId = session.serverId;
+
   let resolved: string;
   try {
     resolved = await ctx.sftpService.realpath(session.serverId, candidate);
@@ -112,6 +123,20 @@ async function validateAndApply(
 
   if (!stat || !stat.isDirectory) {
     log(ctx, `syncFromTerminal: resolved path is not a directory: ${resolved}`);
+    return undefined;
+  }
+
+  // Re-check immediately before committing: both the focused session and the
+  // explorer's active server must still match what was captured at entry.
+  // A slower validation for a since-abandoned session/server pairing must
+  // never land on an explorer that has since switched to a different server.
+  const currentFocused = resolveFocusedSshSession(ctx);
+  const currentActiveServerId = ctx.fileExplorerProvider.getActiveServerId();
+  if (currentFocused?.id !== expectedSessionId || currentActiveServerId !== expectedServerId) {
+    log(
+      ctx,
+      `syncFromTerminal: discarding stale validation for session ${expectedSessionId} — focused session or explorer server changed`
+    );
     return undefined;
   }
 

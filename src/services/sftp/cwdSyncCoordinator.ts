@@ -13,17 +13,17 @@
  * (module-scope `vscode` import), and must not reach into provider privates.
  *
  * **Deviation from the sketch:** `tracker` is typed as `CwdTrackerLike` (a
- * structural interface covering exactly the five `CwdTracker` methods used
- * here) rather than the concrete `CwdTracker` class. A real `CwdTracker`
- * instance satisfies it unchanged, so the wiring agent passes it with no
- * cast — but it also lets tests drive a plain fake tracker directly, which
- * matters because `CwdTracker.report()` enforces its own independent
- * 300 ms-per-session floor between accepted changes (`CWD_MIN_INTERVAL_MS`).
- * That floor exceeds this coordinator's own 250 ms debounce window, so a
- * burst of *real* same-session tracker events can never arrive close enough
- * together to exercise the coordinator's debounce coalescing in isolation.
- * A fake tracker lets the test fire synthetic events on whatever schedule it
- * wants, testing the coordinator's debounce purely on its own terms.
+ * structural interface covering exactly the `CwdTracker` methods used here)
+ * rather than the concrete `CwdTracker` class. A real `CwdTracker` instance
+ * satisfies it unchanged, so the wiring agent passes it with no cast — but it
+ * also lets tests drive a plain fake tracker directly, which matters because
+ * `CwdTracker.report()` enforces its own independent 300 ms-per-session floor
+ * on listener delivery (`CWD_MIN_INTERVAL_MS`). That floor exceeds this
+ * coordinator's own 250 ms debounce window, so a burst of *real* same-session
+ * tracker events can never arrive close enough together to exercise the
+ * coordinator's debounce coalescing in isolation. A fake tracker lets the
+ * test fire synthetic events on whatever schedule it wants, testing the
+ * coordinator's debounce purely on its own terms.
  *
  * **Second deviation:** `CwdTracker.isStale()` needs a `lastOutputAt`
  * timestamp per session, and nothing in `NexusCore`/`SftpService`/the
@@ -35,12 +35,43 @@
  * reporting staleness only via the authority-change signal, never the
  * elapsed-time signal, which matches "degrade to nothing happens" (R3)
  * rather than fabricating an age.
+ *
+ * **Generation token (race-fix):** `resolveAndApply` awaits two SFTP round
+ * trips (`realpath` then `tryStat`) before committing a `setRootPath` call.
+ * Anything that makes the eventual commit stale — a newer record superseding
+ * this one, or the arbitration context itself changing underneath it (focus,
+ * explorer server, pin, visibility, busy, following) — must stop that commit
+ * from landing. A monotonic `generation` counter is bumped every time a
+ * fresh apply attempt is dispatched (immediate or via the debounce firing) so
+ * two overlapping attempts get distinct tokens; the dispatch captures its own
+ * token and `resolveAndApply` aborts if `this.generation` has moved on by the
+ * time each await resolves. This alone fixes *out-of-order completion*
+ * (a slow record and a fast, newer record resolving in the "wrong" order).
+ * Separately, `passesArbitration()` re-runs the full synchronous arbitration
+ * set immediately before each commit point, which fixes *stale-context*
+ * races (the explorer switched servers, the session lost focus, the view
+ * was hidden, etc. while the awaits were in flight) even when no newer
+ * record ever arrived to bump the generation. The two mechanisms are
+ * deliberately redundant on some dimensions (e.g. a follow-off toggle bumps
+ * the generation *and* is caught by the arbitration recheck) — cheap
+ * insurance, not a design smell.
  */
 
 import type { CwdRecord } from "../terminal/cwdTracker";
 
 /** Default debounce window (§5.3 rule 5 / §9 — not user-configurable). */
 const DEFAULT_DEBOUNCE_MS = 250;
+
+/**
+ * How often to poll for a stale/fresh UI-state transition while following is
+ * on (§7.5/§8.2 state 4). This is a pure UI-observability timer — it never
+ * calls `considerApply`/`resolveAndApply` and never triggers a re-root; it
+ * only decides whether `emitStateChange()` needs firing so a "stale" label
+ * appears or clears even when nothing else touches cwd state (ordinary
+ * terminal output with no cwd report, or a same-value heartbeat, neither of
+ * which fire `onDidChangeCwd`).
+ */
+export const FRESHNESS_POLL_MS = 5_000;
 
 /**
  * The exact subset of `CwdTracker`'s public API this coordinator uses. A real
@@ -51,6 +82,9 @@ export interface CwdTrackerLike {
   isDisabled(sessionId: string): boolean;
   isStale(sessionId: string, now: number, lastOutputAt: number | undefined): boolean;
   clear(sessionId: string): void;
+  /** Lifts a §7.3 burst shutdown for a session (state 7 recovery — see
+   * `setFollowing()`). */
+  reenable(sessionId: string): void;
   onDidChangeCwd(listener: (record: CwdRecord) => void): () => void;
 }
 
@@ -147,6 +181,17 @@ export class CwdSyncCoordinator {
    * changed. */
   private lastFocusedSessionId: string | undefined;
 
+  /** Monotonic token bumped on every fresh apply dispatch and on every
+   * policy/server/focus change — see the module-level "generation token" doc
+   * comment above. */
+  private generation = 0;
+
+  /** Cache for the periodic freshness-boundary poll (§7.5/§8.2 state 4) — set
+   * of `sessionId:isStale` is unnecessary since only the focused session is
+   * ever rendered; a single cached boolean is enough. */
+  private lastKnownStale: boolean | undefined;
+  private readonly freshnessPollTimer: ReturnType<typeof setInterval>;
+
   private readonly stateListeners = new Set<() => void>();
   private readonly unsubscribeTracker: () => void;
   private readonly unsubscribeCore: () => void;
@@ -169,9 +214,12 @@ export class CwdSyncCoordinator {
         return;
       }
       this.lastFocusedSessionId = focusedSessionId;
+      this.generation++; // invalidate any apply in flight for the old focus
       this.emitStateChange();
       this.applyForFocusedSession("focus-changed");
     });
+
+    this.freshnessPollTimer = setInterval(() => this.checkFreshnessBoundary(), FRESHNESS_POLL_MS);
   }
 
   // ─── Enable state (§8.1) ────────────────────────────────────────────────
@@ -181,6 +229,7 @@ export class CwdSyncCoordinator {
       return;
     }
     this.following = on;
+    this.generation++;
     if (!on) {
       this.cancelDebounce();
       this.hiddenBuffer = undefined;
@@ -188,6 +237,15 @@ export class CwdSyncCoordinator {
       // §8.3: toggling following off -> on clears any stale pin.
       this.paused = false;
       this.pinnedSessionId = undefined;
+      // §7.3/§8.2 state 7 recovery: lift a rate-limit shutdown for the
+      // currently focused session. Without this, the sticky per-session
+      // `disabled` flag on `CwdTracker` survives an off/on toggle and the
+      // session drops straight back into state 7 — the concrete mechanism
+      // behind state 7's "use the Follow button to turn it back on" message.
+      const focusedSessionId = this.deps.core.getSnapshot().focusedSessionId;
+      if (focusedSessionId) {
+        this.deps.tracker.reenable(focusedSessionId);
+      }
     }
     this.emitStateChange();
   }
@@ -216,6 +274,7 @@ export class CwdSyncCoordinator {
   public notifyManualNavigation(): void {
     this.paused = true;
     this.pinnedSessionId = this.deps.core.getSnapshot().focusedSessionId;
+    this.generation++; // abandon anything in flight from before the pin
     this.emitStateChange();
   }
 
@@ -247,6 +306,7 @@ export class CwdSyncCoordinator {
    * if it belonged to that session. */
   public onSessionEnded(sessionId: string): void {
     this.deps.tracker.clear(sessionId);
+    this.generation++;
     if (this.pinnedSessionId === sessionId) {
       this.paused = false;
       this.pinnedSessionId = undefined;
@@ -261,6 +321,26 @@ export class CwdSyncCoordinator {
       this.lastFocusedSessionId = undefined;
     }
     this.emitStateChange();
+  }
+
+  /**
+   * Doc §8.3: "the pin clears automatically on ... explorer server change."
+   * Call this from every place the File Explorer's active server changes
+   * (`setActiveServer` / `clearActiveServer` call sites) — the provider
+   * itself must stay unaware of this feature, so the wiring/command layer is
+   * responsible for calling this alongside those provider calls. Clears the
+   * pin, invalidates any apply in flight for the old server (generation
+   * bump, and the pending debounce is moot for the old context regardless),
+   * and re-evaluates the newly active server against the focused session's
+   * tracked record.
+   */
+  public notifyExplorerServerChanged(): void {
+    this.paused = false;
+    this.pinnedSessionId = undefined;
+    this.generation++;
+    this.cancelDebounce();
+    this.emitStateChange();
+    this.applyForFocusedSession("explorer-server-changed");
   }
 
   // ─── Derived UI state (§8.2) ─────────────────────────────────────────────
@@ -323,6 +403,51 @@ export class CwdSyncCoordinator {
     }
   }
 
+  // ─── Freshness-boundary observability (§7.5/§8.2 state 4) ───────────────
+
+  /**
+   * Periodic, side-effect-free check: has the focused session's stale/fresh
+   * boolean flipped since the last poll? If so, fire a state-change event so
+   * the UI's "stale" label appears or clears — this NEVER calls
+   * `considerApply`/`resolveAndApply`, so it can never trigger a re-root.
+   * Without this, a session that goes stale (or a stale session that
+   * recovers via a heartbeat) only repaints the UI if something else
+   * unrelated happens to call `emitStateChange()` first, which may never
+   * happen (§7.5's own trigger: ordinary output with no cwd report for
+   * 60+ seconds updates nothing observable at all).
+   */
+  private checkFreshnessBoundary(): void {
+    if (!this.following || this.paused) {
+      return;
+    }
+    const snapshot = this.deps.core.getSnapshot();
+    const focusedSessionId = snapshot.focusedSessionId;
+    if (!focusedSessionId) {
+      return;
+    }
+    const focusedSession = snapshot.activeSessions.find((s) => s.id === focusedSessionId);
+    if (!focusedSession) {
+      return;
+    }
+    if (this.deps.provider.getActiveServerId() !== focusedSession.serverId) {
+      return;
+    }
+    if (this.deps.tracker.isDisabled(focusedSessionId)) {
+      return;
+    }
+    const record = this.deps.tracker.getRecord(focusedSessionId);
+    if (!record) {
+      return;
+    }
+
+    const now = this.deps.now();
+    const stale = this.deps.tracker.isStale(focusedSessionId, now, this.deps.lastOutputAt(focusedSessionId));
+    if (stale !== this.lastKnownStale) {
+      this.lastKnownStale = stale;
+      this.emitStateChange();
+    }
+  }
+
   // ─── Apply pipeline (§5.3) ───────────────────────────────────────────────
 
   private applyForFocusedSession(reason: string, opts?: { immediate?: boolean }): void {
@@ -332,8 +457,8 @@ export class CwdSyncCoordinator {
   }
 
   /**
-   * Runs arbitration rules 1-6 (§5.3) for a specific record, then either
-   * schedules the debounced resolve-and-apply (rule 7-10) or, for
+   * Runs the synchronous arbitration rules (§5.3) for a specific record, then
+   * either schedules the debounced resolve-and-apply or, for
    * `opts.immediate`, runs it right away (used by `resume()` and
    * re-show-with-buffered-value, both of which are explicit, already-decided
    * actions rather than a raw incoming signal).
@@ -367,6 +492,20 @@ export class CwdSyncCoordinator {
       return;
     }
 
+    // §7.5/doc §5.3 rule 2: reject a rate-limit-disabled or stale record
+    // before scheduling anything — re-applying a stale directory (e.g. one
+    // marked stale by a nested-ssh/tmux authority change in the very same
+    // tick that produced this record) would re-root onto an untrusted path.
+    if (this.deps.tracker.isDisabled(record.sessionId)) {
+      this.deps.log(`Directory sync: skip (${reason}) — rate-limit shutdown for session ${record.sessionId}`);
+      return;
+    }
+    const now = this.deps.now();
+    if (this.deps.tracker.isStale(record.sessionId, now, this.deps.lastOutputAt(record.sessionId))) {
+      this.deps.log(`Directory sync: skip (${reason}) — stale record for session ${record.sessionId}`);
+      return;
+    }
+
     if (this.deps.provider.isBusy()) {
       this.deps.log(`Directory sync: skip (${reason}) — explorer is busy`);
       return;
@@ -380,7 +519,8 @@ export class CwdSyncCoordinator {
 
     if (opts?.immediate) {
       this.cancelDebounce();
-      void this.resolveAndApply(record, reason);
+      const generation = ++this.generation;
+      void this.resolveAndApply(record, reason, generation);
       return;
     }
 
@@ -397,7 +537,8 @@ export class CwdSyncCoordinator {
       const toApply = this.debouncedRecord;
       this.debouncedRecord = undefined;
       if (toApply) {
-        void this.resolveAndApply(toApply, reason);
+        const generation = ++this.generation;
+        void this.resolveAndApply(toApply, reason, generation);
       }
     }, this.debounceMs);
   }
@@ -411,12 +552,59 @@ export class CwdSyncCoordinator {
   }
 
   /**
+   * Re-runs the full synchronous arbitration set — following, focused
+   * session, server match, pin, busy, visibility — against *current* state
+   * (as opposed to whatever was true when the apply was first dispatched).
+   * Used at each commit point inside `resolveAndApply`, in addition to the
+   * generation-token check, so a context change that happens without a
+   * newer record ever arriving (e.g. the explorer switches server while a
+   * `realpath` call is in flight) still aborts the commit.
+   */
+  private passesArbitration(record: CwdRecord): { ok: true } | { ok: false; reasonMsg: string } {
+    if (!this.following) {
+      return { ok: false, reasonMsg: "following was turned off" };
+    }
+    const focusedSessionId = this.deps.core.getSnapshot().focusedSessionId;
+    if (record.sessionId !== focusedSessionId) {
+      return { ok: false, reasonMsg: `session ${record.sessionId} is no longer focused` };
+    }
+    const activeServerId = this.deps.provider.getActiveServerId();
+    if (activeServerId !== record.serverId) {
+      return {
+        ok: false,
+        reasonMsg: `server mismatch (explorer=${activeServerId ?? "<none>"}, session=${record.serverId})`
+      };
+    }
+    if (this.paused) {
+      return { ok: false, reasonMsg: "pinned (manual navigation)" };
+    }
+    if (this.deps.provider.isBusy()) {
+      return { ok: false, reasonMsg: "explorer is busy" };
+    }
+    if (!this.visible) {
+      return { ok: false, reasonMsg: "view is hidden" };
+    }
+    return { ok: true };
+  }
+
+  private isCurrentGeneration(generation: number): boolean {
+    return !this.disposed && this.generation === generation;
+  }
+
+  /**
    * Rules 8-10 (§5.3). Both SFTP calls are wrapped in try/catch — §5.4 hole
    * (c): the explorer can be torn down mid-flight and `getSftp` throws
    * `No SFTP session for server …`. A failure logs and drops; it must never
    * reject out of the coordinator (it is always invoked via `void`).
+   *
+   * `generation` is captured by the caller at dispatch time; this method
+   * abandons the commit if it no longer matches `this.generation` (a newer
+   * apply superseded this one, or a policy/server/focus change bumped it),
+   * and separately re-runs `passesArbitration()` against current state after
+   * each await (§ generation-token doc comment above) — the two together
+   * fix both the out-of-order-completion race and the stale-context race.
    */
-  private async resolveAndApply(record: CwdRecord, reason: string): Promise<void> {
+  private async resolveAndApply(record: CwdRecord, reason: string, generation: number): Promise<void> {
     let resolved: string;
     try {
       resolved = await this.deps.sftp.realpath(record.serverId, record.cwd);
@@ -427,7 +615,13 @@ export class CwdSyncCoordinator {
       return;
     }
 
-    if (this.disposed) {
+    if (!this.isCurrentGeneration(generation)) {
+      this.deps.log(`Directory sync: abandon (${reason}) — superseded while resolving realpath`);
+      return;
+    }
+    const afterRealpath = this.passesArbitration(record);
+    if (!afterRealpath.ok) {
+      this.deps.log(`Directory sync: abandon (${reason}) — ${afterRealpath.reasonMsg}`);
       return;
     }
 
@@ -439,7 +633,13 @@ export class CwdSyncCoordinator {
       return;
     }
 
-    if (this.disposed) {
+    if (!this.isCurrentGeneration(generation)) {
+      this.deps.log(`Directory sync: abandon (${reason}) — superseded while resolving stat`);
+      return;
+    }
+    const afterStat = this.passesArbitration(record);
+    if (!afterStat.ok) {
+      this.deps.log(`Directory sync: abandon (${reason}) — ${afterStat.reasonMsg}`);
       return;
     }
 
@@ -467,6 +667,7 @@ export class CwdSyncCoordinator {
     this.unsubscribeTracker();
     this.unsubscribeCore();
     this.cancelDebounce();
+    clearInterval(this.freshnessPollTimer);
     this.stateListeners.clear();
   }
 }

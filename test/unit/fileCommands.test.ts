@@ -150,7 +150,8 @@ function createContext(overrides?: {
       clearPin: vi.fn(),
       setFollowing: vi.fn(),
       resume: vi.fn(),
-      getState: vi.fn()
+      getState: vi.fn(),
+      notifyExplorerServerChanged: vi.fn()
     } as any
   };
 }
@@ -179,6 +180,25 @@ describe("fileCommands title bar actions", () => {
     expect(ctx.sftpService.realpath).toHaveBeenCalledWith("srv-1", ".");
     expect(ctx.fileExplorerProvider.setActiveServer).toHaveBeenCalledWith(server, "/home/dev");
     expect(mockExecuteCommand).toHaveBeenCalledWith("nexusFileExplorer.focus");
+    // §8.3: the pin clears automatically on an explorer server change, and
+    // the coordinator must re-evaluate the newly active server.
+    expect(ctx.cwdSyncCoordinator!.notifyExplorerServerChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("browseServerFiles tolerates a missing cwdSyncCoordinator", async () => {
+    const ctx = createContext();
+    delete (ctx as any).cwdSyncCoordinator;
+    const server = {
+      id: "srv-1",
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password" as const,
+      isHidden: false
+    };
+
+    await expect(browseServerFiles(ctx, server)).resolves.toBeUndefined();
   });
 
   it("createFile falls back to active root directory when no tree item is passed", async () => {
@@ -935,6 +955,18 @@ describe("fileCommands title bar actions", () => {
       expect(ctx.sftpService.disconnect).toHaveBeenCalledWith("srv-1");
       expect(clearCachedPassword).toHaveBeenCalledWith("srv-1");
       expect(clearElevatedForServer).toHaveBeenCalledWith("srv-1");
+      expect(ctx.fileExplorerProvider.clearActiveServer).toHaveBeenCalled();
+      // §8.3: the pin clears automatically on an explorer server change.
+      expect(ctx.cwdSyncCoordinator!.notifyExplorerServerChanged).toHaveBeenCalledTimes(1);
+    });
+
+    it("tolerates a missing cwdSyncCoordinator", async () => {
+      const ctx = createContext({ activeServerId: "srv-1" });
+      delete (ctx as any).cwdSyncCoordinator;
+      registerFileCommands(ctx);
+      const handler = registeredCommands.get("nexus.files.disconnect")!;
+
+      expect(() => handler()).not.toThrow();
       expect(ctx.fileExplorerProvider.clearActiveServer).toHaveBeenCalled();
     });
 
