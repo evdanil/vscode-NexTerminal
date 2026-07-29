@@ -558,13 +558,31 @@ export class CwdSyncCoordinator {
       // that; silently losing the report was never required. Latest-wins,
       // exactly like `hiddenBuffer` below. Replayed by `onBusyIdle()` once
       // `provider.onDidChangeBusy` fires the idle transition.
+      //
+      // P1 fix: a newly buffered record supersedes any apply currently in
+      // flight — it IS a newer decision — so bump the generation here too.
+      // Without this, a slow in-flight `resolveAndApply` for an *older*
+      // record can still believe its own generation token is current when
+      // its awaited SFTP call resolves, fail arbitration on `isBusy()`, and
+      // reach `abandonMidFlight`, which would otherwise clobber this fresher
+      // buffer with the stale one (see `abandonMidFlight`'s own generation +
+      // `updatedAt` guards below for the second layer of defense).
       this.busyBuffer = record;
+      this.generation++;
       this.deps.log(`Directory sync: buffered (${reason}) — explorer is busy`);
       return;
     }
 
     if (!this.visible) {
+      // Same reasoning as the busy buffer above: a freshly buffered record
+      // supersedes whatever apply might be in flight. There is currently no
+      // hidden-buffer counterpart to `abandonMidFlight` that could clobber
+      // this on its own (only the busy path has that second writer), but
+      // bumping the generation here is cheap, keeps the two buffers
+      // symmetric, and means a future change that adds one doesn't silently
+      // reintroduce the bug (§7.4 bug 1) this fix addresses for `busyBuffer`.
       this.hiddenBuffer = record;
+      this.generation++;
       this.deps.log(`Directory sync: buffered (${reason}) — view is hidden`);
       return;
     }
@@ -654,12 +672,48 @@ export class CwdSyncCoordinator {
    * something else that happened to coincide with busy, e.g. a pin set in
    * the same tick) is harmless: the eventual retry re-runs every rule from
    * scratch and simply skips again if still blocked.
+   *
+   * **P1 fix (§7.4 bug 1b — "a stale in-flight record clobbers a newer
+   * busy-buffered one"):** `generation` is the token `resolveAndApply`
+   * captured at dispatch time for `record`. Two guards, deliberately
+   * redundant:
+   *  1. `isCurrentGeneration(generation)` — if a newer record has since been
+   *     buffered (which now bumps the generation — see `considerApply`
+   *     above) or any other policy change bumped it, `record` is stale and
+   *     must not overwrite whatever is now buffered.
+   *  2. Belt and braces: even when the generation check alone would allow
+   *     the write, never replace a strictly newer buffered record. Compare
+   *     `CwdRecord.updatedAt` — equal timestamps keep the existing buffer,
+   *     since same-tick reports already resolve latest-wins inside
+   *     `CwdTracker` before either one reaches here.
+   * Neither guard blocks the plain-deferral case (v2.8.71): when nothing
+   * else has superseded `record`, the generation is still current and
+   * `busyBuffer` is either empty or holds something no newer than `record`,
+   * so the write proceeds exactly as before.
    */
-  private abandonMidFlight(record: CwdRecord, reason: string, arbitration: { ok: false; reasonMsg: string }): void {
+  private abandonMidFlight(
+    record: CwdRecord,
+    reason: string,
+    arbitration: { ok: false; reasonMsg: string },
+    generation: number
+  ): void {
     this.deps.log(`Directory sync: abandon (${reason}) — ${arbitration.reasonMsg}`);
-    if (this.deps.provider.isBusy()) {
-      this.busyBuffer = record;
+    if (!this.deps.provider.isBusy()) {
+      return;
     }
+    if (!this.isCurrentGeneration(generation)) {
+      this.deps.log(
+        `Directory sync: abandon (${reason}) — not buffering ${record.cwd}; superseded by a newer record`
+      );
+      return;
+    }
+    if (this.busyBuffer && this.busyBuffer.updatedAt >= record.updatedAt) {
+      this.deps.log(
+        `Directory sync: abandon (${reason}) — not buffering ${record.cwd}; a newer record is already buffered`
+      );
+      return;
+    }
+    this.busyBuffer = record;
   }
 
   /**
@@ -692,7 +746,7 @@ export class CwdSyncCoordinator {
     }
     const afterRealpath = this.passesArbitration(record);
     if (!afterRealpath.ok) {
-      this.abandonMidFlight(record, reason, afterRealpath);
+      this.abandonMidFlight(record, reason, afterRealpath, generation);
       return;
     }
 
@@ -710,7 +764,7 @@ export class CwdSyncCoordinator {
     }
     const afterStat = this.passesArbitration(record);
     if (!afterStat.ok) {
-      this.abandonMidFlight(record, reason, afterStat);
+      this.abandonMidFlight(record, reason, afterStat, generation);
       return;
     }
 

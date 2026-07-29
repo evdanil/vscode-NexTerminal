@@ -488,6 +488,78 @@ describe("CwdSyncCoordinator", () => {
       expect(provider.setRootPath).not.toHaveBeenCalled();
     });
 
+    it("P1 fix (§7.4): a stale in-flight record's mid-flight abandon must not clobber a newer already-buffered record", async () => {
+      const { tracker, provider, sftp, core, coordinator } = setup();
+      coordinator.setFollowing(true);
+      coordinator.setViewVisible(true);
+      provider.state.activeServerId = "srv-1";
+      core.state.focusedSessionId = "s1";
+
+      // Step 1: record A dispatches (debounce fires) and its realpath() call
+      // hangs, simulating an in-flight resolve.
+      let releaseRealpathA: ((path: string) => void) | undefined;
+      (sftp.realpath as any).mockImplementationOnce(
+        () => new Promise<string>((resolve) => { releaseRealpathA = resolve; })
+      );
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/a" }));
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // resolveAndApply(A) dispatched; realpath("/a") pending
+
+      // Step 2: the explorer goes busy while A is still in flight.
+      provider.setBusy(true);
+
+      // Step 3: a newer record B arrives for the same session WHILE busy is
+      // true and A's realpath() has not yet resolved -> considerApply(B)
+      // buffers it immediately (busyBuffer = B), *before* A's mid-flight
+      // abandon ever runs.
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/b" }));
+
+      // Step 4: A's realpath() now resolves. The generation check / mid-flight
+      // arbitration recheck fails (busy), triggering abandonMidFlight(A) —
+      // which must NOT overwrite the newer buffered B with the stale A.
+      releaseRealpathA?.("/a");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+
+      // Step 5: busy clears -> the buffered record is replayed. It must be
+      // B (the newer report), never the stale A.
+      provider.setBusy(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).toHaveBeenCalledTimes(1);
+      expect(provider.setRootPath).toHaveBeenCalledWith("/b", { restartWatcher: false });
+    });
+
+    it("a buffered record still survives a mid-flight abandon that is not superseded (plain deferral, v2.8.71)", async () => {
+      const { tracker, provider, sftp, core, coordinator } = setup();
+      coordinator.setFollowing(true);
+      coordinator.setViewVisible(true);
+      provider.state.activeServerId = "srv-1";
+      core.state.focusedSessionId = "s1";
+
+      let releaseRealpath: ((path: string) => void) | undefined;
+      (sftp.realpath as any).mockImplementationOnce(
+        () => new Promise<string>((resolve) => { releaseRealpath = resolve; })
+      );
+
+      // Only one record ever arrives; nothing supersedes it. The explorer
+      // becomes busy purely because of unrelated activity (e.g. a tree
+      // refresh), not because a newer record was buffered.
+      tracker.fire(makeRecord({ sessionId: "s1", serverId: "srv-1", cwd: "/only" }));
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // realpath("/only") pending, not yet busy
+
+      provider.setBusy(true);
+      releaseRealpath?.("/only");
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).not.toHaveBeenCalled();
+
+      provider.setBusy(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(provider.setRootPath).toHaveBeenCalledTimes(1);
+      expect(provider.setRootPath).toHaveBeenCalledWith("/only", { restartWatcher: false });
+    });
+
     it("dispose() clears any busy-buffered record and stops listening for idle", async () => {
       const { tracker, provider, core, coordinator } = setup();
       coordinator.setFollowing(true);

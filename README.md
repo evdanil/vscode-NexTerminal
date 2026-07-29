@@ -183,14 +183,20 @@ Elevation depends on the SSH account actually having sudo rights on the remote h
 
 The File Explorer can track whichever SSH terminal you're focused on, so it moves with that terminal's current directory instead of sitting wherever you last navigated.
 
-This is **continuous sync** — not a one-off jump — for any shell that announces its own directory. `fish` (≥ 3.x) does this unconditionally, and prompt frameworks like `starship` do too, using the same `OSC 7` escape sequence Nexus already reads out of the terminal's own output. Plain bash and zsh don't announce it by default, but one line fixes that for good:
+This is **continuous sync** — not a one-off jump — for any shell that announces its own directory. `fish` (≥ 3.x) does this unconditionally, and prompt frameworks like `starship` do too, using the same `OSC 7` escape sequence Nexus already reads out of the terminal's own output. Plain bash and zsh don't announce it by default, but one snippet each fixes that for good:
 
 ```bash
 # ~/.bashrc — let Nexus follow this shell's directory
 PROMPT_COMMAND='printf "\033]7;file://%s%s\033\\" "$HOSTNAME" "$PWD"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 ```
 
-(The zsh equivalent goes in `~/.zshrc` via `precmd_functions`.) Add it once and that shell reports its directory continuously from then on — no waiting for a future Nexus release.
+```zsh
+# ~/.zshrc — let Nexus follow this shell's directory
+__nexus_osc7() { printf '\033]7;file://%s%s\033\\' "${HOST}" "$PWD"; }
+precmd_functions+=(__nexus_osc7)
+```
+
+(zsh sets `$HOST` automatically — `$HOSTNAME` is frequently unset there, unlike in bash.) Add either once and that shell reports its directory continuously from then on — no waiting for a future Nexus release.
 
 For anything that isn't a POSIX shell — Cisco IOS, Juniper, FortiOS, or any other device that will never emit that escape sequence — run **Go to Terminal Directory** to jump the File Explorer to your terminal's current directory on demand, using a best-effort read of the visible prompt.
 

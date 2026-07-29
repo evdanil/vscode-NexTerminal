@@ -287,7 +287,7 @@ describe("cwdSyncCommands", () => {
       expect(mockShowInformationMessage).not.toHaveBeenCalled();
     });
 
-    it("'Show Me How' writes the rc snippet to the output channel and shows it", async () => {
+    it("'Show Me How' writes both the bash and zsh rc snippets to the output channel and shows it (P2 fix)", async () => {
       const { ctx } = makeNudgeHarness();
       (ctx.cwdSyncCoordinator!.getState as any).mockReturnValue({ kind: "noSource", terminalName: "t" });
       mockShowInformationMessage.mockResolvedValue("Show Me How");
@@ -297,9 +297,18 @@ describe("cwdSyncCommands", () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      expect(ctx.cwdSyncOutputChannel!.appendLine).toHaveBeenCalledWith(
-        expect.stringContaining("PROMPT_COMMAND=")
+      const appendedLines = (ctx.cwdSyncOutputChannel!.appendLine as any).mock.calls.map(
+        (call: unknown[]) => call[0]
       );
+      const combined = appendedLines.join("\n");
+
+      // Bash snippet: still present, unchanged.
+      expect(combined).toEqual(expect.stringContaining("PROMPT_COMMAND="));
+      // Zsh snippet: a zsh user must get a real, copy-pasteable hook — not
+      // just a comment naming a mechanism without supplying it.
+      expect(combined).toEqual(expect.stringContaining("precmd_functions"));
+      expect(combined).toEqual(expect.stringContaining("${HOST}"));
+
       expect(ctx.cwdSyncOutputChannel!.show).toHaveBeenCalledTimes(1);
       expect(mockExecuteCommand).not.toHaveBeenCalled();
     });

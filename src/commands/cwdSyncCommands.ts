@@ -53,12 +53,30 @@ const NO_SOURCE_FOLLOW_GO_TO_TERMINAL_ACTION = "Go to Terminal Directory";
 const noSourceFollowNudgeShownServers = new Set<string>();
 
 /**
- * Byte-for-byte identical to the rc one-liner documented in
- * `README.md`'s "Directory Sync (Follow Terminal Directory)" section — kept
- * in sync deliberately so "Show Me How" and the docs can never drift apart.
+ * Byte-for-byte identical to the rc snippets documented in `README.md`'s
+ * "Directory Sync (Follow Terminal Directory)" section and
+ * `docs/functional-documentation.md`'s §4.4.2 — kept in sync deliberately so
+ * "Show Me How" and the docs can never drift apart.
+ *
+ * P2 fix — the old single constant here shipped only the bash form plus a
+ * comment *naming* the zsh mechanism ("the equivalent goes in ~/.zshrc via
+ * precmd_functions") without ever supplying it: a zsh user who clicked
+ * "Show Me How" got a `PROMPT_COMMAND=` assignment zsh never executes,
+ * followed by a dead end. Both shells now get a real, copy-pasteable hook.
  */
-const BASH_ZSH_OSC7_HOOK_SNIPPET =
-  "# ~/.bashrc — let Nexus follow this shell's directory\nPROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"$HOSTNAME\" \"$PWD\"'\"${PROMPT_COMMAND:+; $PROMPT_COMMAND}\"\n# zsh: the equivalent goes in ~/.zshrc via precmd_functions";
+const BASH_OSC7_HOOK_SNIPPET =
+  "# ~/.bashrc — let Nexus follow this shell's directory\nPROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"$HOSTNAME\" \"$PWD\"'\"${PROMPT_COMMAND:+; $PROMPT_COMMAND}\"";
+
+/**
+ * zsh sets `$HOST` automatically; `$HOSTNAME` is frequently unset there
+ * (unlike bash, which always has it), so the zsh hook must use `${HOST}` —
+ * verified against a real zsh 5.9 interactively via a pty: `precmd_functions`
+ * fires the hook before every prompt, and the single-quoted `printf` format
+ * (`'\033]7;file://%s%s\033\\'`) emits the byte-exact `ESC ] 7 ; file://<host><path> ESC \`
+ * OSC 7 + ST sequence, the same as the bash form below.
+ */
+const ZSH_OSC7_HOOK_SNIPPET =
+  "# ~/.zshrc — let Nexus follow this shell's directory\n__nexus_osc7() { printf '\\033]7;file://%s%s\\033\\\\' \"${HOST}\" \"$PWD\"; }\nprecmd_functions+=(__nexus_osc7)";
 
 interface FocusedSshSession {
   id: string;
@@ -241,7 +259,12 @@ function showNoSourceFollowNudge(ctx: CommandContext, session: FocusedSshSession
     )
     .then((choice) => {
       if (choice === NO_SOURCE_FOLLOW_SHOW_ME_HOW_ACTION) {
-        ctx.cwdSyncOutputChannel?.appendLine(BASH_ZSH_OSC7_HOOK_SNIPPET);
+        // P2 fix: both shells' hooks, not just bash's — a zsh user gets a
+        // real snippet to paste instead of a `PROMPT_COMMAND=` line their
+        // shell never runs plus a comment naming a mechanism it never supplies.
+        ctx.cwdSyncOutputChannel?.appendLine(BASH_OSC7_HOOK_SNIPPET);
+        ctx.cwdSyncOutputChannel?.appendLine("");
+        ctx.cwdSyncOutputChannel?.appendLine(ZSH_OSC7_HOOK_SNIPPET);
         ctx.cwdSyncOutputChannel?.show();
       } else if (choice === NO_SOURCE_FOLLOW_GO_TO_TERMINAL_ACTION) {
         void vscode.commands.executeCommand("nexus.files.syncFromTerminal");
