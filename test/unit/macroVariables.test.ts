@@ -114,7 +114,11 @@ describe("substituteMacroVariables", () => {
   });
 
   it("un-escapes $${x} to ${x} when x is declared", () => {
-    expect(substituteMacroVariables("$${host}", { host: "unused" })).toBe("${host}");
+    // `host` is declared but has no entered value — the real flow can never
+    // produce a `values` map holding an unprompted name (only used-and-prompted
+    // names ever land in `values`), so the declaration is expressed via
+    // `declaredNames` instead of an artificial `values` entry.
+    expect(substituteMacroVariables("$${host}", {}, ["host"])).toBe("${host}");
   });
 
   it("un-escapes $$x to $x when x is declared (bare form)", () => {
@@ -138,6 +142,21 @@ describe("substituteMacroVariables", () => {
 
   it("adjacent placeholders ${a}${b} both substitute correctly", () => {
     expect(substituteMacroVariables("${a}${b}", { a: "1", b: "2" })).toBe("12");
+  });
+
+  describe("explicit declaredNames argument (declared vs. has-a-value are different sets)", () => {
+    it("a declared-but-valueless name's escape is still honoured", () => {
+      expect(substituteMacroVariables("$${host}", {}, ["host"])).toBe("${host}");
+    });
+
+    it("a declared-but-valueless name used unescaped (never prompted) is left verbatim", () => {
+      expect(substituteMacroVariables("$host", {}, ["host"])).toBe("$host");
+    });
+
+    it("omitting declaredNames falls back to the keys of values", () => {
+      expect(substituteMacroVariables("ping $host", { host: "10.0.0.1" })).toBe("ping 10.0.0.1");
+      expect(substituteMacroVariables("$${host}", { host: "10.0.0.1" })).toBe("${host}");
+    });
   });
 
   it("absent, empty, or non-array variables leave text unaffected via an empty values map", () => {
@@ -192,7 +211,13 @@ describe("substituteMacroVariables", () => {
     // `${constructor}` / `$toString` are valid variable names by the §4 pattern, so a
     // lookup that used `name in values` or a bare `{}` map would resolve them off the
     // prototype chain and substitute `undefined` into text the user never declared.
-    for (const name of ["constructor", "toString", "hasOwnProperty", "valueOf"]) {
+    // `__proto__` is the one of these that actually broke in practice: unlike
+    // `constructor`/`toString`/`hasOwnProperty`/`valueOf` (writable, own-property
+    // assignment shadows the inherited one just fine), assigning `values["__proto__"]
+    // = x` on a plain object literal is intercepted by Object.prototype's legacy
+    // accessor and changes the object's prototype instead of creating an own
+    // property — an entered value would silently vanish rather than substitute.
+    for (const name of ["constructor", "toString", "hasOwnProperty", "valueOf", "__proto__"]) {
       it(`leaves an undeclared \${${name}} untouched`, () => {
         expect(substituteMacroVariables(`a \${${name}} b`, { host: "x" })).toBe(`a \${${name}} b`);
         expect(substituteMacroVariables(`a $${name} b`, { host: "x" })).toBe(`a $${name} b`);
@@ -262,6 +287,43 @@ describe("getValidMacroVariables", () => {
     ] as unknown as MacroVariable[];
     const result = getValidMacroVariables({ variables });
     expect(result.map((v) => v.name)).toEqual(["host", "username"]);
+  });
+
+  describe("full field validation (§4.2 review fix)", () => {
+    it("drops a non-string label but keeps the variable", () => {
+      const variables = [{ name: "host", label: 42 }] as unknown as MacroVariable[];
+      expect(getValidMacroVariables({ variables })).toEqual([{ name: "host" }]);
+    });
+
+    it("drops a non-string default but keeps the variable", () => {
+      const variables = [{ name: "host", default: 42 }] as unknown as MacroVariable[];
+      expect(getValidMacroVariables({ variables })).toEqual([{ name: "host" }]);
+    });
+
+    it("drops a non-boolean secret (treated as not secret)", () => {
+      const variables = [{ name: "host", secret: "yes" }] as unknown as MacroVariable[];
+      expect(getValidMacroVariables({ variables })).toEqual([{ name: "host" }]);
+    });
+
+    it("drops a non-boolean remember", () => {
+      const variables = [{ name: "host", remember: "no" }] as unknown as MacroVariable[];
+      expect(getValidMacroVariables({ variables })).toEqual([{ name: "host" }]);
+    });
+
+    it("dedupes duplicate names, first occurrence wins", () => {
+      const variables = [
+        { name: "host", label: "First" },
+        { name: "host", label: "Second" }
+      ] as unknown as MacroVariable[];
+      expect(getValidMacroVariables({ variables })).toEqual([{ name: "host", label: "First" }]);
+    });
+
+    it("strips default and remember from a secret entry", () => {
+      const variables = [
+        { name: "password", secret: true, default: "leaked", remember: false }
+      ] as unknown as MacroVariable[];
+      expect(getValidMacroVariables({ variables })).toEqual([{ name: "password", secret: true }]);
+    });
   });
 });
 

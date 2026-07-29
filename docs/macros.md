@@ -147,6 +147,13 @@ with nothing typed substitutes an empty string, which can produce a malformed
 command (for example `-H  -U root`); that is your call to make, and Nexus does
 not block it.
 
+Remembering (see **Don't remember**, above) happens step by step as you move
+forward through the prompts, not only once the whole sequence sends
+successfully. If you cancel partway through — for example you enter the host,
+then press Esc at the username prompt — the host value you already entered is
+still remembered for the next time you run the macro, even though nothing was
+sent this time.
+
 ### Worked example: IPMI SOL console
 
 The **Prompted command** template starts from this macro:
@@ -160,6 +167,29 @@ Running it prompts for the host, then the username, then the password (masked,
 never remembered), in that order, then sends the filled-in command line to the
 terminal you invoked it from — even if you switch to a different terminal tab
 while the prompts are still open.
+
+### Which terminal receives the macro
+
+This is a real behavioral difference between the two send paths, and it is
+easy to miss:
+
+- A macro with **no** declared variables is sent through the same
+  immediate, same-tick path Nexus has always used: whatever terminal is
+  active at the moment you invoke it.
+- A macro that declares variables is different: the target terminal is
+  captured at the moment you invoke the macro, *before* any prompts are
+  shown, and the resolved text is sent to that same terminal even if you
+  switch to a different tab while the prompts are still open (see **Worked
+  example**, above).
+
+One consequence: the variable-free path sends through VS Code's own
+text-sending command, which resolves VS Code's own `${workspaceFolder}` /
+`${env:FOO}`-style variables before the text reaches the terminal. The
+variables path sends directly to the terminal instead and does not perform
+that resolution — so `${workspaceFolder}` or `${env:FOO}` written into a
+variables-macro's text is sent to the terminal literally (and, per the Syntax
+table above, passed through untouched unless you also happen to declare a
+macro variable with that exact name).
 
 ### No automatic quoting
 
@@ -187,11 +217,13 @@ conditions, use a **Script** with `prompt()` instead — see the Scripts
 documentation. Scripts have loops, conditionals, and timeouts that macros
 intentionally do not.
 
-If a macro somehow ends up with both a trigger pattern and variables (for
-example, from an older imported configuration), Nexus treats it as a plain,
-non-auto-triggering macro: no zap icon, no enable/disable toggle, and the
-macro's tooltip in the sidebar reads `Auto-trigger suppressed: macro has
-variables`.
+If a macro somehow ends up with both a trigger pattern and variables (this
+cannot happen through config import — sanitization strips the trigger in
+exactly this case; the two real sources are legacy `nexus.terminal.macros`
+settings absorption, which persists entries verbatim, or a direct edit to
+Nexus's stored state), Nexus treats it as a plain, non-auto-triggering macro:
+no zap icon, no enable/disable toggle, and the macro's tooltip in the sidebar
+reads `Auto-trigger suppressed: macro has variables`.
 
 ### Avoiding remote shell history
 

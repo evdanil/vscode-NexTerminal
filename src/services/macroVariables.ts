@@ -85,8 +85,24 @@ export function scanPlaceholders(text: string, declaredNames: readonly string[])
  * *inside the replacement value itself*; a password of ``pa$`word`` under
  * `String.replace` would splice arbitrary preceding text into the output. Array-append
  * treats every entered value as an opaque, never-rescanned, never-reinterpreted string.
+ *
+ * `declaredNames` is DELIBERATELY separate from the keys of `values`: "declared" and
+ * "has an entered value" are different sets. Only placeholders that actually appear
+ * unescaped get prompted (§5.3), so a name whose sole occurrence is `$${name}` is
+ * declared but valueless — and it is exactly that name whose escape must still be
+ * honoured. Deriving declaredness from `values` collapses the two and leaves `$$` on
+ * the wire where the syntax table promises `$`. Omitting the argument falls back to
+ * the keys of `values`, which is correct whenever every declared name was prompted.
  */
-export function substituteMacroVariables(text: string, values: Readonly<Record<string, string>>): string {
+export function substituteMacroVariables(
+  text: string,
+  values: Readonly<Record<string, string>>,
+  declaredNames?: readonly string[]
+): string {
+  // A Set, not an object map: `__proto__`, `constructor` and `toString` are all
+  // valid variable names under MACRO_VARIABLE_NAME_PATTERN.
+  const declared = declaredNames !== undefined ? new Set(declaredNames) : new Set(Object.keys(values));
+
   const out: string[] = [];
   let lastIndex = 0;
 
@@ -99,12 +115,14 @@ export function substituteMacroVariables(text: string, values: Readonly<Record<s
 
     out.push(text.slice(lastIndex, match.index));
 
-    if (!Object.prototype.hasOwnProperty.call(values, name)) {
+    if (!declared.has(name)) {
       out.push(full); // not declared — always verbatim, escaped or not
     } else if (escaped) {
       out.push(full.slice(1)); // declared escape — un-escape by dropping one leading "$"
-    } else {
+    } else if (Object.prototype.hasOwnProperty.call(values, name)) {
       out.push(values[name]); // entered value — never rescanned, never a replacement pattern
+    } else {
+      out.push(full); // declared but never prompted (no unescaped use) — leave it alone
     }
 
     lastIndex = match.index + full.length;
@@ -125,9 +143,35 @@ export function hasMacroVariables(macro: Pick<TerminalMacro, "variables">): bool
   return Array.isArray(macro.variables) && macro.variables.length > 0;
 }
 
-function isPlausibleMacroVariable(entry: unknown): entry is MacroVariable {
-  if (!entry || typeof entry !== "object") return false;
-  return isValidVariableName((entry as Record<string, unknown>).name);
+/**
+ * Narrows one raw entry to a usable `MacroVariable`, dropping fields whose type is
+ * wrong rather than trusting them.
+ *
+ * Every field is checked, not just `name`. The macro editor renders `label` and
+ * `default` straight into HTML via `escapeHtml`, which calls `.replaceAll` on its
+ * argument — a numeric `label` would throw inside `renderMacroEditorHtml`, leaving
+ * `panel.webview.html` unassigned and the Macro Editor permanently blank, including
+ * for the user trying to open it to delete the bad entry.
+ *
+ * That is reachable: `VscodeMacroStore.absorbLegacySettingsIfPresent()` persists
+ * `nexus.terminal.macros` entries verbatim on every activation, Settings Sync replay
+ * included, without passing them through `sanitizeImportedMacro` (§4.2).
+ */
+function toValidMacroVariable(entry: unknown): MacroVariable | undefined {
+  if (!entry || typeof entry !== "object") return undefined;
+  const raw = entry as Record<string, unknown>;
+  if (!isValidVariableName(raw.name)) return undefined;
+
+  const variable: MacroVariable = { name: raw.name };
+  if (typeof raw.label === "string") variable.label = raw.label;
+  if (raw.secret === true) variable.secret = true;
+  // `default` and `remember` are meaningless on a masked variable and are dropped
+  // here too, matching what `sanitizeImportedMacroVariables` does on the import path.
+  if (!variable.secret) {
+    if (typeof raw.default === "string") variable.default = raw.default;
+    if (raw.remember === false) variable.remember = false;
+  }
+  return variable;
 }
 
 /**
@@ -139,7 +183,19 @@ function isPlausibleMacroVariable(entry: unknown): entry is MacroVariable {
  */
 export function getValidMacroVariables(macro: Pick<TerminalMacro, "variables">): MacroVariable[] {
   if (!hasMacroVariables(macro)) return [];
-  return (macro.variables as unknown[]).filter(isPlausibleMacroVariable);
+  const out: MacroVariable[] = [];
+  const seen = new Set<string>();
+  for (const entry of macro.variables as unknown[]) {
+    const variable = toValidMacroVariable(entry);
+    // Deduped by name: the editor and the import sanitizer both reject duplicates,
+    // but legacy settings absorption does not — and a duplicate would otherwise be
+    // prompted for twice ("1 of 2", "2 of 2", same question) with only the second
+    // answer surviving into the substitution map.
+    if (!variable || seen.has(variable.name)) continue;
+    seen.add(variable.name);
+    out.push(variable);
+  }
+  return out;
 }
 
 export interface MacroVariableValidationError {

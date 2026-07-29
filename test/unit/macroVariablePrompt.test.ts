@@ -72,7 +72,11 @@ class FakeInputBox {
   }
 
   fireBack(): void {
-    for (const h of [...this.buttonHandlers]) h(mockBackButton);
+    this.fireButton(mockBackButton);
+  }
+
+  fireButton(button: unknown): void {
+    for (const h of [...this.buttonHandlers]) h(button);
   }
 
   private remove<T>(list: Handler<T>[], handler: Handler<T>): void {
@@ -248,6 +252,96 @@ describe("resolveMacroText — prompt sequencing", () => {
       await tick();
     }
     box.fireHide();
+
+    const result = await resultPromise;
+    expect(result).toBeUndefined();
+    expect(box.disposed).toBe(true);
+  });
+
+  it("escape-only text: zero prompts, and the escape is un-escaped", async () => {
+    const macro = makeMacro({ text: "echo $${host}", variables: [{ name: "host" }] });
+    const result = await resolveMacroText(macro);
+    expect(result).toBe("echo ${host}");
+    expect(mockCreateInputBox).not.toHaveBeenCalled();
+  });
+
+  it("mixed escaped and unescaped use of the same name: one prompt, both forms resolved correctly", async () => {
+    const macro = makeMacro({ text: "echo $host; echo $${host}", variables: [{ name: "host" }] });
+    const box = queueInputBox();
+    const resultPromise = resolveMacroText(macro);
+    await tick();
+
+    expect(mockCreateInputBox).toHaveBeenCalledTimes(1);
+    expect(box.totalSteps).toBe(1);
+
+    box.value = "10.0.0.1";
+    box.fireAccept();
+    const result = await resultPromise;
+    expect(result).toBe("echo 10.0.0.1; echo ${host}");
+  });
+
+  it("a second declared variable that only appears escaped is never prompted, but its escape still resolves", async () => {
+    const macro = makeMacro({
+      text: "curl $host:8080 '$${port}'",
+      variables: [{ name: "host" }, { name: "port" }]
+    });
+    const box = queueInputBox();
+    const resultPromise = resolveMacroText(macro);
+    await tick();
+
+    expect(mockCreateInputBox).toHaveBeenCalledTimes(1);
+    expect(box.totalSteps).toBe(1);
+    expect(box.prompt).toBe("host");
+
+    box.value = "10.0.0.1";
+    box.fireAccept();
+    const result = await resultPromise;
+    expect(result).toBe("curl 10.0.0.1:8080 '${port}'");
+  });
+
+  it("backing into a masked step never prefills the previously entered secret", async () => {
+    const macro = makeMacro({
+      text: "$host $password $confirm",
+      variables: [{ name: "host" }, { name: "password", secret: true }, { name: "confirm" }]
+    });
+    const box = queueInputBox();
+    const resultPromise = resolveMacroText(macro);
+    await tick();
+
+    box.value = "10.0.0.1";
+    box.fireAccept();
+    await tick();
+
+    expect(box.password).toBe(true);
+    expect(box.value).toBe(""); // masked step never prefills, even on the first visit
+    box.value = "hunter2";
+    box.fireAccept();
+    await tick();
+
+    // Now at step 3 (confirm) — go back into the masked step.
+    box.fireBack();
+    await tick();
+    expect(box.password).toBe(true);
+    expect(box.value).toBe(""); // backing in must not re-seat the previously typed secret
+
+    box.value = "hunter2";
+    box.fireAccept();
+    await tick();
+    box.value = "yes";
+    box.fireAccept();
+
+    const result = await resultPromise;
+    expect(result).toBe("10.0.0.1 hunter2 yes");
+  });
+
+  it("a non-Back button settles the step as a cancel rather than hanging forever", async () => {
+    const macro = makeMacro({ variables: [{ name: "host" }], text: "$host" });
+    const box = queueInputBox();
+    const resultPromise = resolveMacroText(macro);
+    await tick();
+
+    const someOtherButton = { __brand: "not-back" };
+    box.fireButton(someOtherButton);
 
     const result = await resultPromise;
     expect(result).toBeUndefined();
@@ -445,6 +539,27 @@ describe("runMacro — target pinning (§8.1)", () => {
 
     expect(terminalA.sendText).not.toHaveBeenCalled();
     expect(mockSetStatusBarMessage).toHaveBeenCalledWith("Target terminal closed — nothing was sent.", 4000);
+  });
+});
+
+describe("runMacro — success reporting (§8.3 fix: successful sends were silent)", () => {
+  it("reports success via the status bar after a successful send, without leaking the resolved value", async () => {
+    const terminalA = makeTerminal("Router1");
+    vscode.window.terminals = [terminalA] as unknown as vscode.Terminal[];
+    vscode.window.activeTerminal = terminalA as unknown as vscode.Terminal;
+
+    const macro = makeMacro({ name: "IPMI SOL", variables: [{ name: "host" }], text: "$host" });
+    const box = queueInputBox();
+    const runPromise = runMacro(macro);
+    await tick();
+
+    box.value = "10.0.0.1";
+    box.fireAccept();
+    await runPromise;
+
+    expect(mockSetStatusBarMessage).toHaveBeenCalledWith('Macro "IPMI SOL" sent to Router1.', 4000);
+    const messages = mockSetStatusBarMessage.mock.calls.map((call) => call[0]);
+    expect(messages.some((msg) => typeof msg === "string" && msg.includes("10.0.0.1"))).toBe(false);
   });
 });
 

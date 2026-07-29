@@ -21,8 +21,13 @@ import {
   normalizeBinding
 } from "../macroBindingHelpers";
 import { repositoryBlobUrl } from "../utils/repositoryLinks";
-import { hasMacroVariables } from "../services/macroVariables";
+import { getValidMacroVariables, hasMacroVariables, scanPlaceholders } from "../services/macroVariables";
 import { runMacro } from "./macroVariablePrompt";
+// NOT imported from "../ui/macroTreeProvider": that module's `class MacroTreeItem
+// extends vscode.TreeItem` executes at load time, and a plain value import from
+// it would force this module (and every test that imports it) to load `vscode`
+// fully shaped. See macroVariableMarker.ts's own doc comment.
+import { VARIABLE_MARKER } from "../ui/macroVariableMarker";
 
 type MacroTemplate = {
   id: string;
@@ -85,10 +90,13 @@ export const MACRO_TEMPLATES: MacroTemplate[] = [
     // editor and happening to notice the new Variables section.
     id: "prompted-command",
     label: "Prompted command",
-    description: "Prompt for host, username, and password, then run a templated command.",
+    description: "Prompt for host, username, and password, then run a templated command (leading space keeps it out of remote shell history).",
     macro: {
       name: "IPMI SOL console",
-      text: "ipmitool -I lanplus -H $host -U $username -P $password sol activate\n",
+      // Leading space intentional: docs/macros.md's "Avoiding remote shell
+      // history" section documents `HISTCONTROL=ignorespace` — a shipped
+      // example should follow its own documented practice.
+      text: " ipmitool -I lanplus -H $host -U $username -P $password sol activate\n",
       variables: [
         { name: "host", label: "Host" },
         { name: "username", label: "Username" },
@@ -97,6 +105,22 @@ export const MACRO_TEMPLATES: MacroTemplate[] = [
     }
   }
 ];
+
+/**
+ * §9.6 — the quick-pick marker must reflect whether the macro will ACTUALLY
+ * prompt (same distinction, and same scan, as macroTreeProvider.ts's sidebar
+ * marker): a macro that declares a variable but never references its
+ * placeholder in the text sends immediately on click, so marking it would lie
+ * about the click behavior. Routing decisions (`runOrSendMacro` below) stay
+ * shape-based via `hasMacroVariables()` — a declared-but-unused variable still
+ * needs its escapes resolved and its target pinned, both of which only happen
+ * on the `runMacro()` path.
+ */
+function macroWillPrompt(macro: TerminalMacro): boolean {
+  if (!hasMacroVariables(macro)) return false;
+  const declaredNames = getValidMacroVariables(macro).map((v) => v.name);
+  return scanPlaceholders(macro.text, declaredNames).used.length > 0;
+}
 
 function sendMacroText(text: string): void {
   void vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text });
@@ -117,7 +141,15 @@ async function runOrSendMacro(macro: TerminalMacro): Promise<void> {
 }
 
 function cloneMacro(macro: TerminalMacro): TerminalMacro {
-  return { ...macro };
+  // A shallow `{ ...macro }` still shares `variables` (array + entry objects)
+  // by reference. Every macro created from a template would otherwise mutate
+  // — and be mutated by — the module-level `MACRO_TEMPLATES` entry, since
+  // MacroEditorPanel and array plumbing elsewhere edit `variables` in place.
+  const clone: TerminalMacro = { ...macro };
+  if (Array.isArray(macro.variables)) {
+    clone.variables = macro.variables.map((variable) => ({ ...variable }));
+  }
+  return clone;
 }
 
 function macroDocsUrl(): string {
@@ -342,9 +374,10 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         macros.map((m, i) => {
           const binding = getAssignedBinding(m);
           const prefix = binding ? `[${bindingToDisplayLabel(binding)}] ` : "";
-          // §9.6 — same marker as the sidebar: "click = sends immediately" and
-          // "click = opens prompts" are different enough behaviors to flag here too.
-          const marker = hasMacroVariables(m) ? "⌸ " : "";
+          // §9.6 — same marker (and same "will it actually prompt" scan) as the
+          // sidebar: "click = sends immediately" and "click = opens prompts" are
+          // different enough behaviors to flag here too.
+          const marker = macroWillPrompt(m) ? VARIABLE_MARKER : "";
           return {
             label: `${prefix}${m.name}`,
             description: `${marker}${m.secret ? "***" : m.text.replace(/\n/g, "\\n")}`,

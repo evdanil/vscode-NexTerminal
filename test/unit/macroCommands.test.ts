@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerMacroCommands } from "../../src/commands/macroCommands";
 import { MacroEditorPanel } from "../../src/ui/macroEditorPanel";
 import { getAssignedBinding } from "../../src/macroBindingHelpers";
+import { VARIABLE_MARKER } from "../../src/ui/macroVariableMarker";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockExecuteCommand = vi.fn();
@@ -289,8 +290,8 @@ describe("macroCommands variable routing (§8.5)", () => {
     await registeredCommands.get("nexus.macro.run")!();
 
     const items = mockShowQuickPick.mock.calls[0][0] as Array<{ label: string; description: string }>;
-    expect(items[0].description).not.toContain("⌸");
-    expect(items[1].description).toContain("⌸");
+    expect(items[0].description).not.toContain(VARIABLE_MARKER.trim());
+    expect(items[1].description).toContain(VARIABLE_MARKER.trim());
   });
 
   it("nexus.macro.run: a cancelled resolve (runMacro resolves without sending) results in no sendMacroText call either", async () => {

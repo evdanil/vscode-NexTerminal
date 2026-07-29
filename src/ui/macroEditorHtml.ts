@@ -23,7 +23,13 @@ function renderVariableRow(variable: MacroVariable, index: number): string {
   // §7.1 — a default is forbidden on a masked variable (it would be plaintext
   // in the store); never render one even if a malformed/legacy record has it.
   const defaultValue = isSecret ? "" : escapeHtml(variable.default ?? "");
-  const dontRemember = variable.remember === false;
+  // `remember` is meaningless on a masked variable — never remembered regardless
+  // of this flag — and `sanitizeImportedMacroVariables`/`toValidMacroVariable`
+  // both strip it from a secret entry. Never render it as checked even if a
+  // malformed/legacy record has it, and disable the control (same treatment as
+  // `default` above) so the editor can't persist a `remember: false` that would
+  // round-trip to a different shape than the rest of the app produces.
+  const dontRemember = !isSecret && variable.remember === false;
   const removeLabel = escapeHtml(variable.name ? `Remove variable ${variable.name}` : "Remove variable");
   return `<div class="variable-row" data-var-row="${index}">
       <div class="variable-row-line1">
@@ -33,7 +39,7 @@ function renderVariableRow(variable: MacroVariable, index: number): string {
       </div>
       <div class="variable-row-line2">
         <label><input type="checkbox" class="var-secret"${isSecret ? " checked" : ""} /> Mask input (never stored)</label>
-        <label><input type="checkbox" class="var-remember"${dontRemember ? " checked" : ""} /> Don't remember</label>
+        <label class="variable-remember-label${isSecret ? " muted" : ""}"><input type="checkbox" class="var-remember"${dontRemember ? " checked" : ""}${isSecret ? " disabled" : ""} /> Don't remember</label>
         <button type="button" class="btn-secondary variable-remove-btn" aria-label="${removeLabel}">Remove</button>
       </div>
       <div class="field-error" data-var-error="${index}"></div>
@@ -152,6 +158,9 @@ export function renderMacroEditorHtml(
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
+    }
+    .variable-remember-label.muted {
+      opacity: 0.55;
     }`,
     body: `  ${emptyStateHtml}
   <div class="form-group">
@@ -339,12 +348,20 @@ export function renderMacroEditorHtml(
       // Row N's error slot is addressed by data-var-error="N" (§9.2). Renumbering
       // on every add/remove keeps that index equal to the row's DOM position,
       // which is also the position the save handler collects it at below.
+      //
+      // Also clears every row's error text here: a host-posted per-row error
+      // addresses a row by position (data-var-error="N"), and add/remove changes
+      // which row sits at position N — without this, a stale message can end up
+      // pinned to a DIFFERENT row than the one that caused it.
       function renumberVariableRows() {
         var rows = variablesList.querySelectorAll(".variable-row");
         for (var i = 0; i < rows.length; i++) {
           rows[i].setAttribute("data-var-row", String(i));
           var errSlot = rows[i].querySelector(".field-error");
-          if (errSlot) errSlot.setAttribute("data-var-error", String(i));
+          if (errSlot) {
+            errSlot.setAttribute("data-var-error", String(i));
+            errSlot.textContent = "";
+          }
         }
       }
 
@@ -367,7 +384,11 @@ export function renderMacroEditorHtml(
 
       function updateTriggerConflictWarning() {
         var triggerVal = document.getElementById("macro-trigger").value.trim();
-        var hasVars = variablesList.querySelectorAll(".variable-row").length > 0;
+        // §9.4 — a blank/whitespace-only row is "not yet filled in", not a
+        // declared variable (matches collectVariablesForSave below); it must not
+        // trip the mutually-exclusive warning by itself, e.g. right after
+        // clicking "+ Add Variable" once on an existing trigger macro.
+        var hasVars = collectDeclaredVariableNames().length > 0;
         var show = !!triggerVal && hasVars;
         var w1 = document.getElementById("variables-trigger-conflict");
         var w2 = document.getElementById("variables-trigger-conflict-2");
@@ -438,22 +459,35 @@ export function renderMacroEditorHtml(
       // to the host; the host (macroEditorPanel.ts) re-validates with
       // validateMacroVariables() regardless, since retainContextWhenHidden means
       // this script can be stale relative to a store changed externally.
+      // The variables argument here is the already-filtered (blank rows removed)
+      // array from collectVariablesForSave() — used for the array-level
+      // MAX_VARIABLES count, which must not count a row that is "not yet filled
+      // in" (§9.4). Per-row
+      // validation instead walks the DOM directly, addressing each row's own
+      // error slot by its actual position — a blank row is skipped (no error,
+      // never blocks Save) rather than reported as an invalid empty name.
       function validateVariablesClientSide(variables) {
         var ok = true;
         var seen = Object.create(null);
-        for (var i = 0; i < variables.length; i++) {
-          var v = variables[i];
-          var errEl = document.querySelector('[data-var-error="' + i + '"]');
+        var rows = variablesList.querySelectorAll(".variable-row");
+        for (var i = 0; i < rows.length; i++) {
+          var row = rows[i];
+          var errEl = row.querySelector(".field-error");
+          var name = row.querySelector(".var-name").value.trim();
           var msg = "";
-          if (!isValidVariableName(v.name)) {
-            msg = '"' + v.name + '" is not a valid variable name.';
-          } else if (seen[v.name]) {
-            msg = 'Duplicate variable name "' + v.name + '".';
-          } else {
-            seen[v.name] = true;
-          }
-          if (!msg && v.secret && typeof v.default === "string" && v.default.length > 0) {
-            msg = '"' + v.name + '" is masked and cannot have a default value.';
+          if (name) {
+            if (!isValidVariableName(name)) {
+              msg = '"' + name + '" is not a valid variable name.';
+            } else if (seen[name]) {
+              msg = 'Duplicate variable name "' + name + '".';
+            } else {
+              seen[name] = true;
+              var isSecretRow = row.querySelector(".var-secret").checked;
+              var defaultVal = row.querySelector(".var-default").value;
+              if (isSecretRow && defaultVal) {
+                msg = '"' + name + '" is masked and cannot have a default value.';
+              }
+            }
           }
           if (errEl) errEl.textContent = msg;
           if (msg) ok = false;
@@ -473,6 +507,9 @@ export function renderMacroEditorHtml(
         for (var i = 0; i < rows.length; i++) {
           var row = rows[i];
           var name = row.querySelector(".var-name").value.trim();
+          // §9.4 — a blank row is "not yet filled in", not a declared variable;
+          // never send it, and never let it count toward the 10-variable cap.
+          if (!name) continue;
           var label = row.querySelector(".var-label").value.trim();
           var isSecretRow = row.querySelector(".var-secret").checked;
           var defaultVal = row.querySelector(".var-default").value;
@@ -481,10 +518,11 @@ export function renderMacroEditorHtml(
           if (label) variable.label = label;
           if (isSecretRow) {
             variable.secret = true;
-          } else if (defaultVal) {
-            variable.default = defaultVal;
+            // remember is meaningless on a masked variable — never emitted for one.
+          } else {
+            if (defaultVal) variable.default = defaultVal;
+            if (dontRemember) variable.remember = false;
           }
-          if (dontRemember) variable.remember = false;
           result.push(variable);
         }
         return result;
@@ -498,20 +536,36 @@ export function renderMacroEditorHtml(
         var rememberInput = row.querySelector(".var-remember");
         var removeBtn = row.querySelector(".variable-remove-btn");
 
+        // A host-posted saveError (§9.2) writes into this row's error slot; edit
+        // ANY field in the row and that message is stale — clear it rather than
+        // leaving it pinned to input the user has since changed.
+        function clearRowError() {
+          var errEl = row.querySelector(".field-error");
+          if (errEl) errEl.textContent = "";
+        }
+
         nameInput.addEventListener("input", function() {
           markDirty();
           updateRemoveAriaLabel(row);
           scheduleDiagnostics();
           updateTriggerConflictWarning();
+          clearRowError();
         });
-        labelInput.addEventListener("input", markDirty);
-        defaultInput.addEventListener("input", markDirty);
+        labelInput.addEventListener("input", function() { markDirty(); clearRowError(); });
+        defaultInput.addEventListener("input", function() { markDirty(); clearRowError(); });
         secretInput.addEventListener("change", function() {
           markDirty();
           defaultInput.disabled = secretInput.checked;
           if (secretInput.checked) defaultInput.value = "";
+          // remember is meaningless on a masked variable (§7.1 fix) — disable
+          // and visually mute "Don't remember" the same way default already is.
+          rememberInput.disabled = secretInput.checked;
+          if (secretInput.checked) rememberInput.checked = false;
+          var rememberLabel = rememberInput.closest("label");
+          if (rememberLabel) rememberLabel.classList.toggle("muted", secretInput.checked);
+          clearRowError();
         });
-        rememberInput.addEventListener("change", markDirty);
+        rememberInput.addEventListener("change", function() { markDirty(); clearRowError(); });
         removeBtn.addEventListener("click", function() {
           row.parentNode.removeChild(row);
           renumberVariableRows();
@@ -702,7 +756,19 @@ export function renderMacroEditorHtml(
             document.getElementById("error-trigger").textContent = TRIGGER_CONFLICT_MESSAGE;
           }
         }
-        if (!valid) return;
+        if (!valid) {
+          // Design §9.4 — ANY save-time failure scrolls to it, not just a
+          // host-posted one. Find the first non-empty field error in document
+          // order and bring it into view.
+          var fieldErrors = document.querySelectorAll(".field-error");
+          for (var fe = 0; fe < fieldErrors.length; fe++) {
+            if (fieldErrors[fe].textContent) {
+              fieldErrors[fe].scrollIntoView({ block: "center" });
+              break;
+            }
+          }
+          return;
+        }
 
         vscode.postMessage({
           type: "save",

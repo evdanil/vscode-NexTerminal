@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderMacroEditorHtml } from "../../src/ui/macroEditorHtml";
-import type { TerminalMacro } from "../../src/models/terminalMacro";
+import type { MacroVariable, TerminalMacro } from "../../src/models/terminalMacro";
 
 const nonce = "test-nonce-456";
 
@@ -348,6 +348,17 @@ describe("renderMacroEditorHtml", () => {
     it("renders an array-level error slot for the Variables section header", () => {
       const html = render([], null);
       expect(html).toContain('id="error-variables"');
+    });
+
+    it("does not throw when a variable has a non-string label or default (legacy-absorption shape)", () => {
+      const macros: TerminalMacro[] = [
+        {
+          name: "Legacy",
+          text: "$host",
+          variables: [{ name: "host", label: 42, default: 99 } as unknown as MacroVariable]
+        }
+      ];
+      expect(() => render(macros, 0)).not.toThrow();
     });
   });
 

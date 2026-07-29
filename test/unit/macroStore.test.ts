@@ -112,6 +112,40 @@ describe("VscodeMacroStore", () => {
     expect(secretBag.has("macro-secret-text-a")).toBe(false);
   });
 
+  it("preserves declared variables on a macro-level-secret macro across the vault split (§7.4)", async () => {
+    const { context, stateBag, secretBag } = makeFakeContext();
+    const declaredVariables = [
+      { name: "host", label: "Host" },
+      { name: "username", label: "Username" },
+      { name: "password", label: "Password", secret: true }
+    ];
+
+    const store1 = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store1.initialize();
+    await store1.save([
+      {
+        id: "b",
+        name: "IPMI SOL console",
+        text: " ipmitool -I lanplus -H $host -U $username -P $password sol activate\n",
+        secret: true,
+        variables: declaredVariables
+      }
+    ]);
+
+    // The vault split strips `text` from the on-disk record — it must never
+    // strip the variable declarations sitting alongside it.
+    const persisted = stateBag.get("nexus.macros") as TerminalMacro[];
+    expect(persisted[0].text).toBe("");
+    expect(persisted[0].variables).toEqual(declaredVariables);
+    expect(secretBag.get("macro-secret-text-b")).toContain("ipmitool");
+
+    const store2 = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store2.initialize();
+    const [m] = store2.getAll();
+    expect(m.text).toContain("ipmitool");
+    expect(m.variables).toEqual(declaredVariables);
+  });
+
   it("resolves secret text on reload", async () => {
     const { context } = makeFakeContext();
     const store1 = new VscodeMacroStore(context, { runLegacyMigration: false });

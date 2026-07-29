@@ -4,9 +4,9 @@ import { getAssignedBinding } from "../macroBindingHelpers";
 import type { TerminalMacro } from "../models/terminalMacro";
 import { getMacros } from "../macroSettings";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders } from "../services/macroVariables";
+import { VARIABLE_MARKER } from "./macroVariableMarker";
 
-/** \u00a79.6 marker prefix for variable macros in the sidebar description. */
-const VARIABLE_MARKER = "\u2338 ";
+export { VARIABLE_MARKER };
 
 export class MacroTreeItem extends vscode.TreeItem {
   public constructor(
@@ -22,7 +22,17 @@ export class MacroTreeItem extends vscode.TreeItem {
     // \u00a74.2 \u2014 `variables` is untrusted at every read site: shape-guarded helpers
     // only, never a bare `macro.variables` truthy check.
     const hasVariables = hasMacroVariables(macro);
-    const variableMarker = hasVariables ? VARIABLE_MARKER : "";
+
+    // \u00a79.6 \u2014 the marker and icon must reflect whether the macro will ACTUALLY
+    // prompt, not merely whether it declares a `variables` array. A macro that
+    // declares `port` but never references `$port` in its text sends immediately
+    // on click \u2014 "click = sends immediately" vs "click = opens prompts" is exactly
+    // the distinction the marker exists to communicate, so it keys off the same
+    // scan the tooltip below already uses, never the raw shape check.
+    const declaredNames = hasVariables ? getValidMacroVariables(macro).map((v) => v.name) : [];
+    const promptedNames = hasVariables ? scanPlaceholders(macro.text, declaredNames).used : [];
+    const willPrompt = promptedNames.length > 0;
+    const variableMarker = willPrompt ? VARIABLE_MARKER : "";
 
     if (macro.secret) {
       this.description = `${variableMarker}\u2022\u2022\u2022\u2022\u2022`;
@@ -46,12 +56,8 @@ export class MacroTreeItem extends vscode.TreeItem {
     // placeholder actually appears (unescaped) in the text are ever prompted
     // for (\u00a75.3), so this mirrors runMacro()'s own scan rather than just
     // listing every declaration.
-    if (hasVariables) {
-      const declaredNames = getValidMacroVariables(macro).map((v) => v.name);
-      const promptedNames = scanPlaceholders(macro.text, declaredNames).used;
-      if (promptedNames.length > 0) {
-        this.tooltip += `\nPrompts for: ${promptedNames.join(", ")}`;
-      }
+    if (willPrompt) {
+      this.tooltip += `\nPrompts for: ${promptedNames.join(", ")}`;
     }
 
     // \u00a76.3 \u2014 a macro with BOTH a triggerPattern and variables must never
@@ -76,7 +82,7 @@ export class MacroTreeItem extends vscode.TreeItem {
       // only the icon and tooltip differ; the context menu stays the one for
       // a plain (or secret) macro.
       this.contextValue = macro.secret ? "nexus.macro.secret" : "nexus.macro";
-      this.iconPath = new vscode.ThemeIcon(hasVariables ? "symbol-parameter" : (macro.secret ? "lock" : "terminal"));
+      this.iconPath = new vscode.ThemeIcon(willPrompt ? "symbol-parameter" : (macro.secret ? "lock" : "terminal"));
     }
   }
 }
