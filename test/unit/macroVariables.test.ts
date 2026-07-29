@@ -9,7 +9,8 @@ import {
   MAX_MACRO_VARIABLES,
   scanPlaceholders,
   substituteMacroVariables,
-  validateMacroVariables
+  validateMacroVariables,
+  withSanitizedVariables
 } from "../../src/services/macroVariables";
 import type { PlaceholderScan } from "../../src/services/macroVariables";
 import { serializeForInlineScript } from "../../src/ui/shared/inlineScriptData";
@@ -325,6 +326,64 @@ describe("getValidMacroVariables", () => {
       ] as unknown as MacroVariable[];
       expect(getValidMacroVariables({ variables })).toEqual([{ name: "password", secret: true }]);
     });
+  });
+});
+
+describe("withSanitizedVariables (Fix 1 — output/persist-path normalization)", () => {
+  it("strips default and remember from a masked entry", () => {
+    const macro = { variables: [{ name: "password", secret: true, default: "hunter2", remember: false }] };
+    const result = withSanitizedVariables(macro);
+    expect(result.variables).toEqual([{ name: "password", secret: true }]);
+    expect(JSON.stringify(result)).not.toContain("hunter2");
+  });
+
+  it("drops invalid-named entries while keeping the rest", () => {
+    const macro = { variables: [{ name: "2bad" }, { name: "ok" }] };
+    const result = withSanitizedVariables(macro);
+    expect(result.variables?.map((v) => v.name)).toEqual(["ok"]);
+  });
+
+  it("collapses duplicate names, first occurrence wins", () => {
+    const macro = {
+      variables: [
+        { name: "host", label: "First" },
+        { name: "host", label: "Second" }
+      ]
+    };
+    const result = withSanitizedVariables(macro);
+    expect(result.variables).toEqual([{ name: "host", label: "First" }]);
+  });
+
+  it("deletes the variables key entirely when nothing survives", () => {
+    const macro = { name: "m", variables: [{ name: "2bad" }, { notAName: true }] };
+    const result = withSanitizedVariables(macro as unknown as { name: string; variables: unknown });
+    expect(result).not.toHaveProperty("variables");
+    expect("variables" in result).toBe(false);
+  });
+
+  it("returns a macro with no variables key unchanged (identity is fine)", () => {
+    const macro = { name: "m", text: "echo hi" };
+    const result = withSanitizedVariables(macro);
+    expect(result).toBe(macro);
+  });
+
+  it("removes the key for a non-array variables shape (Settings-Sync corruption, §4.2)", () => {
+    const macro = { name: "m", variables: "abc" as unknown as MacroVariable[] };
+    const result = withSanitizedVariables(macro);
+    expect(result).not.toHaveProperty("variables");
+  });
+
+  it("removes the key for an empty variables array", () => {
+    const macro = { name: "m", variables: [] as MacroVariable[] };
+    const result = withSanitizedVariables(macro);
+    expect(result).not.toHaveProperty("variables");
+  });
+
+  it("does not mutate the input macro (returns a copy)", () => {
+    const macro = { variables: [{ name: "password", secret: true, default: "hunter2" }] };
+    const original = JSON.parse(JSON.stringify(macro));
+    withSanitizedVariables(macro);
+    expect(macro).toEqual(original);
   });
 });
 

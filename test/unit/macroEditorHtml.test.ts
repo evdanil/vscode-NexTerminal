@@ -382,6 +382,21 @@ describe("renderMacroEditorHtml", () => {
       expect(html).toContain('id="variables-diagnostics"');
     });
 
+    // Fix 4: the strip must be BOUNDED, not just given a floor. `min-height` lets a
+    // macro with several undeclared placeholders (one hint line each) grow the
+    // strip without limit and push the controls below it around per keystroke —
+    // exactly the layout-bounce this reserved strip exists to prevent. A fixed
+    // `height` + `overflow-y: auto` caps it instead.
+    it("bounds the diagnostics strip's height rather than only setting a minimum (Fix 4)", () => {
+      const html = render([], null);
+      const match = /\.variables-diagnostics\s*\{[^}]*\}/.exec(html);
+      if (!match) throw new Error(".variables-diagnostics rule not found in the rendered CSS");
+      const rule = match[0];
+      expect(rule).toMatch(/(?<!-)height:\s*54px/); // bounded, not open-ended
+      expect(rule).not.toMatch(/min-height:/);
+      expect(rule).toContain("overflow-y: auto"); // content beyond the cap scrolls instead of expanding it
+    });
+
     it("wires an Add variable button into the undeclared-placeholder hint", () => {
       const html = render([], null);
       expect(html).toContain("is not declared and will be sent as-is.");
@@ -411,6 +426,131 @@ describe("renderMacroEditorHtml", () => {
       expect(html).toContain("function updateTriggerConflictWarning()");
       expect(html).toContain("prompt for input or auto-trigger, not both");
       expect(html).toContain("use a Script with prompt()");
+    });
+
+    // Fix 3: updateTriggerConflictWarning() now falls back to rowHasContent(row)
+    // when no row has a declared name yet, so a row where the user typed only a
+    // label (or ticked a box) still trips the conflict instead of hiding it until
+    // Save. Same no-DOM environment as the "blank vs partially-filled variable
+    // rows" block above: extract the real function from the rendered script (not
+    // a hand-copied reimplementation) and execute it against stubs, rather than
+    // asserting on source text — a pure-string assertion would pass even if the
+    // fallback branch were deleted, as long as the literal identifier
+    // "rowHasContent(row)" still appeared somewhere else in the file.
+    describe("falls back to rowHasContent for undeclared rows (Fix 3)", () => {
+      function extractUpdateTriggerConflictWarning(
+        html: string
+      ): (
+        document: unknown,
+        variablesList: unknown,
+        rowHasContent: (row: unknown) => boolean,
+        collectDeclaredVariableNames: () => string[],
+        TRIGGER_CONFLICT_MESSAGE: string
+      ) => () => void {
+        const match = /function updateTriggerConflictWarning\(\) \{[\s\S]*?\n      \}/.exec(html);
+        if (!match) throw new Error("updateTriggerConflictWarning() not found in the rendered script");
+        return new Function(
+          "document",
+          "variablesList",
+          "rowHasContent",
+          "collectDeclaredVariableNames",
+          "TRIGGER_CONFLICT_MESSAGE",
+          `${match[0]}\nreturn updateTriggerConflictWarning;`
+        ) as ReturnType<typeof extractUpdateTriggerConflictWarning>;
+      }
+
+      function stubWarningEl() {
+        return { textContent: "", classes: {} as Record<string, boolean>, classList: undefined as unknown };
+      }
+
+      function makeHarness(triggerVal: string, pendingRows: unknown[]) {
+        const w1 = stubWarningEl();
+        const w2 = stubWarningEl();
+        for (const w of [w1, w2]) {
+          w.classList = { toggle: (cls: string, val: boolean) => { w.classes[cls] = val; } };
+        }
+        const elements: Record<string, unknown> = {
+          "macro-trigger": { value: triggerVal },
+          "variables-trigger-conflict": w1,
+          "variables-trigger-conflict-2": w2
+        };
+        const stubDocument = { getElementById: (id: string) => elements[id] };
+        const stubVariablesList = { querySelectorAll: () => pendingRows };
+        return { w1, w2, stubDocument, stubVariablesList };
+      }
+
+      it("consults rowHasContent when no row has a declared name yet, and shows the conflict for a label-only row", () => {
+        const html = render([], null);
+        const updateTriggerConflictWarning = extractUpdateTriggerConflictWarning(html);
+        const labelOnlyRow = { __marker: "label-only-row" };
+        const { w1, w2, stubDocument, stubVariablesList } = makeHarness("router#", [labelOnlyRow]);
+
+        let calledWith: unknown;
+        const rowHasContent = (row: unknown) => {
+          calledWith = row;
+          return true; // simulates a row where the user typed only a label
+        };
+        const collectDeclaredVariableNames = () => []; // no row has a name yet
+
+        const run = updateTriggerConflictWarning(
+          stubDocument,
+          stubVariablesList,
+          rowHasContent,
+          collectDeclaredVariableNames,
+          "CONFLICT_MESSAGE"
+        );
+        run();
+
+        expect(calledWith).toBe(labelOnlyRow); // the fallback actually reached the row
+        expect(w1.textContent).toBe("CONFLICT_MESSAGE");
+        expect(w2.textContent).toBe("CONFLICT_MESSAGE");
+        expect(w1.classes.visible).toBe(true);
+        expect(w2.classes.visible).toBe(true);
+      });
+
+      it("stays hidden when every pending row is wholly blank, even with a trigger pattern present", () => {
+        const html = render([], null);
+        const updateTriggerConflictWarning = extractUpdateTriggerConflictWarning(html);
+        const blankRow = { __marker: "blank-row" };
+        const { w1, w2, stubDocument, stubVariablesList } = makeHarness("router#", [blankRow]);
+
+        const rowHasContent = () => false; // wholly untouched row
+        const collectDeclaredVariableNames = () => [];
+
+        const run = updateTriggerConflictWarning(
+          stubDocument,
+          stubVariablesList,
+          rowHasContent,
+          collectDeclaredVariableNames,
+          "CONFLICT_MESSAGE"
+        );
+        run();
+
+        expect(w1.textContent).toBe("");
+        expect(w1.classes.visible).toBe(false);
+      });
+
+      it("does not fall back to rowHasContent when a row already has a declared name", () => {
+        const html = render([], null);
+        const updateTriggerConflictWarning = extractUpdateTriggerConflictWarning(html);
+        const { w1, stubDocument, stubVariablesList } = makeHarness("router#", []);
+
+        let rowHasContentCalled = false;
+        const rowHasContent = () => { rowHasContentCalled = true; return false; };
+        const collectDeclaredVariableNames = () => ["host"]; // already has a declared name
+
+        const run = updateTriggerConflictWarning(
+          stubDocument,
+          stubVariablesList,
+          rowHasContent,
+          collectDeclaredVariableNames,
+          "CONFLICT_MESSAGE"
+        );
+        run();
+
+        expect(rowHasContentCalled).toBe(false); // short-circuited — hasVars already true
+        expect(w1.classes.visible).toBe(true);
+      });
     });
   });
 

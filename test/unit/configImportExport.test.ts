@@ -1217,6 +1217,35 @@ describe("share export command", () => {
 
     expect(mockWriteFile).not.toHaveBeenCalled();
   });
+
+  it("Fix 1 — a masked variable's plaintext default never reaches the exported share payload", async () => {
+    const shareStore = new InMemoryMacroStore();
+    await shareStore.initialize();
+    await shareStore.save([
+      {
+        name: "Login",
+        text: "login $password\n",
+        secret: false,
+        variables: [{ name: "password", secret: true, default: "hunter2" }]
+      }
+    ]);
+    setActiveMacroStore(shareStore);
+
+    const savedUri = { fsPath: "/fake/export-vars.json", scheme: "file" };
+    mockShowSaveDialog.mockResolvedValue(savedUri);
+    mockWriteFile.mockResolvedValue(undefined);
+
+    const exportCmd = registeredCommands.get("nexus.config.export")!;
+    await exportCmd();
+
+    expect(mockWriteFile).toHaveBeenCalledTimes(1);
+    const writtenText = Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8");
+    expect(writtenText).not.toContain("hunter2");
+
+    const writtenData = JSON.parse(writtenText);
+    const login = writtenData.macros.find((m: { name: string }) => m.name === "Login");
+    expect(login.variables).toEqual([{ name: "password", secret: true }]);
+  });
 });
 
 describe("backup export command", () => {
@@ -1834,6 +1863,44 @@ describe("share import", () => {
 
     const macros = macroStore.getAll();
     expect(macros).toHaveLength(1); // deduped — same name/text/trigger/keybinding/variables
+  });
+
+  it("Fix 2 — two entries in one share file that differ before sanitization but collide after it are deduped, not both stored", async () => {
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    setActiveMacroStore(macroStore);
+
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [
+        // Carries an extra invalid-named variable that sanitization drops —
+        // pre-sanitization this differs from the second entry, post-sanitization
+        // it is identical (same name/text/trigger/keybinding/variables=["host"]).
+        {
+          name: "cmd",
+          text: "run\n",
+          variables: [{ name: "host" }, { name: "2bad" }]
+        },
+        {
+          name: "cmd",
+          text: "run\n",
+          variables: [{ name: "host" }]
+        }
+      ]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-intra-file-dup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const macros = macroStore.getAll();
+    expect(macros).toHaveLength(1); // NOT two — the second entry collides with the first post-sanitization
+    expect(macros[0].variables?.map((v) => v.name)).toEqual(["host"]);
   });
 });
 

@@ -130,6 +130,36 @@ describe("macroCommands clipboard actions", () => {
   });
 });
 
+describe("macroCommands copyAllAsJson (Fix 1 — output-path sanitization)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    registerMacroCommands();
+  });
+
+  it("does not leak a masked variable's plaintext default into the clipboard JSON", async () => {
+    const macros = [
+      {
+        name: "Login",
+        text: "login $password\n",
+        variables: [{ name: "password", secret: true, default: "hunter2" }]
+      }
+    ];
+    mockGetMacros.mockReturnValue(macros);
+
+    const copyAllAsJson = registeredCommands.get("nexus.macro.copyAllAsJson");
+    expect(copyAllAsJson).toBeDefined();
+    await copyAllAsJson!();
+
+    expect(mockClipboardWriteText).toHaveBeenCalledTimes(1);
+    const written = mockClipboardWriteText.mock.calls[0][0] as string;
+    expect(written).not.toContain("hunter2");
+
+    const parsed = JSON.parse(written);
+    expect(parsed[0].variables).toEqual([{ name: "password", secret: true }]);
+  });
+});
+
 describe("macroCommands documentation actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();

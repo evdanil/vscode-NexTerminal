@@ -384,11 +384,18 @@ export function renderMacroEditorHtml(
 
       function updateTriggerConflictWarning() {
         var triggerVal = document.getElementById("macro-trigger").value.trim();
-        // §9.4 — a blank/whitespace-only row is "not yet filled in", not a
-        // declared variable (matches collectVariablesForSave below); it must not
-        // trip the mutually-exclusive warning by itself, e.g. right after
-        // clicking "+ Add Variable" once on an existing trigger macro.
+        // §9.4 — a wholly untouched row is "not yet filled in" and must not trip the
+        // mutually-exclusive warning by itself, e.g. right after clicking
+        // "+ Add Variable" once on an existing trigger macro. But a row the user has
+        // started filling in counts even before the name is typed, otherwise the
+        // conflict stays hidden right up until Save and then appears out of nowhere.
         var hasVars = collectDeclaredVariableNames().length > 0;
+        if (!hasVars) {
+          var pending = variablesList.querySelectorAll(".variable-row");
+          for (var pi = 0; pi < pending.length; pi++) {
+            if (rowHasContent(pending[pi])) { hasVars = true; break; }
+          }
+        }
         var show = !!triggerVal && hasVars;
         var w1 = document.getElementById("variables-trigger-conflict");
         var w2 = document.getElementById("variables-trigger-conflict-2");

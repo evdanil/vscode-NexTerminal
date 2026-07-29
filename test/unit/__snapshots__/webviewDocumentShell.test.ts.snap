@@ -276,7 +276,13 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
     /* Reserved height so hints appearing/disappearing under Text don't bounce
        the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
     .variables-diagnostics {
-      min-height: 32px;
+      /* Bounded, not just a minimum: the point of reserving this strip is that
+         hints appearing and disappearing per keystroke must not shift the controls
+         below it. A macro referencing several undeclared shell-style placeholders
+         produces one hint per name, so the strip scrolls past three rather than
+         growing without limit. */
+      height: 54px;
+      overflow-y: auto;
       font-size: 11px;
       line-height: 1.6;
       margin-top: 6px;
@@ -1028,7 +1034,13 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
     /* Reserved height so hints appearing/disappearing under Text don't bounce
        the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
     .variables-diagnostics {
-      min-height: 32px;
+      /* Bounded, not just a minimum: the point of reserving this strip is that
+         hints appearing and disappearing per keystroke must not shift the controls
+         below it. A macro referencing several undeclared shell-style placeholders
+         produces one hint per name, so the strip scrolls past three rather than
+         growing without limit. */
+      height: 54px;
+      overflow-y: auto;
       font-size: 11px;
       line-height: 1.6;
       margin-top: 6px;
@@ -1851,7 +1863,13 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
     /* Reserved height so hints appearing/disappearing under Text don't bounce
        the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
     .variables-diagnostics {
-      min-height: 32px;
+      /* Bounded, not just a minimum: the point of reserving this strip is that
+         hints appearing and disappearing per keystroke must not shift the controls
+         below it. A macro referencing several undeclared shell-style placeholders
+         produces one hint per name, so the strip scrolls past three rather than
+         growing without limit. */
+      height: 54px;
+      overflow-y: auto;
       font-size: 11px;
       line-height: 1.6;
       margin-top: 6px;
@@ -2674,7 +2692,13 @@ exports[`webview document shell (byte-identity guard) > highlight rule editor 1`
     /* Reserved height so hints appearing/disappearing under Text don't bounce
        the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
     .variables-diagnostics {
-      min-height: 32px;
+      /* Bounded, not just a minimum: the point of reserving this strip is that
+         hints appearing and disappearing per keystroke must not shift the controls
+         below it. A macro referencing several undeclared shell-style placeholders
+         produces one hint per name, so the strip scrolls past three rather than
+         growing without limit. */
+      height: 54px;
+      overflow-y: auto;
       font-size: 11px;
       line-height: 1.6;
       margin-top: 6px;
@@ -3775,7 +3799,13 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
     /* Reserved height so hints appearing/disappearing under Text don't bounce
        the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
     .variables-diagnostics {
-      min-height: 32px;
+      /* Bounded, not just a minimum: the point of reserving this strip is that
+         hints appearing and disappearing per keystroke must not shift the controls
+         below it. A macro referencing several undeclared shell-style placeholders
+         produces one hint per name, so the strip scrolls past three rather than
+         growing without limit. */
+      height: 54px;
+      overflow-y: auto;
       font-size: 11px;
       line-height: 1.6;
       margin-top: 6px;
@@ -4348,11 +4378,18 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
 
       function updateTriggerConflictWarning() {
         var triggerVal = document.getElementById("macro-trigger").value.trim();
-        // §9.4 — a blank/whitespace-only row is "not yet filled in", not a
-        // declared variable (matches collectVariablesForSave below); it must not
-        // trip the mutually-exclusive warning by itself, e.g. right after
-        // clicking "+ Add Variable" once on an existing trigger macro.
+        // §9.4 — a wholly untouched row is "not yet filled in" and must not trip the
+        // mutually-exclusive warning by itself, e.g. right after clicking
+        // "+ Add Variable" once on an existing trigger macro. But a row the user has
+        // started filling in counts even before the name is typed, otherwise the
+        // conflict stays hidden right up until Save and then appears out of nowhere.
         var hasVars = collectDeclaredVariableNames().length > 0;
+        if (!hasVars) {
+          var pending = variablesList.querySelectorAll(".variable-row");
+          for (var pi = 0; pi < pending.length; pi++) {
+            if (rowHasContent(pending[pi])) { hasVars = true; break; }
+          }
+        }
         var show = !!triggerVal && hasVars;
         var w1 = document.getElementById("variables-trigger-conflict");
         var w2 = document.getElementById("variables-trigger-conflict-2");
@@ -5089,7 +5126,13 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
     /* Reserved height so hints appearing/disappearing under Text don't bounce
        the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
     .variables-diagnostics {
-      min-height: 32px;
+      /* Bounded, not just a minimum: the point of reserving this strip is that
+         hints appearing and disappearing per keystroke must not shift the controls
+         below it. A macro referencing several undeclared shell-style placeholders
+         produces one hint per name, so the strip scrolls past three rather than
+         growing without limit. */
+      height: 54px;
+      overflow-y: auto;
       font-size: 11px;
       line-height: 1.6;
       margin-top: 6px;
@@ -6555,7 +6598,13 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
     /* Reserved height so hints appearing/disappearing under Text don't bounce
        the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
     .variables-diagnostics {
-      min-height: 32px;
+      /* Bounded, not just a minimum: the point of reserving this strip is that
+         hints appearing and disappearing per keystroke must not shift the controls
+         below it. A macro referencing several undeclared shell-style placeholders
+         produces one hint per name, so the strip scrolls past three rather than
+         growing without limit. */
+      height: 54px;
+      overflow-y: auto;
       font-size: 11px;
       line-height: 1.6;
       margin-top: 6px;
@@ -7592,7 +7641,13 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
     /* Reserved height so hints appearing/disappearing under Text don't bounce
        the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
     .variables-diagnostics {
-      min-height: 32px;
+      /* Bounded, not just a minimum: the point of reserving this strip is that
+         hints appearing and disappearing per keystroke must not shift the controls
+         below it. A macro referencing several undeclared shell-style placeholders
+         produces one hint per name, so the strip scrolls past three rather than
+         growing without limit. */
+      height: 54px;
+      overflow-y: auto;
       font-size: 11px;
       line-height: 1.6;
       margin-top: 6px;

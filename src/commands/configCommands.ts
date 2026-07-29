@@ -5,7 +5,7 @@ import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
 import type { MacroTriggerScope, MacroVariable, TerminalMacro } from "../models/terminalMacro";
-import { isValidVariableName, MAX_MACRO_VARIABLES } from "../services/macroVariables";
+import { isValidVariableName, MAX_MACRO_VARIABLES, withSanitizedVariables } from "../services/macroVariables";
 import type { SecretVault } from "../services/ssh/contracts";
 import {
   passwordSecretKey,
@@ -611,7 +611,9 @@ export function sanitizeForSharing(
 
   const sanitizedMacros = macros
     .filter((m) => !m.secret)
-    .map((m) => ({ ...m, id: randomUUID() })); // fresh ids for share exports
+    // fresh ids for share exports; variable declarations normalized so a masked
+    // variable's plaintext `default` never leaves this machine in a share file.
+    .map((m) => withSanitizedVariables({ ...m, id: randomUUID() }));
 
   // Sanitize paths from the settings snapshot.
   const sanitizedSettings = { ...settings };
@@ -1244,7 +1246,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         // an over-cap or malformed `variables` array, or a variables+trigger macro
         // whose auto-trigger can never compile.
         const remapped: TerminalMacro = sanitizeImportedMacro({ ...m, id: randomUUID() });
-        if (!existingByKey.has(keyOf(remapped))) {
+        const key = keyOf(remapped);
+        if (!existingByKey.has(key)) {
+          // Record the key as we go: two entries in one share file can differ before
+          // sanitization and be identical after it (e.g. one carries an extra
+          // invalid-named variable that gets dropped), and would otherwise both land.
+          existingByKey.add(key);
           merged.push(remapped);
         }
       }

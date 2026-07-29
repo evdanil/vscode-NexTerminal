@@ -272,7 +272,13 @@ export function baseWebviewCss(): string {
     /* Reserved height so hints appearing/disappearing under Text don't bounce
        the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
     .variables-diagnostics {
-      min-height: 32px;
+      /* Bounded, not just a minimum: the point of reserving this strip is that
+         hints appearing and disappearing per keystroke must not shift the controls
+         below it. A macro referencing several undeclared shell-style placeholders
+         produces one hint per name, so the strip scrolls past three rather than
+         growing without limit. */
+      height: 54px;
+      overflow-y: auto;
       font-size: 11px;
       line-height: 1.6;
       margin-top: 6px;

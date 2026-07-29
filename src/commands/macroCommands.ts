@@ -21,7 +21,7 @@ import {
   normalizeBinding
 } from "../macroBindingHelpers";
 import { repositoryBlobUrl } from "../utils/repositoryLinks";
-import { getValidMacroVariables, hasMacroVariables, scanPlaceholders } from "../services/macroVariables";
+import { getValidMacroVariables, hasMacroVariables, scanPlaceholders, withSanitizedVariables } from "../services/macroVariables";
 import { runMacro } from "./macroVariablePrompt";
 // NOT imported from "../ui/macroTreeProvider": that module's `class MacroTreeItem
 // extends vscode.TreeItem` executes at load time, and a plain value import from
@@ -539,7 +539,10 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
 
     vscode.commands.registerCommand("nexus.macro.copyAllAsJson", async () => {
       const macros = getMacros();
-      const sanitized = macros.map((m) => m.secret ? { ...m, text: "" } : m);
+      // Redact macro-level secret text AND normalize variable declarations: a masked
+      // variable's `default` is plaintext, and unsanitized ingestion paths (legacy
+      // settings absorption) can persist one that the runtime never reads.
+      const sanitized = macros.map((m) => withSanitizedVariables(m.secret ? { ...m, text: "" } : m));
       await vscode.env.clipboard.writeText(JSON.stringify(sanitized, null, 2));
       const secretCount = macros.filter((m) => m.secret).length;
       const suffix = secretCount > 0

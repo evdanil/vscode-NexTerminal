@@ -198,6 +198,33 @@ export function getValidMacroVariables(macro: Pick<TerminalMacro, "variables">):
   return out;
 }
 
+/**
+ * Returns a copy of `macro` whose `variables` have been normalized to the storable /
+ * shareable shape — invalid entries dropped, duplicates collapsed, and `default` /
+ * `remember` stripped from masked entries. The key is removed entirely when nothing
+ * survives.
+ *
+ * Needed because `getValidMacroVariables()` only protects *read* sites, and not every
+ * consumer of a macro is a read site: `Copy All as JSON`, share export, and legacy
+ * settings absorption all pass `macro.variables` through verbatim. A masked variable
+ * carrying a plaintext `default` — which the editor blocks but a hand-written
+ * settings.json or share file does not — would otherwise reach globalState, the
+ * clipboard, and an exported share file, even though the runtime never uses it.
+ */
+export function withSanitizedVariables<T extends Pick<TerminalMacro, "variables">>(macro: T): T {
+  if (!hasMacroVariables(macro)) {
+    if (macro.variables === undefined) return macro;
+    const stripped = { ...macro };
+    delete stripped.variables;
+    return stripped;
+  }
+  const variables = getValidMacroVariables(macro);
+  const out = { ...macro };
+  if (variables.length > 0) out.variables = variables;
+  else delete out.variables;
+  return out;
+}
+
 export interface MacroVariableValidationError {
   /** Row index into the (pre-filter) variables array; undefined for array-level issues. */
   index?: number;

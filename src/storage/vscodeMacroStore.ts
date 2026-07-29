@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { TerminalMacro } from "../models/terminalMacro";
 import type { MacroStore, MacroStoreChangeListener } from "./macroStore";
+import { withSanitizedVariables } from "../services/macroVariables";
 
 const MACROS_KEY = "nexus.macros";
 const SECRET_IDS_KEY = "nexus.macros.secretIds";
@@ -203,7 +204,11 @@ export class VscodeMacroStore implements MacroStore {
   }
 
   private async persistLegacyMigration(macros: TerminalMacro[]): Promise<void> {
-    const assigned = macros.map((m) => ({
+    // Variables are normalized here rather than only at read time: this path absorbs
+    // `nexus.terminal.macros` from settings.json verbatim on every activation
+    // (Settings Sync replay included), so without it a hand-written masked variable
+    // carrying a plaintext `default` would be written straight into globalState.
+    const assigned = macros.map((m) => withSanitizedVariables({
       ...m,
       id: m.id && typeof m.id === "string" ? m.id : randomUUID()
     }));
