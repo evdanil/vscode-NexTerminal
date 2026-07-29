@@ -1326,6 +1326,41 @@ describe("backup export command", () => {
     expect(writtenData.servers[0].id).toBe("s1");
   });
 
+  it("Fix 2 — strips a masked variable's plaintext default from the top-level (cleartext) macros array", async () => {
+    // The InMemoryMacroStore used here does NOT itself sanitize on save() (only
+    // VscodeMacroStore does, at its own persistence chokepoint) — so if this
+    // assertion passes, it's specifically because configCommands.ts's own
+    // `withSanitizedVariables(nonSecretForTopLevel)` call did the stripping, not
+    // because the store already cleaned the data before we saw it.
+    const backupExportStore = new InMemoryMacroStore();
+    await backupExportStore.initialize();
+    await backupExportStore.save([
+      {
+        name: "Login",
+        text: "login $password\n",
+        variables: [{ name: "password", label: "Password", secret: true, default: "hunter2" }]
+      }
+    ]);
+    setActiveMacroStore(backupExportStore);
+
+    mockShowInputBox
+      .mockResolvedValueOnce("testpass123")
+      .mockResolvedValueOnce("testpass123");
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+    mockWriteFile.mockResolvedValue(undefined);
+
+    const backupCmd = registeredCommands.get("nexus.config.export.backup")!;
+    await backupCmd();
+
+    const writtenData = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+    expect(Array.isArray(writtenData.macros)).toBe(true);
+    // The `macros` array sits OUTSIDE `encryptedSecrets` — the whole point of the
+    // fix is that this plaintext default never appears anywhere in the backup file.
+    expect(JSON.stringify(writtenData)).not.toContain("hunter2");
+    const loginMacro = writtenData.macros.find((m: { name: string }) => m.name === "Login");
+    expect(loginMacro.variables).toEqual([{ name: "password", label: "Password", secret: true }]);
+  });
+
   it("exports the user .ssh folder and resolved scripts folder inside encrypted secrets", async () => {
     const sshDir = path.join(os.homedir(), ".ssh");
     const scriptsDir = "/workspace/.nexus/scripts";

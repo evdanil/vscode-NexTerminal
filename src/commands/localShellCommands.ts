@@ -13,6 +13,7 @@ import { LocalShellProfileTreeItem, LocalShellSessionTreeItem } from "../ui/nexu
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { INVALID_FOLDER_PATH_MESSAGE, normalizeOptionalFolderPath } from "../utils/folderPaths";
 import { naturalCompare } from "../utils/naturalCompare";
+import { hasMacroVariables } from "../services/macroVariables";
 import { collectGroups } from "./serverCommands";
 import type { CommandContext, LocalShellTerminalEntry } from "./types";
 
@@ -410,6 +411,10 @@ function localShellDescription(profile: LocalShellProfile): string {
 function hasAllTerminalAutoTriggerMacros(): boolean {
   return getMacros().some((macro) =>
     Boolean(macro.triggerPattern) &&
+    // A macro declaring variables never compiles to a trigger rule
+    // (MacroAutoTrigger.reload skips it), so warning that it could fire in a Local
+    // Shell would be warning about something that cannot happen.
+    !hasMacroVariables(macro) &&
     (macro.triggerScope === undefined || macro.triggerScope === "all-terminals")
   );
 }

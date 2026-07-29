@@ -231,6 +231,49 @@ describe("VscodeMacroStore", () => {
   });
 });
 
+describe("VscodeMacroStore — masked variable default sanitization at persistence chokepoints (Fix 1)", () => {
+  const dirtyVariable = { name: "password", label: "Password", secret: true, default: "hunter2" };
+  const sanitizedVariable = { name: "password", label: "Password", secret: true };
+
+  it("save() strips a masked variable's plaintext default before it reaches globalState", async () => {
+    const { context, stateBag } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+    await store.save([
+      { id: "a", name: "Login", text: "login $password\n", variables: [dirtyVariable] }
+    ]);
+
+    const persisted = stateBag.get("nexus.macros") as TerminalMacro[];
+    expect(persisted).toHaveLength(1);
+    expect(JSON.stringify(persisted)).not.toContain("hunter2");
+    // The declaration itself survives — only the plaintext default is stripped.
+    expect(persisted[0].variables).toEqual([sanitizedVariable]);
+
+    expect(JSON.stringify(store.getAll())).not.toContain("hunter2");
+    expect(store.getAll()[0].variables).toEqual([sanitizedVariable]);
+  });
+
+  it("reloadFromState() strips a masked variable's plaintext default already sitting in globalState from an earlier build", async () => {
+    const { context, stateBag } = makeFakeContext();
+    // Simulate a record persisted by a build that predates this fix — written
+    // directly into globalState, bypassing save() (and therefore its sanitization)
+    // entirely.
+    stateBag.set("nexus.macros", [
+      { id: "a", name: "Login", text: "login $password\n", variables: [dirtyVariable] }
+    ]);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    const all = store.getAll();
+    expect(all).toHaveLength(1);
+    expect(JSON.stringify(all)).not.toContain("hunter2");
+    // The variable NAME (and other non-forbidden fields) still survive — we strip
+    // the default, not the declaration.
+    expect(all[0].variables).toEqual([sanitizedVariable]);
+  });
+});
+
 describe("VscodeMacroStore corrupt globalState shape", () => {
   // A context whose globalState returns the default ONLY when the key is absent,
   // mirroring VS Code: a corrupt stored value (object/string/null/number) is

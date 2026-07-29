@@ -907,8 +907,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
         // Collect all macros from the store
         const allMacros = getMacros(); // resolved — secret text included
+        // This array sits OUTSIDE `encryptedSecrets`, i.e. in the backup file's
+        // cleartext — so a masked variable's plaintext `default` here would be
+        // readable without the backup password.
         const nonSecretForTopLevel: TerminalMacro[] = allMacros.map((m) =>
-          m.secret ? { ...m, text: "" } : { ...m }
+          withSanitizedVariables(m.secret ? { ...m, text: "" } : { ...m })
         );
         const secretMacroBlobs = allMacros
           .filter((m) => m.secret && m.id)

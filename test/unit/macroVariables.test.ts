@@ -437,6 +437,17 @@ describe("macroVariablesWebviewJs", () => {
     expect(js).toContain("function scanMacroPlaceholders(");
   });
 
+  it("Fix 4 — does not start with a newline (the call site is indented, so a leading newline would leave a whitespace-only line behind)", () => {
+    const js = macroVariablesWebviewJs();
+    expect(js.startsWith("\n")).toBe(false);
+  });
+
+  it("Fix 4 — contains no whitespace-only line (would fail `git diff --check` once embedded in the rendered macro editor HTML)", () => {
+    const js = macroVariablesWebviewJs();
+    const whitespaceOnlyLines = js.split("\n").filter((line) => line.length > 0 && /^\s+$/.test(line));
+    expect(whitespaceOnlyLines).toEqual([]);
+  });
+
   // Cross-checked by embedded source string, not by executing the generated JS
   // (no `new Function`/`eval` in tests) — mirrors the existing
   // `regexSafety.test.ts` precedent, which only exercises the TS side directly.

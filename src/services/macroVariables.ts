@@ -279,8 +279,10 @@ export function validateMacroVariables(
  * authoritative TypeScript implementation above.
  */
 export function macroVariablesWebviewJs(): string {
-  return `
-      function isValidVariableName(name) {
+  // No leading newline: the call site is indented, so a leading "\n" would leave that
+  // indentation behind as a whitespace-only line and make `git diff --check` fail on
+  // the rendered-HTML snapshot.
+  return `function isValidVariableName(name) {
         var namePattern = new RegExp(${serializeForInlineScript(MACRO_VARIABLE_NAME_PATTERN.source)});
         return typeof name === "string" && namePattern.test(name);
       }

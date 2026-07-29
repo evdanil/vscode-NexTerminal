@@ -630,4 +630,27 @@ describe("renderMacroEditorHtml", () => {
     expect(html).not.toContain('placeholder="Server or serial profile id"');
     expect(html).not.toContain('type="text" id="macro-trigger-profile"');
   });
+
+  // NOTE: a whole-document sweep (every line of the fully rendered HTML) is NOT
+  // used here because it also flags several PRE-EXISTING whitespace-only lines
+  // that are unrelated to Fix 4 and out of scope for this change (reported
+  // separately, not fixed): a leading "\n" in baseWebviewCss() (right after
+  // `<style>`), a leading "\n" in baseWebviewJs() (right after `<script>`), a
+  // leading "\n" in regexSafetyWebviewJs(), and the `${emptyStateHtml}` slot at
+  // the top of the body template collapsing to a bare-indent line whenever at
+  // least one macro exists. This guard is scoped to the exact call site Fix 4
+  // changed — `${macroVariablesWebviewJs()}` embedded (indented) inside the
+  // `<script>` block — so it fails only if THIS class of defect returns here.
+  it("Fix 4 guard — no whitespace-only line immediately precedes the embedded macro-variable scan functions in the rendered HTML", () => {
+    const html = render(
+      [{ id: "m1", name: "Login", text: "login $password\n", variables: [{ name: "password", secret: true }] }],
+      0
+    );
+    const lines = html.split("\n");
+    const embedIndex = lines.findIndex((line) => line.includes("function isValidVariableName("));
+    expect(embedIndex).toBeGreaterThan(0);
+    const precedingLine = lines[embedIndex - 1];
+    const isWhitespaceOnly = precedingLine.length > 0 && /^\s+$/.test(precedingLine);
+    expect(isWhitespaceOnly).toBe(false);
+  });
 });

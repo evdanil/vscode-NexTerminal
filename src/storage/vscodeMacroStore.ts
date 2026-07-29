@@ -61,7 +61,10 @@ export class VscodeMacroStore implements MacroStore {
   }
 
   public async save(macros: TerminalMacro[]): Promise<void> {
-    const normalized: TerminalMacro[] = macros.map((m) => ({
+    // Sanitizing here rather than at each consumer makes this the chokepoint: every
+    // write to globalState goes through `save()`, so a masked variable's plaintext
+    // `default` can never be persisted regardless of which caller supplied it.
+    const normalized: TerminalMacro[] = macros.map((m) => withSanitizedVariables({
       ...m,
       id: m.id && m.id.length > 0 ? m.id : randomUUID()
     }));
@@ -138,11 +141,15 @@ export class VscodeMacroStore implements MacroStore {
     for (const entry of raw) {
       if (!entry || typeof entry !== "object") continue;
       const id = entry.id && typeof entry.id === "string" ? entry.id : randomUUID();
+      // Sanitized on the way in as well as on the way out (`save()`), so a record
+      // already sitting in globalState from an earlier build cannot leak a masked
+      // variable's plaintext default into `getAll()` — and therefore into Copy All,
+      // share export, or an encrypted backup's cleartext `macros` array.
       if (entry.secret) {
         const vaulted = await this.context.secrets.get(macroSecretKey(id));
-        resolved.push({ ...entry, id, text: vaulted ?? "" });
+        resolved.push(withSanitizedVariables({ ...entry, id, text: vaulted ?? "" }));
       } else {
-        resolved.push({ ...entry, id });
+        resolved.push(withSanitizedVariables({ ...entry, id }));
       }
     }
     this.resolved = resolved;

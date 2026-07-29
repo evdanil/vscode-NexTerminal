@@ -4259,7 +4259,6 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
       // §9.3 — the scan is authoritative in src/services/macroVariables.ts; this
       // webview must never re-implement it (mirrors the regexSafetyWebviewJs()
       // precedent above).
-      
       function isValidVariableName(name) {
         var namePattern = new RegExp("^[A-Za-z_][A-Za-z0-9_]{0,31}$");
         return typeof name === "string" && namePattern.test(name);
