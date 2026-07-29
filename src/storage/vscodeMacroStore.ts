@@ -226,7 +226,10 @@ export class VscodeMacroStore implements MacroStore {
 
 function keyOfLegacy(m: TerminalMacro): string {
   const textKey = m.secret ? "__SECRET__" : (m.text ?? "");
-  return `${m.name ?? ""}|${textKey}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}`;
+  // §10 — same key as configCommands.ts's keyOf(): two macros differing only in
+  // their variable declarations must not collide; append the variable names.
+  const variableNames = Array.isArray(m.variables) ? m.variables.map((v) => v?.name ?? "").join(",") : "";
+  return `${m.name ?? ""}|${textKey}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}|${variableNames}`;
 }
 
 /** Dedupe legacy macros by `name|text|triggerPattern|keybinding`. First occurrence wins. */

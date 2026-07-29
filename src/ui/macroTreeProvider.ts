@@ -3,6 +3,10 @@ import { bindingToDisplayLabel } from "../macroBindings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { TerminalMacro } from "../models/terminalMacro";
 import { getMacros } from "../macroSettings";
+import { getValidMacroVariables, hasMacroVariables, scanPlaceholders } from "../services/macroVariables";
+
+/** \u00a79.6 marker prefix for variable macros in the sidebar description. */
+const VARIABLE_MARKER = "\u2338 ";
 
 export class MacroTreeItem extends vscode.TreeItem {
   public constructor(
@@ -14,11 +18,17 @@ export class MacroTreeItem extends vscode.TreeItem {
     const prefix = displayBinding ? `[${bindingToDisplayLabel(displayBinding)}] ` : "";
     super(`${prefix}${macro.name}`, vscode.TreeItemCollapsibleState.None);
     this.id = `macro:${index}`;
+
+    // \u00a74.2 \u2014 `variables` is untrusted at every read site: shape-guarded helpers
+    // only, never a bare `macro.variables` truthy check.
+    const hasVariables = hasMacroVariables(macro);
+    const variableMarker = hasVariables ? VARIABLE_MARKER : "";
+
     if (macro.secret) {
-      this.description = "\u2022\u2022\u2022\u2022\u2022";
+      this.description = `${variableMarker}\u2022\u2022\u2022\u2022\u2022`;
     } else {
       const preview = macro.text.replace(/\n/g, "\u21b5");
-      this.description = `\u2192 ${preview.length > 40 ? preview.slice(0, 37) + "..." : preview}`;
+      this.description = `${variableMarker}\u2192 ${preview.length > 40 ? preview.slice(0, 37) + "..." : preview}`;
     }
     this.command = {
       command: "nexus.macro.runItem",
@@ -31,7 +41,27 @@ export class MacroTreeItem extends vscode.TreeItem {
     } else {
       this.tooltip = `${macro.name}${bindingHint}\n${macro.text.replace(/\n/g, "\\n")}`;
     }
-    if (macro.triggerPattern) {
+
+    // \u00a79.6 \u2014 names only; values do not exist at this point. Only names whose
+    // placeholder actually appears (unescaped) in the text are ever prompted
+    // for (\u00a75.3), so this mirrors runMacro()'s own scan rather than just
+    // listing every declaration.
+    if (hasVariables) {
+      const declaredNames = getValidMacroVariables(macro).map((v) => v.name);
+      const promptedNames = scanPlaceholders(macro.text, declaredNames).used;
+      if (promptedNames.length > 0) {
+        this.tooltip += `\nPrompts for: ${promptedNames.join(", ")}`;
+      }
+    }
+
+    // \u00a76.3 \u2014 a macro with BOTH a triggerPattern and variables must never
+    // render as a live trigger macro: macroAutoTrigger.reload()'s in-loop
+    // `continue` means such a rule never compiles, so the zap icon,
+    // enable/disable toggle, and "active"/"paused" tooltip would all be dead
+    // controls for a rule that can never fire.
+    const isTriggerMacro = !!macro.triggerPattern && !hasVariables;
+
+    if (isTriggerMacro) {
       const state = triggerDisabled ? "paused" : "active";
       const intervalHint = macro.triggerInterval ? `, every ${macro.triggerInterval}s` : "";
       this.tooltip += `\nAuto-trigger: /${macro.triggerPattern}/ (${state}${intervalHint})`;
@@ -39,8 +69,14 @@ export class MacroTreeItem extends vscode.TreeItem {
       this.contextValue = macro.secret ? base.replace("nexus.macro.", "nexus.macro.secret.") : base;
       this.iconPath = new vscode.ThemeIcon(triggerDisabled ? "circle-slash" : "zap");
     } else {
+      if (hasVariables && macro.triggerPattern) {
+        this.tooltip += "\nAuto-trigger suppressed: macro has variables";
+      }
+      // contextValue is intentionally UNCHANGED for variable macros (\u00a79.6) \u2014
+      // only the icon and tooltip differ; the context menu stays the one for
+      // a plain (or secret) macro.
       this.contextValue = macro.secret ? "nexus.macro.secret" : "nexus.macro";
-      this.iconPath = new vscode.ThemeIcon(macro.secret ? "lock" : "terminal");
+      this.iconPath = new vscode.ThemeIcon(hasVariables ? "symbol-parameter" : (macro.secret ? "lock" : "terminal"));
     }
   }
 }

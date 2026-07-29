@@ -21,6 +21,8 @@ import {
   normalizeBinding
 } from "../macroBindingHelpers";
 import { repositoryBlobUrl } from "../utils/repositoryLinks";
+import { hasMacroVariables } from "../services/macroVariables";
+import { runMacro } from "./macroVariablePrompt";
 
 type MacroTemplate = {
   id: string;
@@ -74,11 +76,44 @@ export const MACRO_TEMPLATES: MacroTemplate[] = [
       triggerScope: "active-session",
       triggerInitiallyDisabled: true
     }
+  },
+  {
+    // §9.7 — the origin story for the whole feature (GitHub issue #35): the
+    // exact ipmitool line from the feature request, with host/username/password
+    // declared and password masked. Most first macros come from this picker, so
+    // without an entry here the feature is discoverable only by opening the
+    // editor and happening to notice the new Variables section.
+    id: "prompted-command",
+    label: "Prompted command",
+    description: "Prompt for host, username, and password, then run a templated command.",
+    macro: {
+      name: "IPMI SOL console",
+      text: "ipmitool -I lanplus -H $host -U $username -P $password sol activate\n",
+      variables: [
+        { name: "host", label: "Host" },
+        { name: "username", label: "Username" },
+        { name: "password", label: "Password", secret: true }
+      ]
+    }
   }
 ];
 
 function sendMacroText(text: string): void {
   void vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text });
+}
+
+/**
+ * Routes a macro run through `runMacro()` (target-pinned prompt-and-send) when it
+ * declares variables (§8.5), or through the unchanged `sendMacroText()` same-tick
+ * path otherwise — §8.1's "scope of the change": a macro with no variables must
+ * see zero behavior change (§4.1).
+ */
+async function runOrSendMacro(macro: TerminalMacro): Promise<void> {
+  if (hasMacroVariables(macro)) {
+    await runMacro(macro);
+  } else {
+    sendMacroText(macro.text);
+  }
 }
 
 function cloneMacro(macro: TerminalMacro): TerminalMacro {
@@ -307,9 +342,12 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         macros.map((m, i) => {
           const binding = getAssignedBinding(m);
           const prefix = binding ? `[${bindingToDisplayLabel(binding)}] ` : "";
+          // §9.6 — same marker as the sidebar: "click = sends immediately" and
+          // "click = opens prompts" are different enough behaviors to flag here too.
+          const marker = hasMacroVariables(m) ? "⌸ " : "";
           return {
             label: `${prefix}${m.name}`,
-            description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"),
+            description: `${marker}${m.secret ? "***" : m.text.replace(/\n/g, "\\n")}`,
             index: i
           };
         }),
@@ -318,10 +356,10 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (!pick) {
         return;
       }
-      sendMacroText(macros[pick.index].text);
+      await runOrSendMacro(macros[pick.index]);
     }),
 
-    vscode.commands.registerCommand("nexus.macro.runBinding", (arg?: unknown) => {
+    vscode.commands.registerCommand("nexus.macro.runBinding", async (arg?: unknown) => {
       const args = arg as { binding?: string } | undefined;
       const binding = normalizeBinding(args?.binding);
       if (!binding) {
@@ -330,11 +368,11 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       const macros = getMacros();
       const macro = macros.find((m) => getAssignedBinding(m) === binding);
       if (macro) {
-        sendMacroText(macro.text);
+        await runOrSendMacro(macro);
       }
     }),
 
-    vscode.commands.registerCommand("nexus.macro.slot", (arg?: unknown) => {
+    vscode.commands.registerCommand("nexus.macro.slot", async (arg?: unknown) => {
       const args = arg as { index?: number } | undefined;
       const index = args?.index;
       if (typeof index !== "number") {
@@ -347,20 +385,20 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       // First try new keybinding system
       const bindingMacro = macros.find((m) => getAssignedBinding(m) === targetBinding);
       if (bindingMacro) {
-        sendMacroText(bindingMacro.text);
+        await runOrSendMacro(bindingMacro);
         return;
       }
 
       const slotMacro = macros.find((m) => m.slot === targetSlot);
       if (slotMacro) {
-        sendMacroText(slotMacro.text);
+        await runOrSendMacro(slotMacro);
       }
     }),
 
-    vscode.commands.registerCommand("nexus.macro.runItem", (arg?: unknown) => {
+    vscode.commands.registerCommand("nexus.macro.runItem", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
       if (item) {
-        sendMacroText(item.macro.text);
+        await runOrSendMacro(item.macro);
       }
     }),
 

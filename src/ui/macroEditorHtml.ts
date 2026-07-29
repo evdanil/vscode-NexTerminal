@@ -4,9 +4,41 @@ import { baseWebviewJs } from "./shared/webviewScripts";
 import { serializeForInlineScript } from "./shared/inlineScriptData";
 import { renderWebviewDocument } from "./shared/webviewDocument";
 import { getAssignedBinding } from "../macroBindingHelpers";
-import type { TerminalMacro } from "../models/terminalMacro";
+import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./macroProfileOptions";
+import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } from "../services/macroVariables";
+
+/**
+ * One repeatable variable row (docs/plans/2026-07-29-macro-variables.md §9.1):
+ * two visible lines (name/label/default, then the two checkboxes + Remove) plus
+ * a per-row error slot addressed by `data-var-error` (§9.2). `index` seeds the
+ * row's error-slot addressing at render time; webview JS renumbers it on every
+ * add/remove so it always matches the DOM order the save handler collects.
+ */
+function renderVariableRow(variable: MacroVariable, index: number): string {
+  const name = escapeHtml(variable.name ?? "");
+  const label = escapeHtml(variable.label ?? "");
+  const isSecret = !!variable.secret;
+  // §7.1 — a default is forbidden on a masked variable (it would be plaintext
+  // in the store); never render one even if a malformed/legacy record has it.
+  const defaultValue = isSecret ? "" : escapeHtml(variable.default ?? "");
+  const dontRemember = variable.remember === false;
+  const removeLabel = escapeHtml(variable.name ? `Remove variable ${variable.name}` : "Remove variable");
+  return `<div class="variable-row" data-var-row="${index}">
+      <div class="variable-row-line1">
+        <input type="text" class="var-name" value="${name}" placeholder="name" maxlength="32" />
+        <input type="text" class="var-label" value="${label}" placeholder="label (optional)" />
+        <input type="text" class="var-default" value="${defaultValue}"${isSecret ? " disabled" : ""} placeholder="default" />
+      </div>
+      <div class="variable-row-line2">
+        <label><input type="checkbox" class="var-secret"${isSecret ? " checked" : ""} /> Mask input (never stored)</label>
+        <label><input type="checkbox" class="var-remember"${dontRemember ? " checked" : ""} /> Don't remember</label>
+        <button type="button" class="btn-secondary variable-remove-btn" aria-label="${removeLabel}">Remove</button>
+      </div>
+      <div class="field-error" data-var-error="${index}"></div>
+    </div>`;
+}
 
 export function renderMacroEditorHtml(
   macros: TerminalMacro[],
@@ -50,6 +82,11 @@ export function renderMacroEditorHtml(
   const nameValue = macro?.name ?? "";
   const textValue = macro?.text?.replace(/\n/g, "\n") ?? "";
   const isSecret = macro?.secret ?? false;
+  // §4.2 — `variables` is untrusted at every read site; `getValidMacroVariables`
+  // applies the shape guard so a corrupt legacy/Settings-Sync record never
+  // reaches row rendering.
+  const variables = macro ? getValidMacroVariables(macro) : [];
+  const variableRowsHtml = variables.map((variable, i) => renderVariableRow(variable, i)).join("\n");
   const isNew = selectedIndex === null;
   const saveLabel = isNew ? "Create" : "Save";
   const deleteDisabled = isNew ? " disabled" : "";
@@ -143,6 +180,18 @@ export function renderMacroEditorHtml(
     <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">${escapeHtml(textValue)}</textarea>
     <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline.</div>
     <div class="field-error" id="error-text"></div>
+    <div class="variables-diagnostics" id="variables-diagnostics" aria-live="polite"></div>
+  </div>
+
+  <div class="form-group">
+    <div class="variables-section-header">
+      <label style="margin-bottom:0;">Variables<span class="field-error variables-header-error" id="error-variables"></span></label>
+      <button type="button" class="btn-secondary" id="add-variable-btn">+ Add Variable</button>
+    </div>
+    <div id="variables-list">${variableRowsHtml}</div>
+    <template id="variable-row-template">${renderVariableRow({ name: "" }, 0)}</template>
+    <div class="hint">Referenced in the text as \${name} or $name. Undeclared placeholders are sent as-is.</div>
+    <div class="variables-trigger-conflict" id="variables-trigger-conflict"></div>
   </div>
 
   <div class="form-group form-group-checkbox">
@@ -156,6 +205,7 @@ export function renderMacroEditorHtml(
     <label for="macro-trigger">Auto-Trigger Pattern</label>
     <input type="text" id="macro-trigger" value="${escapeHtml(triggerValue)}" placeholder="e.g., [Pp]assword:\\s*$" />
     <div class="field-error" id="error-trigger"></div>
+    <div class="variables-trigger-conflict" id="variables-trigger-conflict-2"></div>
     <div class="hint">Enter the JavaScript regex pattern only, without surrounding /slashes/ or flags. Avoid risky shapes like (.*)+; use line-bounded text like [^\\n]*. When matched, this macro's text is sent automatically (expect/send).</div>
   </div>
 
@@ -232,6 +282,11 @@ export function renderMacroEditorHtml(
 
       var VALID_PATTERN = /^(alt\\+[a-z0-9]|alt\\+shift\\+[a-z0-9]|ctrl\\+shift\\+[a-z0-9])$/;
       ${regexSafetyWebviewJs()}
+      var MAX_VARIABLES = ${MAX_MACRO_VARIABLES};
+      // §9.3 — the scan is authoritative in src/services/macroVariables.ts; this
+      // webview must never re-implement it (mirrors the regexSafetyWebviewJs()
+      // precedent above).
+      ${macroVariablesWebviewJs()}
 
       function isValidBinding(value) {
         return VALID_PATTERN.test(value.trim().toLowerCase());
@@ -276,6 +331,228 @@ export function renderMacroEditorHtml(
         document.getElementById("dirty-flag").classList.remove("visible");
       }
 
+      // ---- Variables (docs/plans/2026-07-29-macro-variables.md §9.1-§9.5) ----
+      var variablesList = document.getElementById("variables-list");
+      var variableRowTemplate = document.getElementById("variable-row-template");
+      var TRIGGER_CONFLICT_MESSAGE = "A macro can prompt for input or auto-trigger, not both. For prompts on an automated flow, use a Script with prompt().";
+
+      // Row N's error slot is addressed by data-var-error="N" (§9.2). Renumbering
+      // on every add/remove keeps that index equal to the row's DOM position,
+      // which is also the position the save handler collects it at below.
+      function renumberVariableRows() {
+        var rows = variablesList.querySelectorAll(".variable-row");
+        for (var i = 0; i < rows.length; i++) {
+          rows[i].setAttribute("data-var-row", String(i));
+          var errSlot = rows[i].querySelector(".field-error");
+          if (errSlot) errSlot.setAttribute("data-var-error", String(i));
+        }
+      }
+
+      function updateRemoveAriaLabel(row) {
+        var nameInput = row.querySelector(".var-name");
+        var removeBtn = row.querySelector(".variable-remove-btn");
+        var name = nameInput.value.trim();
+        removeBtn.setAttribute("aria-label", name ? ("Remove variable " + name) : "Remove variable");
+      }
+
+      function collectDeclaredVariableNames() {
+        var rows = variablesList.querySelectorAll(".variable-row");
+        var names = [];
+        for (var i = 0; i < rows.length; i++) {
+          var n = rows[i].querySelector(".var-name").value.trim();
+          if (n) names.push(n);
+        }
+        return names;
+      }
+
+      function updateTriggerConflictWarning() {
+        var triggerVal = document.getElementById("macro-trigger").value.trim();
+        var hasVars = variablesList.querySelectorAll(".variable-row").length > 0;
+        var show = !!triggerVal && hasVars;
+        var w1 = document.getElementById("variables-trigger-conflict");
+        var w2 = document.getElementById("variables-trigger-conflict-2");
+        w1.textContent = show ? TRIGGER_CONFLICT_MESSAGE : "";
+        w2.textContent = show ? TRIGGER_CONFLICT_MESSAGE : "";
+        w1.classList.toggle("visible", show);
+        w2.classList.toggle("visible", show);
+      }
+
+      var diagnosticsTimer = null;
+      function scheduleDiagnostics() {
+        if (diagnosticsTimer) clearTimeout(diagnosticsTimer);
+        diagnosticsTimer = setTimeout(computeDiagnostics, 300);
+      }
+
+      // §9.3 — three hints, all non-blocking: (a) an undeclared placeholder with
+      // a one-click fix, (b) a declared-but-unused variable, (c) the positive
+      // confirmation once the macro is well-formed. Uses scanMacroPlaceholders()
+      // from macroVariablesWebviewJs() above — never a second scanner.
+      function computeDiagnostics() {
+        var text = document.getElementById("macro-text").value;
+        var declaredNames = collectDeclaredVariableNames();
+        var scan = scanMacroPlaceholders(text, declaredNames);
+        var container = document.getElementById("variables-diagnostics");
+        container.innerHTML = "";
+
+        var lines = [];
+        for (var u = 0; u < scan.undeclared.length; u++) {
+          (function(name) {
+            var line = document.createElement("div");
+            line.className = "diag-hint";
+            var span = document.createElement("span");
+            span.textContent = "$" + name + " is not declared and will be sent as-is.";
+            line.appendChild(span);
+            var btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn-secondary diag-add-btn";
+            btn.textContent = 'Add variable "' + name + '"';
+            btn.addEventListener("click", function() { addVariableRow(name); });
+            line.appendChild(btn);
+            lines.push(line);
+          })(scan.undeclared[u]);
+        }
+
+        var unused = declaredNames.filter(function(n) { return scan.used.indexOf(n) === -1; });
+        for (var w = 0; w < unused.length; w++) {
+          (function(name) {
+            var uline = document.createElement("div");
+            uline.className = "diag-hint";
+            uline.textContent = name + " is declared but $" + name + " / \${" + name + "} does not appear in the text.";
+            lines.push(uline);
+          })(unused[w]);
+        }
+
+        if (lines.length === 0 && scan.used.length > 0) {
+          var okLine = document.createElement("div");
+          okLine.className = "diag-positive";
+          okLine.textContent = "Will prompt for: " + scan.used.join(", ");
+          lines.push(okLine);
+        }
+
+        for (var li = 0; li < lines.length; li++) {
+          container.appendChild(lines[li]);
+        }
+      }
+
+      // Client-side pre-check of the §9.4 rules so the common cases never round-trip
+      // to the host; the host (macroEditorPanel.ts) re-validates with
+      // validateMacroVariables() regardless, since retainContextWhenHidden means
+      // this script can be stale relative to a store changed externally.
+      function validateVariablesClientSide(variables) {
+        var ok = true;
+        var seen = Object.create(null);
+        for (var i = 0; i < variables.length; i++) {
+          var v = variables[i];
+          var errEl = document.querySelector('[data-var-error="' + i + '"]');
+          var msg = "";
+          if (!isValidVariableName(v.name)) {
+            msg = '"' + v.name + '" is not a valid variable name.';
+          } else if (seen[v.name]) {
+            msg = 'Duplicate variable name "' + v.name + '".';
+          } else {
+            seen[v.name] = true;
+          }
+          if (!msg && v.secret && typeof v.default === "string" && v.default.length > 0) {
+            msg = '"' + v.name + '" is masked and cannot have a default value.';
+          }
+          if (errEl) errEl.textContent = msg;
+          if (msg) ok = false;
+        }
+        var arrayMsg = "";
+        if (variables.length > MAX_VARIABLES) {
+          arrayMsg = "A macro may declare at most " + MAX_VARIABLES + " variables.";
+        }
+        document.getElementById("error-variables").textContent = arrayMsg;
+        if (arrayMsg) ok = false;
+        return ok;
+      }
+
+      function collectVariablesForSave() {
+        var rows = variablesList.querySelectorAll(".variable-row");
+        var result = [];
+        for (var i = 0; i < rows.length; i++) {
+          var row = rows[i];
+          var name = row.querySelector(".var-name").value.trim();
+          var label = row.querySelector(".var-label").value.trim();
+          var isSecretRow = row.querySelector(".var-secret").checked;
+          var defaultVal = row.querySelector(".var-default").value;
+          var dontRemember = row.querySelector(".var-remember").checked;
+          var variable = { name: name };
+          if (label) variable.label = label;
+          if (isSecretRow) {
+            variable.secret = true;
+          } else if (defaultVal) {
+            variable.default = defaultVal;
+          }
+          if (dontRemember) variable.remember = false;
+          result.push(variable);
+        }
+        return result;
+      }
+
+      function bindVariableRow(row) {
+        var nameInput = row.querySelector(".var-name");
+        var labelInput = row.querySelector(".var-label");
+        var secretInput = row.querySelector(".var-secret");
+        var defaultInput = row.querySelector(".var-default");
+        var rememberInput = row.querySelector(".var-remember");
+        var removeBtn = row.querySelector(".variable-remove-btn");
+
+        nameInput.addEventListener("input", function() {
+          markDirty();
+          updateRemoveAriaLabel(row);
+          scheduleDiagnostics();
+          updateTriggerConflictWarning();
+        });
+        labelInput.addEventListener("input", markDirty);
+        defaultInput.addEventListener("input", markDirty);
+        secretInput.addEventListener("change", function() {
+          markDirty();
+          defaultInput.disabled = secretInput.checked;
+          if (secretInput.checked) defaultInput.value = "";
+        });
+        rememberInput.addEventListener("change", markDirty);
+        removeBtn.addEventListener("click", function() {
+          row.parentNode.removeChild(row);
+          renumberVariableRows();
+          markDirty();
+          scheduleDiagnostics();
+          updateTriggerConflictWarning();
+        });
+
+        updateRemoveAriaLabel(row);
+      }
+
+      function addVariableRow(prefillName) {
+        var rows = variablesList.querySelectorAll(".variable-row");
+        if (rows.length >= MAX_VARIABLES) {
+          document.getElementById("error-variables").textContent = "A macro may declare at most " + MAX_VARIABLES + " variables.";
+          return;
+        }
+        var fragment = variableRowTemplate.content.cloneNode(true);
+        var row = fragment.querySelector(".variable-row");
+        if (prefillName) {
+          row.querySelector(".var-name").value = prefillName;
+        }
+        variablesList.appendChild(row);
+        var addedRow = variablesList.lastElementChild;
+        bindVariableRow(addedRow);
+        renumberVariableRows();
+        markDirty();
+        scheduleDiagnostics();
+        updateTriggerConflictWarning();
+        // §9.1 — "+ Add Variable" moves focus into the new row's name input.
+        addedRow.querySelector(".var-name").focus();
+      }
+
+      var existingVariableRows = variablesList.querySelectorAll(".variable-row");
+      for (var vi = 0; vi < existingVariableRows.length; vi++) {
+        bindVariableRow(existingVariableRows[vi]);
+      }
+      document.getElementById("add-variable-btn").addEventListener("click", function() {
+        addVariableRow();
+      });
+
       function requestNewMacro() {
         if (dirty) {
           vscode.postMessage({ type: "confirmSwitch", targetValue: "__new__" });
@@ -303,13 +580,17 @@ export function renderMacroEditorHtml(
 
       // Track changes
       document.getElementById("macro-name").addEventListener("input", markDirty);
-      document.getElementById("macro-text").addEventListener("input", markDirty);
+      document.getElementById("macro-text").addEventListener("input", function() {
+        markDirty();
+        scheduleDiagnostics();
+      });
       document.getElementById("macro-secret").addEventListener("change", markDirty);
       document.getElementById("macro-trigger").addEventListener("input", function() {
         markDirty();
         var val = this.value.trim();
         var errorEl = document.getElementById("error-trigger");
         errorEl.textContent = validateTriggerPattern(val);
+        updateTriggerConflictWarning();
       });
       document.getElementById("macro-trigger-scope").addEventListener("change", function() {
         markDirty();
@@ -408,6 +689,19 @@ export function renderMacroEditorHtml(
         } else {
           document.getElementById("error-trigger-profile").textContent = "";
         }
+
+        var variablesForSave = collectVariablesForSave();
+        if (!validateVariablesClientSide(variablesForSave)) {
+          valid = false;
+        }
+        if (triggerVal && variablesForSave.length > 0) {
+          valid = false;
+          // Don't clobber a more specific (regex safety / empty-match) trigger
+          // error already set above — the conflict message is the fallback.
+          if (!document.getElementById("error-trigger").textContent) {
+            document.getElementById("error-trigger").textContent = TRIGGER_CONFLICT_MESSAGE;
+          }
+        }
         if (!valid) return;
 
         vscode.postMessage({
@@ -423,7 +717,8 @@ export function renderMacroEditorHtml(
           triggerInterval: isNaN(intervalVal) || intervalVal < 1 ? null : intervalVal,
           triggerInitiallyDisabled: triggerInitiallyDisabled,
           triggerScope: triggerScope,
-          triggerProfileId: triggerProfileId || null
+          triggerProfileId: triggerProfileId || null,
+          variables: variablesForSave
         });
       });
 
@@ -443,14 +738,27 @@ export function renderMacroEditorHtml(
           clearDirty();
         }
         if (msg.type === "saveError") {
-          var field = msg.field || "trigger";
-          var errEl = document.getElementById("error-" + field);
-          if (errEl) {
-            errEl.textContent = msg.message || "Could not save macro.";
+          // §9.2 — per-row errors address a data-var-error="N" slot, never
+          // an id (rows have no stable id; N is the row's DOM position).
+          if (msg.field === "variable" && typeof msg.row === "number") {
+            var rowErrEl = document.querySelector('[data-var-error="' + msg.row + '"]');
+            if (rowErrEl) {
+              rowErrEl.textContent = msg.message || "Invalid variable.";
+              rowErrEl.scrollIntoView({ block: "center" });
+            }
+          } else {
+            var field = msg.field || "trigger";
+            var errEl = document.getElementById("error-" + field);
+            if (errEl) {
+              errEl.textContent = msg.message || "Could not save macro.";
+              errEl.scrollIntoView({ block: "center" });
+            }
           }
         }
       });
       updateTriggerProfileState();
+      computeDiagnostics();
+      updateTriggerConflictWarning();
     })();`
   });
 }

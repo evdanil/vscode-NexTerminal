@@ -165,3 +165,94 @@ describe("collectIncomingMacros (direct)", () => {
     expect(result?.macros[1].triggerPattern).toBeUndefined();
   });
 });
+
+describe("collectIncomingMacros — variable sanitization (§10)", () => {
+  function importOne(macro: Record<string, unknown>): TerminalMacro {
+    const payload = {
+      version: 2 as const,
+      exportedAt: "",
+      macros: [macro] as TerminalMacro[]
+    };
+    return collectIncomingMacros(payload)!.macros[0];
+  }
+
+  it("drops a non-array variables shape", () => {
+    const result = importOne({ name: "m", text: "t", variables: "abc" });
+    expect(result.variables).toBeUndefined();
+  });
+
+  it("drops an object-shaped (non-array) variables value too", () => {
+    const result = importOne({ name: "m", text: "t", variables: { length: 5 } });
+    expect(result.variables).toBeUndefined();
+  });
+
+  it("drops entries with an invalid name, keeping the valid ones", () => {
+    const result = importOne({
+      name: "m",
+      text: "t",
+      variables: [{ name: "host" }, { name: "2bad" }, { name: "user name" }, "garbage", null]
+    });
+    expect(result.variables?.map((v) => v.name)).toEqual(["host"]);
+  });
+
+  it("drops duplicate names, keeping the first occurrence", () => {
+    const result = importOne({
+      name: "m",
+      text: "t",
+      variables: [
+        { name: "host", label: "first" },
+        { name: "host", label: "second" }
+      ]
+    });
+    expect(result.variables).toHaveLength(1);
+    expect(result.variables?.[0].label).toBe("first");
+  });
+
+  it("caps at 10 variables", () => {
+    const variables = Array.from({ length: 15 }, (_, i) => ({ name: `v${i}` }));
+    const result = importOne({ name: "m", text: "t", variables });
+    expect(result.variables).toHaveLength(10);
+  });
+
+  it("strips default and remember from a secret variable", () => {
+    const result = importOne({
+      name: "m",
+      text: "t",
+      variables: [{ name: "password", secret: true, default: "hunter2", remember: false }]
+    });
+    expect(result.variables?.[0]).toEqual({ name: "password", secret: true });
+  });
+
+  it("keeps default/remember on a non-secret variable", () => {
+    const result = importOne({
+      name: "m",
+      text: "t",
+      variables: [{ name: "host", default: "10.0.0.1", remember: false }]
+    });
+    expect(result.variables?.[0]).toEqual({ name: "host", default: "10.0.0.1", remember: false });
+  });
+
+  it("strips trigger fields when both variables and a triggerPattern survive sanitization (§6.2)", () => {
+    const result = importOne({
+      name: "m",
+      text: "t",
+      variables: [{ name: "host" }],
+      triggerPattern: "router#",
+      triggerScope: "all-terminals"
+    });
+    expect(result.variables?.map((v) => v.name)).toEqual(["host"]);
+    expect(result.triggerPattern).toBeUndefined();
+    expect(result.triggerScope).toBeUndefined();
+  });
+
+  it("a macro with no trigger at all still gets its variables sanitized (the common case)", () => {
+    const result = importOne({ name: "m", text: "t", variables: [{ name: "2bad" }, { name: "host" }] });
+    expect(result.variables?.map((v) => v.name)).toEqual(["host"]);
+  });
+
+  it("a macro with a valid trigger and no variables is unaffected by the new variables logic", () => {
+    const result = importOne({ name: "m", text: "t", triggerPattern: "router#" });
+    expect(result.variables).toBeUndefined();
+    expect(result.triggerPattern).toBe("router#");
+  });
+});

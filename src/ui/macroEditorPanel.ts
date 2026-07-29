@@ -10,14 +10,47 @@ import {
   getMacros,
   saveMacros
 } from "../macroSettings";
-import type { TerminalMacro } from "../models/terminalMacro";
+import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
+import { MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
 import type { MacroProfileOptionInput } from "./macroProfileOptions";
 import { createWebviewNonce } from "./shared/webviewNonce";
 
 type MacroProfileProvider = () => MacroProfileOptionInput[];
+
+/**
+ * Coerces the webview's raw `variables` payload into `MacroVariable[]`. The
+ * panel uses `retainContextWhenHidden`, so the webview's own client-side
+ * checks (macroEditorHtml.ts) can be stale relative to a store changed
+ * externally — this parse is defensive, not just a passthrough, and
+ * `default` is preserved even on a `secret` entry so `validateMacroVariables()`
+ * below can catch and report that combination rather than have it silently
+ * dropped before validation ever sees it.
+ */
+function parseIncomingVariables(raw: unknown): MacroVariable[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((entry): MacroVariable => {
+    const e = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+    const variable: MacroVariable = {
+      name: typeof e.name === "string" ? e.name.trim() : ""
+    };
+    if (typeof e.label === "string" && e.label.trim() !== "") {
+      variable.label = e.label.trim();
+    }
+    if (typeof e.default === "string" && e.default !== "") {
+      variable.default = e.default;
+    }
+    if (e.secret === true) {
+      variable.secret = true;
+    }
+    if (e.remember === false) {
+      variable.remember = false;
+    }
+    return variable;
+  });
+}
 
 export class MacroEditorPanel {
   private static instance: MacroEditorPanel | undefined;
@@ -224,6 +257,46 @@ export class MacroEditorPanel {
           }
         }
 
+        // §9.4 — host-side enforcement of every variable rule via the single
+        // shared validator (never re-implemented here or trusted from the
+        // webview alone; retainContextWhenHidden means the webview's own
+        // client-side pre-check can be stale relative to a store changed
+        // externally). Errors are routed to the sanctioned UI slot for each
+        // class: per-row errors carry `row` (data-var-error="N"); the
+        // variables/trigger conflict reuses the existing #error-trigger slot
+        // (it can only occur when triggerPattern is set and variables.length
+        // is within the cap, so it is always the remaining array-level error
+        // once "too many" is ruled out); anything else array-level (only
+        // "too many variables" today) goes to #error-variables.
+        const variables = parseIncomingVariables(msg.variables);
+        const variableErrors = validateMacroVariables(variables, {
+          triggerPattern: triggerPattern || undefined
+        });
+        if (variableErrors.length > 0) {
+          const first = variableErrors[0];
+          if (first.index !== undefined) {
+            void this.panel.webview.postMessage({
+              type: "saveError",
+              field: "variable",
+              row: first.index,
+              message: first.message
+            });
+          } else if (variables.length > MAX_MACRO_VARIABLES) {
+            void this.panel.webview.postMessage({
+              type: "saveError",
+              field: "variables",
+              message: first.message
+            });
+          } else {
+            void this.panel.webview.postMessage({
+              type: "saveError",
+              field: "trigger",
+              message: first.message
+            });
+          }
+          return;
+        }
+
         const existingMacro = index >= 0 ? macros[index] : undefined;
         const macro: TerminalMacro = { ...existingMacro, name, text };
         delete macro.keybinding;
@@ -232,6 +305,11 @@ export class MacroEditorPanel {
         delete macro.triggerInitiallyDisabled;
         delete macro.triggerInterval;
         delete macro.triggerProfileId;
+        // §9.5 — `variables` MUST join this delete-then-conditionally-re-add
+        // pattern. Without the unconditional delete here, clearing every row
+        // in the UI (variables === []) would silently resurrect the old array
+        // through the `{ ...existingMacro }` spread above.
+        delete macro.variables;
         if (secret) macro.secret = true;
         else delete macro.secret;
         const triggerCooldown = msg.triggerCooldown as number | undefined;
@@ -255,6 +333,9 @@ export class MacroEditorPanel {
           macro.triggerProfileId = triggerProfileId.trim();
         } else {
           delete macro.triggerProfileId;
+        }
+        if (variables.length > 0) {
+          macro.variables = variables;
         }
         const normalizedBinding = normalizeBinding(bindingRaw);
         if (normalizedBinding) {

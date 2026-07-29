@@ -17,6 +17,10 @@ automation that does not need a full script.
 The template includes a trailing newline, so running it sends the command and
 presses Enter.
 
+If you want a macro that asks you for input every time it runs — a host, a
+username, a password — skip ahead to **Variables**, below, and start from the
+**Prompted command** template instead of **Send command**.
+
 ## Blank Macros vs Template Macros
 
 Use **Add Macro From Template** when you are learning macros or want a safe
@@ -37,6 +41,9 @@ Built-in templates include:
   appears.
 - **Scoped auto-trigger example**: shows a prompt-triggered command that starts
   paused until you resume it.
+- **Prompted command**: prompts for host, username, and password, then sends a
+  templated `ipmitool` command — a complete worked example of **Variables**
+  (below).
 
 ## Sending Text and Newlines
 
@@ -77,6 +84,9 @@ Not protected:
   transcript files may contain it.
 - Anyone with access to the VS Code profile, SecretStorage backend, terminal
   session, clipboard, or remote host may be able to access the value.
+- A masked **variable** value (see **Variables**, below) is never persisted or
+  remembered, but once it is sent it is subject to the same terminal/host
+  echo, scrollback, and clipboard caveats listed above for secret macro text.
 
 For secret auto-triggers, prefer **Active session** or **Matching profile** scope
 instead of **All terminals**.
@@ -84,6 +94,118 @@ instead of **All terminals**.
 A host or background session can trigger a secret macro by printing text that
 matches the pattern. For passwords and tokens, use **Active session** or
 **Matching profile**, keep the regex narrow, and avoid **All terminals**.
+
+## Variables
+
+Macros can declare named variables and prompt for them before the macro's
+text is sent. Reference a declared variable in the text as either `$host` or
+`${host}` — both forms work once `host` is declared. If a placeholder's name
+was never declared as a variable, Nexus sends it exactly as written (an
+undeclared `$host` reaches the terminal unchanged) — a typo in a variable name
+fails silently rather than blocking the macro, so watch the live hints under
+the Text field in the Macro Editor to catch that.
+
+### Declaring a variable
+
+Open a macro in the Macro Editor and use the new **Variables** section, or
+start from the **Prompted command** template (see Quick Start, above). Each
+variable has:
+
+- **Name** — must match `/^[A-Za-z_][A-Za-z0-9_]{0,31}$/` (letters, digits, and
+  underscore; must not start with a digit).
+- **Label** (optional) — the prompt text shown in the input box. Defaults to
+  the variable's name.
+- **Default** — a prefilled value. Not allowed on a masked variable, since a
+  default would be plaintext in the macro store.
+- **Mask input (never stored)** — shows the input box as a password field and
+  never remembers the entered value, even across runs in the same window.
+- **Don't remember** — non-secret variables remember the last value entered in
+  the current VS Code window by default; check this box to turn that off for
+  one variable. Remembered values live in memory only, are scoped to the
+  current window, and are lost on reload — nothing about them is ever written
+  to disk.
+
+A macro may declare up to 10 variables.
+
+### Syntax
+
+| Written | Meaning |
+|---|---|
+| `${name}` — `name` declared | replaced with the entered value |
+| `$name` — `name` declared | replaced with the entered value |
+| `${name}` / `$name` — **not** declared | **passed through untouched** |
+| `$${name}` / `$$name` — `name` declared | literal `${name}` / `$name` (escape) |
+| `$${name}` / `$$name` — **not** declared | **passed through untouched, `$$` intact** |
+| `$$`, `$(cmd)`, `${#arr[@]}`, `$1` | never touched |
+
+Only declared variables whose placeholder actually appears (unescaped) in the
+text are prompted for, once each, in declaration order — a variable you
+declare but never reference in the text produces no prompt.
+
+Empty input is accepted as a legitimate value. Pressing Enter through a prompt
+with nothing typed substitutes an empty string, which can produce a malformed
+command (for example `-H  -U root`); that is your call to make, and Nexus does
+not block it.
+
+### Worked example: IPMI SOL console
+
+The **Prompted command** template starts from this macro:
+
+```
+Text:      ipmitool -I lanplus -H $host -U $username -P $password sol activate
+Variables: host (Host), username (Username), password (Password, masked)
+```
+
+Running it prompts for the host, then the username, then the password (masked,
+never remembered), in that order, then sends the filled-in command line to the
+terminal you invoked it from — even if you switch to a different terminal tab
+while the prompts are still open.
+
+### No automatic quoting
+
+Values are substituted exactly as entered — Nexus does not add quotes around
+them. On a shell where you want quoting, most commonly for a password that
+could contain shell metacharacters, add it yourself in the macro text:
+
+```
+ipmitool -I lanplus -H $host -U $username -P '${password}' sol activate
+```
+
+Nexus does not add the quotes in `'${password}'` automatically, because this
+extension's other main audience is network-device CLIs (Cisco IOS, Juniper,
+Arista, and similar) where wrapping a value in single quotes would corrupt the
+command instead of protecting it. Add quoting yourself only on a shell where
+you know it applies.
+
+### Variables and auto-trigger do not mix
+
+A macro can prompt for input, or auto-trigger from terminal output — not both.
+Prompting means opening an input box, which cannot happen safely from a
+background pattern match running on a possibly-inactive terminal. If you need
+a fully automated flow that also needs to compute values or branch on
+conditions, use a **Script** with `prompt()` instead — see the Scripts
+documentation. Scripts have loops, conditionals, and timeouts that macros
+intentionally do not.
+
+If a macro somehow ends up with both a trigger pattern and variables (for
+example, from an older imported configuration), Nexus treats it as a plain,
+non-auto-triggering macro: no zap icon, no enable/disable toggle, and the
+macro's tooltip in the sidebar reads `Auto-trigger suppressed: macro has
+variables`.
+
+### Avoiding remote shell history
+
+Many shells support a leading-space convention that skips a command from being
+recorded in that shell's own history. In bash or zsh, set
+`HISTCONTROL=ignorespace` and start the macro's text with a single space:
+
+```
+ ipmitool -I lanplus -H $host -U $username -P '${password}' sol activate
+```
+
+This only affects the remote shell's own history file. It does not change
+anything about how Nexus stores or remembers the macro or its variables — see
+**Not protected**, above.
 
 ## Keybindings
 

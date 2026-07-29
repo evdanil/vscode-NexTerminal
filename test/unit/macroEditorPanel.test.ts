@@ -233,6 +233,147 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
   });
 
+  function baseSaveMsg(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      type: "save",
+      index: null,
+      id: null,
+      name: "Test",
+      text: "run $host",
+      secret: false,
+      keybinding: null,
+      triggerPattern: null,
+      triggerCooldown: 3,
+      triggerInterval: null,
+      triggerInitiallyDisabled: false,
+      triggerScope: "all-terminals",
+      triggerProfileId: null,
+      variables: [],
+      ...overrides
+    };
+  }
+
+  describe("variables validation (§9.4) and persistence (§9.5)", () => {
+    it("rejects an invalid variable name on the correct row", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({ variables: [{ name: "9bad" }] }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({
+        type: "saveError",
+        field: "variable",
+        row: 0,
+        message: expect.stringContaining("not a valid variable name")
+      });
+      expect(getMacros()).toHaveLength(0);
+    });
+
+    it("rejects a duplicate variable name on the second row", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({ variables: [{ name: "host" }, { name: "host" }] }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({
+        type: "saveError",
+        field: "variable",
+        row: 1,
+        message: expect.stringContaining("Duplicate variable name")
+      });
+      expect(getMacros()).toHaveLength(0);
+    });
+
+    it("rejects more than the max variables as an array-level error, not a row error", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+      const variables = Array.from({ length: 11 }, (_, i) => ({ name: `v${i}` }));
+
+      await sendMessage(baseSaveMsg({ variables }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({
+        type: "saveError",
+        field: "variables",
+        message: expect.stringContaining("at most 10 variables")
+      });
+      expect(getMacros()).toHaveLength(0);
+    });
+
+    it("rejects a masked variable with a non-empty default", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({
+        variables: [{ name: "password", secret: true, default: "hunter2" }]
+      }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({
+        type: "saveError",
+        field: "variable",
+        row: 0,
+        message: expect.stringContaining("masked and cannot have a default value")
+      });
+      expect(getMacros()).toHaveLength(0);
+    });
+
+    it("rejects a macro declaring both variables and a trigger pattern, on the trigger field", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({
+        triggerPattern: "foo",
+        variables: [{ name: "host" }]
+      }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({
+        type: "saveError",
+        field: "trigger",
+        message: expect.stringContaining("prompt for input or auto-trigger")
+      });
+      expect(getMacros()).toHaveLength(0);
+    });
+
+    it("persists a valid variables array, dropping empty label/default fields", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({
+        variables: [
+          { name: "host", label: "Host" },
+          { name: "password", secret: true }
+        ]
+      }));
+
+      const after = getMacros();
+      expect(after).toHaveLength(1);
+      expect(after[0].variables).toEqual([
+        { name: "host", label: "Host" },
+        { name: "password", secret: true }
+      ]);
+    });
+
+    it("clearing all variable rows actually clears the stored array, not resurrected via the spread (§9.5)", async () => {
+      await harness([
+        { name: "IPMI", text: "run $host", variables: [{ name: "host" }] }
+      ]);
+      const before = getMacros();
+      const macroId = before[0].id!;
+      const { sendMessage } = await openPanel(0);
+
+      await sendMessage(baseSaveMsg({
+        index: 0,
+        id: macroId,
+        text: "run $host",
+        variables: []
+      }));
+
+      const after = getMacros();
+      expect(after).toHaveLength(1);
+      expect(after[0].variables).toBeUndefined();
+      expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+    });
+  });
+
   it("subscribes to the store and re-renders on external change; disposes the subscription", async () => {
     await harness([{ name: "Alpha", text: "a" }]);
     await openPanel(0);

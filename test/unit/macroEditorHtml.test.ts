@@ -239,6 +239,185 @@ describe("renderMacroEditorHtml", () => {
     expect(html).not.toContain("NESTED_QUANTIFIER_RE");
   });
 
+  it("produces syntactically valid inline JavaScript", () => {
+    // A safety net against TS-template-literal escaping mistakes (this file
+    // hand-builds JS source as text) — this would have caught a stray
+    // unescaped quote or an unintentionally "live" ${...} interpolation.
+    const macros: TerminalMacro[] = [
+      { name: "IPMI", text: "ipmitool -H $host", variables: [{ name: "host", label: "Host" }] }
+    ];
+    const html = render(macros, 0);
+    const scriptMatch = html.match(/<script[^>]*>([\s\S]*?)<\/script>/);
+    expect(scriptMatch).not.toBeNull();
+    const scriptBody = scriptMatch![1];
+    expect(() => new Function(scriptBody)).not.toThrow();
+  });
+
+  describe("Variables section (§9.1-§9.4)", () => {
+    it("places the Variables section between Text and the macro-level Secret checkbox", () => {
+      const html = render([], null);
+      const textIdx = html.indexOf('id="macro-text"');
+      const variablesIdx = html.indexOf('id="variables-list"');
+      const secretIdx = html.indexOf('id="macro-secret"');
+      expect(textIdx).toBeGreaterThan(-1);
+      expect(variablesIdx).toBeGreaterThan(textIdx);
+      expect(secretIdx).toBeGreaterThan(variablesIdx);
+    });
+
+    it("renders the Add Variable button", () => {
+      const html = render([], null);
+      expect(html).toContain('id="add-variable-btn"');
+      expect(html).toContain("+ Add Variable");
+    });
+
+    it("renders a hidden template row for cloning new rows in webview JS", () => {
+      const html = render([], null);
+      expect(html).toContain('id="variable-row-template"');
+      expect(html).toContain("<template");
+    });
+
+    it("renders existing variable rows from macro.variables, HTML-escaped", () => {
+      const macros: TerminalMacro[] = [
+        {
+          name: "IPMI",
+          text: "ipmitool -H $host",
+          variables: [{ name: "host", label: "<b>Host</b>", default: '10.0.0.1"' }]
+        }
+      ];
+      const html = render(macros, 0);
+      expect(html).toContain('class="var-name" value="host"');
+      expect(html).toContain("&lt;b&gt;Host&lt;/b&gt;");
+      expect(html).toContain("10.0.0.1&quot;");
+      expect(html).not.toContain("<b>Host</b>");
+    });
+
+    it("never renders a default value or an enabled default field for a masked variable", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$password", variables: [{ name: "password", secret: true, default: "leaked" }] }
+      ];
+      const html = render(macros, 0);
+      expect(html).not.toContain("leaked");
+      expect(html).toMatch(/class="var-default" value=""\s+disabled/);
+    });
+
+    it("uses 'Mask input (never stored)' and \"Don't remember\" — never a second 'Secret' checkbox label", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$password", variables: [{ name: "password", secret: true }] }
+      ];
+      const html = render(macros, 0);
+      expect(html).toContain("Mask input (never stored)");
+      expect(html).toContain("Don't remember");
+      // The macro-level Secret checkbox keeps its own distinct label text.
+      expect(html).toContain("Secret (hide value in sidebar and pickers");
+    });
+
+    it("checks the Don't remember checkbox when remember is explicitly false", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$host", variables: [{ name: "host", remember: false }] }
+      ];
+      const html = render(macros, 0);
+      const rowMatch = html.match(/<div class="variable-row"[^>]*>[\s\S]*?<\/div>\s*<\/div>/);
+      expect(rowMatch).not.toBeNull();
+      expect(rowMatch![0]).toContain('class="var-remember" checked');
+    });
+
+    it("sets aria-label on the remove button referencing the variable's name", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$host", variables: [{ name: "host" }] }
+      ];
+      const html = render(macros, 0);
+      expect(html).toContain('aria-label="Remove variable host"');
+    });
+
+    it("renders a per-row error slot addressed by data-var-error", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$host", variables: [{ name: "host" }] }
+      ];
+      const html = render(macros, 0);
+      expect(html).toContain('data-var-error="0"');
+    });
+
+    it("caps the variable name input at 32 characters client-side", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$host", variables: [{ name: "host" }] }
+      ];
+      const html = render(macros, 0);
+      expect(html).toContain('maxlength="32"');
+    });
+
+    it("renders an array-level error slot for the Variables section header", () => {
+      const html = render([], null);
+      expect(html).toContain('id="error-variables"');
+    });
+  });
+
+  describe("Live diagnostics under Text (§9.3)", () => {
+    it("uses macroVariablesWebviewJs's scan — never a second scanner", () => {
+      const html = render([], null);
+      expect(html).toContain("function scanMacroPlaceholders(");
+      expect(html).toContain("function isValidVariableName(");
+      // Called by name from this file's own diagnostics code.
+      expect(html).toContain("scanMacroPlaceholders(text, declaredNames)");
+    });
+
+    it("recomputes diagnostics on a ~300ms debounce", () => {
+      const html = render([], null);
+      expect(html).toContain("function scheduleDiagnostics()");
+      expect(html).toContain("setTimeout(computeDiagnostics, 300)");
+    });
+
+    it("reserves fixed height for the diagnostics strip so hints don't bounce the layout", () => {
+      const html = render([], null);
+      expect(html).toContain('id="variables-diagnostics"');
+    });
+
+    it("wires an Add variable button into the undeclared-placeholder hint", () => {
+      const html = render([], null);
+      expect(html).toContain("is not declared and will be sent as-is.");
+      expect(html).toContain("addVariableRow(name)");
+    });
+
+    it("wires the declared-but-unused hint", () => {
+      const html = render([], null);
+      expect(html).toContain("does not appear in the text.");
+    });
+
+    it("wires the positive confirmation", () => {
+      const html = render([], null);
+      expect(html).toContain("Will prompt for: ");
+    });
+  });
+
+  describe("Live trigger-conflict warning (§9.4)", () => {
+    it("renders a warning slot next to both the Variables header and the trigger field", () => {
+      const html = render([], null);
+      expect(html).toContain('id="variables-trigger-conflict"');
+      expect(html).toContain('id="variables-trigger-conflict-2"');
+    });
+
+    it("wires updateTriggerConflictWarning to both the trigger field and variable-row changes", () => {
+      const html = render([], null);
+      expect(html).toContain("function updateTriggerConflictWarning()");
+      expect(html).toContain("prompt for input or auto-trigger, not both");
+      expect(html).toContain("use a Script with prompt()");
+    });
+  });
+
+  describe("saveError protocol extension (§9.2, §9.5)", () => {
+    it("routes field:'variable' saveError messages to the matching data-var-error slot and scrolls it into view", () => {
+      const html = render([], null);
+      expect(html).toContain('msg.field === "variable"');
+      expect(html).toContain('data-var-error="');
+      expect(html).toContain("scrollIntoView");
+    });
+
+    it("includes variables in the save postMessage payload", () => {
+      const html = render([], null);
+      expect(html).toContain("variables: variablesForSave");
+      expect(html).toContain("collectVariablesForSave()");
+    });
+  });
+
   it("renders matching profile choices by display name instead of raw ids", () => {
     const html = renderMacroEditorHtml([], null, nonce, [
       { id: "52a3b610-f871-462c-9541-20d13c0f7e56", name: "Core Router", kind: "server" },

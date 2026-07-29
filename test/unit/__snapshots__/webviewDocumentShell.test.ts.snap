@@ -216,6 +216,92 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
       margin-top: 3px;
       line-height: 1.4;
     }
+    .variables-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .variables-section-header > label {
+      margin-bottom: 0;
+    }
+    .variables-header-error {
+      display: inline-block;
+      margin-left: 8px;
+    }
+    .variable-row {
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128,128,128,0.35)));
+      border-radius: 3px;
+      padding: 8px;
+      margin-top: 10px;
+    }
+    .variable-row-line1 {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    /* Panel is user-resizable and routinely sits at 350-450px; each text input
+       shrinks with the row but never collapses below a usable width. */
+    .variable-row-line1 input {
+      flex: 1 1 120px;
+      min-width: 120px;
+      width: auto;
+    }
+    .variable-row-line2 {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    .variable-row-line2 label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: normal;
+      font-size: 12px;
+      margin-bottom: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .variable-remove-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+    .variable-row .field-error {
+      margin-top: 6px;
+    }
+    /* Reserved height so hints appearing/disappearing under Text don't bounce
+       the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
+    .variables-diagnostics {
+      min-height: 32px;
+      font-size: 11px;
+      line-height: 1.6;
+      margin-top: 6px;
+    }
+    .variables-diagnostics .diag-hint {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-positive {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-add-btn {
+      margin-left: 6px;
+      padding: 1px 8px;
+      font-size: 11px;
+    }
+    .variables-trigger-conflict {
+      display: none;
+      color: var(--vscode-errorForeground);
+      font-size: 11px;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .variables-trigger-conflict.visible {
+      display: block;
+    }
     .field-error {
       color: var(--vscode-errorForeground);
       font-size: 11px;
@@ -881,6 +967,92 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
       font-size: 11px;
       margin-top: 3px;
       line-height: 1.4;
+    }
+    .variables-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .variables-section-header > label {
+      margin-bottom: 0;
+    }
+    .variables-header-error {
+      display: inline-block;
+      margin-left: 8px;
+    }
+    .variable-row {
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128,128,128,0.35)));
+      border-radius: 3px;
+      padding: 8px;
+      margin-top: 10px;
+    }
+    .variable-row-line1 {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    /* Panel is user-resizable and routinely sits at 350-450px; each text input
+       shrinks with the row but never collapses below a usable width. */
+    .variable-row-line1 input {
+      flex: 1 1 120px;
+      min-width: 120px;
+      width: auto;
+    }
+    .variable-row-line2 {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    .variable-row-line2 label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: normal;
+      font-size: 12px;
+      margin-bottom: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .variable-remove-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+    .variable-row .field-error {
+      margin-top: 6px;
+    }
+    /* Reserved height so hints appearing/disappearing under Text don't bounce
+       the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
+    .variables-diagnostics {
+      min-height: 32px;
+      font-size: 11px;
+      line-height: 1.6;
+      margin-top: 6px;
+    }
+    .variables-diagnostics .diag-hint {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-positive {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-add-btn {
+      margin-left: 6px;
+      padding: 1px 8px;
+      font-size: 11px;
+    }
+    .variables-trigger-conflict {
+      display: none;
+      color: var(--vscode-errorForeground);
+      font-size: 11px;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .variables-trigger-conflict.visible {
+      display: block;
     }
     .field-error {
       color: var(--vscode-errorForeground);
@@ -1619,6 +1791,92 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
       margin-top: 3px;
       line-height: 1.4;
     }
+    .variables-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .variables-section-header > label {
+      margin-bottom: 0;
+    }
+    .variables-header-error {
+      display: inline-block;
+      margin-left: 8px;
+    }
+    .variable-row {
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128,128,128,0.35)));
+      border-radius: 3px;
+      padding: 8px;
+      margin-top: 10px;
+    }
+    .variable-row-line1 {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    /* Panel is user-resizable and routinely sits at 350-450px; each text input
+       shrinks with the row but never collapses below a usable width. */
+    .variable-row-line1 input {
+      flex: 1 1 120px;
+      min-width: 120px;
+      width: auto;
+    }
+    .variable-row-line2 {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    .variable-row-line2 label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: normal;
+      font-size: 12px;
+      margin-bottom: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .variable-remove-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+    .variable-row .field-error {
+      margin-top: 6px;
+    }
+    /* Reserved height so hints appearing/disappearing under Text don't bounce
+       the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
+    .variables-diagnostics {
+      min-height: 32px;
+      font-size: 11px;
+      line-height: 1.6;
+      margin-top: 6px;
+    }
+    .variables-diagnostics .diag-hint {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-positive {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-add-btn {
+      margin-left: 6px;
+      padding: 1px 8px;
+      font-size: 11px;
+    }
+    .variables-trigger-conflict {
+      display: none;
+      color: var(--vscode-errorForeground);
+      font-size: 11px;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .variables-trigger-conflict.visible {
+      display: block;
+    }
     .field-error {
       color: var(--vscode-errorForeground);
       font-size: 11px;
@@ -2355,6 +2613,92 @@ exports[`webview document shell (byte-identity guard) > highlight rule editor 1`
       font-size: 11px;
       margin-top: 3px;
       line-height: 1.4;
+    }
+    .variables-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .variables-section-header > label {
+      margin-bottom: 0;
+    }
+    .variables-header-error {
+      display: inline-block;
+      margin-left: 8px;
+    }
+    .variable-row {
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128,128,128,0.35)));
+      border-radius: 3px;
+      padding: 8px;
+      margin-top: 10px;
+    }
+    .variable-row-line1 {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    /* Panel is user-resizable and routinely sits at 350-450px; each text input
+       shrinks with the row but never collapses below a usable width. */
+    .variable-row-line1 input {
+      flex: 1 1 120px;
+      min-width: 120px;
+      width: auto;
+    }
+    .variable-row-line2 {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    .variable-row-line2 label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: normal;
+      font-size: 12px;
+      margin-bottom: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .variable-remove-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+    .variable-row .field-error {
+      margin-top: 6px;
+    }
+    /* Reserved height so hints appearing/disappearing under Text don't bounce
+       the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
+    .variables-diagnostics {
+      min-height: 32px;
+      font-size: 11px;
+      line-height: 1.6;
+      margin-top: 6px;
+    }
+    .variables-diagnostics .diag-hint {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-positive {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-add-btn {
+      margin-left: 6px;
+      padding: 1px 8px;
+      font-size: 11px;
+    }
+    .variables-trigger-conflict {
+      display: none;
+      color: var(--vscode-errorForeground);
+      font-size: 11px;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .variables-trigger-conflict.visible {
+      display: block;
     }
     .field-error {
       color: var(--vscode-errorForeground);
@@ -3371,6 +3715,92 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
       margin-top: 3px;
       line-height: 1.4;
     }
+    .variables-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .variables-section-header > label {
+      margin-bottom: 0;
+    }
+    .variables-header-error {
+      display: inline-block;
+      margin-left: 8px;
+    }
+    .variable-row {
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128,128,128,0.35)));
+      border-radius: 3px;
+      padding: 8px;
+      margin-top: 10px;
+    }
+    .variable-row-line1 {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    /* Panel is user-resizable and routinely sits at 350-450px; each text input
+       shrinks with the row but never collapses below a usable width. */
+    .variable-row-line1 input {
+      flex: 1 1 120px;
+      min-width: 120px;
+      width: auto;
+    }
+    .variable-row-line2 {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    .variable-row-line2 label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: normal;
+      font-size: 12px;
+      margin-bottom: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .variable-remove-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+    .variable-row .field-error {
+      margin-top: 6px;
+    }
+    /* Reserved height so hints appearing/disappearing under Text don't bounce
+       the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
+    .variables-diagnostics {
+      min-height: 32px;
+      font-size: 11px;
+      line-height: 1.6;
+      margin-top: 6px;
+    }
+    .variables-diagnostics .diag-hint {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-positive {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-add-btn {
+      margin-left: 6px;
+      padding: 1px 8px;
+      font-size: 11px;
+    }
+    .variables-trigger-conflict {
+      display: none;
+      color: var(--vscode-errorForeground);
+      font-size: 11px;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .variables-trigger-conflict.visible {
+      display: block;
+    }
     .field-error {
       color: var(--vscode-errorForeground);
       font-size: 11px;
@@ -3519,6 +3949,30 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
     <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">echo hi</textarea>
     <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline.</div>
     <div class="field-error" id="error-text"></div>
+    <div class="variables-diagnostics" id="variables-diagnostics" aria-live="polite"></div>
+  </div>
+
+  <div class="form-group">
+    <div class="variables-section-header">
+      <label style="margin-bottom:0;">Variables<span class="field-error variables-header-error" id="error-variables"></span></label>
+      <button type="button" class="btn-secondary" id="add-variable-btn">+ Add Variable</button>
+    </div>
+    <div id="variables-list"></div>
+    <template id="variable-row-template"><div class="variable-row" data-var-row="0">
+      <div class="variable-row-line1">
+        <input type="text" class="var-name" value="" placeholder="name" maxlength="32" />
+        <input type="text" class="var-label" value="" placeholder="label (optional)" />
+        <input type="text" class="var-default" value="" placeholder="default" />
+      </div>
+      <div class="variable-row-line2">
+        <label><input type="checkbox" class="var-secret" /> Mask input (never stored)</label>
+        <label><input type="checkbox" class="var-remember" /> Don't remember</label>
+        <button type="button" class="btn-secondary variable-remove-btn" aria-label="Remove variable">Remove</button>
+      </div>
+      <div class="field-error" data-var-error="0"></div>
+    </div></template>
+    <div class="hint">Referenced in the text as \${name} or $name. Undeclared placeholders are sent as-is.</div>
+    <div class="variables-trigger-conflict" id="variables-trigger-conflict"></div>
   </div>
 
   <div class="form-group form-group-checkbox">
@@ -3532,6 +3986,7 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
     <label for="macro-trigger">Auto-Trigger Pattern</label>
     <input type="text" id="macro-trigger" value="x" placeholder="e.g., [Pp]assword:\\s*$" />
     <div class="field-error" id="error-trigger"></div>
+    <div class="variables-trigger-conflict" id="variables-trigger-conflict-2"></div>
     <div class="hint">Enter the JavaScript regex pattern only, without surrounding /slashes/ or flags. Avoid risky shapes like (.*)+; use line-bounded text like [^\\n]*. When matched, this macro's text is sent automatically (expect/send).</div>
   </div>
 
@@ -3767,6 +4222,41 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
         return "";
       }
 
+      var MAX_VARIABLES = 10;
+      // §9.3 — the scan is authoritative in src/services/macroVariables.ts; this
+      // webview must never re-implement it (mirrors the regexSafetyWebviewJs()
+      // precedent above).
+      
+      function isValidVariableName(name) {
+        var namePattern = new RegExp("^[A-Za-z_][A-Za-z0-9_]{0,31}$");
+        return typeof name === "string" && namePattern.test(name);
+      }
+      function scanMacroPlaceholders(text, declaredNames) {
+        // Object.create(null) — a plain {} would report "$toString" / "$constructor"
+        // as declared-and-used via the prototype chain, drifting from the Set-based
+        // TypeScript scan above. Variable names may legitimately be "constructor".
+        var declared = Object.create(null);
+        for (var i = 0; i < declaredNames.length; i++) declared[declaredNames[i]] = true;
+        var usedSet = Object.create(null);
+        var undeclared = [];
+        var seenUndeclared = Object.create(null);
+        var re = new RegExp("\\\\$(\\\\$?)(?:\\\\{([A-Za-z_][A-Za-z0-9_]*)\\\\}|([A-Za-z_][A-Za-z0-9_]*))", "g");
+        var match;
+        while ((match = re.exec(text)) !== null) {
+          var escaped = match[1] === "$";
+          var name = match[2] !== undefined ? match[2] : match[3];
+          if (escaped) continue;
+          if (declared[name]) {
+            usedSet[name] = true;
+          } else if (!seenUndeclared[name]) {
+            seenUndeclared[name] = true;
+            undeclared.push(name);
+          }
+        }
+        var used = declaredNames.filter(function (name) { return usedSet[name]; });
+        return { used: used, undeclared: undeclared };
+      }
+
 
       function isValidBinding(value) {
         return VALID_PATTERN.test(value.trim().toLowerCase());
@@ -3811,6 +4301,228 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
         document.getElementById("dirty-flag").classList.remove("visible");
       }
 
+      // ---- Variables (docs/plans/2026-07-29-macro-variables.md §9.1-§9.5) ----
+      var variablesList = document.getElementById("variables-list");
+      var variableRowTemplate = document.getElementById("variable-row-template");
+      var TRIGGER_CONFLICT_MESSAGE = "A macro can prompt for input or auto-trigger, not both. For prompts on an automated flow, use a Script with prompt().";
+
+      // Row N's error slot is addressed by data-var-error="N" (§9.2). Renumbering
+      // on every add/remove keeps that index equal to the row's DOM position,
+      // which is also the position the save handler collects it at below.
+      function renumberVariableRows() {
+        var rows = variablesList.querySelectorAll(".variable-row");
+        for (var i = 0; i < rows.length; i++) {
+          rows[i].setAttribute("data-var-row", String(i));
+          var errSlot = rows[i].querySelector(".field-error");
+          if (errSlot) errSlot.setAttribute("data-var-error", String(i));
+        }
+      }
+
+      function updateRemoveAriaLabel(row) {
+        var nameInput = row.querySelector(".var-name");
+        var removeBtn = row.querySelector(".variable-remove-btn");
+        var name = nameInput.value.trim();
+        removeBtn.setAttribute("aria-label", name ? ("Remove variable " + name) : "Remove variable");
+      }
+
+      function collectDeclaredVariableNames() {
+        var rows = variablesList.querySelectorAll(".variable-row");
+        var names = [];
+        for (var i = 0; i < rows.length; i++) {
+          var n = rows[i].querySelector(".var-name").value.trim();
+          if (n) names.push(n);
+        }
+        return names;
+      }
+
+      function updateTriggerConflictWarning() {
+        var triggerVal = document.getElementById("macro-trigger").value.trim();
+        var hasVars = variablesList.querySelectorAll(".variable-row").length > 0;
+        var show = !!triggerVal && hasVars;
+        var w1 = document.getElementById("variables-trigger-conflict");
+        var w2 = document.getElementById("variables-trigger-conflict-2");
+        w1.textContent = show ? TRIGGER_CONFLICT_MESSAGE : "";
+        w2.textContent = show ? TRIGGER_CONFLICT_MESSAGE : "";
+        w1.classList.toggle("visible", show);
+        w2.classList.toggle("visible", show);
+      }
+
+      var diagnosticsTimer = null;
+      function scheduleDiagnostics() {
+        if (diagnosticsTimer) clearTimeout(diagnosticsTimer);
+        diagnosticsTimer = setTimeout(computeDiagnostics, 300);
+      }
+
+      // §9.3 — three hints, all non-blocking: (a) an undeclared placeholder with
+      // a one-click fix, (b) a declared-but-unused variable, (c) the positive
+      // confirmation once the macro is well-formed. Uses scanMacroPlaceholders()
+      // from macroVariablesWebviewJs() above — never a second scanner.
+      function computeDiagnostics() {
+        var text = document.getElementById("macro-text").value;
+        var declaredNames = collectDeclaredVariableNames();
+        var scan = scanMacroPlaceholders(text, declaredNames);
+        var container = document.getElementById("variables-diagnostics");
+        container.innerHTML = "";
+
+        var lines = [];
+        for (var u = 0; u < scan.undeclared.length; u++) {
+          (function(name) {
+            var line = document.createElement("div");
+            line.className = "diag-hint";
+            var span = document.createElement("span");
+            span.textContent = "$" + name + " is not declared and will be sent as-is.";
+            line.appendChild(span);
+            var btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn-secondary diag-add-btn";
+            btn.textContent = 'Add variable "' + name + '"';
+            btn.addEventListener("click", function() { addVariableRow(name); });
+            line.appendChild(btn);
+            lines.push(line);
+          })(scan.undeclared[u]);
+        }
+
+        var unused = declaredNames.filter(function(n) { return scan.used.indexOf(n) === -1; });
+        for (var w = 0; w < unused.length; w++) {
+          (function(name) {
+            var uline = document.createElement("div");
+            uline.className = "diag-hint";
+            uline.textContent = name + " is declared but $" + name + " / \${" + name + "} does not appear in the text.";
+            lines.push(uline);
+          })(unused[w]);
+        }
+
+        if (lines.length === 0 && scan.used.length > 0) {
+          var okLine = document.createElement("div");
+          okLine.className = "diag-positive";
+          okLine.textContent = "Will prompt for: " + scan.used.join(", ");
+          lines.push(okLine);
+        }
+
+        for (var li = 0; li < lines.length; li++) {
+          container.appendChild(lines[li]);
+        }
+      }
+
+      // Client-side pre-check of the §9.4 rules so the common cases never round-trip
+      // to the host; the host (macroEditorPanel.ts) re-validates with
+      // validateMacroVariables() regardless, since retainContextWhenHidden means
+      // this script can be stale relative to a store changed externally.
+      function validateVariablesClientSide(variables) {
+        var ok = true;
+        var seen = Object.create(null);
+        for (var i = 0; i < variables.length; i++) {
+          var v = variables[i];
+          var errEl = document.querySelector('[data-var-error="' + i + '"]');
+          var msg = "";
+          if (!isValidVariableName(v.name)) {
+            msg = '"' + v.name + '" is not a valid variable name.';
+          } else if (seen[v.name]) {
+            msg = 'Duplicate variable name "' + v.name + '".';
+          } else {
+            seen[v.name] = true;
+          }
+          if (!msg && v.secret && typeof v.default === "string" && v.default.length > 0) {
+            msg = '"' + v.name + '" is masked and cannot have a default value.';
+          }
+          if (errEl) errEl.textContent = msg;
+          if (msg) ok = false;
+        }
+        var arrayMsg = "";
+        if (variables.length > MAX_VARIABLES) {
+          arrayMsg = "A macro may declare at most " + MAX_VARIABLES + " variables.";
+        }
+        document.getElementById("error-variables").textContent = arrayMsg;
+        if (arrayMsg) ok = false;
+        return ok;
+      }
+
+      function collectVariablesForSave() {
+        var rows = variablesList.querySelectorAll(".variable-row");
+        var result = [];
+        for (var i = 0; i < rows.length; i++) {
+          var row = rows[i];
+          var name = row.querySelector(".var-name").value.trim();
+          var label = row.querySelector(".var-label").value.trim();
+          var isSecretRow = row.querySelector(".var-secret").checked;
+          var defaultVal = row.querySelector(".var-default").value;
+          var dontRemember = row.querySelector(".var-remember").checked;
+          var variable = { name: name };
+          if (label) variable.label = label;
+          if (isSecretRow) {
+            variable.secret = true;
+          } else if (defaultVal) {
+            variable.default = defaultVal;
+          }
+          if (dontRemember) variable.remember = false;
+          result.push(variable);
+        }
+        return result;
+      }
+
+      function bindVariableRow(row) {
+        var nameInput = row.querySelector(".var-name");
+        var labelInput = row.querySelector(".var-label");
+        var secretInput = row.querySelector(".var-secret");
+        var defaultInput = row.querySelector(".var-default");
+        var rememberInput = row.querySelector(".var-remember");
+        var removeBtn = row.querySelector(".variable-remove-btn");
+
+        nameInput.addEventListener("input", function() {
+          markDirty();
+          updateRemoveAriaLabel(row);
+          scheduleDiagnostics();
+          updateTriggerConflictWarning();
+        });
+        labelInput.addEventListener("input", markDirty);
+        defaultInput.addEventListener("input", markDirty);
+        secretInput.addEventListener("change", function() {
+          markDirty();
+          defaultInput.disabled = secretInput.checked;
+          if (secretInput.checked) defaultInput.value = "";
+        });
+        rememberInput.addEventListener("change", markDirty);
+        removeBtn.addEventListener("click", function() {
+          row.parentNode.removeChild(row);
+          renumberVariableRows();
+          markDirty();
+          scheduleDiagnostics();
+          updateTriggerConflictWarning();
+        });
+
+        updateRemoveAriaLabel(row);
+      }
+
+      function addVariableRow(prefillName) {
+        var rows = variablesList.querySelectorAll(".variable-row");
+        if (rows.length >= MAX_VARIABLES) {
+          document.getElementById("error-variables").textContent = "A macro may declare at most " + MAX_VARIABLES + " variables.";
+          return;
+        }
+        var fragment = variableRowTemplate.content.cloneNode(true);
+        var row = fragment.querySelector(".variable-row");
+        if (prefillName) {
+          row.querySelector(".var-name").value = prefillName;
+        }
+        variablesList.appendChild(row);
+        var addedRow = variablesList.lastElementChild;
+        bindVariableRow(addedRow);
+        renumberVariableRows();
+        markDirty();
+        scheduleDiagnostics();
+        updateTriggerConflictWarning();
+        // §9.1 — "+ Add Variable" moves focus into the new row's name input.
+        addedRow.querySelector(".var-name").focus();
+      }
+
+      var existingVariableRows = variablesList.querySelectorAll(".variable-row");
+      for (var vi = 0; vi < existingVariableRows.length; vi++) {
+        bindVariableRow(existingVariableRows[vi]);
+      }
+      document.getElementById("add-variable-btn").addEventListener("click", function() {
+        addVariableRow();
+      });
+
       function requestNewMacro() {
         if (dirty) {
           vscode.postMessage({ type: "confirmSwitch", targetValue: "__new__" });
@@ -3838,13 +4550,17 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
 
       // Track changes
       document.getElementById("macro-name").addEventListener("input", markDirty);
-      document.getElementById("macro-text").addEventListener("input", markDirty);
+      document.getElementById("macro-text").addEventListener("input", function() {
+        markDirty();
+        scheduleDiagnostics();
+      });
       document.getElementById("macro-secret").addEventListener("change", markDirty);
       document.getElementById("macro-trigger").addEventListener("input", function() {
         markDirty();
         var val = this.value.trim();
         var errorEl = document.getElementById("error-trigger");
         errorEl.textContent = validateTriggerPattern(val);
+        updateTriggerConflictWarning();
       });
       document.getElementById("macro-trigger-scope").addEventListener("change", function() {
         markDirty();
@@ -3943,6 +4659,19 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
         } else {
           document.getElementById("error-trigger-profile").textContent = "";
         }
+
+        var variablesForSave = collectVariablesForSave();
+        if (!validateVariablesClientSide(variablesForSave)) {
+          valid = false;
+        }
+        if (triggerVal && variablesForSave.length > 0) {
+          valid = false;
+          // Don't clobber a more specific (regex safety / empty-match) trigger
+          // error already set above — the conflict message is the fallback.
+          if (!document.getElementById("error-trigger").textContent) {
+            document.getElementById("error-trigger").textContent = TRIGGER_CONFLICT_MESSAGE;
+          }
+        }
         if (!valid) return;
 
         vscode.postMessage({
@@ -3958,7 +4687,8 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
           triggerInterval: isNaN(intervalVal) || intervalVal < 1 ? null : intervalVal,
           triggerInitiallyDisabled: triggerInitiallyDisabled,
           triggerScope: triggerScope,
-          triggerProfileId: triggerProfileId || null
+          triggerProfileId: triggerProfileId || null,
+          variables: variablesForSave
         });
       });
 
@@ -3978,14 +4708,27 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
           clearDirty();
         }
         if (msg.type === "saveError") {
-          var field = msg.field || "trigger";
-          var errEl = document.getElementById("error-" + field);
-          if (errEl) {
-            errEl.textContent = msg.message || "Could not save macro.";
+          // §9.2 — per-row errors address a data-var-error="N" slot, never
+          // an id (rows have no stable id; N is the row's DOM position).
+          if (msg.field === "variable" && typeof msg.row === "number") {
+            var rowErrEl = document.querySelector('[data-var-error="' + msg.row + '"]');
+            if (rowErrEl) {
+              rowErrEl.textContent = msg.message || "Invalid variable.";
+              rowErrEl.scrollIntoView({ block: "center" });
+            }
+          } else {
+            var field = msg.field || "trigger";
+            var errEl = document.getElementById("error-" + field);
+            if (errEl) {
+              errEl.textContent = msg.message || "Could not save macro.";
+              errEl.scrollIntoView({ block: "center" });
+            }
           }
         }
       });
       updateTriggerProfileState();
+      computeDiagnostics();
+      updateTriggerConflictWarning();
     })();
   </script>
 </body>
@@ -4207,6 +4950,92 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
       font-size: 11px;
       margin-top: 3px;
       line-height: 1.4;
+    }
+    .variables-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .variables-section-header > label {
+      margin-bottom: 0;
+    }
+    .variables-header-error {
+      display: inline-block;
+      margin-left: 8px;
+    }
+    .variable-row {
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128,128,128,0.35)));
+      border-radius: 3px;
+      padding: 8px;
+      margin-top: 10px;
+    }
+    .variable-row-line1 {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    /* Panel is user-resizable and routinely sits at 350-450px; each text input
+       shrinks with the row but never collapses below a usable width. */
+    .variable-row-line1 input {
+      flex: 1 1 120px;
+      min-width: 120px;
+      width: auto;
+    }
+    .variable-row-line2 {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    .variable-row-line2 label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: normal;
+      font-size: 12px;
+      margin-bottom: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .variable-remove-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+    .variable-row .field-error {
+      margin-top: 6px;
+    }
+    /* Reserved height so hints appearing/disappearing under Text don't bounce
+       the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
+    .variables-diagnostics {
+      min-height: 32px;
+      font-size: 11px;
+      line-height: 1.6;
+      margin-top: 6px;
+    }
+    .variables-diagnostics .diag-hint {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-positive {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-add-btn {
+      margin-left: 6px;
+      padding: 1px 8px;
+      font-size: 11px;
+    }
+    .variables-trigger-conflict {
+      display: none;
+      color: var(--vscode-errorForeground);
+      font-size: 11px;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .variables-trigger-conflict.visible {
+      display: block;
     }
     .field-error {
       color: var(--vscode-errorForeground);
@@ -5588,6 +6417,92 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
       margin-top: 3px;
       line-height: 1.4;
     }
+    .variables-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .variables-section-header > label {
+      margin-bottom: 0;
+    }
+    .variables-header-error {
+      display: inline-block;
+      margin-left: 8px;
+    }
+    .variable-row {
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128,128,128,0.35)));
+      border-radius: 3px;
+      padding: 8px;
+      margin-top: 10px;
+    }
+    .variable-row-line1 {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    /* Panel is user-resizable and routinely sits at 350-450px; each text input
+       shrinks with the row but never collapses below a usable width. */
+    .variable-row-line1 input {
+      flex: 1 1 120px;
+      min-width: 120px;
+      width: auto;
+    }
+    .variable-row-line2 {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    .variable-row-line2 label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: normal;
+      font-size: 12px;
+      margin-bottom: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .variable-remove-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+    .variable-row .field-error {
+      margin-top: 6px;
+    }
+    /* Reserved height so hints appearing/disappearing under Text don't bounce
+       the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
+    .variables-diagnostics {
+      min-height: 32px;
+      font-size: 11px;
+      line-height: 1.6;
+      margin-top: 6px;
+    }
+    .variables-diagnostics .diag-hint {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-positive {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-add-btn {
+      margin-left: 6px;
+      padding: 1px 8px;
+      font-size: 11px;
+    }
+    .variables-trigger-conflict {
+      display: none;
+      color: var(--vscode-errorForeground);
+      font-size: 11px;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .variables-trigger-conflict.visible {
+      display: block;
+    }
     .field-error {
       color: var(--vscode-errorForeground);
       font-size: 11px;
@@ -6538,6 +7453,92 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
       font-size: 11px;
       margin-top: 3px;
       line-height: 1.4;
+    }
+    .variables-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .variables-section-header > label {
+      margin-bottom: 0;
+    }
+    .variables-header-error {
+      display: inline-block;
+      margin-left: 8px;
+    }
+    .variable-row {
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128,128,128,0.35)));
+      border-radius: 3px;
+      padding: 8px;
+      margin-top: 10px;
+    }
+    .variable-row-line1 {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    /* Panel is user-resizable and routinely sits at 350-450px; each text input
+       shrinks with the row but never collapses below a usable width. */
+    .variable-row-line1 input {
+      flex: 1 1 120px;
+      min-width: 120px;
+      width: auto;
+    }
+    .variable-row-line2 {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    .variable-row-line2 label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: normal;
+      font-size: 12px;
+      margin-bottom: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .variable-remove-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+    .variable-row .field-error {
+      margin-top: 6px;
+    }
+    /* Reserved height so hints appearing/disappearing under Text don't bounce
+       the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
+    .variables-diagnostics {
+      min-height: 32px;
+      font-size: 11px;
+      line-height: 1.6;
+      margin-top: 6px;
+    }
+    .variables-diagnostics .diag-hint {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-positive {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-add-btn {
+      margin-left: 6px;
+      padding: 1px 8px;
+      font-size: 11px;
+    }
+    .variables-trigger-conflict {
+      display: none;
+      color: var(--vscode-errorForeground);
+      font-size: 11px;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .variables-trigger-conflict.visible {
+      display: block;
     }
     .field-error {
       color: var(--vscode-errorForeground);

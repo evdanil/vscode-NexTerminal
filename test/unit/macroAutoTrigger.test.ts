@@ -1017,4 +1017,101 @@ describe("MacroAutoTrigger", () => {
     expect(sent).toEqual([]);
     obs.dispose();
   });
+
+  describe("macro variables (§6.1) — variables and auto-trigger are mutually exclusive", () => {
+    it("a macro with variables compiles no rule, even with an otherwise-valid trigger pattern", () => {
+      setConfig([
+        { name: "hasVars", text: "show ip route $host\n", triggerPattern: "router#", variables: [{ name: "host" }] }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    it("a corrupt `variables: \"abc\"` shape does NOT suppress a valid trigger (§4.2 — Array.isArray guard, not `?.length`)", () => {
+      setConfig([
+        { name: "corruptVars", text: "yes\n", triggerPattern: "Continue\\?", variables: "abc" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("Continue?");
+      flush();
+
+      expect(sent).toEqual(["yes\n"]);
+      obs.dispose();
+    });
+
+    it("an empty `variables: []` does NOT suppress a valid trigger", () => {
+      setConfig([
+        { name: "emptyVars", text: "yes\n", triggerPattern: "Continue\\?", variables: [] }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("Continue?");
+      flush();
+
+      expect(sent).toEqual(["yes\n"]);
+      obs.dispose();
+    });
+
+    it("positional coherence: disabling index 2 survives reload even though index 1 declares variables and compiles no rule — intervalOwners still keys the interval macro at 0", () => {
+      setConfig([
+        { name: "interval", text: "show status\n", triggerPattern: "router#", triggerInterval: 10 },
+        { name: "hasVars", text: "show ip route $host\n", triggerPattern: "router#", variables: [{ name: "host" }] },
+        { name: "pw", text: "secret123\n", triggerPattern: "[Pp]assword:\\s*$" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      // Arm the interval macro at index 0 so intervalOwners keys it there.
+      obs.onOutput("router#");
+      flush();
+      expect(sent).toEqual(["show status\n"]);
+
+      // The tree's toggle operates on raw array index — disable index 2 (the
+      // password macro), exactly as extension.ts's setDisabled(item.index, …) would.
+      trigger.setDisabled(2, true);
+      expect(trigger.isDisabled(2)).toBe(true);
+
+      // Reload (e.g. triggered by an unrelated settings change). A pre-filtering
+      // bug would compile the surviving password macro at index 1, corrupting
+      // both isDisabled(2) and the interval macro's ownership keying at index 0.
+      trigger.reload();
+
+      expect(trigger.isDisabled(2)).toBe(true);
+      expect(trigger.isDisabled(0)).toBe(false);
+
+      // Index 2 (still disabled) must not fire the password macro.
+      obs.onOutput("Password: ");
+      flush();
+      expect(sent).toEqual(["show status\n"]);
+
+      // Index 0's interval ownership survived reload — re-arm and confirm it
+      // still fires the SAME interval macro after the interval elapses.
+      obs.onOutput("Codes: C connected\r\nrouter#");
+      vi.advanceTimersByTime(10_000);
+      flush();
+      expect(sent).toEqual(["show status\n", "show status\n"]);
+
+      // Re-enabling index 2 fires the password macro — proving the index still
+      // resolves to it, not to the (compile-skipped) variables macro at index 1.
+      trigger.setDisabled(2, false);
+      obs.onOutput("Password: ");
+      flush();
+      expect(sent).toEqual(["show status\n", "show status\n", "secret123\n"]);
+
+      obs.dispose();
+    });
+  });
 });

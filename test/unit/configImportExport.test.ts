@@ -1730,6 +1730,113 @@ describe("share import", () => {
     expect(macros.map(m => m.name)).toContain("hello");
     expect(macros.find(m => m.name === "hello")?.text).toBe("hi");
   });
+
+  it("keyOf includes declared variable names — two macros differing only in variables are NOT deduped (§10)", async () => {
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    await macroStore.save([{ id: "existing-1", name: "cmd", text: "run\n" }]);
+    setActiveMacroStore(macroStore);
+
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [{ name: "cmd", text: "run\n", variables: [{ name: "host" }] }]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-vars.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const macros = macroStore.getAll();
+    expect(macros).toHaveLength(2); // NOT collapsed — variables make the key distinct
+    expect(macros.filter((m) => m.name === "cmd")).toHaveLength(2);
+    expect(macros.some((m) => Array.isArray(m.variables) && m.variables[0]?.name === "host")).toBe(true);
+    expect(macros.some((m) => m.variables === undefined)).toBe(true);
+  });
+
+  it("keyOf treats a macro with identical variables as a true duplicate on share-import merge", async () => {
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    await macroStore.save([{ id: "existing-1", name: "cmd", text: "run\n", variables: [{ name: "host" }] }]);
+    setActiveMacroStore(macroStore);
+
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [{ name: "cmd", text: "run\n", variables: [{ name: "host" }] }]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-vars-dup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const macros = macroStore.getAll();
+    expect(macros).toHaveLength(1); // deduped — same name/text/trigger/keybinding/variables
+  });
+});
+
+describe("legacy macro absorption with variables present (§10 — keyOfLegacy)", () => {
+  beforeEach(() => {
+    configStore.clear();
+  });
+
+  function makeLegacyMacroStoreContext() {
+    const stateMap = new Map<string, unknown>();
+    const secretMap = new Map<string, string>();
+    return {
+      globalState: {
+        get<T>(k: string, fb: T): T { return (stateMap.get(k) as T) ?? fb; },
+        async update(k: string, v: unknown): Promise<void> {
+          if (v === undefined) stateMap.delete(k); else stateMap.set(k, v);
+        },
+        keys(): readonly string[] { return [...stateMap.keys()]; }
+      },
+      secrets: {
+        async get(k: string): Promise<string | undefined> { return secretMap.get(k); },
+        async store(k: string, v: string): Promise<void> { secretMap.set(k, v); },
+        async delete(k: string): Promise<void> { secretMap.delete(k); }
+      }
+    } as unknown as import("vscode").ExtensionContext;
+  }
+
+  it("keyOfLegacy includes variable names — legacy macros differing only in variables are both absorbed, not deduped", async () => {
+    configStore.set("nexus.terminal.macros", [
+      { name: "cmd", text: "run\n" },
+      { name: "cmd", text: "run\n", variables: [{ name: "host" }] }
+    ]);
+
+    const fakeCtx = makeLegacyMacroStoreContext();
+    const macroStore = new VscodeMacroStore(fakeCtx);
+    await macroStore.initialize();
+
+    const macros = macroStore.getAll();
+    expect(macros).toHaveLength(2); // both absorbed — variables make the legacy key distinct
+    expect(macros.some((m) => m.variables === undefined)).toBe(true);
+    expect(macros.some((m) => Array.isArray(m.variables) && m.variables[0]?.name === "host")).toBe(true);
+  });
+
+  it("keyOfLegacy still dedupes a truly identical legacy macro (same variables) on re-absorption", async () => {
+    configStore.set("nexus.terminal.macros", [{ name: "cmd", text: "run\n", variables: [{ name: "host" }] }]);
+
+    const fakeCtx = makeLegacyMacroStoreContext();
+    let macroStore = new VscodeMacroStore(fakeCtx);
+    await macroStore.initialize();
+    expect(macroStore.getAll()).toHaveLength(1);
+
+    // Simulate the legacy setting reappearing (Settings Sync replay) with the SAME entry.
+    configStore.set("nexus.terminal.macros", [{ name: "cmd", text: "run\n", variables: [{ name: "host" }] }]);
+    macroStore = new VscodeMacroStore(fakeCtx);
+    await macroStore.initialize();
+    expect(macroStore.getAll()).toHaveLength(1); // not duplicated
+  });
 });
 
 describe("import from MobaXterm command", () => {
