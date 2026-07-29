@@ -12,6 +12,8 @@ import type { FileExplorerTreeProvider } from "../ui/fileExplorerTreeProvider";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 import type { TerminalRegistry } from "../services/terminal/terminalRegistry";
 import type { ElevationBroker, NexusFileSystemProvider } from "../services/sftp/nexusFileSystemProvider";
+import type { CwdTracker } from "../services/terminal/cwdTracker";
+import type { CwdSyncCoordinator } from "../services/sftp/cwdSyncCoordinator";
 
 export type ServerTerminalMap = Map<string, Set<vscode.Terminal>>;
 export type SessionTerminalMap = Map<string, vscode.Terminal>;
@@ -64,4 +66,17 @@ export interface CommandContext {
   globalStoragePath: string;
   extensionPath: string;
   globalState: vscode.Memento;
+  /**
+   * Directory-sync (issue #35) infrastructure — all optional so existing test
+   * harnesses that build a `CommandContext` literal without them keep
+   * type-checking unchanged; production wiring (`extension.ts`) always
+   * supplies them.
+   */
+  cwdTracker?: CwdTracker;
+  cwdSyncCoordinator?: CwdSyncCoordinator;
+  /** Per-session last-output timestamp, fed by the OSC 7 observer in
+   * `serverCommands.ts` and read by `CwdSyncDeps.lastOutputAt` (§7.5 staleness). */
+  cwdLastOutputAt?: Map<string, number>;
+  /** Diagnostics sink for directory-sync suppressions/failures (§7.6). */
+  cwdSyncOutputChannel?: vscode.OutputChannel;
 }

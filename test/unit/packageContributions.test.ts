@@ -625,4 +625,128 @@ describe("package contributions", () => {
       expect(meta?.description).toBe(description);
     });
   });
+
+  describe("Directory Sync (Follow Terminal Directory, issue #35 Phase 1)", () => {
+    const followCommands = [
+      "nexus.files.followTerminal",
+      "nexus.files.unfollowTerminal",
+      "nexus.files.resumeFollowTerminal",
+      "nexus.files.syncFromTerminal"
+    ];
+
+    it("contributes all four commands with the expected titles and icons", () => {
+      const byId = (id: string) => packageJson.contributes.commands.find((c) => c.command === id);
+      expect(byId("nexus.files.followTerminal")).toMatchObject({ title: "Follow Terminal Directory", icon: "$(link)" });
+      expect(byId("nexus.files.unfollowTerminal")).toMatchObject({
+        title: "Stop Following Terminal Directory",
+        icon: "$(circle-slash)"
+      });
+      expect(byId("nexus.files.resumeFollowTerminal")).toMatchObject({
+        title: "Resume Following Terminal Directory",
+        icon: "$(pinned)"
+      });
+      expect(byId("nexus.files.syncFromTerminal")).toMatchObject({
+        title: "Go to Terminal Directory",
+        icon: "$(arrow-circle-down)"
+      });
+    });
+
+    it("gates nexus.files.syncFromTerminal's enablement on a connected Nexus terminal", () => {
+      const cmd = packageJson.contributes.commands.find((c) => c.command === "nexus.files.syncFromTerminal");
+      expect(cmd?.enablement).toBe("nexus.isNexusTerminalConnected");
+    });
+
+    it("puts exactly the three toggle commands inline at navigation@1 in the File Explorer title bar, with mutually exclusive when-clauses", () => {
+      const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+      const fileExplorerNav1 = titleMenuItems.filter(
+        (item) => item.when?.startsWith("view == nexusFileExplorer") && item.group === "navigation@1"
+      );
+      const byCmd = (id: string) => fileExplorerNav1.find((i) => i.command === id);
+      expect(fileExplorerNav1.map((i) => i.command).sort()).toEqual([
+        "nexus.files.followTerminal",
+        "nexus.files.resumeFollowTerminal",
+        "nexus.files.unfollowTerminal"
+      ]);
+      expect(byCmd("nexus.files.followTerminal")?.when).toBe("view == nexusFileExplorer && !nexus.files.followingTerminal");
+      expect(byCmd("nexus.files.unfollowTerminal")?.when).toBe(
+        "view == nexusFileExplorer && nexus.files.followingTerminal && !nexus.files.followPaused"
+      );
+      expect(byCmd("nexus.files.resumeFollowTerminal")?.when).toBe("view == nexusFileExplorer && nexus.files.followPaused");
+    });
+
+    it("demotes createFile, createDir, and disconnect out of navigation, leaving 6 inline navigation slots", () => {
+      const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+      const fileExplorerNav = titleMenuItems.filter(
+        (item) => item.when?.startsWith("view == nexusFileExplorer") && item.group?.startsWith("navigation")
+      );
+      const navCommands = fileExplorerNav.map((item) => item.command);
+      expect(navCommands).not.toContain("nexus.files.createFile");
+      expect(navCommands).not.toContain("nexus.files.createDir");
+      expect(navCommands).not.toContain("nexus.files.disconnect");
+      expect(new Set(fileExplorerNav.map((item) => item.group)).size).toBe(6);
+
+      const secondary = titleMenuItems.filter(
+        (item) => item.when === "view == nexusFileExplorer" && !item.group?.startsWith("navigation")
+      );
+      expect(secondary.map((item) => item.command).sort()).toEqual([
+        "nexus.files.createDir",
+        "nexus.files.createFile",
+        "nexus.files.disconnect",
+        "nexus.files.syncFromTerminal"
+      ]);
+    });
+
+    it("places Go to Terminal Directory in its own secondary title group (1_sync@1)", () => {
+      const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+      const entry = titleMenuItems.find(
+        (item) => item.command === "nexus.files.syncFromTerminal" && item.when === "view == nexusFileExplorer"
+      );
+      expect(entry?.group).toBe("1_sync@1");
+    });
+
+    it("adds the four sync entries to the '.' row context menu, gated on the currentDir contextValue", () => {
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      const currentDirItems = menuItems.filter((item) => item.when?.includes("nexus.fileExplorer.currentDir"));
+      expect(currentDirItems.map((item) => item.command).sort()).toEqual(followCommands.slice().sort());
+
+      const byCmd = (id: string) => currentDirItems.find((item) => item.command === id);
+      expect(byCmd("nexus.files.syncFromTerminal")?.when).toBe(
+        "view == nexusFileExplorer && viewItem == nexus.fileExplorer.currentDir"
+      );
+      expect(byCmd("nexus.files.followTerminal")?.when).toBe(
+        "view == nexusFileExplorer && viewItem == nexus.fileExplorer.currentDir && !nexus.files.followingTerminal"
+      );
+      expect(byCmd("nexus.files.unfollowTerminal")?.when).toBe(
+        "view == nexusFileExplorer && viewItem == nexus.fileExplorer.currentDir && nexus.files.followingTerminal && !nexus.files.followPaused"
+      );
+      expect(byCmd("nexus.files.resumeFollowTerminal")?.when).toBe(
+        "view == nexusFileExplorer && viewItem == nexus.fileExplorer.currentDir && nexus.files.followPaused"
+      );
+    });
+
+    it("adds nexus.files.syncFromTerminal as nexus@4 to both terminal/title/context and editor/title/context", () => {
+      const terminalTitleMenu = packageJson.contributes.menus["terminal/title/context"] ?? [];
+      const editorTitleMenu = packageJson.contributes.menus["editor/title/context"] ?? [];
+
+      const terminalEntry = terminalTitleMenu.find((item) => item.command === "nexus.files.syncFromTerminal");
+      expect(terminalEntry?.group).toBe("nexus@4");
+      expect(terminalEntry?.when).toBeUndefined();
+
+      const editorEntry = editorTitleMenu.find((item) => item.command === "nexus.files.syncFromTerminal");
+      expect(editorEntry?.group).toBe("nexus@4");
+      expect(editorEntry?.when).toBe("resourceScheme == 'vscode-terminal'");
+    });
+
+    it("contributes an explicit commandPalette when-clause per command, gating the three toggles on the same context keys", () => {
+      const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+      const byCmd = (id: string) => paletteMenu.find((item) => item.command === id);
+
+      for (const id of followCommands) {
+        expect(byCmd(id)?.when).toBeDefined();
+      }
+      expect(byCmd("nexus.files.followTerminal")?.when).toBe("!nexus.files.followingTerminal");
+      expect(byCmd("nexus.files.unfollowTerminal")?.when).toBe("nexus.files.followingTerminal && !nexus.files.followPaused");
+      expect(byCmd("nexus.files.resumeFollowTerminal")?.when).toBe("nexus.files.followPaused");
+    });
+  });
 });

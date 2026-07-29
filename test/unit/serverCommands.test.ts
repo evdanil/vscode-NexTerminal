@@ -27,8 +27,10 @@ vi.mock("../../src/services/ssh/deploySshKey", () => ({
   deployPublicKeyToRemote: vi.fn(async () => ({ alreadyDeployed: false }))
 }));
 
+const mockAddOutputObserver = vi.fn((_observer: unknown) => ({ dispose: vi.fn() }));
+
 vi.mock("../../src/services/ssh/sshPty", () => ({
-  SshPty: vi.fn(function () { return {}; })
+  SshPty: vi.fn(function () { return { addOutputObserver: mockAddOutputObserver }; })
 }));
 
 vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
@@ -55,7 +57,8 @@ vi.mock("vscode", () => ({
     showInputBox: vi.fn(),
     showOpenDialog: vi.fn(),
     withProgress: vi.fn(),
-    createTerminal: vi.fn(() => ({ show: vi.fn(), dispose: vi.fn() }))
+    createTerminal: vi.fn(() => ({ show: vi.fn(), dispose: vi.fn() })),
+    activeTerminal: undefined as unknown
   },
   env: {
     clipboard: {
@@ -231,6 +234,7 @@ function setupHarness(options: {
       emitChange();
     }),
     markSessionActivity: vi.fn(),
+    setFocusedSession: vi.fn(),
     onDidChange: vi.fn((listener: (nextSnapshot: typeof snapshot) => void) => {
       changeListeners.push(listener);
       return () => {
@@ -314,6 +318,7 @@ describe("server disconnect with tunnel autoStop", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
   });
 
   it("routes Add SSH Server to a dedicated SSH add form", async () => {
@@ -448,6 +453,7 @@ describe("server test connection command", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
     vi.mocked(vscode.window.withProgress as any).mockImplementation(async (_options: unknown, task: () => Promise<unknown>) => task());
   });
 
@@ -842,6 +848,7 @@ describe("deploy key command", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
     vi.mocked(findLocalKeyPairs).mockReset();
     vi.mocked(generateKeyPair).mockReset();
     vi.mocked(deployPublicKeyToRemote).mockReset();
@@ -1245,6 +1252,7 @@ describe("SSH terminal tab visual differentiation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
     vi.mocked(vscode.window.withProgress as any).mockImplementation(
       async (_options: unknown, task: () => Promise<unknown>) => task()
     );
@@ -1275,6 +1283,7 @@ describe("SSH File Explorer auto-open on manual connect", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
     vi.mocked(vscode.window.withProgress as any).mockImplementation(
       async (_options: unknown, task: () => Promise<unknown>) => task()
     );
@@ -1405,5 +1414,188 @@ describe("SSH File Explorer auto-open on manual connect", () => {
       serverId: "srv-1"
     }));
     expect(mockShowErrorMessage).toHaveBeenCalledWith("Failed to browse files on Server 1: sftp unavailable");
+  });
+});
+
+describe("directory sync (issue #35) — OSC 7 observer + lifecycle holes", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  function latestFullCallbacks(): {
+    onSessionOpened(sessionId: string): void;
+    onSessionClosed(sessionId: string): void;
+    onDisconnected?(sessionId: string): void;
+  } {
+    const calls = vi.mocked(SshPty).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    return calls[calls.length - 1][2] as unknown as {
+      onSessionOpened(sessionId: string): void;
+      onSessionClosed(sessionId: string): void;
+      onDisconnected?(sessionId: string): void;
+    };
+  }
+
+  it("attaches exactly one OSC 7 observer per connect, bound to the session id once it opens", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+    const report = vi.fn();
+    (ctx as any).cwdTracker = { report };
+    (ctx as any).cwdLastOutputAt = new Map<string, number>();
+
+    registerServerCommands(ctx);
+    const connectCmd = registeredCommands.get("nexus.server.connect");
+    await connectCmd!("srv-1");
+
+    expect(mockAddOutputObserver).toHaveBeenCalledTimes(1);
+    const observer = mockAddOutputObserver.mock.calls[0][0] as {
+      onOutput(text: string): void;
+      dispose(): void;
+    };
+
+    // Output arriving before the session id is bound must not throw and must
+    // not report — there is no session key to report against yet (§5.2/§5.4g).
+    observer.onOutput("\x1b]7;file://host/tmp\x07");
+    expect(report).not.toHaveBeenCalled();
+    expect((ctx as any).cwdLastOutputAt.size).toBe(0);
+
+    latestFullCallbacks().onSessionOpened("session-1");
+
+    observer.onOutput("\x1b]7;file://host/var/log\x07");
+    expect(report).toHaveBeenCalledWith("session-1", "srv-1", "/var/log", "osc7", "host", expect.any(Number));
+    expect((ctx as any).cwdLastOutputAt.get("session-1")).toEqual(expect.any(Number));
+  });
+
+  it("records lastOutputAt on every chunk even when the chunk carries no OSC 7 match", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+    (ctx as any).cwdTracker = { report: vi.fn() };
+    (ctx as any).cwdLastOutputAt = new Map<string, number>();
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+    const observer = mockAddOutputObserver.mock.calls[0][0] as { onOutput(text: string): void };
+    latestFullCallbacks().onSessionOpened("session-1");
+
+    observer.onOutput("plain prompt output, no escape sequence\r\n");
+
+    expect((ctx as any).cwdLastOutputAt.get("session-1")).toEqual(expect.any(Number));
+  });
+
+  it("disposes the observer's parser on session teardown so a stranded partial sequence cannot leak into later output", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+    const report = vi.fn();
+    (ctx as any).cwdTracker = { report };
+    (ctx as any).cwdLastOutputAt = new Map<string, number>();
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+    const observer = mockAddOutputObserver.mock.calls[0][0] as {
+      onOutput(text: string): void;
+      dispose(): void;
+    };
+    latestFullCallbacks().onSessionOpened("session-1");
+
+    // Feed a partial OSC 7 sequence (held in the parser's internal carry).
+    observer.onOutput("\x1b]7;file://host/tm");
+    observer.dispose();
+    report.mockClear();
+
+    // Completing the old partial after dispose must NOT produce a match —
+    // dispose() resets the parser's carry buffer.
+    observer.onOutput("p\x07");
+    expect(report).not.toHaveBeenCalled();
+  });
+
+  it("re-asserts focus on session open when the session's terminal is the active VS Code terminal (§5.4 hole a)", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+    const createdTerminal = vi.mocked(vscode.window.createTerminal).mock.results[0].value;
+    (vscode.window as any).activeTerminal = createdTerminal;
+
+    latestFullCallbacks().onSessionOpened("session-1");
+
+    expect(ctx.core.setFocusedSession).toHaveBeenCalledWith("session-1");
+  });
+
+  it("does not force focus on session open when another terminal is the active VS Code terminal", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+    (vscode.window as any).activeTerminal = { show: vi.fn(), dispose: vi.fn() }; // some other terminal
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+    latestFullCallbacks().onSessionOpened("session-1");
+
+    expect(ctx.core.setFocusedSession).not.toHaveBeenCalled();
+  });
+
+  it("re-asserts focus again on reconnect (same sessionId, terminal re-opens while its tab is active)", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+    const createdTerminal = vi.mocked(vscode.window.createTerminal).mock.results[0].value;
+    (vscode.window as any).activeTerminal = createdTerminal;
+
+    const callbacks = latestFullCallbacks();
+    callbacks.onSessionOpened("session-1"); // first connect
+    callbacks.onDisconnected?.("session-1"); // connection lost
+    (ctx.core.setFocusedSession as any).mockClear();
+    callbacks.onSessionOpened("session-1"); // reconnect: same sessionId, terminal never lost VS Code focus
+
+    expect(ctx.core.setFocusedSession).toHaveBeenCalledWith("session-1");
+  });
+
+  it("calls coordinator.onSessionEnded on disconnect, clearing directory-sync state for the session (§5.4 hole b)", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+    const onSessionEnded = vi.fn();
+    (ctx as any).cwdSyncCoordinator = { onSessionEnded };
+    (ctx as any).cwdLastOutputAt = new Map<string, number>([["session-1", 123]]);
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+    const callbacks = latestFullCallbacks();
+    callbacks.onSessionOpened("session-1");
+
+    callbacks.onDisconnected?.("session-1");
+
+    expect(onSessionEnded).toHaveBeenCalledWith("session-1");
+    expect((ctx as any).cwdLastOutputAt.has("session-1")).toBe(false);
+  });
+
+  it("also calls coordinator.onSessionEnded on a direct session close (no prior disconnect)", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+    const onSessionEnded = vi.fn();
+    (ctx as any).cwdSyncCoordinator = { onSessionEnded };
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+    const callbacks = latestFullCallbacks();
+    callbacks.onSessionOpened("session-1");
+
+    callbacks.onSessionClosed("session-1");
+
+    expect(onSessionEnded).toHaveBeenCalledWith("session-1");
+  });
+
+  it("tolerates a missing cwdTracker/cwdSyncCoordinator (e.g. web extension fallback)", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+    // cwdTracker / cwdSyncCoordinator left unset (optional fields)
+
+    registerServerCommands(ctx);
+    await expect(registeredCommands.get("nexus.server.connect")!("srv-1")).resolves.toBeUndefined();
+    const observer = mockAddOutputObserver.mock.calls[0][0] as { onOutput(text: string): void };
+    const callbacks = latestFullCallbacks();
+
+    expect(() => {
+      callbacks.onSessionOpened("session-1");
+      observer.onOutput("\x1b]7;file://host/var/log\x07");
+      callbacks.onDisconnected?.("session-1");
+    }).not.toThrow();
   });
 });

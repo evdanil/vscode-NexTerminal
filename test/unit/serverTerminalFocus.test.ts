@@ -50,6 +50,12 @@ vi.mock("vscode", () => ({
   },
   ProgressLocation: { Notification: 15 },
   TerminalLocation: { Editor: 2, Panel: 1 },
+  Disposable: class {
+    public constructor(private readonly callOnDispose: () => void) {}
+    public dispose(): void {
+      this.callOnDispose();
+    }
+  },
   TreeItem: class {
     public id?: string;
     public tooltip?: string;

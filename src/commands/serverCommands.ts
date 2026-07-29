@@ -7,6 +7,8 @@ import type { AuthProfile, AuthType, ProxyConfig, ServerConfig } from "../models
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
+import type { PtyOutputObserver } from "../services/macroAutoTrigger";
+import { Osc7Parser } from "../services/terminal/osc7Parser";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { serverFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
@@ -93,6 +95,62 @@ function removeTerminal(serverId: string, terminal: vscode.Terminal, terminalsBy
   if (terminals.size === 0) {
     terminalsByServer.delete(serverId);
   }
+}
+
+/**
+ * Directory-sync (issue #35, §5.2) passive OSC 7 observer. One instance per SSH
+ * session, attached via `pty.addOutputObserver` alongside the existing macro
+ * observer. Feeds each chunk to a per-session `Osc7Parser`, records a per-session
+ * `lastOutputAt` timestamp on every chunk (the coordinator's staleness check
+ * needs this — see `CwdSyncDeps.lastOutputAt`), and reports any parsed match to
+ * `CwdTracker`.
+ *
+ * **Late-binding pattern (§5.2/§5.4g):** mirrors the shape of the macro
+ * observer's `createObserver(..., undefined, server.id)` +
+ * `bindObserverToSession(obs, sessionId)` — the sessionId does not exist yet at
+ * the point this observer is attached (`terminalRegistry.register` runs before
+ * `pty.open()` fires `onSessionOpened`), so `onOutput` closes over a mutable
+ * `sessionId` variable that starts `undefined` and is set once `onSessionOpened`
+ * fires. Unlike the macro observer, this one is entirely local to
+ * `serverCommands.ts` (never crosses into `macroAutoTrigger.ts`), so a simple
+ * closure variable is used instead of an exported `bindObserverToSession` API.
+ */
+function createOsc7Observer(
+  ctx: CommandContext,
+  serverId: string
+): PtyOutputObserver & { bindSessionId(sessionId: string): void; resetParser(): void } {
+  const parser = new Osc7Parser();
+  let sessionId: string | undefined;
+  return {
+    onOutput: (text: string) => {
+      if (sessionId) {
+        ctx.cwdLastOutputAt?.set(sessionId, Date.now());
+      }
+      if (!ctx.cwdTracker || !sessionId) {
+        return;
+      }
+      const matches = parser.feed(text);
+      if (matches.length === 0) {
+        return;
+      }
+      const now = Date.now();
+      for (const match of matches) {
+        ctx.cwdTracker.report(sessionId, serverId, match.path, "osc7", match.authority, now);
+      }
+    },
+    pauseIntervalMacros: () => {
+      /* no macro state on this observer to pause */
+    },
+    dispose: () => {
+      parser.reset();
+    },
+    bindSessionId: (id: string) => {
+      sessionId = id;
+    },
+    resetParser: () => {
+      parser.reset();
+    }
+  };
 }
 
 function collectGroups(ctx: CommandContext): string[] {
@@ -598,6 +656,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown, options: Connec
         undefined,
         server.id
       );
+      const osc7Observer = createOsc7Observer(ctx, server.id);
       const terminalType = vscode.workspace.getConfiguration("nexus.ssh").get<string>("terminalType", "xterm-256color");
       const pty = new SshPty(
         server,
@@ -612,11 +671,22 @@ async function connectServer(ctx: CommandContext, arg?: unknown, options: Connec
               pty: ptyRef
             });
             ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
+            osc7Observer.bindSessionId(sessionId);
             if (terminalRef) {
               ctx.sessionTerminals.set(sessionId, terminalRef);
             }
             if (ptyRef) {
               ctx.activityIndicators.set(sessionId, ptyRef);
+            }
+
+            // §5.4 hole (a): NexusCore.unregisterSession nulls focusedSessionId on
+            // disconnect (nexusCore.ts:313-316), and onDidChangeActiveTerminal
+            // never fires again on reconnect — the terminal never lost VS Code
+            // focus. Without this, directory sync is a permanent no-op after any
+            // reconnect. Re-assert focus here whenever this session's terminal is
+            // the terminal VS Code currently considers active.
+            if (vscode.window.activeTerminal === terminalRef) {
+              ctx.core.setFocusedSession(sessionId);
             }
 
             if (
@@ -649,6 +719,14 @@ async function connectServer(ctx: CommandContext, arg?: unknown, options: Connec
             ctx.core.unregisterSession(sessionId);
             ctx.sessionTerminals.delete(sessionId);
             ctx.activityIndicators.delete(sessionId);
+            // Belt-and-braces alongside the onDisconnected cleanup below: a
+            // terminal can close without ever going through onDisconnected
+            // (SshPty.dispose() calls onSessionClosed directly, bypassing
+            // handleDisconnect — see sshPty.ts), so clear here too rather than
+            // leaking a tracker entry / lastOutputAt timestamp for a session
+            // that never reconnects. Idempotent if onDisconnected already ran.
+            ctx.cwdSyncCoordinator?.onSessionEnded(sessionId);
+            ctx.cwdLastOutputAt?.delete(sessionId);
             if (terminalRef) {
               removeTerminal(server.id, terminalRef, ctx.terminalsByServer);
             }
@@ -660,6 +738,18 @@ async function connectServer(ctx: CommandContext, arg?: unknown, options: Connec
             ctx.core.unregisterSession(sessionId);
             ctx.sessionTerminals.delete(sessionId);
             ctx.activityIndicators.delete(sessionId);
+            // §5.4 hole (b): sessionId is stable across reconnect (sshPty.ts:35),
+            // including a reconnect to a *different* host after the user edits
+            // host/port (extension.ts invalidates the pool on exactly that
+            // change). Clear the tracker record and any pin owned by this
+            // session so a stale cwd from the old host cannot survive into the
+            // new connection. Also reset the OSC 7 parser's carry buffer so a
+            // partial escape sequence stranded by the disconnect cannot
+            // prepend to the reconnected session's first chunk (mirrors
+            // SshPty.start()'s own oscFilter.reset() for the same reason).
+            osc7Observer.resetParser();
+            ctx.cwdSyncCoordinator?.onSessionEnded(sessionId);
+            ctx.cwdLastOutputAt?.delete(sessionId);
             // Intentionally keep terminalsByServer entry (terminal is still
             // alive for reconnect) and do NOT stop auto-stop tunnels — they
             // will be cleaned up when the terminal is fully closed via
@@ -684,6 +774,7 @@ async function connectServer(ctx: CommandContext, arg?: unknown, options: Connec
         terminalType
       );
       ptyRef = pty;
+      pty.addOutputObserver(osc7Observer);
       const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
       const terminal = vscode.window.createTerminal({
         name: terminalName,
