@@ -183,18 +183,24 @@ Elevation depends on the SSH account actually having sudo rights on the remote h
 
 The File Explorer can track whichever SSH terminal you're focused on, so it moves with that terminal's current directory instead of sitting wherever you last navigated.
 
-This is **continuous sync** — not a one-off jump — for any shell that announces its own directory. `fish` (≥ 3.x) does this unconditionally, and prompt frameworks like `starship` do too, using the same `OSC 7` escape sequence Nexus already reads out of the terminal's own output. Plain bash and zsh don't announce it by default, but one line fixes that for good:
+This is **continuous sync** — not a one-off jump — for any shell that announces its own directory. `fish` (≥ 3.x) does this unconditionally, and prompt frameworks like `starship` do too, using the same `OSC 7` escape sequence Nexus already reads out of the terminal's own output. Plain bash and zsh don't announce it by default, but one snippet each fixes that for good:
 
 ```bash
 # ~/.bashrc — let Nexus follow this shell's directory
 PROMPT_COMMAND='printf "\033]7;file://%s%s\033\\" "$HOSTNAME" "$PWD"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 ```
 
-(The zsh equivalent goes in `~/.zshrc` via `precmd_functions`.) Add it once and that shell reports its directory continuously from then on — no waiting for a future Nexus release.
+```zsh
+# ~/.zshrc — let Nexus follow this shell's directory
+__nexus_osc7() { printf '\033]7;file://%s%s\033\\' "${HOST}" "$PWD"; }
+precmd_functions+=(__nexus_osc7)
+```
+
+(zsh sets `$HOST` automatically — `$HOSTNAME` is frequently unset there, unlike in bash.) Add either once and that shell reports its directory continuously from then on — no waiting for a future Nexus release.
 
 For anything that isn't a POSIX shell — Cisco IOS, Juniper, FortiOS, or any other device that will never emit that escape sequence — run **Go to Terminal Directory** to jump the File Explorer to your terminal's current directory on demand, using a best-effort read of the visible prompt.
 
-Turn continuous following on or off from the toggle at the left of the File Explorer title bar, or from the right-click menu on the `.` row that shows your current directory — never from Settings. Navigating manually (Go to Path, Go Home, or `..`) pauses following rather than fighting it; one click on **Resume Following Terminal Directory** jumps straight back to the terminal's directory.
+Turn continuous following on or off from the toggle at the left of the File Explorer title bar, or from the right-click menu on the `.` row that shows your current directory — never from Settings. Turning it on jumps immediately to the focused terminal's already-known directory if one is on record and the explorer is idle and visible, rather than waiting for the next `cd` or focus change. Navigating manually (Go to Path, Go Home, or `..`) pauses following rather than fighting it; one click on **Resume Following Terminal Directory** jumps straight back to the terminal's directory.
 
 If you turn following on for a terminal that hasn't reported a directory yet, Nexus tells you right away instead of leaving the toggle looking broken: **Show Me How** drops the rc one-liner into the Nexus Directory Sync output channel, and **Go to Terminal Directory** jumps there manually in the meantime. That notice shows once per server per window.
 

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { extractLatestPromptPath } from "../services/terminal/promptPathHeuristic";
 import { promptGoToPath } from "./fileCommands";
+import { isTerminalArg } from "./terminalTabCommands";
 import type { CommandContext } from "./types";
 
 /**
@@ -53,12 +54,30 @@ const NO_SOURCE_FOLLOW_GO_TO_TERMINAL_ACTION = "Go to Terminal Directory";
 const noSourceFollowNudgeShownServers = new Set<string>();
 
 /**
- * Byte-for-byte identical to the rc one-liner documented in
- * `README.md`'s "Directory Sync (Follow Terminal Directory)" section — kept
- * in sync deliberately so "Show Me How" and the docs can never drift apart.
+ * Byte-for-byte identical to the rc snippets documented in `README.md`'s
+ * "Directory Sync (Follow Terminal Directory)" section and
+ * `docs/functional-documentation.md`'s §4.4.2 — kept in sync deliberately so
+ * "Show Me How" and the docs can never drift apart.
+ *
+ * P2 fix — the old single constant here shipped only the bash form plus a
+ * comment *naming* the zsh mechanism ("the equivalent goes in ~/.zshrc via
+ * precmd_functions") without ever supplying it: a zsh user who clicked
+ * "Show Me How" got a `PROMPT_COMMAND=` assignment zsh never executes,
+ * followed by a dead end. Both shells now get a real, copy-pasteable hook.
  */
-const BASH_ZSH_OSC7_HOOK_SNIPPET =
-  "# ~/.bashrc — let Nexus follow this shell's directory\nPROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"$HOSTNAME\" \"$PWD\"'\"${PROMPT_COMMAND:+; $PROMPT_COMMAND}\"\n# zsh: the equivalent goes in ~/.zshrc via precmd_functions";
+const BASH_OSC7_HOOK_SNIPPET =
+  "# ~/.bashrc — let Nexus follow this shell's directory\nPROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"$HOSTNAME\" \"$PWD\"'\"${PROMPT_COMMAND:+; $PROMPT_COMMAND}\"";
+
+/**
+ * zsh sets `$HOST` automatically; `$HOSTNAME` is frequently unset there
+ * (unlike bash, which always has it), so the zsh hook must use `${HOST}` —
+ * verified against a real zsh 5.9 interactively via a pty: `precmd_functions`
+ * fires the hook before every prompt, and the single-quoted `printf` format
+ * (`'\033]7;file://%s%s\033\\'`) emits the byte-exact `ESC ] 7 ; file://<host><path> ESC \`
+ * OSC 7 + ST sequence, the same as the bash form below.
+ */
+const ZSH_OSC7_HOOK_SNIPPET =
+  "# ~/.zshrc — let Nexus follow this shell's directory\n__nexus_osc7() { printf '\\033]7;file://%s%s\\033\\\\' \"${HOST}\" \"$PWD\"; }\nprecmd_functions+=(__nexus_osc7)";
 
 interface FocusedSshSession {
   id: string;
@@ -81,6 +100,40 @@ function resolveFocusedSshSession(ctx: CommandContext): FocusedSshSession | unde
     return undefined;
   }
   return snapshot.activeSessions.find((session) => session.id === focusedSessionId);
+}
+
+/**
+ * Resolves which SSH session `nexus.files.syncFromTerminal` should act on.
+ *
+ * When the command is invoked from a terminal tab's own context menu
+ * (`terminal/title/context` / `editor/title/context` in `package.json`), VS Code
+ * passes the clicked `vscode.Terminal` as the first argument — the same shape
+ * `terminalTabCommands.ts`'s `resolveTerminal()` sniffs. `isTerminalArg()` is
+ * that module's exported duck-type check, reused here rather than re-derived,
+ * so the two command modules agree on exactly one definition of "this arg is
+ * the clicked terminal." Without honouring it, right-clicking a *non-focused*
+ * Nexus SSH terminal and choosing "Go to Terminal Directory" silently syncs
+ * whichever terminal happens to be focused instead.
+ *
+ * A `vscode.Terminal` that maps to no live Nexus SSH session (a plain shell tab,
+ * a serial tab, a session that has since ended) resolves to `undefined` and the
+ * command no-ops. Falling back to the focused session there would be worse than
+ * doing nothing: the user pointed at a specific tab.
+ *
+ * Every other invocation path (command palette, the File Explorer `.` row, the
+ * bug-2 "Go to Terminal Directory" nudge button) passes no `vscode.Terminal`, so
+ * this collapses to `resolveFocusedSshSession` — today's behaviour, unchanged.
+ */
+function resolveTargetSshSession(ctx: CommandContext, arg?: unknown): FocusedSshSession | undefined {
+  if (isTerminalArg(arg)) {
+    for (const [sessionId, tracked] of ctx.sessionTerminals) {
+      if (tracked === arg) {
+        return ctx.core.getSnapshot().activeSessions.find((session) => session.id === sessionId);
+      }
+    }
+    return undefined;
+  }
+  return resolveFocusedSshSession(ctx);
 }
 
 /** Resolution ladder step 1 — a non-stale tracker record for the focused session. */
@@ -125,11 +178,18 @@ function getHeuristicCandidate(ctx: CommandContext, session: FocusedSshSession):
  * captured at entry closes that cross-server race — otherwise a slower
  * validation for session/server A can land on an explorer that has since
  * moved on to server B.
+ *
+ * The re-check re-resolves the target *the same way it was originally
+ * resolved* (`resolveTargetSshSession(ctx, arg)`), so a terminal-tab
+ * invocation is re-validated against the clicked terminal rather than against
+ * whatever is focused now. With no `arg` this is byte-for-byte the old
+ * focused-session re-check.
  */
 async function validateAndApply(
   ctx: CommandContext,
   session: FocusedSshSession,
-  candidate: string
+  candidate: string,
+  arg?: unknown
 ): Promise<string | undefined> {
   const expectedSessionId = session.id;
   const expectedServerId = session.serverId;
@@ -155,13 +215,13 @@ async function validateAndApply(
     return undefined;
   }
 
-  // Re-check immediately before committing: both the focused session and the
+  // Re-check immediately before committing: both the target session and the
   // explorer's active server must still match what was captured at entry.
   // A slower validation for a since-abandoned session/server pairing must
   // never land on an explorer that has since switched to a different server.
-  const currentFocused = resolveFocusedSshSession(ctx);
+  const currentTarget = resolveTargetSshSession(ctx, arg);
   const currentActiveServerId = ctx.fileExplorerProvider.getActiveServerId();
-  if (currentFocused?.id !== expectedSessionId || currentActiveServerId !== expectedServerId) {
+  if (currentTarget?.id !== expectedSessionId || currentActiveServerId !== expectedServerId) {
     log(
       ctx,
       `syncFromTerminal: discarding stale validation for session ${expectedSessionId} — focused session or explorer server changed`
@@ -241,7 +301,12 @@ function showNoSourceFollowNudge(ctx: CommandContext, session: FocusedSshSession
     )
     .then((choice) => {
       if (choice === NO_SOURCE_FOLLOW_SHOW_ME_HOW_ACTION) {
-        ctx.cwdSyncOutputChannel?.appendLine(BASH_ZSH_OSC7_HOOK_SNIPPET);
+        // P2 fix: both shells' hooks, not just bash's — a zsh user gets a
+        // real snippet to paste instead of a `PROMPT_COMMAND=` line their
+        // shell never runs plus a comment naming a mechanism it never supplies.
+        ctx.cwdSyncOutputChannel?.appendLine(BASH_OSC7_HOOK_SNIPPET);
+        ctx.cwdSyncOutputChannel?.appendLine("");
+        ctx.cwdSyncOutputChannel?.appendLine(ZSH_OSC7_HOOK_SNIPPET);
         ctx.cwdSyncOutputChannel?.show();
       } else if (choice === NO_SOURCE_FOLLOW_GO_TO_TERMINAL_ACTION) {
         void vscode.commands.executeCommand("nexus.files.syncFromTerminal");
@@ -271,10 +336,12 @@ function maybeShowNoSourceFollowNudge(ctx: CommandContext): void {
 
 /**
  * `nexus.files.syncFromTerminal` — the resolution ladder (§8.5(a) inline
- * commentary walks the full flow):
- *  1. A non-stale tracker record for the focused SSH session, if its
+ * commentary walks the full flow). `arg` is VS Code's command argument: the
+ * clicked `vscode.Terminal` for a terminal-tab context-menu invocation,
+ * otherwise absent (see `resolveTargetSshSession`).
+ *  1. A non-stale tracker record for the target SSH session, if its
  *     `serverId` matches the explorer's active server.
- *  2. Else the prompt-text heuristic against the focused terminal's scrollback.
+ *  2. Else the prompt-text heuristic against the target terminal's scrollback.
  *  3. Validate whichever candidate step 1/2 produced; on success, re-root.
  *  4. On no candidate or failed validation, open the `goToPath` prompt
  *     prefilled with the best candidate we have (or the current root, matching
@@ -282,23 +349,23 @@ function maybeShowNoSourceFollowNudge(ctx: CommandContext): void {
  *  5. If that also yields nothing, show the once-per-session incapability
  *     toast (§8.5a).
  */
-async function syncFromTerminal(ctx: CommandContext): Promise<void> {
+async function syncFromTerminal(ctx: CommandContext, arg?: unknown): Promise<void> {
   const activeServerId = ctx.fileExplorerProvider.getActiveServerId();
   if (!activeServerId) {
     log(ctx, "syncFromTerminal: no active File Explorer server");
     return;
   }
 
-  const session = resolveFocusedSshSession(ctx);
+  const session = resolveTargetSshSession(ctx, arg);
   if (!session || session.serverId !== activeServerId) {
-    log(ctx, "syncFromTerminal: no focused SSH session for the active explorer server");
+    log(ctx, "syncFromTerminal: no target SSH session for the active explorer server");
     return;
   }
 
   const candidate = getTrackedCandidate(ctx, session) ?? getHeuristicCandidate(ctx, session);
 
   if (candidate) {
-    const resolved = await validateAndApply(ctx, session, candidate);
+    const resolved = await validateAndApply(ctx, session, candidate, arg);
     if (resolved) {
       await maybeShowFirstSyncNudge(ctx, resolved);
       return;
@@ -350,9 +417,12 @@ export function registerCwdSyncCommands(ctx: CommandContext): vscode.Disposable[
     ctx.cwdSyncCoordinator.resume();
   });
 
-  const syncFromTerminalCmd = vscode.commands.registerCommand("nexus.files.syncFromTerminal", async () => {
-    await syncFromTerminal(ctx);
-  });
+  const syncFromTerminalCmd = vscode.commands.registerCommand(
+    "nexus.files.syncFromTerminal",
+    async (arg?: unknown) => {
+      await syncFromTerminal(ctx, arg);
+    }
+  );
 
   return [followTerminal, unfollowTerminal, resumeFollowTerminal, syncFromTerminalCmd];
 }

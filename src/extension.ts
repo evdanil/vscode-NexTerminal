@@ -48,7 +48,13 @@ import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
 import { readBoundedNumber } from "./utils/boundedConfig";
 import { createCoalescedInvoker } from "./utils/coalescedInvoker";
-import { clearTrackedSessionActivity, focusSessionTerminal } from "./utils/sessionTerminalFocus";
+import {
+  applyActiveEditorChange,
+  applyActiveTerminalChange,
+  clearTrackedSessionActivity,
+  focusSessionTerminal,
+  type TerminalFocusChangeOptions
+} from "./utils/sessionTerminalFocus";
 import { resolveScriptSessionForTerminal, resolveSessionForTerminal } from "./utils/terminalSessionLookup";
 import { registerSettingsCommands } from "./commands/settingsCommands";
 import { SettingsPanel } from "./ui/settingsPanel";
@@ -915,17 +921,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   syncViewsImmediate();
 
+  // Both focus listeners share one deps object and delegate to
+  // `sessionTerminalFocus.ts`, where the §5.3-rule-7 invariant ("editor focus
+  // must NOT clear focusedSessionId") is documented and unit-tested. Keep these
+  // wrappers thin — any focus policy belongs in those two functions.
+  const focusChangeOptions: TerminalFocusChangeOptions = {
+    core,
+    activityIndicators: ctx.activityIndicators,
+    target: ctx,
+    resolveSessionId: resolveTrackedSessionForTerminal
+  };
+
   const editorFocusListener = vscode.window.onDidChangeActiveTextEditor(() => {
-    ctx.focusedTerminal = undefined;
+    applyActiveEditorChange(focusChangeOptions);
   });
 
   const terminalActivityListener = vscode.window.onDidChangeActiveTerminal((terminal) => {
-    ctx.focusedTerminal = terminal ?? undefined;
-    const sessionId = resolveTrackedSessionForTerminal(terminal);
-    core.setFocusedSession(sessionId);
-    if (sessionId) {
-      clearTrackedSessionActivity({ core, activityIndicators: ctx.activityIndicators }, sessionId);
-    }
+    applyActiveTerminalChange(focusChangeOptions, terminal ?? undefined);
   });
 
   let previousServers = new Map<string, import("./models/config").ServerConfig>(

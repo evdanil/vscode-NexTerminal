@@ -406,6 +406,22 @@ export async function promptGoToPath(ctx: CommandContext, defaultValue: string):
       vscode.window.showWarningMessage("Path is not a directory.");
       return undefined;
     }
+    // Re-check immediately before committing: the explorer's active server
+    // must still be the one this path was validated against. Both awaits
+    // above are open-ended — the input box waits on the user, and the stat
+    // call on the network — so the explorer can switch servers (a different
+    // server browsed, or `clearActiveServer()` from the auto-disconnect path
+    // in extension.ts) while they are in flight. Mirrors the same guard in
+    // `validateAndApply` (cwdSyncCommands.ts).
+    if (ctx.fileExplorerProvider.getActiveServerId() !== activeId) {
+      ctx.cwdSyncOutputChannel?.appendLine(
+        `[cwdSync] goToPath: discarding navigation to ${inputPath} — explorer switched servers (was ${activeId}, now ${ctx.fileExplorerProvider.getActiveServerId() ?? "<none>"})`
+      );
+      vscode.window.showWarningMessage(
+        "Cannot navigate to path: the File Explorer switched to a different server."
+      );
+      return undefined;
+    }
     ctx.sftpService.invalidateCache(activeId, inputPath);
     ctx.fileExplorerProvider.setRootPath(inputPath);
     ctx.cwdSyncCoordinator?.notifyManualNavigation();

@@ -175,7 +175,12 @@ export class CwdSyncCoordinator {
   private pinnedSessionId: string | undefined;
 
   private visible = false;
-  /** Latest record withheld while `visible` is false; applied once on re-show. */
+  /**
+   * Latest record withheld while `visible` is false; applied once on re-show.
+   * Written from two places, exactly like `busyBuffer`: `considerApply` (the
+   * view was already hidden when the record arrived) and `abandonMidFlight`
+   * (the view was hidden *while* the record's SFTP calls were in flight).
+   */
   private hiddenBuffer: CwdRecord | undefined;
 
   /**
@@ -265,6 +270,23 @@ export class CwdSyncCoordinator {
       const focusedSessionId = this.deps.core.getSnapshot().focusedSessionId;
       if (focusedSessionId) {
         this.deps.tracker.reenable(focusedSessionId);
+      }
+      // Turning Follow on must act on data the tracker already holds, rather
+      // than looking inert until the next `cwd-changed`/`focus-changed`
+      // event — which on a quiet shell may be minutes away, on exactly the
+      // hosts where this feature already works.
+      //
+      // Deliberately guarded on "idle AND visible right now": the buffering
+      // paths (`busyBuffer` / `hiddenBuffer`) exist to defer a *report*, not
+      // to record a toggle. Enabling while busy or hidden must NOT populate
+      // a buffer, because a later idle/re-show would then replay a decision
+      // the user never made — see the "discards a busy-buffered record when
+      // following is turned off before idle" regression test, whose whole
+      // point is that an off/on toggle cannot resurrect a dead buffered
+      // record. When blocked, fall back to the normal event-driven path,
+      // exactly as before this fix.
+      if (!this.deps.provider.isBusy() && this.visible) {
+        this.applyForFocusedSession("following-enabled", { immediate: true });
       }
     }
     this.emitStateChange();
@@ -558,13 +580,31 @@ export class CwdSyncCoordinator {
       // that; silently losing the report was never required. Latest-wins,
       // exactly like `hiddenBuffer` below. Replayed by `onBusyIdle()` once
       // `provider.onDidChangeBusy` fires the idle transition.
+      //
+      // P1 fix: a newly buffered record supersedes any apply currently in
+      // flight — it IS a newer decision — so bump the generation here too.
+      // Without this, a slow in-flight `resolveAndApply` for an *older*
+      // record can still believe its own generation token is current when
+      // its awaited SFTP call resolves, fail arbitration on `isBusy()`, and
+      // reach `abandonMidFlight`, which would otherwise clobber this fresher
+      // buffer with the stale one (see `abandonMidFlight`'s own generation +
+      // `updatedAt` guards below for the second layer of defense).
       this.busyBuffer = record;
+      this.generation++;
       this.deps.log(`Directory sync: buffered (${reason}) — explorer is busy`);
       return;
     }
 
     if (!this.visible) {
+      // Same reasoning as the busy buffer above: a freshly buffered record
+      // supersedes whatever apply might be in flight, so bump the generation.
+      // `abandonMidFlight` is the second writer to this buffer (a record
+      // whose commit was blocked by the view being hidden *after* its SFTP
+      // calls were already dispatched), and it relies on this bump — plus
+      // its own `updatedAt` comparison — to avoid clobbering whatever is
+      // buffered here with an older record.
       this.hiddenBuffer = record;
+      this.generation++;
       this.deps.log(`Directory sync: buffered (${reason}) — view is hidden`);
       return;
     }
@@ -644,21 +684,87 @@ export class CwdSyncCoordinator {
   }
 
   /**
-   * Logs a mid-flight `passesArbitration()` failure and, when the explorer
-   * became busy during the awaited SFTP call (§7.4 bug 1), buffers the
-   * record instead of dropping it — `onBusyIdle()` retries it (through full
-   * arbitration again) once the explorer signals idle. `isBusy()` is
-   * evaluated synchronously right here, immediately after the arbitration
-   * check that already consulted it, so there is no race between the two
-   * reads. A false positive (buffering when the *actual* blocking rule was
-   * something else that happened to coincide with busy, e.g. a pin set in
-   * the same tick) is harmless: the eventual retry re-runs every rule from
-   * scratch and simply skips again if still blocked.
+   * Logs a mid-flight `passesArbitration()` failure and, when the reason the
+   * commit can no longer land is one this coordinator already knows how to
+   * *defer* rather than drop, buffers the record for a later retry:
+   *  - the explorer became busy during the awaited SFTP call (§7.4 bug 1) —
+   *    `onBusyIdle()` retries it once the explorer signals idle;
+   *  - the view was hidden during the awaited SFTP call —
+   *    `setViewVisible(true)` retries it on re-show.
+   * Both retries go through `considerApply`, which re-runs the *full*
+   * arbitration set from scratch, so a "wrong" buffer here is harmless: the
+   * eventual retry simply skips again if still blocked.
+   *
+   * The blocking condition is re-read from live state (`provider.isBusy()` /
+   * `this.visible`) rather than string-matching `arbitration.reasonMsg` —
+   * both are evaluated synchronously right here, immediately after the
+   * arbitration check that already consulted them, so there is no race
+   * between the two reads. Busy is checked first, matching
+   * `passesArbitration`'s own rule order (and `considerApply`'s), so a
+   * simultaneously-busy-and-hidden explorer lands in the same buffer the
+   * synchronous path would have chosen. Everything else (following turned
+   * off, focus moved, server changed, pin taken) is a genuine drop — those
+   * decisions are dead, not deferred.
+   *
+   * **P1 fix (§7.4 bug 1b — "a stale in-flight record clobbers a newer
+   * buffered one"):** see `bufferOnAbandon` below for the two guards.
    */
-  private abandonMidFlight(record: CwdRecord, reason: string, arbitration: { ok: false; reasonMsg: string }): void {
+  private abandonMidFlight(
+    record: CwdRecord,
+    reason: string,
+    arbitration: { ok: false; reasonMsg: string },
+    generation: number
+  ): void {
     this.deps.log(`Directory sync: abandon (${reason}) — ${arbitration.reasonMsg}`);
     if (this.deps.provider.isBusy()) {
+      this.bufferOnAbandon(record, reason, generation, "busy");
+    } else if (!this.visible) {
+      this.bufferOnAbandon(record, reason, generation, "hidden");
+    }
+  }
+
+  /**
+   * Writes `record` into the busy or hidden buffer on behalf of
+   * `abandonMidFlight`, under two deliberately redundant guards.
+   * `generation` is the token `resolveAndApply` captured at dispatch time
+   * for `record`:
+   *  1. `isCurrentGeneration(generation)` — if a newer record has since been
+   *     buffered (which bumps the generation — see `considerApply` above) or
+   *     any other policy change bumped it, `record` is stale and must not
+   *     overwrite whatever is now buffered.
+   *  2. Belt and braces: even when the generation check alone would allow
+   *     the write, never replace a strictly newer buffered record. Compare
+   *     `CwdRecord.updatedAt` — equal timestamps keep the existing buffer,
+   *     since same-tick reports already resolve latest-wins inside
+   *     `CwdTracker` before either one reaches here.
+   * Neither guard blocks the plain-deferral case (v2.8.71): when nothing
+   * else has superseded `record`, the generation is still current and the
+   * target buffer is either empty or holds something no newer than `record`,
+   * so the write proceeds exactly as before.
+   */
+  private bufferOnAbandon(
+    record: CwdRecord,
+    reason: string,
+    generation: number,
+    which: "busy" | "hidden"
+  ): void {
+    if (!this.isCurrentGeneration(generation)) {
+      this.deps.log(
+        `Directory sync: abandon (${reason}) — not buffering ${record.cwd}; superseded by a newer record`
+      );
+      return;
+    }
+    const current = which === "busy" ? this.busyBuffer : this.hiddenBuffer;
+    if (current && current.updatedAt >= record.updatedAt) {
+      this.deps.log(
+        `Directory sync: abandon (${reason}) — not buffering ${record.cwd}; a newer record is already buffered`
+      );
+      return;
+    }
+    if (which === "busy") {
       this.busyBuffer = record;
+    } else {
+      this.hiddenBuffer = record;
     }
   }
 
@@ -692,7 +798,7 @@ export class CwdSyncCoordinator {
     }
     const afterRealpath = this.passesArbitration(record);
     if (!afterRealpath.ok) {
-      this.abandonMidFlight(record, reason, afterRealpath);
+      this.abandonMidFlight(record, reason, afterRealpath, generation);
       return;
     }
 
@@ -710,7 +816,7 @@ export class CwdSyncCoordinator {
     }
     const afterStat = this.passesArbitration(record);
     if (!afterStat.ok) {
-      this.abandonMidFlight(record, reason, afterStat);
+      this.abandonMidFlight(record, reason, afterStat, generation);
       return;
     }
 

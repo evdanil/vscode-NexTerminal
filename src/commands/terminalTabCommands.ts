@@ -9,12 +9,28 @@ export interface TerminalTabCommandsDeps {
   localShellTerminals?: LocalShellTerminalMap;
 }
 
+/**
+ * Duck-types VS Code's `terminal/title/context` / `editor/title/context`
+ * command argument — the clicked `vscode.Terminal` itself, distinguishing it
+ * from the `{ session: { id } }` / `{ profile: { id } }` tree-item shapes
+ * used elsewhere in this module and from a bare `FileTreeItem`-style arg
+ * (e.g. the File Explorer's `.` row, which carries neither `creationOptions`
+ * nor `session`/`profile`).
+ *
+ * Exported so any other command module resolving the same terminal-tab
+ * argument shape (`cwdSyncCommands.ts`'s `nexus.files.syncFromTerminal`)
+ * shares this one definition rather than re-deriving the check.
+ */
+export function isTerminalArg(arg: unknown): arg is vscode.Terminal {
+  return !!arg && typeof (arg as vscode.Terminal).creationOptions === "object";
+}
+
 function resolveTerminal(
   arg: unknown,
   deps: TerminalTabCommandsDeps
 ): vscode.Terminal | undefined {
-  if (arg && typeof (arg as vscode.Terminal).creationOptions === "object") {
-    return arg as vscode.Terminal;
+  if (isTerminalArg(arg)) {
+    return arg;
   }
   const asAny = arg as Record<string, unknown> | undefined;
   if (asAny?.session && typeof (asAny.session as Record<string, unknown>).id === "string") {

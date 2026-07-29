@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [2.8.72] — 2026-07-29
+
+Review findings against 2.8.71's directory sync fixes (#35), from a staff-engineer pass over the whole feature.
+
+### Fixed
+
+- **A stale in-flight directory report could clobber a newer one buffered while the File Explorer was busy.** 2.8.71 fixed the busy-buffer drop, but the abandon path that runs when an in-flight `realpath`/`stat` resolves after the explorer has since gone busy wrote into the buffer unconditionally — so an older report resolving late could overwrite an already-buffered newer report, and the explorer would re-root to the stale directory once idle while silently discarding the newest one. Buffering a record now bumps the same generation token the out-of-order-completion fix already uses, and the mid-flight abandon path only writes the buffer when its own generation is still current and the buffer doesn't already hold a same-or-newer report (compared by `updatedAt`). The same fix closes an identical hole on the view-hidden path (a report could be lost, not just buffered, if the File Explorer was hidden rather than busy at the moment an in-flight report resolved).
+- **Turning Follow Terminal Directory on could look inert.** If the terminal already had a fresh, applicable directory on record when the toggle was clicked, nothing happened until the next `cd` or focus change — now enabling Follow applies the already-known directory immediately whenever the explorer is idle and visible.
+- **"Go to Terminal Directory" from a terminal tab's own right-click menu ignored which tab was clicked**, silently syncing whichever terminal happened to be focused instead. It now targets the terminal the menu was opened on; a tab that isn't a live Nexus SSH session (a plain shell, serial, or already-disconnected tab) is a clean no-op rather than a wrong-terminal sync.
+- **A slow "Go to Path" navigation could commit onto the wrong server.** If the File Explorer's active server changed while the input box was open or the path was being validated, the typed path could still land on the explorer — now it's discarded if the active server changed underneath it, matching the same guard "Go to Terminal Directory" already had.
+- **"Show Me How" gave zsh users a bash snippet they couldn't use.** The rc hook shown when a host has never reported a directory was bash's `PROMPT_COMMAND=` line followed by a comment naming zsh's `precmd_functions` mechanism without ever supplying it — a zsh user who clicked it ended up exactly where they started. The output channel, README, and functional documentation now all show a real zsh hook alongside the bash one (`precmd_functions+=(__nexus_osc7)`, using `${HOST}` rather than `$HOSTNAME` since zsh sets the former but frequently leaves the latter unset).
+
 ## [2.8.71] — 2026-07-29
 
 Two fixes for the directory sync feature shipped in 2.8.70 (#35), from real-world use.
