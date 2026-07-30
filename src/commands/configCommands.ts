@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
-import type { MacroTriggerScope, MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import type { SecretVault } from "../services/ssh/contracts";
 import {
@@ -31,10 +31,13 @@ import { sniffImportFormat, type SniffedFormat } from "../utils/importFormatSnif
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateLocalShellProfile } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import {
+  VALID_MACRO_TRIGGER_SCOPES,
   canonicalMacroBinding,
   canonicalMacroSecret,
   canonicalMacroTriggerTerms,
-  canonicalMacroVariableTerms
+  canonicalMacroVariableTerms,
+  compiledTriggerCooldownSeconds,
+  compiledTriggerIntervalSeconds
 } from "../storage/macroStore";
 import { getMacros, saveMacros, replaceMacros, getActiveMacroStore } from "../macroSettings";
 import { validateSettingUpdate } from "../ui/settingsValidation";
@@ -722,8 +725,6 @@ function plural(count: number, singular: string, pluralForm = `${singular}s`): s
   return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
-const VALID_MACRO_TRIGGER_SCOPES = new Set<MacroTriggerScope>(["all-terminals", "active-session", "profile"]);
-
 function stripMacroTrigger(macro: TerminalMacro): void {
   delete macro.triggerPattern;
   delete macro.triggerCooldown;
@@ -846,14 +847,35 @@ function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
   }
 
   if (macro.triggerPattern !== undefined) {
-    if (typeof macro.triggerCooldown !== "number" || !Number.isFinite(macro.triggerCooldown) || macro.triggerCooldown < 0 || macro.triggerCooldown > 300) {
-      delete macro.triggerCooldown;
-    }
-    if (typeof macro.triggerInterval !== "number" || !Number.isFinite(macro.triggerInterval) || macro.triggerInterval < 1 || macro.triggerInterval > 86400) {
-      delete macro.triggerInterval;
-    }
+    // NORMALIZE ONTO THE RUNTIME MEANING — never delete a value the compiler would have honoured.
+    //
+    // Deleting is not a neutral rejection. `MacroAutoTrigger.reload()` reads an absent cooldown as
+    // "follow the `defaultCooldown` SETTING" and any present one as a pinned value, so dropping a
+    // `triggerCooldown: 5000` did not remove a bad number, it changed a macro pinned at 300s (the
+    // clamp's ceiling) into one that tracks a machine-local setting. The record it was exported
+    // from still keys as 300s, so the two stopped matching and the import added a SECOND copy —
+    // with its own id, its own live `Password:` rule and, for a responder macro, a second password
+    // per prompt. The same held for a quoted `"5"` (the compiler pins the shipped default for it)
+    // and, in the opposite direction, for the old 1..86400 interval window: `reload()` asks only
+    // for `> 0`, so a legacy `0.5` runs a live 500 ms rule that this path used to erase.
+    //
+    // `compiledTrigger*Seconds()` (storage/macroStore.ts) is the same pair of functions `reload()`
+    // compiles with and both content keys are built on, so what lands here is by construction the
+    // macro the file described — clamped where the runtime clamps, preserved where it does not.
+    const cooldownSeconds = compiledTriggerCooldownSeconds(macro.triggerCooldown);
+    if (cooldownSeconds === undefined) delete macro.triggerCooldown;
+    else macro.triggerCooldown = cooldownSeconds;
+
+    const intervalSeconds = compiledTriggerIntervalSeconds(macro.triggerInterval);
+    if (intervalSeconds === undefined) delete macro.triggerInterval;
+    else macro.triggerInterval = intervalSeconds;
+
+    // `reload()` tests this for TRUTHINESS (`if (macro.triggerInitiallyDisabled)`), so a
+    // hand-edited `"yes"` means "start paused" and deleting it silently started the imported copy
+    // live — one paused macro and one live one where the store held a single paused record.
     if (typeof macro.triggerInitiallyDisabled !== "boolean") {
-      delete macro.triggerInitiallyDisabled;
+      if (macro.triggerInitiallyDisabled) macro.triggerInitiallyDisabled = true;
+      else delete macro.triggerInitiallyDisabled;
     }
   }
 

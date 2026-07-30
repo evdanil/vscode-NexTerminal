@@ -1825,4 +1825,34 @@ describe("MacroAutoTrigger", () => {
       obs.dispose();
     });
   });
+
+  describe("shared trigger-field definitions", () => {
+    it("compiles cooldowns and intervals through the same functions the content keys and the import sanitizer use", async () => {
+      // `DEFAULT_TRIGGER_COOLDOWN` and the two `compiledTrigger*Seconds()` helpers moved into
+      // storage/macroStore.ts so that the three readers of a stored trigger field — this compiler,
+      // `canonicalMacroTriggerTerms()`, and `sanitizeImportedMacro()` — cannot hold three opinions
+      // about what it means. Every duplicate-macro bug on this branch was two of those three
+      // disagreeing, so the wiring itself is worth pinning: if the re-export ever resolved to
+      // `undefined` (an import cycle, a bundling accident), the macro editor would start persisting
+      // an explicit `3` where it now leaves the field absent, and every macro it saved would key as
+      // a different macro from the one it replaced.
+      const store = await import("../../src/storage/macroStore");
+      const { DEFAULT_TRIGGER_COOLDOWN } = await import("../../src/services/macroAutoTrigger");
+      expect(DEFAULT_TRIGGER_COOLDOWN).toBe(3);
+      expect(DEFAULT_TRIGGER_COOLDOWN).toBe(store.DEFAULT_TRIGGER_COOLDOWN);
+
+      // The three branches this compiler takes, asserted against the shared helper rather than
+      // restated: clamped inside the bounds, the shipped fallback for anything unusable, and
+      // "no explicit cooldown" for absent.
+      expect(store.compiledTriggerCooldownSeconds(5000)).toBe(300);
+      expect(store.compiledTriggerCooldownSeconds(-5)).toBe(0);
+      expect(store.compiledTriggerCooldownSeconds("5")).toBe(DEFAULT_TRIGGER_COOLDOWN);
+      expect(store.compiledTriggerCooldownSeconds(undefined)).toBeUndefined();
+      expect(store.compiledTriggerCooldownSeconds(null)).toBeUndefined();
+      // The interval is NOT clamped — `reload()` asks only for `> 0`.
+      expect(store.compiledTriggerIntervalSeconds(0.5)).toBe(0.5);
+      expect(store.compiledTriggerIntervalSeconds(0)).toBeUndefined();
+      expect(store.compiledTriggerIntervalSeconds("60")).toBeUndefined();
+    });
+  });
 });

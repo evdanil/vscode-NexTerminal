@@ -1887,9 +1887,20 @@ describe("backup import", () => {
     // single such record anywhere in either set aborted the whole import: no macros, no servers
     // past that point, and an error the user cannot act on. The local set is the reachable half,
     // because legacy absorption persists settings.json records verbatim.
+    //
+    // Every JSON type that is not a string is covered on both sides, deliberately. A guard that
+    // special-cased the plausible hand-edit (a NUMBER) and let the rest through would satisfy the
+    // number-only version of this test while still throwing on `true` or `{}` — both of which a
+    // hand-edited settings.json or a file from another machine can carry, and neither of which
+    // has a `.trim()` to duck-type through.
     const store = new InMemoryMacroStore();
     await store.initialize();
-    await store.save([{ name: "Local", text: "local\n", keybinding: 1 } as unknown as TerminalMacro]);
+    await store.save([
+      { name: "Local", text: "local\n", keybinding: 1 },
+      { name: "LocalBool", text: "local\n", keybinding: true },
+      { name: "LocalObj", text: "local\n", keybinding: { key: "alt+9" } },
+      { name: "LocalArr", text: "local\n", keybinding: ["alt+9"] }
+    ] as unknown as TerminalMacro[]);
     setActiveMacroStore(store);
 
     await runBackupImport(
@@ -1900,19 +1911,28 @@ describe("backup import", () => {
         servers: [],
         tunnels: [],
         serialProfiles: [],
-        macros: [{ id: "f1", name: "Fromfile", text: "file\n", keybinding: 2 }],
+        macros: [
+          { id: "f1", name: "Fromfile", text: "file\n", keybinding: 2 },
+          { id: "f2", name: "FromfileBool", text: "file\n", keybinding: false },
+          { id: "f3", name: "FromfileObj", text: "file\n", keybinding: { key: "alt+8" } },
+          { id: "f4", name: "FromfileArr", text: "file\n", keybinding: ["alt+8"] }
+        ],
         settings: {}
       },
       "merge"
     );
 
     const macros = getMacros();
-    expect(macros.map((m) => m.name).sort()).toEqual(["Fromfile", "Local"]);
-    // Neither record binds anything: an unusable value is not a binding, and the imported one
-    // does not keep it either — `sanitizeImportedMacro()` drops a keybinding it cannot validate,
-    // the same as it does for a malformed string.
-    expect(macros.map((m) => getAssignedBinding(m))).toEqual([undefined, undefined]);
-    expect(macros.find((m) => m.name === "Fromfile")!.keybinding).toBeUndefined();
+    expect(macros.map((m) => m.name).sort()).toEqual([
+      "Fromfile", "FromfileArr", "FromfileBool", "FromfileObj", "Local", "LocalArr", "LocalBool", "LocalObj"
+    ]);
+    // No record binds anything: an unusable value is not a binding, and the imported ones do not
+    // keep it either — `sanitizeImportedMacro()` drops a keybinding it cannot validate, the same
+    // as it does for a malformed string.
+    expect(macros.map((m) => getAssignedBinding(m))).toEqual(new Array(8).fill(undefined));
+    expect(macros.filter((m) => m.name.startsWith("Fromfile")).map((m) => m.keybinding)).toEqual([
+      undefined, undefined, undefined, undefined
+    ]);
   });
 
   it("a macro carrying `variables: []` merges back from its own backup as ONE macro", async () => {
@@ -1955,6 +1975,182 @@ describe("backup import", () => {
     await runBackupImport(written, "merge");
     expect(localStore.getAll()).toHaveLength(1);
     expect(localStore.getAll()[0].id).toBe("machine-b-1");
+  });
+
+  /** A one-macro backup payload, for the round-trip repros below. */
+  function backupWith(macro: Record<string, unknown>): Record<string, unknown> {
+    return {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [macro],
+      settings: {}
+    };
+  }
+
+  /** Seeds a fresh store with one macro and makes it the active one. */
+  async function storeWith(macro: TerminalMacro): Promise<InMemoryMacroStore> {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    await store.save([macro]);
+    setActiveMacroStore(store);
+    return store;
+  }
+
+  it("merge does NOT re-add a macro whose cooldown is above the clamp ceiling — the sanitizer clamps onto the runtime meaning instead of deleting", async () => {
+    // `triggerCooldown: 5000` is what a user who assumed milliseconds writes, and legacy
+    // absorption persists a hand-written `nexus.terminal.macros` verbatim. `reload()` clamps it
+    // to the 300s ceiling and PINS it there. The import sanitizer used to delete anything outside
+    // 0..300, which is not a rejection of a bad value but a different macro: an absent cooldown
+    // follows the machine-local `defaultCooldown` SETTING. So the copy in the file stopped keying
+    // like the record it was exported from, and merging that backup added a SECOND `Password:`
+    // responder — a distinct id, so the ambiguous-id fail-safe suppresses neither, and both
+    // compile a live rule. One prompt, two passwords.
+    //
+    // The ids differ because that is what leaves the content key as the only dedupe: the file
+    // came from another machine, or from before a replace-mode restore freshened every id.
+    const store = await storeWith(
+      { id: "local-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerCooldown: 5000 }
+    );
+
+    await runBackupImport(
+      backupWith({ id: "file-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerCooldown: 5000 }),
+      "merge"
+    );
+
+    expect(store.getAll()).toHaveLength(1);
+    expect(store.getAll()[0].id).toBe("local-1");
+    // Nothing was rewritten in place either — the skip is a skip.
+    expect(store.getAll()[0].triggerCooldown).toBe(5000);
+
+    // ...and when the store does NOT already hold it, the record still lands, carrying the value
+    // the compiler would have used. Clamped, not deleted (which would hand it to the setting) and
+    // not passed through verbatim (which would leave an out-of-range number in globalState).
+    const fresh = new InMemoryMacroStore();
+    await fresh.initialize();
+    setActiveMacroStore(fresh);
+    await runBackupImport(
+      backupWith({ id: "file-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerCooldown: 5000 }),
+      "merge"
+    );
+    expect(fresh.getAll()).toHaveLength(1);
+    expect(fresh.getAll()[0].triggerCooldown).toBe(300);
+  });
+
+  it("merge does NOT re-add a macro whose sub-second interval the old import window erased", async () => {
+    // The opposite direction of the same mistake. `reload()` asks only `typeof x === "number" &&
+    // x > 0`, so a stored `0.5` is a live 500 ms interval rule; the sanitizer's 1..86400 window
+    // was an import-path invention with no runtime behind it, and deleting the field turned that
+    // rule into no rule at all. Two shapes, two keys, two macros — and the one in the store keeps
+    // firing twice a second.
+    const store = await storeWith(
+      { id: "local-1", name: "Keepalive", text: " \n", triggerPattern: ">", triggerInterval: 0.5 }
+    );
+
+    await runBackupImport(
+      backupWith({ id: "file-1", name: "Keepalive", text: " \n", triggerPattern: ">", triggerInterval: 0.5 }),
+      "merge"
+    );
+
+    expect(store.getAll()).toHaveLength(1);
+    expect(store.getAll()[0].id).toBe("local-1");
+
+    // Preserved rather than clamped when it lands: `reload()` does not clamp the interval, so
+    // rounding it up to the old floor would make the imported copy a different macro again — the
+    // very thing this fix is closing, one round of copying later.
+    const fresh = new InMemoryMacroStore();
+    await fresh.initialize();
+    setActiveMacroStore(fresh);
+    await runBackupImport(
+      backupWith({ id: "file-1", name: "Keepalive", text: " \n", triggerPattern: ">", triggerInterval: 0.5 }),
+      "merge"
+    );
+    expect(fresh.getAll()[0].triggerInterval).toBe(0.5);
+  });
+
+  it("merge does NOT re-add a macro whose quoted cooldown pins the shipped default", async () => {
+    // A hand-edited settings.json that quoted its numbers. `clampSeconds()` hands `"5"` the
+    // shipped `DEFAULT_TRIGGER_COOLDOWN`, so the record runs at a FIXED 3s — deleting the field
+    // handed it to the setting instead, and the two copies parted company.
+    const store = await storeWith(
+      { id: "local-1", name: "Ack", text: "y\n", triggerPattern: "confirm:", triggerCooldown: "5" } as unknown as TerminalMacro
+    );
+
+    await runBackupImport(
+      backupWith({ id: "file-1", name: "Ack", text: "y\n", triggerPattern: "confirm:", triggerCooldown: "5" }),
+      "merge"
+    );
+
+    expect(store.getAll()).toHaveLength(1);
+    expect(store.getAll()[0].id).toBe("local-1");
+
+    // What lands on a store that does not have it is the number the compiler was going to use,
+    // which is also why the two key alike.
+    const fresh = new InMemoryMacroStore();
+    await fresh.initialize();
+    setActiveMacroStore(fresh);
+    await runBackupImport(
+      backupWith({ id: "file-1", name: "Ack", text: "y\n", triggerPattern: "confirm:", triggerCooldown: "5" }),
+      "merge"
+    );
+    expect(fresh.getAll()[0].triggerCooldown).toBe(3);
+  });
+
+  it("merge does NOT re-add a macro whose start-paused flag is a truthy non-boolean, and does not import it live", async () => {
+    // `reload()` reads this field for TRUTHINESS, so a hand-written `"yes"` means "start paused".
+    // Deleting it produced a second copy of the macro that was also the WRONG copy: the store's
+    // record starts paused and the imported one starts live, so the pair is one macro the user
+    // silenced plus one that fires.
+    const store = await storeWith(
+      { id: "local-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerInitiallyDisabled: "yes" } as unknown as TerminalMacro
+    );
+
+    await runBackupImport(
+      backupWith({ id: "file-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerInitiallyDisabled: "yes" }),
+      "merge"
+    );
+
+    expect(store.getAll()).toHaveLength(1);
+    expect(store.getAll()[0].id).toBe("local-1");
+
+    const fresh = new InMemoryMacroStore();
+    await fresh.initialize();
+    setActiveMacroStore(fresh);
+    await runBackupImport(
+      backupWith({ id: "file-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerInitiallyDisabled: "yes" }),
+      "merge"
+    );
+    expect(fresh.getAll()[0].triggerInitiallyDisabled).toBe(true);
+  });
+
+  it("merge does NOT re-add a macro whose trigger scope the compiler refuses — an unknown scope is the same nothing as no pattern", async () => {
+    // `reload()` skips a macro whose scope the enum does not name, so the record compiles no rule
+    // at all — exactly as much as a pattern-less one. The sanitizer strips the whole trigger for
+    // the same reason, but the key used to keep the bad string verbatim, so the stripped copy
+    // matched nothing and landed as a second (also inert) macro in the tree.
+    const store = await storeWith(
+      { id: "local-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerScope: "bogus" } as unknown as TerminalMacro
+    );
+
+    await runBackupImport(
+      backupWith({ id: "file-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerScope: "bogus" }),
+      "merge"
+    );
+
+    expect(store.getAll()).toHaveLength(1);
+    expect(store.getAll()[0].id).toBe("local-1");
+    // A scope the compiler DOES name is untouched by that fold: this is still two macros.
+    const scoped = await storeWith(
+      { id: "local-2", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerScope: "active-session" }
+    );
+    await runBackupImport(
+      backupWith({ id: "file-2", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerScope: "profile", triggerProfileId: "prod-1" }),
+      "merge"
+    );
+    expect(scoped.getAll()).toHaveLength(2);
   });
 
   it("merge does not drop a secret macro whose decrypted text happens to equal a plain macro's", async () => {
@@ -2561,10 +2757,17 @@ describe("share import", () => {
     // (`existing.map(keyOf)`, then `keyOf()` per incoming record), so the third and last place
     // a non-string binding used to throw is here. The local record is the reachable half:
     // legacy absorption persists a hand-written `nexus.terminal.macros` verbatim, and nothing
-    // between there and here type-checks the field.
+    // between there and here type-checks the field. Every non-string JSON type is covered on both
+    // sides for the reason the backup test gives: a guard that handled only the plausible NUMBER
+    // still throws on `true` or `{}`, and nothing upstream stops either from arriving.
     const shareImportStore = new InMemoryMacroStore();
     await shareImportStore.initialize();
-    await shareImportStore.save([{ name: "Local", text: "local\n", keybinding: 1 } as unknown as TerminalMacro]);
+    await shareImportStore.save([
+      { name: "Local", text: "local\n", keybinding: 1 },
+      { name: "LocalBool", text: "local\n", keybinding: true },
+      { name: "LocalObj", text: "local\n", keybinding: { key: "alt+9" } },
+      { name: "LocalArr", text: "local\n", keybinding: ["alt+9"] }
+    ] as unknown as TerminalMacro[]);
     setActiveMacroStore(shareImportStore);
 
     const shareData = {
@@ -2574,7 +2777,12 @@ describe("share import", () => {
       servers: [],
       tunnels: [],
       serialProfiles: [],
-      macros: [{ name: "Shared", text: "shared\n", keybinding: 2 }],
+      macros: [
+        { name: "Shared", text: "shared\n", keybinding: 2 },
+        { name: "SharedBool", text: "shared\n", keybinding: false },
+        { name: "SharedObj", text: "shared\n", keybinding: { key: "alt+8" } },
+        { name: "SharedArr", text: "shared\n", keybinding: ["alt+8"] }
+      ],
       settings: {}
     };
 
@@ -2585,9 +2793,13 @@ describe("share import", () => {
     await registeredCommands.get("nexus.config.import")!();
 
     const macros = shareImportStore.getAll();
-    expect(macros.map((m) => m.name).sort()).toEqual(["Local", "Shared"]);
-    expect(macros.map((m) => getAssignedBinding(m))).toEqual([undefined, undefined]);
-    expect(macros.find((m) => m.name === "Shared")!.keybinding).toBeUndefined();
+    expect(macros.map((m) => m.name).sort()).toEqual([
+      "Local", "LocalArr", "LocalBool", "LocalObj", "Shared", "SharedArr", "SharedBool", "SharedObj"
+    ]);
+    expect(macros.map((m) => getAssignedBinding(m))).toEqual(new Array(8).fill(undefined));
+    expect(macros.filter((m) => m.name.startsWith("Shared")).map((m) => m.keybinding)).toEqual([
+      undefined, undefined, undefined, undefined
+    ]);
   });
 
   it("share import sanitizes variables — a masked variable's plaintext default never reaches the store", async () => {
@@ -3972,6 +4184,54 @@ describe("share export round-trip", () => {
     // Optional fields should survive the round-trip
     expect(snapshot.tunnels[0].browserUrl).toBe("https://myapp.local:{localPort}/admin");
     expect(snapshot.tunnels[0].notes).toBe("test note");
+  });
+
+  it("share export then import of that same file adds no macros — with both ends freshening ids, the content key is the only dedupe left", async () => {
+    // The whole loop through the REAL commands, on ONE machine with no Settings Sync involved:
+    // `nexus.config.export` writes a share file with a fresh id per macro, `nexus.config.import`
+    // freshens every id again on the way in, so no id in the file names anything locally and the
+    // content key decides alone. Any field the sanitizer rewrites into a different runtime meaning
+    // therefore shows up here as a duplicate — and this one duplicated on THIS BRANCH but not on
+    // main, where the key ignored the cooldown entirely and the sanitized copy still matched.
+    // Widening the key is what made the sanitizer's deletions load-bearing.
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    await store.save([
+      { id: "local-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerCooldown: 5000 },
+      { id: "local-2", name: "Keepalive", text: " \n", triggerPattern: ">", triggerInterval: 0.5 },
+      { id: "local-3", name: "Ack", text: "y\n", triggerPattern: "confirm:", triggerCooldown: "5" }
+    ] as unknown as TerminalMacro[]);
+    setActiveMacroStore(store);
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/share-macros.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+    await registeredCommands.get("nexus.config.export")!();
+
+    // The premise: the file really does carry the stored values verbatim, under other ids.
+    const written = JSON.parse(exportedJson);
+    expect(written.macros.map((m: TerminalMacro) => m.id)).not.toContain("local-1");
+    expect(written.macros[0].triggerCooldown).toBe(5000);
+    expect(written.macros[1].triggerInterval).toBe(0.5);
+    expect(written.macros[2].triggerCooldown).toBe("5");
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-macros.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(exportedJson, "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(store.getAll().map((m) => m.id)).toEqual(["local-1", "local-2", "local-3"]);
   });
 
   it("share export then import preserves linked auth profile references", async () => {

@@ -21,10 +21,18 @@ import type { TerminalMacro } from "./models/terminalMacro";
  * (`renderMacroEditorHtml()`'s `bindingValue`), which is what the user would have opened to
  * repair the record.
  *
- * Behaviour for strings is unchanged, byte for byte; `null`/`undefined` still answer
- * `undefined` as they always did. Only the values that used to throw now resolve — to
- * `undefined`, i.e. "this record binds nothing", which is what every consumer already does with
- * an absent keybinding and lets `getAssignedBinding()` fall through to a legacy `slot`.
+ * Behaviour for primitive strings is unchanged, byte for byte; `null`/`undefined` still answer
+ * `undefined` as they always did. Everything else used to throw and now resolves to `undefined`,
+ * i.e. "this record binds nothing" — which is what every consumer already does with an absent
+ * keybinding, and lets `getAssignedBinding()` fall through to a legacy `slot`.
+ *
+ * One value changes without having thrown, and it is not "no change at all": a boxed
+ * `new String("alt+1")` has `typeof "object"` yet duck-typed through `.trim()`, so it used to
+ * resolve to `alt+1` and now binds nothing. It is not reachable from any of the three inputs
+ * above — `JSON.parse` never produces one, so neither globalState, nor settings.json, nor a
+ * backup or share file can hold one — and a String object is not a supported value for the
+ * command argument either. So no supported behaviour changes; the claim is that narrow, not that
+ * the guard is a no-op for every non-throwing input.
  */
 export function normalizeBinding(binding: unknown): string | undefined {
   if (typeof binding !== "string") return undefined;

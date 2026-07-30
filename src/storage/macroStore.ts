@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { slotToBinding } from "../macroBindings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import { clamp } from "../utils/helpers";
-import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import type { MacroTriggerScope, MacroVariable, TerminalMacro } from "../models/terminalMacro";
 
 export interface MacroStoreChangeListener {
   (): void;
@@ -284,36 +284,104 @@ export function canonicalMacroBinding(macro: TerminalMacro): string {
   return getAssignedBinding(macro) ?? "";
 }
 
-/** `reload()`'s explicit-cooldown bounds — `clampSeconds(macro.triggerCooldown, DEFAULT, 0, 300)`. */
+/**
+ * `reload()`'s explicit-cooldown fallback, bounds, and scope gate.
+ *
+ * `DEFAULT_TRIGGER_COOLDOWN` is DEFINED here and re-exported by services/macroAutoTrigger.ts for
+ * its existing consumers, and `VALID_MACRO_TRIGGER_SCOPES` replaces the copy that file and
+ * commands/configCommands.ts each kept. Three places have to agree about what a stored trigger
+ * field MEANS — the compiler that runs it, the content keys that decide whether two records are
+ * the same macro, and the import sanitizer that rewrites it — and every duplicate-macro bug on
+ * this branch has been two of those three disagreeing. One definition each is the only form of
+ * that agreement that cannot drift.
+ */
+export const DEFAULT_TRIGGER_COOLDOWN = 3;
 const TRIGGER_COOLDOWN_MIN_SECONDS = 0;
 const TRIGGER_COOLDOWN_MAX_SECONDS = 300;
+export const VALID_MACRO_TRIGGER_SCOPES = new Set<MacroTriggerScope>([
+  "all-terminals",
+  "active-session",
+  "profile"
+]);
 
 /**
- * A cooldown as `MacroAutoTrigger.reload()` resolves it. THREE outcomes, not two:
+ * The explicit cooldown `MacroAutoTrigger.reload()` COMPILES for a record, in seconds, or
+ * `undefined` when the record pins none and follows the `nexus.terminal.macros.defaultCooldown`
+ * SETTING. It is `reload()`'s own expression, factored out:
+ * `macro.triggerCooldown != null ? clampSeconds(macro.triggerCooldown, DEFAULT_TRIGGER_COOLDOWN, 0, 300) : <setting>`.
  *
- *   - absent or `null` → `null` here. `reload()` takes the `this.defaultCooldownMs` branch,
- *     which comes from the `nexus.terminal.macros.defaultCooldown` SETTING.
- *   - a finite number → the CLAMPED value. `reload()` applies `clampSeconds(v, DEFAULT, 0, 300)`,
- *     so `300` and `301` (and `0` and `-5`) are one timing, not two. Keying the raw number let
- *     two records the clamp flattens together survive as two macros with identical live rules —
- *     for a `Password:` responder, the password sent twice per prompt.
- *   - anything else present (a quoted number from a hand-edited settings.json, `NaN`,
- *     `Infinity`, an object) → the fixed `"__DEFAULT__"`. `clampSeconds()` returns its
- *     `DEFAULT_TRIGGER_COOLDOWN` fallback for all of them, so they are one macro too.
+ * THREE outcomes, not two:
  *
- * The third state is kept apart from the first deliberately, and it is the same argument that
- * keeps absent apart from an explicit `3`: absent follows a machine-local SETTING while a value
- * the clamp rejects pins the shipped constant, so they coincide only while that setting is left
- * alone. Collapsing them would make the key depend on a mutable setting and would DROP a macro
- * the moment the user changed it. A string can never collide with the clamped-number branch:
- * `JSON.stringify` writes `"__DEFAULT__"` and `300` differently.
+ *   - absent or `null` → `undefined`. `reload()` takes the `this.defaultCooldownMs` branch.
+ *   - a finite number → the CLAMPED value, so `300` and `301` (and `0` and `-5`) are one timing.
+ *   - anything else present (a quoted number from a hand-edited settings.json, `NaN`, an
+ *     object) → `DEFAULT_TRIGGER_COOLDOWN`, which is what `clampSeconds()` falls back to.
+ *
+ * BOTH READERS OF A STORED COOLDOWN GO THROUGH THIS, and that is the point of it existing:
+ * `canonicalMacroCooldown()` below, and `sanitizeImportedMacro()` (commands/configCommands.ts),
+ * which now writes the result back onto the imported record. Deleting the field instead — what
+ * the sanitizer used to do for anything outside 0..300 or not a number — did not just "reject an
+ * invalid value", it CHANGED THE MACRO: a pinned 300s became "follow the setting". So a record
+ * absorbed verbatim from a legacy settings.json could never key-match its own exported copy, and
+ * came back from its own backup or share file as a second macro with a second live rule.
  */
-function canonicalMacroCooldown(value: unknown): unknown {
-  if (value === undefined || value === null) return null;
+export function compiledTriggerCooldownSeconds(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
   if (typeof value === "number" && Number.isFinite(value)) {
     return clamp(value, TRIGGER_COOLDOWN_MIN_SECONDS, TRIGGER_COOLDOWN_MAX_SECONDS);
   }
-  return "__DEFAULT__";
+  return DEFAULT_TRIGGER_COOLDOWN;
+}
+
+/**
+ * The interval `reload()` COMPILES, in seconds, or `undefined` for "no interval rule" — mirroring
+ * `typeof x === "number" && x > 0 ? x * 1000 : undefined` exactly, including the absence of a
+ * clamp.
+ *
+ * `sanitizeImportedMacro()`'s old 1..86400 window was an import-path invention with no runtime
+ * behind it: a stored `0.5` runs a live 500 ms rule (`reload()` asks only for `> 0`), so deleting
+ * it on the way back in produced a copy that was a DIFFERENT macro from the one exported, and the
+ * two then coexisted. Narrowing here is therefore not available; the field is either the interval
+ * the runtime will honour or it is absent. Non-finite values are unreachable through this path —
+ * `JSON.parse` cannot produce one and settings.json is JSON — and would key as `null` on both
+ * sides anyway, since `JSON.stringify` writes `Infinity` as `null`.
+ */
+export function compiledTriggerIntervalSeconds(value: unknown): number | undefined {
+  return typeof value === "number" && value > 0 ? value : undefined;
+}
+
+/**
+ * A cooldown as a content-key term: THE COMPILED MILLISECONDS, or `null` for "follows the
+ * setting".
+ *
+ * Milliseconds, not the stored seconds, because `reload()` stores `clampSeconds(...) * 1000` and
+ * IEEE-754 multiplication is not injective. `190.83296102825926` and `190.8329610282593` are
+ * different numbers, both survive a JSON round trip as themselves, and both sit inside every
+ * import range — yet both times 1000 are the same `190832.96102825928`. Keying the seconds let
+ * two records with provably identical `cooldownMs` be absorbed as two macros, each compiling its
+ * own live rule; for a `Password:` responder that is the password sent twice per prompt. Keying
+ * the product cannot over-collapse in exchange: two seconds values whose products are equal are
+ * one timing at runtime, which is the whole test this file applies.
+ *
+ * Absent stays apart from a value the clamp rejects (`null` versus `3000`) for the reason it
+ * stays apart from an explicit `3`: absent follows a machine-local SETTING while an unusable
+ * value pins the shipped constant, so they coincide only while that setting is left alone.
+ * Collapsing them would make the key depend on a mutable setting and DROP a macro the moment the
+ * user changed it.
+ *
+ * An unusable value and an explicit `3` DO key alike, and must: `reload()` compiles 3000 ms for
+ * both, and the sanitizer now rewrites the unusable one to `3` — so keeping them apart would put
+ * a hand-edited `triggerCooldown: "5"` back into the store as a second copy of itself the first
+ * time its own backup was merged.
+ */
+function canonicalMacroCooldown(value: unknown): number | null {
+  const seconds = compiledTriggerCooldownSeconds(value);
+  return seconds === undefined ? null : seconds * 1000;
+}
+
+/** The six trigger terms for a record that compiles no rule at all. */
+function inertTriggerTerms(): unknown[] {
+  return ["", null, null, false, "", ""];
 }
 
 /**
@@ -325,34 +393,56 @@ function canonicalMacroCooldown(value: unknown): unknown {
  * that shape (its cooldown write is not gated on the pattern) while `sanitizeImportedMacro()`
  * strips the whole group, so the two shapes must collapse or the same macro imports twice.
  *
- * Per-field, when there IS a pattern:
- *   - cooldown goes through `canonicalMacroCooldown()` above: clamped exactly as `reload()`
- *     clamps it, with absent (follow the configured default) kept apart from an explicit value.
- *   - interval mirrors `typeof x === "number" && x > 0 ? x * 1000 : undefined`, so `0`, a
- *     negative, a string and absent are all "no interval". NOT clamped, because `reload()` does
- *     not clamp it either — `sanitizeImportedMacro()`'s 1..86400 window is an import-path
- *     rule, and a legacy record outside it still runs at whatever it says.
+ * AN INVALID SCOPE IS THE SAME NOTHING. `reload()`'s next gate is
+ * `macro.triggerScope !== undefined && !VALID_MACRO_TRIGGER_SCOPES.has(...) → continue`, so a scope the
+ * enum does not name compiles exactly as much as a missing pattern does: nothing. An earlier
+ * revision kept the bad string verbatim on the grounds that "keeping it can only over-name" —
+ * but over-naming is a duplicate, and this one was reachable: `sanitizeImportedMacro()` strips
+ * the whole trigger for an invalid scope, so a legacy record carrying one came back from its own
+ * export as a second macro. `null` folds here too, and has to: `null !== undefined` is what
+ * `reload()` tests, so a `triggerScope: null` compiles nothing while `?? "all-terminals"` below
+ * would have called it a live all-terminals rule.
+ *
+ * Per-field, when there IS a pattern and the scope is one the compiler accepts:
+ *   - cooldown goes through `canonicalMacroCooldown()` above: the compiled MILLISECONDS, with
+ *     absent (follow the configured default) kept apart from an explicit value.
+ *   - interval likewise compiles to milliseconds via `compiledTriggerIntervalSeconds()`, so `0`,
+ *     a negative, a string and absent are all "no interval", and two seconds values whose
+ *     millisecond products coincide are the one rule they compile to.
  *   - start-paused mirrors `if (macro.triggerInitiallyDisabled)` — truthy, not `=== true`.
  *   - scope: absent is `"all-terminals"`. `evaluate()` tests only for `"active-session"` and
- *     `"profile"`; everything else, absent included, falls through to "every terminal". An
- *     INVALID scope string is kept verbatim rather than folded into "no rule at all" (which is
- *     what `reload()`'s `VALID_TRIGGER_SCOPES` check makes it): keeping it can only over-name,
- *     and `sanitizeImportedMacro()` strips the whole trigger for one anyway.
+ *     `"profile"`; absent falls through to "every terminal".
  *   - profile id only when the scope is `"profile"` — `evaluate()` reads it nowhere else.
  *
  * NOT collapsed: a pattern suppressed by a non-empty `variables` array (§6.1). That suppression
  * is lifted by deleting the variables, so the pattern is real configuration the user can bring
  * back, and folding it away would drop a macro's whole trigger on the strength of a state the
  * editor refuses to create.
+ *
+ * ALSO NOT collapsed, and NOT claimed to be closed: the shapes `sanitizeImportedMacro()` rejects
+ * outright rather than rewrites — a non-string `triggerPattern` (`5` compiles the live regex
+ * `/5/`), a pattern with surrounding whitespace or one that is only whitespace (both compile,
+ * and the sanitizer trims), an unsafe regex, a `"profile"` scope with no profile id, a
+ * `keybinding` string the binding validator refuses. Each can still import as a second record
+ * that keys differently from the one it came from. All of them require a hand-edited
+ * `nexus.terminal.macros` to exist in the first place (the editor trims, validates and drops
+ * every one of these before persisting), and the sanitizer's narrowing is deliberate at an
+ * untrusted boundary — preserving a whitespace-only pattern verbatim would let a share file
+ * install a rule that matches nearly every line of output. See the round-8 notes on the PR.
  */
 export function canonicalMacroTriggerTerms(macro: TerminalMacro): unknown[] {
   const pattern = macro.triggerPattern ?? "";
-  if (!pattern) return ["", null, null, false, "", ""];
-  const scope = macro.triggerScope ?? "all-terminals";
+  if (!pattern) return inertTriggerTerms();
+  const declaredScope = macro.triggerScope;
+  if (declaredScope !== undefined && !VALID_MACRO_TRIGGER_SCOPES.has(declaredScope)) {
+    return inertTriggerTerms();
+  }
+  const scope = declaredScope ?? "all-terminals";
+  const intervalSeconds = compiledTriggerIntervalSeconds(macro.triggerInterval);
   return [
     pattern,
     canonicalMacroCooldown(macro.triggerCooldown),
-    typeof macro.triggerInterval === "number" && macro.triggerInterval > 0 ? macro.triggerInterval : null,
+    intervalSeconds === undefined ? null : intervalSeconds * 1000,
     Boolean(macro.triggerInitiallyDisabled),
     scope,
     scope === "profile" ? (macro.triggerProfileId ?? "") : ""

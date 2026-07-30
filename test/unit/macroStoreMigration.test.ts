@@ -548,20 +548,37 @@ describe("MacroStore legacy migration", () => {
     // label — macroEditorPanel.ts and `sanitizeImportedMacroVariables()`), which is exactly why
     // legacy absorption is where it has to be handled: a hand-written settings.json is the only
     // thing that makes one, and absorption is the only path that reads it.
+    // The opposite direction is in the same fixture on purpose. A label the prompt path cannot
+    // use — `toValidMacroVariable()` keeps only a string — asks the SAME question as no label at
+    // all ("port", the variable's name), so those two records are one macro. A key that merely
+    // told every DEFINED label apart from an absent one would satisfy the first pair while
+    // absorbing this one twice, which is the wrong direction on the destructive path: absorption
+    // clears `nexus.terminal.macros` afterwards.
     const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
     vscode.__setConfig("nexus.terminal", {
       global: [
         { name: "Ping", text: "ping $host\n", variables: [{ name: "host" }] },
-        { name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "" }] }
-      ] as TerminalMacro[]
+        { name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "" }] },
+        { name: "Port", text: "port $port\n", variables: [{ name: "port" }] },
+        { name: "Port", text: "port $port\n", variables: [{ name: "port", label: 42 }] }
+      ] as unknown as TerminalMacro[]
     });
-    const { ctx } = makeCtx();
+    const { ctx, state } = makeCtx();
     const store = new VscodeMacroStore(ctx);
     await store.initialize();
 
     const all = store.getAll();
-    expect(all).toHaveLength(2);
-    expect(all.map((m) => m.variables?.[0].label ?? "<absent>").sort()).toEqual(["", "<absent>"]);
+    expect(all).toHaveLength(3);
+    expect(all.filter((m) => m.name === "Ping").map((m) => m.variables?.[0].label ?? "<absent>").sort())
+      .toEqual(["", "<absent>"]);
+    // First occurrence wins, so the survivor is the one with no label — and the unusable one is
+    // what did NOT come through.
+    expect(all.filter((m) => m.name === "Port").map((m) => m.variables?.[0].label ?? "<absent>"))
+      .toEqual(["<absent>"]);
+    // `withRedactedVariables()` keeps a non-string label verbatim, so the collapse is symmetric
+    // across the persistence boundary and a Settings Sync replay of the same file absorbs nothing
+    // further.
+    expect((state.get("nexus.macros") as TerminalMacro[])).toHaveLength(3);
   });
 
   it("legacy cooldowns the trigger compiler cannot tell apart are absorbed once — and the ones it can are not", async () => {
@@ -610,6 +627,41 @@ describe("MacroStore legacy migration", () => {
     expect(pick("Ack").map((m) => m.triggerCooldown)).toEqual(["5"]);
     expect(pick("Keep").map((m) => m.triggerCooldown).sort()).toEqual([30, 5]);
     expect(pick("Dflt").map((m) => m.triggerCooldown ?? "<absent>").sort()).toEqual(["<absent>", "nope"]);
+  });
+
+  it("legacy cooldowns and intervals that differ only below the millisecond the compiler multiplies to are absorbed once", async () => {
+    // `reload()` does not store the seconds it reads, it stores `seconds * 1000` — and IEEE-754
+    // multiplication is not injective. These two numbers are different, each survives a JSON round
+    // trip as itself, and both sit inside every range the import path checks; their products are
+    // the same double. Keying the SOURCE seconds therefore absorbed them as two macros whose
+    // compiled rules are bit-identical, which for a `Password:` responder is one prompt answered
+    // twice — the exact failure the canonicalization exists to prevent, arriving through the last
+    // term that was still keyed as it is written rather than as it is compiled.
+    const finer = 190.83296102825926;
+    const coarser = 190.8329610282593;
+    expect(finer).not.toBe(coarser);
+    expect(JSON.parse(JSON.stringify([finer, coarser]))).toEqual([finer, coarser]);
+    expect(finer * 1000).toBe(coarser * 1000);
+
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    vscode.__setConfig("nexus.terminal", {
+      global: [
+        { name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerCooldown: finer },
+        { name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerCooldown: coarser },
+        { name: "Keepalive", text: " \n", triggerPattern: ">", triggerInterval: finer },
+        { name: "Keepalive", text: " \n", triggerPattern: ">", triggerInterval: coarser }
+      ] as TerminalMacro[]
+    });
+    const { ctx } = makeCtx();
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    const all = store.getAll();
+    expect(all.map((m) => m.name)).toEqual(["Enable", "Keepalive"]);
+    // First occurrence wins, and the survivor keeps the number the user wrote — the collapse is in
+    // the KEY, not a rewrite of the record.
+    expect(all[0].triggerCooldown).toBe(finer);
+    expect(all[1].triggerInterval).toBe(finer);
   });
 
   it("legacy records neither the trigger compiler nor the prompt path can tell apart are absorbed once", async () => {
