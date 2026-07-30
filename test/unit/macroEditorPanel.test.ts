@@ -294,20 +294,18 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     // produces no notification, no in-panel error, and — because only a `saved` message clears
     // it — a webview still showing "Unsaved changes" with no explanation.
     //
-    // This is not theoretical. `VscodeMacroStore` fails CLOSED when it cannot write a secret
-    // id's marker file (unwritable global storage, full disk, dead network share), and a save
-    // republishes every secret the window holds — so that condition rejects EVERY save
-    // containing any secret macro, including an edit to an unrelated plain one. This editor is
-    // the primary secret-editing surface. Every other `saveMacros()` call site in the extension
-    // is awaited inside a registered command handler, where VS Code reports the rejection
-    // itself; this one is the exception.
+    // This is not theoretical. `VscodeMacroStore.save()` writes both `globalState` and
+    // `SecretStorage`, and either can reject — a locked OS keyring, a corrupt or read-only
+    // extension storage database. A save republishes every secret the window holds, so a
+    // failing keyring rejects EVERY save containing any secret macro, including an edit to an
+    // unrelated plain one. This editor is the primary secret-editing surface. Every other
+    // `saveMacros()` call site in the extension is awaited inside a registered command
+    // handler, where VS Code reports the rejection itself; this one is the exception.
     await harness([{ name: "Alpha", text: "a\n" }]);
     const { sendMessage } = await openPanel(0);
     const id = getMacros()[0].id!;
 
-    const failure = new Error(
-      "Nexus could not record macro secret ids in /storage/macro-secret-ids, so nothing was saved."
-    );
+    const failure = new Error("EPERM: globalState is not writable, so nothing was saved.");
     vi.spyOn(store, "save").mockRejectedValue(failure);
     const rendersBefore = htmlWrites;
 
@@ -334,7 +332,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     ).resolves.toBeUndefined();
 
     expect(mockShowErrorMessage).toHaveBeenCalledWith(
-      expect.stringContaining("could not record macro secret ids")
+      expect.stringContaining("globalState is not writable")
     );
     expect(mockPostMessage).toHaveBeenCalledWith(
       expect.objectContaining({ type: "saveError", field: "save" })

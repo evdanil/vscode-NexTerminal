@@ -1,88 +1,35 @@
 import { describe, it, expect, vi } from "vitest";
 
-// VscodeMacroStore imports vscode for the legacy migration (tests with
-// { runLegacyMigration: false } never touch those stubs) AND for `workspace.fs`, which it
-// uses on every save that writes a secret: the secret-id ledger is one marker FILE per id
-// under `globalStorageUri`, because a `globalState` array is a read-modify-write that two
-// windows can lose. So the mock below is a real (if tiny) in-memory filesystem rather than
-// a set of no-op spies — a no-op `writeFile` would make every "the marker was written"
-// assertion vacuous, and a no-op `readDirectory` would hide the sweep entirely.
-vi.mock("vscode", () => {
-  const files = new Map<string, Uint8Array>();
-  const dirs = new Set<string>();
-  return {
-    workspace: {
-      getConfiguration: vi.fn(() => ({
-        inspect: vi.fn(() => ({})),
-        update: vi.fn()
-      })),
-      fs: {
-        async createDirectory(uri: { path: string }): Promise<void> {
-          // Idempotent, like the real one, and it creates parents.
-          const parts = uri.path.split("/").filter(Boolean);
-          for (let i = 1; i <= parts.length; i++) dirs.add(`/${parts.slice(0, i).join("/")}`);
-        },
-        async writeFile(uri: { path: string }, content: Uint8Array): Promise<void> {
-          const parent = uri.path.slice(0, uri.path.lastIndexOf("/"));
-          if (!dirs.has(parent)) throw new Error(`ENOENT: no such directory, open '${uri.path}'`);
-          files.set(uri.path, content);
-        },
-        async readFile(uri: { path: string }): Promise<Uint8Array> {
-          const found = files.get(uri.path);
-          if (!found) throw new Error(`ENOENT: no such file, open '${uri.path}'`);
-          return found;
-        },
-        async readDirectory(uri: { path: string }): Promise<Array<[string, number]>> {
-          if (!dirs.has(uri.path)) throw new Error(`ENOENT: no such directory, scandir '${uri.path}'`);
-          const prefix = `${uri.path}/`;
-          return [...files.keys()]
-            .filter((p) => p.startsWith(prefix) && !p.slice(prefix.length).includes("/"))
-            .map((p) => [p.slice(prefix.length), 1] as [string, number]);
-        },
-        async delete(uri: { path: string }): Promise<void> {
-          if (!files.delete(uri.path)) throw new Error(`ENOENT: no such file, unlink '${uri.path}'`);
-        }
-      }
-    },
-    Uri: {
-      joinPath(base: { path: string; scheme?: string }, ...parts: string[]) {
-        const path = [base.path.replace(/\/$/, ""), ...parts].join("/");
-        return { path, fsPath: path, scheme: base.scheme ?? "file" };
-      }
-    },
-    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
-    __fsFiles: files,
-    __fsDirs: dirs
-  };
-});
+// `VscodeMacroStore` imports vscode only for the legacy migration (tests with
+// { runLegacyMigration: false } never touch those stubs). It deliberately touches no other
+// part of the API — in particular NOT `workspace.fs`: the per-secret-id marker files it used
+// to write under `globalStorageUri` are gone, replaced by `SecretStorage.keys()`. The absence
+// of an `fs` stub here is therefore load-bearing rather than an omission — any re-introduction
+// of a filesystem-backed ledger fails every test in this file with "Cannot read properties of
+// undefined".
+vi.mock("vscode", () => ({
+  workspace: {
+    getConfiguration: vi.fn(() => ({
+      inspect: vi.fn(() => ({})),
+      update: vi.fn()
+    }))
+  },
+  ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 }
+}));
 
-import * as vscodeMock from "vscode";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore } from "../../src/storage/vscodeMacroStore";
 import { assignMacroIds, assignUniqueMacroIds, isValidMacroId } from "../../src/storage/macroStore";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
-const fsFiles = (vscodeMock as unknown as { __fsFiles: Map<string, Uint8Array> }).__fsFiles;
-const fsDirs = (vscodeMock as unknown as { __fsDirs: Set<string> }).__fsDirs;
-
 /**
- * The mocked filesystem is module state and therefore shared by every test in this file, so
- * each context gets its OWN global-storage root. Without that, one test's marker files would
- * be visible to the next test's `clearAll()` sweep and a leak would read as a pass.
+ * A fake `ExtensionContext` whose `SecretStorage` has `keys()`, because every host the
+ * extension now runs on does: `engines.vscode` is `^1.105.0` and the API was finalized in
+ * 1.105. `clearAll()` calls it unconditionally.
  */
-let contextSeq = 0;
-
-/**
- * @param enumerableSecrets give the fake `SecretStorage` a `keys()` method, i.e. model a host
- * on VS Code >= 1.105 where the API was finalized. It is OPT-IN because the extension's engine
- * floor (`^1.95.0`) admits hosts without it, and `clearAll()` feature-detects rather than
- * assuming: the default here is the older host, so every test that does not ask for it is
- * exercising the name-based records (macro list, marker files, legacy ledger) on their own.
- */
-function makeFakeContext(options: { enumerableSecrets?: boolean } = {}) {
+function makeFakeContext() {
   const stateBag = new Map<string, unknown>();
   const secretBag = new Map<string, string>();
-  const globalStoragePath = `/global-storage/ctx-${++contextSeq}`;
   const secrets: Record<string, unknown> = {
     async get(key: string): Promise<string | undefined> {
       return secretBag.get(key);
@@ -92,14 +39,13 @@ function makeFakeContext(options: { enumerableSecrets?: boolean } = {}) {
     },
     async delete(key: string): Promise<void> {
       secretBag.delete(key);
+    },
+    async keys(): Promise<string[]> {
+      return [...secretBag.keys()];
     }
   };
-  if (options.enumerableSecrets) {
-    secrets.keys = async (): Promise<string[]> => [...secretBag.keys()];
-  }
   return {
     context: {
-      globalStorageUri: { path: globalStoragePath, fsPath: globalStoragePath, scheme: "file" },
       globalState: {
         get<T>(key: string, fallback: T): T {
           return (stateBag.get(key) as T) ?? fallback;
@@ -115,24 +61,7 @@ function makeFakeContext(options: { enumerableSecrets?: boolean } = {}) {
       secrets
     } as unknown as import("vscode").ExtensionContext,
     stateBag,
-    secretBag,
-    /** Marker-file names currently under this context's global storage, sorted. */
-    markerNames(): string[] {
-      const prefix = `${globalStoragePath}/macro-secret-ids/`;
-      return [...fsFiles.keys()]
-        .filter((p) => p.startsWith(prefix))
-        .map((p) => p.slice(prefix.length))
-        .sort();
-    },
-    /** Secret ids recoverable from this context's marker files — the ids are the CONTENTS. */
-    markedIds(): string[] {
-      const prefix = `${globalStoragePath}/macro-secret-ids/`;
-      return [...fsFiles.entries()]
-        .filter(([p]) => p.startsWith(prefix))
-        .map(([, bytes]) => new TextDecoder().decode(bytes))
-        .sort();
-    },
-    globalStoragePath
+    secretBag
   };
 }
 
@@ -297,13 +226,12 @@ describe("VscodeMacroStore", () => {
     expect(secretBag.has("macro-secret-text-b")).toBe(false);
   });
 
-  it("clearAll order: MACROS_KEY first, then vault entries, then SECRET_IDS_KEY", async () => {
+  it("clearAll order: MACROS_KEY first, then vault entries", async () => {
     const { context } = makeFakeContext();
     const ops: string[] = [];
     const origUpdate = context.globalState.update.bind(context.globalState);
     context.globalState.update = async (k: string, v: unknown) => {
       if (k === "nexus.macros" && v === undefined) ops.push("state");
-      if (k === "nexus.macros.secretIds" && v === undefined) ops.push("secretIds");
       return origUpdate(k, v);
     };
     const origDelete = context.secrets.delete.bind(context.secrets);
@@ -317,24 +245,22 @@ describe("VscodeMacroStore", () => {
     await store.save([{ id: "x", name: "s", text: "v", secret: true }]);
     ops.length = 0;
     await store.clearAll();
+    // MACROS_KEY goes first so a crash between the two leaves no record pointing at a value
+    // that is already gone; the entries the record no longer names are found by enumeration.
     expect(ops[0]).toBe("state");
     expect(ops[1]).toBe("secret");
-    expect(ops[ops.length - 1]).toBe("secretIds");
   });
 
-  // Also the LEGACY-FALLBACK contract: "orphan" below is seeded into `nexus.macros.secretIds`
-  // and into the vault by hand and has no marker file, which is exactly the shape a build
-  // predating the marker files leaves behind. Complete Reset must still find it.
-  it("clearAll sweeps an orphan vault entry the index knows about but `resolved` does not", async () => {
+  // The sweep must cover an entry that is in the VAULT but in neither `resolved` nor
+  // `nexus.macros` — the shape a crash between `secrets.store()` and the MACROS_KEY commit
+  // leaves, and the shape a build predating any of this could leave. Nothing names "orphan"
+  // anywhere; only `SecretStorage.keys()` can report it.
+  it("clearAll sweeps an orphan vault entry that `resolved` does not account for", async () => {
     const { context, secretBag } = makeFakeContext();
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });
     await store.initialize();
     await store.save([{ id: "live", name: "m", text: "v", secret: true }]);
 
-    // Simulate orphan from a crash: index has an extra id, vault has a stale entry
-    const index = [...(context.globalState.get<string[]>("nexus.macros.secretIds", []))];
-    index.push("orphan");
-    await context.globalState.update("nexus.macros.secretIds", index);
     await context.secrets.store("macro-secret-text-orphan", "zombie");
 
     await store.clearAll();
@@ -342,246 +268,46 @@ describe("VscodeMacroStore", () => {
     expect(secretBag.has("macro-secret-text-orphan")).toBe(false);
   });
 
-  describe("secret-id ledger — the orphan list clearAll depends on", () => {
-    // The test above seeds the index by hand, so it only proves clearAll READS the
-    // index; it says nothing about whether the index still holds anything by the time
-    // clearAll runs. Every real clearAll is preceded by an initialize(), so these
-    // exercise the maintenance path instead.
-
-    it("survives a reload that no longer sees the macro — this is what makes clearAll's vault-first/index-last order mean anything", async () => {
+  describe("Complete Reset sweeps by ENUMERATION — no list this extension had to remember to write", () => {
+    it("finds a vault entry after a reload that no longer sees the macro at all", async () => {
       const { context, stateBag, secretBag } = makeFakeContext();
       const store1 = new VscodeMacroStore(context, { runLegacyMigration: false });
       await store1.initialize();
       await store1.save([{ id: "s", name: "Password", text: "hunter2", secret: true }]);
       expect(secretBag.get("macro-secret-text-s")).toBe("hunter2");
 
-      // MACROS_KEY is lost — a partial write, a corrupt value degraded to [], or
-      // another window's Complete Reset landing between the vault write and the state
-      // write. The vault entry is still there and only the ledger can still name it.
+      // MACROS_KEY is lost — a partial write, a corrupt value degraded to [], or another
+      // window's Complete Reset landing between the vault write and the state write. The
+      // vault entry is still there and NOTHING in globalState names it.
       stateBag.delete("nexus.macros");
 
       const store2 = new VscodeMacroStore(context, { runLegacyMigration: false });
       await store2.initialize();
       expect(store2.getAll()).toEqual([]);
+      expect([...secretBag.keys()]).toEqual(["macro-secret-text-s"]);
 
-      // A reload that REBUILT the index from what it just read would have wiped the
-      // only remaining reference to this vault entry, stranding the secret forever.
+      // A sweep restricted to what the store can still name — `this.resolved`, which is
+      // empty — leaves the secret in the OS keyring forever.
       await store2.clearAll();
       expect(secretBag.has("macro-secret-text-s")).toBe(false);
     });
 
-    it("drops an id whose vault entry save() just deleted, so the ledger cannot grow without bound", async () => {
-      const { context, secretBag } = makeFakeContext();
+    it("does not throw when SecretStorage.keys() rejects — the rest of the reset still runs", async () => {
+      // A locked or unavailable OS keyring can reject rather than answer. Complete Reset has
+      // vault entries of its own to delete and must get to them, so enumeration degrades to
+      // "nothing extra to sweep" rather than failing the command.
+      const { context, stateBag, secretBag } = makeFakeContext();
       const store = new VscodeMacroStore(context, { runLegacyMigration: false });
       await store.initialize();
-      await store.save([{ id: "s", name: "m", text: "classified", secret: true }]);
-      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual(["s"]);
-
-      // Flip to non-secret: save() deletes the vault entry, so the ledger must forget it.
-      await store.save([{ id: "s", name: "m", text: "now-public", secret: false }]);
-      expect(secretBag.has("macro-secret-text-s")).toBe(false);
-      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual([]);
-
-      // And likewise when the macro is removed outright.
-      await store.save([{ id: "t", name: "n", text: "classified", secret: true }]);
-      await store.save([]);
-      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual([]);
-    });
-
-    it("never lists an id that exists only in memory — a runtime-only UUID has no vault entry to sweep", async () => {
-      const { context, stateBag } = makeFakeContext();
-      // A secret record with no id at all: reloadFromState() mints a runtime UUID for
-      // it so the rest of the app can key off `macro.id`, but that UUID was never a
-      // vault key, so indexing it would describe an entry that cannot exist.
-      stateBag.set("nexus.macros", [{ name: "Password", text: "", secret: true }]);
-
-      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
-      await store.initialize();
-
-      const runtimeId = store.getAll()[0].id!;
-      expect(runtimeId).toBeTruthy();
-      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).not.toContain(runtimeId);
-    });
-  });
-
-  describe("secret-id MARKER FILES — the per-entity ledger the globalState array could not be", () => {
-    it("writes the marker BEFORE the vault entry it names, with the id as the file's contents", async () => {
-      const { context, markerNames, markedIds } = makeFakeContext();
-      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
-      await store.initialize();
-
-      const markedAtStore = new Map<string, string[]>();
-      const origStore = context.secrets.store.bind(context.secrets);
-      context.secrets.store = async (k: string, v: string) => {
-        markedAtStore.set(k, markedIds());
-        return origStore(k, v);
-      };
-
       await store.save([{ id: "s", name: "Password", text: "hunter2\n", secret: true }]);
 
-      // The guarantee: at the instant the value hit the vault, the id naming it was already
-      // on disk in a medium that a second window cannot overwrite. Writing the marker
-      // afterwards leaves a window in which a crash strands a plaintext credential under a
-      // key nothing names — not `nexus.macros`, not the ledger, not Complete Reset.
-      expect(markedAtStore.get("macro-secret-text-s")).toEqual(["s"]);
-      // One file, named by a hash (macro ids are only promised to be non-empty strings, and a
-      // hand-edited backup can put a path separator in one), with the id as its contents so
-      // the sweep can recover it.
-      expect(markerNames()).toHaveLength(1);
-      expect(markerNames()[0]).toMatch(/^[0-9a-f]{64}\.id$/);
-      expect(markedIds()).toEqual(["s"]);
-    });
-
-    it("Complete Reset sweeps a vault entry that only a marker still names — the entry the globalState ledger loses to a second window", async () => {
-      const { context, stateBag, secretBag, markedIds } = makeFakeContext();
-      const windowA = new VscodeMacroStore(context, { runLegacyMigration: false });
-      await windowA.initialize();
-      const windowB = new VscodeMacroStore(context, { runLegacyMigration: false });
-      await windowB.initialize();
-
-      await windowA.save([{ id: "a", name: "A", text: "secret-a\n", secret: true }]);
-      expect(stateBag.get("nexus.macros.secretIds")).toEqual(["a"]);
-
-      // Window B is running on a globalState cache from BEFORE A's save. That is not a
-      // contrivance — it is what VS Code hands a second window, and extension code cannot
-      // invalidate or lock it, which is the whole reason the array ledger cannot be the
-      // authoritative record. B's ledger read therefore answers `[]`, its union write drops
-      // "a", and its wholesale `nexus.macros` write drops A's macro too.
-      const origGet = context.globalState.get.bind(context.globalState);
-      context.globalState.get = ((key: string, fallback: unknown) =>
-        key === "nexus.macros.secretIds" ? [] : origGet(key, fallback)) as typeof context.globalState.get;
-      await windowB.save([{ id: "b", name: "B", text: "secret-b\n", secret: true }]);
-      context.globalState.get = origGet;
-
-      // The lost race, reproduced: nothing in globalState names "a" any more...
-      expect(stateBag.get("nexus.macros.secretIds")).toEqual(["b"]);
-      expect((stateBag.get("nexus.macros") as TerminalMacro[]).map((m) => m.id)).toEqual(["b"]);
-      expect(secretBag.get("macro-secret-text-a")).toBe("secret-a\n");
-      // ...but the marker files do, because two windows creating two different files cannot
-      // lose one another's write.
-      expect(markedIds()).toEqual(["a", "b"]);
-
-      const later = new VscodeMacroStore(context, { runLegacyMigration: false });
-      await later.initialize();
-      await later.clearAll();
-
-      expect(secretBag.has("macro-secret-text-a")).toBe(false);
-      expect(secretBag.has("macro-secret-text-b")).toBe(false);
-      // And the markers go with the entries they named, so the directory does not grow
-      // without bound.
-      expect(markedIds()).toEqual([]);
-    });
-
-    it("a save whose marker cannot be written writes NOTHING — not the vault entry, not the ledger, not nexus.macros", async () => {
-      const { context, stateBag, secretBag, markedIds } = makeFakeContext();
-      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
-      await store.initialize();
-      await store.save([{ id: "keep", name: "Existing", text: "show version\n" }]);
-      const before = JSON.stringify(stateBag.get("nexus.macros"));
-
-      const fs = (vscodeMock as unknown as { workspace: { fs: Record<string, unknown> } }).workspace.fs;
-      const origWriteFile = fs.writeFile;
-      fs.writeFile = async () => {
-        throw new Error("EACCES: permission denied");
+      (context.secrets as unknown as { keys(): Promise<string[]> }).keys = async () => {
+        throw new Error("the OS keyring is unavailable");
       };
-      try {
-        await expect(
-          store.save([
-            { id: "keep", name: "Existing", text: "show version\n" },
-            { id: "new", name: "Password", text: "hunter2\n", secret: true }
-          ])
-        ).rejects.toThrow(/could not record macro secret ids/);
-      } finally {
-        fs.writeFile = origWriteFile;
-      }
 
-      // Fail CLOSED, and fail early: the marker is the first write of the save, so an
-      // unwritable storage folder loses the save rather than producing a vault entry no key
-      // names. The opposite choice — store the secret and hope — is how an unsweepable
-      // plaintext credential is created, which is the whole point of the marker.
-      expect(secretBag.has("macro-secret-text-new")).toBe(false);
-      expect(markedIds()).toEqual([]);
-      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual([]);
-      expect(JSON.stringify(stateBag.get("nexus.macros"))).toBe(before);
-      // ...and the in-memory list is not advanced either, so the UI still shows what is
-      // actually on disk rather than the save the user thinks succeeded.
-      expect(store.getAll().map((m) => m.id)).toEqual(["keep"]);
-    });
-
-    it("bounds the added I/O: nothing at all for a save with no secrets, and one marker write per SECRET id per save — never per macro", async () => {
-      const { context, markedIds } = makeFakeContext();
-      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
-      await store.initialize();
-
-      const fs = (vscodeMock as unknown as {
-        workspace: { fs: Record<string, (...args: never[]) => unknown> };
-      }).workspace.fs;
-      const calls: string[] = [];
-      const wrapped = ["createDirectory", "writeFile", "readFile", "readDirectory", "delete"].map((name) => {
-        const orig = fs[name];
-        fs[name] = ((...args: never[]) => {
-          calls.push(name);
-          return orig(...args);
-        }) as typeof orig;
-        return [name, orig] as const;
-      });
-      try {
-        // A macro list with no secrets in it never opens the storage folder — an unwritable
-        // one therefore blocks saving a SECRET macro and nothing else.
-        await store.save([{ id: "plain", name: "Poll", text: "show status\n" }]);
-        expect(calls).toEqual([]);
-
-        await store.save([
-          { id: "plain", name: "Poll", text: "show status\n" },
-          { id: "s", name: "Password", text: "hunter2\n", secret: true }
-        ]);
-        expect(calls).toEqual(["createDirectory", "writeFile"]);
-
-        // Saving the same secret again re-writes the marker, UNCONDITIONALLY. An earlier
-        // revision memoized "this window already wrote it" and skipped the repeat; that memo
-        // described this process, not the disk, and another window deleting the macro removes
-        // the marker while this window's next save still republishes the vault entry — leaving
-        // a live secret named by nothing. Same id, same bytes, so the repeat write costs one
-        // idempotent `writeFile` and cannot race anything.
-        //
-        // What stays bounded is the SHAPE of the cost: one write per SECRET id, never per
-        // macro. The plain macro in this list contributes nothing, and neither does renaming
-        // it.
-        calls.length = 0;
-        await store.save([
-          { id: "plain", name: "Poll (prod)", text: "show status\n" },
-          { id: "s", name: "Password", text: "new-pass\n", secret: true }
-        ]);
-        expect(calls).toEqual(["createDirectory", "writeFile"]);
-
-        // Ten more plain macros do not add a single filesystem call; each additional secret
-        // adds exactly one. That is the property worth pinning — the I/O tracks secret count,
-        // and a long macro list is free.
-        //
-        // FOUR secrets, not two, and the count is what makes the bound a bound: with the
-        // largest fixture at two, an implementation that marked only the first, or only the
-        // first two, satisfied the assertion. Every secret in the save must be named before any
-        // of them is stored, and a write per marker is what that costs.
-        calls.length = 0;
-        await store.save([
-          ...Array.from({ length: 10 }, (_, i) => ({
-            id: `p${i}`,
-            name: `Poll ${i}`,
-            text: "show status\n"
-          })),
-          { id: "plain", name: "Poll (prod)", text: "show status\n" },
-          { id: "s", name: "Password", text: "new-pass\n", secret: true },
-          { id: "s2", name: "Enable", text: "enable-pass\n", secret: true },
-          { id: "s3", name: "Console", text: "console-pass\n", secret: true },
-          { id: "s4", name: "Radius", text: "radius-pass\n", secret: true }
-        ]);
-        expect(calls).toEqual(["createDirectory", "writeFile", "writeFile", "writeFile", "writeFile"]);
-        // ...and it really is one marker PER SECRET, each carrying its own id — a count alone
-        // would pass for four writes of the same id.
-        expect(markedIds()).toEqual(["s", "s2", "s3", "s4"]);
-      } finally {
-        for (const [name, orig] of wrapped) fs[name] = orig;
-      }
+      await expect(store.clearAll()).resolves.toBeUndefined();
+      expect(stateBag.has("nexus.macros")).toBe(false);
+      expect(secretBag.has("macro-secret-text-s")).toBe(false);
     });
 
     it("serializes its own mutations: Complete Reset issued while a save is blocked on the keyring cannot interleave with it", async () => {
@@ -626,99 +352,73 @@ describe("VscodeMacroStore", () => {
     });
 
     /**
-     * The interleaving `runExclusive()` does NOT cover, because it is between two WINDOWS.
-     *
-     * The sibling test above runs the reset and the save in one window, where they are
-     * serialized whole. Across windows there is no lock, and the ordering contract — name the
-     * id before storing it — cannot help, because the write that UNNAMES the entry happens
-     * afterwards:
+     * The interleaving `runExclusive()` does NOT cover, because it is between two WINDOWS —
+     * and the one no list of names could ever have swept, which is why the sweep asks the
+     * vault itself instead:
      *
      *   1. windows A and B both hold secret `p`;
-     *   2. B starts a stale save: marker written, ledger written, then it blocks inside
-     *      `secrets.store(p)` behind an OS keychain prompt;
-     *   3. A deletes `p` — vault entry, ledger entry and marker all go;
-     *   4. B's store resumes and RE-CREATES the vault entry, then republishes MACROS_KEY. It
-     *      does not mark again: the marking already happened, before it blocked;
-     *   5. A saves some other secret. Its wholesale MACROS_KEY and ledger writes drop `p`.
+     *   2. B starts a stale save and blocks inside `secrets.store(p)` behind an OS keychain
+     *      prompt;
+     *   3. A deletes `p`, taking the vault entry;
+     *   4. B's store resumes and RE-CREATES the entry, then republishes MACROS_KEY;
+     *   5. A saves some other secret. Its wholesale MACROS_KEY write drops `p`.
      *
-     * `p`'s value is then in the OS keyring named by nothing at all.
+     * `p`'s value is then in the OS keyring with no macro record naming it. No ordering of
+     * writes at the START of a save prevents that, because the write that unnames the entry
+     * happens afterwards.
      */
-    function overlappingStaleSave(context: import("vscode").ExtensionContext, markedIds: () => string[]) {
-      return async (): Promise<void> => {
-        const windowA = new VscodeMacroStore(context, { runLegacyMigration: false });
-        await windowA.initialize();
-        await windowA.save([{ id: "p", name: "Password", text: "hunter2\n", secret: true }]);
+    async function overlappingStaleSave(context: import("vscode").ExtensionContext): Promise<void> {
+      const windowA = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await windowA.initialize();
+      await windowA.save([{ id: "p", name: "Password", text: "hunter2\n", secret: true }]);
 
-        const windowB = new VscodeMacroStore(context, { runLegacyMigration: false });
-        await windowB.initialize();
-        expect(windowB.getAll().map((m) => m.id)).toEqual(["p"]);
+      const windowB = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await windowB.initialize();
+      expect(windowB.getAll().map((m) => m.id)).toEqual(["p"]);
 
-        // B blocks INSIDE the store for `p`, which is where a real save blocks.
-        let release!: () => void;
-        const gate = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        let gated = false;
-        const origStore = context.secrets.store.bind(context.secrets);
-        (context.secrets as unknown as { store: typeof origStore }).store = async (k: string, v: string) => {
-          if (!gated && k === "macro-secret-text-p") {
-            gated = true;
-            await gate;
-          }
-          return origStore(k, v);
-        };
-
-        const bSaving = windowB.save([{ id: "p", name: "Password", text: "hunter2\n", secret: true }]);
-        // A deletes the macro while B sits on the prompt: entry, ledger and marker all go.
-        await windowA.save([]);
-        expect(markedIds()).toEqual([]);
-        release();
-        await bSaving;
-        (context.secrets as unknown as { store: typeof origStore }).store = origStore;
-
-        // B re-created the entry and did not re-mark it.
-        expect(markedIds()).toEqual([]);
-
-        // A saves an unrelated secret. Its wholesale writes publish A's view, in which `p`
-        // does not exist — so nothing names `p` any more, in any record.
-        await windowA.save([{ id: "q", name: "Other", text: "other\n", secret: true }]);
+      // B blocks INSIDE the store for `p`, which is where a real save blocks.
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let gated = false;
+      const origStore = context.secrets.store.bind(context.secrets);
+      (context.secrets as unknown as { store: typeof origStore }).store = async (k: string, v: string) => {
+        if (!gated && k === "macro-secret-text-p") {
+          gated = true;
+          await gate;
+        }
+        return origStore(k, v);
       };
+
+      const bSaving = windowB.save([{ id: "p", name: "Password", text: "hunter2\n", secret: true }]);
+      // A deletes the macro while B sits on the prompt.
+      await windowA.save([]);
+      release();
+      await bSaving;
+      (context.secrets as unknown as { store: typeof origStore }).store = origStore;
+
+      // A saves an unrelated secret. Its wholesale write publishes A's view, in which `p`
+      // does not exist — so no macro record names `p` any more.
+      await windowA.save([{ id: "q", name: "Other", text: "other\n", secret: true }]);
     }
 
-    it("an overlapping cross-window delete leaves a vault entry no marker, ledger or macro record names", async () => {
-      const { context, stateBag, secretBag, markedIds } = makeFakeContext();
-      await overlappingStaleSave(context, markedIds)();
+    it("sweeps an entry a stale save in another window re-created after this one deleted it — named by no macro record at all", async () => {
+      const { context, stateBag, secretBag } = makeFakeContext();
+      await overlappingStaleSave(context);
 
-      // The residue, reproduced. This is a statement of the LIMIT, not of a defect that the
-      // ordering contract could have prevented: unconditional writes at the start of a save
-      // cannot establish an unconditional invariant while another window may delete the marker
-      // afterwards, and re-marking after the store only moves the window rather than closing it.
+      // The residue, reproduced: the value is live in the keyring and `nexus.macros` names
+      // only `q`.
       expect(secretBag.get("macro-secret-text-p")).toBe("hunter2\n");
-      expect(markedIds()).toEqual(["q"]);
-      expect(stateBag.get("nexus.macros.secretIds")).toEqual(["q"]);
       expect((stateBag.get("nexus.macros") as TerminalMacro[]).map((m) => m.id)).toEqual(["q"]);
 
-      // ...and on a host with no `SecretStorage.keys()`, Complete Reset cannot find it. Pinned
-      // rather than glossed: a sweep can only delete keys something names, so on those hosts
-      // this entry survives the reset. `q` — which IS named — goes.
       const later = new VscodeMacroStore(context, { runLegacyMigration: false });
       await later.initialize();
-      await later.clearAll();
-      expect(secretBag.has("macro-secret-text-q")).toBe(false);
-      expect(secretBag.get("macro-secret-text-p")).toBe("hunter2\n");
-    });
-
-    it("Complete Reset sweeps that residue on a host with SecretStorage.keys() — the one source needing no earlier write to have survived", async () => {
-      const { context, secretBag, markedIds } = makeFakeContext({ enumerableSecrets: true });
-      await overlappingStaleSave(context, markedIds)();
-      expect(secretBag.get("macro-secret-text-p")).toBe("hunter2\n");
-
-      const later = new VscodeMacroStore(context, { runLegacyMigration: false });
-      await later.initialize();
+      // `p` is in neither `later.resolved` nor `nexus.macros`, so only enumeration can reach it.
+      expect(later.getAll().map((m) => m.id)).toEqual(["q"]);
       await later.clearAll();
 
-      // Both gone: `q` because three separate records name it, `p` because the host itself
-      // does. Complete Reset is genuinely complete here.
+      // Both gone. Complete Reset is genuinely complete.
       expect([...secretBag.keys()]).toEqual([]);
     });
 
@@ -728,14 +428,16 @@ describe("VscodeMacroStore", () => {
       // of the MACRO store must not take them, and an enumeration that swept everything it
       // could see would.
       //
-      // Two things keep that true and this test discriminates against losing BOTH: the prefix
-      // filter in `readVaultSecretIds()`, and the fact that the sweep deletes
-      // `macroSecretKey(id)` rather than the enumerated key itself. Dropping either one alone is
-      // unobservable — a foreign key that slips through the filter is then looked up under
-      // `macro-secret-text-<that key>`, which does not exist — so no single-term mutation fails
-      // here. The implementation this DOES fail is the natural wrong one: "delete every key
-      // SecretStorage reports".
-      const { context, secretBag } = makeFakeContext({ enumerableSecrets: true });
+      // Two things keep that true: the prefix filter in `readVaultSecretIds()`, and the fact
+      // that the sweep deletes `macroSecretKey(id)` rather than the enumerated key itself. Each
+      // is pinned separately, because the SURVIVING-KEYS assertion alone does not distinguish
+      // them — a foreign key that slips past the filter is then looked up under
+      // `macro-secret-text-<its tail>`, which does not exist, so the foreign secret survives
+      // anyway. So the delete TARGETS are asserted too: dropping the filter makes the sweep
+      // reach for keys derived from other subsystems' names (`passphrase-server-1` becomes
+      // `macro-secret-text-1`, `authProfilePassword-ap1` becomes `macro-secret-text-d-ap1`) and
+      // that shows up here even though nothing is destroyed by it.
+      const { context, secretBag } = makeFakeContext();
       const store = new VscodeMacroStore(context, { runLegacyMigration: false });
       await store.initialize();
       await store.save([{ id: "m", name: "Password", text: "hunter2\n", secret: true }]);
@@ -745,6 +447,13 @@ describe("VscodeMacroStore", () => {
       // An orphan of this store's own that nothing names, so the sweep has a reason to run.
       secretBag.set("macro-secret-text-orphan", "stranded\n");
 
+      const deleted: string[] = [];
+      const origDelete = context.secrets.delete.bind(context.secrets);
+      context.secrets.delete = async (k: string) => {
+        deleted.push(k);
+        return origDelete(k);
+      };
+
       await store.clearAll();
 
       expect([...secretBag.keys()].sort()).toEqual([
@@ -752,20 +461,16 @@ describe("VscodeMacroStore", () => {
         "passphrase-server-1",
         "password-server-1"
       ]);
+      // Exactly the two macro keys, and nothing derived from a foreign one.
+      expect(deleted.sort()).toEqual(["macro-secret-text-m", "macro-secret-text-orphan"]);
     });
 
-    it("removes the marker for an id whose vault entry it just deleted, even when the save that wrote it never advanced the in-memory list", async () => {
-      // The narrowing that decides whether a marker removal is even attempted used to read only
-      // "was secret in `this.resolved` a moment ago", and `this.resolved` advances only at the
-      // very END of a save. So: save a NEW secret; let the marker, the ledger and the vault
-      // store all succeed; make the MACROS_KEY commit reject. The record never reaches
-      // `this.resolved`. Retry the same macro as a PLAIN one — the vault entry and the ledger
-      // entry are both cleaned up, but the id is in neither `this.resolved` nor the incoming
-      // secret set, so its marker file stayed on disk indefinitely.
-      //
-      // Over-naming is the cheap direction (one no-op `secrets.delete()` at the next Complete
-      // Reset), but a file left forever is still worth closing.
-      const { context, secretBag, markedIds } = makeFakeContext();
+    it("sweeps an entry left behind by a save whose MACROS_KEY commit failed after the value had landed", async () => {
+      // The crash contract, end to end. The store lands in the vault, the commit rejects, so
+      // the record never reaches `nexus.macros` OR `this.resolved`. Nothing this extension
+      // wrote names that entry — the point of the deleted marker/ledger machinery was to make
+      // sure something did, and enumeration makes the question moot.
+      const { context, secretBag } = makeFakeContext();
       const store = new VscodeMacroStore(context, { runLegacyMigration: false });
       await store.initialize();
 
@@ -785,18 +490,12 @@ describe("VscodeMacroStore", () => {
       await expect(
         store.save([{ id: "s", name: "Password", text: "hunter2\n", secret: true }])
       ).rejects.toThrow(/EPERM/);
-      // The marker and the vault entry landed before the commit failed — which is the contract
-      // working, not a bug: naming first is what keeps the entry sweepable.
-      expect(markedIds()).toEqual(["s"]);
       expect(secretBag.get("macro-secret-text-s")).toBe("hunter2\n");
       expect(store.getAll()).toEqual([]);
+      expect(context.globalState.get("nexus.macros", [])).toEqual([]);
 
-      // Same macro, saved as plain this time.
-      await store.save([{ id: "s", name: "Password", text: "hunter2\n" }]);
-
+      await store.clearAll();
       expect(secretBag.has("macro-secret-text-s")).toBe(false);
-      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual([]);
-      expect(markedIds()).toEqual([]);
     });
   });
 
@@ -1051,12 +750,11 @@ describe("VscodeMacroStore", () => {
       // No macro still carries a `slot`, so a migration routine of the old shape would
       // find nothing to change and could not reach save() even if one came back.
       expect(all.some((m) => m.slot !== undefined)).toBe(false);
-      // MACROS_KEY untouched and the vault never written — read or delete. (The one write
-      // that IS expected here is the secret-id ledger growing to name the existing
-      // `macro-secret-text-dup` entry, which is `reloadFromState()` keeping Complete Reset
-      // able to find it; it neither reads nor changes the secret.)
-      expect(writes).not.toContain("state:nexus.macros");
-      expect(writes.filter((w) => w.startsWith("store:") || w.startsWith("delete:"))).toEqual([]);
+      // NOTHING was written, anywhere. This used to have to allow one write — the secret-id
+      // ledger growing on every reload to name the existing `macro-secret-text-dup` entry —
+      // and with that ledger gone the load path is a pure read again, which is what the
+      // sibling test above asserts for the no-secrets case.
+      expect(writes).toEqual([]);
       expect(stateBag.get("nexus.macros")).toBe(seeded);
       expect(secretBag.get("macro-secret-text-dup")).toBe("b-password\n");
     });
@@ -1146,7 +844,6 @@ describe("VscodeMacroStore", () => {
         { id: "dup", name: "Password", text: "", secret: true }
       ]);
       secretBag.set("macro-secret-text-dup", "hunter2\n");
-      stateBag.set("nexus.macros.secretIds", ["dup"]);
 
       // Keyring outage at activation: `get()` reports it as `undefined`.
       const realGet = context.secrets.get.bind(context.secrets);
@@ -1193,7 +890,6 @@ describe("VscodeMacroStore", () => {
       expect(vaultOps).not.toContain("delete:macro-secret-text-dup");
       // And no empty entry was minted under the re-keyed twin's fresh id.
       expect([...secretBag.keys()]).toEqual(["macro-secret-text-dup"]);
-      expect(stateBag.get("nexus.macros.secretIds")).toEqual(["dup"]);
 
       // The property the user actually experiences: when the keyring answers again, the
       // password comes back attached to the macro that owns it.
@@ -1219,7 +915,6 @@ describe("VscodeMacroStore", () => {
         { id: "dup", name: "Password B", text: "", secret: true }
       ]);
       secretBag.set("macro-secret-text-dup", "hunter2\n");
-      stateBag.set("nexus.macros.secretIds", ["dup"]);
       context.secrets.get = async () => undefined;
 
       const store = new VscodeMacroStore(context, { runLegacyMigration: false });
@@ -1313,7 +1008,6 @@ describe("VscodeMacroStore", () => {
       ]);
       secretBag.set("macro-secret-text-u", "keyring-value\n");
       secretBag.set("macro-secret-text-e", "");
-      stateBag.set("nexus.macros.secretIds", ["u", "e"]);
 
       const realGet = context.secrets.get.bind(context.secrets);
       context.secrets.get = async (key: string) =>
@@ -1349,7 +1043,7 @@ describe("VscodeMacroStore", () => {
 
   describe("cross-window secret writes — a save publishes this window's whole view", () => {
     it("republishes every secret it holds, so a deleted entry comes back whole — and, as the documented cost, another window's newer value is reverted with the rest of that window's edits", async () => {
-      const { context, secretBag, markedIds } = makeFakeContext();
+      const { context, secretBag } = makeFakeContext();
       const seed = new VscodeMacroStore(context, { runLegacyMigration: false });
       await seed.initialize();
       await seed.save([
@@ -1400,9 +1094,6 @@ describe("VscodeMacroStore", () => {
       const a2 = windowA.getAll().filter((m) => m.id !== "p");
       await windowA.save(a2);
       expect(secretBag.has("macro-secret-text-p")).toBe(false);
-      // A's delete takes the MARKER with the entry, which is the state that made a per-window
-      // "already marked" memo unsound: B's memo still says it marked "p".
-      expect(markedIds()).toEqual([]);
 
       const b2 = windowB.getAll();
       b2[1].name = "Poll (prod 2)";
@@ -1411,45 +1102,29 @@ describe("VscodeMacroStore", () => {
       const persisted = context.globalState.get("nexus.macros", []) as TerminalMacro[];
       expect(persisted.find((m) => m.id === "p")?.secret).toBe(true);
       expect(secretBag.get("macro-secret-text-p")).toBe("old\n");
-      // ...and the id naming that republished entry is BACK ON DISK. This is the assertion the
-      // memo failed: markers are shared cross-window state that another window legitimately
-      // deletes, so "this window already wrote it" is never a statement about what is there.
-      // Skipping the write here leaves a live plaintext secret in the OS keyring that no marker
-      // names, sweepable only via `SECRET_IDS_KEY` + MACROS_KEY — the correlated lost-union race
-      // `updateSecretIndex()` documents as sufficient, on its own, to strand a credential.
-      expect(markedIds()).toEqual(["p"]);
 
       const reloaded = new VscodeMacroStore(context, { runLegacyMigration: false });
       await reloaded.initialize();
       expect(reloaded.getAll().find((m) => m.id === "p")?.text).toBe("old\n");
 
-      // Part 3 — what that marker BUYS for the republished entry, i.e. exactly what skipping
-      // the write would have cost. A adds a secret of its own while its cached ledger still
-      // predates B's write: the correlated lost-union race `updateSecretIndex()` documents.
-      // A's ledger write is its own union, `["q"]`, and A's MACROS_KEY write drops the record
-      // for "p" — the same window wins both, because both writers write in the same order.
-      // Afterwards NEITHER globalState key names `macro-secret-text-p`; only the marker does.
-      const origGet = context.globalState.get.bind(context.globalState);
-      context.globalState.get = ((key: string, fallback: unknown) =>
-        key === "nexus.macros.secretIds" ? [] : origGet(key, fallback)) as typeof context.globalState.get;
+      // Part 3 — the republished entry stays SWEEPABLE even once no macro record names it.
+      // A, whose view no longer contains "p", saves a secret of its own; its wholesale
+      // MACROS_KEY write drops "p" again while B's republished vault entry stays behind. This
+      // is the residue the deleted marker files existed to name, and Complete Reset reaches it
+      // now because it asks `SecretStorage` rather than a list of names.
       await windowA.save([...windowA.getAll(), { id: "q", name: "Enable", text: "enable\n", secret: true }]);
-      context.globalState.get = origGet;
 
       expect(secretBag.get("macro-secret-text-p")).toBe("old\n");
       expect(
         (context.globalState.get("nexus.macros", []) as TerminalMacro[]).some((m) => m.id === "p")
       ).toBe(false);
-      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual(["q"]);
-      expect(markedIds()).toEqual(["p", "q"]);
 
-      // Complete Reset still reaches the stranded entry, and the marker is the only record
-      // that could have led it there.
       const sweeper = new VscodeMacroStore(context, { runLegacyMigration: false });
       await sweeper.initialize();
+      expect(sweeper.getAll().some((m) => m.id === "p")).toBe(false);
       await sweeper.clearAll();
       expect(secretBag.has("macro-secret-text-p")).toBe(false);
       expect(secretBag.has("macro-secret-text-q")).toBe(false);
-      expect(markedIds()).toEqual([]);
     });
 
     it("restores the vault entry when another window ran Complete Reset between this window's load and its save", async () => {
@@ -1568,23 +1243,21 @@ describe("VscodeMacroStore", () => {
   });
 
   describe("vault write ordering — the crash contract clearAll() relies on", () => {
-    it("names a vault key in the ledger BEFORE storing it, and deletes only after MACROS_KEY is committed", async () => {
+    it("stores BEFORE committing MACROS_KEY, and deletes only after — and the whole save writes globalState exactly once", async () => {
       const { context } = makeFakeContext();
       const store = new VscodeMacroStore(context, { runLegacyMigration: false });
       await store.initialize();
       await store.save([{ id: "s", name: "Password", text: "hunter2\n", secret: true }]);
 
       const ops: string[] = [];
-      const ledgerAtStore = new Map<string, string[]>();
       const origUpdate = context.globalState.update.bind(context.globalState);
       context.globalState.update = async (k: string, v: unknown) => {
-        ops.push(k === "nexus.macros" ? "state" : "ledger");
+        ops.push(`state:${k}`);
         return origUpdate(k, v);
       };
       const origStore = context.secrets.store.bind(context.secrets);
       const origDelete = context.secrets.delete.bind(context.secrets);
       context.secrets.store = async (k: string, v: string) => {
-        ledgerAtStore.set(k, [...context.globalState.get<string[]>("nexus.macros.secretIds", [])]);
         ops.push(`store:${k}`);
         return origStore(k, v);
       };
@@ -1594,26 +1267,22 @@ describe("VscodeMacroStore", () => {
       };
 
       // Flip "s" to non-secret (a delete) and add a brand-new secret "t" (a store), so
-      // one save exercises grow → store → MACROS_KEY → delete → shrink.
+      // one save exercises store → MACROS_KEY → delete.
       await store.save([
         { id: "s", name: "Password", text: "now-public", secret: false },
         { id: "t", name: "Enable", text: "enable\n", secret: true }
       ]);
 
-      // The guarantee itself: at the instant "t"'s value hit the vault, the ledger already
-      // named it. A crash right there leaves an entry Complete Reset can still sweep;
-      // growing the ledger afterwards would leave it named by nothing, forever.
-      expect(ledgerAtStore.get("macro-secret-text-t")).toContain("t");
-
       const iStore = ops.indexOf("store:macro-secret-text-t");
-      const iState = ops.indexOf("state");
+      const iState = ops.indexOf("state:nexus.macros");
       const iDelete = ops.indexOf("delete:macro-secret-text-s");
       expect(iStore).toBeGreaterThanOrEqual(0);
       expect(iState).toBeGreaterThan(iStore);
       expect(iDelete).toBeGreaterThan(iState);
-      // The shrink is last, after the delete it describes.
-      expect(ops[ops.length - 1]).toBe("ledger");
-      expect(ops.lastIndexOf("ledger")).toBeGreaterThan(iDelete);
+      // ONE globalState write, and it is `nexus.macros`. The ledger this save used to grow
+      // before the store and shrink after the delete is gone; a re-introduction shows up here
+      // as extra `state:` entries, and any name-based ledger has to write globalState.
+      expect(ops.filter((o) => o.startsWith("state:"))).toEqual(["state:nexus.macros"]);
     });
 
     it("re-keying a duplicate stores the secret under its new key BEFORE the old key is deleted", async () => {
@@ -1875,7 +1544,6 @@ describe("VscodeMacroStore", () => {
         { id: "p", name: "Existing", text: "", secret: true, triggerPattern: "Password:" }
       ]);
       secretBag.set("macro-secret-text-p", "old-local-password\n");
-      stateBag.set("nexus.macros.secretIds", ["p"]);
       const realGet = context.secrets.get.bind(context.secrets);
       context.secrets.get = async () => undefined;
 
@@ -2145,6 +1813,9 @@ describe("VscodeMacroStore corrupt globalState shape", () => {
         },
         async delete(key: string): Promise<void> {
           secretBag.delete(key);
+        },
+        async keys(): Promise<string[]> {
+          return [...secretBag.keys()];
         }
       }
     } as unknown as import("vscode").ExtensionContext;
@@ -2166,8 +1837,12 @@ describe("VscodeMacroStore corrupt globalState shape", () => {
     });
   }
 
-  it("clearAll does not throw when nexus.macros.secretIds is corrupt", async () => {
-    const context = makeStrictContext({ "nexus.macros.secretIds": { bad: true } });
+  it("clearAll does not throw when SecretStorage.keys() answers with a non-array", async () => {
+    // A host answering something other than `string[]` is not a shape the API admits, but the
+    // sweep must not turn a surprising answer into a failed Complete Reset — it has vault
+    // entries of its own to delete and must get to them.
+    const context = makeStrictContext({ "nexus.macros": [] });
+    (context.secrets as unknown as { keys(): Promise<unknown> }).keys = async () => ({ bad: true });
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });
     await store.initialize();
     await expect(store.clearAll()).resolves.toBeUndefined();

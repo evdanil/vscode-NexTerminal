@@ -3,42 +3,13 @@ import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroS
 import { getAssignedBinding } from "../../src/macroBindingHelpers";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
-// `workspace.fs` is part of this mock because `VscodeMacroStore` writes one marker FILE per
-// secret id under `globalStorageUri` before it writes the vault entry that id names — see
-// `ensureSecretMarkers()`. Legacy absorption stores secrets, so it goes through that path too,
-// and it fails CLOSED: a no-op fs stub would let the absorb quietly stop happening.
+// There is deliberately no `workspace.fs` in this mock: the absorb path stores secrets, and it
+// no longer writes anything to the filesystem to do so. The per-secret-id marker files it used
+// to write under `globalStorageUri` are gone, replaced by `SecretStorage.keys()` at sweep time.
 vi.mock("vscode", () => {
   const configs = new Map<string, { global: unknown; workspace: unknown; workspaceFolder: unknown }>();
-  const files = new Map<string, Uint8Array>();
-  const dirs = new Set<string>();
   const api = {
     workspace: {
-      fs: {
-        async createDirectory(uri: { path: string }): Promise<void> {
-          const parts = uri.path.split("/").filter(Boolean);
-          for (let i = 1; i <= parts.length; i++) dirs.add(`/${parts.slice(0, i).join("/")}`);
-        },
-        async writeFile(uri: { path: string }, content: Uint8Array): Promise<void> {
-          const parent = uri.path.slice(0, uri.path.lastIndexOf("/"));
-          if (!dirs.has(parent)) throw new Error(`ENOENT: no such directory, open '${uri.path}'`);
-          files.set(uri.path, content);
-        },
-        async readFile(uri: { path: string }): Promise<Uint8Array> {
-          const found = files.get(uri.path);
-          if (!found) throw new Error(`ENOENT: no such file, open '${uri.path}'`);
-          return found;
-        },
-        async readDirectory(uri: { path: string }): Promise<Array<[string, number]>> {
-          if (!dirs.has(uri.path)) throw new Error(`ENOENT: no such directory, scandir '${uri.path}'`);
-          const prefix = `${uri.path}/`;
-          return [...files.keys()]
-            .filter((p) => p.startsWith(prefix) && !p.slice(prefix.length).includes("/"))
-            .map((p) => [p.slice(prefix.length), 1] as [string, number]);
-        },
-        async delete(uri: { path: string }): Promise<void> {
-          if (!files.delete(uri.path)) throw new Error(`ENOENT: no such file, unlink '${uri.path}'`);
-        }
-      },
       getConfiguration(section: string) {
         const get = () => configs.get(section) ?? { global: undefined, workspace: undefined, workspaceFolder: undefined };
         return {
@@ -67,12 +38,6 @@ vi.mock("vscode", () => {
         };
       }
     },
-    Uri: {
-      joinPath(base: { path: string; scheme?: string }, ...parts: string[]) {
-        const path = [base.path.replace(/\/$/, ""), ...parts].join("/");
-        return { path, fsPath: path, scheme: base.scheme ?? "file" };
-      }
-    },
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     __setConfig(section: string, value: { global?: unknown; workspace?: unknown; workspaceFolder?: unknown }) {
       configs.set(section, { global: value.global, workspace: value.workspace, workspaceFolder: value.workspaceFolder });
@@ -80,32 +45,16 @@ vi.mock("vscode", () => {
     __getConfig(section: string) {
       return configs.get(section);
     },
-    __files: files,
     __reset() { configs.clear(); }
   };
   return api;
 });
 
-import * as vscodeMock from "vscode";
-
-/**
- * The mocked filesystem's file table, so a test can look at the marker files the absorb path
- * wrote. Reached through the module rather than the factory closure because `vi.mock` is
- * hoisted above everything else in this file.
- */
-const fsFiles = (vscodeMock as unknown as { __files: Map<string, Uint8Array> }).__files;
-
-let ctxSeq = 0;
-
 function makeCtx() {
   const state = new Map<string, unknown>();
   const secrets = new Map<string, string>();
-  // A per-context storage root: the mocked filesystem is module state shared by every test
-  // in this file, so without it one test's marker files would be visible to the next.
-  const globalStoragePath = `/global-storage/ctx-${++ctxSeq}`;
   return {
     ctx: {
-      globalStorageUri: { path: globalStoragePath, fsPath: globalStoragePath, scheme: "file" },
       globalState: {
         get<T>(k: string, fb: T): T { return (state.get(k) as T) ?? fb; },
         async update(k: string, v: unknown): Promise<void> { if (v === undefined) state.delete(k); else state.set(k, v); },
@@ -114,20 +63,14 @@ function makeCtx() {
       secrets: {
         async get(k: string): Promise<string | undefined> { return secrets.get(k); },
         async store(k: string, v: string): Promise<void> { secrets.set(k, v); },
-        async delete(k: string): Promise<void> { secrets.delete(k); }
+        async delete(k: string): Promise<void> { secrets.delete(k); },
+        // Present because `engines.vscode` is `^1.105.0`, where `SecretStorage.keys()` is
+        // finalized. `clearAll()` calls it unconditionally.
+        async keys(): Promise<string[]> { return [...secrets.keys()]; }
       }
     } as unknown as import("vscode").ExtensionContext,
     state,
-    secrets,
-    globalStoragePath,
-    /** Secret ids recoverable from this context's marker files — the ids are the CONTENTS. */
-    markedIds(): string[] {
-      const prefix = `${globalStoragePath}/macro-secret-ids/`;
-      return [...fsFiles.entries()]
-        .filter(([p]) => p.startsWith(prefix))
-        .map(([, bytes]) => new TextDecoder().decode(bytes))
-        .sort();
-    }
+    secrets
   };
 }
 
@@ -382,101 +325,17 @@ describe("MacroStore legacy migration", () => {
     // remaining copy of "Absorbed" disappearing.
     expect((vscode.__getConfig("nexus.terminal") as { global: unknown }).global).toEqual(legacy);
 
-    // The vault value that was written before the guard fired is an orphan, but a NAMED
-    // one: the ledger grows before the store, so Complete Reset can still sweep it.
+    // The vault value written before the guard fired is an orphan: no macro record names it,
+    // in this window or the other one. It is still SWEEPABLE, because Complete Reset asks
+    // `SecretStorage` which of this extension's keys exist rather than consulting a list this
+    // path had to remember to write.
     const orphanKeys = [...secrets.keys()];
     expect(orphanKeys).toHaveLength(1);
-    const indexed = ctx.globalState.get<string[]>("nexus.macros.secretIds", []);
-    expect(orphanKeys[0]).toBe(macroSecretKey(indexed[0]));
-  });
+    expect(orphanKeys[0]).toMatch(/^macro-secret-text-/);
+    expect(store.getAll().some((m) => macroSecretKey(m.id!) === orphanKeys[0])).toBe(false);
 
-  it("a legacy absorb whose secret-id marker cannot be written stores NOTHING, keeps the legacy setting, and does not take activation down", async () => {
-    const vscode = (await import("vscode")) as unknown as {
-      __setConfig: (s: string, v: Record<string, unknown>) => void;
-      __getConfig: (s: string) => unknown;
-      workspace: { fs: Record<string, (...args: never[]) => unknown> };
-    };
-    const { ctx, state, secrets } = makeCtx();
-    const existing = [{ id: "a", name: "Existing", text: "x" }] as TerminalMacro[];
-    state.set("nexus.macros", existing);
-    // A PLAIN record alongside the secret one, and it is what makes the "nothing was written"
-    // assertion below mean something: with a secret-only fixture, an implementation that
-    // persisted the plain absorbed records and abandoned only the secret ones would leave
-    // MACROS_KEY untouched by coincidence and pass. The absorb is all-or-nothing — the legacy
-    // setting is only cleared once every record in it has landed — so "Plain" must not appear
-    // either.
-    const legacy = [
-      { name: "Absorbed", text: "absorbed-secret", secret: true },
-      { name: "Plain", text: "show version" }
-    ] as TerminalMacro[];
-    vscode.__setConfig("nexus.terminal", { global: legacy });
-
-    const fs = vscode.workspace.fs;
-    const origWriteFile = fs.writeFile;
-    fs.writeFile = (async () => {
-      throw new Error("EACCES: permission denied");
-    }) as typeof origWriteFile;
-    const store = new VscodeMacroStore(ctx);
-    try {
-      // Fail closed, and QUIETLY. Unlike `save()`, this path runs during activation, where a
-      // throw is a failed activation rather than a failed command — so it returns false and
-      // the caller abandons the absorb instead of propagating.
-      await expect(store.initialize()).resolves.toBeUndefined();
-    } finally {
-      fs.writeFile = origWriteFile;
-    }
-
-    // NOTHING was written. Not the vault entry the marker could not name, not the legacy
-    // ledger, not MACROS_KEY. Proceeding past the marker failure — writing the secret and
-    // hoping — is exactly how an unsweepable plaintext credential is created.
+    await store.clearAll();
     expect([...secrets.keys()]).toEqual([]);
-    expect(ctx.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual([]);
-    expect(state.get("nexus.macros")).toEqual(existing);
-    expect(store.getAll().map((m) => m.name)).toEqual(["Existing"]);
-    expect(store.getLastAbsorbedCount()).toBe(0);
-
-    // The legacy setting is untouched, so those records still exist somewhere. Clearing it
-    // after abandoning the absorb would have destroyed the only remaining copy.
-    expect((vscode.__getConfig("nexus.terminal") as { global: unknown }).global).toEqual(legacy);
-
-    // ...and it really is a RETRY, not a loss: with the filesystem healthy the next
-    // activation absorbs the same records, secret value intact.
-    const store2 = new VscodeMacroStore(ctx);
-    await store2.initialize();
-    expect(store2.getAll().map((m) => m.name)).toEqual(["Existing", "Absorbed", "Plain"]);
-    expect(store2.getAll().find((m) => m.name === "Absorbed")!.text).toBe("absorbed-secret");
-    expect((vscode.__getConfig("nexus.terminal") as { global: unknown }).global).toBeUndefined();
-  });
-
-  it("names a legacy secret id on disk BEFORE storing it — the ORDER, not just the end state", async () => {
-    // The sibling test above asserts an end state, which a store-then-roll-back implementation
-    // reproduces exactly: write the vault entry, discover the marker cannot be written, delete
-    // the entry, return false. That implementation violates the contract this path shares with
-    // `save()` — a vault entry must never exist under an id nothing on disk names, not even
-    // briefly, because a crash in the gap strands a plaintext credential no Complete Reset can
-    // reach. `save()` has the order pinned (macroStore.test.ts); this path did not.
-    const vscode = (await import("vscode")) as unknown as {
-      __setConfig: (s: string, v: Record<string, unknown>) => void;
-    };
-    const { ctx, markedIds } = makeCtx();
-    vscode.__setConfig("nexus.terminal", {
-      global: [{ name: "Absorbed", text: "absorbed-secret", secret: true }] as TerminalMacro[]
-    });
-
-    const namedAtStore: Array<{ id: string; marked: string[] }> = [];
-    const mutableSecrets = ctx.secrets as unknown as { store(k: string, v: string): Promise<void> };
-    const origStore = mutableSecrets.store.bind(ctx.secrets);
-    mutableSecrets.store = async (k: string, v: string) => {
-      namedAtStore.push({ id: k.slice("macro-secret-text-".length), marked: markedIds() });
-      return origStore(k, v);
-    };
-
-    const store = new VscodeMacroStore(ctx);
-    await store.initialize();
-
-    // At the instant the value hit the vault, the id naming it was already on disk.
-    expect(namedAtStore).toHaveLength(1);
-    expect(namedAtStore[0].marked).toContain(namedAtStore[0].id);
   });
 
   it("absorbs legacy macros that differ only in trigger metadata or `slot` — the absorb dedupe is a ONE-WAY door", async () => {

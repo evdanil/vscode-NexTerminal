@@ -1597,10 +1597,6 @@ describe("backup import", () => {
     const realGet = async (k: string): Promise<string | undefined> => secretMap.get(k);
     let keyringDown = false;
     const fakeCtx = {
-      // `VscodeMacroStore` writes one marker file per secret id under `globalStorageUri`
-      // before the vault entry it names, and fails closed if it cannot — see
-      // `ensureSecretMarkers()`.
-      globalStorageUri: { path: "/global-storage", fsPath: "/global-storage", scheme: "file" },
       globalState: {
         get<T>(k: string, fb: T): T { return (stateMap.get(k) as T) ?? fb; },
         async update(k: string, v: unknown): Promise<void> {
@@ -1611,7 +1607,10 @@ describe("backup import", () => {
       secrets: {
         async get(k: string): Promise<string | undefined> { return keyringDown ? undefined : realGet(k); },
         async store(k: string, v: string): Promise<void> { secretMap.set(k, v); },
-        async delete(k: string): Promise<void> { secretMap.delete(k); }
+        async delete(k: string): Promise<void> { secretMap.delete(k); },
+        // Present because `engines.vscode` is `^1.105.0`, where `SecretStorage.keys()` is
+        // finalized. `VscodeMacroStore.clearAll()` calls it unconditionally.
+        async keys(): Promise<string[]> { return [...secretMap.keys()]; }
       }
     } as unknown as import("vscode").ExtensionContext;
 
@@ -3046,10 +3045,6 @@ describe("legacy macro absorption with variables present (§10 — keyOfLegacy)"
     const stateMap = new Map<string, unknown>();
     const secretMap = new Map<string, string>();
     return {
-      // `VscodeMacroStore` writes one marker file per secret id under `globalStorageUri`
-      // before the vault entry it names, and fails closed if it cannot — see
-      // `ensureSecretMarkers()`.
-      globalStorageUri: { path: "/global-storage", fsPath: "/global-storage", scheme: "file" },
       globalState: {
         get<T>(k: string, fb: T): T { return (stateMap.get(k) as T) ?? fb; },
         async update(k: string, v: unknown): Promise<void> {
@@ -3060,7 +3055,10 @@ describe("legacy macro absorption with variables present (§10 — keyOfLegacy)"
       secrets: {
         async get(k: string): Promise<string | undefined> { return secretMap.get(k); },
         async store(k: string, v: string): Promise<void> { secretMap.set(k, v); },
-        async delete(k: string): Promise<void> { secretMap.delete(k); }
+        async delete(k: string): Promise<void> { secretMap.delete(k); },
+        // Present because `engines.vscode` is `^1.105.0`, where `SecretStorage.keys()` is
+        // finalized. `VscodeMacroStore.clearAll()` calls it unconditionally.
+        async keys(): Promise<string[]> { return [...secretMap.keys()]; }
       }
     } as unknown as import("vscode").ExtensionContext;
   }
@@ -4082,10 +4080,6 @@ describe("complete reset", () => {
     const stateMap = new Map<string, unknown>();
     const secretMap = new Map<string, string>();
     const fakeCtx = {
-      // `VscodeMacroStore` writes one marker file per secret id under `globalStorageUri`
-      // before the vault entry it names, and fails closed if it cannot — see
-      // `ensureSecretMarkers()`.
-      globalStorageUri: { path: "/global-storage", fsPath: "/global-storage", scheme: "file" },
       globalState: {
         get<T>(k: string, fb: T): T { return (stateMap.get(k) as T) ?? fb; },
         async update(k: string, v: unknown): Promise<void> {
@@ -4096,7 +4090,10 @@ describe("complete reset", () => {
       secrets: {
         async get(k: string): Promise<string | undefined> { return secretMap.get(k); },
         async store(k: string, v: string): Promise<void> { secretMap.set(k, v); },
-        async delete(k: string): Promise<void> { secretMap.delete(k); }
+        async delete(k: string): Promise<void> { secretMap.delete(k); },
+        // Present because `engines.vscode` is `^1.105.0`, where `SecretStorage.keys()` is
+        // finalized. `VscodeMacroStore.clearAll()` calls it unconditionally.
+        async keys(): Promise<string[]> { return [...secretMap.keys()]; }
       }
     } as unknown as import("vscode").ExtensionContext;
 
