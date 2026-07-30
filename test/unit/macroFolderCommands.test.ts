@@ -6,6 +6,7 @@ const mockShowQuickPick = vi.fn();
 const mockShowWarningMessage = vi.fn();
 const mockShowInformationMessage = vi.fn();
 const mockSetStatusBarMessage = vi.fn();
+const mockShowErrorMessage = vi.fn();
 const mockOpenNew = vi.fn();
 
 vi.mock("vscode", () => ({
@@ -21,6 +22,7 @@ vi.mock("vscode", () => ({
     showQuickPick: (...args: unknown[]) => mockShowQuickPick(...args),
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
+    showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
     setStatusBarMessage: (...args: unknown[]) => mockSetStatusBarMessage(...args)
   },
   env: {
@@ -299,13 +301,60 @@ describe("macro folder commands", () => {
       expect(getMacroFolders()).not.toContain("Net");
     });
 
-    it("cancelling (or re-entering the same name) does nothing", async () => {
+    it("cancelling does nothing", async () => {
       await store.save([{ name: "M", text: "t", group: "Cisco" }]);
       mockShowInputBox.mockResolvedValue(undefined);
 
       await registeredCommands.get("nexus.macro.renameFolder")!(folderArg("Cisco"));
 
       expect(getMacros()[0].group).toBe("Cisco");
+    });
+
+    it("re-entering the SAME name changes nothing — in particular it must not promote a derived folder to an explicit entry", async () => {
+      // The cancel case above was the only thing this ever exercised, so
+      // deleting the `newName.trim() === currentName` early return survived
+      // it. Without that return the rename runs as a no-op prefix
+      // substitution, and its "make sure the destination exists" pass writes
+      // `nexus.macros.folders` — turning a folder that existed only because a
+      // macro's `group` derives it into a persistent explicit one, which then
+      // outlives the macro moving out.
+      await store.save([{ name: "M", text: "t", group: "Cisco" }]);
+      expect(getMacroFolders()).toEqual([]); // derived only, nothing explicit
+      mockShowInputBox.mockResolvedValue("Cisco");
+
+      await registeredCommands.get("nexus.macro.renameFolder")!(folderArg("Cisco"));
+
+      expect(getMacros()[0].group).toBe("Cisco");
+      expect(getMacroFolders()).toEqual([]);
+    });
+
+    it("refuses a rename that would push a descendant past the path-length cap, writing nothing", async () => {
+      // A rename is a prefix substitution, so a longer new name lengthens
+      // every descendant. Unchecked, a deep descendant crosses
+      // MAX_FOLDER_PATH_LENGTH, stops normalizing, and the macro silently
+      // drops to the root — data loss caused by a command the user invoked.
+      const longGroup = `A/${"x".repeat(4090)}`; // 4092 chars: valid today
+      await store.save([{ name: "Deep", text: "t", group: longGroup }]);
+      await store.saveFolders(["A"]);
+      mockShowInputBox.mockResolvedValue("BBBBBBBBBB"); // 10 chars -> 4101, over the cap
+
+      await registeredCommands.get("nexus.macro.renameFolder")!(folderArg("A"));
+
+      expect(getMacros()[0].group).toBe(longGroup); // untouched, still renderable
+      expect(getMacroFolders()).toEqual(["A"]); // and the folder list is untouched too
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("4096 characters"));
+    });
+
+    it("still renames when every resulting descendant path stays within the cap", async () => {
+      // Guards the length check against becoming a blanket refusal.
+      const group = `A/${"x".repeat(4000)}`;
+      await store.save([{ name: "Deep", text: "t", group }]);
+      mockShowInputBox.mockResolvedValue("BBBBBBBBBB");
+
+      await registeredCommands.get("nexus.macro.renameFolder")!(folderArg("A"));
+
+      expect(getMacros()[0].group).toBe(`BBBBBBBBBB/${"x".repeat(4000)}`);
+      expect(mockShowErrorMessage).not.toHaveBeenCalled();
     });
 
     it("no-ops without a folder arg", async () => {
@@ -397,8 +446,10 @@ describe("macro folder commands", () => {
         { name: "B", text: "t" }
       ]);
       mockShowWarningMessage.mockImplementation(async () => {
-        // Models a concurrent save landing during the (user-paced) modal —
-        // another command, another window, or an unrelated autosave.
+        // Models a concurrent save landing during the (user-paced) modal.
+        // `{ modal: true }` blocks the USER, not the extension host, so this is
+        // another same-window flow: the Macro Editor, a config import, another
+        // macro command. (Not another window — see macroCommandsIdentity.test.ts.)
         await store.save([...getMacros(), { name: "C", text: "t" }]);
         return "Remove Folder";
       });
@@ -465,16 +516,24 @@ describe("macro folder commands", () => {
       expect(getMacros().map((m) => m.name)).toEqual(["First", "RootA", "Second"]); // unchanged
     });
 
-    it("no-ops at the bottom of a folder with folder-specific wording", async () => {
+    it("no-ops at the bottom of a folder with folder-specific wording, leaving the array untouched", async () => {
+      // Two things the previous version of this test could not see. It put the
+      // moved macro at the PHYSICAL END of the array, where an implementation
+      // that ignores groups entirely also finds no next element — identical
+      // no-op, no discrimination. And it asserted only the status message, so
+      // an implementation that showed the message AND swapped anyway survived.
+      // Here "Second" is last within "Cisco" but NOT last in the array, and
+      // the array is asserted.
       await store.save([
         { name: "First", text: "t", group: "Cisco" },
-        { name: "RootA", text: "t" },
-        { name: "Second", text: "t", group: "Cisco" }
+        { name: "Second", text: "t", group: "Cisco" },
+        { name: "RootA", text: "t" }
       ]);
 
-      await registeredCommands.get("nexus.macro.moveDown")!(macroArg(2));
+      await registeredCommands.get("nexus.macro.moveDown")!(macroArg(1));
 
       expect(mockSetStatusBarMessage).toHaveBeenCalledWith("Already at the bottom of this folder", 2000);
+      expect(getMacros().map((m) => m.name)).toEqual(["First", "Second", "RootA"]);
     });
 
     it("no-ops at the top of the ROOT list with root wording when no macro has a group", async () => {

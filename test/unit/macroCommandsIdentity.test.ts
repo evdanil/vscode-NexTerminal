@@ -4,12 +4,29 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * "Resolve a macro, await a dialog, mutate the array" — the shape every
  * concurrency defect in this feature has had.
  *
- * These tests all drive the SAME interleaving: the mocked dialog performs
- * another window's save before it resolves, so by the time the command writes,
- * the array it captured no longer describes reality. A command that re-reads
+ * **The overlapping writer is in THIS window.** Earlier revisions of these
+ * tests said "another window", which is not how it can happen:
+ * `MacroStore.getAll()` serves an in-memory array that only this window's own
+ * `save()` / `clearAll()` / `initialize()` update, and VS Code's `Memento` has
+ * no change event, so a second window's `globalState` write is invisible here
+ * until reload. What actually overlaps a dialog is a same-window flow the user
+ * or the extension drives while it is open — the Macro Editor saving or
+ * deleting, a drag onto a folder, `moveToFolder`, a config import. `{ modal:
+ * true }` does not prevent any of them (it blocks the user's input, not the
+ * extension host's async work), and the non-modal notifications used by
+ * `confirmBindingWarnings` and the paste-newline prompt leave the whole window
+ * clickable, so the user can drive one BY HAND mid-dialog. The mocked dialogs
+ * below stand in for exactly that.
+ *
+ * These tests all drive the SAME interleaving: the mocked dialog performs one
+ * of those saves before it resolves, so by the time the command writes, the
+ * array it captured no longer describes reality. A command that re-reads
  * `getMacros()` but keeps applying its PRE-dialog index is not merely stale —
  * it confidently mutates whichever macro has since slid into that slot, which
- * is strictly worse than writing back the stale snapshot.
+ * is strictly worse than writing back the stale snapshot. And identity is not
+ * the only thing that can go stale: `pasteSecret` re-resolves the right macro
+ * and must still refuse to write, because the macro's `secret` FLAG can have
+ * been turned off in the same window meanwhile.
  *
  * Unlike `macroFolderCommands.test.ts`, this file uses the REAL
  * `macroBindingHelpers`: `assignBinding` clears the binding from every other
@@ -107,9 +124,10 @@ describe("macro commands resolve their target by identity across every dialog aw
 
     it("a concurrent delete during the confirmation must not remove the macro that took the freed slot", async () => {
       // [A, B]; the context menu was opened on A (index 0). While the modal is
-      // up, another window deletes A and saves [B]. Confirming must remove
-      // NOTHING — A is already gone — and above all must not remove B, whose
-      // name the user never saw in the dialog.
+      // up, the Macro Editor (same window — modality blocks the user, not the
+      // host) deletes A and saves [B]. Confirming must remove NOTHING — A is
+      // already gone — and above all must not remove B, whose name the user
+      // never saw in the dialog.
       await store.save([
         { name: "A", text: "a" },
         { name: "B", text: "b" }
@@ -164,6 +182,41 @@ describe("macro commands resolve their target by identity across every dialog aw
 
       expect(getMacros().map((m) => m.name)).toEqual(["A"]);
     });
+
+    it("reports that the macro was already gone instead of answering a confirmation with silence", async () => {
+      // The no-write is correct; saying nothing about it was not. The user
+      // answered a modal naming "A" and, if A had merely been renamed rather
+      // than deleted, would see a sidebar that still looks populated with no
+      // indication of what their click did.
+      await store.save([
+        { name: "A", text: "a" },
+        { name: "B", text: "b" }
+      ]);
+      const item = macroArg(0);
+      const survivor = getMacros()[1];
+      mockShowWarningMessage.mockImplementation(async () => {
+        await store.save([survivor]);
+        return "Remove";
+      });
+
+      await registeredCommands.get("nexus.macro.remove")!(item);
+
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining("already removed"));
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining('"A"'));
+    });
+
+    it("stays silent on the ordinary successful removal — the report is for the vanished case only", async () => {
+      await store.save([
+        { name: "A", text: "a" },
+        { name: "B", text: "b" }
+      ]);
+      const item = macroArg(0);
+      mockShowWarningMessage.mockResolvedValue("Remove");
+
+      await registeredCommands.get("nexus.macro.remove")!(item);
+
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    });
   });
 
   describe("nexus.macro.assignSlot", () => {
@@ -183,7 +236,7 @@ describe("macro commands resolve their target by identity across every dialog aw
 
     it("a concurrent delete during the binding prompt must not rebind another macro or strip a third macro's shortcut", async () => {
       // [A, B, C]; C owns alt+7. The menu was opened on A (index 0). While the
-      // input box is up, another window deletes A, leaving [B, C]. A write
+      // input box is up, a same-window flow deletes A, leaving [B, C]. A write
       // through the pre-dialog index 0 lands on B — and `assignBinding` first
       // clears alt+7 from everyone else, so C loses its shortcut as collateral.
       await store.save([
@@ -240,6 +293,24 @@ describe("macro commands resolve their target by identity across every dialog aw
       expect(named("A")?.keybinding).toBe("alt+7");
       expect(named("C")?.keybinding).toBeUndefined();
     });
+
+    it("reports that the macro was already gone instead of dropping a typed binding on the floor", async () => {
+      await store.save([
+        { name: "A", text: "a" },
+        { name: "B", text: "b" }
+      ]);
+      const item = macroArg(0);
+      const survivor = getMacros()[1];
+      mockShowInputBox.mockImplementation(async () => {
+        await store.save([survivor]);
+        return "alt+7";
+      });
+
+      await registeredCommands.get("nexus.macro.assignSlot")!(item);
+
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining("no longer exists"));
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining('"A"'));
+    });
   });
 
   describe("nexus.macro.pasteSecret", () => {
@@ -277,6 +348,62 @@ describe("macro commands resolve their target by identity across every dialog aw
 
       expect(named("B")?.text).toBe("old-b");
       expect(mockShowInformationMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining("from clipboard")
+      );
+    });
+
+    it("a macro that stopped being SECRET while the append-newline prompt was open must not receive the clipboard text", async () => {
+      // Identity is not the whole precondition. The macro re-resolves
+      // perfectly here — same id, same slot — but the append-newline prompt is
+      // a plain non-modal `showInformationMessage`, so the user can open the
+      // Macro Editor on this very macro, untick Secret, save, and only then
+      // answer it. Writing now would have `MacroStore.save()` delete the vault
+      // entry and put the clipboard password into `nexus.macros` in cleartext.
+      //
+      // Clipboard text WITHOUT a trailing newline is what opens that prompt at
+      // all — with "fresh\n" the command never awaits and the window never
+      // exists.
+      await store.save([
+        { id: "a", name: "A", text: "old-a", secret: true },
+        { id: "b", name: "B", text: "old-b", secret: true }
+      ]);
+      const item = macroArg(0);
+      mockClipboardReadText.mockResolvedValue("hunter2");
+      mockShowInformationMessage.mockImplementation(async () => {
+        // The Macro Editor saving the same macro with Secret unticked.
+        const [a, b] = getMacros();
+        await store.save([{ ...a, secret: false }, b]);
+        return "Yes";
+      });
+
+      await registeredCommands.get("nexus.macro.pasteSecret")!(item);
+
+      // The clipboard password is nowhere in the store.
+      expect(named("A")?.text).toBe("old-a");
+      expect(named("A")?.secret).toBe(false);
+      expect(getMacros().map((m) => m.text)).not.toContain("hunter2\n");
+      // ...and the command does not claim it worked.
+      expect(mockShowInformationMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining("from clipboard")
+      );
+      // It says why, naming the macro — silence here reads as success.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("no longer a secret macro")
+      );
+    });
+
+    it("still pastes through the append-newline prompt when the macro is left alone", async () => {
+      // Guards the fix against becoming a no-op: the added precondition must
+      // not block the ordinary flow through that same prompt.
+      await store.save([{ id: "a", name: "A", text: "old-a", secret: true }]);
+      const item = macroArg(0);
+      mockClipboardReadText.mockResolvedValue("hunter2");
+      mockShowInformationMessage.mockResolvedValue("Yes");
+
+      await registeredCommands.get("nexus.macro.pasteSecret")!(item);
+
+      expect(named("A")?.text).toBe("hunter2\n");
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(
         expect.stringContaining("from clipboard")
       );
     });

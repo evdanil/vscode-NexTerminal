@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   collectMacroFolders,
+  macroFolderField,
   macroGroup,
   sanitizeMacroFolderList,
   sanitizeMacroGroup
 } from "../../src/services/macroFolders";
+import { MAX_FOLDER_PATH_LENGTH } from "../../src/utils/folderPaths";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
 describe("sanitizeMacroGroup (§4.2 — untrusted at every read site)", () => {
@@ -114,5 +116,39 @@ describe("collectMacroFolders — union of explicit + derived, ancestors include
       { name: "b", text: "t", group: "Item2" }
     ];
     expect(collectMacroFolders(macros, [])).toEqual(["Item2", "Item10"]);
+  });
+});
+
+describe("macroFolderField — the one definition of what the Macro Editor's Folder field shows", () => {
+  it("renders a valid group as-is", () => {
+    expect(macroFolderField("Cisco/Routers")).toEqual({ value: "Cisco/Routers", state: "valid" });
+  });
+
+  it("treats a missing, blank or non-string group as an empty field", () => {
+    expect(macroFolderField(undefined)).toEqual({ value: "", state: "empty" });
+    expect(macroFolderField("   ")).toEqual({ value: "", state: "empty" });
+    expect(macroFolderField({ bad: true })).toEqual({ value: "", state: "empty" });
+  });
+
+  it("SHOWS a stored-but-unrenderable group instead of hiding it — that is the value the user has to correct", () => {
+    expect(macroFolderField("Cisco\\Routers")).toEqual({ value: "Cisco\\Routers", state: "unrenderable" });
+    expect(macroFolderField("../secrets")).toEqual({ value: "../secrets", state: "unrenderable" });
+    expect(macroFolderField("a/b/c/d/e/f/g/h/i/j/k")).toEqual({
+      value: "a/b/c/d/e/f/g/h/i/j/k",
+      state: "unrenderable"
+    });
+  });
+
+  it("withholds a group past the path-length cap so it can never reach the DOM", () => {
+    const huge = "X".repeat(8_000_000);
+    expect(macroFolderField(huge)).toEqual({ value: "", state: "oversize" });
+    // The boundary is the same one normalizeFolderPath enforces, so a group a
+    // real filesystem could produce is always renderable.
+    expect(macroFolderField("Y".repeat(MAX_FOLDER_PATH_LENGTH)).state).toBe("valid");
+    expect(macroFolderField("Y".repeat(MAX_FOLDER_PATH_LENGTH + 1)).state).toBe("oversize");
+  });
+
+  it("trims, because the webview trims before posting — an untrimmed baseline could never compare equal", () => {
+    expect(macroFolderField("  Cisco  ")).toEqual({ value: "Cisco", state: "valid" });
   });
 });

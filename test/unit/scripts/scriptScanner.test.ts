@@ -28,10 +28,12 @@ vi.mock("vscode", () => ({
 
 import * as vscode from "vscode";
 import {
+  findHiddenScriptFolderSegment,
   scanScriptsDir,
   SCRIPT_SCAN_MAX_DEPTH,
   SCRIPT_SCAN_MAX_ENTRIES
 } from "../../../src/services/scripts/scriptScanner";
+import { MAX_FOLDER_DEPTH } from "../../../src/utils/folderPaths";
 
 const ROOT = "/scripts";
 const rootUri = { fsPath: ROOT, scheme: "file", path: ROOT, toString: () => ROOT };
@@ -249,5 +251,56 @@ describe("scanScriptsDir", () => {
     const result = await scanScriptsDir(rootUri as never);
     expect(folderPaths(result)).toEqual([]);
     expect(result.scripts).toEqual([]);
+  });
+
+  it("SCRIPT_SCAN_MAX_DEPTH tracks MAX_FOLDER_DEPTH", () => {
+    // The two are the same bound seen from two sides: normalizeFolderPath is
+    // what stops a user creating a folder deeper than this, and this scanner
+    // is what has to find what they created.
+    //
+    // Be honest about what this catches. Import-vs-literal is a source-text
+    // property, and while the two numbers happen to be equal a literal `10`
+    // passes here just as an import does. The mutation it DOES fail against is
+    // the one that matters: MAX_FOLDER_DEPTH moving while a re-declared copy
+    // stays behind, which is the drift the import exists to make impossible.
+    expect(SCRIPT_SCAN_MAX_DEPTH).toBe(MAX_FOLDER_DEPTH);
+  });
+});
+
+describe("findHiddenScriptFolderSegment — the skip list, reused by the New Folder / New Script validators", () => {
+  it("names the segment that would make a folder invisible", () => {
+    expect(findHiddenScriptFolderSegment(".archive")).toBe(".archive");
+    expect(findHiddenScriptFolderSegment("node_modules")).toBe("node_modules");
+    expect(findHiddenScriptFolderSegment("NODE_MODULES")).toBe("NODE_MODULES");
+    expect(findHiddenScriptFolderSegment("types")).toBe("types");
+    expect(findHiddenScriptFolderSegment("Types")).toBe("Types");
+    // Not only at the root: a hidden ANCESTOR hides everything under it.
+    expect(findHiddenScriptFolderSegment("cisco/.archive/old")).toBe(".archive");
+    expect(findHiddenScriptFolderSegment("cisco/node_modules")).toBe("node_modules");
+  });
+
+  it("allows everything the scanner actually walks, including a non-root types/", () => {
+    expect(findHiddenScriptFolderSegment("cisco")).toBeUndefined();
+    expect(findHiddenScriptFolderSegment("cisco/backup")).toBeUndefined();
+    // scriptTypesGenerator only ever writes <scriptsDir>/types, so a user's own
+    // cisco/types is a real folder the scanner descends into.
+    expect(findHiddenScriptFolderSegment("cisco/types")).toBeUndefined();
+    expect(findHiddenScriptFolderSegment("typescript")).toBeUndefined();
+  });
+
+  it("agrees with the walk it describes: every name it rejects really does fail to render", async () => {
+    // The predicate and the walk must not drift — that is the entire reason
+    // the predicate lives in this module.
+    mockFsEntries.set(ROOT, [[".archive", DIR], ["node_modules", DIR], ["types", DIR], ["cisco", DIR]]);
+    mockFsEntries.set(`${ROOT}/.archive`, [["a.js", FILE]]);
+    mockFsEntries.set(`${ROOT}/node_modules`, [["b.js", FILE]]);
+    mockFsEntries.set(`${ROOT}/types`, [["c.js", FILE]]);
+    mockFsEntries.set(`${ROOT}/cisco`, [["types", DIR]]);
+    mockFsEntries.set(`${ROOT}/cisco/types`, [["d.js", FILE]]);
+
+    const result = await scanScriptsDir(rootUri as never);
+
+    expect(folderPaths(result)).toEqual(["cisco", "cisco/types"]);
+    expect(result.scripts.map((s) => s.fileName)).toEqual(["d.js"]);
   });
 });

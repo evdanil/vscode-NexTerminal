@@ -630,6 +630,18 @@ empty folder stays until you remove it.
   placed there won't appear in the Scripts view or any picker. A "Some
   folders are nested deeper than 10 levels — scripts inside may be hidden"
   row pins near the top of the Scripts view whenever this happens.
+  **Connect and Run Script…** says the same thing, because it runs the same
+  bounded scan: if a limit was hit it appends the reason to the picker's
+  placeholder, or — when the truncated scan matched nothing at all — to the
+  "no scripts" message, so a scan that merely stopped looking is never
+  reported as "there are none".
+- **Names the Scripts view can't show are rejected up front.** Folders
+  starting with `.`, anything called `node_modules`, and a top-level `types`
+  folder are skipped by the scan (see the troubleshooting table below), so
+  **New Folder** and **New Script** refuse them rather than creating a real
+  directory that never appears — and that then reports "already exists" the
+  next time you try. A `types` folder that isn't at the top level, like
+  `cisco/types`, is fine.
 
 ## Commands and views
 

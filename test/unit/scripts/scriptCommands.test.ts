@@ -287,6 +287,22 @@ describe("scriptCommands", () => {
       expect(state.writtenFiles.size).toBe(0);
     });
 
+    it("rejects a folder part the Scripts view will never render, so a new script cannot be created somewhere invisible", async () => {
+      state.inputBoxReturn = undefined;
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler();
+      const validate = state.inputBoxValidator!;
+
+      expect(validate("node_modules/backup")).toMatch(/never shows/);
+      expect(validate(".archive/backup")).toMatch(/never shows/);
+      expect(validate("types/backup")).toMatch(/never shows/);
+      expect(validate("cisco/types/backup")).toBeUndefined();
+      expect(validate("cisco/backup")).toBeUndefined();
+      // A dot-prefixed LEAF is a file, not a directory — the scanner lists it.
+      expect(validate(".hidden")).toBeUndefined();
+    });
+
     it("Fix 7 — a trailing slash is rejected with 'Name is required', not silently creating the folder name as a script at the root", async () => {
       // Regression: right-click "cisco" -> New Script pre-seeds "cisco/"; if
       // the user presses Enter without typing a leaf, the pre-fix code
@@ -382,6 +398,26 @@ describe("scriptCommands", () => {
       const message = state.inputBoxValidator!("cisco\\backup");
       expect(message).toBeDefined();
       expect(message!).toMatch(/use '\/'/i);
+    });
+
+    it("rejects names the Scripts view will never render, instead of creating an invisible directory", async () => {
+      // These all pass the folder-path grammar, so the directory really got
+      // created on disk — and then `scanScriptsDir` skipped it, so it never
+      // appeared, and a second attempt reported "already exists" about a
+      // folder the user cannot see anywhere.
+      state.inputBoxReturn = undefined;
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+      await handler();
+      const validate = state.inputBoxValidator!;
+
+      expect(validate(".archive")).toMatch(/never shows/);
+      expect(validate("node_modules")).toMatch(/never shows/);
+      expect(validate("types")).toMatch(/never shows/);
+      expect(validate("cisco/.old")).toMatch(/never shows/);
+      // ...and does NOT reject the things the scanner does walk.
+      expect(validate("cisco")).toBeUndefined();
+      expect(validate("cisco/types")).toBeUndefined();
     });
   });
 

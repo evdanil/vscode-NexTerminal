@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { parseScriptHeader } from "./scriptHeader";
 import { resolveScriptsDir } from "./resolveScriptsDir";
-import { scanScriptsDir } from "./scriptScanner";
+import { scanScriptsDir, SCRIPT_SCAN_MAX_DEPTH } from "./scriptScanner";
 import type { ScriptTargetType } from "./scriptTypes";
 
 interface ScriptPickItem extends vscode.QuickPickItem {
@@ -85,17 +85,30 @@ export async function pickScriptFromWorkspace(
     });
   }
 
+  // §5.3 requires truncation to be ANNOUNCED, never silent — the Scripts tree
+  // pins a warning row for it. Without the same signal here, hitting a cap
+  // produced the single most misleading sentence this module has ("No Nexus
+  // scripts compatible with SSH profiles"), asserting that nothing exists when
+  // the scan simply stopped looking. Both branches below carry it: the empty
+  // case must not claim emptiness, and a partial list must not look complete.
+  const truncationNote = scan.truncated
+    ? `The scan stopped after examining ${scan.examined} entries, so some scripts may be hidden — point "nexus.scripts.path" at a tighter folder.`
+    : scan.depthTruncated
+      ? `Folders nested more than ${SCRIPT_SCAN_MAX_DEPTH} levels deep were not searched, so some scripts may be hidden.`
+      : "";
+
   if (items.length === 0) {
-    void vscode.window.showInformationMessage(
-      targetType
-        ? `No Nexus scripts compatible with ${targetType.toUpperCase()} profiles. Add one in ${dir.fsPath}.`
-        : `No Nexus scripts found in ${dir.fsPath}.`
-    );
+    const base = targetType
+      ? `No Nexus scripts compatible with ${targetType.toUpperCase()} profiles. Add one in ${dir.fsPath}.`
+      : `No Nexus scripts found in ${dir.fsPath}.`;
+    void vscode.window.showInformationMessage(truncationNote ? `${base} ${truncationNote}` : base);
     return undefined;
   }
 
   const picked = await vscode.window.showQuickPick(items, {
-    placeHolder: "Pick a Nexus script to run on this profile",
+    placeHolder: truncationNote
+      ? `Pick a Nexus script to run on this profile — ${truncationNote}`
+      : "Pick a Nexus script to run on this profile",
     matchOnDescription: true,
     matchOnDetail: true
   });

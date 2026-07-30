@@ -13,7 +13,12 @@
  * destroy what it stored (see `dropNonPathGroup()`).
  */
 import type { TerminalMacro } from "../models/terminalMacro";
-import { getAncestorPaths, normalizeOptionalFolderPath } from "../utils/folderPaths";
+import {
+  getAncestorPaths,
+  normalizeFolderPath,
+  normalizeOptionalFolderPath,
+  MAX_FOLDER_PATH_LENGTH
+} from "../utils/folderPaths";
 import { naturalComparePath } from "../utils/naturalCompare";
 
 /**
@@ -73,6 +78,67 @@ export function dropNonPathGroup<T extends Pick<TerminalMacro, "group">>(macro: 
   if (typeof raw === "string" && raw.trim().length > 0) return macro;
   const { group: _drop, ...rest } = macro;
   return rest as T;
+}
+
+/**
+ * How the Macro Editor's **Folder** field represents a stored `group`.
+ *
+ * There is exactly one function for this because two callers must agree on it
+ * byte-for-byte: `macroEditorHtml.ts` renders `value` into the input, and
+ * `macroEditorPanel.ts` compares the submitted text against the same `value`
+ * to decide whether the user touched the field at all. If those two ever
+ * disagreed, an untouched field would read as edited and the save would
+ * rewrite (or delete) a stored folder path the user never looked at — which
+ * is precisely the defect this helper exists to close: the editor sanitized
+ * an unrenderable group to an EMPTY field, the webview posted `group: null`,
+ * and saving a name change silently destroyed the stored value, making
+ * §4.9.3's "storage is never rewritten" false on the most ordinary write path.
+ *
+ * The four states:
+ *
+ * - `empty` — no stored group. The field is blank; typing a path assigns one.
+ * - `valid` — the stored group normalizes. Rendered as-is.
+ * - `unrenderable` — a stored string that does NOT normalize (`Cisco\Routers`
+ *   typed with a Windows separator, a `..` segment, over-depth). It is
+ *   rendered **raw** so the user can see and fix the thing that is keeping the
+ *   macro at the root. Saving it unchanged preserves it byte-for-byte; saving
+ *   it CHANGED runs the normal grammar, so any edit forces an explicit,
+ *   validated decision.
+ * - `oversize` — a stored string longer than `MAX_FOLDER_PATH_LENGTH`. It is
+ *   deliberately NOT rendered: a pathological `"a".repeat(8_000_000)` group
+ *   (reachable from a hand-edited settings.json via the legacy-absorption
+ *   path) must never reach the DOM. The field is blank and a notice explains
+ *   that the stored value is kept; **Move to Folder → (root)** clears it.
+ *
+ * `value` is trimmed because the webview trims before posting, so an untrimmed
+ * baseline could never compare equal to what comes back. The length check runs
+ * BEFORE `trim()` for the same O(1) reason `normalizeFolderPath` does it —
+ * trimming an eight-megabyte string to discover it is too long is the cost the
+ * bound exists to avoid.
+ */
+export interface MacroFolderField {
+  /** Exactly what the Folder input renders — and the baseline for "untouched". */
+  readonly value: string;
+  readonly state: "empty" | "valid" | "unrenderable" | "oversize";
+}
+
+export function macroFolderField(rawGroup: unknown): MacroFolderField {
+  if (typeof rawGroup !== "string") {
+    // A non-string group never reaches here from the store (`dropNonPathGroup`
+    // strips it at ingest), and there is no path in it to preserve anyway.
+    return { value: "", state: "empty" };
+  }
+  if (rawGroup.length > MAX_FOLDER_PATH_LENGTH) {
+    return { value: "", state: "oversize" };
+  }
+  const trimmed = rawGroup.trim();
+  if (trimmed.length === 0) {
+    return { value: "", state: "empty" };
+  }
+  return {
+    value: trimmed,
+    state: normalizeFolderPath(trimmed) === undefined ? "unrenderable" : "valid"
+  };
 }
 
 /**

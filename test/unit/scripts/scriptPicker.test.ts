@@ -3,6 +3,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 const mockFsEntries = new Map<string, Array<[string, number]>>();
 const mockFiles = new Map<string, string>();
 let quickPickItems: unknown[] | undefined;
+let quickPickOptions: { placeHolder?: string } | undefined;
 let quickPickReturn: unknown = undefined;
 const shownInfo: string[] = [];
 
@@ -30,8 +31,9 @@ vi.mock("vscode", () => ({
     }
   },
   window: {
-    showQuickPick: vi.fn((items: unknown[]) => {
+    showQuickPick: vi.fn((items: unknown[], options?: unknown) => {
       quickPickItems = items;
+      quickPickOptions = options as { placeHolder?: string } | undefined;
       return Promise.resolve(quickPickReturn);
     }),
     showInformationMessage: vi.fn((msg: string) => {
@@ -51,6 +53,7 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     mockFsEntries.clear();
     mockFiles.clear();
     quickPickItems = undefined;
+    quickPickOptions = undefined;
     quickPickReturn = undefined;
     shownInfo.length = 0;
     (vscode.workspace as unknown as { workspaceFolders: unknown[] }).workspaceFolders = [
@@ -230,5 +233,62 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     await pickScriptFromWorkspace(GLOBAL_STORAGE);
     const items = (quickPickItems as Array<{ label: string; description?: string }>) ?? [];
     expect(items).toEqual([expect.objectContaining({ label: "Top", description: "" })]);
+  });
+
+  describe("§5.3 — a truncated scan is announced here too, never reported as 'no scripts'", () => {
+    it("the entry cap must not produce the bare 'No Nexus scripts compatible with SSH profiles' message", async () => {
+      // The exact misleading sentence §5.8 exists to prevent, made reachable
+      // again by the cap: the scan stopped looking, and saying "none exist"
+      // sends the user hunting for a script that is sitting right there.
+      const entries: Array<[string, number]> = Array.from(
+        { length: 600 },
+        (_, i) => [`junk${i}.txt`, 1] as [string, number]
+      );
+      mockFsEntries.set("/ws/.nexus/scripts", entries);
+
+      const result = await pickScriptFromWorkspace(GLOBAL_STORAGE, "ssh");
+
+      expect(result).toBeUndefined();
+      expect(shownInfo).toHaveLength(1);
+      expect(shownInfo[0]).toMatch(/compatible with SSH profiles/);
+      expect(shownInfo[0]).toMatch(/some scripts may be hidden/);
+      expect(shownInfo[0]).toMatch(/500 entries/);
+    });
+
+    it("the depth cap gets its own reason, distinct from the entry cap", async () => {
+      // d1..d10 are descended into; d11 is listed but never opened.
+      mockFsEntries.set("/ws/.nexus/scripts", [["d1", 2]]);
+      for (let i = 1; i <= 10; i++) {
+        const path = `/ws/.nexus/scripts/${Array.from({ length: i }, (_, k) => `d${k + 1}`).join("/")}`;
+        mockFsEntries.set(path, [[`d${i + 1}`, 2]]);
+      }
+
+      const result = await pickScriptFromWorkspace(GLOBAL_STORAGE);
+
+      expect(result).toBeUndefined();
+      expect(shownInfo).toHaveLength(1);
+      expect(shownInfo[0]).toMatch(/nested more than 10 levels deep/);
+    });
+
+    it("a PARTIAL result is flagged too — a list that looks complete is the same lie in a quieter form", async () => {
+      const entries: Array<[string, number]> = [["good.js", 1]];
+      for (let i = 0; i < 600; i++) entries.push([`junk${i}.txt`, 1]);
+      mockFsEntries.set("/ws/.nexus/scripts", entries);
+      mockFiles.set("/ws/.nexus/scripts/good.js", "/**\n * @nexus-script\n * @name Good\n */\n");
+
+      await pickScriptFromWorkspace(GLOBAL_STORAGE);
+
+      expect((quickPickItems as Array<{ label: string }>).map((i) => i.label)).toEqual(["Good"]);
+      expect(quickPickOptions?.placeHolder).toMatch(/some scripts may be hidden/);
+    });
+
+    it("an untruncated scan's placeholder and empty-message stay exactly as they were", async () => {
+      mockFsEntries.set("/ws/.nexus/scripts", [["good.js", 1]]);
+      mockFiles.set("/ws/.nexus/scripts/good.js", "/**\n * @nexus-script\n * @name Good\n */\n");
+
+      await pickScriptFromWorkspace(GLOBAL_STORAGE);
+
+      expect(quickPickOptions?.placeHolder).toBe("Pick a Nexus script to run on this profile");
+    });
   });
 });

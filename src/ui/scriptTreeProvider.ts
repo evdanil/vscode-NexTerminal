@@ -375,8 +375,11 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
           children.push(...scriptPlaceholders());
         }
         if (scan.depthTruncated) {
-          // Fix 6 — pinned at root, distinct from (and rendered ahead of) the
-          // entry-cap node below only when both happen to fire together.
+          // Fix 6 — pinned at root, distinct from the entry-cap node. Both
+          // `unshift`, so when the two fire together this one ends up SECOND
+          // and the entry-cap node below ends up first — deliberately, since
+          // "the whole scan stopped" explains more of what is missing than
+          // "one branch was too deep".
           children.unshift({ kind: "depthTruncated" });
         }
         if (scan.truncated) {

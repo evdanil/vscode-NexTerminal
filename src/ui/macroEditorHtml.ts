@@ -8,7 +8,7 @@ import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./macroProfileOptions";
 import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } from "../services/macroVariables";
-import { sanitizeMacroGroup } from "../services/macroFolders";
+import { macroFolderField } from "../services/macroFolders";
 
 /**
  * One repeatable variable row (docs/plans/2026-07-29-macro-variables.md §9.1):
@@ -90,9 +90,31 @@ export function renderMacroEditorHtml(
 
   const nameValue = macro?.name ?? "";
   const textValue = macro?.text?.replace(/\n/g, "\n") ?? "";
-  // §4.11 — the Folder field. For an existing macro, its own (sanitized, §4.2)
-  // group; for a new macro, the caller's seed (e.g. `addToFolder`, §4.7).
-  const groupValue = macro ? (sanitizeMacroGroup(macro.group) ?? "") : (seedGroup ?? "");
+  // §4.11 — the Folder field. For an existing macro, whatever
+  // `macroFolderField()` says its stored group looks like in this input; for a
+  // new macro, the caller's seed (e.g. `addToFolder`, §4.7).
+  //
+  // This deliberately does NOT sanitize. Sanitizing showed an empty field for a
+  // stored-but-unrenderable group, which meant the one surface where §4.9.3
+  // says the user can "correct it" displayed nothing to correct — and, worse,
+  // handed the save path an empty value that deleted the stored path. The raw
+  // string is rendered instead (escaped by `escapeHtml`, and withheld entirely
+  // above `MAX_FOLDER_PATH_LENGTH` so a pathological multi-megabyte group can
+  // never reach the DOM), with a notice explaining why the macro is at the
+  // root. `macroEditorPanel.ts` preserves it verbatim if the user leaves it
+  // alone, and validates normally the moment they touch it.
+  const storedFolder = macro ? macroFolderField(macro.group) : undefined;
+  const groupValue = storedFolder ? storedFolder.value : (seedGroup ?? "");
+  const folderNotice =
+    storedFolder?.state === "unrenderable"
+      ? "This folder path isn't usable, so this macro shows at the root. Fix it (or clear it) and save; leaving it untouched keeps the stored value exactly as it is."
+      : storedFolder?.state === "oversize"
+        ? "This macro's stored folder path is too long to show here, so the macro shows at the root. Type a new path to replace it, or use Move to Folder → (root) to clear it; leaving this field empty keeps the stored value."
+        : "";
+  // Folded into the existing hint rather than added as its own element: an
+  // empty conditional block on its own line leaves a whitespace-only line in
+  // the rendered HTML, which `git diff --check` fails on via the snapshot test.
+  const folderNoticeHtml = folderNotice ? `<strong>${escapeHtml(folderNotice)}</strong> ` : "";
   // Each option carries its own indentation and the whole block is empty when there
   // are no folders yet — which is the normal starting state. Interpolating an empty
   // string into an already-indented line would leave the indent behind as a
@@ -298,7 +320,7 @@ ${folderOptionsHtml}
       </div>
     </div>
     <div class="field-error" id="error-folder"></div>
-    <div class="hint">Optional. Groups this macro under a sidebar folder. Use "/" for nested folders (e.g. Cisco/Routers).</div>
+    <div class="hint">${folderNoticeHtml}Optional. Groups this macro under a sidebar folder. Use "/" for nested folders (e.g. Cisco/Routers).</div>
   </div>
 
   <div class="bottom-actions">

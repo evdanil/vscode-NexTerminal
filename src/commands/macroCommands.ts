@@ -24,6 +24,7 @@ import {
 import { repositoryBlobUrl } from "../utils/repositoryLinks";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders, withRedactedVariables } from "../services/macroVariables";
 import { collectMacroFolders, sanitizeMacroGroup } from "../services/macroFolders";
+import { mutateMacroById } from "../services/macroMutation";
 import {
   getAncestorPaths,
   folderDisplayName,
@@ -31,7 +32,8 @@ import {
   normalizeFolderPath,
   normalizeOptionalFolderPath,
   parentPath,
-  INVALID_FOLDER_PATH_MESSAGE
+  INVALID_FOLDER_PATH_MESSAGE,
+  MAX_FOLDER_PATH_LENGTH
 } from "../utils/folderPaths";
 import { runMacro } from "./macroVariablePrompt";
 // NOT imported from "../ui/macroTreeProvider": that module's `class MacroTreeItem
@@ -402,18 +404,52 @@ async function pickFolderDestination(macros: TerminalMacro[]): Promise<string | 
   return normalized;
 }
 
+/** The prefix substitution a folder rename applies to one descendant path. */
+function renamedDescendantPath(path: string, oldPath: string, newPath: string): string {
+  return newPath + path.slice(oldPath.length);
+}
+
 /**
  * §4.7 / §4.4 — `renameFolder` rewrites `group` on every descendant macro and
  * remaps the explicit-folder list, prefix-safe via `isDescendantOrSelf` (so
  * `Net` never touches `Network`). Renaming onto an existing path merges,
  * matching the Hub's behavior.
+ *
+ * Returns `false` — having written NOTHING — when the rename would produce a
+ * path this codebase can no longer render. A rename is a prefix substitution,
+ * so a longer new name lengthens every descendant, and a deep descendant can
+ * cross `MAX_FOLDER_PATH_LENGTH`. Past that bound `normalizeFolderPath`
+ * rejects it, every read site sanitizes it to `undefined`, and the macro
+ * silently drops to the root — the exact data loss §4.2's read-site
+ * chokepoint exists to make survivable, arriving here through a command the
+ * user explicitly invoked. Validating every resulting path up front also
+ * keeps the operation atomic: the folder list and the macro array are two
+ * separate writes, and a half-applied rename is worse than a refused one.
+ * (Depth cannot change — the rename box collects a single leaf segment — so
+ * length is the only way this fires.)
  */
-async function renameMacroFolder(oldPath: string, newPath: string): Promise<void> {
+async function renameMacroFolder(oldPath: string, newPath: string): Promise<boolean> {
   const explicit = getMacroFolders();
+  const resulting: string[] = [];
+  for (const f of explicit) {
+    if (isDescendantOrSelf(f, oldPath)) {
+      resulting.push(renamedDescendantPath(f, oldPath, newPath));
+    }
+  }
+  for (const m of getMacros()) {
+    const group = sanitizeMacroGroup(m.group);
+    if (group !== undefined && isDescendantOrSelf(group, oldPath)) {
+      resulting.push(renamedDescendantPath(group, oldPath, newPath));
+    }
+  }
+  if (resulting.some((path) => normalizeFolderPath(path) === undefined)) {
+    return false;
+  }
+
   const nextExplicit = new Set<string>();
   for (const f of explicit) {
     if (isDescendantOrSelf(f, oldPath)) {
-      nextExplicit.add(newPath + f.slice(oldPath.length));
+      nextExplicit.add(renamedDescendantPath(f, oldPath, newPath));
     } else {
       nextExplicit.add(f);
     }
@@ -429,13 +465,14 @@ async function renameMacroFolder(oldPath: string, newPath: string): Promise<void
     const group = sanitizeMacroGroup(m.group);
     if (group !== undefined && isDescendantOrSelf(group, oldPath)) {
       changed = true;
-      return { ...m, group: newPath + group.slice(oldPath.length) };
+      return { ...m, group: renamedDescendantPath(group, oldPath, newPath) };
     }
     return m;
   });
   if (changed) {
     await saveMacros(updated);
   }
+  return true;
 }
 
 /**
@@ -469,10 +506,12 @@ async function removeMacroFolder(path: string): Promise<void> {
 
   // Fix 2 (MAJOR) — `macros` above was captured BEFORE the confirmation
   // dialog, which the user can leave open indefinitely. Anything saved while
-  // it was open (another command, another window, an auto-trigger state
-  // write) must not be discarded by writing back that stale snapshot — the
-  // affected-count message above may already be reading slightly-stale data,
-  // but the actual MUTATION below must operate on the latest array.
+  // it was open (another macro command, the Macro Editor, a drag onto a
+  // folder, a config import — all in THIS window; see `mutateMacroById`'s
+  // note on why another window is not the threat) must not be discarded by
+  // writing back that stale snapshot — the affected-count message above may
+  // already be reading slightly-stale data, but the actual MUTATION below
+  // must operate on the latest array.
   const latest = getMacros();
   let changed = false;
   const updatedMacros = latest.map((m) => {
@@ -534,54 +573,6 @@ function findNextInGroup(macros: TerminalMacro[], index: number, group: string |
 }
 
 /**
- * The one safe way to run the shape "resolve a macro, await a dialog, then
- * mutate the array" — hand-rolled three times before this, and wrong every
- * time.
- *
- * The trap is that re-reading `getMacros()` after the dialog is only HALF the
- * fix. `getMacros()` returns a fresh array on every call, so a pre-dialog
- * index applied to a post-dialog array is not merely stale, it is confidently
- * wrong: with `[A, B]`, opening a dialog on A (index 0) and another window
- * deleting A while it is open leaves `[B]`, and `splice(0, 1)` /
- * `assignBinding(latest, 0, …)` then hits **B** — a macro the user never
- * selected, after a confirmation naming A. A bounds check does not help; index
- * 0 is perfectly in bounds.
- *
- * `id` is the only stable identity a macro has across those awaits. It is a
- * `MacroStore` invariant, not a hope: both store implementations assign a
- * UUID in `save()`, and `VscodeMacroStore` assigns one again in
- * `reloadFromState()`, so everything `getMacros()` ever returns — and
- * therefore every `MacroTreeItem.macro` — carries one. A missing id can only
- * mean the caller synthesised a macro that never came from the store, and is
- * treated as "no target": no write at all, never a guess.
- *
- * `mutate` receives the FRESHLY read array and the index of the target macro
- * WITHIN THAT ARRAY, so whole-array operations (`splice`, `assignBinding`'s
- * clear-the-binding-from-everyone-else pass) work exactly as before.
- *
- * `moveToFolder` and `MacroTreeProvider.handleDrop` solve the same problem in
- * their own shape — many ids / one id, no index needed, a pure field rewrite
- * expressed as a `map` — and are left as they are rather than bent through
- * this signature.
- */
-async function mutateMacroById(
-  id: string | undefined,
-  mutate: (macros: TerminalMacro[], index: number) => void
-): Promise<boolean> {
-  if (!id) {
-    return false;
-  }
-  const latest = getMacros();
-  const index = latest.findIndex((m) => m.id === id);
-  if (index === -1) {
-    return false; // Deleted while the dialog was open — a no-op, never a wrong write.
-  }
-  mutate(latest, index);
-  await saveMacros(latest);
-  return true;
-}
-
-/**
  * Position of the macro with `id` in `macros`, or -1. Only ever used for the
  * PRE-dialog read (the name to show in a confirmation, the binding to pre-fill
  * in a prompt). The index it returns is valid for `macros` and nothing else —
@@ -627,7 +618,9 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
     // the confirmation dialog (see `mutateMacroById`). Re-reading the array
     // after the dialog while still indexing into it with the PRE-dialog index
     // was worse than not re-reading at all — it confidently removed whichever
-    // macro had since slid into that slot.
+    // macro had since slid into that slot. The overlapping writer is another
+    // flow in THIS window (the Macro Editor, a drag onto a folder, an import),
+    // not another window; `{ modal: true }` blocks the user, not the host.
     vscode.commands.registerCommand("nexus.macro.remove", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
       let targetId: string | undefined;
@@ -653,17 +646,25 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (index === -1) {
         return;
       }
+      const confirmedName = macros[index].name;
       const confirm = await vscode.window.showWarningMessage(
-        `Remove macro "${macros[index].name}"?`,
+        `Remove macro "${confirmedName}"?`,
         { modal: true },
         "Remove"
       );
       if (confirm !== "Remove") {
         return;
       }
-      await mutateMacroById(targetId, (latest, i) => {
+      const outcome = await mutateMacroById(targetId, (latest, i) => {
         latest.splice(i, 1);
       });
+      if (outcome === "missing") {
+        // Saying nothing here left the user staring at a confirmation they
+        // answered and a sidebar that may look unchanged (the macro could
+        // have been renamed away rather than deleted). The end state is what
+        // they asked for, so this is informational, not an error.
+        void vscode.window.showInformationMessage(`"${confirmedName}" was already removed.`);
+      }
     }),
 
     vscode.commands.registerCommand("nexus.macro.run", async () => {
@@ -776,13 +777,19 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       }
       // The prompt's conflict warning is a display concern and reads the
       // pre-dialog snapshot; the WRITE below re-resolves by identity.
+      const promptedName = macros[index].name;
       const bindingResult = await promptForBinding(macros, index, getAssignedBinding(macros[index]));
       if (bindingResult === undefined) {
         return; // Cancelled
       }
-      await mutateMacroById(targetId, (latest, i) => {
+      const outcome = await mutateMacroById(targetId, (latest, i) => {
         assignBinding(latest, i, bindingResult);
       });
+      if (outcome === "missing") {
+        void vscode.window.showInformationMessage(
+          `"${promptedName}" no longer exists — its keyboard shortcut was not changed.`
+        );
+      }
     }),
 
     // §4.4 — swaps with the previous/next macro SHARING THE SAME `group`, not
@@ -984,7 +991,11 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         void vscode.window.showErrorMessage(INVALID_FOLDER_PATH_MESSAGE);
         return;
       }
-      await renameMacroFolder(oldPath, normalized);
+      if (!(await renameMacroFolder(oldPath, normalized))) {
+        void vscode.window.showErrorMessage(
+          `Renaming "${currentName}" to "${newName.trim()}" would push some folder paths past ${MAX_FOLDER_PATH_LENGTH} characters, which would drop those macros to the root. Nothing was renamed — choose a shorter name.`
+        );
+      }
     }),
 
     // Re-parents descendants, preserving substructure; never deletes macros.
@@ -1029,16 +1040,34 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           text += "\n";
         }
       }
-      // The third instance of the same shape: `clipboard.readText()` and the
+      // The worst instance of the same shape: `clipboard.readText()` and the
       // append-newline prompt are both awaits, after which `item.index` is a
-      // pre-dialog position. Writing a secret's plaintext into whichever macro
-      // now occupies that slot is the worst outcome of the three, so it goes
-      // through the same identity path.
-      const updated = await mutateMacroById(item.macro.id, (macros, i) => {
+      // pre-dialog position and `item.macro.secret` is a pre-dialog FACT.
+      //
+      // Identity alone is not enough here. The append-newline prompt is a
+      // plain non-modal `showInformationMessage`, so the window stays fully
+      // interactive: the user can open the Macro Editor on this very macro,
+      // untick **Secret**, save, and only then answer the notification. The
+      // macro re-resolves perfectly by id — and writing to it now would have
+      // `MacroStore.save()` delete its vault entry and put the clipboard
+      // password straight into `nexus.macros` in cleartext. So the
+      // confidentiality precondition is re-checked against the FRESH record,
+      // not the one the context menu was opened on.
+      const outcome = await mutateMacroById(item.macro.id, (macros, i) => {
+        if (!macros[i].secret) {
+          return false;
+        }
         macros[i] = { ...macros[i], text };
       });
-      if (!updated) {
-        return; // The macro went away mid-flow — don't claim it was updated.
+      if (outcome === "skipped") {
+        void vscode.window.showWarningMessage(
+          `"${item.macro.name}" is no longer a secret macro, so its value was NOT replaced — pasting into it would have stored the clipboard text in plain text. Re-enable Secret first, or use Edit Macro.`
+        );
+        return;
+      }
+      if (outcome === "missing") {
+        void vscode.window.showInformationMessage(`"${item.macro.name}" no longer exists — nothing was pasted.`);
+        return;
       }
       void vscode.window.showInformationMessage(`Updated "${item.macro.name}" from clipboard.`);
     }),

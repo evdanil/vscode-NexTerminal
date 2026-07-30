@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 import { parseScriptHeader } from "../services/scripts/scriptHeader";
 import { resolveScriptsDir } from "../services/scripts/resolveScriptsDir";
+import { findHiddenScriptFolderSegment } from "../services/scripts/scriptScanner";
 import { repositoryBlobUrl, repositoryTreeUrl } from "../utils/repositoryLinks";
 import { normalizeFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 
@@ -288,8 +289,23 @@ function validateScriptPathInput(raw: string): string | undefined {
     if (dirPath === undefined) {
       return INVALID_FOLDER_PATH_MESSAGE;
     }
+    const hidden = findHiddenScriptFolderSegment(dirPath);
+    if (hidden) {
+      return hiddenScriptFolderMessage(hidden);
+    }
   }
   return undefined;
+}
+
+/**
+ * A path the grammar accepts but `scanScriptsDir` will never surface (§5.3's
+ * skip list) is not a valid destination: the directory gets created on disk,
+ * never renders in the Scripts view, and a second attempt reports "already
+ * exists" about a folder the user has no way to see. The rules themselves live
+ * with the scanner (`findHiddenScriptFolderSegment`) so the two cannot drift.
+ */
+function hiddenScriptFolderMessage(segment: string): string {
+  return `The Scripts view never shows "${segment}" — folders starting with '.', 'node_modules', and a top-level 'types' folder are skipped. Choose another name.`;
 }
 
 function validateNewScriptFolderPath(raw: string): string | undefined {
@@ -298,8 +314,13 @@ function validateNewScriptFolderPath(raw: string): string | undefined {
   }
   const trimmed = raw.trim();
   if (!trimmed) return "Folder path is required";
-  if (normalizeFolderPath(trimmed) === undefined) {
+  const normalized = normalizeFolderPath(trimmed);
+  if (normalized === undefined) {
     return INVALID_FOLDER_PATH_MESSAGE;
+  }
+  const hidden = findHiddenScriptFolderSegment(normalized);
+  if (hidden) {
+    return hiddenScriptFolderMessage(hidden);
   }
   return undefined;
 }

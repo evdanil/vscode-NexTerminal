@@ -14,7 +14,8 @@ import {
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
-import { collectMacroFolders } from "../services/macroFolders";
+import { collectMacroFolders, macroFolderField } from "../services/macroFolders";
+import { mutateMacroById } from "../services/macroMutation";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
@@ -126,8 +127,13 @@ export class MacroEditorPanel {
       this.unsubscribe();
       MacroEditorPanel.instance = undefined;
     });
-    // Re-render when the macro store changes externally (second window, Settings
-    // Sync, legacy absorption, clearAll) so index/id resolution stays current.
+    // Re-render when the macro store changes underneath us so index/id
+    // resolution stays current. "Underneath us" means THIS window: the store's
+    // change event fires only for this instance's own `save()` / `saveFolders()`
+    // / `clearAll()`, so the writers are a macro command, a drag onto a folder,
+    // a config import, or legacy absorption at activation. A second window's
+    // `globalState` write is invisible here until reload — `Memento` has no
+    // change event.
     this.unsubscribe = getActiveMacroStore().onDidChange(() => {
       if (this.isSaving) return;
       this.render();
@@ -247,6 +253,10 @@ export class MacroEditorPanel {
           this.render();
           return;
         }
+        // The one read of the stored record, hoisted above the Folder-field
+        // logic below (which needs it) and shared with the hidden-declaration
+        // check further down, which used to re-derive the identical value.
+        const existingMacro = index >= 0 ? macros[index] : undefined;
         const triggerInitiallyDisabled = msg.triggerInitiallyDisabled as boolean | undefined;
         const triggerInterval = msg.triggerInterval as number | undefined | null;
         const triggerScope = msg.triggerScope as TerminalMacro["triggerScope"] | undefined;
@@ -312,8 +322,25 @@ export class MacroEditorPanel {
         // "" canonicalizes to `undefined` (§4.1); anything else structurally
         // invalid (`..`, `.`, `\`, over-depth) is rejected rather than silently
         // dropped, since here (unlike ingest, §4.2) the user is right there to fix it.
+        //
+        // ...but ONLY when the user actually touched the field. §4.9.3 promises
+        // that a stored folder path is "kept byte-for-byte and shown at the
+        // root until you correct it", and this handler was the one place that
+        // broke the promise: for a stored `Cisco\Routers` the renderer produced
+        // an EMPTY Folder field, the webview posted `group: null`, and the
+        // unconditional `delete macro.group` below destroyed the value on a
+        // save that only changed the macro's NAME — the most ordinary write
+        // path there is. `macroFolderField()` is the single shared definition
+        // of what the field shows for a given stored value (see its doc
+        // comment), so "the submitted text still equals the stored value's
+        // field representation" is exactly "the user did not touch it", and
+        // that case is carried through verbatim, unvalidated. Any real edit
+        // goes through the grammar as before — so an unrenderable path the
+        // user does touch forces an explicit, validated decision.
         const groupInput = typeof msg.group === "string" ? msg.group : "";
-        const normalizedGroup = normalizeOptionalFolderPath(groupInput);
+        const folderUntouched =
+          existingMacro !== undefined && groupInput.trim() === macroFolderField(existingMacro.group).value;
+        const normalizedGroup = folderUntouched ? undefined : normalizeOptionalFolderPath(groupInput);
         if (normalizedGroup === null) {
           void this.panel.webview.postMessage({
             type: "saveError",
@@ -350,11 +377,10 @@ export class MacroEditorPanel {
         // Only the trigger-activating case is blocked. Clearing rows the user could
         // actually see, or adding a trigger to a macro whose declarations were all
         // visible and removed, both stay legal.
-        const existing = index >= 0 ? macros[index] : undefined;
         const hiddenDeclarations =
-          existing !== undefined &&
-          Array.isArray(existing.variables) &&
-          existing.variables.length > getValidMacroVariables(existing).length;
+          existingMacro !== undefined &&
+          Array.isArray(existingMacro.variables) &&
+          existingMacro.variables.length > getValidMacroVariables(existingMacro).length;
         if (hiddenDeclarations && triggerPattern && variables.length === 0) {
           void this.panel.webview.postMessage({
             type: "saveError",
@@ -395,7 +421,6 @@ export class MacroEditorPanel {
           return;
         }
 
-        const existingMacro = index >= 0 ? macros[index] : undefined;
         const macro: TerminalMacro = { ...existingMacro, name, text };
         delete macro.keybinding;
         delete macro.slot;
@@ -409,9 +434,16 @@ export class MacroEditorPanel {
         // through the `{ ...existingMacro }` spread above.
         delete macro.variables;
         // §4.1 — "" canonicalizes to `undefined`; only a non-empty normalized
-        // path is ever persisted.
+        // path is ever persisted. The untouched case re-attaches the stored
+        // string byte-for-byte instead (see the Folder-field comment above);
+        // the `delete` first keeps this in the same delete-then-re-add shape
+        // as `variables` (§9.5), so nothing survives the spread by accident.
         delete macro.group;
-        if (normalizedGroup) macro.group = normalizedGroup;
+        if (folderUntouched) {
+          if (typeof existingMacro?.group === "string") macro.group = existingMacro.group;
+        } else if (normalizedGroup) {
+          macro.group = normalizedGroup;
+        }
         if (secret) macro.secret = true;
         else delete macro.secret;
         const triggerCooldown = msg.triggerCooldown as number | undefined;
@@ -440,32 +472,56 @@ export class MacroEditorPanel {
           macro.variables = variables;
         }
         const normalizedBinding = normalizeBinding(bindingRaw);
-        if (normalizedBinding) {
-          if (!isValidBinding(normalizedBinding)) {
-            break;
-          }
-          if (!(await confirmBindingWarnings(normalizedBinding))) {
-            break;
-          }
-          if (index >= 0) {
-            macros[index] = macro;
-            assignBinding(macros, index, normalizedBinding);
-            this.selectedIndex = index;
-          } else {
-            macros.push(macro);
-            const newIndex = macros.length - 1;
-            assignBinding(macros, newIndex, normalizedBinding);
-            this.selectedIndex = newIndex;
-          }
-        } else if (index >= 0) {
-          macros[index] = macro;
-          this.selectedIndex = index;
-        } else {
-          macros.push(macro);
-          this.selectedIndex = macros.length - 1;
+        if (normalizedBinding && !isValidBinding(normalizedBinding)) {
+          break;
+        }
+        if (normalizedBinding && !(await confirmBindingWarnings(normalizedBinding))) {
+          break;
         }
 
-        await this.persist(macros);
+        // `confirmBindingWarnings` is a NON-modal `showWarningMessage`
+        // (macroSettings.ts) — the window stays fully interactive while its
+        // "Use Anyway / Cancel" toast is up, and the panel's own store
+        // subscription re-renders from concurrent writes, so they are plainly
+        // expected here. Writing back `macros` — read before that await — then
+        // silently reverted whatever landed in between (a macro dragged into a
+        // folder, a `moveToFolder`, an import), and `assignBinding`'s
+        // clear-the-binding-from-every-other-macro pass compounded it across
+        // the whole stale array. Re-resolve by id against a freshly read array,
+        // exactly as every macro command now does.
+        if (macroId !== null) {
+          let savedIndex = -1;
+          const outcome = await this.withSaveGuard(() =>
+            mutateMacroById(macroId, (latest, i) => {
+              savedIndex = i;
+              latest[i] = macro;
+              if (normalizedBinding) {
+                assignBinding(latest, i, normalizedBinding);
+              }
+            })
+          );
+          if (outcome !== "saved") {
+            void vscode.window.showWarningMessage(
+              "This macro changed externally and could not be saved. The editor has been refreshed."
+            );
+            this.render();
+            break;
+          }
+          this.selectedIndex = savedIndex;
+        } else {
+          // A brand-new macro has no id to re-resolve, so the append is the
+          // whole operation; it still reads the array fresh rather than
+          // reusing the pre-dialog snapshot.
+          const latest = getMacros();
+          latest.push(macro);
+          const newIndex = latest.length - 1;
+          if (normalizedBinding) {
+            assignBinding(latest, newIndex, normalizedBinding);
+          }
+          await this.persist(latest);
+          this.selectedIndex = newIndex;
+        }
+
         this.render();
         void this.panel.webview.postMessage({ type: "saved" });
         break;
@@ -495,9 +551,26 @@ export class MacroEditorPanel {
         );
         if (confirm !== "Delete") break;
 
-        macros.splice(index, 1);
-        await this.persist(macros);
-        this.selectedIndex = macros.length > 0 ? Math.min(index, macros.length - 1) : null;
+        // Same discipline as the save path above. `{ modal: true }` blocks the
+        // USER, not the extension host: an auto-trigger write, a watcher, or an
+        // import can still land while the confirmation is up, and splicing a
+        // pre-dialog snapshot would discard it.
+        let deletedIndex = index;
+        const outcome = await this.withSaveGuard(() =>
+          mutateMacroById(macroId, (latest, i) => {
+            deletedIndex = i;
+            latest.splice(i, 1);
+          })
+        );
+        if (outcome !== "saved") {
+          void vscode.window.showWarningMessage(
+            "This macro changed externally and could not be deleted. The editor has been refreshed."
+          );
+          this.render();
+          break;
+        }
+        const remaining = getMacros();
+        this.selectedIndex = remaining.length > 0 ? Math.min(deletedIndex, remaining.length - 1) : null;
         this.render();
         break;
       }
@@ -505,16 +578,25 @@ export class MacroEditorPanel {
   }
 
   /**
-   * Persist macros while suppressing the store's change-event re-render for our
-   * own write, so a self-save does not race the explicit `render()` calls in the
+   * Run a write while suppressing the store's change-event re-render for our
+   * own save, so a self-save does not race the explicit `render()` calls in the
    * save/delete handlers (which set `selectedIndex` to the just-applied target).
+   *
+   * Every path that persists must go through this, including
+   * `mutateMacroById` — that helper calls `saveMacros()` directly, which would
+   * otherwise fire the store's change event straight back into this panel's own
+   * subscription mid-flow.
    */
-  private async persist(macros: TerminalMacro[]): Promise<void> {
+  private async withSaveGuard<T>(run: () => Promise<T>): Promise<T> {
     this.isSaving = true;
     try {
-      await saveMacros(macros);
+      return await run();
     } finally {
       this.isSaving = false;
     }
+  }
+
+  private async persist(macros: TerminalMacro[]): Promise<void> {
+    await this.withSaveGuard(() => saveMacros(macros));
   }
 }

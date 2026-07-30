@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { MAX_FOLDER_DEPTH } from "../../utils/folderPaths";
 
 /**
  * Recursive bounded filesystem scan of the Nexus scripts directory (§5.3, §5.8
@@ -21,9 +22,16 @@ import * as vscode from "vscode";
  */
 
 /**
- * Matches `MAX_FOLDER_DEPTH` in `src/utils/folderPaths.ts` (§5.3) — a folder
- * path of exactly this many segments is the deepest `normalizeFolderPath`
- * lets a user create (New Folder / New Script). Fix 2: the scanner must
+ * IS `MAX_FOLDER_DEPTH` from `src/utils/folderPaths.ts` (§5.3), imported
+ * rather than re-declared as its own `10`: the two are not two numbers that
+ * happen to be equal, they are one bound seen from two sides —
+ * `normalizeFolderPath` is what stops a user creating a folder deeper than
+ * this, and this scanner is what has to find what they created. A local
+ * literal lets one move without the other, and the failure is silent in both
+ * directions (scripts that exist but never render, or a wasted deeper walk).
+ *
+ * A folder path of exactly this many segments is therefore the deepest one a
+ * user can create (New Folder / New Script). Fix 2: the scanner must
  * therefore DESCEND into a folder at exactly this depth (read its own
  * scripts/subfolders), not merely list it — otherwise a script the product
  * itself allowed the user to create is invisible in both the Scripts tree
@@ -31,7 +39,7 @@ import * as vscode from "vscode";
  * one level beyond this (depth + 1) is still listed (§5.4 — all directories
  * render) but is never descended into.
  */
-export const SCRIPT_SCAN_MAX_DEPTH = 10;
+export const SCRIPT_SCAN_MAX_DEPTH = MAX_FOLDER_DEPTH;
 
 /**
  * Entries examined counts EVERY directory and EVERY file, `.js` scripts
@@ -62,6 +70,30 @@ function isSkippedDirName(name: string): boolean {
   if (name.startsWith(".")) return true;
   if (name.toLowerCase() === "node_modules") return true;
   return false;
+}
+
+/**
+ * The first path segment this scanner would skip, or `undefined` if every
+ * segment survives — i.e. "would a folder at this path ever appear in the
+ * Scripts view?".
+ *
+ * It lives here, next to the skip rules themselves, because the New Folder /
+ * New Script validators are the other half of the same contract: without it
+ * they happily accepted `.archive`, `node_modules`, and a root-level `types`,
+ * created the real directory on disk, and then never rendered it — after which
+ * retrying reported "already exists" about a folder the user cannot see. A
+ * second, hand-maintained copy of the rules in `scriptCommands.ts` would have
+ * reproduced exactly that the next time either list changed.
+ */
+export function findHiddenScriptFolderSegment(folderPath: string): string | undefined {
+  const segments = folderPath.split("/");
+  for (let i = 0; i < segments.length; i++) {
+    const name = segments[i];
+    if (isSkippedDirName(name)) return name;
+    // Root-only, matching the walk: a user's own `cisco/types/` is fine.
+    if (i === 0 && name.toLowerCase() === ROOT_GENERATED_TYPES_DIR) return name;
+  }
+  return undefined;
 }
 
 function isJsFile(name: string): boolean {
