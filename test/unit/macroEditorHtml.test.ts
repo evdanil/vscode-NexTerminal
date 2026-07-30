@@ -228,7 +228,10 @@ describe("renderMacroEditorHtml", () => {
   describe("the newline the HTML parser eats after <textarea>", () => {
     /** The raw child text of `#macro-text`, before any parsing. */
     function textareaSource(html: string): string {
-      const match = html.match(/<textarea id="macro-text"[^>]*>([\s\S]*?)<\/textarea\s*>/i);
+      // End tag as `[^>]*` rather than `\s*`: an HTML end tag may carry
+      // (ignored) attributes, so `</textarea foo>` closes the element. See the
+      // note on the script-extraction regex below.
+      const match = html.match(/<textarea id="macro-text"[^>]*>([\s\S]*?)<\/textarea[^>]*>/i);
       expect(match).not.toBeNull();
       return match![1];
     }
@@ -287,12 +290,15 @@ describe("renderMacroEditorHtml", () => {
       { name: "IPMI", text: "ipmitool -H $host", variables: [{ name: "host", label: "Host" }] }
     ];
     const html = render(macros, 0);
-    // Case-insensitive, and the tag name is followed by a space-or-`>` rather
-    // than by `[^>]*` alone: `<script` is emitted with an optional nonce
-    // attribute (`formHtml.ts`), so the boundary has to be explicit or the
-    // pattern would also claim a hypothetical `<scriptish>`. CodeQL's
-    // `js/bad-tag-filter` flags the loose form.
-    const scriptMatch = html.match(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script\s*>/i);
+    // Three things this has to get right, each one a `js/bad-tag-filter` alert:
+    // tag names are case-insensitive (`<SCRIPT>` closes nothing here, but the
+    // pattern must not claim otherwise); the start tag's name needs an explicit
+    // `\s`-or-`>` boundary, since `<script` is emitted with an optional nonce
+    // attribute (`formHtml.ts`) and a bare `[^>]*` would also claim a
+    // hypothetical `<scriptish>`; and an END tag may carry attributes that the
+    // parser ignores, so `</script\t\n bar>` closes the element just as
+    // `</script>` does and `\s*` is too narrow.
+    const scriptMatch = html.match(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script[^>]*>/i);
     expect(scriptMatch).not.toBeNull();
     const scriptBody = scriptMatch![1];
     expect(() => new Function(scriptBody)).not.toThrow();
