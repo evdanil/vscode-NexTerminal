@@ -32,9 +32,6 @@ const VALID_TRIGGER_SCOPES = new Set<MacroTriggerScope>(["all-terminals", "activ
  * sequence (four hex digits after `u`), never an actual NUL byte typed into
  * this source file, or the file becomes binary to git.
  *
- * Two id-less macros with identical name AND text collide on this key by
- * design — see the "collide by design" test in macroAutoTrigger.test.ts.
- *
  * Guards with `typeof macro.id === "string" && macro.id.length > 0` rather than a
  * bare truthy/`.length` check on `macro.id`: a corrupt import can hand this a
  * non-string `id` (e.g. `{length: 1}`), which is truthy and has a positive
@@ -42,9 +39,54 @@ const VALID_TRIGGER_SCOPES = new Set<MacroTriggerScope>(["all-terminals", "activ
  * guarantees. Two such distinct objects would both stringify to the same
  * `id:[object Object]` key here despite never having been deduped as equal
  * anywhere upstream — exactly the collision this key exists to prevent.
+ *
+ * This key is NOT guaranteed unique across an arbitrary macro set. `MacroStore.save()`
+ * enforces uniqueness on the way in, but a set already sitting in globalState from
+ * before that invariant existed (or one that never went through a store at all) can
+ * hold two macros that resolve to the same key: a shared `id`, or — via the fallback
+ * below — two id-less macros with identical name AND text. When that happens the key
+ * is ambiguous and no per-macro state may be recorded or acted upon under it. See
+ * `findAmbiguousMacroStateKeys()`.
  */
 export function macroStateKey(macro: TerminalMacro): string {
   return typeof macro.id === "string" && macro.id.length > 0 ? `id:${macro.id}` : `anon:${macro.name}\u0000${macro.text}`;
+}
+
+/**
+ * Returns every `macroStateKey()` that MORE THAN ONE macro in `macros` resolves to.
+ *
+ * Why ambiguity is resolved here rather than repaired at the storage layer: once two
+ * macros share an `id`, "which of them owns the single vault entry at
+ * `macroSecretKey(id)`" is genuinely unanswerable — pre-invariant duplicate secret
+ * saves were last-write-wins, so the stored value may belong to either. Every award
+ * heuristic tried in review either handed one macro another macro's password, deleted
+ * the only copy of a legitimate secret, or re-derived ownership from array position —
+ * which is exactly the positional keying `macroStateKey()` exists to eliminate. So the
+ * store no longer guesses: `VscodeMacroStore.reloadFromState()` preserves what is on
+ * disk verbatim, and ambiguity is handled HERE, in the only fail-safe direction
+ * available. An ambiguous macro compiles no rule, owns no interval and records no
+ * pause state — it cannot fire at all, rather than possibly firing the wrong thing.
+ *
+ * Measured across the WHOLE macro set, not just the trigger-capable subset: every
+ * macro claims its key regardless of whether it compiles a rule (`setDisabled()` /
+ * `isDisabled()` accept any macro, and `pruneState()` derives key liveness from all of
+ * them), so a non-trigger macro sharing a trigger macro's id makes that key just as
+ * ambiguous as two trigger macros would.
+ *
+ * The remedy is a WRITE, never a load-time rewrite: `MacroStore.save()` re-keys
+ * duplicates, so opening and saving either colliding macro clears the conflict
+ * permanently. `MacroTreeProvider` renders the suppressed state so the macro is never
+ * silently broken.
+ */
+export function findAmbiguousMacroStateKeys(macros: readonly TerminalMacro[]): Set<string> {
+  const seen = new Set<string>();
+  const ambiguous = new Set<string>();
+  for (const macro of macros) {
+    const key = macroStateKey(macro);
+    if (seen.has(key)) ambiguous.add(key);
+    else seen.add(key);
+  }
+  return ambiguous;
 }
 
 export interface PtyOutputObserver {
@@ -86,6 +128,7 @@ export class MacroAutoTrigger implements vscode.Disposable {
   private defaultCooldownMs = DEFAULT_TRIGGER_COOLDOWN * 1000;
   private maxBufferLength = MAX_BUFFER_LENGTH;
   private readonly defaultDisabledKeys = new Set<string>();
+  private ambiguousKeys = new Set<string>();
   private readonly disabledKeys = new Set<string>();
   private readonly enabledKeys = new Set<string>();
   private readonly observers = new Set<ObserverState>();
@@ -124,6 +167,10 @@ export class MacroAutoTrigger implements vscode.Disposable {
     this.rules = [];
     this.rulesByKey = new Map();
     this.defaultDisabledKeys.clear();
+    // Computed over the FULL macro set before anything is compiled — see
+    // `findAmbiguousMacroStateKeys()`. Recomputed on every reload rather than cached
+    // incrementally: `macros` is the only source of truth for who claims which key.
+    this.ambiguousKeys = findAmbiguousMacroStateKeys(macros);
     const activeRules = new Map<string, CompiledTriggerRule>();
     for (const macro of macros) {
       if (!macro.triggerPattern) continue;
@@ -141,6 +188,20 @@ export class MacroAutoTrigger implements vscode.Disposable {
       if (Array.isArray(macro.variables) && macro.variables.length > 0) continue;
       if (macro.triggerScope !== undefined && !VALID_TRIGGER_SCOPES.has(macro.triggerScope)) continue;
       const stateKey = macroStateKey(macro);
+      // Ambiguous identity — two or more macros in this set resolve to `stateKey`, so
+      // every per-macro map in this file (pause/resume, interval ownership, cooldown,
+      // and the `rulesByKey` lookup that gates script macro filters by NAME) would
+      // silently conflate them. Compile nothing: an ambiguous macro must be unable to
+      // fire rather than able to fire as, or instead of, its twin.
+      //
+      // Position matters, exactly as for the §6.1 skip above it: this `continue` must
+      // run BEFORE `defaultDisabledKeys` is populated, so a macro that is both
+      // ambiguous and `triggerInitiallyDisabled` never records a default-disabled entry
+      // for a rule that will never compile. Nothing may be written under an ambiguous
+      // key — `setDisabled()` refuses it and `pruneState()` evicts it — because
+      // whichever macro keeps the key when the collision is later resolved by a save
+      // would otherwise inherit a toggle it never earned.
+      if (this.ambiguousKeys.has(stateKey)) continue;
       if (macro.triggerInitiallyDisabled) {
         this.defaultDisabledKeys.add(stateKey);
       }
@@ -190,6 +251,16 @@ export class MacroAutoTrigger implements vscode.Disposable {
 
   public setDisabled(macro: TerminalMacro, disabled: boolean): void {
     const stateKey = macroStateKey(macro);
+    // Refuse to record anything under an ambiguous key. The macro compiles no rule and
+    // cannot fire either way, so nothing is lost — but a toggle stored here would be
+    // silently inherited by whichever claimant keeps the key once a later `save()`
+    // re-keys the duplicates, handing one macro a pause/resume decision the user made
+    // while looking at another. `pruneState()` evicts keys that BECOME ambiguous after
+    // being written; this closes the other direction. Unreachable from the UI (the tree
+    // renders an ambiguous macro with a plain contextValue, so the Pause/Resume items
+    // never appear, and both commands are hidden from the palette) — this is the guard
+    // for every other caller.
+    if (this.ambiguousKeys.has(stateKey)) return;
     const disabledChanged = this.updateDisabledState(stateKey, disabled);
     const intervalRule = this.rulesByKey.get(stateKey);
     const intervalChanged =
@@ -497,16 +568,23 @@ export class MacroAutoTrigger implements vscode.Disposable {
 
   /**
    * Prunes pause/resume state keyed to macros that no longer exist in the
-   * current macro set. Contract: a key survives only if some macro currently
-   * in `macros` still resolves to it via `macroStateKey()` — position is
-   * irrelevant. `disabledKeys` additionally drops any key that has become
+   * current macro set. Contract: a key survives only if EXACTLY ONE macro
+   * currently in `macros` resolves to it via `macroStateKey()` — position is
+   * irrelevant. A key claimed by two or more macros is evicted as aggressively
+   * as one claimed by none: it compiled no rule (see `reload()`), and leaving a
+   * pause/resume decision parked under it would hand that decision to whichever
+   * claimant keeps the key when a later `save()` re-keys the duplicates — the
+   * macro the user was NOT looking at when they set it. `disabledKeys`
+   * additionally drops any key that has become
    * default-disabled (it is now tracked via `enabledKeys` instead), and
    * `enabledKeys` drops any key that is no longer default-disabled (now
    * tracked via `disabledKeys` instead) — mirroring the mutual exclusivity
    * `updateDisabledState()`/`isDisabledByKey()` rely on.
    */
   private pruneState(macros: readonly TerminalMacro[]): void {
-    const currentKeys = new Set(macros.map((macro) => macroStateKey(macro)));
+    const currentKeys = new Set(
+      macros.map((macro) => macroStateKey(macro)).filter((key) => !this.ambiguousKeys.has(key))
+    );
     for (const key of [...this.disabledKeys]) {
       if (!currentKeys.has(key) || this.defaultDisabledKeys.has(key)) {
         this.disabledKeys.delete(key);

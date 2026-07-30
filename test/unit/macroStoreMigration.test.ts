@@ -186,9 +186,101 @@ describe("MacroStore legacy migration", () => {
     expect(secrets.get(macroSecretKey(first.id!))).toBe("first-secret");
     expect(secrets.get(macroSecretKey(second.id!))).toBe("second-secret");
 
-    // The secret-id index must not carry the duplicate literal id twice either.
+    // NOTE: an earlier version of this test claimed to check the secret-id index but
+    // asserted on `nexus.macros`. Asserting the index here instead does not fix that,
+    // it just makes the assertion decorative in a new way: `initialize()` always runs
+    // `reloadFromState()` after the absorb, and that unions the on-disk secret ids back
+    // into the ledger, so ANY single-point failure of index maintenance on the absorb
+    // path is healed before this test can observe it. The ledger is asserted where it
+    // can actually fail — see "secret-id ledger" in macroStore.test.ts.
     const persisted = state.get("nexus.macros") as TerminalMacro[];
     expect(persisted.map((m) => m.id).sort()).toEqual([first.id, second.id].sort());
+  });
+
+  it("an already-persisted macro's id is IMMUTABLE across an absorb — re-keying one at startup orphans its vault entry", async () => {
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    const { ctx, state, secrets } = makeCtx();
+
+    // Two secret macros already in globalState sharing an id from before the
+    // uniqueness invariant existed. Their real text lives in the vault; the on-disk
+    // records carry `text: ""`. Absorption runs on EVERY activation, so if it re-keyed
+    // one of them the vault-store branch would be skipped (empty text) and the value
+    // would be stranded under the old id with nothing left pointing at it.
+    state.set("nexus.macros", [
+      { id: "dup", name: "Password A", text: "", secret: true },
+      { id: "dup", name: "Password B", text: "", secret: true }
+    ] as TerminalMacro[]);
+    secrets.set(macroSecretKey("dup"), "shared-secret");
+
+    // Something to absorb, so persistLegacyMigration actually runs.
+    vscode.__setConfig("nexus.terminal", { global: [{ name: "new", text: "echo new" }] as TerminalMacro[] });
+
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    const persisted = state.get("nexus.macros") as TerminalMacro[];
+    expect(persisted.filter((m) => m.id === "dup")).toHaveLength(2);
+    expect(secrets.get(macroSecretKey("dup"))).toBe("shared-secret");
+    // Duplicates on disk are left for MacroAutoTrigger to suppress, not repaired here.
+    expect(store.getAll().filter((m) => m.id === "dup")).toHaveLength(2);
+  });
+
+  it("an absorbed macro whose hand-written id collides with an existing one is re-keyed — it must not overwrite that macro's vault entry", async () => {
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    const { ctx, state, secrets } = makeCtx();
+
+    // Provenance, not position: the absorbed record's secret is the cleartext in
+    // settings.json and it has never had a vault entry, so it is provably not the
+    // owner of `macro-secret-text-shared`. Keeping its id would make
+    // persistLegacyMigration's `secrets.store()` clobber the existing macro's password.
+    state.set("nexus.macros", [
+      { id: "shared", name: "Existing", text: "", secret: true }
+    ] as TerminalMacro[]);
+    secrets.set(macroSecretKey("shared"), "existing-secret");
+
+    vscode.__setConfig("nexus.terminal", {
+      global: [{ id: "shared", name: "Absorbed", text: "absorbed-secret", secret: true }] as TerminalMacro[]
+    });
+
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    const all = store.getAll();
+    const existing = all.find((m) => m.name === "Existing")!;
+    const absorbed = all.find((m) => m.name === "Absorbed")!;
+    expect(existing.id).toBe("shared");
+    expect(absorbed.id).not.toBe("shared");
+    expect(secrets.get(macroSecretKey("shared"))).toBe("existing-secret");
+    expect(secrets.get(macroSecretKey(absorbed.id!))).toBe("absorbed-secret");
+    expect(existing.text).toBe("existing-secret");
+    expect(absorbed.text).toBe("absorbed-secret");
+  });
+
+  it("a non-object entry in the legacy setting is dropped, not absorbed, and does not fail activation", async () => {
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    const { ctx } = makeCtx();
+    // Only the ARRAY shape is validated before this point, so a hand-edited
+    // settings.json can put anything inside it. `keyOfLegacy()` dereferences `.secret`
+    // — an unguarded entry here rejects initialize(), which rejects activate().
+    vscode.__setConfig("nexus.terminal", { global: [null, { name: "real", text: "echo real" }] });
+
+    const store = new VscodeMacroStore(ctx);
+    await expect(store.initialize()).resolves.toBeUndefined();
+    expect(store.getAll().map((m) => m.name)).toEqual(["real"]);
+  });
+
+  it("a non-object record already in globalState survives the absorb rewrite as-is, not as a phantom {id} macro", async () => {
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    const { ctx, state } = makeCtx();
+    state.set("nexus.macros", [null, { id: "a", name: "Real", text: "x" }]);
+    vscode.__setConfig("nexus.terminal", { global: [{ name: "new", text: "echo new" }] as TerminalMacro[] });
+
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    const persisted = state.get("nexus.macros") as unknown[];
+    expect(persisted[0]).toBeNull();
+    expect(store.getAll().map((m) => m.name)).toEqual(["Real", "new"]);
   });
 
   it("does not duplicate secret macros when Settings Sync replays cleartext", async () => {

@@ -3,6 +3,7 @@ import { bindingToDisplayLabel } from "../macroBindings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { TerminalMacro } from "../models/terminalMacro";
 import { getMacros } from "../macroSettings";
+import { findAmbiguousMacroStateKeys, macroStateKey } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders } from "../services/macroVariables";
 import { VARIABLE_MARKER } from "./macroVariableMarker";
 
@@ -13,7 +14,8 @@ export class MacroTreeItem extends vscode.TreeItem {
     public readonly macro: TerminalMacro,
     public readonly index: number,
     public readonly displayBinding?: string,
-    triggerDisabled?: boolean
+    triggerDisabled?: boolean,
+    identityConflict?: boolean
   ) {
     const prefix = displayBinding ? `[${bindingToDisplayLabel(displayBinding)}] ` : "";
     super(`${prefix}${macro.name}`, vscode.TreeItemCollapsibleState.None);
@@ -65,7 +67,14 @@ export class MacroTreeItem extends vscode.TreeItem {
     // `continue` means such a rule never compiles, so the zap icon,
     // enable/disable toggle, and "active"/"paused" tooltip would all be dead
     // controls for a rule that can never fire.
-    const isTriggerMacro = !!macro.triggerPattern && !hasVariables;
+    //
+    // `identityConflict` is the same situation for the same reason: another macro in
+    // this set resolves to the same `macroStateKey()`, so reload()'s ambiguity
+    // `continue` compiles no rule for it either. Keeping the plain contextValue is
+    // what removes the Pause/Resume items (their `when` clauses match only the
+    // `.triggered` context values), which in turn keeps `setDisabled()`'s refusal to
+    // write under an ambiguous key from ever reading as a dead button.
+    const isTriggerMacro = !!macro.triggerPattern && !hasVariables && !identityConflict;
 
     if (isTriggerMacro) {
       const state = triggerDisabled ? "paused" : "active";
@@ -75,14 +84,28 @@ export class MacroTreeItem extends vscode.TreeItem {
       this.contextValue = macro.secret ? base.replace("nexus.macro.", "nexus.macro.secret.") : base;
       this.iconPath = new vscode.ThemeIcon(triggerDisabled ? "circle-slash" : "zap");
     } else {
-      if (hasVariables && macro.triggerPattern) {
+      // A suppressed auto-trigger must say so, or the macro is just silently broken.
+      // The identity conflict is reported ahead of the variables note when both apply:
+      // variables-vs-trigger is a documented design rule, an identity conflict is
+      // corrupt data the user has to act on \u2014 and the action is stated, because it is
+      // not guessable. Reorder rather than "edit this macro": any write re-keys
+      // duplicates (MacroStore.save()), but Move Up/Move Down resolve their target by
+      // tree index, whereas the macro editor resolves by id and therefore refuses to
+      // act on a macro whose id is shared (macroEditorPanel.ts).
+      const conflictSuppressed = !!identityConflict && !!macro.triggerPattern;
+      if (conflictSuppressed) {
+        this.tooltip +=
+          "\nAuto-trigger suppressed: another macro has the same internal id. Reorder any macro with Move Up / Move Down to assign fresh ids.";
+      } else if (hasVariables && macro.triggerPattern) {
         this.tooltip += "\nAuto-trigger suppressed: macro has variables";
       }
       // contextValue is intentionally UNCHANGED for variable macros (\u00a79.6) \u2014
       // only the icon and tooltip differ; the context menu stays the one for
-      // a plain (or secret) macro.
+      // a plain (or secret) macro. Same for an identity conflict.
       this.contextValue = macro.secret ? "nexus.macro.secret" : "nexus.macro";
-      this.iconPath = new vscode.ThemeIcon(willPrompt ? "symbol-parameter" : (macro.secret ? "lock" : "terminal"));
+      this.iconPath = new vscode.ThemeIcon(
+        conflictSuppressed ? "warning" : (willPrompt ? "symbol-parameter" : (macro.secret ? "lock" : "terminal"))
+      );
     }
   }
 }
@@ -105,11 +128,16 @@ export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem>
 
   public getChildren(): MacroTreeItem[] {
     const macros = getMacros();
+    // Derived from THIS render's macro list via the same helper `MacroAutoTrigger.reload()`
+    // uses, rather than queried off the trigger instance: identical input, identical
+    // rule, no way for the tree to disagree with what actually compiled.
+    const ambiguousKeys = findAmbiguousMacroStateKeys(macros);
 
     return macros.map((macro, index) => {
       const displayBinding = getAssignedBinding(macro);
       const triggerDisabled = macro.triggerPattern ? this.isTriggerDisabled(macro) : undefined;
-      return new MacroTreeItem(macro, index, displayBinding, triggerDisabled);
+      const identityConflict = ambiguousKeys.has(macroStateKey(macro));
+      return new MacroTreeItem(macro, index, displayBinding, triggerDisabled, identityConflict);
     });
   }
 }

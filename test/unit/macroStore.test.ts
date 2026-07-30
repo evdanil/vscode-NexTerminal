@@ -237,7 +237,7 @@ describe("VscodeMacroStore", () => {
     expect(ops[ops.length - 1]).toBe("secretIds");
   });
 
-  it("clearAll sweeps orphan secret ids tracked in the index", async () => {
+  it("clearAll sweeps an orphan vault entry the index knows about but `resolved` does not", async () => {
     const { context, secretBag } = makeFakeContext();
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });
     await store.initialize();
@@ -254,7 +254,69 @@ describe("VscodeMacroStore", () => {
     expect(secretBag.has("macro-secret-text-orphan")).toBe(false);
   });
 
-  describe("unique-id invariant (Fix 1) — save() rejects duplicate ids", () => {
+  describe("secret-id ledger — the orphan list clearAll depends on", () => {
+    // The test above seeds the index by hand, so it only proves clearAll READS the
+    // index; it says nothing about whether the index still holds anything by the time
+    // clearAll runs. Every real clearAll is preceded by an initialize(), so these
+    // exercise the maintenance path instead.
+
+    it("survives a reload that no longer sees the macro — this is what makes clearAll's vault-first/index-last order mean anything", async () => {
+      const { context, stateBag, secretBag } = makeFakeContext();
+      const store1 = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store1.initialize();
+      await store1.save([{ id: "s", name: "Password", text: "hunter2", secret: true }]);
+      expect(secretBag.get("macro-secret-text-s")).toBe("hunter2");
+
+      // MACROS_KEY is lost — a partial write, a corrupt value degraded to [], or
+      // another window's Complete Reset landing between the vault write and the state
+      // write. The vault entry is still there and only the ledger can still name it.
+      stateBag.delete("nexus.macros");
+
+      const store2 = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store2.initialize();
+      expect(store2.getAll()).toEqual([]);
+
+      // A reload that REBUILT the index from what it just read would have wiped the
+      // only remaining reference to this vault entry, stranding the secret forever.
+      await store2.clearAll();
+      expect(secretBag.has("macro-secret-text-s")).toBe(false);
+    });
+
+    it("drops an id whose vault entry save() just deleted, so the ledger cannot grow without bound", async () => {
+      const { context, secretBag } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+      await store.save([{ id: "s", name: "m", text: "classified", secret: true }]);
+      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual(["s"]);
+
+      // Flip to non-secret: save() deletes the vault entry, so the ledger must forget it.
+      await store.save([{ id: "s", name: "m", text: "now-public", secret: false }]);
+      expect(secretBag.has("macro-secret-text-s")).toBe(false);
+      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual([]);
+
+      // And likewise when the macro is removed outright.
+      await store.save([{ id: "t", name: "n", text: "classified", secret: true }]);
+      await store.save([]);
+      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual([]);
+    });
+
+    it("never lists an id that exists only in memory — a runtime-only UUID has no vault entry to sweep", async () => {
+      const { context, stateBag } = makeFakeContext();
+      // A secret record with no id at all: reloadFromState() mints a runtime UUID for
+      // it so the rest of the app can key off `macro.id`, but that UUID was never a
+      // vault key, so indexing it would describe an entry that cannot exist.
+      stateBag.set("nexus.macros", [{ name: "Password", text: "", secret: true }]);
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      const runtimeId = store.getAll()[0].id!;
+      expect(runtimeId).toBeTruthy();
+      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).not.toContain(runtimeId);
+    });
+  });
+
+  describe("unique-id invariant — enforced on save(), never on load", () => {
     it("reassigns a fresh id to a later duplicate, and each secret macro keeps its own vault entry", async () => {
       const { context, secretBag } = makeFakeContext();
       const store = new VscodeMacroStore(context, { runLegacyMigration: false });
@@ -321,84 +383,101 @@ describe("VscodeMacroStore", () => {
       expect(m.id).not.toBe("");
     });
 
-    it("reloadFromState() dedupes a duplicate id already sitting in globalState from before this invariant existed — mixed order, secret macro NOT first (Fix 1 regression)", async () => {
-      const { context, stateBag, secretBag } = makeFakeContext();
-      // The non-secret macro sorts FIRST this time (the old "first occurrence
-      // wins" repair would hand it the shared id and strand the secret macro
-      // behind a brand-new id that has no vault entry, losing the real secret
-      // even though there is no ambiguity — only one macro here is secret).
-      stateBag.set("nexus.macros", [
-        { id: "dup", name: "Poll", text: "show status\n" },
-        { id: "dup", name: "Password", text: "", secret: true }
-      ]);
-      secretBag.set("macro-secret-text-dup", "hunter2\n");
-
+    it("save() dedup is loss-free with the secret SECOND: the value moves to the fresh key and the shared key is not left holding it", async () => {
+      const { context, secretBag } = makeFakeContext();
       const store = new VscodeMacroStore(context, { runLegacyMigration: false });
       await store.initialize();
+
+      // Mirror of the test above with the ordering reversed, so neither test can be
+      // satisfied by a rule that happens to favour whichever claimant sorts first.
+      await store.save([
+        { id: "dup", name: "Poll", text: "show status\n" },
+        { id: "dup", name: "Password", text: "hunter2\n", secret: true }
+      ]);
 
       const [poll, password] = store.getAll();
-      // The SECRET macro keeps the original id — it is the only member that will
-      // ever read macroSecretKey("dup"), regardless of array position.
-      expect(password.id).toBe("dup");
+      expect(poll.id).toBe("dup");
+      expect(password.id).not.toBe("dup");
       expect(password.text).toBe("hunter2\n");
-      expect(poll.id).not.toBe("dup");
-      expect(poll.text).toBe("show status\n");
-    });
-
-    it("reloadFromState() fails closed on an ambiguous secret vault entry: two SECRET macros sharing an id, vault content belonging to the SECOND (Fix 1 — hostile ordering)", async () => {
-      const { context, stateBag, secretBag } = makeFakeContext();
-      // Hostile ordering, per code review: both duplicate-id claimants are
-      // secret, and the single vault entry under the shared id was last written
-      // by the SECOND one (pre-invariant duplicate secret saves were
-      // last-write-wins). A naive "first occurrence keeps the id" repair would
-      // hand macro A the secret that actually belongs to macro B.
-      stateBag.set("nexus.macros", [
-        { id: "dup", name: "Password A", text: "", secret: true },
-        { id: "dup", name: "Password B", text: "", secret: true }
-      ]);
-      secretBag.set("macro-secret-text-dup", "password-b-secret\n");
-
-      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
-      await store.initialize();
-
-      const [first, second] = store.getAll();
-      // Neither may keep the ambiguous id...
-      expect(first.id).not.toBe("dup");
-      expect(second.id).not.toBe("dup");
-      expect(first.id).not.toBe(second.id);
-      // ...and neither may be handed the vault's secret on a guess — fail closed.
-      expect(first.text).toBe("");
-      expect(second.text).toBe("");
-
-      // The now-permanently-unclaimed vault entry is swept, so a later import
-      // reusing the literal id "dup" can never inherit an ambiguous secret it
-      // never wrote.
+      // The non-secret claimant kept "dup", and save() clears the vault entry for a
+      // non-secret macro — so the secret must have landed under its own fresh key.
+      expect(secretBag.get(`macro-secret-text-${password.id}`)).toBe("hunter2\n");
       expect(secretBag.has("macro-secret-text-dup")).toBe(false);
     });
 
-    it("the duplicate-id repair converges: it is persisted, not re-randomised on every activation (Fix 1)", async () => {
+    it("reloadFromState() leaves a duplicate id EXACTLY as found — no re-key in memory, no rewrite on disk, no vault write", async () => {
+      const { context, stateBag, secretBag } = makeFakeContext();
+      // Two secret macros sharing an id, from before the invariant existed. The single
+      // vault entry may belong to either (duplicate secret saves were last-write-wins),
+      // so there is nothing to repair here that is not a guess. Load must not guess:
+      // ambiguity is resolved fail-safe by MacroAutoTrigger, which compiles no rule for
+      // either of them (see macroAutoTrigger.test.ts).
+      const seeded = [
+        { id: "dup", name: "Password A", text: "", secret: true },
+        { id: "dup", name: "Password B", text: "", secret: true }
+      ];
+      stateBag.set("nexus.macros", seeded);
+      secretBag.set("macro-secret-text-dup", "password-b-secret\n");
+
+      const macrosKeyWrites: unknown[] = [];
+      const origUpdate = context.globalState.update.bind(context.globalState);
+      context.globalState.update = async (k: string, v: unknown) => {
+        if (k === "nexus.macros") macrosKeyWrites.push(v);
+        return origUpdate(k, v);
+      };
+      const vaultWrites: string[] = [];
+      const origStore = context.secrets.store.bind(context.secrets);
+      const origDelete = context.secrets.delete.bind(context.secrets);
+      context.secrets.store = async (k: string, v: string) => { vaultWrites.push(`store:${k}`); return origStore(k, v); };
+      context.secrets.delete = async (k: string) => { vaultWrites.push(`delete:${k}`); return origDelete(k); };
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      // In memory: both keep the id they were stored with.
+      const [a, b] = store.getAll();
+      expect(a.id).toBe("dup");
+      expect(b.id).toBe("dup");
+
+      // On disk: byte-identical, and MACROS_KEY was never written at all.
+      expect(macrosKeyWrites).toHaveLength(0);
+      expect(stateBag.get("nexus.macros")).toBe(seeded);
+
+      // The vault is read-only on this path. Deleting the ambiguous entry would destroy
+      // the only copy of whichever macro's secret it really is.
+      expect(vaultWrites).toEqual([]);
+      expect(secretBag.get("macro-secret-text-dup")).toBe("password-b-secret\n");
+    });
+
+    it("the remedy for a pre-existing duplicate is a save(): it re-keys and keeps the resolved secret under the new key", async () => {
       const { context, stateBag, secretBag } = makeFakeContext();
       stateBag.set("nexus.macros", [
         { id: "dup", name: "Password A", text: "", secret: true },
         { id: "dup", name: "Password B", text: "", secret: true }
       ]);
-      secretBag.set("macro-secret-text-dup", "password-b-secret\n");
+      secretBag.set("macro-secret-text-dup", "shared-secret\n");
 
-      const store1 = new VscodeMacroStore(context, { runLegacyMigration: false });
-      await store1.initialize();
-      const idsAfterFirstLoad = store1.getAll().map((m) => m.id).sort();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
 
-      // A second, independent store instance reloading the SAME persisted state
-      // (as happens on the next activation) must see the already-corrected,
-      // unique ids rather than re-randomising fresh ones.
+      // The user opens either macro and saves — exactly what macroCommands.ts /
+      // macroEditorPanel.ts do with the full list.
+      await store.save(store.getAll());
+
+      const [a, b] = store.getAll();
+      expect(a.id).not.toBe(b.id);
+      // The vault value both of them resolved to at load is preserved under BOTH ids —
+      // nothing is destroyed by the repair, which is why load can safely defer to it.
+      expect(secretBag.get(`macro-secret-text-${a.id}`)).toBe("shared-secret\n");
+      expect(secretBag.get(`macro-secret-text-${b.id}`)).toBe("shared-secret\n");
+      expect(a.text).toBe("shared-secret\n");
+      expect(b.text).toBe("shared-secret\n");
+
+      // And it converges: a fresh store instance reading the repaired state sees the
+      // same unique ids rather than re-deriving anything.
       const store2 = new VscodeMacroStore(context, { runLegacyMigration: false });
       await store2.initialize();
-      const idsAfterSecondLoad = store2.getAll().map((m) => m.id).sort();
-
-      expect(idsAfterSecondLoad).toEqual(idsAfterFirstLoad);
-      // The corrected ids must actually be what's on disk, not just in-memory.
-      const persisted = stateBag.get("nexus.macros") as TerminalMacro[];
-      expect(persisted.map((m) => m.id).sort()).toEqual(idsAfterFirstLoad);
+      expect(store2.getAll().map((m) => m.id)).toEqual([a.id, b.id]);
     });
   });
 

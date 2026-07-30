@@ -1154,31 +1154,28 @@ describe("MacroAutoTrigger", () => {
       obs.dispose();
     });
 
-    // NOTE: unlike the test above, this one does NOT pin the exact position of the
-    // §6.1 `continue` relative to the `triggerInitiallyDisabled` bookkeeping — no
-    // identity here changes position or value, so moving that `continue` below the
-    // bookkeeping would still pass this test unchanged. Rewritten from a "positional
-    // coherence" test (see git history / PR review) that asserted INDEX semantics: it
-    // proved that disabling the macro at raw array index 2 kept working even though
-    // the macro at index 1 (declaring `variables`) compiles no rule and could have
-    // shifted indices via pre-filtering. Now that state is keyed by macro identity
-    // (`macroStateKey()`), not array position, that specific hazard no longer
-    // exists — indices are never used as keys anywhere in MacroAutoTrigger. This
-    // test is rewritten to assert the equivalent IDENTITY guarantee instead: a
-    // sibling macro that compiles no rule (variables) must not disturb the
-    // disable-state or interval-ownership keying of the macros around it. General
-    // per-macro-identity lifecycle coverage across reload — not a skip-position guard.
-    it("identity coherence: disabling the password macro survives reload even though a sibling macro declares variables and compiles no rule", () => {
+    // NOTE: this one does NOT pin the position of the §6.1 `continue` relative to the
+    // `triggerInitiallyDisabled` bookkeeping — the test above does that. What it pins
+    // is that a compile-skipped sibling does not disturb the identity keying of the
+    // macros around it ACROSS AN ARRAY MUTATION. The mutation is the point: an earlier
+    // version of this test never moved, renamed, removed or re-id'd anything, so
+    // reverting every state map in MacroAutoTrigger to array indices left it green.
+    // It now reorders the list between the disable and the assertions, which is the
+    // operation (`nexus.macro.moveUp`/`moveDown`) that index keying gets wrong.
+    it("identity coherence: a paused password macro stays paused across a REORDER even though a sibling macro declares variables and compiles no rule", () => {
       setConfig([
         { name: "interval", text: "show status\n", triggerPattern: "router#", triggerInterval: 10 },
         { name: "hasVars", text: "show ip route $host\n", triggerPattern: "router#", variables: [{ name: "host" }] },
-        { name: "pw", text: "secret123\n", triggerPattern: "[Pp]assword:\\s*$" }
+        { name: "pw", text: "secret123\n", triggerPattern: "[Pp]assword:\\s*$" },
+        { name: "banner", text: "banner\n", triggerPattern: "MOTD" }
       ]);
       const trigger = new MacroAutoTrigger();
       const sent: string[] = [];
       const obs = trigger.createObserver((text) => sent.push(text));
       const intervalMacro = macroAt(0);
+      const varsMacro = macroAt(1);
       const pwMacro = macroAt(2);
+      const bannerMacro = macroAt(3);
 
       // Arm the interval macro so intervalOwners keys it by identity.
       obs.onOutput("router#");
@@ -1190,32 +1187,39 @@ describe("MacroAutoTrigger", () => {
       trigger.setDisabled(pwMacro, true);
       expect(trigger.isDisabled(pwMacro)).toBe(true);
 
-      // Reload (e.g. triggered by an unrelated settings change). The
-      // variables-declaring sibling must not corrupt either the password
-      // macro's disabled state or the interval macro's ownership keying.
+      // Reorder, as `nexus.macro.moveUp`/`moveDown` do — the password macro leaves
+      // slot 2 and the banner macro takes it. Under index keying the pause would
+      // transfer to whoever now occupies the old slot: `banner` would go silent and
+      // `pw` would go live, which is the whole hazard this PR exists to close.
+      void activeStore.save([intervalMacro, varsMacro, bannerMacro, pwMacro]);
       trigger.reload();
 
       expect(trigger.isDisabled(pwMacro)).toBe(true);
+      expect(trigger.isDisabled(bannerMacro)).toBe(false);
       expect(trigger.isDisabled(intervalMacro)).toBe(false);
 
-      // The password macro (still disabled) must not fire.
+      // The password macro (still disabled) must not fire...
       obs.onOutput("Password: ");
       flush();
       expect(sent).toEqual(["show status\n"]);
+      // ...and the macro that inherited its old slot must NOT have inherited its pause.
+      obs.onOutput("MOTD");
+      flush();
+      expect(sent).toEqual(["show status\n", "banner\n"]);
 
-      // The interval macro's ownership survived reload — re-arm and confirm it
+      // The interval macro's ownership survived the reorder — re-arm and confirm it
       // still fires the SAME interval macro after the interval elapses.
       obs.onOutput("Codes: C connected\r\nrouter#");
       vi.advanceTimersByTime(10_000);
       flush();
-      expect(sent).toEqual(["show status\n", "show status\n"]);
+      expect(sent).toEqual(["show status\n", "banner\n", "show status\n"]);
 
       // Re-enabling the password macro by identity fires it — proving identity
       // still resolves to it, not to the (compile-skipped) variables macro.
       trigger.setDisabled(pwMacro, false);
       obs.onOutput("Password: ");
       flush();
-      expect(sent).toEqual(["show status\n", "show status\n", "secret123\n"]);
+      expect(sent).toEqual(["show status\n", "banner\n", "show status\n", "secret123\n"]);
 
       obs.dispose();
     });
@@ -1513,7 +1517,7 @@ describe("MacroAutoTrigger", () => {
       obs.dispose();
     });
 
-    it("two id-less macros with identical name AND text collide on the anon: fallback key — documented behaviour, not a bug", () => {
+    it("two id-less macros with identical name AND text collide on the anon: fallback key — and that collision is treated as ambiguous, not as shared state", () => {
       // `macroStateKey()` falls back to `anon:${name}${NUL}${text}` only when a
       // macro has no `id`. Two macros that are byte-for-byte identical in both
       // name and text produce the SAME key in that case — there is no other
@@ -1523,9 +1527,13 @@ describe("MacroAutoTrigger", () => {
       // empty string is normalized the same as a missing id, and a later
       // duplicate id is reassigned a fresh one — see macroStore.test.ts), which
       // is why this collision only matters for the rare id-less `RawMacroStore`
-      // path exercised below. This test asserts and documents that collision
-      // rather than pretending it can't happen: give macros an id, or vary
-      // their text, to avoid it.
+      // path exercised below.
+      //
+      // The fallback is sound exactly as long as it is unique. When it is not, it is
+      // no more usable than a duplicated `id` and gets the identical treatment: both
+      // macros are ambiguous, so NEITHER compiles a rule and neither can fire. Letting
+      // them share one live key instead would mean pausing one silently pauses the
+      // other — and, worse, resuming one silently resumes the other.
       const rawStore = new RawMacroStore();
       void rawStore.initialize();
       setActiveMacroStore(rawStore);
@@ -1541,10 +1549,14 @@ describe("MacroAutoTrigger", () => {
 
       expect(macroStateKey(first)).toBe(macroStateKey(second));
 
-      trigger.setDisabled(first, true);
-
-      // Disabling "first" reports "second" as disabled too — they share a key.
-      expect(trigger.isDisabled(second)).toBe(true);
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+      obs.onOutput("AAA");
+      flush();
+      obs.onOutput("BBB");
+      flush();
+      expect(sent).toEqual([]);
+      obs.dispose();
     });
 
     it("macroStateKey() does not let two macros with differently-shaped non-string ids collide on a coerced key (Fix 2)", () => {
@@ -1558,6 +1570,192 @@ describe("MacroAutoTrigger", () => {
       const macroA = { id: { length: 1 } as unknown as string, name: "A", text: "textA" } as unknown as TerminalMacro;
       const macroB = { id: { length: 1 } as unknown as string, name: "B", text: "textB" } as unknown as TerminalMacro;
       expect(macroStateKey(macroA)).not.toBe(macroStateKey(macroB));
+    });
+  });
+
+  describe("ambiguous macro identity — two macros claiming one state key fail safe", () => {
+    /**
+     * Duplicate ids reach MacroAutoTrigger because the STORE deliberately stops
+     * repairing them: at load there is no answerable question of which of two macros
+     * sharing an id owns the single vault entry behind it, and every award heuristic
+     * tried in review either handed one macro another's password, destroyed the only
+     * copy of a legitimate secret, or re-derived identity from array position.
+     * `RawMacroStore` stands in for that persisted state — it saves ids verbatim,
+     * exactly as `VscodeMacroStore.reloadFromState()` now surfaces them.
+     */
+    function seed(macros: Array<Record<string, unknown>>): RawMacroStore {
+      const rawStore = new RawMacroStore();
+      void rawStore.initialize();
+      setActiveMacroStore(rawStore);
+      mockConfig = { "nexus.terminal.macros": { autoTrigger: true } };
+      void rawStore.save(macros as TerminalMacro[]);
+      return rawStore;
+    }
+
+    it("neither of two macros sharing an id compiles a rule — an ambiguous macro cannot fire at all", () => {
+      // Restore of a backup ordered [A, P] where both carry id "dup" and P is a
+      // deliberately-paused secret password trigger. Awarding "dup" to whichever
+      // claimant sorts first makes ownership positional again and lets P go live under
+      // A's state. Nothing may fire here.
+      seed([
+        { id: "dup", name: "A", text: "harmless\n", triggerPattern: "AAA" },
+        { id: "dup", name: "P", text: "hunter2\n", secret: true, triggerPattern: "[Pp]assword:" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("AAA");
+      flush();
+      obs.onOutput("Password: ");
+      flush();
+
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    it("a macro with a UNIQUE id in the same set is unaffected — suppression is per key, not global", () => {
+      seed([
+        { id: "dup", name: "A", text: "a\n", triggerPattern: "AAA" },
+        { id: "dup", name: "B", text: "b\n", triggerPattern: "BBB" },
+        { id: "solo", name: "C", text: "c\n", triggerPattern: "CCC" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("AAA");
+      obs.onOutput("BBB");
+      flush();
+      expect(sent).toEqual([]);
+
+      obs.onOutput("CCC");
+      flush();
+      expect(sent).toEqual(["c\n"]);
+      obs.dispose();
+    });
+
+    it("ambiguity is measured across the WHOLE macro set: a macro with no trigger pattern still claims its key", () => {
+      // The colliding macro never reaches the compile loop — it has no triggerPattern,
+      // so it `continue`s out on the first guard. Counting keys only for macros that
+      // survive that far would leave "dup" looking unique and let the password trigger
+      // compile, while `isDisabled()`/`setDisabled()`/`pruneState()` still treat the two
+      // macros as one.
+      seed([
+        { id: "dup", name: "Plain", text: "not a trigger\n" },
+        { id: "dup", name: "P", text: "hunter2\n", secret: true, triggerPattern: "[Pp]assword:" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("Password: ");
+      flush();
+
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    it("skip position: an ambiguous macro records no default-disabled entry either", () => {
+      // Same shape as the §6.1 skip-position test above. The ambiguity `continue` must
+      // run BEFORE `defaultDisabledKeys.add(stateKey)`: if it ran after, the shared key
+      // would land in `defaultDisabledKeys` with nothing in `enabledKeys` to counter it
+      // and `isDisabled()` would report `true` for a rule that never compiled — state
+      // recorded under a key whose owner is unknown, which is exactly what must not
+      // happen.
+      const store = seed([
+        { id: "dup", name: "A", text: "a\n", triggerPattern: "AAA", triggerInitiallyDisabled: true },
+        { id: "dup", name: "B", text: "b\n", triggerPattern: "BBB" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const [a, b] = store.getAll();
+
+      expect(trigger.isDisabled(a)).toBe(false);
+      expect(trigger.isDisabled(b)).toBe(false);
+    });
+
+    it("setDisabled() records nothing under an ambiguous key, so the surviving claimant cannot inherit it when a save re-keys the duplicates", () => {
+      const store = seed([
+        { id: "dup", name: "A", text: "a\n", triggerPattern: "AAA" },
+        { id: "dup", name: "P", text: "hunter2\n", secret: true, triggerPattern: "[Pp]assword:" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const [a, p] = store.getAll();
+
+      // The user pauses one of them (reachable only from a caller that bypasses the
+      // tree, which hides the Pause/Resume items for a conflicted macro).
+      trigger.setDisabled(a, true);
+
+      // The conflict is then resolved the supported way — a save re-keys the
+      // duplicates — with NO intervening reload to prune anything.
+      void store.save([{ ...a, id: "dup" }, { ...p, id: "fresh" }] as TerminalMacro[]);
+      trigger.reload();
+
+      const [aFixed, pFixed] = store.getAll();
+      // Whoever kept "dup" must not inherit a pause the user set while the key meant
+      // "either of these two macros".
+      expect(trigger.isDisabled(aFixed)).toBe(false);
+      expect(trigger.isDisabled(pFixed)).toBe(false);
+
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+      obs.onOutput("AAA");
+      flush();
+      expect(sent).toEqual(["a\n"]);
+      obs.dispose();
+    });
+
+    it("pruneState() evicts a key that BECOMES ambiguous, so it is not still parked there when the conflict is resolved", () => {
+      // The other direction of the same invariant: the key was written while it
+      // unambiguously belonged to A, and only later did a second claimant appear.
+      const store = seed([
+        { id: "a", name: "A", text: "a\n", triggerPattern: "AAA" },
+        { id: "b", name: "B", text: "b\n", triggerPattern: "BBB" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const [a, b] = store.getAll();
+      trigger.setDisabled(a, true);
+      expect(trigger.isDisabled(a)).toBe(true);
+
+      // A duplicate of A's id arrives (a merge import, a hand-edited backup).
+      void store.save([a, b, { id: "a", name: "A-clone", text: "clone\n", triggerPattern: "CCC" }] as TerminalMacro[]);
+      trigger.reload();
+
+      // ...and is then resolved.
+      void store.save([a, b, { id: "c", name: "A-clone", text: "clone\n", triggerPattern: "CCC" }] as TerminalMacro[]);
+      trigger.reload();
+
+      expect(trigger.isDisabled(store.getAll()[0])).toBe(false);
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+      obs.onOutput("AAA");
+      flush();
+      expect(sent).toEqual(["a\n"]);
+      obs.dispose();
+    });
+
+    it("an armed interval macro stops when its key becomes ambiguous — ownership and timers are released, not left running", () => {
+      const store = seed([
+        { id: "poll", name: "Poll", text: "show status\n", triggerPattern: "router#", triggerInterval: 10 }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text), () => true);
+
+      obs.onOutput("router#");
+      flush();
+      expect(sent).toEqual(["show status\n"]);
+
+      // A second macro claiming "poll" arrives.
+      const [poll] = store.getAll();
+      void store.save([poll, { id: "poll", name: "Clone", text: "clone\n", triggerPattern: "ZZZ" }] as TerminalMacro[]);
+      trigger.reload();
+
+      obs.onOutput("Codes: C connected\r\nrouter#");
+      vi.advanceTimersByTime(60_000);
+      flush();
+      expect(sent).toEqual(["show status\n"]);
+      obs.dispose();
     });
   });
 });

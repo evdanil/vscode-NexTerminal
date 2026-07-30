@@ -160,6 +160,77 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     expect(mockShowWarningMessage).toHaveBeenCalled();
   });
 
+  describe("duplicate macro ids (a list that predates the unique-id invariant)", () => {
+    // The editor resolves its target by id, so two macros sharing one make "which macro
+    // did the user open" unanswerable. InMemoryMacroStore re-keys duplicates on save, so
+    // this needs a store that surfaces persisted state verbatim — which is exactly what
+    // VscodeMacroStore.reloadFromState() now does, having stopped repairing ids on load.
+    async function harnessWithDuplicateIds(): Promise<{
+      macros: TerminalMacro[];
+      sendMessage: (msg: Record<string, unknown>) => void;
+    }> {
+      vi.resetModules();
+      const macroSettings = await import("../../src/macroSettings");
+      const macros: TerminalMacro[] = [
+        { id: "dup", name: "Alpha", text: "a" },
+        { id: "dup", name: "Beta", text: "b" }
+      ];
+      macroSettings.setActiveMacroStore({
+        async initialize() { /* no-op */ },
+        getAll: () => macros.map((m) => ({ ...m })),
+        async save(next: TerminalMacro[]) {
+          macros.splice(0, macros.length, ...next.map((m) => ({ ...m })));
+        },
+        onDidChange: () => () => { /* no-op */ },
+        async clearAll() { macros.length = 0; }
+      } as unknown as Parameters<typeof macroSettings.setActiveMacroStore>[0]);
+      const { MacroEditorPanel } = await import("../../src/ui/macroEditorPanel");
+      MacroEditorPanel.open(1); // opened on Beta
+      return { macros, sendMessage: onDidReceiveMessageHandler! };
+    }
+
+    it("refuses to save rather than write the edited macro over its twin", async () => {
+      const { macros, sendMessage } = await harnessWithDuplicateIds();
+
+      await sendMessage({
+        type: "save",
+        index: 1,
+        id: "dup",
+        name: "Beta-edited",
+        text: "b2",
+        secret: false,
+        keybinding: null,
+        triggerPattern: null,
+        triggerCooldown: 3,
+        triggerInterval: null,
+        triggerInitiallyDisabled: false,
+        triggerScope: "all-terminals",
+        triggerProfileId: null
+      });
+
+      // Taking the first match would have turned Alpha into "Beta-edited", silently
+      // destroying it — and the id conflict makes that the FIRST macro, not the one the
+      // user was looking at.
+      expect(macros.map((m) => m.name)).toEqual(["Alpha", "Beta"]);
+      expect(macros.map((m) => m.text)).toEqual(["a", "b"]);
+      expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("same internal id")
+      );
+    });
+
+    it("refuses to delete rather than remove the wrong macro", async () => {
+      const { macros, sendMessage } = await harnessWithDuplicateIds();
+
+      await sendMessage({ type: "delete", index: 1, id: "dup" });
+
+      expect(macros.map((m) => m.name)).toEqual(["Alpha", "Beta"]);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("same internal id")
+      );
+    });
+  });
+
   it("delete by id removes the correct macro after an external reorder", async () => {
     await harness([
       { name: "Alpha", text: "a" },

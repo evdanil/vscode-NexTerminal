@@ -266,6 +266,38 @@ describe("MacroTreeItem", () => {
       expect(item.tooltip).not.toContain("suppressed");
     });
   });
+
+  describe("identity conflict", () => {
+    it("renders a conflicted trigger macro as a non-trigger macro with a warning icon and a remedy the user can act on", () => {
+      // MacroAutoTrigger compiles no rule for an ambiguous state key, so the zap icon,
+      // the Pause/Resume items and the "active"/"paused" tooltip would all be dead
+      // controls — the same reasoning as §6.3 for variables. Unlike §6.3 this is corrupt
+      // data rather than a design rule, so it also has to say what to do about it: a
+      // macro that quietly stops firing with no explanation is its own bug.
+      const macro = { id: "dup", name: "Password", text: "hunter2\n", secret: true, triggerPattern: "[Pp]assword:" };
+      const item = new MacroTreeItem(macro, 0, undefined, false, true);
+      expect((item.iconPath as { id: string }).id).toBe("warning");
+      expect(item.contextValue).toBe("nexus.macro.secret");
+      expect(item.tooltip).toContain("Auto-trigger suppressed: another macro has the same internal id");
+      expect(item.tooltip).toContain("Move Up / Move Down");
+      expect(item.tooltip).not.toContain("Auto-trigger:");
+    });
+
+    it("takes precedence over the variables note when both suppressions apply", () => {
+      const macro = { name: "Both", text: "run $host", triggerPattern: "foo", variables: [{ name: "host" }] };
+      const item = new MacroTreeItem(macro, 0, undefined, false, true);
+      expect(item.tooltip).toContain("another macro has the same internal id");
+      expect(item.tooltip).not.toContain("macro has variables");
+    });
+
+    it("leaves a conflicted macro that has no trigger pattern rendering exactly as before — nothing is suppressed for it", () => {
+      const macro = { id: "dup", name: "Plain", text: "echo hi" };
+      const item = new MacroTreeItem(macro, 0, undefined, undefined, true);
+      expect((item.iconPath as { id: string }).id).toBe("terminal");
+      expect(item.contextValue).toBe("nexus.macro");
+      expect(item.tooltip).not.toContain("suppressed");
+    });
+  });
 });
 
 describe("MacroTreeProvider", () => {
@@ -357,5 +389,35 @@ describe("MacroTreeProvider", () => {
   it("getTreeItem returns the element itself", () => {
     const item = new MacroTreeItem({ name: "Test", text: "test" }, 0);
     expect(provider.getTreeItem(item)).toBe(item);
+  });
+
+  it("flags exactly the macros whose state key is claimed by more than one macro", async () => {
+    // InMemoryMacroStore re-keys duplicates on save (the write-time invariant), so this
+    // needs a store that surfaces persisted state verbatim — which is what
+    // VscodeMacroStore.reloadFromState() now does with a duplicate that predates the
+    // invariant. Without the conflict wired through getChildren(), the first two items
+    // would render as live zap triggers for rules MacroAutoTrigger never compiled.
+    const rawStore = {
+      async initialize() { /* no-op */ },
+      getAll: () => [
+        { id: "dup", name: "A", text: "a\n", triggerPattern: "AAA" },
+        { id: "dup", name: "B", text: "b\n", triggerPattern: "BBB" },
+        { id: "solo", name: "C", text: "c\n", triggerPattern: "CCC" }
+      ],
+      async save() { /* no-op */ },
+      onDidChange: () => () => { /* no-op */ },
+      async clearAll() { /* no-op */ }
+    };
+    setActiveMacroStore(rawStore as unknown as Parameters<typeof setActiveMacroStore>[0]);
+
+    const children = new MacroTreeProvider().getChildren();
+    expect((children[0].iconPath as { id: string }).id).toBe("warning");
+    expect((children[1].iconPath as { id: string }).id).toBe("warning");
+    expect(children[0].contextValue).toBe("nexus.macro");
+    expect(children[1].contextValue).toBe("nexus.macro");
+
+    expect((children[2].iconPath as { id: string }).id).toBe("zap");
+    expect(children[2].contextValue).toBe("nexus.macro.triggered");
+    expect(children[2].tooltip).not.toContain("suppressed");
   });
 });

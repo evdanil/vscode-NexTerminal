@@ -20,6 +20,36 @@ import { createWebviewNonce } from "./shared/webviewNonce";
 
 type MacroProfileProvider = () => MacroProfileOptionInput[];
 
+/** Shown when a save/delete target cannot be resolved to exactly one macro. */
+const AMBIGUOUS_TARGET_MESSAGE =
+  "Another macro has the same internal id, so Nexus cannot tell which one you were editing. " +
+  "Reorder any macro with Move Up / Move Down to assign fresh ids, then try again.";
+
+/**
+ * Resolves the save/delete target by stable id, never by the render-time array index:
+ * an external reorder or delete between render and save would otherwise hit the wrong
+ * macro.
+ *
+ * Returns -1 when the id is absent, unknown, OR claimed by more than one macro. That
+ * last case is reachable for a macro list that predates the unique-id invariant
+ * (`MacroStore.save()`), which the read path deliberately no longer repairs — see
+ * `VscodeMacroStore.reloadFromState()`. Taking the first match would write the macro
+ * the user was looking at over its twin, silently destroying it; refusing is the same
+ * fail-safe `MacroAutoTrigger` applies to an ambiguous state key. Every other repair
+ * route (Move Up / Move Down, delete, or editing any macro with a unique id) re-saves
+ * the whole list and clears the conflict, so this is never a dead end.
+ */
+function resolveUniqueMacroIndex(macros: readonly TerminalMacro[], macroId: string | null): number {
+  if (macroId === null) return -1;
+  const first = macros.findIndex((m) => m.id === macroId);
+  if (first === -1) return -1;
+  return macros.some((m, i) => i > first && m.id === macroId) ? -1 : first;
+}
+
+function isAmbiguousMacroId(macros: readonly TerminalMacro[], macroId: string | null): boolean {
+  return macroId !== null && macros.filter((m) => m.id === macroId).length > 1;
+}
+
 /**
  * Coerces the webview's raw `variables` payload into `MacroVariable[]`. The
  * panel uses `retainContextWhenHidden`, so the webview's own client-side
@@ -183,15 +213,16 @@ export class MacroEditorPanel {
         const bindingRaw = msg.keybinding as string | null;
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
-        // Resolve the target by stable id, never by the render-time array index:
-        // an external reorder/delete between render and save would otherwise hit
-        // the wrong macro. A null id means an unsaved (new) macro → push path.
-        const index = macroId !== null ? macros.findIndex((m) => m.id === macroId) : -1;
+        // A null id means an unsaved (new) macro → push path.
+        const index = resolveUniqueMacroIndex(macros, macroId);
         if (macroId !== null && index === -1) {
-          // The macro we were editing was deleted/changed externally. Do not
-          // fall through to the push path (that would create a stray duplicate).
+          // The macro we were editing was deleted/changed externally, or its id is
+          // shared with another macro. Do not fall through to the push path (that
+          // would create a stray duplicate) and do not guess a target.
           void vscode.window.showWarningMessage(
-            "This macro changed externally and could not be saved. The editor has been refreshed."
+            isAmbiguousMacroId(macros, macroId)
+              ? AMBIGUOUS_TARGET_MESSAGE
+              : "This macro changed externally and could not be saved. The editor has been refreshed."
           );
           this.render();
           return;
@@ -404,12 +435,14 @@ export class MacroEditorPanel {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
         // Resolve by stable id; the render-time index may be stale.
-        const index = macroId !== null ? macros.findIndex((m) => m.id === macroId) : -1;
+        const index = resolveUniqueMacroIndex(macros, macroId);
         const macro = index >= 0 ? macros[index] : undefined;
         if (!macro) {
           if (macroId !== null) {
             void vscode.window.showWarningMessage(
-              "This macro changed externally and could not be deleted. The editor has been refreshed."
+              isAmbiguousMacroId(macros, macroId)
+                ? AMBIGUOUS_TARGET_MESSAGE
+                : "This macro changed externally and could not be deleted. The editor has been refreshed."
             );
             this.render();
           }
