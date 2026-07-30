@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { slotToBinding } from "../macroBindings";
-import type { TerminalMacro } from "../models/terminalMacro";
+import { getAssignedBinding } from "../macroBindingHelpers";
+import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 
 export interface MacroStoreChangeListener {
   (): void;
@@ -213,6 +214,153 @@ export function withMigratedSlot<T extends { slot?: number; keybinding?: string 
   const migrated: T = { ...macro, keybinding: slotToBinding(macro.slot) };
   delete (migrated as { slot?: number }).slot;
   return migrated;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * CONTENT-KEY CANONICALIZATION
+ *
+ * Two content keys exist in this codebase and both decide whether a macro is thrown away:
+ * `keyOf()` (commands/configCommands.ts) drops an INCOMING record on import, and
+ * `keyOfLegacy()` (storage/vscodeMacroStore.ts) decides whether a settings.json record is
+ * absorbed AGAIN on the next activation. They answer different questions and they have
+ * opposite failure directions — a key that is too coarse silently DROPS a legitimate macro,
+ * one that is too fine DUPLICATES a macro — but they are subject to the same single rule,
+ * which is why the terms live here rather than being written out twice:
+ *
+ *   TWO RECORDS THE RUNTIME CANNOT TELL APART MUST PRODUCE THE SAME TERMS,
+ *   AND TWO RECORDS IT CAN MUST NOT.
+ *
+ * The runtime in question is `MacroAutoTrigger.reload()` (services/macroAutoTrigger.ts) plus
+ * the variable-prompt path, so each collapse below cites the line it mirrors. Both directions
+ * have been shipped as bugs on this branch:
+ *
+ *   - Under-collapsing: the macro editor persists an EXPLICIT `triggerScope: "all-terminals"`
+ *     (ui/macroEditorHtml.ts's `?? "all-terminals"` default, written back by
+ *     ui/macroEditorPanel.ts), while `sanitizeImportedMacro()` leaves an absent scope absent.
+ *     The two are runtime-identical — `reload()`/`evaluate()` only ever test for
+ *     `"active-session"` and `"profile"` — so a merge import of a backup written before the
+ *     macro was last edited added a SECOND copy of it, both copies compiling a live rule.
+ *     For a `Password:` responder that is the password sent twice per prompt.
+ *   - Over-collapsing: keying `secret` as `m.secret === true` when every consumer in the
+ *     codebase tests it for TRUTHINESS (legacy absorption persists `secret: "true"` verbatim)
+ *     made a legacy secret macro and a plain macro with the same text collide, and the plain
+ *     one was discarded with no report.
+ *
+ * The terms are deliberately NOT a hash and NOT a delimiter join: callers `JSON.stringify` the
+ * assembled array, so a field containing the delimiter cannot forge another record's key.
+ * ------------------------------------------------------------------------------------------ */
+
+/**
+ * `secret` as the STORE reads it. Every consumer tests truthiness — `reloadFromState()`'s
+ * `if (entry.secret)`, `write()`'s `if (m.secret)`, `persistLegacyMigration()`'s `m.secret &&`,
+ * `collectIncomingMacros()`'s `if (m.secret)` — so `secret: "true"` (which legacy settings
+ * absorption persists verbatim) is the same macro as `secret: true` and must key as one.
+ */
+export function canonicalMacroSecret(macro: TerminalMacro): boolean {
+  return Boolean(macro.secret);
+}
+
+/**
+ * The binding the app actually applies, via the same helper every consumer uses
+ * (`getAssignedBinding()`: normalized `keybinding`, else `alt+{slot}`). Keying the raw
+ * `keybinding` field instead left `slot` out of the key entirely, so two slot-era records
+ * differing only in `slot: 1` versus `slot: 2` — which `withMigratedSlot()` would have turned
+ * into distinct `alt+1` / `alt+2` bindings — collided, and the second was dropped on import.
+ * It also treats `Alt+1` and `alt+1` as the one binding they resolve to.
+ *
+ * NOT keyed, deliberately: a `slot` sitting alongside an explicit `keybinding`. `withMigratedSlot()`
+ * leaves that shape untouched (the keybinding already wins), and the slot stays faintly reachable
+ * through the `nexus.macro.slot` back-compat command's `m.slot === targetSlot` fallback — so
+ * `{slot: 3, keybinding: "alt+m"}` and `{keybinding: "alt+m"}` are not quite identical at runtime,
+ * and this key collides them. That is the same collision the pre-existing key had (it named
+ * `keybinding` and nothing else), and closing it would COST more than it buys: the macro editor
+ * deletes `slot` on every save while an older backup of the same macro keeps it, which is exactly
+ * the editor-versus-file divergence that produced the duplicate-trigger double-fire this
+ * canonicalization exists to stop. Between an obscure drop and a reachable double-send, the drop
+ * is the one to take.
+ */
+export function canonicalMacroBinding(macro: TerminalMacro): string {
+  return getAssignedBinding(macro) ?? "";
+}
+
+/**
+ * The six auto-trigger fields, reduced to what `MacroAutoTrigger.reload()` can observe.
+ *
+ * WITH NO PATTERN, NOTHING ELSE MEANS ANYTHING. `reload()` starts with
+ * `if (!macro.triggerPattern) continue`, so a cooldown, an interval, a scope or a start-paused
+ * flag on a pattern-less macro compiles into nothing at all. The editor can persist exactly
+ * that shape (its cooldown write is not gated on the pattern) while `sanitizeImportedMacro()`
+ * strips the whole group, so the two shapes must collapse or the same macro imports twice.
+ *
+ * Per-field, when there IS a pattern:
+ *   - cooldown is kept VERBATIM (`?? null`), and this is the one default that is deliberately
+ *     NOT collapsed. `reload()` reads `macro.triggerCooldown != null ? clamp(...) :
+ *     this.defaultCooldownMs`, and `defaultCooldownMs` comes from the
+ *     `nexus.terminal.macros.defaultCooldown` SETTING. So absent means "follow the configured
+ *     default" and an explicit `3` means "pin to 3": identical only while that setting is left
+ *     at its shipped value, and different the moment a user changes it. Collapsing them would
+ *     make the key depend on a mutable machine-local setting and would DROP a pinned macro.
+ *   - interval mirrors `typeof x === "number" && x > 0 ? x * 1000 : undefined`, so `0`, a
+ *     negative, a string and absent are all "no interval".
+ *   - start-paused mirrors `if (macro.triggerInitiallyDisabled)` — truthy, not `=== true`.
+ *   - scope: absent is `"all-terminals"`. `evaluate()` tests only for `"active-session"` and
+ *     `"profile"`; everything else, absent included, falls through to "every terminal". An
+ *     INVALID scope string is kept verbatim rather than folded into "no rule at all" (which is
+ *     what `reload()`'s `VALID_TRIGGER_SCOPES` check makes it): keeping it can only over-name,
+ *     and `sanitizeImportedMacro()` strips the whole trigger for one anyway.
+ *   - profile id only when the scope is `"profile"` — `evaluate()` reads it nowhere else.
+ *
+ * NOT collapsed: a pattern suppressed by a non-empty `variables` array (§6.1). That suppression
+ * is lifted by deleting the variables, so the pattern is real configuration the user can bring
+ * back, and folding it away would drop a macro's whole trigger on the strength of a state the
+ * editor refuses to create.
+ */
+export function canonicalMacroTriggerTerms(macro: TerminalMacro): unknown[] {
+  const pattern = macro.triggerPattern ?? "";
+  if (!pattern) return ["", null, null, false, "", ""];
+  const scope = macro.triggerScope ?? "all-terminals";
+  return [
+    pattern,
+    macro.triggerCooldown ?? null,
+    typeof macro.triggerInterval === "number" && macro.triggerInterval > 0 ? macro.triggerInterval : null,
+    Boolean(macro.triggerInitiallyDisabled),
+    scope,
+    scope === "profile" ? (macro.triggerProfileId ?? "") : ""
+  ];
+}
+
+/**
+ * Every declared variable field that changes what running the macro does: what the prompt says,
+ * what it is prefilled with, whether the input is masked, whether the value is remembered. Two
+ * macros differing in any of them are two macros (§10).
+ *
+ * `default` and `remember` are reported only for a NON-masked variable, because on a masked one
+ * they do not survive: `toValidMacroVariable()` ignores them, `withRedactedVariables()` deletes
+ * them at every persistence boundary, and `sanitizeImportedMacroVariables()` strips them on
+ * import. That gating is inert for `keyOf()` (both sides of that comparison are already
+ * redacted or sanitized) and load-bearing for `keyOfLegacy()`, which compares a settings.json
+ * record against the redacted copy of itself already on disk — keying a masked variable's
+ * `default` there would make the two copies never match and re-absorb the macro on every single
+ * activation.
+ *
+ * A non-array `variables` keys as `null` — distinct from an empty array, because
+ * `withRedactedVariables()` DROPS a non-array while keeping an empty one, and from the trigger's
+ * point of view (§6.1, `Array.isArray && length > 0`) they behave the same but persist
+ * differently.
+ */
+export function canonicalMacroVariableTerms(macro: TerminalMacro): unknown {
+  if (!Array.isArray(macro.variables)) return null;
+  return macro.variables.map((v: MacroVariable | null | undefined) => {
+    if (!v || typeof v !== "object") return null;
+    const secret = v.secret === true;
+    return [
+      v.name ?? "",
+      v.label ?? "",
+      secret,
+      secret ? "" : (v.default ?? ""),
+      secret ? false : v.remember === false
+    ];
+  });
 }
 
 export interface MacroIdAssignment<T> {

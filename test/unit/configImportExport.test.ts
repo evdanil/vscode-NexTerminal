@@ -130,6 +130,7 @@ import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigReposi
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
 import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
+import { getAssignedBinding } from "../../src/macroBindingHelpers";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
@@ -1804,6 +1805,11 @@ describe("backup import", () => {
         // remembered.
         { id: "vl1", name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "Target host" }] },
         { id: "vl2", name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "Jump host" }] },
+        // The variable NAME itself, which nothing exercised: a declaration the text does not
+        // reference still prompts, and the name is what the prompt is titled with when no
+        // label is given. Two macros asking for different things are two macros.
+        { id: "vn1", name: "Connect", text: "connect\n", variables: [{ name: "host" }] },
+        { id: "vn2", name: "Connect", text: "connect\n", variables: [{ name: "target" }] },
         { id: "vd1", name: "Ssh", text: "ssh $user\n", variables: [{ name: "user" }] },
         { id: "vd2", name: "Ssh", text: "ssh $user\n", variables: [{ name: "user", default: "admin" }] },
         { id: "vs1", name: "Login", text: "login $pw\n", variables: [{ name: "pw" }] },
@@ -1828,7 +1834,7 @@ describe("backup import", () => {
     await runBackupImport(file, "merge");
 
     const macros = getMacros();
-    expect(macros).toHaveLength(26);
+    expect(macros).toHaveLength(28);
     // Both halves of every pair landed, and are distinguishable by the field they differ in.
     const pick = (name: string) => macros.filter((m) => m.name === name);
     expect(pick("Enable").map((m) => m.triggerScope).sort()).toEqual(["active-session", "all-terminals"]);
@@ -1837,6 +1843,7 @@ describe("backup import", () => {
     expect(pick("Keepalive").map((m) => m.triggerInterval).sort()).toEqual([300, 60]);
     expect(pick("Reload").map((m) => m.triggerInitiallyDisabled === true).sort()).toEqual([false, true]);
     expect(pick("Ping").map((m) => m.variables?.[0].label).sort()).toEqual(["Jump host", "Target host"]);
+    expect(pick("Connect").map((m) => m.variables?.[0].name).sort()).toEqual(["host", "target"]);
     expect(pick("Ssh").map((m) => m.variables?.[0].default ?? "").sort()).toEqual(["", "admin"]);
     expect(pick("Login").map((m) => m.variables?.[0].secret === true).sort()).toEqual([false, true]);
     expect(pick("Trace").map((m) => m.variables?.[0].remember === false).sort()).toEqual([false, true]);
@@ -1896,6 +1903,199 @@ describe("backup import", () => {
     expect(macros.map((m) => m.secret === true).sort()).toEqual([false, true]);
     expect(macros.find((m) => m.secret)!.text).toBe("cisco\n");
     expect(macros.find((m) => !m.secret)!.id).toBe("local");
+  });
+
+  it("merge does NOT re-add a macro the editor saved with an explicit default scope when the backup leaves the scope absent", async () => {
+    // Executed reproduction of the round-5 regression, and the reason the content key is
+    // canonicalized rather than spelled out field by field.
+    //
+    // The macro editor always writes a scope for a trigger macro — ui/macroEditorHtml.ts
+    // defaults the control to "all-terminals" and ui/macroEditorPanel.ts writes back whatever
+    // the control says — while `sanitizeImportedMacro()` leaves an absent scope absent. The two
+    // are the SAME MACRO at runtime: MacroAutoTrigger.evaluate() only ever tests for
+    // "active-session" and "profile", so an absent scope and an explicit "all-terminals" both
+    // mean every terminal.
+    //
+    // The user flow is ordinary: import an older backup or a share (absent scope), open the
+    // macro in the editor and press Save — even changing nothing — then later merge the same
+    // file again. With the scope keyed verbatim that produced TWO macros with distinct ids, so
+    // the ambiguous-id fail-safe suppresses neither: both compile a rule and both fire on one
+    // match. For this fixture, a `confirm:` responder, that is `y\n` sent twice; for a
+    // `Password:` responder it is the password sent twice per prompt.
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    // Exactly what the editor persists, down to the explicit scope.
+    await store.save([
+      { id: "local", name: "Ack", text: "y\n", triggerPattern: "confirm:", triggerScope: "all-terminals" }
+    ]);
+    setActiveMacroStore(store);
+
+    const backup = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      // The same macro as written before the editor materialized the default: no scope at all.
+      macros: [{ id: "file-ack", name: "Ack", text: "y\n", triggerPattern: "confirm:" }],
+      settings: {}
+    };
+
+    await runBackupImport(backup, "merge");
+
+    const macros = getMacros();
+    expect(macros).toHaveLength(1);
+    expect(macros[0].id).toBe("local");
+
+    // The same collapse in the other direction — a pattern-less macro carrying inert trigger
+    // fields. The editor's cooldown write is not gated on the pattern, so it can persist
+    // `triggerCooldown` on a macro with no trigger at all, while `sanitizeImportedMacro()`
+    // strips the whole group. Neither record compiles anything, so they are one macro.
+    await store.save([
+      ...getMacros(),
+      { id: "local-2", name: "Banner", text: "show banner\n", triggerCooldown: 30, triggerInterval: 90 }
+    ]);
+    await runBackupImport(
+      {
+        ...backup,
+        macros: [...backup.macros, { id: "file-banner", name: "Banner", text: "show banner\n" }]
+      },
+      "merge"
+    );
+    expect(getMacros().map((m) => m.name)).toEqual(["Ack", "Banner"]);
+  });
+
+  it("merge does NOT drop a plain macro that collides with a legacy TRUTHY-secret one — `secret` is keyed as the store reads it", async () => {
+    // Executed reproduction of the second round-5 regression. Keying `m.secret === true`
+    // regressed the truthy encoding every consumer in the codebase actually uses: legacy
+    // settings absorption persists `secret: "true"` verbatim, `reloadFromState()` vault-reads on
+    // `if (entry.secret)`, and `write()` vault-stores on `if (m.secret)`. So the stored record
+    // below IS a secret macro at runtime, and the incoming plain one is a different macro that
+    // happens to share its name and text.
+    //
+    // A content-key collision in the merge branch is a DROP with no report, so this cost the
+    // user a macro out of their own backup, silently.
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    await store.save([
+      { id: "legacy", name: "Login", text: "hunter2\n", secret: "true" } as unknown as TerminalMacro
+    ]);
+    setActiveMacroStore(store);
+
+    await runBackupImport(
+      {
+        version: 2,
+        exportType: "backup",
+        exportedAt: new Date().toISOString(),
+        servers: [],
+        tunnels: [],
+        serialProfiles: [],
+        macros: [{ id: "file-plain", name: "Login", text: "hunter2\n" }],
+        settings: {}
+      },
+      "merge"
+    );
+
+    const macros = getMacros();
+    expect(macros).toHaveLength(2);
+    expect(macros.map((m) => m.id)).toEqual(["legacy", "file-plain"]);
+    expect(macros[1].secret).toBeUndefined();
+  });
+
+  it("the content key cannot be forged through a field containing the delimiter", async () => {
+    // The key is assembled with `JSON.stringify`, not a `|` join, and this is what makes that
+    // a property rather than a comment. With a join, two records can produce the identical
+    // string, and a collision here is a silent DROP — a macro missing from the user's own
+    // backup, reported to nobody. A macro name is free text and a macro's TEXT is arbitrary
+    // terminal input, so a `|` in either is not exotic.
+    //
+    // The forgery needs two ADJACENT free-text terms, which is why both pairs are here. The
+    // first (`name`/`text`) does not collide under today's field order — `secret` sits between
+    // them and contributes `false` — and is kept so the fixture still covers the shape if the
+    // order ever changes. The second (`text`/`triggerPattern`, which ARE adjacent) is the one
+    // that forges: `x` + `p|q` and `x|p` + `q` both join to `…|x|p|q|…`.
+    //
+    // Reverting `keyOf()` to a delimiter join with every field still present passes every other
+    // test in this file; it fails here.
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
+
+    await runBackupImport(
+      {
+        version: 2,
+        exportType: "backup",
+        exportedAt: new Date().toISOString(),
+        servers: [],
+        tunnels: [],
+        serialProfiles: [],
+        macros: [
+          { id: "forge-1", name: "a|b", text: "c" },
+          { id: "forge-2", name: "a", text: "b|c" },
+          // The same shape one field further along, so a join that merely uses a rarer
+          // separator does not pass either.
+          { id: "forge-3", name: "Sep", text: "x", triggerPattern: "p|q" },
+          { id: "forge-4", name: "Sep", text: "x|p", triggerPattern: "q" }
+        ],
+        settings: {}
+      },
+      "merge"
+    );
+
+    const macros = getMacros();
+    expect(macros).toHaveLength(4);
+    expect(macros.map((m) => m.id)).toEqual(["forge-1", "forge-2", "forge-3", "forge-4"]);
+  });
+
+  it("merge keeps two slot-era macros that differ only in their legacy `slot`", async () => {
+    // `slot` is the deprecated spelling of `keybinding`, migrated by `withMigratedSlot()` on
+    // both the read and the write path, so these two records become `alt+1` and `alt+2` — two
+    // macros on two different shortcuts. Keying the raw `keybinding` field left `slot` out of
+    // the key entirely: both records had an absent `keybinding`, agreed on every other term,
+    // and the second was dropped before the store could migrate it.
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
+
+    await runBackupImport(
+      {
+        version: 2,
+        exportType: "backup",
+        exportedAt: new Date().toISOString(),
+        servers: [],
+        tunnels: [],
+        serialProfiles: [],
+        macros: [
+          { id: "slot-1", name: "Bounce", text: "bounce\n", slot: 1 },
+          { id: "slot-2", name: "Bounce", text: "bounce\n", slot: 2 }
+        ],
+        settings: {}
+      },
+      "merge"
+    );
+
+    const macros = getMacros();
+    expect(macros).toHaveLength(2);
+    expect(macros.map((m) => getAssignedBinding(m)).sort()).toEqual(["alt+1", "alt+2"]);
+
+    // ...and the converse, which is what makes this a key and not just a wider tuple: a record
+    // that already carries the MIGRATED spelling of a slot the store holds is the same macro,
+    // so re-importing it adds nothing.
+    await runBackupImport(
+      {
+        version: 2,
+        exportType: "backup",
+        exportedAt: new Date().toISOString(),
+        servers: [],
+        tunnels: [],
+        serialProfiles: [],
+        macros: [{ id: "slot-1-migrated", name: "Bounce", text: "bounce\n", keybinding: "alt+1" }],
+        settings: {}
+      },
+      "merge"
+    );
+    expect(getMacros()).toHaveLength(2);
   });
 
   it("Fix A — backup restore strips the trigger even when every declared variable entry is invalid", async () => {

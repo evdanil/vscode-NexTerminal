@@ -6,6 +6,13 @@ const mockShowErrorMessage = vi.fn();
 let onDidReceiveMessageHandler: ((msg: Record<string, unknown>) => void) | undefined;
 let onDidDisposeHandler: (() => void) | undefined;
 let lastHtml = "";
+/**
+ * Every assignment to `webview.html`, i.e. every `render()`. Counted rather than merely
+ * captured because "did NOT re-render" is a real assertion in this file: re-rendering rebuilds
+ * the panel from the STORE, so doing it after a failed save silently discards the edit the user
+ * is being told was not saved.
+ */
+let htmlWrites = 0;
 
 vi.mock("vscode", () => ({
   window: {
@@ -13,6 +20,7 @@ vi.mock("vscode", () => ({
       webview: {
         set html(value: string) {
           lastHtml = value;
+          htmlWrites++;
         },
         get html() {
           return lastHtml;
@@ -81,6 +89,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     onDidReceiveMessageHandler = undefined;
     onDidDisposeHandler = undefined;
     lastHtml = "";
+    htmlWrites = 0;
   });
 
   it("save by id targets the correct macro after an external reorder", async () => {
@@ -300,6 +309,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       "Nexus could not record macro secret ids in /storage/macro-secret-ids, so nothing was saved."
     );
     vi.spyOn(store, "save").mockRejectedValue(failure);
+    const rendersBefore = htmlWrites;
 
     // Must not reject: nothing upstream can catch it.
     await expect(
@@ -333,6 +343,40 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     // that clears the dirty flag, and a cleared flag on an unsaved edit is how the edit gets
     // closed and lost.
     expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+    // And the panel is NOT rebuilt. `render()` reads the STORE, which for a failed save still
+    // holds the pre-edit macro, so re-rendering would throw away the very text the error is
+    // telling the user was not saved — the exact outcome reporting the failure exists to
+    // avoid. Reporting the error and then calling `render()` satisfies every other assertion
+    // in this test; it fails here.
+    expect(htmlWrites).toBe(rendersBefore);
+    expect(lastHtml).toContain("Alpha");
+    expect(lastHtml).not.toContain("Alpha (renamed)");
+  });
+
+  it("a store failure on DELETE is reported as a failed delete, and does not rebuild the panel either", async () => {
+    // The same store call backs both Save and Delete, so the one `catch` at the message
+    // subscription sees both. Reporting a failed delete as "could not save the macro" describes
+    // an action the user did not take, and the in-panel slot said "Not saved:" for something
+    // that was never a save.
+    await harness([{ name: "Alpha", text: "a\n" }]);
+    const { sendMessage } = await openPanel(0);
+    const id = getMacros()[0].id!;
+    mockShowWarningMessage.mockResolvedValue("Delete");
+
+    vi.spyOn(store, "save").mockRejectedValue(new Error("EACCES: permission denied"));
+    const rendersBefore = htmlWrites;
+
+    await expect(
+      Promise.resolve(sendMessage({ type: "delete", index: 0, id }))
+    ).resolves.toBeUndefined();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("could not delete the macro")
+    );
+    expect(mockPostMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "saveError", field: "save", message: expect.stringContaining("Not deleted:") })
+    );
+    expect(htmlWrites).toBe(rendersBefore);
   });
 
   it("creating a new macro (null id) appends and assigns an id", async () => {

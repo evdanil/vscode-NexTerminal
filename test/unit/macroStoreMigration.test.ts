@@ -85,6 +85,15 @@ vi.mock("vscode", () => {
   return api;
 });
 
+import * as vscodeMock from "vscode";
+
+/**
+ * The mocked filesystem's file table, so a test can look at the marker files the absorb path
+ * wrote. Reached through the module rather than the factory closure because `vi.mock` is
+ * hoisted above everything else in this file.
+ */
+const fsFiles = (vscodeMock as unknown as { __files: Map<string, Uint8Array> }).__files;
+
 let ctxSeq = 0;
 
 function makeCtx() {
@@ -108,7 +117,16 @@ function makeCtx() {
       }
     } as unknown as import("vscode").ExtensionContext,
     state,
-    secrets
+    secrets,
+    globalStoragePath,
+    /** Secret ids recoverable from this context's marker files — the ids are the CONTENTS. */
+    markedIds(): string[] {
+      const prefix = `${globalStoragePath}/macro-secret-ids/`;
+      return [...fsFiles.entries()]
+        .filter(([p]) => p.startsWith(prefix))
+        .map(([, bytes]) => new TextDecoder().decode(bytes))
+        .sort();
+    }
   };
 }
 
@@ -380,7 +398,16 @@ describe("MacroStore legacy migration", () => {
     const { ctx, state, secrets } = makeCtx();
     const existing = [{ id: "a", name: "Existing", text: "x" }] as TerminalMacro[];
     state.set("nexus.macros", existing);
-    const legacy = [{ name: "Absorbed", text: "absorbed-secret", secret: true }] as TerminalMacro[];
+    // A PLAIN record alongside the secret one, and it is what makes the "nothing was written"
+    // assertion below mean something: with a secret-only fixture, an implementation that
+    // persisted the plain absorbed records and abandoned only the secret ones would leave
+    // MACROS_KEY untouched by coincidence and pass. The absorb is all-or-nothing — the legacy
+    // setting is only cleared once every record in it has landed — so "Plain" must not appear
+    // either.
+    const legacy = [
+      { name: "Absorbed", text: "absorbed-secret", secret: true },
+      { name: "Plain", text: "show version" }
+    ] as TerminalMacro[];
     vscode.__setConfig("nexus.terminal", { global: legacy });
 
     const fs = vscode.workspace.fs;
@@ -415,9 +442,160 @@ describe("MacroStore legacy migration", () => {
     // activation absorbs the same records, secret value intact.
     const store2 = new VscodeMacroStore(ctx);
     await store2.initialize();
-    expect(store2.getAll().map((m) => m.name)).toEqual(["Existing", "Absorbed"]);
+    expect(store2.getAll().map((m) => m.name)).toEqual(["Existing", "Absorbed", "Plain"]);
     expect(store2.getAll().find((m) => m.name === "Absorbed")!.text).toBe("absorbed-secret");
     expect((vscode.__getConfig("nexus.terminal") as { global: unknown }).global).toBeUndefined();
+  });
+
+  it("names a legacy secret id on disk BEFORE storing it — the ORDER, not just the end state", async () => {
+    // The sibling test above asserts an end state, which a store-then-roll-back implementation
+    // reproduces exactly: write the vault entry, discover the marker cannot be written, delete
+    // the entry, return false. That implementation violates the contract this path shares with
+    // `save()` — a vault entry must never exist under an id nothing on disk names, not even
+    // briefly, because a crash in the gap strands a plaintext credential no Complete Reset can
+    // reach. `save()` has the order pinned (macroStore.test.ts); this path did not.
+    const vscode = (await import("vscode")) as unknown as {
+      __setConfig: (s: string, v: Record<string, unknown>) => void;
+    };
+    const { ctx, markedIds } = makeCtx();
+    vscode.__setConfig("nexus.terminal", {
+      global: [{ name: "Absorbed", text: "absorbed-secret", secret: true }] as TerminalMacro[]
+    });
+
+    const namedAtStore: Array<{ id: string; marked: string[] }> = [];
+    const mutableSecrets = ctx.secrets as unknown as { store(k: string, v: string): Promise<void> };
+    const origStore = mutableSecrets.store.bind(ctx.secrets);
+    mutableSecrets.store = async (k: string, v: string) => {
+      namedAtStore.push({ id: k.slice("macro-secret-text-".length), marked: markedIds() });
+      return origStore(k, v);
+    };
+
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    // At the instant the value hit the vault, the id naming it was already on disk.
+    expect(namedAtStore).toHaveLength(1);
+    expect(namedAtStore[0].marked).toContain(namedAtStore[0].id);
+  });
+
+  it("absorbs legacy macros that differ only in trigger metadata or `slot` — the absorb dedupe is a ONE-WAY door", async () => {
+    // `dedupeLegacyMacros()` collapses before anything is persisted, and
+    // `absorbLegacySettingsIfPresent()` then clears `nexus.terminal.macros` from every scope.
+    // So a record the dedupe key cannot tell apart from another is not "merged" — it is deleted
+    // from the only place it existed. Two `Password:` responders scoped to different profiles,
+    // or two shortcuts on different slots, are not one macro.
+    //
+    // Each pair below is identical on every other term, so restoring any single term to the
+    // pre-fix key fails this test on its own.
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    vscode.__setConfig("nexus.terminal", {
+      global: [
+        { name: "Poll", text: "show status\n", triggerPattern: "#", triggerCooldown: 5 },
+        { name: "Poll", text: "show status\n", triggerPattern: "#", triggerCooldown: 30 },
+        { name: "Keepalive", text: " \n", triggerPattern: ">", triggerInterval: 60 },
+        { name: "Keepalive", text: " \n", triggerPattern: ">", triggerInterval: 300 },
+        { name: "Reload", text: "reload\n", triggerPattern: "confirm" },
+        { name: "Reload", text: "reload\n", triggerPattern: "confirm", triggerInitiallyDisabled: true },
+        { name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerScope: "active-session" },
+        { name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerScope: "all-terminals" },
+        { name: "Scoped", text: "enable\n", triggerPattern: "Password:", triggerScope: "profile", triggerProfileId: "prod-1" },
+        { name: "Scoped", text: "enable\n", triggerPattern: "Password:", triggerScope: "profile", triggerProfileId: "staging-1" },
+        // The pattern itself, which the `Sep` pair below cannot pin (it differs in `text` too).
+        { name: "Ack", text: "y\n", triggerPattern: "confirm:" },
+        { name: "Ack", text: "y\n", triggerPattern: "proceed:" },
+        { name: "Bounce", text: "bounce\n", slot: 1 },
+        { name: "Bounce", text: "bounce\n", slot: 2 },
+        { name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "Target host" }] },
+        { name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "Jump host" }] },
+        // A delimiter in a free-text field must not forge another record's key. The two terms
+        // have to be ADJACENT in the key for a join to collide them, and `text` and
+        // `triggerPattern` are: `x` + `p|q` and `x|p` + `q` both join to `…|x|p|q|…`, so with a
+        // join the second of these is deleted from settings.json and never written anywhere.
+        { name: "Sep", text: "x", triggerPattern: "p|q" },
+        { name: "Sep", text: "x|p", triggerPattern: "q" }
+      ] as TerminalMacro[]
+    });
+    const { ctx } = makeCtx();
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    const all = store.getAll();
+    expect(all).toHaveLength(18);
+    const pick = (name: string) => all.filter((m) => m.name === name);
+    expect(pick("Poll").map((m) => m.triggerCooldown).sort()).toEqual([30, 5]);
+    expect(pick("Keepalive").map((m) => m.triggerInterval).sort()).toEqual([300, 60]);
+    expect(pick("Reload").map((m) => m.triggerInitiallyDisabled === true).sort()).toEqual([false, true]);
+    expect(pick("Enable").map((m) => m.triggerScope).sort()).toEqual(["active-session", "all-terminals"]);
+    expect(pick("Scoped").map((m) => m.triggerProfileId).sort()).toEqual(["prod-1", "staging-1"]);
+    // Migrated on the read path, which is what makes these two different macros rather than
+    // two records that merely look different on disk.
+    expect(pick("Bounce").map((m) => m.keybinding).sort()).toEqual(["alt+1", "alt+2"]);
+    expect(pick("Ping").map((m) => m.variables?.[0].label).sort()).toEqual(["Jump host", "Target host"]);
+    expect(pick("Ack").map((m) => m.triggerPattern).sort()).toEqual(["confirm:", "proceed:"]);
+    expect(pick("Sep").map((m) => m.text).sort()).toEqual(["x", "x|p"]);
+  });
+
+  it("re-absorbing the identical settings does not multiply a macro across the redaction boundary", async () => {
+    // The no-multiplication property, and the reason the widened key still cannot name
+    // everything. The absorb runs on EVERY activation and Settings Sync can replay the cleared
+    // setting back, so the key is compared between the settings.json copy and the copy already
+    // on disk — which `persistLegacyMigration()` has run through `withRedactedVariables()`, and
+    // whose secret text has moved to the vault leaving `text: ""` behind. A key that named a
+    // masked variable's `default`, or a secret macro's text, would never match its own record
+    // and would add a fresh copy of it on every single start.
+    //
+    // The fixture carries every shape that crosses that boundary at once: a secret macro, a
+    // masked variable with a plaintext default, a legacy `slot`, and a full trigger
+    // configuration. Absorbing three times must still be one of each.
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    const settings = [
+      {
+        name: "Login",
+        text: "hunter2\n",
+        secret: true,
+        slot: 1,
+        triggerPattern: "Password:",
+        triggerCooldown: 5,
+        triggerScope: "profile",
+        triggerProfileId: "prod-1",
+        triggerInitiallyDisabled: true
+      },
+      {
+        name: "Ssh",
+        text: "ssh $user@$host\n",
+        variables: [
+          { name: "user", label: "Username", default: "admin" },
+          { name: "pass", label: "Password", secret: true, default: "hunter2", remember: true }
+        ]
+      }
+    ] as unknown as TerminalMacro[];
+    const { ctx, state } = makeCtx();
+
+    vscode.__setConfig("nexus.terminal", { global: settings });
+    let store = new VscodeMacroStore(ctx);
+    await store.initialize();
+    expect(store.getAll().map((m) => m.name)).toEqual(["Login", "Ssh"]);
+    expect(store.getLastAbsorbedCount()).toBe(2);
+    // The boundary really is being crossed: the masked default never reached globalState, and
+    // the secret text moved to the vault.
+    expect(JSON.stringify(state.get("nexus.macros"))).not.toContain("hunter2");
+
+    for (let run = 0; run < 2; run++) {
+      vscode.__setConfig("nexus.terminal", { global: settings });
+      store = new VscodeMacroStore(ctx);
+      await store.initialize();
+      expect(store.getAll().map((m) => m.name)).toEqual(["Login", "Ssh"]);
+      expect(store.getLastAbsorbedCount()).toBe(0);
+    }
+
+    // ...and the secret survived all of it, under one id.
+    const login = store.getAll().find((m) => m.name === "Login")!;
+    expect(login.text).toBe("hunter2\n");
+    expect(login.keybinding).toBe("alt+1");
+    expect(store.getAll().find((m) => m.name === "Ssh")!.variables).toEqual([
+      { name: "user", label: "Username", default: "admin" },
+      { name: "pass", label: "Password", secret: true }
+    ]);
   });
 
   it("does not duplicate secret macros when Settings Sync replays cleartext", async () => {

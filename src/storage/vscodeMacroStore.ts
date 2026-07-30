@@ -4,6 +4,10 @@ import type { TerminalMacro } from "../models/terminalMacro";
 import {
   assignIdsForAbsorbedMacros,
   assignMacroIds,
+  canonicalMacroBinding,
+  canonicalMacroSecret,
+  canonicalMacroTriggerTerms,
+  canonicalMacroVariableTerms,
   isValidMacroId,
   withMigratedSlot,
   type MacroStore,
@@ -17,9 +21,12 @@ const SECRET_PREFIX = "macro-secret-text-";
 const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
 
 /**
- * Subdirectory of `context.globalStorageUri` holding the per-secret-id marker files that
- * are the AUTHORITATIVE record of which vault keys this extension may have written. See
- * `ensureSecretMarkers()` for why a directory of files rather than a `globalState` array.
+ * Subdirectory of `context.globalStorageUri` holding the per-secret-id marker files: the record
+ * of which vault keys this extension may have written that a second window cannot clobber. See
+ * `ensureSecretMarkers()` for why a directory of files rather than a `globalState` array, and
+ * `clearAllExclusive()` for the one thing markers do NOT promise — they bound what a SAVE must
+ * do, and another window deleting a marker after this one wrote it is why the sweep also
+ * enumerates the vault itself where the host allows it.
  *
  * Its own subdirectory, not `globalStorageUri` itself: `readDirectory()` on the root would
  * enumerate every other thing the extension keeps there (session logs, scripts scaffolding,
@@ -81,6 +88,27 @@ export class VscodeMacroStore implements MacroStore {
    * post-dedup `macro.id`.
    */
   private unresolvedSecretIds = new Set<string>();
+  /**
+   * Ids this instance has successfully written a marker file for. USED ONLY TO WIDEN MARKER
+   * REMOVAL — never to skip a marker WRITE.
+   *
+   * That distinction is the whole of it, and it is the difference between this set and the memo
+   * that was removed in an earlier revision. The memo answered "may I skip writing this marker?"
+   * with per-window state that says nothing about what is on disk, and another window deleting
+   * the file made every later answer wrong — which is precisely the invariant markers exist for.
+   * `ensureSecretMarkers()` stays unconditional and this set is never consulted there. Here it
+   * answers a question whose wrong answers are both cheap: a marker that is removed when it did
+   * not need to be is re-created by the next save that stores the id, and one that is not
+   * removed costs a single no-op `secrets.delete()` at the next Complete Reset.
+   *
+   * It exists because `write()` cannot otherwise name the id it just marked. Marker removal is
+   * narrowed to ids that plausibly HAVE a marker, and the natural source for that — "was secret
+   * in `this.resolved` a moment ago" — misses an id whose marker and vault entry were written by
+   * a save that then failed at its MACROS_KEY commit: `this.resolved` never advanced, so a retry
+   * that saves the same record as PLAIN deletes the vault entry and leaves the marker behind
+   * indefinitely.
+   */
+  private markedSecretIds = new Set<string>();
   /**
    * Tail of the serialization chain for this store's MUTATING operations — see
    * `runExclusive()`.
@@ -243,18 +271,26 @@ export class VscodeMacroStore implements MacroStore {
 
     const currentIds = new Set(this.resolved.map((m) => m.id).filter((v): v is string => Boolean(v)));
     const nextIds = new Set(normalized.map((m) => m.id!).filter(Boolean));
-    // Ids this store believed had a vault entry before this save. `deletedVaultIds` below is
-    // deliberately wider than that — it names every non-secret macro's id, because the delete
-    // for those is incidental and unconditional — and dropping a marker for each of them would
-    // put one filesystem call per plain macro on every save. Marker removal is therefore
-    // narrowed to ids that plausibly HAVE a marker: ones that were secret a moment ago, which
-    // is every id this window has ever marked that is still in play (`ensureSecretMarkers()`
-    // marks exactly `storedVaultIds`, and every id in it lands in `this.resolved` as a secret).
-    // Missing one is the cheap direction — an unremoved marker costs one no-op
+    // Ids that plausibly HAVE a marker file. `deletedVaultIds` below is deliberately wider —
+    // it names every non-secret macro's id, because the delete for those is incidental and
+    // unconditional — and attempting a marker removal for each of them would put one filesystem
+    // call per plain macro on every save. So removal is narrowed, and this is the narrowing.
+    //
+    // Two sources, because neither alone names every marker this window may have written:
+    //   - what was secret a moment ago (`this.resolved`), which covers markers written by
+    //     earlier saves and by `reloadFromState()`'s view of the disk;
+    //   - what THIS INSTANCE has actually marked (`markedSecretIds`), which covers an id whose
+    //     marker was written by a save that then failed before advancing `this.resolved` — a
+    //     MACROS_KEY rejection after the marker and the vault store had both landed. Without it,
+    //     retrying that same record as PLAIN deleted the vault entry and left the marker on disk
+    //     indefinitely. See `markedSecretIds` for why this is not the write-skipping memo that
+    //     was removed.
+    // Missing one is still the cheap direction — an unremoved marker costs one no-op
     // `secrets.delete()` at the next Complete Reset.
-    const previouslySecretIds = new Set(
-      this.resolved.filter((m) => m.secret && isValidMacroId(m.id)).map((m) => m.id)
-    );
+    const previouslySecretIds = new Set<string>([
+      ...this.resolved.filter((m) => m.secret && isValidMacroId(m.id)).map((m) => m.id!),
+      ...this.markedSecretIds
+    ]);
 
     // Every vault key this call deletes, so the secret-id ledger can drop it (see
     // `updateSecretIndex()`); anything not deleted stays indexed even if it is not in
@@ -368,8 +404,11 @@ export class VscodeMacroStore implements MacroStore {
     //    (`ensureSecretMarkers()`, the authoritative one) and then the legacy
     //    `SECRET_IDS_KEY` array (`updateSecretIndex()`). A vault entry written under an id
     //    that neither MACROS_KEY nor either record names yet is unreachable forever — not by
-    //    a later save, not by Complete Reset. Naming it first can only over-name: a named id
-    //    with no entry behind it costs one no-op `secrets.delete()`.
+    //    a later save, not by Complete Reset. Within this save, naming first can only over-name:
+    //    a named id with no entry behind it costs one no-op `secrets.delete()`. It is a CRASH
+    //    contract, not a cross-window one — another window can delete the marker after this save
+    //    wrote it, which `clearAllExclusive()` describes in full and answers by also enumerating
+    //    the vault where the host allows it.
     //
     //    Markers go first because they are the half that FAILS CLOSED. If the marker cannot
     //    be written the save is abandoned here, before anything at all has been written —
@@ -534,6 +573,9 @@ export class VscodeMacroStore implements MacroStore {
           vscode.Uri.joinPath(dir, secretMarkerFileName(id)),
           new TextEncoder().encode(id)
         );
+        // Recorded AFTER the write, and only to widen a later removal — see
+        // `markedSecretIds`. Nothing in this function ever reads it.
+        this.markedSecretIds.add(id);
       }
     } catch (err) {
       const where = dir ? dir.fsPath : "the extension global storage folder";
@@ -568,6 +610,7 @@ export class VscodeMacroStore implements MacroStore {
         // Already gone, or the directory is unreadable. Either way the id is over-named at
         // worst, which is the cheap direction.
       }
+      this.markedSecretIds.delete(id);
     }
   }
 
@@ -628,38 +671,101 @@ export class VscodeMacroStore implements MacroStore {
     this.resolved = [];
     this.unresolvedSecretIds = new Set<string>();
 
-    // Also sweep from the two persisted records of "vault keys this extension may have
-    // written", so orphans `resolved` no longer accounts for still go. For entries THIS build
-    // wrote this covers every one, because both writers in this file name an id BEFORE storing
-    // it (see `save()`'s write-order contract and `persistLegacyMigration()`): a crash anywhere
-    // after the naming leaves the entry named.
+    // Sweep from every record of "vault keys this extension may have written", so orphans
+    // `resolved` no longer accounts for still go:
     //
-    //   - marker files, the authoritative record: per-file writes, so two windows adding
-    //     different secrets at the same moment cannot lose each other's id;
+    //   - marker files: per-file writes, so two windows adding different secrets at the same
+    //     moment cannot lose each other's id (which is what `SECRET_IDS_KEY` alone could not
+    //     promise);
     //   - `SECRET_IDS_KEY`, kept as a LEGACY FALLBACK for entries created by builds that
-    //     predate the marker files — whatever that array still names is still swept.
+    //     predate the marker files — whatever that array still names is still swept;
+    //   - the HOST'S OWN ENUMERATION of this extension's secret keys, where it exists
+    //     (`readVaultSecretIds()`). This is the only source that needs no cooperation from any
+    //     past or concurrent write, and it is what makes Complete Reset genuinely complete on a
+    //     host that has it.
     //
-    // WHAT IS NOT SWEPT, stated rather than glossed: a pre-marker entry whose `SECRET_IDS_KEY`
-    // write lost the cross-window race. Such an entry is named by no marker (its build wrote
-    // none), by no ledger entry (that write is the one that was lost), and by no record in
-    // MACROS_KEY (the same window won both writes, so the macro is gone from there too). There
-    // is nothing left to find it by: `SecretStorage` has no enumeration API, so a sweep can
-    // only delete keys something names, and the only remedy for one of these is the OS keyring
-    // manager. The marker files exist precisely so that no FUTURE entry can end up in that
-    // state. Entries written by a build predating the ordering contract are likewise unreachable.
+    // THE MARKERS ARE NOT AN UNCONDITIONAL INVARIANT, and an earlier revision of this comment
+    // claimed they were ("for entries THIS build wrote this covers every one, because both
+    // writers name an id BEFORE storing it"). Naming first is a CRASH contract and it holds: a
+    // crash anywhere after the naming leaves the entry named. It is not a contract against
+    // another WINDOW, because a window can delete the marker after this one wrote it and before
+    // — or after — the store it describes:
+    //
+    //   1. windows A and B both hold secret `p`;
+    //   2. B starts a stale save: it writes `p`'s marker and ledger entry, then blocks inside
+    //      `secrets.store(p)` behind an OS keychain prompt;
+    //   3. A deletes `p` (or runs Complete Reset), removing the vault entry, the ledger entry
+    //      and the marker;
+    //   4. B's store resumes and RE-CREATES the vault entry, then republishes MACROS_KEY. It
+    //      does not mark again — the marking already happened, before it blocked;
+    //   5. A, whose view is now empty, saves some other secret. Its wholesale MACROS_KEY and
+    //      ledger writes drop `p` without deleting `p`'s vault entry.
+    //
+    // `p` is then named by no marker, no ledger and no macro record. No ordering of unconditional
+    // writes at the START of a save can prevent that, because the deletion that unnames the entry
+    // happens afterwards; re-marking after the store only moves the window rather than closing
+    // it, at the cost of doubling the marker I/O on every save.
+    //
+    // Enumeration is what closes it, and only on hosts that have `SecretStorage.keys()`
+    // (finalized in VS Code 1.105; this extension's engine floor is lower, so it is
+    // feature-detected). WHAT IS STILL NOT SWEPT on an older host: that residue, and the
+    // pre-marker entry whose `SECRET_IDS_KEY` write lost the cross-window race — named by no
+    // marker (its build wrote none), no ledger entry (that write is the one that was lost) and
+    // no MACROS_KEY record. Without a list API a sweep can only delete keys something names, so
+    // on those hosts the remedy is a newer VS Code, after which Complete Reset finds them.
     const indexedIds = this.readSecretIndex();
     const markerIds = await this.readSecretMarkerIds();
+    const enumeratedIds = await this.readVaultSecretIds();
 
     // Delete vault entries FIRST (before clearing either record) so a crash between
     // these awaits leaves the records intact — next clearAll can still find orphans.
-    const allIds = new Set([...ids, ...indexedIds, ...markerIds]);
+    const allIds = new Set([...ids, ...indexedIds, ...markerIds, ...enumeratedIds]);
     for (const id of allIds) {
       await this.context.secrets.delete(macroSecretKey(id));
     }
     await this.context.globalState.update(SECRET_IDS_KEY, undefined);
     await this.removeSecretMarkers(allIds);
+    this.markedSecretIds.clear();
 
     this.emit();
+  }
+
+  /**
+   * Every macro-secret id the HOST itself can name, from `SecretStorage.keys()`.
+   *
+   * The one source in `clearAllExclusive()` that does not depend on some earlier write having
+   * survived: it asks the storage that actually holds the values which of this extension's keys
+   * exist, so it finds entries no marker, ledger or macro record names — the cross-window
+   * residue described there, and anything a build predating the ordering contract left behind.
+   *
+   * FEATURE-DETECTED, not assumed. `keys()` was finalized in VS Code 1.105 while this
+   * extension's `engines.vscode` floor is `^1.95.0`, so on an older host the method simply is
+   * not there and the sweep falls back to the three name-based records. Raising the floor to
+   * make this unconditional is a compatibility decision, not a bug fix, so it is not made here.
+   *
+   * Filtered to `macro-secret-text-` and nothing else: the same `SecretStorage` holds server
+   * passwords, key passphrases, proxy credentials and auth-profile secrets, and Complete Reset
+   * of the MACRO store must not touch any of them. Best-effort throughout — a rejection or a
+   * non-array answer degrades to "nothing extra to sweep" rather than failing a reset that has
+   * vault entries of its own to delete.
+   */
+  private async readVaultSecretIds(): Promise<Set<string>> {
+    const out = new Set<string>();
+    const secrets = this.context.secrets as Partial<vscode.SecretStorage>;
+    if (typeof secrets.keys !== "function") return out;
+    let keys: unknown;
+    try {
+      keys = await secrets.keys();
+    } catch {
+      return out;
+    }
+    if (!Array.isArray(keys)) return out;
+    for (const key of keys) {
+      if (typeof key !== "string" || !key.startsWith(SECRET_PREFIX)) continue;
+      const id = key.slice(SECRET_PREFIX.length);
+      if (isValidMacroId(id)) out.add(id);
+    }
+    return out;
   }
 
   private emit(): void {
@@ -816,8 +922,13 @@ export class VscodeMacroStore implements MacroStore {
    *     extension host does not let this code bypass, invalidate, or lock.
    *   - Making the ledger append-only does not help either: the lost write is the union
    *     itself, not the shrink.
-   *   - Enumerating the vault instead of keeping a ledger would remove the need for it
-   *     entirely, and is what the ledger is a workaround FOR: `SecretStorage` has no list API.
+   *   - Enumerating the vault instead of keeping a ledger is what this array is a workaround
+   *     FOR, and it is now available — but only conditionally. `SecretStorage.keys()` was
+   *     finalized in VS Code 1.105 and this extension's engine floor is `^1.95.0`, so
+   *     `clearAll()` uses it when the host has it (`readVaultSecretIds()`) and falls back to
+   *     the name-based records when it does not. That makes enumeration a strictly better
+   *     SWEEP, not a replacement for this ledger: it says nothing about what a SAVE must do,
+   *     and it is absent on the older hosts the ledger is there for.
    *   - ONE MEMENTO KEY PER SECRET ID does not help, though it looks like it should. It was
    *     proposed in review precisely to make concurrent additions write distinct storage
    *     entities: `nexus.macros.secretId.<hash>` per id, swept via `Memento.keys()`. But a
@@ -1026,32 +1137,59 @@ export class VscodeMacroStore implements MacroStore {
 }
 
 /**
- * Dedupe key for LEGACY SETTINGS ABSORPTION only. Deliberately NOT the same key as
- * configCommands.ts's `keyOf()`, which was widened to cover the whole trigger configuration
- * and every variable field; the comment here used to claim they were the same and they are not.
+ * Dedupe key for LEGACY SETTINGS ABSORPTION only. It is NOT `keyOf()` (configCommands.ts) and
+ * cannot be, but the two now share their canonicalization (`canonicalMacro*Terms()`,
+ * macroStore.ts) so that the one rule both must obey — runtime-indistinguishable records key
+ * the same, runtime-distinguishable records do not — has a single implementation.
  *
  * They answer different questions and have opposite failure directions. `keyOf()` decides
  * whether an IMPORTED record is dropped, so a key that is too coarse silently discards a
- * legitimate macro — it must be as specific as possible. This one decides whether a record
- * already written to MACROS_KEY is absorbed from settings.json AGAIN, on every activation and
- * on every Settings Sync replay, so a key that is too specific duplicates a macro on every
- * start. It is compared across a redaction boundary: `persistLegacyMigration()` runs the
- * absorbed record through `withRedactedVariables()` before persisting, so the settings copy can
- * carry a masked variable's `default` that the on-disk copy does not. Keying on that field
- * would make the two copies never match and multiply the macro indefinitely.
+ * legitimate macro. This one decides whether a record already written to MACROS_KEY is absorbed
+ * from settings.json AGAIN, on every activation and on every Settings Sync replay, so a key
+ * that is too specific duplicates a macro on every start.
  *
- * `text` is `__SECRET__` for a secret macro for the same reason: on-disk it is `""` (the value
- * is in the vault) while in settings.json it is the cleartext.
+ * THE ONLY THING THAT MAY BE OMITTED IS WHAT THE REDACTION BOUNDARY DESTROYS.
+ * `persistLegacyMigration()` runs the absorbed record through `withRedactedVariables()` before
+ * persisting, so a field that survives in settings.json but not on disk would make the two
+ * copies never match and multiply the macro indefinitely. Exactly two things are in that
+ * category, and they are handled rather than dropped from the key:
+ *
+ *   - a secret macro's `text` — cleartext in settings.json, `""` on disk once the value moves
+ *     to the vault — which keys as the fixed `"__SECRET__"`;
+ *   - a MASKED variable's `default`/`remember`, which `canonicalMacroVariableTerms()` reports
+ *     only for non-masked variables (see its doc comment).
+ *
+ * That is the whole of the exemption. An earlier revision generalized it into "leave the
+ * trigger configuration out", which is not what the boundary requires and cost real macros:
+ * two legacy records differing only in `triggerCooldown: 5` versus `30`, or `slot: 1` versus
+ * `slot: 2`, collapsed in `dedupeLegacyMacros()` BEFORE persistence — and then
+ * `absorbLegacySettingsIfPresent()` cleared `nexus.terminal.macros` from every scope, so the
+ * loser was gone for good. Nothing survives an absorb that the key cannot tell apart, which is
+ * why every non-redacted content field is named here.
+ *
+ * Assembled with `JSON.stringify` rather than a `|` join, for the reason `keyOf()` gives: with
+ * a join, a macro named `a|b` with text `c` keys identically to one named `a` with text `b|c`,
+ * and a hand-written settings.json is exactly where such a name comes from.
  */
 function keyOfLegacy(m: TerminalMacro): string {
   const textKey = m.secret ? "__SECRET__" : (m.text ?? "");
-  // §10 — two macros differing only in their variable declarations must not collide; append
-  // the variable names, which are the one part of a declaration that survives redaction.
-  const variableNames = Array.isArray(m.variables) ? m.variables.map((v) => v?.name ?? "").join(",") : "";
-  return `${m.name ?? ""}|${textKey}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}|${variableNames}`;
+  return JSON.stringify([
+    m.name ?? "",
+    canonicalMacroSecret(m),
+    textKey,
+    ...canonicalMacroTriggerTerms(m),
+    // The EFFECTIVE binding, so a legacy `slot` participates. `persistLegacyMigration()`
+    // deliberately writes absorbed records with their `slot` intact, and `save()` writes
+    // migrated ones with a `keybinding`, so keying the raw field made the same macro look
+    // different depending on which path last wrote it — while `slot: 1` and `slot: 2` looked
+    // identical. Both sides of the comparison go through the same helper, so the migration
+    // itself cannot desynchronize them.
+    canonicalMacroBinding(m),
+    canonicalMacroVariableTerms(m)
+  ]);
 }
 
-/** Dedupe legacy macros by `name|text|triggerPattern|keybinding`. First occurrence wins. */
+/** Dedupe legacy macros on `keyOfLegacy()`. First occurrence wins. */
 function dedupeLegacyMacros(macros: TerminalMacro[]): TerminalMacro[] {
   const seen = new Set<string>();
   const out: TerminalMacro[] = [];

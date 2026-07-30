@@ -30,6 +30,12 @@ import {
 import { sniffImportFormat, type SniffedFormat } from "../utils/importFormatSniffer";
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateLocalShellProfile } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
+import {
+  canonicalMacroBinding,
+  canonicalMacroSecret,
+  canonicalMacroTriggerTerms,
+  canonicalMacroVariableTerms
+} from "../storage/macroStore";
 import { getMacros, saveMacros, replaceMacros, getActiveMacroStore } from "../macroSettings";
 import { validateSettingUpdate } from "../ui/settingsValidation";
 import { SETTINGS_META } from "../ui/settingsMetadata";
@@ -665,22 +671,6 @@ async function promptDecryptPassword(): Promise<string | undefined> {
 }
 
 /**
- * §10 — two macros differing only in their variable declarations must not collide on
- * import/dedupe. EVERY declared field participates, not just the name: `label`, `default`,
- * `secret` and `remember` each change what the macro does when it runs (what the prompt says,
- * what it is prefilled with, whether the input is masked, whether the value is remembered), so
- * two records that differ in any of them are two different macros.
- */
-function variablesKey(m: TerminalMacro): unknown {
-  if (!Array.isArray(m.variables)) return null;
-  return m.variables.map((v) =>
-    v && typeof v === "object"
-      ? [v.name ?? "", v.label ?? "", v.default ?? "", v.secret === true, v.remember === false]
-      : null
-  );
-}
-
-/**
  * Content key for "do I already have this macro?" — used by share import and by merge-mode
  * backup import (the latter because replace-mode restore re-keys every incoming record, so an
  * id in a file stops naming anything local the moment a replace has run; see the merge branch).
@@ -704,6 +694,15 @@ function variablesKey(m: TerminalMacro): unknown {
  * what makes importing the same file twice idempotent after a replace-mode restore has re-keyed
  * everything in it. See the merge branch for why both are load-bearing.
  *
+ * BEING TOO SPECIFIC IS ALSO A BUG, and the opposite one. Every term therefore names what the
+ * RUNTIME can observe, not the field as it happens to be spelled on disk — see
+ * `canonicalMacroTriggerTerms()` and friends (storage/macroStore.ts) for the collapses and the
+ * runtime lines each one mirrors. Two records this key separates are added as two macros, each
+ * with a live auto-trigger, so a spelling difference that the trigger compiler cannot see
+ * (`triggerScope: "all-terminals"` as the macro editor writes it versus the absent scope
+ * `sanitizeImportedMacro()` leaves alone) means a `Password:` responder answering one prompt
+ * twice. That regression shipped on this branch and this is where it is closed.
+ *
  * Built with `JSON.stringify` rather than a `|` join so that a value containing the delimiter
  * cannot forge a different record's key — with a join, a macro named `a|b` and text `c` keys
  * the same as one named `a` with text `b|c`.
@@ -711,16 +710,11 @@ function variablesKey(m: TerminalMacro): unknown {
 function keyOf(m: TerminalMacro): string {
   return JSON.stringify([
     m.name ?? "",
-    m.secret === true,
+    canonicalMacroSecret(m),
     m.text ?? "",
-    m.triggerPattern ?? "",
-    m.triggerCooldown ?? null,
-    m.triggerInterval ?? null,
-    m.triggerInitiallyDisabled === true,
-    m.triggerScope ?? "",
-    m.triggerProfileId ?? "",
-    m.keybinding ?? "",
-    variablesKey(m)
+    ...canonicalMacroTriggerTerms(m),
+    canonicalMacroBinding(m),
+    canonicalMacroVariableTerms(m)
   ]);
 }
 

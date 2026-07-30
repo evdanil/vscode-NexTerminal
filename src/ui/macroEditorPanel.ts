@@ -113,7 +113,7 @@ export class MacroEditorPanel {
     // returned rather than discarded so a caller that CAN await one still can (VS Code does
     // not); it never rejects, so nothing downstream has to handle it.
     this.panel.webview.onDidReceiveMessage((msg) =>
-      this.handleMessage(msg).catch((err) => this.reportHandlerFailure(err))
+      this.handleMessage(msg).catch((err) => this.reportHandlerFailure(err, msg?.type))
     );
     this.panel.onDidDispose(() => {
       this.disposed = true;
@@ -491,15 +491,26 @@ export class MacroEditorPanel {
    * Both channels are used deliberately: the notification is what the user sees when the panel
    * is not focused, and the `#error-save` slot is what they see when it is — it sits beside the
    * Save button, so the dirty flag that (correctly) stayed set has its reason next to it.
+   *
+   * It does NOT re-render. `render()` rebuilds the webview from the STORE, which for a failed
+   * save is the state the user's edit was never written into — so re-rendering here would
+   * silently discard the edit the message is telling them was not saved, which is exactly the
+   * outcome reporting the failure exists to avoid. The panel keeps the user's text, keeps the
+   * dirty flag, and shows why.
+   *
+   * `messageType` is the failing message's `type`, used only to name the operation: the same
+   * store call backs both Save and Delete, and reporting a failed delete as "could not save the
+   * macro" describes the wrong action.
    */
-  private reportHandlerFailure(err: unknown): void {
+  private reportHandlerFailure(err: unknown, messageType?: unknown): void {
     const detail = err instanceof Error ? err.message : String(err);
-    void vscode.window.showErrorMessage(`Nexus could not save the macro: ${detail}`);
+    const action = messageType === "delete" ? "delete" : "save";
+    void vscode.window.showErrorMessage(`Nexus could not ${action} the macro: ${detail}`);
     if (this.disposed) return;
     void this.panel.webview.postMessage({
       type: "saveError",
       field: "save",
-      message: `Not saved: ${detail}`
+      message: `Not ${action === "delete" ? "deleted" : "saved"}: ${detail}`
     });
   }
 
