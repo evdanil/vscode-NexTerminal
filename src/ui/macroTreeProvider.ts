@@ -92,7 +92,7 @@ export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem>
   public readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
 
   public constructor(
-    private readonly isTriggerDisabled: (macro: TerminalMacro, index: number) => boolean = () => false
+    private readonly isTriggerDisabled: (macro: TerminalMacro) => boolean = () => false
   ) {}
 
   public refresh(): void {
@@ -108,7 +108,7 @@ export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem>
 
     return macros.map((macro, index) => {
       const displayBinding = getAssignedBinding(macro);
-      const triggerDisabled = macro.triggerPattern ? this.isTriggerDisabled(macro, index) : undefined;
+      const triggerDisabled = macro.triggerPattern ? this.isTriggerDisabled(macro) : undefined;
       return new MacroTreeItem(macro, index, displayBinding, triggerDisabled);
     });
   }

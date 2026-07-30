@@ -3,9 +3,46 @@ import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore } from "../../src/storage/vscodeMacroStore";
 import { setActiveMacroStore } from "../../src/macroSettings";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
+import type { MacroStore, MacroStoreChangeListener } from "../../src/storage/macroStore";
 
 let mockConfig: Record<string, Record<string, unknown>> = {};
 let activeStore: InMemoryMacroStore;
+
+/**
+ * Minimal MacroStore that does NOT synthesize an `id` on save (unlike both
+ * InMemoryMacroStore and VscodeMacroStore, which always assign one). Used
+ * only by the tests that need to exercise MacroAutoTrigger's `anon:` fallback
+ * identity (macros with no `id` at all) — every other test in this file goes
+ * through `activeStore`/`setConfig()`, where ids ARE always present, matching
+ * how both real store implementations behave in production.
+ */
+class RawMacroStore implements MacroStore {
+  private macros: TerminalMacro[] = [];
+  private readonly listeners = new Set<MacroStoreChangeListener>();
+
+  public async initialize(): Promise<void> {
+    // no-op
+  }
+
+  public getAll(): TerminalMacro[] {
+    return this.macros.map((m) => ({ ...m }));
+  }
+
+  public async save(macros: TerminalMacro[]): Promise<void> {
+    this.macros = macros.map((m) => ({ ...m })); // deliberately no id synthesis
+    for (const listener of this.listeners) listener();
+  }
+
+  public onDidChange(listener: MacroStoreChangeListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  public async clearAll(): Promise<void> {
+    this.macros = [];
+    for (const listener of this.listeners) listener();
+  }
+}
 
 vi.mock("vscode", () => ({
   EventEmitter: class MockEventEmitter<T> {
@@ -41,7 +78,7 @@ vi.mock("vscode", () => ({
   }
 }));
 
-import { MacroAutoTrigger } from "../../src/services/macroAutoTrigger";
+import { MacroAutoTrigger, macroStateKey } from "../../src/services/macroAutoTrigger";
 
 function setConfig(
   macros: Array<Record<string, unknown>>,
@@ -53,6 +90,20 @@ function setConfig(
   };
   // Feed macros into the store synchronously (save is async but InMemoryMacroStore resolves immediately)
   void activeStore.save(macros as TerminalMacro[]);
+}
+
+/**
+ * Fetches the macro currently at `index` from the active store, WITH its
+ * assigned id (InMemoryMacroStore synthesizes one on save — see
+ * inMemoryMacroStore.ts — matching how VscodeMacroStore behaves in
+ * production). MacroAutoTrigger's public API now keys state by macro
+ * identity rather than array position, so tests fetch the macro object to
+ * pass to `isDisabled()`/`setDisabled()` instead of a raw index.
+ */
+function macroAt(index: number): TerminalMacro {
+  const macro = activeStore.getAll()[index];
+  if (!macro) throw new Error(`No macro at index ${index}`);
+  return macro;
 }
 
 /** Flush deferred writeBack calls (setTimeout(fn, 0)). */
@@ -379,7 +430,7 @@ describe("MacroAutoTrigger", () => {
     ]);
     const trigger = new MacroAutoTrigger();
 
-    expect(trigger.isDisabled(0)).toBe(true);
+    expect(trigger.isDisabled(macroAt(0))).toBe(true);
   });
 
   it("large chunk guard keeps the tail so prompt-at-end still matches", () => {
@@ -419,8 +470,8 @@ describe("MacroAutoTrigger", () => {
     const sent: string[] = [];
     const obs = trigger.createObserver((text) => sent.push(text));
 
-    trigger.setDisabled(0, true);
-    expect(trigger.isDisabled(0)).toBe(true);
+    trigger.setDisabled(macroAt(0), true);
+    expect(trigger.isDisabled(macroAt(0))).toBe(true);
 
     obs.onOutput("Password:");
     flush();
@@ -430,7 +481,7 @@ describe("MacroAutoTrigger", () => {
     flush();
     expect(sent).toEqual(["yes\n"]); // other macro still works
 
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     obs.onOutput("Password:");
     flush();
     expect(sent).toEqual(["yes\n", "secret\n"]); // re-enabled
@@ -449,7 +500,7 @@ describe("MacroAutoTrigger", () => {
     flush();
     expect(sent).toEqual([]);
 
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
     expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
     obs.dispose();
@@ -473,7 +524,7 @@ describe("MacroAutoTrigger", () => {
     flush();
     expect(sent).toEqual([]);
 
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
     expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
 
@@ -508,7 +559,7 @@ describe("MacroAutoTrigger", () => {
 
     obs.onOutput("router#");
     flush();
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
     expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
 
@@ -537,7 +588,7 @@ describe("MacroAutoTrigger", () => {
     flush();
     expect(sent).toEqual([]);
 
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
     expect(sent).toEqual(["show ip route 0.0.0.0\n"]);
     obs.dispose();
@@ -552,7 +603,7 @@ describe("MacroAutoTrigger", () => {
     const sent: string[] = [];
     const obs = trigger.createObserver((text) => sent.push(text));
 
-    trigger.setDisabled(0, true);
+    trigger.setDisabled(macroAt(0), true);
 
     obs.onOutput("FirstPrompt");
     flush();
@@ -595,7 +646,7 @@ describe("MacroAutoTrigger", () => {
     expect(sentB).toEqual([]);
 
     // Enable the macro while terminal B is active
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
 
     // Only terminal B should fire
@@ -695,13 +746,13 @@ describe("MacroAutoTrigger", () => {
     flush();
 
     // Enable while on A — starts on A
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
     expect(sentA).toEqual(["show status\n"]);
     expect(sentB).toEqual([]);
 
     // Disable the macro
-    trigger.setDisabled(0, true);
+    trigger.setDisabled(macroAt(0), true);
     // Run a cycle so isDisabled clears armed state
     obsA.onOutput("router#");
     flush();
@@ -709,7 +760,7 @@ describe("MacroAutoTrigger", () => {
     // Switch to B and re-enable — should start on B now
     activeObs = "b";
     obsB.onOutput("router#");
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
     expect(sentB).toEqual(["show status\n"]);
     // A should not have fired again
@@ -752,15 +803,15 @@ describe("MacroAutoTrigger", () => {
     obsC.onOutput("router#");
     flush();
 
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
     expect(sentA).toEqual(["show status\n"]);
     expect(sentB).toEqual([]);
     expect(sentC).toEqual([]);
 
-    trigger.setDisabled(0, true);
+    trigger.setDisabled(macroAt(0), true);
     activeObs = "b";
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
     expect(sentA).toEqual(["show status\n"]);
     expect(sentB).toEqual(["show status\n"]);
@@ -810,7 +861,7 @@ describe("MacroAutoTrigger", () => {
     expect(sentA).toEqual(["show status\n"]);
 
     obsA.onOutput("router#");
-    trigger.setDisabled(0, true);
+    trigger.setDisabled(macroAt(0), true);
     vi.advanceTimersByTime(15_000);
     flush();
     expect(sentA).toEqual(["show status\n"]);
@@ -818,7 +869,7 @@ describe("MacroAutoTrigger", () => {
     activeObs = "b";
     obsB.onOutput("router#");
     flush();
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
     expect(sentB).toEqual(["show status\n"]);
 
@@ -855,7 +906,7 @@ describe("MacroAutoTrigger", () => {
     expect(sentA).toEqual(["show status\n"]);
 
     obsA.dispose();
-    expect(trigger.isDisabled(0)).toBe(true);
+    expect(trigger.isDisabled(macroAt(0))).toBe(true);
     expect(changes).toHaveBeenCalled();
 
     activeObs = "b";
@@ -863,7 +914,7 @@ describe("MacroAutoTrigger", () => {
     flush();
     expect(sentB).toEqual([]);
 
-    trigger.setDisabled(0, false);
+    trigger.setDisabled(macroAt(0), false);
     flush();
     expect(sentB).toEqual(["show status\n"]);
 
@@ -1065,7 +1116,17 @@ describe("MacroAutoTrigger", () => {
       obs.dispose();
     });
 
-    it("positional coherence: disabling index 2 survives reload even though index 1 declares variables and compiles no rule — intervalOwners still keys the interval macro at 0", () => {
+    // Rewritten from a "positional coherence" test (see git history / PR review)
+    // that asserted INDEX semantics: it proved that disabling the macro at raw
+    // array index 2 kept working even though the macro at index 1 (declaring
+    // `variables`) compiles no rule and could have shifted indices via
+    // pre-filtering. Now that state is keyed by macro identity
+    // (`macroStateKey()`), not array position, that specific hazard no longer
+    // exists — indices are never used as keys anywhere in MacroAutoTrigger. This
+    // test is rewritten to assert the equivalent IDENTITY guarantee instead: a
+    // sibling macro that compiles no rule (variables) must not disturb the
+    // disable-state or interval-ownership keying of the macros around it.
+    it("identity coherence: disabling the password macro survives reload even though a sibling macro declares variables and compiles no rule", () => {
       setConfig([
         { name: "interval", text: "show status\n", triggerPattern: "router#", triggerInterval: 10 },
         { name: "hasVars", text: "show ip route $host\n", triggerPattern: "router#", variables: [{ name: "host" }] },
@@ -1074,40 +1135,42 @@ describe("MacroAutoTrigger", () => {
       const trigger = new MacroAutoTrigger();
       const sent: string[] = [];
       const obs = trigger.createObserver((text) => sent.push(text));
+      const intervalMacro = macroAt(0);
+      const pwMacro = macroAt(2);
 
-      // Arm the interval macro at index 0 so intervalOwners keys it there.
+      // Arm the interval macro so intervalOwners keys it by identity.
       obs.onOutput("router#");
       flush();
       expect(sent).toEqual(["show status\n"]);
 
-      // The tree's toggle operates on raw array index — disable index 2 (the
-      // password macro), exactly as extension.ts's setDisabled(item.index, …) would.
-      trigger.setDisabled(2, true);
-      expect(trigger.isDisabled(2)).toBe(true);
+      // Disable the password macro by identity, exactly as extension.ts's
+      // setDisabled(item.macro, …) does.
+      trigger.setDisabled(pwMacro, true);
+      expect(trigger.isDisabled(pwMacro)).toBe(true);
 
-      // Reload (e.g. triggered by an unrelated settings change). A pre-filtering
-      // bug would compile the surviving password macro at index 1, corrupting
-      // both isDisabled(2) and the interval macro's ownership keying at index 0.
+      // Reload (e.g. triggered by an unrelated settings change). The
+      // variables-declaring sibling must not corrupt either the password
+      // macro's disabled state or the interval macro's ownership keying.
       trigger.reload();
 
-      expect(trigger.isDisabled(2)).toBe(true);
-      expect(trigger.isDisabled(0)).toBe(false);
+      expect(trigger.isDisabled(pwMacro)).toBe(true);
+      expect(trigger.isDisabled(intervalMacro)).toBe(false);
 
-      // Index 2 (still disabled) must not fire the password macro.
+      // The password macro (still disabled) must not fire.
       obs.onOutput("Password: ");
       flush();
       expect(sent).toEqual(["show status\n"]);
 
-      // Index 0's interval ownership survived reload — re-arm and confirm it
+      // The interval macro's ownership survived reload — re-arm and confirm it
       // still fires the SAME interval macro after the interval elapses.
       obs.onOutput("Codes: C connected\r\nrouter#");
       vi.advanceTimersByTime(10_000);
       flush();
       expect(sent).toEqual(["show status\n", "show status\n"]);
 
-      // Re-enabling index 2 fires the password macro — proving the index still
-      // resolves to it, not to the (compile-skipped) variables macro at index 1.
-      trigger.setDisabled(2, false);
+      // Re-enabling the password macro by identity fires it — proving identity
+      // still resolves to it, not to the (compile-skipped) variables macro.
+      trigger.setDisabled(pwMacro, false);
       obs.onOutput("Password: ");
       flush();
       expect(sent).toEqual(["show status\n", "show status\n", "secret123\n"]);
@@ -1193,6 +1256,201 @@ describe("MacroAutoTrigger", () => {
       // "hunter2\n" would have been sent here.
       expect(sent).toEqual([]);
       obs.dispose();
+    });
+  });
+
+  describe("macro identity survives array mutation (moveUp/moveDown/remove) — fix/macro-trigger-index-identity", () => {
+    it("REGRESSION: reordering macros does not reattach pause/resume state to whoever now sits in the old slot", () => {
+      setConfig([
+        { name: "A", text: "a\n", triggerPattern: "AAA" },
+        { name: "B", text: "secret-password\n", triggerPattern: "BBB" },
+        { name: "C", text: "c\n", triggerPattern: "CCC" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const macroA = macroAt(0);
+      const macroB = macroAt(1);
+      const macroC = macroAt(2);
+
+      // User pauses B (a secret-bearing trigger) — C is left at its default (active).
+      trigger.setDisabled(macroB, true);
+      expect(trigger.isDisabled(macroB)).toBe(true);
+      expect(trigger.isDisabled(macroC)).toBe(false);
+
+      // Simulate `nexus.macro.moveDown` on B: it swaps array elements 1 and 2
+      // in place and saves — exactly what macroCommands.ts does.
+      void activeStore.save([macroA, macroC, macroB]);
+      trigger.reload();
+
+      // Both directions of the bug: B (now at slot 2) must STAY paused, and C
+      // (now at slot 1 — B's old slot) must STAY active. Before the fix, state
+      // was keyed by array position, so this reorder would have silently
+      // resumed B (the secret macro) and paused C (the unrelated one).
+      expect(trigger.isDisabled(macroB)).toBe(true);
+      expect(trigger.isDisabled(macroC)).toBe(false);
+
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("BBB"); // B's pattern — must NOT fire, it is still paused.
+      flush();
+      expect(sent).toEqual([]);
+
+      obs.onOutput("CCC"); // C's pattern — must still fire, it was never paused.
+      flush();
+      expect(sent).toEqual(["c\n"]);
+
+      obs.dispose();
+    });
+
+    it("removing a macro before a paused one leaves the paused one paused", () => {
+      setConfig([
+        { name: "A", text: "a\n", triggerPattern: "AAA" },
+        { name: "B", text: "b-secret\n", triggerPattern: "BBB" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const macroB = macroAt(1);
+
+      trigger.setDisabled(macroB, true);
+      expect(trigger.isDisabled(macroB)).toBe(true);
+
+      // Simulate `nexus.macro.remove` on A (index 0): splices it out, B shifts
+      // from array index 1 down to index 0.
+      void activeStore.save([macroB]);
+      trigger.reload();
+
+      expect(trigger.isDisabled(macroB)).toBe(true);
+
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+      obs.onOutput("BBB");
+      flush();
+      expect(sent).toEqual([]); // still paused despite shifting to index 0
+      obs.dispose();
+    });
+
+    it("triggerInitiallyDisabled macros keep their resumed/paused state across a reorder", () => {
+      setConfig([
+        { name: "A", text: "a\n", triggerPattern: "AAA" },
+        { name: "route", text: "show ip route\n", triggerPattern: "router#", triggerInitiallyDisabled: true },
+        { name: "C", text: "c\n", triggerPattern: "CCC", triggerInitiallyDisabled: true }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const macroA = macroAt(0);
+      const macroRoute = macroAt(1);
+      const macroC = macroAt(2);
+
+      // Both start paused (triggerInitiallyDisabled).
+      expect(trigger.isDisabled(macroRoute)).toBe(true);
+      expect(trigger.isDisabled(macroC)).toBe(true);
+
+      // User resumes "route" only.
+      trigger.setDisabled(macroRoute, false);
+      expect(trigger.isDisabled(macroRoute)).toBe(false);
+      expect(trigger.isDisabled(macroC)).toBe(true);
+
+      // Reorder: [A, route, C] -> [C, route, A]
+      void activeStore.save([macroC, macroRoute, macroA]);
+      trigger.reload();
+
+      expect(trigger.isDisabled(macroRoute)).toBe(false); // still resumed
+      expect(trigger.isDisabled(macroC)).toBe(true); // still paused
+    });
+
+    it("interval ownership survives a reorder — the interval macro keeps its owner and does not double-fire", () => {
+      setConfig([
+        { name: "A", text: "a\n", triggerPattern: "AAA" },
+        { name: "poll", text: "show status\n", triggerPattern: "router#", triggerInterval: 10 }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const macroA = macroAt(0);
+      const macroPoll = macroAt(1);
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+      expect(sent).toEqual(["show status\n"]);
+
+      // Reorder: [A, poll] -> [poll, A]
+      void activeStore.save([macroPoll, macroA]);
+      trigger.reload();
+
+      obs.onOutput("show status\nrouter#");
+      vi.advanceTimersByTime(10_000);
+      flush();
+      // Fires exactly once more — ownership survived the reorder rather than
+      // being dropped (zero fires) or duplicated (double fire).
+      expect(sent).toEqual(["show status\n", "show status\n"]);
+      obs.dispose();
+    });
+
+    it("macros without an id (anon: fallback identity) also survive a reorder", () => {
+      const rawStore = new RawMacroStore();
+      void rawStore.initialize();
+      setActiveMacroStore(rawStore);
+      mockConfig = { "nexus.terminal.macros": { autoTrigger: true } };
+
+      void rawStore.save([
+        { name: "A", text: "a\n", triggerPattern: "AAA" },
+        { name: "B", text: "b-secret\n", triggerPattern: "BBB" },
+        { name: "C", text: "c\n", triggerPattern: "CCC" }
+      ] as TerminalMacro[]);
+
+      const trigger = new MacroAutoTrigger();
+      const [macroA, macroB, macroC] = rawStore.getAll();
+      expect(macroB.id).toBeUndefined(); // confirms the anon: fallback path is exercised
+
+      trigger.setDisabled(macroB, true);
+      expect(trigger.isDisabled(macroB)).toBe(true);
+      expect(trigger.isDisabled(macroC)).toBe(false);
+
+      // Reorder: [A, B, C] -> [A, C, B]
+      void rawStore.save([macroA, macroC, macroB]);
+      trigger.reload();
+
+      expect(trigger.isDisabled(macroB)).toBe(true);
+      expect(trigger.isDisabled(macroC)).toBe(false);
+
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+      obs.onOutput("BBB");
+      flush();
+      expect(sent).toEqual([]);
+      obs.onOutput("CCC");
+      flush();
+      expect(sent).toEqual(["c\n"]);
+      obs.dispose();
+    });
+
+    it("two id-less macros with identical name AND text collide on the anon: fallback key — documented behaviour, not a bug", () => {
+      // `macroStateKey()` falls back to `anon:${name}${NUL}${text}` only when a
+      // macro has no `id`. Two macros that are byte-for-byte identical in both
+      // name and text produce the SAME key in that case — there is no other
+      // stable, position-independent identity available for a macro the store
+      // hasn't assigned an id to (both InMemoryMacroStore and VscodeMacroStore
+      // always assign one in practice, which is why this only matters for the
+      // rare id-less path). This test asserts and documents that collision
+      // rather than pretending it can't happen: give macros an id, or vary
+      // their text, to avoid it.
+      const rawStore = new RawMacroStore();
+      void rawStore.initialize();
+      setActiveMacroStore(rawStore);
+      mockConfig = { "nexus.terminal.macros": { autoTrigger: true } };
+
+      void rawStore.save([
+        { name: "dup", text: "same\n", triggerPattern: "AAA" },
+        { name: "dup", text: "same\n", triggerPattern: "BBB" }
+      ] as TerminalMacro[]);
+
+      const trigger = new MacroAutoTrigger();
+      const [first, second] = rawStore.getAll();
+
+      expect(macroStateKey(first)).toBe(macroStateKey(second));
+
+      trigger.setDisabled(first, true);
+
+      // Disabling "first" reports "second" as disabled too — they share a key.
+      expect(trigger.isDisabled(second)).toBe(true);
     });
   });
 });

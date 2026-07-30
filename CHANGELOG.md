@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [2.8.74] — 2026-07-30
+
+### Fixed
+
+- **Reordering a macro no longer moves another macro's paused/resumed auto-trigger state onto it.** `MacroAutoTrigger` tracked which macros were paused by their position in the list, and **Move Up** / **Move Down** change positions without moving that state — so reordering could silently resume a macro you had paused and pause one you hadn't. With a paused secret macro (a password auto-send, say) sitting next to an active trigger, a single Move Down was enough to make the secret one live again. All auto-trigger state — paused/resumed, interval ownership, cooldown timers — is now keyed to the macro itself, so it follows the macro wherever it moves in the list. Deleting a macro no longer shifts the state of the ones after it either.
+
 ## [2.8.73] — 2026-07-29
 
 Adds prompted input variables to macros (#35 follow-up) — the editor, sidebar, and template surface of the feature; the underlying scan/substitution engine and the runtime prompt flow ship in the same release.

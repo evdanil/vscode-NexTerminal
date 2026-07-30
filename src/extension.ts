@@ -849,7 +849,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push({ dispose: cwdSyncStateListener });
   renderCwdSyncState();
 
-  const macroTreeProvider = new MacroTreeProvider((_macro, index) => macroAutoTrigger.isDisabled(index));
+  const macroTreeProvider = new MacroTreeProvider((macro) => macroAutoTrigger.isDisabled(macro));
   const macroView = vscode.window.createTreeView("nexusMacros", {
     treeDataProvider: macroTreeProvider
   });
@@ -1158,12 +1158,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
-      macroAutoTrigger.setDisabled(item.index, true);
+      macroAutoTrigger.setDisabled(item.macro, true);
     }
   });
   const enableTriggerCmd = vscode.commands.registerCommand("nexus.macro.enableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
-      macroAutoTrigger.setDisabled(item.index, false);
+      macroAutoTrigger.setDisabled(item.macro, false);
     }
   });
   const fileDisposables = registerFileCommands(ctx);
