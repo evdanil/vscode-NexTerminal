@@ -32,6 +32,28 @@ export function macroGroup(macro: Pick<TerminalMacro, "group">): string | undefi
 }
 
 /**
+ * Normalizes a macro's untrusted `group` in place at an ingest chokepoint
+ * (mirrors `withRedactedVariables()`'s role for `variables`). Returns a new
+ * object only when the value actually changes, matching
+ * `withRedactedVariables()`'s identity-preserving convention.
+ *
+ * Shared by every `MacroStore` implementation's `save()` — Fix 5 (§4.2)
+ * requires `group` to be sanitized identically regardless of which store is
+ * active, the same way `sanitizeMacroFolderList()` is shared for the explicit
+ * folder list.
+ */
+export function withNormalizedGroup<T extends Pick<TerminalMacro, "group">>(macro: T): T {
+  const normalized = sanitizeMacroGroup(macro.group);
+  if (normalized === macro.group) return macro;
+  if (normalized === undefined) {
+    if (macro.group === undefined) return macro;
+    const { group: _drop, ...rest } = macro;
+    return rest as T;
+  }
+  return { ...macro, group: normalized };
+}
+
+/**
  * Sanitizes a persisted/imported explicit-folder list: drops non-strings and
  * structurally invalid paths, dedupes, keeps no ordering guarantee (callers
  * sort as needed). Mirrors the "filter to strings, normalise, drop the rest"

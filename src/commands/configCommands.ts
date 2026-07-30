@@ -1396,11 +1396,20 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // replace just below, and `saveFolders()` itself replaces — no separate
     // upfront-clear step is needed the way `groups` needs one for `addGroup`'s
     // additive API); merge mode unions with what already exists.
-    if (Array.isArray(data.macroFolders)) {
+    //
+    // Fix 5 — a pre-2.8.75 backup predates `macroFolders` entirely, so
+    // `data.macroFolders` is `undefined` rather than `[]`. In REPLACE mode
+    // that must still clear the list (not skip writing it): `saveMacros()`
+    // below unconditionally replaces the macros array, so leaving the OLD
+    // store's folder list untouched would show folders left over from a
+    // config the import just discarded. Merge mode has no such gap — unioning
+    // with nothing already sitting there is a correct no-op.
+    if (mode === "replace") {
+      const incomingFolders = Array.isArray(data.macroFolders) ? sanitizeMacroFolderList(data.macroFolders) : [];
+      await saveMacroFolders(incomingFolders);
+    } else if (Array.isArray(data.macroFolders)) {
       const incomingFolders = sanitizeMacroFolderList(data.macroFolders);
-      if (mode === "replace") {
-        await saveMacroFolders(incomingFolders);
-      } else if (incomingFolders.length > 0) {
+      if (incomingFolders.length > 0) {
         await saveMacroFolders([...new Set([...getMacroFolders(), ...incomingFolders])]);
       }
     }

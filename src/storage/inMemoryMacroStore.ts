@@ -5,7 +5,17 @@ import {
   type MacroStore,
   type MacroStoreChangeListener
 } from "./macroStore";
-import { sanitizeMacroFolderList } from "../services/macroFolders";
+import { sanitizeMacroFolderList, withNormalizedGroup } from "../services/macroFolders";
+
+/**
+ * Fix 1 — mirrors `VscodeMacroStore`'s `isUsableMacro()`: a macro is not
+ * usable without a string `name` and a string `text`; anything else (e.g. a
+ * caller writing through a stale/out-of-bounds index) is dropped here rather
+ * than persisted, so a malformed record can never reach the tree.
+ */
+function isUsableMacro(m: TerminalMacro): boolean {
+  return !!m && typeof m === "object" && typeof m.name === "string" && typeof m.text === "string";
+}
 
 export class InMemoryMacroStore implements MacroStore {
   private macros: TerminalMacro[] = [];
@@ -29,7 +39,14 @@ export class InMemoryMacroStore implements MacroStore {
     // Also mirrors the legacy `slot` → `keybinding` normalization VscodeMacroStore does,
     // so tests and the web-host fallback see the same macro shape the production store
     // hands out. See `withMigratedSlot()` in macroStore.ts.
-    this.macros = assignUniqueMacroIds(macros).map((m) => withMigratedSlot(m));
+    // Fix 1 — unusable records are dropped BEFORE ids are assigned, so a fresh UUID is
+    // never spent on a record that is about to be discarded. Fix 5 — `group` gets the
+    // same ingest-time normalization VscodeMacroStore applies: the two MacroStore
+    // implementations must not have different ingest contracts for the same untrusted
+    // field (§4.2).
+    this.macros = assignUniqueMacroIds(macros.filter(isUsableMacro)).map((m) =>
+      withNormalizedGroup(withMigratedSlot(m))
+    );
     for (const listener of this.listeners) listener();
   }
 

@@ -1659,6 +1659,43 @@ describe("backup import", () => {
     expect(arrayLikeShape?.triggerPattern).toBeUndefined();
   });
 
+  it("Fix 5c — replace mode clears macroFolders when the backup predates the field (pre-2.8.75)", async () => {
+    // A pre-2.8.75 backup has no `macroFolders` key at all (`undefined`, not
+    // `[]`). Replace mode unconditionally replaces the macros array via
+    // `saveMacros()` below — leaving the OLD store's folder list untouched
+    // would show folders left over from a config the import just discarded.
+    const importStore = new InMemoryMacroStore();
+    await importStore.initialize();
+    await importStore.save([{ name: "Stale", text: "t", group: "Cisco" }]);
+    await importStore.saveFolders(["Cisco", "Empty"]);
+    setActiveMacroStore(importStore);
+
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [{ name: "Fresh", text: "echo hi" }],
+      settings: {}
+      // no macroFolders — pre-2.8.75 shape
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup-no-folders.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(importStore.getAll().map((m) => m.name)).toEqual(["Fresh"]);
+    // Before Fix 5c this stayed ["Cisco", "Empty"] — folders from the
+    // discarded config, dangling after the macros they belonged to were wiped.
+    expect(importStore.getFolders()).toEqual([]);
+  });
+
   it("shows error on wrong password", async () => {
     const { encrypt } = await import("../../src/utils/configCrypto");
     const encrypted = encrypt(JSON.stringify({ passwords: {}, passphrases: {}, secretMacros: [] }), "correct");

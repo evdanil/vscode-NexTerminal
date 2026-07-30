@@ -116,6 +116,56 @@ describe("MacroStore (in-memory)", () => {
     expect(m.id).toBeTruthy();
     expect(m.id).not.toBe("");
   });
+
+  it("Fix 1 (BLOCKER) — drops a record with no name/text rather than persisting a ghost macro", async () => {
+    // Reproduces the exact shape a stale-index write produces:
+    // `{ ...updated[idx] }` where `updated[idx]` is `undefined` yields `{}`.
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    await store.save([
+      { name: "Good", text: "t" },
+      {} as unknown as TerminalMacro
+    ]);
+    const all = store.getAll();
+    expect(all).toHaveLength(1);
+    expect(all[0].name).toBe("Good");
+  });
+
+  it("Fix 1 — drops a record whose name or text is non-string", async () => {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    await store.save([
+      { name: "Good", text: "t" },
+      { name: 42, text: "t" } as unknown as TerminalMacro,
+      { name: "NoText", text: undefined } as unknown as TerminalMacro
+    ]);
+    const all = store.getAll();
+    expect(all).toHaveLength(1);
+    expect(all[0].name).toBe("Good");
+  });
+
+  describe("group is sanitized on save() the same way as VscodeMacroStore (Fix 5 — aligned ingest contracts)", () => {
+    it("canonicalizes an empty-string group to undefined", async () => {
+      const store = new InMemoryMacroStore();
+      await store.initialize();
+      await store.save([{ name: "m", text: "t", group: "" }]);
+      expect(store.getAll()[0].group).toBeUndefined();
+    });
+
+    it("drops a structurally invalid group ('..') rather than persisting it", async () => {
+      const store = new InMemoryMacroStore();
+      await store.initialize();
+      await store.save([{ name: "m", text: "t", group: "../secrets" }]);
+      expect(store.getAll()[0].group).toBeUndefined();
+    });
+
+    it("keeps a valid group untouched", async () => {
+      const store = new InMemoryMacroStore();
+      await store.initialize();
+      await store.save([{ name: "m", text: "t", group: "Cisco/Routers" }]);
+      expect(store.getAll()[0].group).toBe("Cisco/Routers");
+    });
+  });
 });
 
 describe("VscodeMacroStore", () => {
@@ -791,6 +841,44 @@ describe("VscodeMacroStore", () => {
       expect(secretBag.get(`macro-secret-text-${a.id}`)).toBe("secret-a");
       expect(secretBag.get(`macro-secret-text-${b.id}`)).toBe("secret-b");
       expect(secretBag.has("macro-secret-text-[object Object]")).toBe(false);
+    });
+
+    it("save() drops a record with no name/text rather than persisting a ghost macro (BLOCKER)", async () => {
+      // Reproduces `nexus.macro.moveToFolder`'s exact failure mode: writing
+      // through a stale/out-of-bounds index turns `{ ...updated[idx] }` (where
+      // `updated[idx]` is `undefined`) into `{}` — a record with no `name` or
+      // `text` that used to survive straight into globalState and then crash
+      // the tree on `macro.text.replace(...)` (macroTreeProvider.ts).
+      const { context, stateBag } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      await store.save([
+        { id: "a", name: "Good", text: "t" },
+        {} as unknown as TerminalMacro
+      ]);
+
+      const all = store.getAll();
+      expect(all).toHaveLength(1);
+      expect(all[0].name).toBe("Good");
+      const persisted = stateBag.get("nexus.macros") as TerminalMacro[];
+      expect(persisted).toHaveLength(1);
+    });
+
+    it("save() drops a record whose name or text is non-string", async () => {
+      const { context } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      await store.save([
+        { id: "a", name: "Good", text: "t" },
+        { id: "b", name: 42, text: "t" } as unknown as TerminalMacro,
+        { id: "c", name: "NoText", text: undefined } as unknown as TerminalMacro
+      ]);
+
+      const all = store.getAll();
+      expect(all).toHaveLength(1);
+      expect(all[0].name).toBe("Good");
     });
   });
 });

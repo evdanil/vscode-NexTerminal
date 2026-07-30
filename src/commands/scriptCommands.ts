@@ -250,6 +250,14 @@ function splitScriptPathSegments(raw: string): string[] {
 
 export function parseScriptPathInput(raw: string): ScriptPathParts | undefined {
   if (raw.includes("\\")) return undefined;
+  // Fix 7 — a trailing "/" (e.g. the pre-seeded "cisco/" from a folder's
+  // context menu, submitted unchanged) has no leaf segment at all:
+  // `splitScriptPathSegments` trims it away silently, which previously left
+  // `dirSegments` empty and `leaf` equal to what the user actually meant as
+  // the FOLDER — creating the script at the scripts ROOT instead of inside
+  // the folder that was right-clicked. Reject it outright rather than
+  // silently reinterpreting the folder name as a leaf.
+  if (raw.trim().endsWith("/")) return undefined;
   const segments = splitScriptPathSegments(raw);
   if (segments.length === 0) return undefined;
   const leaf = segments[segments.length - 1];
@@ -264,6 +272,10 @@ export function parseScriptPathInput(raw: string): ScriptPathParts | undefined {
 function validateScriptPathInput(raw: string): string | undefined {
   if (raw.includes("\\")) {
     return "Use '/' to separate folders, not '\\'.";
+  }
+  // Fix 7 — see parseScriptPathInput's comment: a trailing "/" has no leaf.
+  if (raw.trim().endsWith("/")) {
+    return "Name is required";
   }
   const segments = splitScriptPathSegments(raw);
   if (segments.length === 0) return "Name is required";
@@ -341,23 +353,33 @@ async function createNewScript(globalStoragePath: string, initialFolder?: string
   const scriptsDir = resolveScriptsDir(globalStoragePath);
   const targetDir = dirPath ? vscode.Uri.joinPath(scriptsDir, dirPath) : scriptsDir;
   const target = vscode.Uri.joinPath(targetDir, `${leaf}.js`);
+  // Fix 5 — a name that passes validation (e.g. an absolute-looking segment
+  // like "C:") can still fail at the filesystem. Without this, that surfaced
+  // as VS Code's generic "contributed command failed" with no indication of
+  // what went wrong or where.
   try {
     // Recursive (mkdir -p semantics) — also creates any intermediate folders
     // in `dirPath` (§5.7 — "New Script accepts a path, creating intermediate
     // directories").
     await vscode.workspace.fs.createDirectory(targetDir);
-  } catch {
-    /* idempotent */
+    let exists = true;
+    try {
+      await vscode.workspace.fs.stat(target);
+    } catch {
+      exists = false;
+    }
+    if (exists) {
+      void vscode.window.showWarningMessage(`${leaf}.js already exists. Opening the existing file.`);
+    } else {
+      const body = template.body.replaceAll("{{NAME}}", leaf);
+      await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(body));
+    }
+    const doc = await vscode.workspace.openTextDocument(target);
+    await vscode.window.showTextDocument(doc);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    void vscode.window.showErrorMessage(`Failed to create script: ${message}`);
   }
-  try {
-    await vscode.workspace.fs.stat(target);
-    void vscode.window.showWarningMessage(`${leaf}.js already exists. Opening the existing file.`);
-  } catch {
-    const body = template.body.replaceAll("{{NAME}}", leaf);
-    await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(body));
-  }
-  const doc = await vscode.workspace.openTextDocument(target);
-  await vscode.window.showTextDocument(doc);
 }
 
 /**
@@ -392,7 +414,15 @@ async function createNewScriptFolder(globalStoragePath: string, initialFolder?: 
   } catch {
     // Doesn't exist yet — fall through and create it.
   }
-  await vscode.workspace.fs.createDirectory(target);
+  // Fix 5 — a name that passes validation can still fail at the filesystem
+  // (permissions, an unsupported path shape, etc.); report it instead of
+  // letting it surface as VS Code's generic "contributed command failed".
+  try {
+    await vscode.workspace.fs.createDirectory(target);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    void vscode.window.showErrorMessage(`Failed to create folder: ${message}`);
+  }
 }
 
 function scriptingDocsUrl(): string {

@@ -136,19 +136,51 @@ describe("scanScriptsDir", () => {
     ]);
   });
 
-  it(`stops descending past depth ${SCRIPT_SCAN_MAX_DEPTH} — the folder at the cap is listed but not read into`, async () => {
+  it(`descends fully into a folder at exactly the max depth (${SCRIPT_SCAN_MAX_DEPTH}) — normalizeFolderPath accepts a path of exactly this many segments, so the scanner must read it (Fix 2)`, async () => {
     // Build a straight-line chain d1/d2/.../d10, each containing only the
-    // next directory. ROOT/d1/.../d10 (the depth-10 folder) additionally
-    // contains d11 and a script — content that must NOT surface, because
-    // reading that folder's own listing would be depth-11 work.
+    // next directory. ROOT/d1/.../d10 (the depth-10 folder — exactly as deep
+    // as a user is allowed to create) contains a script that MUST surface:
+    // before Fix 2, this folder was listed but never read, making a
+    // legitimately-created script invisible in both the tree and the picker.
     const dirNames = Array.from({ length: SCRIPT_SCAN_MAX_DEPTH }, (_, i) => `d${i + 1}`);
     let currentDirPath = ROOT;
     for (const name of dirNames) {
       mockFsEntries.set(currentDirPath, [[name, DIR]]);
       currentDirPath = `${currentDirPath}/${name}`;
     }
-    // currentDirPath is now ROOT/d1/.../d10 — never read by the scanner.
-    mockFsEntries.set(currentDirPath, [["d11", DIR], ["deep.js", FILE]]);
+    // currentDirPath is now ROOT/d1/.../d10 — must be read.
+    mockFsEntries.set(currentDirPath, [["deep.js", FILE]]);
+
+    const expectedFolderPaths: string[] = [];
+    let rel = "";
+    for (const name of dirNames) {
+      rel = rel ? `${rel}/${name}` : name;
+      expectedFolderPaths.push(rel);
+    }
+    const depth10Path = expectedFolderPaths[expectedFolderPaths.length - 1];
+
+    const result = await scanScriptsDir(rootUri as never);
+    expect(folderPaths(result)).toEqual(expectedFolderPaths.sort());
+    expect(result.scripts).toEqual([
+      expect.objectContaining({ fileName: "deep.js", folderPath: depth10Path })
+    ]);
+    expect(result.truncated).toBe(false);
+  });
+
+  it(`a folder found one level beyond the cap (depth ${SCRIPT_SCAN_MAX_DEPTH + 1}) still renders but is never descended into`, async () => {
+    // Same chain, one directory deeper: ROOT/d1/.../d10/d11. Folders are
+    // always pushed when discovered regardless of the depth cap (§5.4 — all
+    // directories render), so d11 must still appear in the folder list — but
+    // reading ITS listing would be depth-12 work, so a script placed directly
+    // inside it must never surface.
+    const dirNames = Array.from({ length: SCRIPT_SCAN_MAX_DEPTH + 1 }, (_, i) => `d${i + 1}`);
+    let currentDirPath = ROOT;
+    for (const name of dirNames) {
+      mockFsEntries.set(currentDirPath, [[name, DIR]]);
+      currentDirPath = `${currentDirPath}/${name}`;
+    }
+    // currentDirPath is now ROOT/d1/.../d11 — must NOT be read.
+    mockFsEntries.set(currentDirPath, [["toodeep.js", FILE]]);
 
     const expectedFolderPaths: string[] = [];
     let rel = "";
@@ -159,12 +191,11 @@ describe("scanScriptsDir", () => {
 
     const result = await scanScriptsDir(rootUri as never);
     expect(folderPaths(result)).toEqual(expectedFolderPaths.sort());
-    expect(folderPaths(result)).not.toContain(`${expectedFolderPaths[expectedFolderPaths.length - 1]}/d11`);
-    expect(result.scripts).toEqual([]); // deep.js lives one level past the cap
+    expect(result.scripts).toEqual([]); // toodeep.js lives inside the un-descended depth-11 folder
     expect(result.truncated).toBe(false);
   });
 
-  it(`truncates after examining ${SCRIPT_SCAN_MAX_ENTRIES} directories/non-.js entries, but .js files themselves are not counted`, async () => {
+  it(`truncates after examining ${SCRIPT_SCAN_MAX_ENTRIES} directory entries, reporting exactly the cap — not one past it (Fix 3 off-by-one)`, async () => {
     const entries: Array<[string, number]> = [];
     for (let i = 0; i < SCRIPT_SCAN_MAX_ENTRIES + 1; i++) {
       entries.push([`d${String(i).padStart(4, "0")}`, DIR]);
@@ -174,11 +205,19 @@ describe("scanScriptsDir", () => {
 
     const result = await scanScriptsDir(rootUri as never);
     expect(result.truncated).toBe(true);
-    expect(result.examined).toBe(SCRIPT_SCAN_MAX_ENTRIES + 1);
+    // Before Fix 3 this reported 501 (increment-then-compare) while the
+    // truncation row said "Stopped after 500" — the tooltip and the row
+    // disagreed. Checking the budget BEFORE incrementing means `examined`
+    // never exceeds the advertised cap.
+    expect(result.examined).toBe(SCRIPT_SCAN_MAX_ENTRIES);
     expect(result.folders.length).toBe(SCRIPT_SCAN_MAX_ENTRIES);
   });
 
-  it("does not count .js files against the entry budget", async () => {
+  it(`counts .js files against the entry budget too (Fix 3) — bounds the per-script readFile fan-out downstream`, async () => {
+    // Before Fix 3, a directory full of `.js` files scanned for free: `examined`
+    // stayed 0 and `truncated` stayed false no matter how many scripts existed,
+    // so both the Scripts tree and pickScriptFromWorkspace() would issue one
+    // sequential readFile per script with no cap and no truncation node.
     const entries: Array<[string, number]> = [];
     for (let i = 0; i < SCRIPT_SCAN_MAX_ENTRIES + 1; i++) {
       entries.push([`s${String(i).padStart(4, "0")}.js`, FILE]);
@@ -186,8 +225,17 @@ describe("scanScriptsDir", () => {
     mockFsEntries.set(ROOT, entries);
 
     const result = await scanScriptsDir(rootUri as never);
-    expect(result.truncated).toBe(false);
-    expect(result.examined).toBe(0);
-    expect(result.scripts.length).toBe(SCRIPT_SCAN_MAX_ENTRIES + 1);
+    expect(result.truncated).toBe(true);
+    expect(result.examined).toBe(SCRIPT_SCAN_MAX_ENTRIES);
+    expect(result.scripts.length).toBe(SCRIPT_SCAN_MAX_ENTRIES); // fan-out bounded, not 501
+  });
+
+  it("skips the generated types/ directory at the scripts root case-insensitively (WSL2's /mnt/c mount is case-insensitive)", async () => {
+    mockFsEntries.set(ROOT, [["Types", DIR]]);
+    mockFsEntries.set(`${ROOT}/Types`, [["nexus-scripts.d.ts", FILE]]);
+
+    const result = await scanScriptsDir(rootUri as never);
+    expect(folderPaths(result)).toEqual([]);
+    expect(result.scripts).toEqual([]);
   });
 });

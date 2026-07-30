@@ -286,6 +286,51 @@ describe("scriptCommands", () => {
       expect(message!).toMatch(/use '\/'/i);
       expect(state.writtenFiles.size).toBe(0);
     });
+
+    it("Fix 7 — a trailing slash is rejected with 'Name is required', not silently creating the folder name as a script at the root", async () => {
+      // Regression: right-click "cisco" -> New Script pre-seeds "cisco/"; if
+      // the user presses Enter without typing a leaf, the pre-fix code
+      // silently created "cisco.js" at the scripts ROOT — the opposite of
+      // what pre-seeding a folder prefix promises.
+      state.inputBoxReturn = "cisco/";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler({ kind: "folder", path: "cisco", name: "cisco", uri: { fsPath: "/ws/.nexus/scripts/cisco" } });
+
+      expect(state.inputBoxValidator).toBeDefined();
+      expect(state.inputBoxValidator!("cisco/")).toBe("Name is required");
+      // Even though the mock's showInputBox doesn't itself enforce
+      // validateInput, parseScriptPathInput independently rejects the same
+      // input — nothing gets written at all, and specifically not at the root.
+      expect(state.writtenFiles.has("/ws/.nexus/scripts/cisco.js")).toBe(false);
+      expect(state.writtenFiles.size).toBe(0);
+    });
+  });
+
+  describe("Fix 5 — filesystem failures during New Script / New Folder are reported, not left to surface as a generic 'contributed command failed'", () => {
+    it("New Script: a createDirectory failure is caught and shown via showErrorMessage", async () => {
+      vi.mocked(vscode.workspace.fs.createDirectory).mockRejectedValueOnce(new Error("EINVAL: invalid path"));
+      state.inputBoxReturn = "my-procedure";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+
+      await expect(handler()).resolves.toBeUndefined();
+
+      expect(state.mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("EINVAL"));
+      expect(state.writtenFiles.size).toBe(0);
+    });
+
+    it("New Folder: a createDirectory failure is caught and shown via showErrorMessage", async () => {
+      state.mockFsStatThrows = true; // doesn't exist yet, so creation is attempted
+      vi.mocked(vscode.workspace.fs.createDirectory).mockRejectedValueOnce(new Error("EACCES: permission denied"));
+      state.inputBoxReturn = "cisco";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+
+      await expect(handler()).resolves.toBeUndefined();
+
+      expect(state.mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("EACCES"));
+    });
   });
 
   describe("nexus.script.newFolder (§5.7 — New Folder)", () => {

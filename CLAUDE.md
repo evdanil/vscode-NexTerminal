@@ -116,6 +116,10 @@ Graceful degradation — registers stub commands showing "not available in brows
 - Integration tests for `TunnelManager` use real TCP sockets
 - Test fixtures in `test/fixtures/` (mock sidecar scripts)
 
+### Testing conventions
+
+- **A test must fail against the specific wrong implementation it exists to prevent.** Before trusting a regression test, ask what happens if the fix it's guarding were reverted or never written — if the test would still pass, it's vacuous. The recurring trap: a fixture where the correct and the broken behaviour produce identical state (e.g. asserting a drop onto root left a macro's folder `undefined`, when the macro had no folder to begin with — a no-op reads the same whether the drop was correctly rejected or silently mis-processed). Construct the fixture so the buggy path visibly changes the outcome, and when in doubt, actually apply the wrong implementation and confirm the test fails before trusting it.
+
 ## Active Technologies
 - TypeScript strict, ES2022 target, CommonJS output (extension host); `node:worker_threads` Worker bundle is the same target — Node 20.x via VS Code's extension host runtime + `vscode` API; `node:worker_threads`; `AsyncFunction` constructor for user-code loading (no `node:vm` module use); no new npm dependencies (001-scripting-support)
 - User script files under workspace-relative directory (default `.nexus/scripts/`); generated IntelliSense scaffolding under `<scriptsDir>/types/nexus-scripts.d.ts` + `<scriptsDir>/jsconfig.json`; new VS Code settings keys `nexus.scripts.path`, `nexus.scripts.defaultTimeout`, `nexus.scripts.macroPolicy` (additive — no migration) (001-scripting-support)

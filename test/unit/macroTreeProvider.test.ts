@@ -679,25 +679,37 @@ describe("MacroTreeProvider drag and drop (§4.9)", () => {
   });
 
   it("a foreign MIME payload (no macro MIME entry) is rejected — no mutation", async () => {
-    await testStore.save([{ id: "m1", name: "M", text: "t" }]);
+    // Fix 4(a) — the macro must start WITH a group and drop onto ROOT, so a
+    // leaking payload would visibly CLEAR it. The prior fixture (no group,
+    // drop onto root) made "rejected" and "processed" produce the identical
+    // `undefined` outcome — deleting the `if (!transferItem) return;` guard
+    // still passed.
+    await testStore.save([{ id: "m1", name: "M", text: "t", group: "Cisco" }]);
     const dataTransfer = makeDataTransfer({ "application/vnd.nexus.item": "{}" });
 
     await provider.handleDrop(undefined, dataTransfer as unknown as vscode.DataTransfer);
 
-    expect(testStore.getAll().find((m) => m.id === "m1")?.group).toBeUndefined();
-    // Confirm this genuinely tested the reject path, not a same-value no-op:
-    // saving happens only on an actual change, so assert save was never reached
-    // by checking the store's macro array reference-shape is untouched (name intact).
+    expect(testStore.getAll().find((m) => m.id === "m1")?.group).toBe("Cisco");
     expect(testStore.getAll()).toHaveLength(1);
   });
 
   it("an unknown macro id in the payload is a no-op", async () => {
-    await testStore.save([{ id: "m1", name: "M", text: "t" }]);
+    // Fix 4(b) — two macros in DIFFERENT folders; assert the one NOT named by
+    // the payload is untouched. The prior fixture had only one macro, so a
+    // `findIndex(...)` replaced by a hardcoded `0` would still have targeted
+    // (and left unchanged) the same, only macro — this version would catch
+    // that mutant, since a hardcoded 0 now targets "m1" instead of no one.
+    await testStore.save([
+      { id: "m1", name: "M1", text: "t", group: "Cisco" },
+      { id: "m2", name: "M2", text: "t", group: "Juniper" }
+    ]);
     const dataTransfer = makeDataTransfer({ [MACRO_DRAG_MIME]: new vscode.DataTransferItem("does-not-exist") });
 
     await provider.handleDrop(undefined, dataTransfer as unknown as vscode.DataTransfer);
 
-    expect(testStore.getAll()).toEqual([expect.objectContaining({ id: "m1", name: "M" })]);
+    const macros = testStore.getAll();
+    expect(macros.find((m) => m.id === "m1")?.group).toBe("Cisco");
+    expect(macros.find((m) => m.id === "m2")?.group).toBe("Juniper");
   });
 });
 

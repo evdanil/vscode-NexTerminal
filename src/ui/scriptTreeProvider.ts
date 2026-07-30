@@ -57,6 +57,15 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   private generation = 0;
   private scanPromise?: Promise<ScriptScanResult>;
 
+  // Fix 3 — `hasMarkedScriptBelowRoot()` re-reads (and header-parses) every
+  // non-root script in the scan. VS Code can call `getChildren(undefined)`
+  // more than once for the same render (e.g. reveal/selection churn) without
+  // a new scan ever starting, which previously repeated that full read on
+  // each call. Memoised per generation: a result computed for the CURRENT
+  // scan generation is reused rather than re-reading the filesystem; a new
+  // scan (bumping `generation`) naturally invalidates it.
+  private markedBelowRootCache?: { generation: number; result: boolean };
+
   public constructor(
     private readonly manager: ScriptRuntimeManager,
     private readonly globalStoragePath: string
@@ -259,8 +268,18 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
     return children;
   }
 
-  /** Tree-wide check for §5.6: is there a marked script anywhere below the root? */
+  /**
+   * Tree-wide check for §5.6: is there a marked script anywhere below the
+   * root? Memoised per scan generation (Fix 3) — without this, every root
+   * `getChildren()` call that finds zero root-level scripts re-reads and
+   * re-parses every non-root script in the tree, on top of the per-folder
+   * reads `getChildren()` already does as each folder renders.
+   */
   private async hasMarkedScriptBelowRoot(scan: ScriptScanResult): Promise<boolean> {
+    if (this.markedBelowRootCache && this.markedBelowRootCache.generation === this.generation) {
+      return this.markedBelowRootCache.result;
+    }
+    let found = false;
     for (const s of scan.scripts) {
       if (s.folderPath === undefined) continue; // already accounted for by the caller
       let text: string;
@@ -271,10 +290,12 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
         continue;
       }
       if (parseScriptHeader(text).marker) {
-        return true;
+        found = true;
+        break;
       }
     }
-    return false;
+    this.markedBelowRootCache = { generation: this.generation, result: found };
+    return found;
   }
 
   private ensureWatcher(): void {

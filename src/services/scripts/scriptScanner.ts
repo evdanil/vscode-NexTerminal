@@ -20,14 +20,29 @@ import * as vscode from "vscode";
  * dependency on `scriptHeader.ts` and stays cheap to call from either side.
  */
 
-/** Matches `MAX_FOLDER_DEPTH` in `src/utils/folderPaths.ts` (§5.3). */
+/**
+ * Matches `MAX_FOLDER_DEPTH` in `src/utils/folderPaths.ts` (§5.3) — a folder
+ * path of exactly this many segments is the deepest `normalizeFolderPath`
+ * lets a user create (New Folder / New Script). Fix 2: the scanner must
+ * therefore DESCEND into a folder at exactly this depth (read its own
+ * scripts/subfolders), not merely list it — otherwise a script the product
+ * itself allowed the user to create is invisible in both the Scripts tree
+ * and the picker, with no truncation node and no explanation. A folder found
+ * one level beyond this (depth + 1) is still listed (§5.4 — all directories
+ * render) but is never descended into.
+ */
 export const SCRIPT_SCAN_MAX_DEPTH = 10;
 
 /**
- * Entries examined counts directories AND non-`.js` files — NOT `.js` files
- * themselves. Counting only "uninteresting" entries is deliberate (§5.3):
- * otherwise a directory containing 50,000 unrelated files would cost nothing
- * against the budget while still making every scan enumerate all of them.
+ * Entries examined counts EVERY directory and EVERY file, `.js` scripts
+ * included (Fix 3). An earlier version of this scanner exempted `.js` files
+ * from the budget — reasoning that only "uninteresting" entries should count
+ * — but the expensive work downstream is PER SCRIPT FILE: `ScriptTreeProvider`
+ * and `pickScriptFromWorkspace` each `readFile` every script found. Exempting
+ * `.js` files let a directory of thousands of bundled scripts skip the
+ * budget entirely while still making the tree and the picker issue that many
+ * sequential `readFile` calls, repeated after every debounced watcher burst,
+ * with no truncation row and no explanation.
  */
 export const SCRIPT_SCAN_MAX_ENTRIES = 500;
 
@@ -73,22 +88,30 @@ export interface ScriptScanResult {
   readonly folders: ScannedFolder[];
   /** True once the entry-examination budget (§5.3) was hit; the scan stopped early. */
   readonly truncated: boolean;
-  /** How many directory / non-.js-file entries were examined before stopping. */
+  /** How many directory / file entries (`.js` scripts included, Fix 3) were examined before stopping. */
   readonly examined: number;
 }
 
 /**
  * Recursively scans `root` for `.js` files and their containing directories,
- * bounded by depth (10) and examined-entry count (500). Never throws — a
- * missing or unreadable directory (including the root itself) yields an empty
- * result, matching the pre-existing "no scripts folder yet" UX in both
- * consumers.
+ * bounded by depth and examined-entry count. Never throws — a missing or
+ * unreadable directory (including the root itself) yields an empty result,
+ * matching the pre-existing "no scripts folder yet" UX in both consumers.
+ *
+ * Depth: descends into directories up to `SCRIPT_SCAN_MAX_DEPTH` (10) levels
+ * deep — a folder at exactly that depth is still fully read (Fix 2); a
+ * folder found one level beyond it is listed but never descended into.
+ *
+ * Entries: every directory and file examined counts against
+ * `SCRIPT_SCAN_MAX_ENTRIES` (500), `.js` scripts included (Fix 3) — once
+ * exceeded, the scan stops immediately and `examined` reports exactly the
+ * cap, never one past it.
  *
  * Symlinked directories: uses `type & vscode.FileType.Directory` (a bitmask
  * test), NOT `type === vscode.FileType.Directory`, so a symlinked directory —
  * common for NTFS junctions surfaced through WSL2's /mnt/c — is followed as a
  * folder rather than silently skipped. This is safe against symlink cycles
- * because the depth cap (10) bounds recursion regardless of how the cycle is
+ * because the depth cap bounds recursion regardless of how the cycle is
  * formed; the caps here are the loop protection, not symlink detection (§5.3).
  */
 export async function scanScriptsDir(root: vscode.Uri): Promise<ScriptScanResult> {
@@ -108,40 +131,42 @@ export async function scanScriptsDir(root: vscode.Uri): Promise<ScriptScanResult
 
     for (const [name, type] of entries) {
       if (truncated) return;
+
+      // Fix 3 — check the budget BEFORE incrementing, and count EVERY entry
+      // (directories, .js files, everything else) uniformly. Checking before
+      // incrementing means `examined` reports exactly SCRIPT_SCAN_MAX_ENTRIES
+      // once truncated, matching the "Stopped after 500" row (an
+      // increment-then-compare would report 501 in the tooltip instead).
+      if (examined >= SCRIPT_SCAN_MAX_ENTRIES) {
+        truncated = true;
+        return;
+      }
+      examined += 1;
+
       const isDir = (type & vscode.FileType.Directory) !== 0;
 
       if (isDir) {
-        // Every directory entry counts against the budget, whether or not it
-        // ends up skipped — the cost of having enumerated it is real (§5.3).
-        examined += 1;
-        if (examined > SCRIPT_SCAN_MAX_ENTRIES) {
-          truncated = true;
-          return;
-        }
         if (isSkippedDirName(name)) continue;
-        if (folderPath === undefined && name === ROOT_GENERATED_TYPES_DIR) continue;
+        // Case-insensitive, matching `isSkippedDirName`'s own
+        // case-insensitivity (§5.3): on WSL2's case-insensitive /mnt/c mount,
+        // a `Types/` directory at the root is the same on-disk directory as
+        // `types/`.
+        if (folderPath === undefined && name.toLowerCase() === ROOT_GENERATED_TYPES_DIR) continue;
 
         const childPath = folderPath ? `${folderPath}/${name}` : name;
         const childDepth = depth + 1;
         folders.push({ uri: vscode.Uri.joinPath(dirUri, name), path: childPath });
-        if (childDepth < SCRIPT_SCAN_MAX_DEPTH) {
+        // Fix 2 — `<=`, not `<`: see SCRIPT_SCAN_MAX_DEPTH's doc comment.
+        if (childDepth <= SCRIPT_SCAN_MAX_DEPTH) {
           await walk(vscode.Uri.joinPath(dirUri, name), childPath, childDepth);
         }
-        // At the depth cap: the folder itself is still listed (§5.4 — all
+        // Past the cap: the folder itself is still listed (§5.4 — all
         // directories render regardless of contents), just not descended into.
         continue;
       }
 
       if (isJsFile(name)) {
         scripts.push({ uri: vscode.Uri.joinPath(dirUri, name), fileName: name, folderPath });
-        continue;
-      }
-
-      // A non-directory, non-.js entry — counts against the budget too.
-      examined += 1;
-      if (examined > SCRIPT_SCAN_MAX_ENTRIES) {
-        truncated = true;
-        return;
       }
     }
   }

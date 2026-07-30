@@ -334,7 +334,17 @@ async function ensureMacroFolderExists(path: string): Promise<void> {
   await saveMacroFolders([...next]);
 }
 
+/**
+ * Fix 8 — matches `validateNewScriptFolderPath` in `scriptCommands.ts`: a `\`
+ * gets its own specific message rather than the generic
+ * `INVALID_FOLDER_PATH_MESSAGE`, so the two views' folder-path validation is
+ * actually consistent (this user base is on Windows/WSL and will type
+ * `Cisco\Routers`).
+ */
 function validateNewFolderPath(value: string): string | null {
+  if (value.includes("\\")) {
+    return "Use '/' to separate folders, not '\\'.";
+  }
   const normalized = normalizeOptionalFolderPath(value);
   if (normalized === null) {
     return INVALID_FOLDER_PATH_MESSAGE;
@@ -437,13 +447,18 @@ async function renameMacroFolder(oldPath: string, newPath: string): Promise<void
  */
 async function removeMacroFolder(path: string): Promise<void> {
   const macros = getMacros();
+  const parent = parentPath(path);
   const affected = macros.filter((m) => {
     const group = sanitizeMacroGroup(m.group);
     return group !== undefined && isDescendantOrSelf(group, path);
   });
   if (affected.length > 0) {
+    // Fix 9 — a top-level folder has no parent: its macros land at the root,
+    // not "the parent folder" (there isn't one), so the confirmation must
+    // word the destination correctly for that case too.
+    const destinationPhrase = parent ? "moved to the parent folder" : "moved to the root";
     const choice = await vscode.window.showWarningMessage(
-      `Remove folder "${folderDisplayName(path)}"? It contains ${affected.length} macro${affected.length === 1 ? "" : "s"} — they will be moved to the parent folder.`,
+      `Remove folder "${folderDisplayName(path)}"? It contains ${affected.length} macro${affected.length === 1 ? "" : "s"} — they will be ${destinationPhrase}.`,
       { modal: true },
       "Remove Folder"
     );
@@ -452,7 +467,6 @@ async function removeMacroFolder(path: string): Promise<void> {
     }
   }
 
-  const parent = parentPath(path);
   let changed = false;
   const updatedMacros = macros.map((m) => {
     const group = sanitizeMacroGroup(m.group);
@@ -756,11 +770,17 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (!normalized) {
         return;
       }
-      if (allMacroFolders().includes(normalized)) {
-        void vscode.window.showInformationMessage(`Folder "${normalized}" already exists.`);
-        return;
-      }
+      // Fix 5 (§4.5) — the folder may already "exist" only because a macro's
+      // `group` derives it (never persisted explicitly, §4.1). Without
+      // promoting it to an explicit entry here too, "New Folder" on such a
+      // folder is a pure no-op: if the user later moves that last macro out,
+      // the folder they just "created" vanishes instead of persisting empty
+      // as promised.
+      const alreadyExists = allMacroFolders().includes(normalized);
       await ensureMacroFolderExists(normalized);
+      if (alreadyExists) {
+        void vscode.window.showInformationMessage(`Folder "${normalized}" already exists.`);
+      }
     }),
 
     // On a tree item: that macro. From the palette: a multi-select quick pick
@@ -770,6 +790,17 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       const macros = getMacros();
       let targetIndices: number[];
       if (item) {
+        // Fix 1 (BLOCKER) — bounds-check `item.index` before use, matching
+        // every sibling command (`moveUp`/`moveDown`, `remove`, `pasteSecret`):
+        // a context menu can outlive the macro it was opened for (e.g. the
+        // macro is deleted via the editor without dismissing the menu), and
+        // an unchecked index would otherwise write through `updated[idx]`
+        // where `updated[idx]` is `undefined` — persisting `{ ...undefined }`
+        // as a nameless, textless "ghost" macro that crashes the tree forever
+        // after (`macroTreeProvider.ts`'s `macro.text.replace(...)`).
+        if (item.index < 0 || item.index >= macros.length) {
+          return;
+        }
         targetIndices = [item.index];
       } else {
         if (macros.length === 0) {
@@ -797,6 +828,14 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       }
       const updated = [...macros];
       for (const idx of targetIndices) {
+        // Defense in depth for the multi-select (palette) path too: the two
+        // `await`s above (`showQuickPick`, `pickFolderDestination`) are a
+        // window during which another command/window could have removed a
+        // macro out from under a stale index — skip rather than persist a
+        // ghost record (same failure mode Fix 1 closes for the tree-item path).
+        if (idx < 0 || idx >= updated.length) {
+          continue;
+        }
         const next = { ...updated[idx] };
         if (destination) {
           next.group = destination;
@@ -837,6 +876,15 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           if (trimmed.includes("/")) {
             return "Folder name cannot contain '/'";
           }
+          // Fix 5 — this box only ever collects a single leaf segment (the
+          // full candidate path is assembled below from the folder's existing
+          // parent), but it still let '.', '..', and '\' through, which then
+          // silently no-op below via normalizeFolderPath rather than telling
+          // the user why. Use the same message every other folder input in
+          // this feature uses.
+          if (trimmed === "." || trimmed === ".." || trimmed.includes("\\")) {
+            return INVALID_FOLDER_PATH_MESSAGE;
+          }
           return null;
         }
       });
@@ -847,6 +895,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       const candidatePath = parent ? `${parent}/${newName.trim()}` : newName.trim();
       const normalized = normalizeFolderPath(candidatePath);
       if (!normalized) {
+        void vscode.window.showErrorMessage(INVALID_FOLDER_PATH_MESSAGE);
         return;
       }
       await renameMacroFolder(oldPath, normalized);

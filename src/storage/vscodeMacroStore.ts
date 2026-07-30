@@ -10,7 +10,7 @@ import {
   type MacroStoreChangeListener
 } from "./macroStore";
 import { withRedactedVariables } from "../services/macroVariables";
-import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
+import { sanitizeMacroFolderList, withNormalizedGroup } from "../services/macroFolders";
 
 const MACROS_KEY = "nexus.macros";
 const SECRET_IDS_KEY = "nexus.macros.secretIds";
@@ -19,20 +19,17 @@ const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
 const MACRO_FOLDERS_KEY = "nexus.macros.folders";
 
 /**
- * §4.2 — normalizes a macro's untrusted `group` in place at an ingest
- * chokepoint (mirrors `withRedactedVariables()`'s role for `variables`).
- * Returns a new object only when the value actually changes, matching
- * `withRedactedVariables()`'s identity-preserving convention.
+ * Fix 1 — the persistence chokepoint (`save()`) is documented as guaranteeing
+ * every stored macro is usable, but previously only enforced id uniqueness.
+ * A caller bug (e.g. `moveToFolder` writing through a stale/out-of-bounds
+ * index) can turn `{ ...undefined }` into `{}` and have it survive a save —
+ * the tree then crashes forever after on `macro.text.replace(...)`
+ * (`macroTreeProvider.ts`), because nothing sanitizes an already-malformed
+ * record out of existence. A macro is not usable without a string `name` and
+ * a string `text`; anything else is dropped here rather than persisted.
  */
-function withNormalizedGroup<T extends Pick<TerminalMacro, "group">>(macro: T): T {
-  const normalized = sanitizeMacroGroup(macro.group);
-  if (normalized === macro.group) return macro;
-  if (normalized === undefined) {
-    if (macro.group === undefined) return macro;
-    const { group: _drop, ...rest } = macro;
-    return rest as T;
-  }
-  return { ...macro, group: normalized };
+function isUsableMacro(m: TerminalMacro): boolean {
+  return !!m && typeof m === "object" && typeof m.name === "string" && typeof m.text === "string";
 }
 
 /**
@@ -134,7 +131,10 @@ export class VscodeMacroStore implements MacroStore {
     // §4.2 — `group` gets the same ingest-time normalization as `variables` and `slot`,
     // for the same chokepoint reason. The three touch disjoint fields, so the order they
     // compose in does not matter.
-    const normalized: TerminalMacro[] = assignUniqueMacroIds(macros).map((m) =>
+    //
+    // Fix 1 — `isUsableMacro` runs FIRST, so a fresh UUID is never spent on a record
+    // that is about to be dropped, and no vault key is ever derived from one.
+    const normalized: TerminalMacro[] = assignUniqueMacroIds(macros.filter(isUsableMacro)).map((m) =>
       withNormalizedGroup(withRedactedVariables(withMigratedSlot(m)))
     );
 

@@ -101,14 +101,17 @@ describe("macro folder commands", () => {
       expect(getMacroFolders()).toEqual([]);
     });
 
-    it("naming an already-existing folder is a no-op with an info message, not an error", async () => {
+    it("naming a folder that only exists because a macro's group derives it (Fix 5): still shows 'already exists', but now PROMOTES it to an explicit entry so it survives the macro moving out later", async () => {
       await store.save([{ name: "M", text: "t", group: "Cisco" }]);
       mockShowInputBox.mockResolvedValue("Cisco");
 
       await registeredCommands.get("nexus.macro.newFolder")!();
 
       expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining("already exists"));
-      expect(getMacroFolders()).toEqual([]); // nothing NEW was persisted
+      // Before Fix 5 this asserted `[]` (nothing persisted) — which is exactly
+      // the bug: moving "M" out of "Cisco" afterward would make the folder the
+      // user just "created" vanish, since it was never made explicit.
+      expect(getMacroFolders()).toEqual(["Cisco"]);
     });
 
     it("rejects a path-traversal folder name via validateInput", async () => {
@@ -119,13 +122,28 @@ describe("macro folder commands", () => {
       expect(options.validateInput("../secrets")).toBeTruthy();
       expect(options.validateInput("Cisco/Routers")).toBeNull();
     });
+
+    it("Fix 8 — rejects a backslash with a message telling the user to use '/', matching the Scripts view's validator", async () => {
+      mockShowInputBox.mockResolvedValue(undefined);
+      await registeredCommands.get("nexus.macro.newFolder")!();
+
+      const options = mockShowInputBox.mock.calls[0][0] as { validateInput: (v: string) => string | null };
+      const message = options.validateInput("Cisco\\Routers");
+      expect(message).toBeTruthy();
+      expect(message).toMatch(/use '\/'/i);
+    });
   });
 
   describe("nexus.macro.moveToFolder (§4.6, §4.7)", () => {
     it("on a tree item, moves just that one macro", async () => {
+      // Fix 4(c) — both macros start in "Cisco" and the destination is root:
+      // if `targetIndices` were ever widened to "every index" (a plausible
+      // regression given the palette path's multi-select), index 0 would ALSO
+      // be cleared here. Starting both at root (the old fixture) made the
+      // correct and the broken behaviour produce the identical outcome.
       await store.save([
-        { name: "A", text: "t" },
-        { name: "B", text: "t" }
+        { name: "A", text: "t", group: "Cisco" },
+        { name: "B", text: "t", group: "Cisco" }
       ]);
       mockShowQuickPick.mockImplementation(async (items: Array<{ folderKind: string }>) =>
         items.find((i) => i.folderKind === "root")
@@ -134,8 +152,28 @@ describe("macro folder commands", () => {
       await registeredCommands.get("nexus.macro.moveToFolder")!(macroArg(1));
 
       const macros = getMacros();
-      expect(macros[0].group).toBeUndefined();
+      expect(macros[0].group).toBe("Cisco"); // untouched — proves only index 1 moved
       expect(macros[1].group).toBeUndefined();
+    });
+
+    it("Fix 1 (BLOCKER) — a stale/out-of-bounds tree-item index is a no-op, never a persisted ghost macro", async () => {
+      // Reproduces the exact failure from the review: the context menu was
+      // opened for the macro at index 0, but by the time the command fires
+      // (e.g. it was deleted via the Macro Editor without dismissing the
+      // menu), index 0 either no longer exists or now refers to a different
+      // macro entirely. Before Fix 1, `updated[idx] = { ...updated[idx] }`
+      // with an out-of-range idx wrote `{}` — a nameless, textless macro —
+      // straight into the store.
+      await store.save([{ name: "Only", text: "t" }]);
+      const staleItem = macroArg(0);
+      await store.save([]); // the macro is gone; staleItem.index (0) is now out of bounds
+      mockShowQuickPick.mockImplementation(async (items: Array<{ folderKind: string }>) =>
+        items.find((i) => i.folderKind === "root")
+      );
+
+      await registeredCommands.get("nexus.macro.moveToFolder")!(staleItem);
+
+      expect(getMacros()).toEqual([]); // no ghost record persisted
     });
 
     it("moves the macro into an existing folder", async () => {
@@ -243,6 +281,19 @@ describe("macro folder commands", () => {
     it("no-ops without a folder arg", async () => {
       await registeredCommands.get("nexus.macro.renameFolder")!(undefined);
       expect(mockShowInputBox).not.toHaveBeenCalled();
+    });
+
+    it("Fix 5 — validateInput rejects '.', '..', and '\\' with the shared invalid-path message instead of silently no-opping later", async () => {
+      await store.save([{ name: "M", text: "t", group: "Cisco" }]);
+      mockShowInputBox.mockResolvedValue(undefined); // simulate cancelling after seeing the error
+
+      await registeredCommands.get("nexus.macro.renameFolder")!(folderArg("Cisco"));
+
+      const options = mockShowInputBox.mock.calls[0][0] as { validateInput: (v: string) => string | null };
+      expect(options.validateInput("..")).toBeTruthy();
+      expect(options.validateInput(".")).toBeTruthy();
+      expect(options.validateInput("Routers\\Old")).toBeTruthy();
+      expect(options.validateInput("Routers")).toBeNull();
     });
   });
 

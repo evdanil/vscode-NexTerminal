@@ -595,7 +595,7 @@
       },
       {
         "command": "nexus.macro.newFolder",
-        "title": "New Folder",
+        "title": "New Macro Folder",
         "category": "Nexus",
         "icon": "$(new-folder)"
       },
@@ -615,8 +615,7 @@
       },
       {
         "command": "nexus.macro.removeFolder",
-        "title": "Remove Folder (keep macros)",
-        "icon": "$(trash)"
+        "title": "Remove Folder (keep macros)"
       },
       {
         "command": "nexus.files.browse",
@@ -752,7 +751,7 @@
       },
       {
         "command": "nexus.script.newFolder",
-        "title": "New Folder",
+        "title": "New Script Folder",
         "category": "Nexus",
         "icon": "$(new-folder)"
       },
