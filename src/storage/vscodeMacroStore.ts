@@ -3,7 +3,7 @@ import * as vscode from "vscode";
 import type { TerminalMacro } from "../models/terminalMacro";
 import {
   assignIdsForAbsorbedMacros,
-  assignUniqueMacroIds,
+  assignMacroIds,
   isValidMacroId,
   withMigratedSlot,
   type MacroStore,
@@ -42,8 +42,14 @@ export class VscodeMacroStore implements MacroStore {
    * `secrets.get()` resolved `undefined`. That is the same answer the API gives for "no
    * entry" and for "the OS keyring is unavailable" (a known Linux transient; it resolves
    * `undefined` rather than rejecting), so the two cannot be told apart at the call site.
-   * Both resolve to `text: ""` in memory, and `save()` uses this set to refuse to write
-   * that empty string back over whatever is really in the vault. See `save()`.
+   * Both resolve to `text: ""` in memory, and `save()` uses this set twice: to refuse to
+   * write that empty string back over whatever is really in the vault, AND to refuse to
+   * re-key the macro away from the entry it cannot carry (`cannotCarrySecret()`). Either
+   * half alone is insufficient — see `save()`.
+   *
+   * Keyed by the id as READ from globalState, which is the id the vault entry is filed
+   * under. Any lookup in this set must therefore use `MacroIdAssignment.priorId`, never a
+   * post-dedup `macro.id`.
    */
   private unresolvedSecretIds = new Set<string>();
   private readonly listeners = new Set<MacroStoreChangeListener>();
@@ -86,14 +92,14 @@ export class VscodeMacroStore implements MacroStore {
     // upstream guarantees it (a replace-mode backup import saves whatever ids the
     // file contains verbatim — see configCommands.ts), and MacroAutoTrigger's
     // `macroStateKey()` treats any two macros with equal `id` as the SAME macro for
-    // pause/resume, interval ownership and cooldown state. `assignUniqueMacroIds()`
-    // (macroStore.ts, shared with InMemoryMacroStore.save()) treats an empty string
-    // AND any non-string value (e.g. `{length: 1}` from a corrupt import — a plain
-    // `.length` check would be fooled by that) as missing, matching
-    // `macroStateKey()`'s own guard. Dedup runs BEFORE the vault read/write loop
-    // below, which keys every vault entry by the final `m.id` — so by the time that
-    // loop runs, ids are already unique and no secret macro's vault entry can be
-    // overwritten or cross-read by another macro that happened to share its id.
+    // pause/resume, interval ownership and cooldown state. `assignMacroIds()`
+    // (macroStore.ts; `InMemoryMacroStore.save()` uses the same implementation via the
+    // `assignUniqueMacroIds()` wrapper) treats an empty string AND any non-string value
+    // (e.g. `{length: 1}` from a corrupt import — a plain `.length` check would be fooled
+    // by that) as missing, matching `macroStateKey()`'s own guard. Dedup runs BEFORE the
+    // vault read/write loop below, which keys every vault entry by the final `m.id` — so by
+    // the time that loop runs, ids are already unique and no secret macro's vault entry can
+    // be overwritten or cross-read by another macro that happened to share its id.
     //
     // Re-keying is safe HERE, and only here, because this is a write path: every caller is
     // a user-initiated command (macro add/edit/remove/reorder, the macro editor panel,
@@ -104,14 +110,25 @@ export class VscodeMacroStore implements MacroStore {
     //
     // It is loss-free for a duplicated secret whose vault value was actually READ at load:
     // that value sits in `m.text`, and the store loop below writes it back under the fresh
-    // key before any delete runs. When the value could NOT be read the guard below keeps
-    // the existing entry instead of overwriting it — see `unresolvedSecretIds`.
+    // key before any delete runs.
+    //
+    // A value that could NOT be read cannot be carried anywhere, so such a record is not
+    // moved either: `cannotCarrySecret()` pins it to the id its (unreadable) vault entry is
+    // filed under, and the twins that merely collide with it are re-keyed instead. Refusing
+    // only the WRITE, as an earlier revision did, was not enough — the re-keyed secret ended
+    // up filed under a fresh id with nothing behind it while the non-secret twin kept the old
+    // id and its `else` branch below deleted the entry that held the only copy of the
+    // password. One transient keyring failure plus any save at all (a rename, a reorder, a
+    // shortcut) was sufficient. See `unresolvedSecretIds` and the write-order block below.
     //
     // Legacy `slot` is normalized here as well as on the read path, so a restored slot-era
     // backup (configCommands.ts hands `save()` the file's records verbatim) converges to
     // `keybinding` on disk instead of only in memory.
-    const normalized: TerminalMacro[] = assignUniqueMacroIds(macros).map((m) =>
-      withRedactedVariables(withMigratedSlot(m))
+    const assignments = assignMacroIds(macros, {
+      keepIdIfPossible: (m) => this.cannotCarrySecret(m)
+    });
+    const normalized: TerminalMacro[] = assignments.map(({ macro }) =>
+      withRedactedVariables(withMigratedSlot(macro))
     );
 
     const currentIds = new Set(this.resolved.map((m) => m.id).filter((v): v is string => Boolean(v)));
@@ -125,12 +142,27 @@ export class VscodeMacroStore implements MacroStore {
     const vaultStores: Array<{ id: string; value: string }> = [];
     const vaultDeletes: string[] = [];
 
+    // What this store believes is ALREADY in the vault under each id, from the load (or the
+    // last save) that produced `this.resolved`. Used to skip writes that cannot change
+    // anything locally — see the cross-window note on `lastKnownVaultText()`.
+    const lastKnown = this.lastKnownVaultText();
+
     // Plan first, write second. Nothing below this loop touches storage, so the ordering
     // of the awaits that follow is stated in one place rather than emerging from where
     // each case happens to sit in the loop.
     const onDisk: TerminalMacro[] = [];
-    for (const m of normalized) {
+    for (let i = 0; i < normalized.length; i++) {
+      const m = normalized[i];
       const id = m.id!;
+      // The id this record ARRIVED with, and therefore the id any vault entry of its own is
+      // filed under. Every question of the form "what do I already know about this record's
+      // secret?" must be asked with THIS id, never with `m.id`: for a re-keyed record `m.id`
+      // is a UUID minted moments ago that no vault entry and no failed read can ever have
+      // been recorded against, so asking with it answers "nothing known" for precisely the
+      // records the store knows least about. That mistake is what let a keyring outage
+      // destroy a password; see the `assignMacroIds()` call above.
+      const priorId = assignments[i].priorId;
+      const readFailed = priorId !== undefined && this.unresolvedSecretIds.has(priorId);
       if (m.secret) {
         // Named in the ledger whether or not the store below actually runs: the entry may
         // already exist and merely be unreadable, and the ledger's one job is to name
@@ -144,12 +176,34 @@ export class VscodeMacroStore implements MacroStore {
         // record still says `secret: true`, so it resolves to "" again next load). The
         // cost is stated in MacroStore.save()'s doc: an unreadable secret also cannot be
         // deliberately cleared until the keyring answers again.
-        if (!(m.text === "" && this.unresolvedSecretIds.has(id))) {
+        //
+        // Almost every such record kept its id (`cannotCarrySecret()` pinned it), so this
+        // guard is normally asking about the very entry it is protecting. The one record
+        // that reaches here re-keyed is the loser of a collision between TWO unreadable
+        // secrets sharing one stored id: the winner keeps the id and the entry, and the
+        // loser must not leave an empty entry behind under its fresh id.
+        const unchanged = priorId === id && typeof m.text === "string" && lastKnown.get(id) === m.text;
+        if (!(m.text === "" && readFailed) && !unchanged) {
           vaultStores.push({ id, value: m.text });
         }
         onDisk.push({ ...m, text: "" });
       } else {
-        // If this macro was previously secret, clean its vault entry
+        // If this macro was previously secret, clean its vault entry.
+        //
+        // This delete is INCIDENTAL — it fires for every non-secret macro on every save,
+        // including macros that have never been secret — so it must not be reachable by an
+        // entry whose contents this call does not know. It is not: the only key it can name
+        // is this record's own, and an unreadable secret colliding with this record on a
+        // stored id has taken that id back (`cannotCarrySecret()`), leaving this record on a
+        // fresh UUID and this delete a no-op. The one case where the collision does NOT take
+        // the id back is a secret the user has just given a new value, and then the entry
+        // being deleted is the superseded old value of that same macro — exactly what a
+        // healthy keyring would delete on the same edit.
+        //
+        // Deletes that DO destroy a known value are the user's own: removing a macro (the
+        // `currentIds`-minus-`nextIds` loop below) or turning a secret one into a plain one.
+        // Those are identical with a healthy keyring and with a broken one, so an outage
+        // cannot be what caused them.
         vaultDeletes.push(id);
         deletedVaultIds.add(id);
         onDisk.push({ ...m });
@@ -173,9 +227,15 @@ export class VscodeMacroStore implements MacroStore {
     // 3. DELETE, and shrink the ledger, only after MACROS_KEY is the record of truth. The
     //    deletes are what destroy data, so they run last and never before the store that
     //    may be carrying the same value to a new key: with `[non-secret(id X),
-    //    secret(id X)]` the secret is re-keyed to a fresh Y while X stays with the
-    //    non-secret twin, and X's entry — the only durable copy of the secret's value —
-    //    must not be deleted until Y holds it.
+    //    secret(id X)]` and a vault that ANSWERED at load, the secret is re-keyed to a fresh
+    //    Y while X stays with the non-secret twin, and X's entry — the only durable copy of
+    //    the secret's value — must not be deleted until Y holds it.
+    //
+    //    Ordering alone does not cover the same shape when the vault did NOT answer, because
+    //    then no store carries the value anywhere and there is nothing for the delete to run
+    //    after. That case is handled before this point, by not re-keying: the secret keeps X
+    //    and the non-secret twin takes the fresh id, so X is in `nextIds`, no branch names it
+    //    for deletion, and the macro that needs the entry is still the one filed under it.
     //
     // `storedVaultIds` and `deletedVaultIds` are disjoint by construction (ids are unique
     // after dedup, each macro takes exactly one branch, and a removed id is not in
@@ -193,6 +253,83 @@ export class VscodeMacroStore implements MacroStore {
     await this.updateSecretIndex(EMPTY_ID_SET, deletedVaultIds);
     this.resolved = normalized;
     this.emit();
+  }
+
+  /**
+   * True when this record is a secret whose vault value this store could not read, so the
+   * value cannot travel with it. `save()` passes this to `assignMacroIds()` as
+   * `keepIdIfPossible`: such a record keeps the id its entry is filed under and any macro
+   * that merely collides with it on that id is re-keyed instead.
+   *
+   * Keyed on the id the record ARRIVED with, which is what `unresolvedSecretIds` is keyed on
+   * (`reloadFromState()` records the id it read, i.e. the stored one). The `text === ""` term
+   * matters: a user who has typed a NEW value for an unreadable secret is carrying a value
+   * after all, so that record re-keys normally and the new value is written under the new id.
+   *
+   * This is NOT an ownership heuristic of the kind `reloadFromState()` refuses to make. It
+   * decides nothing about who the value belongs to — the read already handed the same value
+   * (or the same failure) to every record sharing the id. It only refuses to MOVE a record
+   * away from side storage this call is unable to move with it.
+   */
+  private cannotCarrySecret(macro: TerminalMacro): boolean {
+    if (!macro || typeof macro !== "object") return false;
+    return (
+      Boolean(macro.secret) &&
+      macro.text === "" &&
+      isValidMacroId(macro.id) &&
+      this.unresolvedSecretIds.has(macro.id)
+    );
+  }
+
+  /**
+   * The vault values this store last OBSERVED, by id: secrets that were read successfully at
+   * load (or written by this window's own `save()`), excluding any id `this.resolved` holds
+   * more than once — for a duplicated id there is no single record whose `text` describes
+   * what is behind the key.
+   *
+   * `save()` skips a `secrets.store()` whose value equals this and whose id did not change.
+   * Locally that is provably a no-op: the store would write the same bytes to the same key.
+   * Across windows it is the difference between keeping and destroying a password. globalState
+   * and the vault are shared, both windows hold a snapshot from whenever they last loaded, and
+   * VS Code offers no compare-and-swap. Window A changes a secret to "new" and saves. Window B,
+   * still holding "old", reorders an unrelated macro. Rewriting every resolved secret on every
+   * save made B's reorder put "old" back over A's "new" — a value B's user never typed and
+   * never saw. Writing only what B's user actually changed leaves A's value standing.
+   *
+   * What this deliberately does NOT do, and why there is no re-read guard on `save()` the way
+   * there is on `persistLegacyMigration()` and the `reloadFromState()` scrub:
+   *
+   *   - It does not make `save()` atomic across windows. B's MACROS_KEY write still lands
+   *     wholesale, so B can still revert A's edits to NON-secret fields (name, trigger,
+   *     keybinding, order). That is the generic globalState race; it predates this store and
+   *     is not fixable without a compare-and-swap primitive VS Code does not expose.
+   *   - It is not extended into "re-read MACROS_KEY and abandon the save if it moved". The two
+   *     places that DO re-read are best-effort repairs nobody asked for — a redaction scrub and
+   *     a legacy absorption — where skipping costs nothing and the next save redoes it. `save()`
+   *     is the opposite: every caller is a user-initiated command, and silently discarding a
+   *     macro the user just wrote, with the UI reporting success, trades a rare cross-window
+   *     revert for routine unexplained data loss. Losing an edit you can see is worse than
+   *     losing one you cannot.
+   *
+   * The narrow, non-destructive half of the protection is therefore taken and the destructive
+   * half is declined, on purpose.
+   */
+  private lastKnownVaultText(): Map<string, string> {
+    const occurrences = new Map<string, number>();
+    for (const m of this.resolved) {
+      if (isValidMacroId(m.id)) occurrences.set(m.id, (occurrences.get(m.id) ?? 0) + 1);
+    }
+    const known = new Map<string, string>();
+    for (const m of this.resolved) {
+      if (!isValidMacroId(m.id) || occurrences.get(m.id) !== 1) continue;
+      if (!m.secret || typeof m.text !== "string") continue;
+      // An id whose read failed describes nothing: `text` is the "" the failure produced,
+      // not the entry's contents. Leaving it out keeps the skip above from mistaking that
+      // "" for a match — the read-failure guard in `save()` handles those records instead.
+      if (this.unresolvedSecretIds.has(m.id)) continue;
+      known.set(m.id, m.text);
+    }
+    return known;
   }
 
   public onDidChange(listener: MacroStoreChangeListener): () => void {
@@ -250,7 +387,8 @@ export class VscodeMacroStore implements MacroStore {
    *    into `text` here, so writing it back under a fresh key preserves it — as far as
    *    the read got. A read that returned `undefined` is recorded in
    *    `unresolvedSecretIds` instead, because "" would otherwise be indistinguishable
-   *    from a real empty secret at save time.
+   *    from a real empty secret at save time; `save()` then declines to re-key that macro
+   *    at all, since a value it could not read is a value it cannot carry to a new key.
    *
    * What it DOES normalize is `slot` → `keybinding` (`withMigratedSlot()`, macroStore.ts),
    * in memory only. That is a pure per-record field rename with no bearing on identity or
@@ -354,6 +492,31 @@ export class VscodeMacroStore implements MacroStore {
    *     deleted, so the ledger does not grow without bound.
    * Over-naming is the cheap direction: an id in the ledger with no entry behind it costs
    * one no-op `secrets.delete()` at `clearAll()`.
+   *
+   * KNOWN, ARGUED GAP — a cross-window ledger race, deliberately not fixed here. This is a
+   * read-modify-write: two windows can each read the ledger before the other's write is
+   * visible, and each writes its own union. Windows A and B add secrets `a` and `b`; both
+   * read `[]`; A writes `[a]`, B writes `[b]`. If B's MACROS_KEY write also lands last,
+   * `macro-secret-text-a` is named by neither key and Complete Reset cannot sweep it — a
+   * stranded plaintext secret in the OS keyring. Reproduced in review.
+   *
+   * Not fixed because no fix is available at this layer, and the plausible-looking ones are
+   * worse than the gap:
+   *   - Re-reading closer to the write does nothing. The read and the `update()` call below
+   *     are ALREADY adjacent with no `await` between them, so within a window the sequence is
+   *     atomic. The staleness is in VS Code's cross-process globalState cache, which the
+   *     extension host does not let this code bypass, invalidate, or lock.
+   *   - Making the ledger append-only does not help either: the lost write is the union
+   *     itself, not the shrink.
+   *   - Enumerating the vault instead of keeping a ledger would remove the need for it
+   *     entirely, and is what the ledger is a workaround FOR: `SecretStorage` has no list API.
+   *
+   * What bounds it: `reloadFromState()` re-unions every secret id in MACROS_KEY at every
+   * activation, so a stranded entry is re-named the moment its macro is still on disk. The
+   * residue is confined to the case where BOTH writes are lost for the same id — the macro
+   * gone from MACROS_KEY and the id gone from the ledger — which requires the two windows to
+   * lose the same race twice, on the same id, in the same direction. Revisit if VS Code ever
+   * exposes a compare-and-swap on globalState or an enumerable SecretStorage.
    */
   private async updateSecretIndex(
     added: ReadonlySet<string>,

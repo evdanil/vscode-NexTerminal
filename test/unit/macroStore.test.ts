@@ -14,7 +14,7 @@ vi.mock("vscode", () => ({
 
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore } from "../../src/storage/vscodeMacroStore";
-import { assignUniqueMacroIds, isValidMacroId } from "../../src/storage/macroStore";
+import { assignMacroIds, assignUniqueMacroIds, isValidMacroId } from "../../src/storage/macroStore";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
 function makeFakeContext() {
@@ -651,6 +651,189 @@ describe("VscodeMacroStore", () => {
     });
   });
 
+  describe("unreadable secrets meet the duplicate-id repair — the re-key must not strand the value", () => {
+    it("an outage plus a duplicate id: the unreadable secret keeps its id, the twin is re-keyed instead", async () => {
+      const { context, stateBag, secretBag } = makeFakeContext();
+
+      // What a pre-invariant build could leave on disk: two macros sharing one id, one of
+      // them the secret. `save()` is what repairs it.
+      stateBag.set("nexus.macros", [
+        { id: "dup", name: "Poll", text: "show status\n" },
+        { id: "dup", name: "Password", text: "", secret: true }
+      ]);
+      secretBag.set("macro-secret-text-dup", "hunter2\n");
+      stateBag.set("nexus.macros.secretIds", ["dup"]);
+
+      // Keyring outage at activation: `get()` reports it as `undefined`.
+      context.secrets.get = async () => undefined;
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+      expect(store.getAll().map((m) => m.text)).toEqual(["show status\n", ""]);
+
+      // Any save at all is enough to trigger the repair — here the least destructive edit
+      // there is, applied to the OTHER macro.
+      const macros = store.getAll();
+      macros[0].name = "Poll (prod)";
+      await store.save(macros);
+
+      // The only durable copy of the password is untouched...
+      expect(secretBag.get("macro-secret-text-dup")).toBe("hunter2\n");
+      // ...and the surviving secret macro is still filed under the key that holds it, so
+      // the value comes back when the keyring does. Preserving the entry while re-keying
+      // the macro away from it would leave the password in the vault and unreachable.
+      const [poll, password] = store.getAll();
+      expect(password.id).toBe("dup");
+      expect(poll.id).not.toBe("dup");
+      // And no empty entry was minted under the re-keyed twin's fresh id.
+      expect([...secretBag.keys()]).toEqual(["macro-secret-text-dup"]);
+      expect(stateBag.get("nexus.macros.secretIds")).toEqual(["dup"]);
+    });
+
+    it("two unreadable secrets sharing an id: the entry survives and the re-keyed twin gets no vault entry at all", async () => {
+      const { context, stateBag, secretBag } = makeFakeContext();
+      stateBag.set("nexus.macros", [
+        { id: "dup", name: "Password A", text: "", secret: true },
+        { id: "dup", name: "Password B", text: "", secret: true }
+      ]);
+      secretBag.set("macro-secret-text-dup", "hunter2\n");
+      stateBag.set("nexus.macros.secretIds", ["dup"]);
+      context.secrets.get = async () => undefined;
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      const macros = store.getAll();
+      macros[0].name = "Password A (prod)";
+      await store.save(macros);
+
+      expect(secretBag.get("macro-secret-text-dup")).toBe("hunter2\n");
+      const [a, b] = store.getAll();
+      expect(a.id).toBe("dup");
+      expect(b.id).not.toBe("dup");
+      // Exactly what MacroStore.save()'s doc promises: the loser of the collision gets NO
+      // entry, not an empty one. An empty entry is a value the user never set, and next
+      // load it is indistinguishable from a deliberately cleared secret.
+      expect(secretBag.has(`macro-secret-text-${b.id}`)).toBe(false);
+      expect([...secretBag.keys()]).toEqual(["macro-secret-text-dup"]);
+    });
+
+    it("re-keys an unreadable secret normally once the user supplies a new value — the pin is for values that cannot move, not for macros that are merely unreadable", async () => {
+      const { context, stateBag, secretBag } = makeFakeContext();
+      stateBag.set("nexus.macros", [
+        { id: "dup", name: "Poll", text: "show status\n" },
+        { id: "dup", name: "Password", text: "", secret: true }
+      ]);
+      secretBag.set("macro-secret-text-dup", "hunter2\n");
+      context.secrets.get = async () => undefined;
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      const macros = store.getAll();
+      macros[1].text = "new-pass\n";
+      await store.save(macros);
+
+      // A value the user just typed CAN travel, so array order decides the id as usual and
+      // the new value lands under the new key.
+      const [poll, password] = store.getAll();
+      expect(poll.id).toBe("dup");
+      expect(password.id).not.toBe("dup");
+      expect(secretBag.get(`macro-secret-text-${password.id}`)).toBe("new-pass\n");
+      expect(secretBag.has("macro-secret-text-dup")).toBe(false);
+    });
+
+    it("with a healthy keyring a genuinely EMPTY secret does not pin its id — array order still decides", async () => {
+      const { context, secretBag } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      // Nothing was loaded, so no read failed: an empty secret here is empty because it is
+      // empty. The pin must key off the failed READ, not off the empty value.
+      await store.save([
+        { id: "dup", name: "Poll", text: "show status\n" },
+        { id: "dup", name: "Password", text: "", secret: true }
+      ]);
+
+      const [poll, password] = store.getAll();
+      expect(poll.id).toBe("dup");
+      expect(password.id).not.toBe("dup");
+      expect(secretBag.get(`macro-secret-text-${password.id}`)).toBe("");
+    });
+  });
+
+  describe("cross-window secret writes — a stale window must not resurrect its own copy", () => {
+    it("does not write a secret back when this window never changed it", async () => {
+      const { context, secretBag } = makeFakeContext();
+      const seed = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await seed.initialize();
+      await seed.save([
+        { id: "p", name: "Password", text: "old\n", secret: true },
+        { id: "r", name: "Poll", text: "show status\n" }
+      ]);
+
+      // Two windows open the same state.
+      const windowA = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await windowA.initialize();
+      const windowB = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await windowB.initialize();
+      expect(windowB.getAll()[0].text).toBe("old\n");
+
+      // A changes the password.
+      const a = windowA.getAll();
+      a[0].text = "new\n";
+      await windowA.save(a);
+      expect(secretBag.get("macro-secret-text-p")).toBe("new\n");
+
+      // B, still holding "old", edits something else entirely.
+      const b = windowB.getAll();
+      b[1].name = "Poll (prod)";
+      await windowB.save(b);
+
+      // B's user never typed a password, so B must not have written one.
+      expect(secretBag.get("macro-secret-text-p")).toBe("new\n");
+    });
+
+    it("still writes a secret whose value this window actually changed", async () => {
+      const { context, secretBag } = makeFakeContext();
+      const seed = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await seed.initialize();
+      await seed.save([{ id: "p", name: "Password", text: "old\n", secret: true }]);
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+      const macros = store.getAll();
+      macros[0].text = "new\n";
+      await store.save(macros);
+
+      expect(secretBag.get("macro-secret-text-p")).toBe("new\n");
+    });
+
+    it("stores a re-keyed secret under its new key even when the VALUE did not change", async () => {
+      const { context, secretBag } = makeFakeContext();
+      const seed = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await seed.initialize();
+      await seed.save([{ id: "dup", name: "Password", text: "hunter2\n", secret: true }]);
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+      expect(store.getAll()[0].text).toBe("hunter2\n");
+
+      // A replace-mode backup import (configCommands.ts) hands save() the file's records
+      // verbatim, ids included — here a file whose two records collide on "dup". The
+      // secret's value is unchanged but its KEY moves, so the write is not a no-op.
+      await store.save([
+        { id: "dup", name: "Poll", text: "show status\n" },
+        { id: "dup", name: "Password", text: "hunter2\n", secret: true }
+      ]);
+
+      const [, password] = store.getAll();
+      expect(password.id).not.toBe("dup");
+      expect(secretBag.get(`macro-secret-text-${password.id}`)).toBe("hunter2\n");
+      expect(secretBag.has("macro-secret-text-dup")).toBe(false);
+    });
+  });
+
   describe("vault write ordering — the crash contract clearAll() relies on", () => {
     it("names a vault key in the ledger BEFORE storing it, and deletes only after MACROS_KEY is committed", async () => {
       const { context } = makeFakeContext();
@@ -791,6 +974,74 @@ describe("VscodeMacroStore", () => {
       expect(secretBag.get(`macro-secret-text-${a.id}`)).toBe("secret-a");
       expect(secretBag.get(`macro-secret-text-${b.id}`)).toBe("secret-b");
       expect(secretBag.has("macro-secret-text-[object Object]")).toBe(false);
+    });
+  });
+
+  describe("assignMacroIds() — id provenance and pinning", () => {
+    it("reports the PRE-dedup id of every record, so a caller keyed by the old id can still look it up", () => {
+      const out = assignMacroIds([
+        { id: "dup", name: "A", text: "a" },
+        { id: "dup", name: "B", text: "b" },
+        { name: "C", text: "c" }
+      ] as TerminalMacro[]);
+
+      expect(out.map((a) => a.priorId)).toEqual(["dup", "dup", undefined]);
+      expect(out[0].macro.id).toBe("dup");
+      expect(out[1].macro.id).not.toBe("dup");
+      // The re-keyed record's own id says nothing about where its side storage lives; only
+      // priorId does. That distinction is the whole point of the return shape.
+      expect(out[1].priorId).not.toBe(out[1].macro.id);
+    });
+
+    it("without keepIdIfPossible it reproduces the plain array-order rule", () => {
+      const input = [
+        { id: "dup", name: "A", text: "a" },
+        { id: "dup", name: "B", text: "b" },
+        { id: "", name: "C", text: "c" }
+      ] as TerminalMacro[];
+      const out = assignMacroIds(input);
+      expect(out[0].macro.id).toBe("dup");
+      expect(out[1].macro.id).not.toBe("dup");
+      expect(out[2].macro.id).toBeTruthy();
+      expect(new Set(out.map((a) => a.macro.id)).size).toBe(3);
+    });
+
+    it("keepIdIfPossible gives a LATER record first claim on a contested id", () => {
+      const out = assignMacroIds(
+        [
+          { id: "dup", name: "A", text: "a" },
+          { id: "dup", name: "B", text: "b" }
+        ] as TerminalMacro[],
+        { keepIdIfPossible: (m) => m.name === "B" }
+      );
+      expect(out[1].macro.id).toBe("dup");
+      expect(out[0].macro.id).not.toBe("dup");
+      // Provenance is unaffected by who won: both arrived carrying "dup".
+      expect(out.map((a) => a.priorId)).toEqual(["dup", "dup"]);
+    });
+
+    it("two pinned records contesting one id: the first in array order wins, the rest re-key", () => {
+      const out = assignMacroIds(
+        [
+          { id: "dup", name: "A", text: "a" },
+          { id: "dup", name: "B", text: "b" },
+          { id: "dup", name: "C", text: "c" }
+        ] as TerminalMacro[],
+        { keepIdIfPossible: () => true }
+      );
+      expect(out[0].macro.id).toBe("dup");
+      expect(out[1].macro.id).not.toBe("dup");
+      expect(out[2].macro.id).not.toBe("dup");
+      expect(new Set(out.map((a) => a.macro.id)).size).toBe(3);
+    });
+
+    it("a pinned record with no usable id gets a fresh one like any other", () => {
+      const out = assignMacroIds([{ name: "A", text: "a" }] as TerminalMacro[], {
+        keepIdIfPossible: () => true
+      });
+      expect(out[0].priorId).toBeUndefined();
+      expect(typeof out[0].macro.id).toBe("string");
+      expect(out[0].macro.id!.length).toBeGreaterThan(0);
     });
   });
 });

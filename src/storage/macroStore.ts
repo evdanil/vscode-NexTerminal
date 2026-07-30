@@ -17,8 +17,9 @@ export interface MacroStore {
    * Invariant, enforced at WRITE TIME ONLY: every macro this call persists has a unique,
    * non-empty, STRING `id` — a non-string value (e.g. an object surviving a corrupt JSON
    * import) and an empty string are both treated as missing, and a later duplicate is
-   * reassigned a fresh id. See `isValidMacroId()` / `assignUniqueMacroIds()` below, the single
-   * implementation both `VscodeMacroStore.save()` and `InMemoryMacroStore.save()` use.
+   * reassigned a fresh id. See `isValidMacroId()` / `assignMacroIds()` below, the single
+   * implementation both `VscodeMacroStore.save()` and `InMemoryMacroStore.save()` use (the
+   * latter through the `assignUniqueMacroIds()` wrapper, having no side storage to key).
    *
    * "Write time only" is deliberate and load-bearing. `save()` is reached exclusively from
    * user-initiated command paths (macro add/edit/remove/reorder, the macro editor panel,
@@ -45,15 +46,26 @@ export interface MacroStore {
    * `withMigratedSlot()` below, applied on the read path, so the shape the app sees is
    * already migrated and no write is needed. Do not reintroduce an activation-time save.
    *
-   * Loss-free, with one stated limit: a duplicated secret's vault value is read into `text`
-   * at load, so writing it back under a fresh key preserves it — WHEN that read succeeded.
-   * `SecretStorage.get()` resolves `undefined` rather than rejecting when the OS keyring is
-   * unavailable, which is indistinguishable at the type level from "no entry". A macro whose
-   * value could not be read therefore carries `text: ""`, and `VscodeMacroStore.save()`
-   * deliberately does not overwrite that macro's existing vault entry with the empty string
-   * (see its `unresolvedSecretIds` guard). The consequence is the opposite trade: while a
-   * value is unreadable it also cannot be cleared, and a re-keyed twin gets no vault entry
-   * at all rather than an empty one.
+   * Loss-free for every secret macro that SURVIVES the save, in both keyring states, and the
+   * two states get there by opposite routes.
+   *
+   * When the vault read succeeded, the value is sitting in `text`, so re-keying is free: the
+   * value is written under the new key before the old key is deleted, and the macro and its
+   * value move together.
+   *
+   * When the read did NOT succeed, nothing can be moved. `SecretStorage.get()` resolves
+   * `undefined` rather than rejecting when the OS keyring is unavailable, which is
+   * indistinguishable at the type level from "no entry", so such a macro carries `text: ""`
+   * and `VscodeMacroStore.save()` will neither overwrite its vault entry with that empty
+   * string NOR re-key the macro away from it (`keepIdIfPossible`, below). Refusing the write
+   * without also refusing the re-key would be the worse half of the deal: the value would
+   * survive in the vault under an id no surviving macro names.
+   *
+   * Two costs, both deliberate. While a value is unreadable it also cannot be deliberately
+   * cleared. And when TWO unreadable secrets share one stored id there is still only one
+   * vault entry between them, so exactly one keeps the id and the other is re-keyed — it gets
+   * no vault entry at all rather than an empty one, which is the honest description of a
+   * macro whose value was never separately stored in the first place.
    */
   save(macros: TerminalMacro[]): Promise<void>;
   /** Subscribe to changes. Returns a disposer. */
@@ -78,19 +90,6 @@ export function isValidMacroId(id: unknown): id is string {
   return typeof id === "string" && id.length > 0;
 }
 
-/**
- * Assigns a unique, valid id to every macro, in array order: an id is kept only when
- * `isValidMacroId` accepts it AND no earlier entry in this same call already claimed
- * it; anything else (missing, non-string, empty, or a repeat) gets a fresh UUID.
- *
- * The single implementation shared by `VscodeMacroStore.save()` and
- * `InMemoryMacroStore.save()` — see `MacroStore.save()`'s doc comment above for why
- * uniqueness matters: `macroStateKey()` (services/macroAutoTrigger.ts) keys every
- * per-macro state map (pause/resume, interval ownership, cooldown) by `id`, so two
- * macros sharing one are indistinguishable to it.
- *
- * WRITE PATHS ONLY. Nothing on a load path may call this — see `MacroStore.save()`.
- */
 /**
  * Legacy `slot` → `keybinding` normalization, applied on the READ path (and again on the
  * write path so an old backup restored through `save()` converges too).
@@ -122,14 +121,87 @@ export function withMigratedSlot<T extends { slot?: number; keybinding?: string 
   return migrated;
 }
 
+export interface MacroIdAssignment<T> {
+  /** The record with its final, unique id applied. */
+  macro: T;
+  /**
+   * The id the record ARRIVED with, when `isValidMacroId()` accepted it; `undefined`
+   * otherwise. This is the id any vault entry belonging to the record is filed under, so
+   * a caller that keys side storage by macro id must consult THIS, not `macro.id`, when
+   * asking "what do I already know about this record?". `macro.id !== priorId` means the
+   * record was re-keyed and its side storage has not moved with it.
+   */
+  priorId: string | undefined;
+}
+
+export interface AssignMacroIdsOptions<T> {
+  /**
+   * Records this returns `true` for get FIRST claim on the id they arrived with, ahead of
+   * array order. Everything else is assigned in array order exactly as it would be without
+   * the option, so omitting it reproduces plain `assignUniqueMacroIds()` byte for byte.
+   *
+   * The reason it exists: re-keying a record is only free when whatever is filed under its
+   * old id can be carried to the new one in the same call. `VscodeMacroStore.save()` cannot
+   * carry a secret whose vault value it failed to READ (a keyring outage is reported as
+   * `undefined`, indistinguishable from "no entry"), so it pins those records instead of
+   * moving them — see its `save()`. Two records that both want the same id still cannot
+   * both have it; the first in array order wins and the rest are re-keyed as usual.
+   */
+  keepIdIfPossible?: (macro: T) => boolean;
+}
+
+/**
+ * Assigns a unique, valid id to every macro, in array order: an id is kept only when
+ * `isValidMacroId` accepts it AND no earlier entry in this same call already claimed
+ * it; anything else (missing, non-string, empty, or a repeat) gets a fresh UUID.
+ *
+ * The single implementation shared by `VscodeMacroStore.save()` and
+ * `InMemoryMacroStore.save()` — see `MacroStore.save()`'s doc comment above for why
+ * uniqueness matters: `macroStateKey()` (services/macroAutoTrigger.ts) keys every
+ * per-macro state map (pause/resume, interval ownership, cooldown) by `id`, so two
+ * macros sharing one are indistinguishable to it.
+ *
+ * Returns the pre-dedup id alongside each record. A caller that keys SIDE STORAGE by macro
+ * id (`VscodeMacroStore`'s vault) must use `priorId` to look that storage up: consulting
+ * the post-dedup id for a re-keyed record asks about a key that has never existed, which
+ * silently answers "nothing known" for exactly the records the caller knows least about.
+ *
+ * WRITE PATHS ONLY. Nothing on a load path may call this — see `MacroStore.save()`.
+ */
+export function assignMacroIds<T extends { id?: string }>(
+  macros: readonly T[],
+  options: AssignMacroIdsOptions<T> = {}
+): Array<MacroIdAssignment<T>> {
+  const priorIds = macros.map((m) => (isValidMacroId(m.id) ? m.id : undefined));
+  const finalIds: Array<string | undefined> = macros.map(() => undefined);
+  const claimed = new Set<string>();
+
+  const keepIdIfPossible = options.keepIdIfPossible;
+  if (keepIdIfPossible) {
+    for (let i = 0; i < macros.length; i++) {
+      const priorId = priorIds[i];
+      if (priorId === undefined || claimed.has(priorId)) continue;
+      if (!keepIdIfPossible(macros[i])) continue;
+      claimed.add(priorId);
+      finalIds[i] = priorId;
+    }
+  }
+
+  for (let i = 0; i < macros.length; i++) {
+    if (finalIds[i] !== undefined) continue;
+    const priorId = priorIds[i];
+    let id = priorId !== undefined && !claimed.has(priorId) ? priorId : randomUUID();
+    while (claimed.has(id)) id = randomUUID();
+    claimed.add(id);
+    finalIds[i] = id;
+  }
+
+  return macros.map((m, i) => ({ macro: { ...m, id: finalIds[i]! }, priorId: priorIds[i] }));
+}
+
+/** `assignMacroIds()` without the id-provenance, for callers that keep no side storage. */
 export function assignUniqueMacroIds<T extends { id?: string }>(macros: readonly T[]): T[] {
-  const seenIds = new Set<string>();
-  return macros.map((m) => {
-    let id = isValidMacroId(m.id) ? m.id : randomUUID();
-    while (seenIds.has(id)) id = randomUUID();
-    seenIds.add(id);
-    return { ...m, id };
-  });
+  return assignMacroIds(macros).map((a) => a.macro);
 }
 
 /**
