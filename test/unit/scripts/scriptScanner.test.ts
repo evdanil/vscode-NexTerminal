@@ -53,7 +53,7 @@ describe("scanScriptsDir", () => {
 
   it("returns an empty result when the root directory does not exist", async () => {
     const result = await scanScriptsDir(rootUri as never);
-    expect(result).toEqual({ scripts: [], folders: [], truncated: false, examined: 0 });
+    expect(result).toEqual({ scripts: [], folders: [], truncated: false, examined: 0, depthTruncated: false });
   });
 
   it("discovers scripts nested multiple levels deep, tagging each with its folder-relative path", async () => {
@@ -165,6 +165,9 @@ describe("scanScriptsDir", () => {
       expect.objectContaining({ fileName: "deep.js", folderPath: depth10Path })
     ]);
     expect(result.truncated).toBe(false);
+    // Fix 6 — nothing here was cut off by the depth cap (the deepest folder
+    // was fully read), so the separate depth-truncation flag must stay false.
+    expect(result.depthTruncated).toBe(false);
   });
 
   it(`a folder found one level beyond the cap (depth ${SCRIPT_SCAN_MAX_DEPTH + 1}) still renders but is never descended into`, async () => {
@@ -192,7 +195,16 @@ describe("scanScriptsDir", () => {
     const result = await scanScriptsDir(rootUri as never);
     expect(folderPaths(result)).toEqual(expectedFolderPaths.sort());
     expect(result.scripts).toEqual([]); // toodeep.js lives inside the un-descended depth-11 folder
+    // `truncated` (the ENTRY-count cap) is correctly false — nowhere near
+    // 500 entries were examined. Fix 6: asserting only this, as the
+    // pre-fix version of this test did, codified the actual bug — a
+    // depth-11 folder was silently skipped with NO signal anywhere in the
+    // result, so the "Stopped after 500 entries" warning node never
+    // rendered and nothing else explained the missing script either.
+    // `depthTruncated` is the separate flag this fix adds specifically for
+    // that case, and it MUST be true here.
     expect(result.truncated).toBe(false);
+    expect(result.depthTruncated).toBe(true);
   });
 
   it(`truncates after examining ${SCRIPT_SCAN_MAX_ENTRIES} directory entries, reporting exactly the cap — not one past it (Fix 3 off-by-one)`, async () => {

@@ -90,6 +90,18 @@ export interface ScriptScanResult {
   readonly truncated: boolean;
   /** How many directory / file entries (`.js` scripts included, Fix 3) were examined before stopping. */
   readonly examined: number;
+  /**
+   * Fix 6 — true if at least one folder was found beyond
+   * `SCRIPT_SCAN_MAX_DEPTH` and therefore listed (§5.4 — all directories
+   * render) but never descended into. Deliberately separate from
+   * `truncated`: that flag means the ENTIRE scan stopped early; this one
+   * means one specific branch was cut off while the rest of the tree scanned
+   * normally. Conflating the two (or dropping this signal entirely) leaves a
+   * legitimately-created depth-11 folder's scripts silently missing from
+   * both the Scripts tree and the picker, with no warning node explaining
+   * why — Design §5.3 requires truncation to always be announced.
+   */
+  readonly depthTruncated: boolean;
 }
 
 /**
@@ -119,6 +131,7 @@ export async function scanScriptsDir(root: vscode.Uri): Promise<ScriptScanResult
   const folders: ScannedFolder[] = [];
   let examined = 0;
   let truncated = false;
+  let depthTruncated = false;
 
   async function walk(dirUri: vscode.Uri, folderPath: string | undefined, depth: number): Promise<void> {
     if (truncated) return;
@@ -159,9 +172,15 @@ export async function scanScriptsDir(root: vscode.Uri): Promise<ScriptScanResult
         // Fix 2 — `<=`, not `<`: see SCRIPT_SCAN_MAX_DEPTH's doc comment.
         if (childDepth <= SCRIPT_SCAN_MAX_DEPTH) {
           await walk(vscode.Uri.joinPath(dirUri, name), childPath, childDepth);
+        } else {
+          // Fix 6 — the folder itself is still listed (§5.4 — all
+          // directories render regardless of contents), just not descended
+          // into. That must be visibly different from "nothing here" —
+          // record it distinctly from the entry-count `truncated` flag so
+          // the tree can render a reason-appropriate warning instead of
+          // silently hiding whatever lives inside this folder.
+          depthTruncated = true;
         }
-        // Past the cap: the folder itself is still listed (§5.4 — all
-        // directories render regardless of contents), just not descended into.
         continue;
       }
 
@@ -172,5 +191,5 @@ export async function scanScriptsDir(root: vscode.Uri): Promise<ScriptScanResult
   }
 
   await walk(root, undefined, 0);
-  return { scripts, folders, truncated, examined };
+  return { scripts, folders, truncated, examined, depthTruncated };
 }

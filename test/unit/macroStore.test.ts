@@ -881,6 +881,48 @@ describe("VscodeMacroStore", () => {
       expect(all[0].name).toBe("Good");
     });
   });
+
+  describe("reloadFromState() also enforces isUsableMacro — a malformed record must not reach the tree (Fix 1, this review round)", () => {
+    // Prior to this fix, `isUsableMacro` was applied only by `save()`.
+    // `reloadFromState()` admitted every non-null object verbatim, so a
+    // record already sitting in MACROS_KEY (from a hand-edited settings.json
+    // absorbed on a previous activation, storage corruption, or a caller bug
+    // elsewhere) reached `getAll()` — and from there `MacroTreeItem`, where
+    // `macro.text.replace(...)` throws on EVERY render, killing the Macros
+    // view permanently, surviving restart, with no in-product recovery.
+    it("drops a record with no name/text already sitting in MACROS_KEY, without crashing", async () => {
+      const { context, stateBag } = makeFakeContext();
+      stateBag.set("nexus.macros", [
+        { id: "a", name: "Good", text: "t" },
+        // The exact settings.json trigger from the review:
+        // `{"name":"Broken","group":"Cisco"}` — no `text` at all.
+        { name: "Broken", group: "Cisco" }
+      ]);
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await expect(store.initialize()).resolves.toBeUndefined();
+
+      const all = store.getAll();
+      expect(all).toHaveLength(1);
+      expect(all[0].name).toBe("Good");
+    });
+
+    it("drops a record whose name or text is non-string, already sitting in MACROS_KEY", async () => {
+      const { context, stateBag } = makeFakeContext();
+      stateBag.set("nexus.macros", [
+        { id: "a", name: "Good", text: "t" },
+        { id: "b", name: 42, text: "t" },
+        { id: "c", name: "NoText", text: undefined }
+      ]);
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      const all = store.getAll();
+      expect(all).toHaveLength(1);
+      expect(all[0].name).toBe("Good");
+    });
+  });
 });
 
 describe("VscodeMacroStore — masked variable default sanitization at persistence chokepoints (Fix 1)", () => {
@@ -1240,6 +1282,23 @@ describe("VscodeMacroStore — `group` is untrusted at every ingest site (§4.2)
   it("reloadFromState() rejects an over-depth group already sitting in MACROS_KEY (bounds an O(n^2) stall)", async () => {
     const { context, stateBag } = makeFakeContext();
     const huge = Array.from({ length: 200 }, () => "a").join("/");
+    stateBag.set("nexus.macros", [
+      { id: "a", name: "m", text: "t", group: huge }
+    ]);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await expect(store.initialize()).resolves.toBeUndefined();
+
+    expect(store.getAll()[0].group).toBeUndefined();
+  });
+
+  it("Fix 4 — reloadFromState() rejects a pathologically long SINGLE-SEGMENT group already sitting in MACROS_KEY (depth/segment-count alone never bounds this)", async () => {
+    // The over-depth test above uses 200 SHORT segments — it exercises depth
+    // only. This is a single segment (segment count 1, well under
+    // MAX_FOLDER_DEPTH) that is instead pathologically LONG — the exact
+    // repro from the review: `group: "X".repeat(8_000_000)`.
+    const { context, stateBag } = makeFakeContext();
+    const huge = "X".repeat(8_000_000);
     stateBag.set("nexus.macros", [
       { id: "a", name: "m", text: "t", group: huge }
     ]);

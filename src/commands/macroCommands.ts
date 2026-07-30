@@ -467,8 +467,15 @@ async function removeMacroFolder(path: string): Promise<void> {
     }
   }
 
+  // Fix 2 (MAJOR) — `macros` above was captured BEFORE the confirmation
+  // dialog, which the user can leave open indefinitely. Anything saved while
+  // it was open (another command, another window, an auto-trigger state
+  // write) must not be discarded by writing back that stale snapshot — the
+  // affected-count message above may already be reading slightly-stale data,
+  // but the actual MUTATION below must operate on the latest array.
+  const latest = getMacros();
   let changed = false;
-  const updatedMacros = macros.map((m) => {
+  const updatedMacros = latest.map((m) => {
     const group = sanitizeMacroGroup(m.group);
     if (group === undefined || !isDescendantOrSelf(group, path)) {
       return m;
@@ -590,8 +597,16 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (confirm !== "Remove") {
         return;
       }
-      macros.splice(index, 1);
-      await saveMacros(macros);
+      // Fix 2 (swept per its own instruction — "any other command that
+      // awaits a dialog before saving") — `macros` above was captured
+      // before this confirmation; re-read the latest array rather than
+      // mutating and persisting that stale snapshot.
+      const latest = getMacros();
+      if (index < 0 || index >= latest.length) {
+        return;
+      }
+      latest.splice(index, 1);
+      await saveMacros(latest);
     }),
 
     vscode.commands.registerCommand("nexus.macro.run", async () => {
@@ -702,8 +717,15 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (bindingResult === undefined) {
         return; // Cancelled
       }
-      assignBinding(macros, index, bindingResult);
-      await saveMacros(macros);
+      // Fix 2 (swept) — `macros` above was captured before the binding
+      // prompt's own await; re-read the latest array before writing the
+      // assignment back, so a concurrent save during the prompt survives.
+      const latest = getMacros();
+      if (index < 0 || index >= latest.length) {
+        return;
+      }
+      assignBinding(latest, index, bindingResult);
+      await saveMacros(latest);
     }),
 
     // §4.4 — swaps with the previous/next macro SHARING THE SAME `group`, not
@@ -785,23 +807,24 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
 
     // On a tree item: that macro. From the palette: a multi-select quick pick
     // of macros first, then the folder picker — the bulk path (§4.6).
+    //
+    // Fix 3 (MAJOR) — a bounds check on an index proves nothing about
+    // IDENTITY once the array has shifted: a stale tree item can hold an
+    // index that is back in bounds but now refers to a DIFFERENT macro (the
+    // one it was opened for was deleted, and a later macro slid into the
+    // same slot). Both the tree-item path and the palette's multi-select
+    // path therefore carry the macro's stable `id` (never a bare index)
+    // across every `await` below, and the final write re-reads the latest
+    // array and updates only entries whose id still matches.
     vscode.commands.registerCommand("nexus.macro.moveToFolder", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
       const macros = getMacros();
-      let targetIndices: number[];
+      let targetIds: string[];
       if (item) {
-        // Fix 1 (BLOCKER) — bounds-check `item.index` before use, matching
-        // every sibling command (`moveUp`/`moveDown`, `remove`, `pasteSecret`):
-        // a context menu can outlive the macro it was opened for (e.g. the
-        // macro is deleted via the editor without dismissing the menu), and
-        // an unchecked index would otherwise write through `updated[idx]`
-        // where `updated[idx]` is `undefined` — persisting `{ ...undefined }`
-        // as a nameless, textless "ghost" macro that crashes the tree forever
-        // after (`macroTreeProvider.ts`'s `macro.text.replace(...)`).
-        if (item.index < 0 || item.index >= macros.length) {
+        if (!item.macro.id) {
           return;
         }
-        targetIndices = [item.index];
+        targetIds = [item.macro.id];
       } else {
         if (macros.length === 0) {
           void vscode.window.showInformationMessage("No macros defined.");
@@ -812,6 +835,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
             label: m.name,
             description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"),
             detail: macroFolderDetail(m),
+            id: m.id,
             index: i
           })),
           { title: "Move to Folder", placeHolder: "Select macros to move", canPickMany: true }
@@ -819,31 +843,36 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         if (!picks || picks.length === 0) {
           return;
         }
-        targetIndices = picks.map((p) => p.index);
+        targetIds = picks.map((p) => p.id).filter((id): id is string => !!id);
+        if (targetIds.length === 0) {
+          return;
+        }
       }
 
       const destination = await pickFolderDestination(macros);
       if (destination === undefined) {
         return;
       }
-      const updated = [...macros];
-      for (const idx of targetIndices) {
-        // Defense in depth for the multi-select (palette) path too: the two
-        // `await`s above (`showQuickPick`, `pickFolderDestination`) are a
-        // window during which another command/window could have removed a
-        // macro out from under a stale index — skip rather than persist a
-        // ghost record (same failure mode Fix 1 closes for the tree-item path).
-        if (idx < 0 || idx >= updated.length) {
-          continue;
+
+      // Re-read the latest array after BOTH awaits above (the quick pick(s)
+      // and the folder picker) and update only entries whose id is still in
+      // `targetIds` — a macro deleted mid-flow simply has no match (no-op,
+      // never a ghost record); a macro that slid into a stale index's old
+      // slot is untouched because its own id was never captured.
+      const latest = getMacros();
+      const idSet = new Set(targetIds);
+      const updated = latest.map((m) => {
+        if (!m.id || !idSet.has(m.id)) {
+          return m;
         }
-        const next = { ...updated[idx] };
+        const next = { ...m };
         if (destination) {
           next.group = destination;
         } else {
           delete next.group;
         }
-        updated[idx] = next;
-      }
+        return next;
+      });
       await saveMacros(updated);
     }),
 

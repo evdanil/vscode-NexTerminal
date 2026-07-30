@@ -176,6 +176,36 @@ describe("macro folder commands", () => {
       expect(getMacros()).toEqual([]); // no ghost record persisted
     });
 
+    it("Fix 3 (MAJOR) — a stale index back IN bounds but now pointing at a DIFFERENT macro must not overwrite it (identity, not just bounds)", async () => {
+      // The exact scenario from the review: a stale tree item
+      // {macro: A(id="a"), index: 0}; A is deleted so the array becomes
+      // [B(id="b", group="Old")] — B now sits at index 0 too. A bounds check
+      // alone ("is 0 a valid index?") passes and would wrongly clear B's
+      // group. The fixture in the ORIGINAL version of this test collapsed to
+      // an empty array (one-item-to-empty), so index 0 was ALWAYS
+      // out-of-bounds after the deletion — a bounds-only implementation and
+      // the correct identity-based one produced the identical outcome there.
+      // This fixture makes index 0 valid but identity-mismatched, so the two
+      // implementations diverge.
+      await store.save([
+        { id: "a", name: "A", text: "t" },
+        { id: "b", name: "B", text: "t", group: "Old" }
+      ]);
+      const staleItem = macroArg(0); // captures A (id "a") at index 0
+      // A is removed; B shifts down to index 0 — same array slot, different macro.
+      await store.save([{ id: "b", name: "B", text: "t", group: "Old" }]);
+      mockShowQuickPick.mockImplementation(async (items: Array<{ folderKind: string }>) =>
+        items.find((i) => i.folderKind === "root")
+      );
+
+      await registeredCommands.get("nexus.macro.moveToFolder")!(staleItem);
+
+      // B's group must be untouched — the stale item's captured id ("a")
+      // does not match B's id ("b"), so the identity-based implementation
+      // treats this as a no-op even though index 0 is a valid slot.
+      expect(getMacros()).toEqual([{ id: "b", name: "B", text: "t", group: "Old" }]);
+    });
+
     it("moves the macro into an existing folder", async () => {
       await store.save([{ name: "A", text: "t" }]);
       await store.saveFolders(["Cisco"]);
@@ -356,6 +386,30 @@ describe("macro folder commands", () => {
       await registeredCommands.get("nexus.macro.removeFolder")!(undefined);
       expect(mockShowWarningMessage).not.toHaveBeenCalled();
     });
+
+    it("Fix 2 (MAJOR) — a macro saved WHILE the confirmation dialog is open must not be discarded by a stale pre-dialog snapshot", async () => {
+      // Reproduces the exact scenario from the review: start removing "Cisco"
+      // from [A(group=Cisco), B(root)]; while the modal warning is open,
+      // something else saves a THIRD macro; confirm. Writing back the array
+      // captured before the dialog opened would silently drop it.
+      await store.save([
+        { name: "A", text: "t", group: "Cisco" },
+        { name: "B", text: "t" }
+      ]);
+      mockShowWarningMessage.mockImplementation(async () => {
+        // Models a concurrent save landing during the (user-paced) modal —
+        // another command, another window, or an unrelated autosave.
+        await store.save([...getMacros(), { name: "C", text: "t" }]);
+        return "Remove Folder";
+      });
+
+      await registeredCommands.get("nexus.macro.removeFolder")!(folderArg("Cisco"));
+
+      const macros = getMacros();
+      expect(macros.map((m) => m.name)).toContain("C"); // must survive the dialog window
+      expect(macros.find((m) => m.name === "A")?.group).toBeUndefined(); // still re-parented to root
+      expect(macros).toHaveLength(3);
+    });
   });
 
   describe("nexus.macro.moveUp / moveDown — group-aware reorder (§4.4)", () => {
@@ -373,6 +427,29 @@ describe("macro folder commands", () => {
 
       const names = getMacros().map((m) => m.name);
       expect(names).toEqual(["RootA", "InFolder2", "RootB", "InFolder1"]);
+    });
+
+    it("Fix 8 — swaps DOWN with the next macro sharing the same group, even when non-adjacent in the array", async () => {
+      // The only prior Move Down fixture ("no-ops at the bottom of a
+      // folder") put the moved item at the PHYSICAL END of the array, where
+      // an adjacent-only implementation and the correct group-aware one both
+      // report "no next element" — identical no-op, no discrimination. This
+      // fixture mirrors the existing non-adjacent Move UP test above: F1's
+      // only same-group neighbour ("F2") is two slots away, not the
+      // adjacent "Root".
+      await store.save([
+        { name: "F1", text: "t", group: "Cisco" },
+        { name: "Root", text: "t" },
+        { name: "F2", text: "t", group: "Cisco" }
+      ]);
+
+      await registeredCommands.get("nexus.macro.moveDown")!(macroArg(0));
+
+      // An adjacent-only implementation would swap F1 with "Root", yielding
+      // [Root, F1, F2] — F1 still precedes F2 inside "Cisco", so from the
+      // folder's perspective it LOOKS unchanged (a silent no-op dressed up
+      // as a swap). The correct group-aware swap exchanges F1 and F2 directly.
+      expect(getMacros().map((m) => m.name)).toEqual(["F2", "Root", "F1"]);
     });
 
     it("no-ops at the top of a folder with folder-specific wording", async () => {

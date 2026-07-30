@@ -383,6 +383,23 @@ describe("MacroStore legacy migration", () => {
       expect(store.getAll()[0].group).toBeUndefined();
     });
 
+    it("Fix 4 — a pathologically long SINGLE-SEGMENT group from legacy settings is dropped (depth/segment-count alone never bounds this)", async () => {
+      // The exact repro from the review: `group: "X".repeat(8_000_000)` has a
+      // segment count of 1 — comfortably under MAX_FOLDER_DEPTH — so only a
+      // length bound (not a depth bound) can catch it.
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      const huge = "X".repeat(8_000_000);
+      vscode.__setConfig("nexus.terminal", {
+        global: [{ name: "a", text: "echo a", group: huge } as TerminalMacro]
+      });
+      const { ctx } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+
+      await expect(store.initialize()).resolves.toBeUndefined();
+
+      expect(store.getAll()[0].group).toBeUndefined();
+    });
+
     it("a valid group from legacy settings survives absorption", async () => {
       const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
       vscode.__setConfig("nexus.terminal", {
@@ -394,6 +411,51 @@ describe("MacroStore legacy migration", () => {
       await store.initialize();
 
       expect(store.getAll()[0].group).toBe("Cisco/Routers");
+    });
+  });
+
+  describe("Fix 1 (this review round) — persistLegacyMigration() enforces isUsableMacro too", () => {
+    // Isolates `persistLegacyMigration()` the same way the §4.2 block above
+    // does: capture the FIRST write to `nexus.macros` (persistLegacyMigration's
+    // own write), before `reloadFromState()` ever runs, so a fix living only
+    // in `reloadFromState()` can't make this pass by accident.
+    it("a macro missing `text` in legacy settings never reaches globalState, not even transiently", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        // The exact settings.json trigger from the review.
+        global: [{ name: "Broken", group: "Cisco" } as unknown as TerminalMacro]
+      });
+      const { ctx } = makeCtx();
+      const writes: unknown[] = [];
+      const origUpdate = ctx.globalState.update.bind(ctx.globalState);
+      ctx.globalState.update = async (key: string, value: unknown) => {
+        if (key === "nexus.macros") writes.push(value);
+        return origUpdate(key, value);
+      };
+      const store = new VscodeMacroStore(ctx);
+
+      await expect(store.initialize()).resolves.toBeUndefined();
+
+      expect(writes.length).toBeGreaterThan(0);
+      const firstWrite = writes[0] as unknown[];
+      expect(firstWrite).toHaveLength(0); // dropped before persistence, not merely hidden later
+      expect(store.getAll()).toEqual([]);
+    });
+
+    it("a usable macro alongside a broken one in legacy settings: only the broken one is dropped", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        global: [
+          { name: "Good", text: "echo good" },
+          { name: "Broken", group: "Cisco" } as unknown as TerminalMacro
+        ]
+      });
+      const { ctx } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+
+      await store.initialize();
+
+      expect(store.getAll().map((m) => m.name)).toEqual(["Good"]);
     });
   });
 

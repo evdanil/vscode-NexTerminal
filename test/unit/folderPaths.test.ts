@@ -6,7 +6,9 @@ import {
   parentPath,
   folderDisplayName,
   getAncestorPaths,
-  MAX_FOLDER_DEPTH
+  MAX_FOLDER_DEPTH,
+  MAX_FOLDER_SEGMENT_LENGTH,
+  MAX_FOLDER_PATH_LENGTH
 } from "../../src/utils/folderPaths";
 
 describe("normalizeFolderPath", () => {
@@ -59,6 +61,41 @@ describe("normalizeFolderPath", () => {
 
   it("returns undefined for whitespace-only input", () => {
     expect(normalizeFolderPath("   ")).toBeUndefined();
+  });
+
+  // Fix 4 — depth alone bounds segment COUNT, not segment or total LENGTH.
+  describe("length bounds (Fix 4)", () => {
+    it("rejects a single segment longer than MAX_FOLDER_SEGMENT_LENGTH", () => {
+      const tooLong = "a".repeat(MAX_FOLDER_SEGMENT_LENGTH + 1);
+      expect(normalizeFolderPath(tooLong)).toBeUndefined();
+    });
+
+    it("accepts a single segment at exactly MAX_FOLDER_SEGMENT_LENGTH", () => {
+      const exact = "a".repeat(MAX_FOLDER_SEGMENT_LENGTH);
+      expect(normalizeFolderPath(exact)).toBe(exact);
+    });
+
+    it("rejects a pathologically long single-segment value — depth (segment COUNT = 1) alone never bounds this", () => {
+      // The exact repro from the review: a single-segment `group` with no
+      // slashes at all sails through the MAX_FOLDER_DEPTH check (its segment
+      // count is 1) and, pre-fix, straight through normalizeFolderPath too.
+      const huge = "X".repeat(8_000_000);
+      expect(normalizeFolderPath(huge)).toBeUndefined();
+    });
+
+    it("rejects a path whose TOTAL length exceeds MAX_FOLDER_PATH_LENGTH even though every individual segment is short and the depth is within MAX_FOLDER_DEPTH", () => {
+      // 9 segments (within MAX_FOLDER_DEPTH), each comfortably under
+      // MAX_FOLDER_SEGMENT_LENGTH — neither the depth check nor the
+      // per-segment length check would reject this. Only the total-length
+      // check does, since the joined path still exceeds MAX_FOLDER_PATH_LENGTH.
+      const segment = "s".repeat(25);
+      const segments = Array.from({ length: 9 }, () => segment);
+      const path = segments.join("/");
+      expect(segments.length).toBeLessThanOrEqual(MAX_FOLDER_DEPTH);
+      expect(segment.length).toBeLessThanOrEqual(MAX_FOLDER_SEGMENT_LENGTH);
+      expect(path.length).toBeGreaterThan(MAX_FOLDER_PATH_LENGTH);
+      expect(normalizeFolderPath(path)).toBeUndefined();
+    });
   });
 });
 

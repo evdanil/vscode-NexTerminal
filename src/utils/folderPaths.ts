@@ -1,17 +1,36 @@
 export const MAX_FOLDER_DEPTH = 10;
 
 /**
+ * Fix 4 — depth alone bounded segment COUNT, never segment or total LENGTH.
+ * `group: "X".repeat(8_000_000)` has a segment count of 1 (passes the depth
+ * check) but persists as an eight-million-character tree row and gets
+ * reprocessed (sort, compare, render) on every refresh. These are shared by
+ * every caller of `normalizeFolderPath` — servers, serial/local-shell
+ * profiles, macros, and scripts all funnel through this one chokepoint.
+ */
+export const MAX_FOLDER_SEGMENT_LENGTH = 64;
+export const MAX_FOLDER_PATH_LENGTH = 200;
+
+/**
  * Normalize a folder path: split on "/", trim segments, filter empty,
- * reject ".."/".", reject depth > MAX_FOLDER_DEPTH.
+ * reject ".."/".", reject depth > MAX_FOLDER_DEPTH, reject an oversized
+ * total length or an oversized individual segment (Fix 4).
  * Returns the cleaned path or undefined if invalid.
  */
 export function normalizeFolderPath(path: string): string | undefined {
+  // Fix 4 — reject BEFORE split()/trim()/join() ever touch an untrusted,
+  // potentially huge string: a caller-supplied `group` (or a persisted
+  // folder-list entry) is untrusted at every read site (§4.2 of the folders
+  // design), and nothing downstream previously bounded its raw length.
+  if (path.length > MAX_FOLDER_PATH_LENGTH) {
+    return undefined;
+  }
   const segments = path.split("/").map((s) => s.trim()).filter((s) => s.length > 0);
   if (segments.length === 0) {
     return undefined;
   }
   for (const seg of segments) {
-    if (seg === ".." || seg === "." || seg.includes("\\")) {
+    if (seg === ".." || seg === "." || seg.includes("\\") || seg.length > MAX_FOLDER_SEGMENT_LENGTH) {
       return undefined;
     }
   }
@@ -39,7 +58,7 @@ export function normalizeOptionalFolderPath(input: unknown): string | undefined 
 }
 
 export const INVALID_FOLDER_PATH_MESSAGE =
-  `Invalid folder path. Use up to ${MAX_FOLDER_DEPTH} levels and avoid '.', '..', or '\\'.`;
+  `Invalid folder path. Use up to ${MAX_FOLDER_DEPTH} levels (each up to ${MAX_FOLDER_SEGMENT_LENGTH} characters) and avoid '.', '..', or '\\'.`;
 
 /**
  * True if `candidate` equals `ancestor` or is nested inside it.

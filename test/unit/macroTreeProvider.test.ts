@@ -2,6 +2,18 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { setActiveMacroStore } from "../../src/macroSettings";
 
+// Fix 8 — the real folder commands (registerMacroCommands) are exercised by
+// the rewritten "assigning/renaming/removing" test below, so registration
+// plumbing and a handful of dialog mocks join the tree-only mock this file
+// already had. `macroBindingHelpers` / `macroBindings` stay UNMOCKED (real,
+// pure, no `vscode` import) — several existing MacroTreeProvider tests above
+// depend on their real formatting behaviour, so stubbing them here would
+// break those rather than only affecting the new command-driven test.
+const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
+const mockShowInputBox = vi.fn();
+const mockShowQuickPick = vi.fn();
+const mockShowWarningMessage = vi.fn();
+
 vi.mock("vscode", () => {
   const EventEmitter = vi.fn().mockImplementation(function () {
     const listeners: Array<(e: unknown) => void> = [];
@@ -35,13 +47,49 @@ vi.mock("vscode", () => {
     EventEmitter,
     workspace: {
       getConfiguration: vi.fn()
-    }
+    },
+    commands: {
+      registerCommand: vi.fn((id: string, handler: (...args: unknown[]) => unknown) => {
+        registeredCommands.set(id, handler);
+        return { dispose: vi.fn() };
+      }),
+      executeCommand: vi.fn()
+    },
+    window: {
+      showInputBox: (...args: unknown[]) => mockShowInputBox(...args),
+      showQuickPick: (...args: unknown[]) => mockShowQuickPick(...args),
+      showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
+      showInformationMessage: vi.fn(),
+      setStatusBarMessage: vi.fn()
+    },
+    env: {
+      openExternal: vi.fn(),
+      clipboard: { readText: vi.fn(), writeText: vi.fn() }
+    },
+    Uri: { parse: (value: string) => ({ toString: () => value, value }) },
+    InputBoxValidationSeverity: { Warning: 2 }
   };
 });
+
+// MacroEditorPanel and runMacro are unused by the folder commands this file
+// invokes (moveToFolder / renameFolder / removeFolder) — stubbed only so
+// importing registerMacroCommands doesn't pull in the real webview panel.
+vi.mock("../../src/ui/macroEditorPanel", () => ({
+  MacroEditorPanel: {
+    open: vi.fn(),
+    openNew: vi.fn(),
+    setProfileProvider: vi.fn()
+  }
+}));
+
+vi.mock("../../src/commands/macroVariablePrompt", () => ({
+  runMacro: vi.fn()
+}));
 
 import { MacroTreeProvider, MacroTreeItem, VARIABLE_MARKER } from "../../src/ui/macroTreeProvider";
 import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
 import { MACRO_DRAG_MIME } from "../../src/ui/dndMimeTypes";
+import { registerMacroCommands } from "../../src/commands/macroCommands";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import * as vscode from "vscode";
 
@@ -490,10 +538,15 @@ describe("MacroTreeProvider — hierarchical folders (§4.3, §4.4)", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    registeredCommands.clear();
     testStore = new InMemoryMacroStore();
     await testStore.initialize();
     setActiveMacroStore(testStore);
     provider = new MacroTreeProvider();
+    // Fix 8 — registered so the rewritten "assigning/renaming/removing" test
+    // below can drive the REAL folder commands rather than a direct
+    // store.save() reassignment.
+    registerMacroCommands();
   });
 
   // The single highest-value test in this design: MacroTreeItem.index must be
@@ -551,23 +604,51 @@ describe("MacroTreeProvider — hierarchical folders (§4.3, §4.4)", () => {
     expect(macroLabels(folderChildren)).toEqual(["Zebra", "Apple"]);
   });
 
-  it("assigning/renaming/removing a group leaves array order and every index unchanged", async () => {
-    const macros: TerminalMacro[] = [
+  it("assigning/renaming/removing a group via the REAL commands leaves array order, ids, and every index unchanged", async () => {
+    // Fix 8 — the previous version of this test only ever did a direct
+    // `store.save()` reassignment; it never called the actual rename or
+    // remove commands. An implementation that reversed the array (or
+    // reindexed macros within a folder) would still have passed it, because
+    // every assertion located macros by NAME rather than checking real
+    // command behaviour. This version drives `moveToFolder`, `renameFolder`,
+    // and `removeFolder` themselves.
+    await testStore.save([
       { name: "A", text: "a" },
       { name: "B", text: "b" },
       { name: "C", text: "c" }
-    ];
-    await testStore.save(macros);
-    const [a, b, c] = testStore.getAll();
-    await testStore.save([{ ...a, group: "X" }, b, c]);
+    ]);
+    const idsBefore = testStore.getAll().map((m) => m.id);
+
+    // 1. ASSIGN — moveToFolder on macro A (tree-item path), into a brand
+    // new folder "Cisco".
+    mockShowQuickPick.mockImplementationOnce(async (items: Array<{ folderKind: string }>) =>
+      items.find((i) => i.folderKind === "new")
+    );
+    mockShowInputBox.mockResolvedValueOnce("Cisco");
+    await registeredCommands.get("nexus.macro.moveToFolder")!({ macro: testStore.getAll()[0], index: 0 });
+    expect(testStore.getAll().map((m) => m.name)).toEqual(["A", "B", "C"]); // still array order
+    expect(testStore.getAll()[0].group).toBe("Cisco");
+
+    // 2. RENAME — Cisco -> Juniper.
+    mockShowInputBox.mockResolvedValueOnce("Juniper");
+    await registeredCommands.get("nexus.macro.renameFolder")!({ folderPath: "Cisco" });
+    expect(testStore.getAll()[0].group).toBe("Juniper");
+
+    // 3. REMOVE — re-parents A back to root (Juniper is top-level).
+    mockShowWarningMessage.mockResolvedValueOnce("Remove Folder");
+    await registeredCommands.get("nexus.macro.removeFolder")!({ folderPath: "Juniper" });
 
     const stored = testStore.getAll();
-    expect(stored.map((m) => m.name)).toEqual(["A", "B", "C"]); // unchanged order
+    expect(stored.map((m) => m.name)).toEqual(["A", "B", "C"]); // array order survived all three commands
+    expect(stored.map((m) => m.id)).toEqual(idsBefore); // same identities, same order
+    expect(stored.every((m) => m.group === undefined)).toBe(true); // folder fully removed
+
     const rootChildren = provider.getChildren();
     const rootMacros = (rootChildren as Array<MacroTreeItem | FolderTreeItem>).filter(
       (m): m is MacroTreeItem => m instanceof MacroTreeItem
     );
-    expect(rootMacros.map((m) => m.index)).toEqual([1, 2]); // B, C keep their true indices
+    expect(rootMacros.map((m) => m.macro.name)).toEqual(["A", "B", "C"]);
+    expect(rootMacros.map((m) => m.index)).toEqual([0, 1, 2]); // TRUE getMacros() indices, refreshed
   });
 
   it("renders a nested folder hierarchy: parent at root, child under parent", async () => {

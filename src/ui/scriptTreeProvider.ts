@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { parseScriptHeader } from "../services/scripts/scriptHeader";
 import { resolveScriptsDir } from "../services/scripts/resolveScriptsDir";
-import { scanScriptsDir, SCRIPT_SCAN_MAX_ENTRIES, type ScriptScanResult } from "../services/scripts/scriptScanner";
+import { scanScriptsDir, SCRIPT_SCAN_MAX_ENTRIES, SCRIPT_SCAN_MAX_DEPTH, type ScriptScanResult } from "../services/scripts/scriptScanner";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 import { createCoalescedInvoker, type CoalescedInvoker } from "../utils/coalescedInvoker";
 import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
@@ -14,6 +14,11 @@ export type ScriptNode =
   | { kind: "script"; uri: vscode.Uri; name: string; description: string; running: boolean; parseErrors: string[] }
   | { kind: "folder"; uri: vscode.Uri; path: string; name: string }
   | { kind: "truncated"; examined: number }
+  // Fix 6 — a distinct node from "truncated": that one means the entry-count
+  // budget stopped the WHOLE scan; this one means one specific branch was cut
+  // off at the depth cap while the rest of the tree scanned normally. Design
+  // §5.3 requires truncation to always be announced, never silent.
+  | { kind: "depthTruncated" }
   | { kind: "placeholder"; label: string; detail?: string; command: vscode.Command; icon: string };
 
 function scriptPlaceholders(): ScriptNode[] {
@@ -57,6 +62,22 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   private generation = 0;
   private scanPromise?: Promise<ScriptScanResult>;
 
+  // Fix 5 — bounds the `getCurrentScan()` retry loop: a scan slower than the
+  // debounced refresh interval, superseded every cycle, would otherwise keep
+  // this loop pending forever (each iteration re-awaits whatever is newest,
+  // and if refreshes keep landing faster than a scan completes, the
+  // generation comparison never settles). Past this many misses, accept the
+  // most recent result even though a fresher scan may still be in flight —
+  // tagged with the generation IT actually belongs to, never the (by then
+  // newer) `this.generation`, so the cache-poisoning bug this fix also closes
+  // can't be reintroduced through the escape hatch.
+  private static readonly MAX_SCAN_RETRIES = 5;
+  // Fix 5 — bounds `getChildren()`'s own restart-on-stale-generation loop
+  // (see below): a sustained refresh storm crossing every readFile await
+  // degrades to "occasionally one generation behind" instead of recursing
+  // without end.
+  private static readonly MAX_CHILDREN_RESTARTS = 5;
+
   // Fix 3 — `hasMarkedScriptBelowRoot()` re-reads (and header-parses) every
   // non-root script in the scan. VS Code can call `getChildren(undefined)`
   // more than once for the same render (e.g. reveal/selection churn) without
@@ -64,6 +85,14 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   // each call. Memoised per generation: a result computed for the CURRENT
   // scan generation is reused rather than re-reading the filesystem; a new
   // scan (bumping `generation`) naturally invalidates it.
+  //
+  // Fix 5 — the generation this cache is tagged with is always the value
+  // EXPLICITLY PASSED IN by the caller (the generation the scan it read
+  // belongs to), never `this.generation` re-read after this method's own
+  // `readFile` awaits. Re-reading `this.generation` at that point was the
+  // poisoning bug: a refresh landing during those awaits bumps
+  // `this.generation` before this method finishes, so the OLD generation's
+  // result would get stamped onto the NEW generation's cache entry.
   private markedBelowRootCache?: { generation: number; result: boolean };
 
   public constructor(
@@ -122,21 +151,30 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   }
 
   /**
-   * Awaits the CURRENT-generation scan, never a stale one (§5.1). If the scan
-   * this call started awaiting resolves after a newer scan has since started
+   * Awaits the CURRENT-generation scan, never a stale one (§5.1), and returns
+   * the generation it actually belongs to alongside it. If the scan this call
+   * started awaiting resolves after a newer scan has since started
    * (`this.generation` moved on while we awaited), loop and await whatever is
-   * now current instead of returning the stale result.
+   * now current instead of returning the stale result — bounded (Fix 5) so a
+   * refresh storm faster than scan completion can't leave this pending
+   * forever.
    */
-  private async getCurrentScan(): Promise<ScriptScanResult> {
+  private async getCurrentScan(): Promise<{ generation: number; scan: ScriptScanResult }> {
     if (!this.scanPromise) {
       this.startScan();
     }
-    for (;;) {
+    for (let attempt = 0; ; attempt++) {
       const gen = this.generation;
       const promise = this.scanPromise!;
       const result = await promise;
-      if (gen === this.generation) {
-        return result;
+      if (gen === this.generation || attempt >= ScriptTreeProvider.MAX_SCAN_RETRIES) {
+        // Fix 5 — tag with `gen` (the generation THIS result belongs to),
+        // never `this.generation`: past the retry budget, `gen` may still be
+        // stale relative to `this.generation`, and the caller (`getChildren`)
+        // is the one that decides whether to accept or restart against a
+        // mismatch — fabricating a fresher generation here would silently
+        // reintroduce the poisoning this fix closes.
+        return { generation: gen, scan: result };
       }
       // A newer scan started while this one was in flight — discard this
       // stale result and pick up whatever refresh() most recently kicked off.
@@ -186,6 +224,28 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       return item;
     }
 
+    if (node.kind === "depthTruncated") {
+      // Fix 6 — distinct node/message from "truncated" above: this one fires
+      // when a folder beyond SCRIPT_SCAN_MAX_DEPTH was found and listed but
+      // never descended into, which previously happened with no signal at
+      // all. contextValue is its own string, outside both script-menu
+      // equality checks, same reasoning as the entry-truncation node.
+      const item = new vscode.TreeItem(
+        `Some folders are nested deeper than ${SCRIPT_SCAN_MAX_DEPTH} levels — scripts inside may be hidden`,
+        vscode.TreeItemCollapsibleState.None
+      );
+      item.id = "nexus-script-depth-truncated";
+      item.tooltip = `A folder more than ${SCRIPT_SCAN_MAX_DEPTH} levels deep was found but not scanned, so scripts inside it (and any of its own subfolders) are not shown. Move it closer to the scripts root to see them.`;
+      item.iconPath = new vscode.ThemeIcon("warning");
+      item.contextValue = "nexus.script.depthTruncated";
+      item.command = {
+        command: "workbench.action.openSettings",
+        title: "Open Nexus Scripts Path Setting",
+        arguments: ["nexus.scripts.path"]
+      };
+      return item;
+    }
+
     const item = new vscode.TreeItem(node.name, vscode.TreeItemCollapsibleState.None);
     item.id = `script:${node.uri.fsPath}`;
     // Only the running badge appears inline — the description goes in the
@@ -213,59 +273,81 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
    * §5.1/§5.4 — hierarchical: folders render whether or not they contain
    * scripts, sorted before scripts, both by natural compare. The truncation
    * node (§5.3) and onboarding placeholders (§5.6) are root-only.
+   *
+   * Fix 5 — the scan's generation token is captured once at the top and
+   * checked again at the bottom, AFTER every `readFile` await in between
+   * (the per-script header reads, and `hasMarkedScriptBelowRoot()`'s own read
+   * loop): a refresh can land during any of those awaits, and rendering the
+   * result as current at that point would paint a superseded generation with
+   * nothing to correct it until an unrelated event fires. Restart against
+   * whatever is now current instead — bounded, so a sustained refresh storm
+   * degrades to "occasionally one generation stale" rather than recursing
+   * forever.
    */
   public async getChildren(element?: ScriptNode): Promise<ScriptNode[]> {
     if (element && element.kind !== "folder") {
       return [];
     }
-    const scan = await this.getCurrentScan();
     const targetPath = element?.kind === "folder" ? element.path : undefined;
 
-    const childFolders: ScriptNode[] = scan.folders
-      .filter((f) => folderParentPath(f.path) === targetPath)
-      .sort((a, b) => naturalComparePath(a.path, b.path))
-      .map((f) => ({ kind: "folder" as const, uri: f.uri, path: f.path, name: folderDisplayName(f.path) }));
+    for (let attempt = 0; ; attempt++) {
+      const { generation, scan } = await this.getCurrentScan();
 
-    const runningPaths = new Set(this.manager.getRuns().map((r) => r.scriptPath));
-    const scriptsHere = scan.scripts.filter((s) => s.folderPath === targetPath);
-    const scriptNodes: Array<Extract<ScriptNode, { kind: "script" }>> = [];
-    for (const s of scriptsHere) {
-      let text: string;
-      try {
-        const bytes = await vscode.workspace.fs.readFile(s.uri);
-        text = new TextDecoder("utf-8").decode(bytes);
-      } catch {
-        continue;
+      const childFolders: ScriptNode[] = scan.folders
+        .filter((f) => folderParentPath(f.path) === targetPath)
+        .sort((a, b) => naturalComparePath(a.path, b.path))
+        .map((f) => ({ kind: "folder" as const, uri: f.uri, path: f.path, name: folderDisplayName(f.path) }));
+
+      const runningPaths = new Set(this.manager.getRuns().map((r) => r.scriptPath));
+      const scriptsHere = scan.scripts.filter((s) => s.folderPath === targetPath);
+      const scriptNodes: Array<Extract<ScriptNode, { kind: "script" }>> = [];
+      for (const s of scriptsHere) {
+        let text: string;
+        try {
+          const bytes = await vscode.workspace.fs.readFile(s.uri);
+          text = new TextDecoder("utf-8").decode(bytes);
+        } catch {
+          continue;
+        }
+        const header = parseScriptHeader(text);
+        if (!header.marker) continue;
+        scriptNodes.push({
+          kind: "script",
+          uri: s.uri,
+          name: header.name ?? s.fileName.replace(/\.[^.]+$/, ""),
+          description: header.description ?? "",
+          running: runningPaths.has(s.uri.fsPath),
+          parseErrors: header.parseErrors
+        });
       }
-      const header = parseScriptHeader(text);
-      if (!header.marker) continue;
-      scriptNodes.push({
-        kind: "script",
-        uri: s.uri,
-        name: header.name ?? s.fileName.replace(/\.[^.]+$/, ""),
-        description: header.description ?? "",
-        running: runningPaths.has(s.uri.fsPath),
-        parseErrors: header.parseErrors
-      });
+      scriptNodes.sort((a, b) => naturalCompare(a.name, b.name));
+
+      const children: ScriptNode[] = [...childFolders, ...scriptNodes];
+
+      if (targetPath === undefined) {
+        // §5.6 — placeholders render only when there are no MARKED scripts
+        // anywhere in the tree, root only. Checked cheaply: skip entirely once
+        // a root-level script already qualified above.
+        if (scriptNodes.length === 0 && !(await this.hasMarkedScriptBelowRoot(scan, generation))) {
+          children.push(...scriptPlaceholders());
+        }
+        if (scan.depthTruncated) {
+          // Fix 6 — pinned at root, distinct from (and rendered ahead of) the
+          // entry-cap node below only when both happen to fire together.
+          children.unshift({ kind: "depthTruncated" });
+        }
+        if (scan.truncated) {
+          // §5.3 — pinned FIRST at root, ahead of everything else.
+          children.unshift({ kind: "truncated", examined: scan.examined });
+        }
+      }
+
+      if (this.generation === generation || attempt >= ScriptTreeProvider.MAX_CHILDREN_RESTARTS) {
+        return children;
+      }
+      // A refresh landed during the awaits above — restart against whatever
+      // is now current rather than returning a superseded generation's tree.
     }
-    scriptNodes.sort((a, b) => naturalCompare(a.name, b.name));
-
-    const children: ScriptNode[] = [...childFolders, ...scriptNodes];
-
-    if (targetPath === undefined) {
-      // §5.6 — placeholders render only when there are no MARKED scripts
-      // anywhere in the tree, root only. Checked cheaply: skip entirely once
-      // a root-level script already qualified above.
-      if (scriptNodes.length === 0 && !(await this.hasMarkedScriptBelowRoot(scan))) {
-        children.push(...scriptPlaceholders());
-      }
-      if (scan.truncated) {
-        // §5.3 — pinned FIRST at root, ahead of folders/scripts/placeholders.
-        children.unshift({ kind: "truncated", examined: scan.examined });
-      }
-    }
-
-    return children;
   }
 
   /**
@@ -274,9 +356,16 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
    * `getChildren()` call that finds zero root-level scripts re-reads and
    * re-parses every non-root script in the tree, on top of the per-folder
    * reads `getChildren()` already does as each folder renders.
+   *
+   * Fix 5 — `generation` is the token the CALLER captured for `scan`, and is
+   * exactly what gets written into the cache. Re-reading `this.generation`
+   * after this method's own `readFile` awaits (the pre-fix behaviour) is the
+   * poisoning bug: a refresh crossing those awaits bumps `this.generation`
+   * before this method returns, which would stamp an OLD generation's result
+   * onto the NEW generation's cache entry.
    */
-  private async hasMarkedScriptBelowRoot(scan: ScriptScanResult): Promise<boolean> {
-    if (this.markedBelowRootCache && this.markedBelowRootCache.generation === this.generation) {
+  private async hasMarkedScriptBelowRoot(scan: ScriptScanResult, generation: number): Promise<boolean> {
+    if (this.markedBelowRootCache && this.markedBelowRootCache.generation === generation) {
       return this.markedBelowRootCache.result;
     }
     let found = false;
@@ -294,7 +383,7 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
         break;
       }
     }
-    this.markedBelowRootCache = { generation: this.generation, result: found };
+    this.markedBelowRootCache = { generation, result: found };
     return found;
   }
 

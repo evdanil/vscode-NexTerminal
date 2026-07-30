@@ -314,6 +314,19 @@ export class VscodeMacroStore implements MacroStore {
 
     for (const entry of raw) {
       if (!entry || typeof entry !== "object") continue;
+      // Fix 1 (BLOCKER) — `isUsableMacro` was previously enforced only by `save()`. A
+      // malformed record can reach MACROS_KEY by other means (a hand-edited settings.json
+      // absorbed verbatim, storage corruption, or a caller bug elsewhere writing through a
+      // stale index) — admitting it into `resolved` here means it reaches `MacroTreeItem`,
+      // where `macro.text.replace(...)` throws on every render, killing the Macros view
+      // permanently, surviving restart. Drop it before it is ever inserted into
+      // `resolved`, the same gate `save()` applies.
+      //
+      // Dropping is all this does. It does NOT re-key: the read path deliberately leaves
+      // stored ids alone (see `MacroStore.save()`'s doc comment and the removed
+      // activation-time caller), so a duplicate id is surfaced verbatim and suppressed
+      // downstream rather than silently repaired here.
+      if (!isUsableMacro(entry)) continue;
 
       const persistedId = isValidMacroId(entry.id) ? entry.id : undefined;
       const id = persistedId ?? randomUUID();
@@ -522,7 +535,19 @@ export class VscodeMacroStore implements MacroStore {
     existingOnDisk: readonly TerminalMacro[],
     absorbed: readonly TerminalMacro[]
   ): Promise<boolean> {
-    const keyed = assignIdsForAbsorbedMacros(existingOnDisk, absorbed);
+    // Fix 1 (BLOCKER) — the ABSORBED half gets the same `isUsableMacro` gate `save()`
+    // applies. A hand-edited settings.json entry missing `name`/`text` (e.g.
+    // `{"name":"Broken","group":"Cisco"}`) would otherwise be persisted straight into
+    // globalState and then crash the tree on every subsequent render.
+    //
+    // The EXISTING half is deliberately NOT filtered. Those records are already in
+    // MACROS_KEY, and this routine runs at every activation: dropping one here would be
+    // an activation-time deletion of user data, the exact class of write this branch
+    // removed. They are already harmless — `reloadFromState()` applies `isUsableMacro`
+    // on the read side, so a malformed stored record never reaches the tree, and the
+    // per-record loop below passes non-objects through verbatim. It stays on disk until
+    // a save the user actually asks for rewrites the list.
+    const keyed = assignIdsForAbsorbedMacros(existingOnDisk, absorbed.filter(isUsableMacro));
     const assigned = [...keyed.existing, ...keyed.absorbed].map((m) =>
       m && typeof m === "object" ? withNormalizedGroup(withRedactedVariables(m)) : m
     );

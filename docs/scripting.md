@@ -605,8 +605,9 @@ empty folder stays until you remove it.
 - **New Folder** — the view's title bar button, or a folder's right-click
   menu for a nested folder — creates a real directory. It shows up
   immediately, even before you put anything in it.
-- A folder's right-click menu also has **Reveal in Explorer**, which opens
-  that directory in your OS file manager.
+- A folder's right-click menu also has **Reveal in Explorer**, which reveals
+  that directory in VS Code's own Explorer view (not your OS file manager —
+  use **Open Scripts Folder**, below, for that).
 - Path segments are validated the same way folders are validated everywhere
   else in Nexus: `.` and `..` are rejected, depth is capped at 10 levels, and
   a `\` is rejected outright with a message telling you to use `/` instead —
@@ -619,11 +620,16 @@ empty folder stays until you remove it.
   300ms so a burst of saves or a directory rename only triggers one rescan.
 - **Scan limits.** To keep a misconfigured `nexus.scripts.path` (e.g.
   pointing at your whole home directory) from hanging the sidebar, the scan
-  stops after 10 levels of nesting or 500 examined directories/non-script
-  files (`.js` files themselves don't count against that limit). If the limit
+  stops after 10 levels of nesting or 500 examined entries — every directory
+  and file counts against that budget, `.js` scripts included. If the limit
   is hit, a "Stopped after 500 entries — some scripts may be hidden" row
   pins to the very top of the Scripts view; clicking it opens the
   `nexus.scripts.path` setting so you can point Nexus at a narrower folder.
+  A folder nested more than 10 levels deep is a separate case: it still
+  shows up in the tree, but Nexus doesn't look inside it, so a script
+  placed there won't appear in the Scripts view or any picker. A "Some
+  folders are nested deeper than 10 levels — scripts inside may be hidden"
+  row pins near the top of the Scripts view whenever this happens.
 
 ## Commands and views
 
@@ -635,7 +641,7 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | `Nexus: Quick Run in Active Terminal` | — | Bind the script to whichever Nexus terminal is currently focused — no picker. Falls back to the session picker if no terminal is focused or the focused terminal isn't a Nexus session. Wired to the sidebar's inline ▶ button. |
 | `Nexus: Stop Nexus Script` | `Ctrl+Alt+S` (macOS `⌘⌥S`) when a script is running | Stop a running script. Prompts if more than one is running. |
 | `Nexus: New Nexus Script` | — | Create a new script from a starter template in your configured scripts directory. Accepts a `/`-separated path (`cisco/backup`) to create it inside a folder, creating missing intermediate folders. |
-| `Nexus: New Folder` (Scripts view title bar, or a folder's right-click menu) | — | Create a real directory under the scripts folder. Shows up immediately, even while empty. |
+| `Nexus: New Script Folder` (Scripts view title bar, or a folder's right-click menu) | — | Create a real directory under the scripts folder. Shows up immediately, even while empty. |
 | `Nexus: Refresh Scripts` | — | Manually rescan the scripts directory, bypassing the ~300ms watcher debounce. |
 | `Nexus: Edit Script` | — | Right-click a script → Edit. Opens the file in the editor. (Clicking the row no longer auto-opens the editor — it would be noisy.) |
 | `Nexus: Delete Script` | — | Right-click a script in the sidebar. Asks for confirmation, then moves to Trash. |

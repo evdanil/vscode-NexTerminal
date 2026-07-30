@@ -671,4 +671,110 @@ describe("ScriptTreeProvider", () => {
 
     provider.dispose();
   });
+
+  it("Fix 5 — a refresh landing while hasMarkedScriptBelowRoot() is still reading an OLD generation's script must not poison the NEW generation's cache", async () => {
+    // Directory A: nothing at root, a marked script nested in "cisco" — this
+    // forces getChildren(root) to fall through to hasMarkedScriptBelowRoot(),
+    // which reads that nested script's content.
+    mockFsEntries.set("/workspace/.nexus/scripts", [["cisco", 2]]);
+    mockFsEntries.set("/workspace/.nexus/scripts/cisco", [["a.js", 1]]);
+
+    let signalReached: () => void = () => {};
+    const reachedBlockingPoint = new Promise<void>((resolve) => { signalReached = resolve; });
+    let resolveNestedRead: (bytes: Uint8Array) => void = () => {};
+    const nestedReadPromise = new Promise<Uint8Array>((resolve) => { resolveNestedRead = resolve; });
+
+    const NESTED_PATH = "/workspace/.nexus/scripts/cisco/a.js";
+    (vscode.workspace.fs as unknown as { readFile: typeof vscode.workspace.fs.readFile }).readFile = vi.fn(
+      (uri: { fsPath: string }) => {
+        if (uri.fsPath === NESTED_PATH) {
+          signalReached();
+          return nestedReadPromise as unknown as Promise<Uint8Array>;
+        }
+        const content = mockFiles.get(uri.fsPath);
+        if (content === undefined) return Promise.reject(new Error(`ENOENT: ${uri.fsPath}`));
+        return Promise.resolve(new TextEncoder().encode(content));
+      }
+    ) as unknown as typeof vscode.workspace.fs.readFile;
+
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+    // Generation 1: getChildren(root) starts, scans dir A (fast, unblocked),
+    // finds no root scripts, and falls into hasMarkedScriptBelowRoot() —
+    // which blocks reading cisco/a.js. We wait for that exact blocking point
+    // (rather than a fixed number of microtask ticks) so the sequencing
+    // below is deterministic.
+    const gen1Children = provider.getChildren();
+    await reachedBlockingPoint;
+
+    // The user points nexus.scripts.path at a DIFFERENT, empty directory —
+    // e.g. the exact trigger from the review. A NEW generation's scan starts
+    // and completes without ever touching the still-blocked read above.
+    mockScriptsPath = "/workspace/.nexus/other";
+    mockFsEntries.set("/workspace/.nexus/other", []);
+    for (const listener of configChangeListeners) {
+      listener({ affectsConfiguration: (section: string) => section === "nexus.scripts.path" });
+    }
+    const gen2Children = await provider.getChildren();
+    expect(gen2Children.filter((c) => c.kind === "placeholder")).toHaveLength(3); // dir B is genuinely empty
+
+    // NOW let generation 1's blocked read resolve — its own
+    // hasMarkedScriptBelowRoot() call finishes AFTER the generation bump.
+    resolveNestedRead(new TextEncoder().encode("/**\n * @nexus-script\n * @name A\n */\n"));
+    await gen1Children;
+
+    // A THIRD call, still generation 2 (dir B, still genuinely empty). Before
+    // Fix 5, generation 1's late-resolving hasMarkedScriptBelowRoot() call
+    // stamped `{ generation: this.generation (already bumped to 2), result:
+    // true (found in dir A's content) }` into the cache — CLOBBERING the
+    // correct entry gen2Children's own call had already written — so this
+    // call would wrongly suppress the onboarding placeholders for a
+    // directory that has nothing in it at all.
+    const gen2Again = await provider.getChildren();
+    expect(gen2Again.filter((c) => c.kind === "placeholder")).toHaveLength(3);
+
+    provider.dispose();
+  });
+
+  // ---- §5.3 — depth-cap truncation is announced too (Fix 6) --------------
+
+  it("Fix 6 — pins a depth-truncation warning node at root when a folder beyond the depth cap is found, distinct from the entry-cap node", async () => {
+    // A straight-line chain d1/.../d11 — one level past the 10-level depth
+    // cap — with a marked script sitting inside the un-descended d11.
+    // Before Fix 6, this script vanished from the tree with NO warning node
+    // anywhere: the scan neither descended into d11 nor set any truncation
+    // flag at all.
+    let currentPath = "/workspace/.nexus/scripts";
+    for (let i = 1; i <= 11; i++) {
+      mockFsEntries.set(currentPath, [[`d${i}`, 2]]);
+      currentPath = `${currentPath}/d${i}`;
+    }
+    mockFsEntries.set(currentPath, [["toodeep.js", 1]]);
+    mockFiles.set(`${currentPath}/toodeep.js`, "/**\n * @nexus-script\n */\n");
+
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+    const children = await provider.getChildren();
+
+    const node = children.find((c) => c.kind === "depthTruncated");
+    expect(node).toBeDefined();
+    const item = provider.getTreeItem(node!);
+    expect(item.command?.command).toBe("workbench.action.openSettings");
+    expect(item.command?.arguments).toEqual(["nexus.scripts.path"]);
+    // Never matches either script-menu equality gate, same as the entry-cap node.
+    expect(item.contextValue).not.toBe("nexus.script.file");
+    expect(item.contextValue).not.toBe("nexus.script.running");
+    // And it must not be the SAME node/message as the entry-count truncation.
+    expect(children.some((c) => c.kind === "truncated")).toBe(false);
+  });
+
+  it("does not show the depth-truncation node when nothing exceeded the depth cap", async () => {
+    mockFsEntries.set("/workspace/.nexus/scripts", [["cisco", 2]]);
+    mockFsEntries.set("/workspace/.nexus/scripts/cisco", [["a.js", 1]]);
+    mockFiles.set("/workspace/.nexus/scripts/cisco/a.js", "/**\n * @nexus-script\n */\n");
+
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+    const children = await provider.getChildren();
+
+    expect(children.some((c) => c.kind === "depthTruncated")).toBe(false);
+  });
 });

@@ -2848,7 +2848,7 @@ describe("import inventory list command", () => {
     await cmd();
 
     expect(mockShowErrorMessage).toHaveBeenCalledWith(
-      "Invalid folder path. Use up to 10 levels and avoid '.', '..', or '\\'."
+      "Invalid folder path. Use up to 10 levels (each up to 64 characters) and avoid '.', '..', or '\\'."
     );
     expect(core.getSnapshot().servers).toHaveLength(0);
   });
