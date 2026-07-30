@@ -53,6 +53,14 @@ function renderField(field: FormFieldDescriptor): string {
   <div class="field-error" id="error-${key}"></div>
 </div>`;
 
+    // A `<textarea>` here renders `field.value` bare, unlike the Macro Editor's
+    // (`TEXTAREA_LEADING_NEWLINE` in `macroEditorHtml.ts`), because the HTML
+    // parser discards one U+000A immediately after the start tag and neither
+    // field this shell renders can tell: `shellArgs` splits on newlines and
+    // filters empties (`splitArgs()`), and `startupCommand` is trimmed on save
+    // (`readString()`), both in `localShellCommands.ts`. A NEW textarea field
+    // whose value is stored verbatim needs the leading newline — without it,
+    // opening the form and pressing Save silently drops the value's first line.
     case "textarea":
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
