@@ -16,6 +16,7 @@ import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore } from "../../src/storage/vscodeMacroStore";
 import { assignUniqueMacroIds, isValidMacroId } from "../../src/storage/macroStore";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
+import { macroGroup } from "../../src/services/macroFolders";
 
 function makeFakeContext() {
   const stateBag = new Map<string, unknown>();
@@ -144,19 +145,32 @@ describe("MacroStore (in-memory)", () => {
     expect(all[0].name).toBe("Good");
   });
 
-  describe("group is sanitized on save() the same way as VscodeMacroStore (Fix 5 — aligned ingest contracts)", () => {
-    it("canonicalizes an empty-string group to undefined", async () => {
+  describe("group ingest contract matches VscodeMacroStore's exactly", () => {
+    it("canonicalizes an empty-string group to undefined (§4.1 — it holds no path)", async () => {
       const store = new InMemoryMacroStore();
       await store.initialize();
       await store.save([{ name: "m", text: "t", group: "" }]);
       expect(store.getAll()[0].group).toBeUndefined();
     });
 
-    it("drops a structurally invalid group ('..') rather than persisting it", async () => {
+    it("drops a non-string group — it cannot be a path, so nothing is destroyed", async () => {
       const store = new InMemoryMacroStore();
       await store.initialize();
-      await store.save([{ name: "m", text: "t", group: "../secrets" }]);
+      await store.save([{ name: "m", text: "t", group: { nope: true } } as unknown as TerminalMacro]);
       expect(store.getAll()[0].group).toBeUndefined();
+    });
+
+    it("PRESERVES an unrenderable group string rather than deleting the assignment", async () => {
+      // `save()` rewrites the WHOLE array, so running the folder-path grammar
+      // here deleted the stored group of macros the caller never touched.
+      // Macro "Other" is the victim: the user is only editing "Edited".
+      const store = new InMemoryMacroStore();
+      await store.initialize();
+      await store.save([
+        { name: "Edited", text: "t", group: "Cisco" },
+        { name: "Other", text: "t", group: "Cisco\\Routers" }
+      ]);
+      expect(store.getAll()[1].group).toBe("Cisco\\Routers");
     });
 
     it("keeps a valid group untouched", async () => {
@@ -1229,16 +1243,37 @@ describe("VscodeMacroStore — `group` is untrusted at every ingest site (§4.2)
     expect(store.getAll()[0].group).toBeUndefined();
   });
 
-  it("save() drops a structurally invalid group ('..') rather than persisting it", async () => {
+  it("save() drops a non-string group — it cannot be a path, so nothing is destroyed", async () => {
     const { context, stateBag } = makeFakeContext();
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });
     await store.initialize();
 
-    await store.save([{ id: "a", name: "m", text: "t", group: "../secrets" }]);
+    await store.save([{ id: "a", name: "m", text: "t", group: { nope: true } } as unknown as TerminalMacro]);
 
     expect(store.getAll()[0].group).toBeUndefined();
     const persisted = stateBag.get("nexus.macros") as Array<{ group?: string }>;
     expect(persisted[0].group).toBeUndefined();
+  });
+
+  it("save() PRESERVES an unrenderable group string on an untouched macro rather than deleting the assignment", async () => {
+    // `save()` rewrites the WHOLE array. Running the folder-path grammar here
+    // meant editing ONE macro silently deleted the stored folder of every
+    // other macro whose group no longer normalizes. "Other" is the victim.
+    const { context, stateBag } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    await store.save([
+      { id: "a", name: "Edited", text: "t", group: "Cisco" },
+      { id: "b", name: "Other", text: "t", group: "Cisco\\Routers" }
+    ]);
+
+    expect(store.getAll()[1].group).toBe("Cisco\\Routers");
+    const persisted = stateBag.get("nexus.macros") as Array<{ group?: string }>;
+    expect(persisted[1].group).toBe("Cisco\\Routers");
+    // ...and it is still treated as ungrouped everywhere it is READ, which is
+    // what keeps §4.2's "malformed group breaks the sidebar" hazard closed.
+    expect(macroGroup(store.getAll()[1])).toBeUndefined();
   });
 
   it("save() keeps a valid group untouched", async () => {
@@ -1251,10 +1286,12 @@ describe("VscodeMacroStore — `group` is untrusted at every ingest site (§4.2)
     expect(store.getAll()[0].group).toBe("Cisco/Routers");
   });
 
-  // §4.2's three concrete failure inputs, applied to a value ALREADY sitting in
+  // §4.2's concrete failure inputs, applied to a value ALREADY sitting in
   // MACROS_KEY (reloadFromState — not save()) — the untrusted-input path the
   // design calls out explicitly: "a malformed value can already be sitting in
-  // MACROS_KEY". None of these may throw and break the whole macro view.
+  // MACROS_KEY". None of these may throw and break the whole macro view, and
+  // — the point of this whole block — none of them may DELETE the stored
+  // value: an activation is not a licence to rewrite the user's data.
   it("reloadFromState() degrades a non-string (object) group already in MACROS_KEY without crashing", async () => {
     const { context, stateBag } = makeFakeContext();
     stateBag.set("nexus.macros", [
@@ -1267,7 +1304,7 @@ describe("VscodeMacroStore — `group` is untrusted at every ingest site (§4.2)
     expect(store.getAll()[0].group).toBeUndefined();
   });
 
-  it("reloadFromState() rejects a '..' path traversal already sitting in MACROS_KEY", async () => {
+  it("reloadFromState() keeps a '..' group already sitting in MACROS_KEY, and renders it as ungrouped", async () => {
     const { context, stateBag } = makeFakeContext();
     stateBag.set("nexus.macros", [
       { id: "a", name: "m", text: "t", group: "../secrets" }
@@ -1276,27 +1313,33 @@ describe("VscodeMacroStore — `group` is untrusted at every ingest site (§4.2)
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });
     await store.initialize();
 
-    expect(store.getAll()[0].group).toBeUndefined();
+    expect(store.getAll()[0].group).toBe("../secrets");
+    // The safety property §4.2 actually needs: it never renders as a `..`
+    // folder, because every READ site sanitizes.
+    expect(macroGroup(store.getAll()[0])).toBeUndefined();
   });
 
-  it("reloadFromState() rejects an over-depth group already sitting in MACROS_KEY (bounds an O(n^2) stall)", async () => {
+  it("reloadFromState() keeps an over-depth group already sitting in MACROS_KEY, and renders it as ungrouped", async () => {
     const { context, stateBag } = makeFakeContext();
-    const huge = Array.from({ length: 200 }, () => "a").join("/");
+    const deep = Array.from({ length: 200 }, () => "a").join("/");
     stateBag.set("nexus.macros", [
-      { id: "a", name: "m", text: "t", group: huge }
+      { id: "a", name: "m", text: "t", group: deep }
     ]);
 
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });
     await expect(store.initialize()).resolves.toBeUndefined();
 
-    expect(store.getAll()[0].group).toBeUndefined();
+    expect(store.getAll()[0].group).toBe(deep);
+    expect(macroGroup(store.getAll()[0])).toBeUndefined();
   });
 
-  it("Fix 4 — reloadFromState() rejects a pathologically long SINGLE-SEGMENT group already sitting in MACROS_KEY (depth/segment-count alone never bounds this)", async () => {
+  it("a pathologically long SINGLE-SEGMENT group already in MACROS_KEY is kept on disk but never renders (depth/segment-count alone never bounds this)", async () => {
     // The over-depth test above uses 200 SHORT segments — it exercises depth
     // only. This is a single segment (segment count 1, well under
-    // MAX_FOLDER_DEPTH) that is instead pathologically LONG — the exact
-    // repro from the review: `group: "X".repeat(8_000_000)`.
+    // MAX_FOLDER_DEPTH) that is instead pathologically LONG — the original
+    // repro, `group: "X".repeat(8_000_000)`. The bound that matters is at the
+    // READ site: `macroGroup()` must reject it, in O(1), without splitting,
+    // sorting or rendering it.
     const { context, stateBag } = makeFakeContext();
     const huge = "X".repeat(8_000_000);
     stateBag.set("nexus.macros", [
@@ -1306,19 +1349,48 @@ describe("VscodeMacroStore — `group` is untrusted at every ingest site (§4.2)
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });
     await expect(store.initialize()).resolves.toBeUndefined();
 
-    expect(store.getAll()[0].group).toBeUndefined();
+    expect(macroGroup(store.getAll()[0])).toBeUndefined();
+    expect(store.getAll()[0].group).toHaveLength(8_000_000);
   });
 
-  it("reloadFromState() scrubs a malformed group off the RAW disk value too, not just getAll()", async () => {
+  it("reloadFromState() does NOT rewrite MACROS_KEY to strip an unrenderable group — merely activating must not destroy a folder assignment", async () => {
+    // This is the inverse of what this test previously asserted. The eager
+    // disk scrub exists so a masked variable's PLAINTEXT DEFAULT cannot linger
+    // in globalState; a folder path is not a secret, and reusing that
+    // machinery for `group` meant one activation permanently deleted the
+    // user's folder with no notice and no undo.
     const { context, stateBag } = makeFakeContext();
     stateBag.set("nexus.macros", [
-      { id: "a", name: "m", text: "t", group: "../secrets" }
+      { id: "a", name: "m", text: "t", group: "Cisco\\Routers" }
     ]);
 
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });
     await store.initialize();
 
     const rawOnDisk = stateBag.get("nexus.macros") as Array<{ group?: string }>;
-    expect(rawOnDisk[0].group).toBeUndefined();
+    expect(rawOnDisk[0].group).toBe("Cisco\\Routers");
+  });
+
+  it("the variables scrub still rewrites MACROS_KEY — the group change must not have disabled it", async () => {
+    // Guards the other side of the same edit: `needsDiskScrub` now fires only
+    // for `variables`, so prove it still fires at all.
+    const { context, stateBag } = makeFakeContext();
+    stateBag.set("nexus.macros", [
+      {
+        id: "a",
+        name: "m",
+        text: "t",
+        group: "Cisco\\Routers",
+        variables: [{ name: "pw", secret: true, default: "hunter2" }]
+      }
+    ]);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    const rawOnDisk = stateBag.get("nexus.macros") as Array<{ group?: string; variables?: Array<{ default?: string }> }>;
+    expect(JSON.stringify(rawOnDisk)).not.toContain("hunter2");
+    // ...without taking the folder assignment down with it.
+    expect(rawOnDisk[0].group).toBe("Cisco\\Routers");
   });
 });

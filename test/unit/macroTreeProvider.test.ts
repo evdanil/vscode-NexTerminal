@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
-import { setActiveMacroStore } from "../../src/macroSettings";
+import { getMacros, setActiveMacroStore } from "../../src/macroSettings";
 
 // Fix 8 — the real folder commands (registerMacroCommands) are exercised by
 // the rewritten "assigning/renaming/removing" test below, so registration
@@ -681,6 +681,35 @@ describe("MacroTreeProvider — hierarchical folders (§4.3, §4.4)", () => {
 
     expect(() => provider.getChildren()).not.toThrow();
     expect(macroLabels(provider.getChildren())).toEqual(["Bad"]);
+  });
+
+  it("a macro whose STORED group is an unrenderable string renders at root and creates no folder — the store keeps the value, the tree never shows it", async () => {
+    // The store no longer deletes an unrenderable group (that destroyed the
+    // user's assignment on the next activation), so the tree is now the layer
+    // that has to cope with one. `..` must never appear as a folder, the
+    // 8-million-character value must never become a row, and neither may
+    // knock the view over.
+    await testStore.save([
+      { name: "Traversal", text: "t", group: "../secrets" },
+      { name: "Backslash", text: "t", group: "Cisco\\Routers" },
+      { name: "Huge", text: "t", group: "X".repeat(8_000_000) },
+      { name: "Grouped", text: "t", group: "Cisco" }
+    ]);
+
+    const children = provider.getChildren();
+
+    // Exactly one folder — "Cisco", from the one macro with a usable group.
+    const folders = (children as unknown[]).filter((c) => c instanceof FolderTreeItem) as FolderTreeItem[];
+    expect(folders.map((f) => f.folderPath)).toEqual(["Cisco"]);
+    // The three unrenderable ones sit at the root, in array order.
+    expect(macroLabels(children)).toEqual(["Traversal", "Backslash", "Huge"]);
+    // ...and the values are still in the store, not silently deleted.
+    expect(getMacros().map((m) => m.group)).toEqual([
+      "../secrets",
+      "Cisco\\Routers",
+      "X".repeat(8_000_000),
+      "Cisco"
+    ]);
   });
 });
 

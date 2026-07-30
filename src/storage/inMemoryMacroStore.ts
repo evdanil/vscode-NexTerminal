@@ -5,7 +5,7 @@ import {
   type MacroStore,
   type MacroStoreChangeListener
 } from "./macroStore";
-import { sanitizeMacroFolderList, withNormalizedGroup } from "../services/macroFolders";
+import { dropNonPathGroup, sanitizeMacroFolderList } from "../services/macroFolders";
 
 /**
  * Fix 1 — mirrors `VscodeMacroStore`'s `isUsableMacro()`: a macro is not
@@ -40,12 +40,16 @@ export class InMemoryMacroStore implements MacroStore {
     // so tests and the web-host fallback see the same macro shape the production store
     // hands out. See `withMigratedSlot()` in macroStore.ts.
     // Fix 1 — unusable records are dropped BEFORE ids are assigned, so a fresh UUID is
-    // never spent on a record that is about to be discarded. Fix 5 — `group` gets the
-    // same ingest-time normalization VscodeMacroStore applies: the two MacroStore
+    // never spent on a record that is about to be discarded.
+    //
+    // `group` gets the same ingest GUARD VscodeMacroStore applies — the two MacroStore
     // implementations must not have different ingest contracts for the same untrusted
-    // field (§4.2).
+    // field (§4.2). Note it is a guard, not the folder-path grammar: a string group is
+    // preserved exactly as given and sanitized only at read sites, so a `save()`
+    // triggered by an unrelated edit can never delete another macro's stored folder
+    // assignment.
     this.macros = assignUniqueMacroIds(macros.filter(isUsableMacro)).map((m) =>
-      withNormalizedGroup(withMigratedSlot(m))
+      dropNonPathGroup(withMigratedSlot(m))
     );
     for (const listener of this.listeners) listener();
   }

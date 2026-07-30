@@ -680,6 +680,7 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | Error toast says the script "failed" on a normal `Timeout` | Shouldn't happen — expected codes are filtered | File an issue; include the Output Channel contents |
 | A folder named `types` at the top level of my scripts folder doesn't appear in the sidebar at all | The generated `types/` at the *root* of the scripts directory (`<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json`) is intentionally hidden from the tree — it's Nexus's own scaffolding, not yours | Only the root-level `types/` is hidden. A `types/` folder anywhere else — e.g. `cisco/types/probe.js` — is a normal folder and shows its scripts like any other |
 | Some scripts or folders seem to be missing from a very large or deeply nested scripts directory | The scan stops after 10 levels of nesting or 500 examined directories/files (scripts included), to keep a misconfigured `nexus.scripts.path` from hanging the sidebar | Point `nexus.scripts.path` at a narrower folder — click the "Stopped after 500 entries" row pinned at the top of the Scripts view to jump straight to that setting |
+| The Scripts view shows a single "Scanning scripts…" row | The folder is changing faster than it can be listed (a bulk checkout, a sync client, or repeatedly switching `nexus.scripts.path`). Rather than show you the previous folder's contents as if they were current, the view says so | Nothing — it repaints itself once the folder settles. Clicking the row forces a refresh if you'd rather not wait |
 
 ---
 

@@ -107,7 +107,11 @@ describe("macroCommands clipboard actions", () => {
   });
 
   it("can append a newline before saving pasted secret text", async () => {
-    const macros = [{ name: "Password", text: "old", secret: true }];
+    // `id` is a MacroStore invariant — both store implementations assign one
+    // in save(), and VscodeMacroStore assigns one again on reload — so
+    // everything getMacros() returns carries one. The command resolves its
+    // target by id across the clipboard/prompt awaits.
+    const macros = [{ id: "pw-1", name: "Password", text: "old", secret: true }];
     const pasteSecret = registeredCommands.get("nexus.macro.pasteSecret");
     expect(pasteSecret).toBeDefined();
     mockGetMacros.mockReturnValue(macros);

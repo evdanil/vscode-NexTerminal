@@ -10,6 +10,15 @@ import { folderDisplayName, parentPath as folderParentPath } from "../utils/fold
 /** §5.2 — every autosave/rescan fires the raw watcher; coalesce into one rescan. */
 const SCRIPT_WATCH_DEBOUNCE_MS = 300;
 
+/**
+ * How long to wait before repainting after `getChildren()` gave up on a
+ * generation race (see the "scanning" node). Deliberately a REPAINT, not a
+ * `refresh()`: refreshing would bump the generation and start yet another
+ * scan, which is precisely the condition that starved the render in the first
+ * place.
+ */
+const SCRIPT_STARVED_REPAINT_MS = 300;
+
 export type ScriptNode =
   | { kind: "script"; uri: vscode.Uri; name: string; description: string; running: boolean; parseErrors: string[] }
   | { kind: "folder"; uri: vscode.Uri; path: string; name: string }
@@ -19,6 +28,12 @@ export type ScriptNode =
   // off at the depth cap while the rest of the tree scanned normally. Design
   // §5.3 requires truncation to always be announced, never silent.
   | { kind: "depthTruncated" }
+  // The tree gave up trying to render a settled generation (see
+  // `MAX_CHILDREN_RESTARTS`). Rendering the superseded scan instead — a
+  // directory that is no longer the configured one — trades a hang for a
+  // quieter wrong answer, so the escape hatch says what happened rather than
+  // showing stale contents.
+  | { kind: "scanning" }
   | { kind: "placeholder"; label: string; detail?: string; command: vscode.Command; icon: string };
 
 function scriptPlaceholders(): ScriptNode[] {
@@ -55,6 +70,8 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   private readonly managerListener: vscode.Disposable;
   private readonly configListener: vscode.Disposable;
   private readonly debouncedRefresh: CoalescedInvoker;
+  /** Repaint-only (never rescan) retry after a starved render — see SCRIPT_STARVED_REPAINT_MS. */
+  private readonly starvedRepaint: CoalescedInvoker;
 
   // §5.1 — one recursive scan per refresh, shared by every getChildren() call
   // for that render pass. `generation` guards against an overlapping older
@@ -72,10 +89,16 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
   // newer) `this.generation`, so the cache-poisoning bug this fix also closes
   // can't be reintroduced through the escape hatch.
   private static readonly MAX_SCAN_RETRIES = 5;
-  // Fix 5 — bounds `getChildren()`'s own restart-on-stale-generation loop
-  // (see below): a sustained refresh storm crossing every readFile await
-  // degrades to "occasionally one generation behind" instead of recursing
-  // without end.
+  // Bounds `getChildren()`'s own restart-on-stale-generation loop (see
+  // below) so a sustained refresh storm crossing every readFile await cannot
+  // spin without end.
+  //
+  // Exhausting it does NOT mean "render the stale scan": that was the first
+  // version of this escape hatch and it traded a hang for a quieter wrong
+  // answer — the tree showing a directory that is no longer the configured
+  // one, with nothing to correct it. Exhaustion returns the "scanning" node
+  // and schedules a repaint instead, so the only two outcomes are a correct
+  // tree or an honest "not showing you anything yet".
   private static readonly MAX_CHILDREN_RESTARTS = 5;
 
   // Fix 3 — `hasMarkedScriptBelowRoot()` re-reads (and header-parses) every
@@ -118,6 +141,10 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       }
     });
     this.debouncedRefresh = createCoalescedInvoker(() => this.refresh(), SCRIPT_WATCH_DEBOUNCE_MS);
+    this.starvedRepaint = createCoalescedInvoker(
+      () => this._onDidChangeTreeData.fire(),
+      SCRIPT_STARVED_REPAINT_MS
+    );
     this.ensureWatcher();
   }
 
@@ -126,6 +153,7 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
     this.managerListener.dispose();
     this.configListener.dispose();
     this.debouncedRefresh.dispose();
+    this.starvedRepaint.dispose();
     this._onDidChangeTreeData.dispose();
   }
 
@@ -224,6 +252,21 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       return item;
     }
 
+    if (node.kind === "scanning") {
+      // Deliberately NO `id`: unlike the two truncation nodes (root-only and
+      // singular), a sustained refresh storm starves every expanded folder's
+      // `getChildren()` at once, and a duplicate TreeItem id makes VS Code
+      // reject the whole render. contextValue is its own string, outside both
+      // script-menu equality checks, so no script menu leaks onto it.
+      const item = new vscode.TreeItem("Scanning scripts…", vscode.TreeItemCollapsibleState.None);
+      item.tooltip =
+        "The scripts folder is changing faster than it can be listed, so the previous contents are not shown (they may be from a folder that is no longer configured). This refreshes itself once the folder settles.";
+      item.iconPath = new vscode.ThemeIcon("sync~spin");
+      item.contextValue = "nexus.script.scanning";
+      item.command = { command: "nexus.script.refresh", title: "Refresh Scripts" };
+      return item;
+    }
+
     if (node.kind === "depthTruncated") {
       // Fix 6 — distinct node/message from "truncated" above: this one fires
       // when a folder beyond SCRIPT_SCAN_MAX_DEPTH was found and listed but
@@ -280,9 +323,9 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
    * loop): a refresh can land during any of those awaits, and rendering the
    * result as current at that point would paint a superseded generation with
    * nothing to correct it until an unrelated event fires. Restart against
-   * whatever is now current instead — bounded, so a sustained refresh storm
-   * degrades to "occasionally one generation stale" rather than recursing
-   * forever.
+   * whatever is now current instead — bounded by `MAX_CHILDREN_RESTARTS`, and
+   * a superseded tree is NEVER returned: exhausting the budget yields the
+   * "scanning" node plus a scheduled repaint.
    */
   public async getChildren(element?: ScriptNode): Promise<ScriptNode[]> {
     if (element && element.kind !== "folder") {
@@ -342,8 +385,20 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
         }
       }
 
-      if (this.generation === generation || attempt >= ScriptTreeProvider.MAX_CHILDREN_RESTARTS) {
+      if (this.generation === generation) {
         return children;
+      }
+      if (attempt >= ScriptTreeProvider.MAX_CHILDREN_RESTARTS) {
+        // Out of restarts and still behind. `children` here was built from a
+        // superseded scan — after a `nexus.scripts.path` change that is a
+        // listing of a directory nobody watches any more, which is exactly the
+        // wrong answer this whole generation mechanism exists to prevent.
+        // Returning it "to avoid a hang" would just make the wrong answer
+        // quiet. Say what is happening instead, and repaint (never rescan —
+        // see SCRIPT_STARVED_REPAINT_MS) so the tree corrects itself the
+        // moment the storm stops, with no user action required.
+        this.starvedRepaint.schedule();
+        return [{ kind: "scanning" }];
       }
       // A refresh landed during the awaits above — restart against whatever
       // is now current rather than returning a superseded generation's tree.

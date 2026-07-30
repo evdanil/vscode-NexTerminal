@@ -533,6 +533,65 @@ function findNextInGroup(macros: TerminalMacro[], index: number, group: string |
   return -1;
 }
 
+/**
+ * The one safe way to run the shape "resolve a macro, await a dialog, then
+ * mutate the array" — hand-rolled three times before this, and wrong every
+ * time.
+ *
+ * The trap is that re-reading `getMacros()` after the dialog is only HALF the
+ * fix. `getMacros()` returns a fresh array on every call, so a pre-dialog
+ * index applied to a post-dialog array is not merely stale, it is confidently
+ * wrong: with `[A, B]`, opening a dialog on A (index 0) and another window
+ * deleting A while it is open leaves `[B]`, and `splice(0, 1)` /
+ * `assignBinding(latest, 0, …)` then hits **B** — a macro the user never
+ * selected, after a confirmation naming A. A bounds check does not help; index
+ * 0 is perfectly in bounds.
+ *
+ * `id` is the only stable identity a macro has across those awaits. It is a
+ * `MacroStore` invariant, not a hope: both store implementations assign a
+ * UUID in `save()`, and `VscodeMacroStore` assigns one again in
+ * `reloadFromState()`, so everything `getMacros()` ever returns — and
+ * therefore every `MacroTreeItem.macro` — carries one. A missing id can only
+ * mean the caller synthesised a macro that never came from the store, and is
+ * treated as "no target": no write at all, never a guess.
+ *
+ * `mutate` receives the FRESHLY read array and the index of the target macro
+ * WITHIN THAT ARRAY, so whole-array operations (`splice`, `assignBinding`'s
+ * clear-the-binding-from-everyone-else pass) work exactly as before.
+ *
+ * `moveToFolder` and `MacroTreeProvider.handleDrop` solve the same problem in
+ * their own shape — many ids / one id, no index needed, a pure field rewrite
+ * expressed as a `map` — and are left as they are rather than bent through
+ * this signature.
+ */
+async function mutateMacroById(
+  id: string | undefined,
+  mutate: (macros: TerminalMacro[], index: number) => void
+): Promise<boolean> {
+  if (!id) {
+    return false;
+  }
+  const latest = getMacros();
+  const index = latest.findIndex((m) => m.id === id);
+  if (index === -1) {
+    return false; // Deleted while the dialog was open — a no-op, never a wrong write.
+  }
+  mutate(latest, index);
+  await saveMacros(latest);
+  return true;
+}
+
+/**
+ * Position of the macro with `id` in `macros`, or -1. Only ever used for the
+ * PRE-dialog read (the name to show in a confirmation, the binding to pre-fill
+ * in a prompt). The index it returns is valid for `macros` and nothing else —
+ * the post-dialog write must go through `mutateMacroById`, which re-resolves
+ * against a freshly read array.
+ */
+function indexOfMacroById(macros: TerminalMacro[], id: string | undefined): number {
+  return id ? macros.findIndex((m) => m.id === id) : -1;
+}
+
 export function registerMacroCommands(profileProvider?: () => MacroProfileOptionInput[]): vscode.Disposable[] {
   if (profileProvider) {
     MacroEditorPanel.setProfileProvider(profileProvider);
@@ -564,11 +623,16 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       }
     }),
 
+    // Identity, not position: the id is captured up front and carried across
+    // the confirmation dialog (see `mutateMacroById`). Re-reading the array
+    // after the dialog while still indexing into it with the PRE-dialog index
+    // was worse than not re-reading at all — it confidently removed whichever
+    // macro had since slid into that slot.
     vscode.commands.registerCommand("nexus.macro.remove", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
-      let index: number;
+      let targetId: string | undefined;
       if (item) {
-        index = item.index;
+        targetId = item.macro.id;
       } else {
         const macros = getMacros();
         if (macros.length === 0) {
@@ -576,37 +640,30 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           return;
         }
         const pick = await vscode.window.showQuickPick(
-          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), index: i })),
+          macros.map((m) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), id: m.id })),
           { title: "Select Macro to Remove" }
         );
         if (!pick) {
           return;
         }
-        index = pick.index;
+        targetId = pick.id;
       }
       const macros = getMacros();
-      const macro = macros[index];
-      if (!macro) {
+      const index = indexOfMacroById(macros, targetId);
+      if (index === -1) {
         return;
       }
       const confirm = await vscode.window.showWarningMessage(
-        `Remove macro "${macro.name}"?`,
+        `Remove macro "${macros[index].name}"?`,
         { modal: true },
         "Remove"
       );
       if (confirm !== "Remove") {
         return;
       }
-      // Fix 2 (swept per its own instruction — "any other command that
-      // awaits a dialog before saving") — `macros` above was captured
-      // before this confirmation; re-read the latest array rather than
-      // mutating and persisting that stale snapshot.
-      const latest = getMacros();
-      if (index < 0 || index >= latest.length) {
-        return;
-      }
-      latest.splice(index, 1);
-      await saveMacros(latest);
+      await mutateMacroById(targetId, (latest, i) => {
+        latest.splice(i, 1);
+      });
     }),
 
     vscode.commands.registerCommand("nexus.macro.run", async () => {
@@ -688,11 +745,15 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       }
     }),
 
+    // Same identity discipline as `remove` above, and the stakes are higher:
+    // `assignBinding` clears the binding from every OTHER macro that holds it,
+    // so writing through a pre-dialog index against a re-read array rebound
+    // the wrong macro AND stripped a third macro's shortcut.
     vscode.commands.registerCommand("nexus.macro.assignSlot", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
-      let index: number;
+      let targetId: string | undefined;
       if (item) {
-        index = item.index;
+        targetId = item.macro.id;
       } else {
         const macros = getMacros();
         if (macros.length === 0) {
@@ -700,32 +761,28 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           return;
         }
         const pick = await vscode.window.showQuickPick(
-          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), index: i })),
+          macros.map((m) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), id: m.id })),
           { title: "Select Macro" }
         );
         if (!pick) {
           return;
         }
-        index = pick.index;
+        targetId = pick.id;
       }
       const macros = getMacros();
-      const macro = macros[index];
-      if (!macro) {
+      const index = indexOfMacroById(macros, targetId);
+      if (index === -1) {
         return;
       }
-      const bindingResult = await promptForBinding(macros, index, getAssignedBinding(macro));
+      // The prompt's conflict warning is a display concern and reads the
+      // pre-dialog snapshot; the WRITE below re-resolves by identity.
+      const bindingResult = await promptForBinding(macros, index, getAssignedBinding(macros[index]));
       if (bindingResult === undefined) {
         return; // Cancelled
       }
-      // Fix 2 (swept) — `macros` above was captured before the binding
-      // prompt's own await; re-read the latest array before writing the
-      // assignment back, so a concurrent save during the prompt survives.
-      const latest = getMacros();
-      if (index < 0 || index >= latest.length) {
-        return;
-      }
-      assignBinding(latest, index, bindingResult);
-      await saveMacros(latest);
+      await mutateMacroById(targetId, (latest, i) => {
+        assignBinding(latest, i, bindingResult);
+      });
     }),
 
     // §4.4 — swaps with the previous/next macro SHARING THE SAME `group`, not
@@ -972,13 +1029,17 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           text += "\n";
         }
       }
-      const macros = getMacros();
-      const macro = macros[item.index];
-      if (!macro) {
-        return;
+      // The third instance of the same shape: `clipboard.readText()` and the
+      // append-newline prompt are both awaits, after which `item.index` is a
+      // pre-dialog position. Writing a secret's plaintext into whichever macro
+      // now occupies that slot is the worst outcome of the three, so it goes
+      // through the same identity path.
+      const updated = await mutateMacroById(item.macro.id, (macros, i) => {
+        macros[i] = { ...macros[i], text };
+      });
+      if (!updated) {
+        return; // The macro went away mid-flow — don't claim it was updated.
       }
-      macro.text = text;
-      await saveMacros(macros);
       void vscode.window.showInformationMessage(`Updated "${item.macro.name}" from clipboard.`);
     }),
 

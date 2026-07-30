@@ -10,7 +10,7 @@ import {
   type MacroStoreChangeListener
 } from "./macroStore";
 import { withRedactedVariables } from "../services/macroVariables";
-import { sanitizeMacroFolderList, withNormalizedGroup } from "../services/macroFolders";
+import { dropNonPathGroup, sanitizeMacroFolderList } from "../services/macroFolders";
 
 const MACROS_KEY = "nexus.macros";
 const SECRET_IDS_KEY = "nexus.macros.secretIds";
@@ -128,14 +128,17 @@ export class VscodeMacroStore implements MacroStore {
     // backup (configCommands.ts hands `save()` the file's records verbatim) converges to
     // `keybinding` on disk instead of only in memory.
     //
-    // §4.2 — `group` gets the same ingest-time normalization as `variables` and `slot`,
-    // for the same chokepoint reason. The three touch disjoint fields, so the order they
-    // compose in does not matter.
+    // §4.2 — `group` is GUARDED here, but NOT normalized: `save()` rewrites the whole
+    // array, including macros this command never touched, so applying the folder-path
+    // grammar here would silently delete a stored folder assignment as a side effect of
+    // an unrelated edit. Only a value that holds no path at all (non-string, or blank) is
+    // dropped; see `dropNonPathGroup()`. `variables` and `slot` ARE normalized, and the
+    // three touch disjoint fields, so the order they compose in does not matter.
     //
     // Fix 1 — `isUsableMacro` runs FIRST, so a fresh UUID is never spent on a record
     // that is about to be dropped, and no vault key is ever derived from one.
     const normalized: TerminalMacro[] = assignUniqueMacroIds(macros.filter(isUsableMacro)).map((m) =>
-      withNormalizedGroup(withRedactedVariables(withMigratedSlot(m)))
+      dropNonPathGroup(withRedactedVariables(withMigratedSlot(m)))
     );
 
     const currentIds = new Set(this.resolved.map((m) => m.id).filter((v): v is string => Boolean(v)));
@@ -336,15 +339,23 @@ export class VscodeMacroStore implements MacroStore {
       // already sitting in globalState from an earlier build cannot leak a masked
       // variable's plaintext default into `getAll()` — and therefore into Copy All,
       // share export, or an encrypted backup's cleartext `macros` array.
-      // §4.2 — `group` gets the same ingest-time normalization: a malformed value
-      // (non-string, `..`, over-depth) can already be sitting in MACROS_KEY.
-      const cleaned = withNormalizedGroup(withRedactedVariables(entry));
-      if (cleaned !== entry) needsDiskScrub = true;
-      // `withMigratedSlot` is applied to the RESOLVED copy only, and deliberately does NOT
-      // set `needsDiskScrub` — the whole point of moving the slot migration to the read
-      // path was to stop it writing. `raw` (and therefore the scrub below, and
-      // `absorbLegacySettingsIfPresent()`'s `keyOfLegacy()` dedupe, which reads globalState
-      // directly) keeps seeing the record exactly as stored.
+      const redacted = withRedactedVariables(entry);
+      // ONLY a variables change may trigger the disk scrub below. `group` is
+      // deliberately excluded: the scrub exists because a plaintext secret
+      // must not linger on disk, and a folder path is not a secret. Letting a
+      // `group` difference set this flag is what made a stored folder
+      // assignment disappear permanently on the next activation.
+      if (redacted !== entry) needsDiskScrub = true;
+      // §4.2 — in-memory guard only, and only against a value that cannot be a
+      // path at all (see `dropNonPathGroup()`). An unrenderable STRING is
+      // kept exactly as stored and simply renders at the root.
+      const cleaned = dropNonPathGroup(redacted);
+      // `withMigratedSlot` is applied to the RESOLVED copy only, and — like the `group`
+      // guard above — deliberately does NOT set `needsDiskScrub`: the whole point of
+      // moving the slot migration to the read path was to stop it writing. `raw` (and
+      // therefore the scrub below, and `absorbLegacySettingsIfPresent()`'s
+      // `keyOfLegacy()` dedupe, which reads globalState directly) keeps seeing the
+      // record exactly as stored.
       const migrated = withMigratedSlot(cleaned);
       if (entry.secret) {
         const vaulted = await this.context.secrets.get(macroSecretKey(id));
@@ -365,8 +376,9 @@ export class VscodeMacroStore implements MacroStore {
     //
     // 1. Scrub the RAW array, minimally. Serializing `resolved` instead would persist
     //    this reload's incidental repairs — dropped non-object records, runtime-only
-    //    UUIDs — turning a redaction into a rewrite of records that were never the
-    //    problem.
+    //    UUIDs, a dropped non-string `group`, a migrated `slot` — turning a redaction
+    //    into a rewrite of records that were never the problem. Only `variables` is
+    //    scrubbed here; neither `group` nor `slot` is ever rewritten on disk by a reload.
     // 2. Only write if MACROS_KEY still holds what we read. globalState is shared
     //    across windows, and there is an `await` on the vault between the read and
     //    this write: another window can save, absorb legacy settings, or complete a
@@ -378,7 +390,7 @@ export class VscodeMacroStore implements MacroStore {
       const current = this.context.globalState.get(MACROS_KEY);
       if (JSON.stringify(current) === JSON.stringify(raw)) {
         const scrubbed = raw.map((entry) =>
-          entry && typeof entry === "object" ? withNormalizedGroup(withRedactedVariables(entry)) : entry
+          entry && typeof entry === "object" ? withRedactedVariables(entry) : entry
         );
         await this.context.globalState.update(MACROS_KEY, scrubbed);
       }
@@ -517,11 +529,17 @@ export class VscodeMacroStore implements MacroStore {
    * entry, so re-keying a collision costs nothing and prevents its
    * `secrets.store(macroSecretKey(id), ...)` from overwriting an existing macro's secret.
    *
-   * Variables — and `group` (§4.2) — are normalized here rather than only at read time:
-   * this path absorbs `nexus.terminal.macros` verbatim on every activation (Settings Sync
-   * replay included), so without it a hand-written masked variable carrying a plaintext
-   * `default`, or a malformed `group` (non-string, `..`, over-depth), would be written
-   * straight into globalState.
+   * Variables are redacted here rather than only at read time: this path absorbs
+   * `nexus.terminal.macros` verbatim on every activation (Settings Sync replay included),
+   * so without it a hand-written masked variable carrying a plaintext `default` would be
+   * written straight into globalState.
+   *
+   * §4.2 — `group` gets the ingest GUARD (non-string dropped) but NOT the folder-path
+   * grammar: a hand-written `group: "Cisco\\Routers"` is the user's stated intent for a
+   * macro they are migrating, and absorbing it as ungrouped-forever would lose that
+   * intent at the one moment the value crosses from settings.json into permanent storage.
+   * It renders at the root until corrected, and the raw value survives for them to
+   * correct.
    *
    * @returns `false` when the MACROS_KEY write was skipped because another window moved
    * the key while this one was awaiting the vault — the caller must then leave the legacy
@@ -549,7 +567,7 @@ export class VscodeMacroStore implements MacroStore {
     // a save the user actually asks for rewrites the list.
     const keyed = assignIdsForAbsorbedMacros(existingOnDisk, absorbed.filter(isUsableMacro));
     const assigned = [...keyed.existing, ...keyed.absorbed].map((m) =>
-      m && typeof m === "object" ? withNormalizedGroup(withRedactedVariables(m)) : m
+      m && typeof m === "object" ? dropNonPathGroup(withRedactedVariables(m)) : m
     );
 
     const storedVaultIds = new Set<string>();

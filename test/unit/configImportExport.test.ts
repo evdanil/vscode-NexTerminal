@@ -130,6 +130,7 @@ import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigReposi
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
 import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
+import { INVALID_FOLDER_PATH_MESSAGE } from "../../src/utils/folderPaths";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
@@ -2847,9 +2848,7 @@ describe("import inventory list command", () => {
     const cmd = registeredCommands.get("nexus.config.import.inventory")!;
     await cmd();
 
-    expect(mockShowErrorMessage).toHaveBeenCalledWith(
-      "Invalid folder path. Use up to 10 levels (each up to 64 characters) and avoid '.', '..', or '\\'."
-    );
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(INVALID_FOLDER_PATH_MESSAGE);
     expect(core.getSnapshot().servers).toHaveLength(0);
   });
 

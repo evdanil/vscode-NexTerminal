@@ -777,4 +777,123 @@ describe("ScriptTreeProvider", () => {
 
     expect(children.some((c) => c.kind === "depthTruncated")).toBe(false);
   });
+
+  // ---- Starved render: the retry budget must never render a stale tree -----
+  //
+  // Both retry budgets (MAX_SCAN_RETRIES / MAX_CHILDREN_RESTARTS) exist to
+  // stop an unbounded wait when refreshes land faster than scans complete.
+  // Exhausting them used to RETURN THE SUPERSEDED SCAN — after a
+  // `nexus.scripts.path` change, a listing of a directory nobody watches any
+  // more, presented as the truth. This is deterministic, not timing-based:
+  // `readDirectory` is gated on a resolver the test owns, and `refresh()` is
+  // synchronous, so the generation always moves BEFORE the resumed
+  // continuation observes it — every scan is superseded the instant it lands.
+  describe("starved render", () => {
+    /** Replaces readDirectory with a gate the test releases one call at a time. */
+    function gateReadDirectory(): Array<() => void> {
+      const waiters: Array<() => void> = [];
+      (vscode.workspace.fs as unknown as { readDirectory: (u: { fsPath: string }) => Promise<Array<[string, number]>> }).readDirectory =
+        vi.fn(async (uri: { fsPath: string }) => {
+          // Registered synchronously: `scanScriptsDir` -> `walk` -> here all
+          // run synchronously up to this await, so by the time `refresh()`
+          // returns, the new scan's waiter already exists.
+          await new Promise<void>((resolve) => { waiters.push(resolve); });
+          return mockFsEntries.get(uri.fsPath) ?? [];
+        });
+      return waiters;
+    }
+
+    /** Drains every pending microtask (a 0ms timer runs strictly after them). */
+    const flush = (): Promise<void> => new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+
+    function seedStaleListing(): void {
+      // A FILE, not a folder, so each scan is exactly one gated readDirectory
+      // and the waiter index below stays 1:1 with the scan generation.
+      mockFsEntries.set("/workspace/.nexus/scripts", [["stale.js", 1]]);
+      mockFiles.set(
+        "/workspace/.nexus/scripts/stale.js",
+        "/**\n * @nexus-script\n * @name Stale Listing\n */\n"
+      );
+    }
+
+    it("returns the scanning node instead of a superseded directory listing when the retry budget runs out", async () => {
+      seedStaleListing();
+      const waiters = gateReadDirectory();
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      let result: Awaited<ReturnType<typeof provider.getChildren>> | undefined;
+      void provider.getChildren().then((c) => { result = c; });
+      await flush(); // generation 1's scan is now parked on waiters[0]
+
+      let iterations = 0;
+      for (let i = 0; result === undefined && i < 100; i++) {
+        // Let the awaited scan finish, then supersede it in the same
+        // synchronous turn — its continuation cannot run until the microtask
+        // queue drains, by which point `this.generation` has already moved.
+        waiters[i]?.();
+        provider.refresh();
+        await flush();
+        iterations = i + 1;
+      }
+
+      expect(iterations).toBeLessThan(100); // it terminated rather than hanging
+      // The whole point: NOT [{ kind: "script", name: "Stale Listing" }].
+      expect(result?.map((n) => n.kind)).toEqual(["scanning"]);
+
+      provider.dispose();
+    });
+
+    it("repaints itself once the storm stops — the scanning node is not a dead end", async () => {
+      seedStaleListing();
+      const waiters = gateReadDirectory();
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      const repaints: number[] = [];
+      provider.onDidChangeTreeData(() => repaints.push(Date.now()));
+
+      let result: Awaited<ReturnType<typeof provider.getChildren>> | undefined;
+      void provider.getChildren().then((c) => { result = c; });
+      await flush();
+      for (let i = 0; result === undefined && i < 100; i++) {
+        waiters[i]?.();
+        provider.refresh();
+        await flush();
+      }
+      expect(result?.map((n) => n.kind)).toEqual(["scanning"]);
+
+      // A repaint is scheduled without any user action. Wait past the debounce
+      // and confirm the view was told to re-ask (refresh() fires the same
+      // event, so count only what arrives after the storm ends).
+      const before = repaints.length;
+      await new Promise<void>((resolve) => { setTimeout(resolve, 400); });
+      expect(repaints.length).toBeGreaterThan(before);
+
+      // ...and re-asking now that generations have settled yields the real
+      // tree, so the node is transient rather than sticky.
+      for (const w of waiters.splice(0)) w();
+      const settled = await provider.getChildren();
+      expect(settled.filter((c) => c.kind === "script").map((c) => (c as { name: string }).name)).toEqual([
+        "Stale Listing"
+      ]);
+
+      provider.dispose();
+    });
+
+    it("renders the scanning node as a distinct, menu-safe row with a refresh action", async () => {
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      const item = provider.getTreeItem({ kind: "scanning" });
+
+      expect(item.label).toBe("Scanning scripts…");
+      expect(item.command?.command).toBe("nexus.script.refresh");
+      // Outside both script-menu equality gates (package.json uses `==`).
+      expect(item.contextValue).not.toBe("nexus.script.file");
+      expect(item.contextValue).not.toBe("nexus.script.running");
+      // No fixed id: a storm starves every expanded folder at once, and a
+      // duplicate TreeItem id makes VS Code reject the whole render.
+      expect(item.id).toBeUndefined();
+
+      provider.dispose();
+    });
+  });
 });

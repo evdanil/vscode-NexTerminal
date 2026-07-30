@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
+import { macroGroup } from "../../src/services/macroFolders";
 
 vi.mock("vscode", () => {
   const configs = new Map<string, { global: unknown; workspace: unknown; workspaceFolder: unknown }>();
@@ -370,7 +371,11 @@ describe("MacroStore legacy migration", () => {
       expect(firstWrite[0].group).toBeUndefined();
     });
 
-    it("a '..' path-traversal group from legacy settings is dropped", async () => {
+    it("a '..' path-traversal group from legacy settings is absorbed as written, and renders as ungrouped", async () => {
+      // Absorption is the one moment this value crosses from settings.json
+      // into permanent storage. Dropping it here loses the user's stated
+      // intent for a macro they are migrating; sanitizing it at every READ
+      // site is what stops it ever rendering as a `..` folder.
       const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
       vscode.__setConfig("nexus.terminal", {
         global: [{ name: "a", text: "echo a", group: "../secrets" } as TerminalMacro]
@@ -380,13 +385,14 @@ describe("MacroStore legacy migration", () => {
 
       await store.initialize();
 
-      expect(store.getAll()[0].group).toBeUndefined();
+      expect(store.getAll()[0].group).toBe("../secrets");
+      expect(macroGroup(store.getAll()[0])).toBeUndefined();
     });
 
-    it("Fix 4 — a pathologically long SINGLE-SEGMENT group from legacy settings is dropped (depth/segment-count alone never bounds this)", async () => {
-      // The exact repro from the review: `group: "X".repeat(8_000_000)` has a
-      // segment count of 1 — comfortably under MAX_FOLDER_DEPTH — so only a
-      // length bound (not a depth bound) can catch it.
+    it("a pathologically long SINGLE-SEGMENT group from legacy settings never renders, and absorption does not hang", async () => {
+      // `group: "X".repeat(8_000_000)` has a segment count of 1 — comfortably
+      // under MAX_FOLDER_DEPTH — so only a length bound catches it, and that
+      // bound lives at the read site where it rejects in O(1).
       const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
       const huge = "X".repeat(8_000_000);
       vscode.__setConfig("nexus.terminal", {
@@ -397,7 +403,8 @@ describe("MacroStore legacy migration", () => {
 
       await expect(store.initialize()).resolves.toBeUndefined();
 
-      expect(store.getAll()[0].group).toBeUndefined();
+      expect(macroGroup(store.getAll()[0])).toBeUndefined();
+      expect(store.getAll()[0].group).toHaveLength(8_000_000);
     });
 
     it("a valid group from legacy settings survives absorption", async () => {

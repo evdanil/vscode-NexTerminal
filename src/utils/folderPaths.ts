@@ -1,27 +1,44 @@
 export const MAX_FOLDER_DEPTH = 10;
 
 /**
- * Fix 4 — depth alone bounded segment COUNT, never segment or total LENGTH.
- * `group: "X".repeat(8_000_000)` has a segment count of 1 (passes the depth
- * check) but persists as an eight-million-character tree row and gets
- * reprocessed (sort, compare, render) on every refresh. These are shared by
- * every caller of `normalizeFolderPath` — servers, serial/local-shell
- * profiles, macros, and scripts all funnel through this one chokepoint.
+ * The ONLY job of this bound is to stop a pathological allocation reaching the
+ * rest of the system: depth bounds segment COUNT, so without it a
+ * single-segment `group: "X".repeat(8_000_000)` passes every other check and
+ * is then split, trimmed, joined, sorted, compared and rendered on every
+ * refresh. It is deliberately NOT a naming policy.
+ *
+ * Why 4096 and not something tighter: it is POSIX `PATH_MAX`, and it is above
+ * what a real filesystem could produce at our own depth limit —
+ * `MAX_FOLDER_DEPTH` (10) segments of `NAME_MAX` (255) plus 9 separators is
+ * 2559 characters. So this cap can never reject a folder path a filesystem
+ * would have accepted at the depth we allow, which matters directly for
+ * script folders (real directories) and leaves macro groups — free-form
+ * strings a user types — comfortably unconstrained.
+ *
+ * There is deliberately NO separate per-segment cap. A segment can never be
+ * longer than the whole path, so a segment cap adds nothing to the bound; the
+ * previous `MAX_FOLDER_SEGMENT_LENGTH = 64` / `MAX_FOLDER_PATH_LENGTH = 200`
+ * pair was policing naming rather than bounding allocation, and rejected
+ * legitimate deep paths (10 levels averaging only 20 characters each already
+ * exceeded 200).
+ *
+ * Shared by every caller of `normalizeFolderPath` — servers, serial and
+ * local-shell profiles, macros, scripts, and the SecureCRT/MobaXterm
+ * importers all funnel through this one chokepoint.
  */
-export const MAX_FOLDER_SEGMENT_LENGTH = 64;
-export const MAX_FOLDER_PATH_LENGTH = 200;
+export const MAX_FOLDER_PATH_LENGTH = 4096;
 
 /**
  * Normalize a folder path: split on "/", trim segments, filter empty,
- * reject ".."/".", reject depth > MAX_FOLDER_DEPTH, reject an oversized
- * total length or an oversized individual segment (Fix 4).
+ * reject ".."/".", reject a backslash in any segment, reject depth >
+ * MAX_FOLDER_DEPTH, reject a total length > MAX_FOLDER_PATH_LENGTH.
  * Returns the cleaned path or undefined if invalid.
  */
 export function normalizeFolderPath(path: string): string | undefined {
-  // Fix 4 — reject BEFORE split()/trim()/join() ever touch an untrusted,
-  // potentially huge string: a caller-supplied `group` (or a persisted
-  // folder-list entry) is untrusted at every read site (§4.2 of the folders
-  // design), and nothing downstream previously bounded its raw length.
+  // Reject BEFORE split()/trim()/join() ever touch an untrusted, potentially
+  // huge string: a caller-supplied `group` (or a persisted folder-list entry)
+  // is untrusted at every read site (§4.2 of the folders design), and the
+  // rejection has to cost O(1), not O(length).
   if (path.length > MAX_FOLDER_PATH_LENGTH) {
     return undefined;
   }
@@ -30,7 +47,7 @@ export function normalizeFolderPath(path: string): string | undefined {
     return undefined;
   }
   for (const seg of segments) {
-    if (seg === ".." || seg === "." || seg.includes("\\") || seg.length > MAX_FOLDER_SEGMENT_LENGTH) {
+    if (seg === ".." || seg === "." || seg.includes("\\")) {
       return undefined;
     }
   }
@@ -58,7 +75,7 @@ export function normalizeOptionalFolderPath(input: unknown): string | undefined 
 }
 
 export const INVALID_FOLDER_PATH_MESSAGE =
-  `Invalid folder path. Use up to ${MAX_FOLDER_DEPTH} levels (each up to ${MAX_FOLDER_SEGMENT_LENGTH} characters) and avoid '.', '..', or '\\'.`;
+  `Invalid folder path. Use up to ${MAX_FOLDER_DEPTH} levels (${MAX_FOLDER_PATH_LENGTH} characters total) and avoid '.', '..', or '\\'.`;
 
 /**
  * True if `candidate` equals `ancestor` or is nested inside it.
