@@ -85,7 +85,10 @@ vi.mock("vscode", () => ({
   RelativePattern: class {
     public constructor(public readonly base: unknown, public readonly pattern: string) {}
   },
-  FileType: { File: 1, Directory: 2 },
+  // Real vscode.FileType values — SymbolicLink included, because a symlinked
+  // directory reports `Directory | SymbolicLink` (2 | 64 = 66) and the scanner
+  // separates the two bits.
+  FileType: { File: 1, Directory: 2, SymbolicLink: 64 },
   Uri: {
     file: (p: string) => ({
       fsPath: p,
@@ -310,6 +313,31 @@ describe("ScriptTreeProvider", () => {
     const children = await provider.getChildren();
     const item = provider.getTreeItem(children[0]);
     expect(String(item.description ?? "")).toContain("running");
+  });
+
+  it("marks a symlinked folder as linked and says the watcher will not notice changes in it", async () => {
+    // The scan follows symlinked directories; the file-system watcher does not
+    // follow links nested under the folder it watches, and VS Code offers no way
+    // to make it (see the argument at ScriptTreeProvider.ensureWatcher). So the
+    // row itself carries the limitation and names the remedy that does work —
+    // Refresh. Left unsaid, this folder's listing can go stale indefinitely with
+    // nothing on screen suggesting why.
+    mockFsEntries.set("/workspace/.nexus/scripts", [["shared", 2 | 64], ["local", 2]]);
+    mockFsEntries.set("/workspace/.nexus/scripts/shared", []);
+    mockFsEntries.set("/workspace/.nexus/scripts/local", []);
+    const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+    const children = await provider.getChildren();
+    const items = children.map((c) => provider.getTreeItem(c) as { label: string; tooltip?: string; iconPath?: { id: string } });
+    const linked = items.find((i) => i.label === "shared")!;
+    const plain = items.find((i) => i.label === "local")!;
+
+    expect(linked.iconPath?.id).toBe("file-symlink-directory");
+    expect(String(linked.tooltip)).toContain("not detected automatically");
+    expect(String(linked.tooltip)).toContain("Refresh");
+    // The ordinary folder is untouched — no icon churn, no scary tooltip.
+    expect(plain.iconPath?.id).toBe("folder");
+    expect(String(plain.tooltip)).toBe("local");
   });
 
   it("does NOT echo header description next to the name — description lives in the tooltip only", async () => {

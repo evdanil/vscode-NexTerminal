@@ -21,7 +21,10 @@ const SCRIPT_STARVED_REPAINT_MS = 300;
 
 export type ScriptNode =
   | { kind: "script"; uri: vscode.Uri; name: string; description: string; running: boolean; parseErrors: string[] }
-  | { kind: "folder"; uri: vscode.Uri; path: string; name: string }
+  // `linked` — this folder is a symlink or sits under one, so the watcher does
+  // not see changes inside it (see `ensureWatcher()`). Carried on the node so
+  // the row itself can say so; nothing else about a linked folder differs.
+  | { kind: "folder"; uri: vscode.Uri; path: string; name: string; linked: boolean }
   | { kind: "truncated"; examined: number }
   // Fix 6 — a distinct node from "truncated": that one means the entry-count
   // budget stopped the WHOLE scan; this one means one specific branch was cut
@@ -227,8 +230,14 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       item.id = `scriptFolder:${node.path}`;
       item.resourceUri = node.uri;
       item.contextValue = "nexus.scriptFolder";
-      item.tooltip = node.path;
-      item.iconPath = new vscode.ThemeIcon("folder");
+      // A linked folder is listed like any other (the scan follows it) but is
+      // NOT watched, so it says so rather than quietly serving a stale listing
+      // — the honest half of the limitation argued at `ensureWatcher()`. The
+      // icon differs too, so the row is identifiable without hovering.
+      item.tooltip = node.linked
+        ? `${node.path}\nLinked folder — changes inside it are not detected automatically. Use Refresh to update this view.`
+        : node.path;
+      item.iconPath = new vscode.ThemeIcon(node.linked ? "file-symlink-directory" : "folder");
       return item;
     }
 
@@ -339,7 +348,13 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
       const childFolders: ScriptNode[] = scan.folders
         .filter((f) => folderParentPath(f.path) === targetPath)
         .sort((a, b) => naturalComparePath(a.path, b.path))
-        .map((f) => ({ kind: "folder" as const, uri: f.uri, path: f.path, name: folderDisplayName(f.path) }));
+        .map((f) => ({
+          kind: "folder" as const,
+          uri: f.uri,
+          path: f.path,
+          name: folderDisplayName(f.path),
+          linked: f.linked
+        }));
 
       const runningPaths = new Set(this.manager.getRuns().map((r) => r.scriptPath));
       const scriptsHere = scan.scripts.filter((s) => s.folderPath === targetPath);
@@ -458,6 +473,35 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
     // event carries the directory's own path, which can't match a *.js glob.
     // Watch everything and rely on getChildren()'s own filtering; a burst of
     // events (e.g. an autosave storm) is coalesced by debouncedRefresh.
+    //
+    // KNOWN LIMITATION, argued rather than overlooked: this recursive watcher
+    // does not follow symlinks nested under `dir`, while `scanScriptsDir` DOES
+    // follow them. So `scripts/shared -> /elsewhere/shared` is listed on every
+    // scan, and thereafter a create/delete/edit inside the target fires no
+    // event, no rescan happens, and the sidebar can serve that folder's stale
+    // listing indefinitely.
+    //
+    // VS Code exposes no way to change that: `createFileSystemWatcher` takes a
+    // glob, not a follow-symlinks flag, and its recursive watcher resolves only
+    // its own root. The one construction that could work is a SECOND watcher
+    // rooted at each linked folder — deliberately not done here:
+    //
+    //   * it is unverifiable from this repo (every test mocks `vscode`, so a
+    //     watcher that silently never fires would look exactly like one that
+    //     works), and a watcher believed to work but not working is strictly
+    //     worse than a known gap, because it removes the reason to Refresh;
+    //   * the link set is only known AFTER a scan, so the watchers would trail
+    //     the tree by one render and still miss the first change following
+    //     startup — partial by construction;
+    //   * it would tie watcher lifetime to scan results, adding a second state
+    //     machine to a class that already carries generation + retry budgets.
+    //
+    // What is done instead: the scanner flags every folder at or below a link
+    // (`ScannedFolder.linked`), and `getTreeItem` renders those rows with a
+    // symlink icon and a tooltip naming Refresh — the limitation is stated at
+    // the exact row it applies to, and `nexus.script.refresh` (the view's title
+    // button) is a full rescan. The picker (`pickScriptFromWorkspace`) is
+    // unaffected: it scans on every invocation, so it never serves a cache.
     const pattern = new vscode.RelativePattern(dir, "**/*");
     this.watcher = vscode.workspace.createFileSystemWatcher(pattern);
     const onEvent = () => this.debouncedRefresh.schedule();

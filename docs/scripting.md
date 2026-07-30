@@ -618,6 +618,15 @@ empty folder stays until you remove it.
   the hood it also refreshes on its own when the scripts directory changes on
   disk — Nexus watches every file and folder in it, debounced by about
   300ms so a burst of saves or a directory rename only triggers one rescan.
+- **Symlinked folders are listed but not watched.** If a folder inside your
+  scripts directory is a symlink (or a Windows junction) pointing somewhere
+  else, Nexus scans through it and shows the scripts inside — but VS Code's
+  file watcher does not follow links nested inside the folder it watches, and
+  offers no way to make it. So edits, additions and deletions made *in the
+  link's target* do not refresh the view on their own. Such folders are drawn
+  with a link icon and say so on hover; press **Refresh Scripts** to pick up
+  changes. Running a script is unaffected, and **Connect and Run Script…**
+  always rescans, so it never shows a stale list.
 - **Scan limits.** To keep a misconfigured `nexus.scripts.path` (e.g.
   pointing at your whole home directory) from hanging the sidebar, the scan
   stops after 10 levels of nesting or 500 examined entries — every directory

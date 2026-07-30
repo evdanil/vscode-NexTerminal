@@ -6,6 +6,7 @@ import { getMacroFolders, getMacros, saveMacros } from "../macroSettings";
 import { findAmbiguousMacroStateKeys, macroStateKey } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders } from "../services/macroVariables";
 import { collectMacroFolders, sanitizeMacroGroup } from "../services/macroFolders";
+import { resolveMacroTarget, AMBIGUOUS_MACRO_TARGET_MESSAGE, type MacroRef } from "../services/macroMutation";
 import { folderDisplayName, parentPath } from "../utils/folderPaths";
 import { naturalComparePath } from "../utils/naturalCompare";
 import { MACRO_DRAG_MIME } from "./dndMimeTypes";
@@ -98,9 +99,21 @@ export class MacroTreeItem extends vscode.TreeItem {
       // variables-vs-trigger is a documented design rule, an identity conflict is
       // corrupt data the user has to act on \u2014 and the action is stated, because it is
       // not guessable. Reorder rather than "edit this macro": any write re-keys
-      // duplicates (MacroStore.save()), but Move Up/Move Down resolve their target by
-      // tree index, whereas the macro editor resolves by id and therefore refuses to
-      // act on a macro whose id is shared (macroEditorPanel.ts).
+      // duplicates (MacroStore.save()), and Move Up / Move Down are the commands that
+      // still ACT on a macro whose id is shared, whereas the macro editor refuses
+      // (macroEditorPanel.ts).
+      //
+      // That still holds after the move commands were routed through
+      // `resolveMacroTarget` (services/macroMutation.ts), which refuses an ambiguous
+      // id \u2014 but only when it has nothing else to go on. A row rendered by this very
+      // provider carries the index it was built at, and the resolver honours that
+      // index whenever the macro still sitting there carries the same id, so a click
+      // on a freshly rendered twin resolves to the exact row clicked. The refusal is
+      // reachable only from a row that is BOTH stale and ambiguous, where a refresh
+      // (any tree repaint) restores the advice. This tooltip is the only stated
+      // recovery path out of a duplicate-id state, so macroCommandsIdentity.test.ts
+      // pins it: "moveUp still reorders the clicked row — the remedy the sidebar
+      // tooltip names must actually work".
       const conflictSuppressed = !!identityConflict && !!macro.triggerPattern;
       if (conflictSuppressed) {
         this.tooltip +=
@@ -121,6 +134,35 @@ export class MacroTreeItem extends vscode.TreeItem {
 
 /** Everything the Macros tree can render: a macro leaf, or a folder (§4.3, §4.10). */
 export type MacroTreeElement = MacroTreeItem | FolderTreeItem;
+
+/**
+ * Reads back what `handleDrag` wrote. Defensive rather than a bare
+ * `JSON.parse`: `DataTransfer` contents are whatever the drag source put there,
+ * and a plain (non-JSON) string is treated as a bare macro id so a payload from
+ * any other producer still resolves by identity instead of being dropped on the
+ * floor. Returns `undefined` only when there is no id to act on at all.
+ */
+function parseMacroDragPayload(payload: string): MacroRef | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return { id: payload }; // A bare id string — resolve by identity alone.
+  }
+  if (typeof parsed === "string") {
+    return parsed ? { id: parsed } : undefined;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    // Valid JSON but not an object or string — e.g. a numeric-looking id, which
+    // `JSON.parse` happily turns into a number. The raw text is the id.
+    return { id: payload };
+  }
+  const { id, index } = parsed as { id?: unknown; index?: unknown };
+  if (typeof id !== "string" || !id) {
+    return undefined;
+  }
+  return typeof index === "number" ? { id, index } : { id };
+}
 
 function makeMacroFolderItem(path: string, collapsibleState: vscode.TreeItemCollapsibleState): FolderTreeItem {
   return new FolderTreeItem(
@@ -222,14 +264,28 @@ export class MacroTreeProvider
     return [...childFolders, ...macroItems];
   }
 
-  /** §4.9 — the payload is the dragged macro's stable `id`, never an index. */
+  /**
+   * §4.9 — the payload is the dragged macro's stable `id`, plus the position of
+   * the row it was dragged FROM. Never the index alone: a bare index is what a
+   * drop would misapply the moment the array shifts between drag and drop.
+   *
+   * The index rides along because the id cannot separate two macros that share
+   * one (a reachable, deliberately unrepaired state — see
+   * `resolveMacroTarget`), and dragging a row is the most literal "this one,
+   * right here" gesture in the whole view. It is only ever honoured when the
+   * macro at that position still carries the dragged id, so a stale payload
+   * falls back to id resolution rather than moving a bystander.
+   */
   public async handleDrag(
     source: readonly MacroTreeElement[],
     dataTransfer: vscode.DataTransfer
   ): Promise<void> {
     const item = source[0];
     if (item instanceof MacroTreeItem && item.macro.id) {
-      dataTransfer.set(MACRO_DRAG_MIME, new vscode.DataTransferItem(item.macro.id));
+      dataTransfer.set(
+        MACRO_DRAG_MIME,
+        new vscode.DataTransferItem(JSON.stringify({ id: item.macro.id, index: item.index }))
+      );
     }
     // Folders are not draggable in v1 (§4.9) — nothing else to serialize.
   }
@@ -248,8 +304,12 @@ export class MacroTreeProvider
     if (!transferItem) {
       return;
     }
-    const macroId = await transferItem.asString();
-    if (!macroId) {
+    const payload = await transferItem.asString();
+    if (!payload) {
+      return;
+    }
+    const ref = parseMacroDragPayload(payload);
+    if (!ref) {
       return;
     }
 
@@ -263,10 +323,18 @@ export class MacroTreeProvider
     }
 
     const macros = getMacros();
-    const index = macros.findIndex((m) => m.id === macroId);
-    if (index === -1) {
+    const dragged = resolveMacroTarget(macros, ref);
+    if (dragged.kind === "ambiguous") {
+      // The payload's position no longer holds the dragged macro AND its id is
+      // shared, so there is no way to tell the twins apart. Dropping "the first
+      // one" would move a macro the user did not drag.
+      void vscode.window.showWarningMessage(AMBIGUOUS_MACRO_TARGET_MESSAGE);
       return;
     }
+    if (dragged.kind !== "resolved") {
+      return;
+    }
+    const index = dragged.index;
     if (sanitizeMacroGroup(macros[index].group) === targetFolder) {
       return; // no-op — already in the target folder
     }

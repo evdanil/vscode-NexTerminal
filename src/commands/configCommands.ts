@@ -1391,6 +1391,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       }
     }
 
+    // Read the incoming macros BEFORE the folder block: whether this payload
+    // replaces the macros array at all is what decides whether clearing the
+    // folder list is a correction or a deletion. See below.
+    const incomingResult = collectIncomingMacros(data, decryptedSecrets);
+
     // §4.1 — explicit macro folders, carried exactly as `groups` is. Replace
     // mode overwrites the persisted list outright (mirrors the macros-array
     // replace just below, and `saveFolders()` itself replaces — no separate
@@ -1398,15 +1403,30 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // additive API); merge mode unions with what already exists.
     //
     // Fix 5 — a pre-2.8.75 backup predates `macroFolders` entirely, so
-    // `data.macroFolders` is `undefined` rather than `[]`. In REPLACE mode
-    // that must still clear the list (not skip writing it): `saveMacros()`
-    // below unconditionally replaces the macros array, so leaving the OLD
-    // store's folder list untouched would show folders left over from a
-    // config the import just discarded. Merge mode has no such gap — unioning
-    // with nothing already sitting there is a correct no-op.
+    // `data.macroFolders` is `undefined` rather than `[]`. In REPLACE mode that
+    // must still clear the list WHEN THE MACROS ARE ALSO BEING REPLACED,
+    // otherwise the store shows folders left over from a config the import just
+    // discarded.
+    //
+    // "When the macros are also being replaced" is the whole condition, and the
+    // earlier unconditional clear got it wrong by asserting `saveMacros()`
+    // always runs below. It does not: `collectIncomingMacros()` returns
+    // `undefined` for a payload carrying neither a top-level `macros` array nor
+    // `settings["nexus.terminal.macros"]`, and the macros block is then skipped
+    // entirely. `isValidExport()` accepts exactly that shape — a servers-only
+    // export, or any pre-macro-export backup — so replace-importing one used to
+    // keep every macro and destroy every explicit empty folder, which is the
+    // one artifact this feature exists to persist. Nothing was replaced;
+    // nothing should have been cleared.
+    //
+    // Merge mode has no such gap — unioning with nothing already sitting there
+    // is a correct no-op.
     if (mode === "replace") {
-      const incomingFolders = Array.isArray(data.macroFolders) ? sanitizeMacroFolderList(data.macroFolders) : [];
-      await saveMacroFolders(incomingFolders);
+      if (Array.isArray(data.macroFolders)) {
+        await saveMacroFolders(sanitizeMacroFolderList(data.macroFolders));
+      } else if (incomingResult !== undefined) {
+        await saveMacroFolders([]);
+      }
     } else if (Array.isArray(data.macroFolders)) {
       const incomingFolders = sanitizeMacroFolderList(data.macroFolders);
       if (incomingFolders.length > 0) {
@@ -1415,7 +1435,6 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     }
 
     // Apply macros from import payload
-    const incomingResult = collectIncomingMacros(data, decryptedSecrets);
     if (incomingResult !== undefined) {
       const { macros: incomingMacros, unresolvedCount } = incomingResult;
       if (mode === "replace") {

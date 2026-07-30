@@ -113,6 +113,20 @@ export interface ScannedFolder {
   readonly uri: vscode.Uri;
   /** Folder-relative path, e.g. "cisco/backup". Never undefined — the scripts root itself is not a "folder" entry. */
   readonly path: string;
+  /**
+   * This directory is a symlink, or lives underneath one. Reported because the
+   * scan and the file-system WATCHER disagree about such a directory: the scan
+   * follows it (see `scanScriptsDir`'s doc comment), while VS Code's recursive
+   * watcher does not follow links nested inside the folder it watches, so
+   * changes made in the link's target fire no event at all. Consumers surface
+   * that instead of silently serving a stale listing — see
+   * `ScriptTreeProvider.ensureWatcher()` for the full argument.
+   *
+   * Inherited downward: a plain directory inside a symlinked one is just as
+   * unwatched as the link itself, and marking only the link would leave a user
+   * who expanded straight into `shared/sub` with no explanation.
+   */
+  readonly linked: boolean;
 }
 
 export interface ScriptScanResult {
@@ -157,6 +171,9 @@ export interface ScriptScanResult {
  * folder rather than silently skipped. This is safe against symlink cycles
  * because the depth cap bounds recursion regardless of how the cycle is
  * formed; the caps here are the loop protection, not symlink detection (§5.3).
+ * Every folder at or below a link is flagged `linked`, because following one is
+ * a promise this module can keep and the file-system watcher cannot — see
+ * `ScannedFolder.linked` and `ScriptTreeProvider.ensureWatcher()`.
  */
 export async function scanScriptsDir(root: vscode.Uri): Promise<ScriptScanResult> {
   const scripts: ScannedScript[] = [];
@@ -165,7 +182,12 @@ export async function scanScriptsDir(root: vscode.Uri): Promise<ScriptScanResult
   let truncated = false;
   let depthTruncated = false;
 
-  async function walk(dirUri: vscode.Uri, folderPath: string | undefined, depth: number): Promise<void> {
+  async function walk(
+    dirUri: vscode.Uri,
+    folderPath: string | undefined,
+    depth: number,
+    insideLink: boolean
+  ): Promise<void> {
     if (truncated) return;
     let entries: Array<[string, vscode.FileType]>;
     try {
@@ -200,10 +222,14 @@ export async function scanScriptsDir(root: vscode.Uri): Promise<ScriptScanResult
 
         const childPath = folderPath ? `${folderPath}/${name}` : name;
         const childDepth = depth + 1;
-        folders.push({ uri: vscode.Uri.joinPath(dirUri, name), path: childPath });
+        // Same bitmask discipline as the Directory test above — a symlinked
+        // directory reports BOTH bits, so `type === SymbolicLink` would never
+        // be true for one.
+        const childLinked = insideLink || (type & vscode.FileType.SymbolicLink) !== 0;
+        folders.push({ uri: vscode.Uri.joinPath(dirUri, name), path: childPath, linked: childLinked });
         // Fix 2 — `<=`, not `<`: see SCRIPT_SCAN_MAX_DEPTH's doc comment.
         if (childDepth <= SCRIPT_SCAN_MAX_DEPTH) {
-          await walk(vscode.Uri.joinPath(dirUri, name), childPath, childDepth);
+          await walk(vscode.Uri.joinPath(dirUri, name), childPath, childDepth, childLinked);
         } else {
           // Fix 6 — the folder itself is still listed (§5.4 — all
           // directories render regardless of contents), just not descended
@@ -222,6 +248,9 @@ export async function scanScriptsDir(root: vscode.Uri): Promise<ScriptScanResult
     }
   }
 
-  await walk(root, undefined, 0);
+  // `false`, even when `root` is itself a symlink: `linked` means "outside the
+  // reach of the watcher's root", and the watcher's root IS this directory. A
+  // marker there would name a condition the user cannot act on.
+  await walk(root, undefined, 0, false);
   return { scripts, folders, truncated, examined, depthTruncated };
 }

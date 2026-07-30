@@ -731,10 +731,51 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
    * work.
    */
   describe("writes re-resolve against a freshly read array, never a pre-dialog snapshot", () => {
+    it("THE EDITED macro's own concurrent folder move survives the save, when the Folder field was untouched", async () => {
+      // The case the sibling test below cannot see. It moves a DIFFERENT macro,
+      // so re-resolving by id is enough to protect it — the whole defect here is
+      // that the record being saved is composed from the PRE-dialog snapshot and
+      // then written over the latest one, so every field on the edited macro
+      // reverts, `group` included.
+      //
+      // Journey: editor open on M (at the root), assign ctrl+shift+f, Save →
+      // the non-modal "common VS Code shortcut / Use Anyway" toast appears →
+      // while it is up the user drags M ITSELF into "Cisco" → Use Anyway. The
+      // save changed the macro's text, never its Folder field, so it has no
+      // business deciding where M lives.
+      await harness([{ name: "M", text: "m" }]);
+      const edited = getMacros()[0];
+      const { sendMessage } = await openPanel(0);
+
+      mockShowWarningMessage.mockImplementation(async () => {
+        await store.save(getMacros().map((m) => (m.id === edited.id ? { ...m, group: "Cisco" } : m)));
+        return "Use Anyway";
+      });
+
+      await sendMessage(baseSaveMsg({
+        index: 0,
+        id: edited.id,
+        name: "M",
+        text: "m2",
+        keybinding: "ctrl+shift+f"
+      }));
+
+      const after = getMacros()[0];
+      expect(mockShowWarningMessage).toHaveBeenCalled(); // the toast really fired
+      expect(after.group).toBe("Cisco"); // the drag survived
+      expect(after.text).toBe("m2"); // ...and the edit still applied
+      expect(after.keybinding).toBe("ctrl+shift+f");
+    });
+
     it("a macro dragged into a folder while the NON-modal binding warning is up is not silently reverted", async () => {
       // The review's exact journey: editor open on M, assign ctrl+shift+f,
       // Save → "is a common VS Code shortcut / Use Anyway" toast appears →
       // while it is up the user drags another macro into a folder → Use Anyway.
+      //
+      // This one moves a macro OTHER than the edited one, which is what makes it
+      // a test of the write ROUTE (re-resolve and touch one slot, never write
+      // back the whole pre-dialog array). The edited macro's own fields need the
+      // separate test above.
       await harness([
         { name: "M", text: "m" },
         { name: "Other", text: "o" }

@@ -83,7 +83,9 @@ vi.mock("../../src/commands/macroVariablePrompt", () => ({
 }));
 
 import { registerMacroCommands } from "../../src/commands/macroCommands";
+import { MacroEditorPanel } from "../../src/ui/macroEditorPanel";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
+import { DuplicateIdMacroStore } from "../helpers/duplicateIdMacroStore";
 import { getMacros, setActiveMacroStore } from "../../src/macroSettings";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
@@ -406,6 +408,208 @@ describe("macro commands resolve their target by identity across every dialog aw
       expect(mockShowInformationMessage).toHaveBeenCalledWith(
         expect.stringContaining("from clipboard")
       );
+    });
+  });
+
+  describe("a STALE tree item whose index is back in bounds", () => {
+    /**
+     * The other half of identity, and the half that resolving purely by id was
+     * never wrong about: a tree item outlives the array it was built from. Move
+     * Up / Move Down were the two commands still applying `item.index` directly,
+     * so deleting a macro ABOVE the selected one made them reorder a macro the
+     * user never clicked — and in the Move Up case they moved the selected macro
+     * the wrong way.
+     */
+    it("moveUp reorders the macro the row was built for, not whatever now occupies its index", async () => {
+      await store.save([
+        { name: "A", text: "a" },
+        { name: "B", text: "b" },
+        { name: "C", text: "c" }
+      ]);
+      const staleItem = macroArg(1); // the row for B, built from [A, B, C]
+      const [, b, c] = getMacros();
+      await store.save([b, c]); // A deleted; index 1 now names C
+
+      await registeredCommands.get("nexus.macro.moveUp")!(staleItem);
+
+      // B is already first, so the correct answer is "nothing moves". Applying
+      // the stale index swapped C and B — moving the SELECTED macro down and an
+      // untouched one up.
+      expect(getMacros().map((m) => m.name)).toEqual(["B", "C"]);
+      expect(mockSetStatusBarMessage).toHaveBeenCalledWith("Already at the top of the list", 2000);
+    });
+
+    it("moveDown reorders the macro the row was built for, not whatever now occupies its index", async () => {
+      // The mirror case, and it fails the opposite way: the stale index lands on
+      // the LAST macro, so a raw-index implementation reports "already at the
+      // bottom" and silently does nothing at all.
+      await store.save([
+        { name: "A", text: "a" },
+        { name: "B", text: "b" },
+        { name: "C", text: "c" }
+      ]);
+      const staleItem = macroArg(1);
+      const [, b, c] = getMacros();
+      await store.save([b, c]);
+
+      await registeredCommands.get("nexus.macro.moveDown")!(staleItem);
+
+      expect(getMacros().map((m) => m.name)).toEqual(["C", "B"]);
+      expect(mockSetStatusBarMessage).not.toHaveBeenCalled();
+    });
+
+    it("Edit Macro opens the macro the row was built for, not whatever now occupies its index", async () => {
+      // Opening the editor writes nothing, so this is not a data-loss bug — it is
+      // worse-shaped than that: the wrong macro arrives pre-filled in a form whose
+      // Save button writes for real, and nothing on screen says the row the user
+      // clicked is not the record they are looking at.
+      await store.save([
+        { name: "A", text: "a" },
+        { name: "B", text: "b" },
+        { name: "C", text: "c" }
+      ]);
+      const staleItem = macroArg(1);
+      const [, b, c] = getMacros();
+      await store.save([b, c]); // index 1 now names C
+
+      await registeredCommands.get("nexus.macro.edit")!(staleItem);
+
+      expect(MacroEditorPanel.open).toHaveBeenCalledWith(0);
+    });
+
+    it("moveUp still swaps normally when the row is fresh — the guard must not turn reordering into a no-op", async () => {
+      await store.save([
+        { name: "A", text: "a" },
+        { name: "B", text: "b" }
+      ]);
+
+      await registeredCommands.get("nexus.macro.moveUp")!(macroArg(1));
+
+      expect(getMacros().map((m) => m.name)).toEqual(["B", "A"]);
+    });
+  });
+
+  describe("two macros sharing one id", () => {
+    /**
+     * Duplicate stored ids are reachable and deliberately unrepaired on the read
+     * path (`VscodeMacroStore.reloadFromState()`), so every command has to cope
+     * with them. Resolving "by id" alone answers with the FIRST match, which
+     * means the user acts on one row and the other one changes — the same class
+     * of wrong-target write as a stale index, arrived at from the opposite
+     * direction. The clicked row's position is the only thing that can tell the
+     * twins apart, so it is preferred whenever the macro still sitting there
+     * carries the same id.
+     *
+     * `DuplicateIdMacroStore` is used instead of `InMemoryMacroStore` because
+     * the latter mirrors the store's WRITE path and re-keys duplicates on
+     * `save()`, so it cannot hold this state at all.
+     */
+    function twins(extra: Partial<TerminalMacro> = {}): TerminalMacro[] {
+      return [
+        { id: "x", name: "login", text: "login\n", ...extra },
+        { id: "x", name: "reboot", text: "reboot\n", ...extra }
+      ];
+    }
+
+    function seed(macros: TerminalMacro[]): DuplicateIdMacroStore {
+      const dupStore = new DuplicateIdMacroStore(macros);
+      setActiveMacroStore(dupStore);
+      return dupStore;
+    }
+
+    it("remove confirms and deletes the twin the context menu was opened on", async () => {
+      const dupStore = seed(twins());
+      const item = { macro: dupStore.getAll()[1], index: 1 };
+      mockShowWarningMessage.mockResolvedValue("Remove");
+
+      await registeredCommands.get("nexus.macro.remove")!(item);
+
+      // First-match resolution named "login" in the confirmation and deleted
+      // "login" — a macro the user did not select, under a name they did not
+      // click, after a dialog that told them it was the other one.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining('"reboot"'),
+        expect.anything(),
+        "Remove"
+      );
+      expect(dupStore.getAll().map((m) => m.name)).toEqual(["login"]);
+    });
+
+    it("pasteSecret writes the clipboard value into the twin that was clicked", async () => {
+      const dupStore = seed(twins({ secret: true }));
+      const item = { macro: dupStore.getAll()[1], index: 1 };
+      mockClipboardReadText.mockResolvedValue("hunter2\n");
+
+      await registeredCommands.get("nexus.macro.pasteSecret")!(item);
+
+      const after = dupStore.getAll();
+      expect(after[1].text).toBe("hunter2\n");
+      expect(after[0].text).toBe("login\n"); // the other twin's password is untouched
+    });
+
+    it("assignSlot binds the twin that was clicked", async () => {
+      const dupStore = seed(twins());
+      const item = { macro: dupStore.getAll()[1], index: 1 };
+      mockShowInputBox.mockResolvedValue("alt+7");
+
+      await registeredCommands.get("nexus.macro.assignSlot")!(item);
+
+      const after = dupStore.getAll();
+      expect(after[1].keybinding).toBe("alt+7");
+      expect(after[0].keybinding).toBeUndefined();
+    });
+
+    it("moveToFolder moves the clicked twin only — never every macro carrying the id", async () => {
+      const dupStore = seed(twins());
+      const item = { macro: dupStore.getAll()[1], index: 1 };
+      mockShowQuickPick.mockImplementation(async (items: Array<{ folderKind?: string; label: string }>) =>
+        items.find((i) => i.label === "$(new-folder) New folder…")
+      );
+      mockShowInputBox.mockResolvedValue("Cisco");
+
+      await registeredCommands.get("nexus.macro.moveToFolder")!(item);
+
+      const after = dupStore.getAll();
+      expect(after[1].group).toBe("Cisco");
+      expect(after[0].group).toBeUndefined(); // an id-keyed rewrite moved both
+    });
+
+    it("moveUp still reorders the clicked row — the remedy the sidebar tooltip names must actually work", async () => {
+      // The identity-conflict tooltip (macroTreeProvider.ts) tells the user to
+      // "Reorder any macro with Move Up / Move Down to assign fresh ids", and
+      // the Macro Editor already refuses to touch a flagged macro. If reordering
+      // refused too, a duplicate-id state would have no stated way out at all.
+      const dupStore = seed(twins());
+
+      await registeredCommands.get("nexus.macro.moveUp")!({ macro: dupStore.getAll()[1], index: 1 });
+
+      expect(dupStore.getAll().map((m) => m.name)).toEqual(["reboot", "login"]);
+      expect(mockSetStatusBarMessage).not.toHaveBeenCalled();
+    });
+
+    it("refuses, saying why, when the row went stale AND the id is shared", async () => {
+      // Neither signal survives: the position no longer holds the dragged id, and
+      // the id names two macros. Guessing here is exactly what destroys the wrong
+      // record, and silence would read as a dead menu item.
+      const dupStore = seed([
+        { id: "y", name: "Other", text: "o" },
+        { id: "x", name: "login", text: "login\n" },
+        { id: "x", name: "reboot", text: "reboot\n" }
+      ]);
+      const item = { macro: dupStore.getAll()[2], index: 2 };
+      mockShowWarningMessage.mockImplementation(async (message: string) => {
+        if (!message.startsWith("Remove macro")) return undefined;
+        // A concurrent same-window write reorders the list while the modal is up,
+        // so index 2 stops naming a macro with id "x".
+        const [other, first, second] = dupStore.getAll();
+        await dupStore.save([first, second, other]);
+        return "Remove";
+      });
+
+      await registeredCommands.get("nexus.macro.remove")!(item);
+
+      expect(dupStore.getAll().map((m) => m.name)).toEqual(["login", "reboot", "Other"]);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
     });
   });
 });

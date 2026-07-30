@@ -89,6 +89,7 @@ vi.mock("../../src/commands/macroVariablePrompt", () => ({
 import { MacroTreeProvider, MacroTreeItem, VARIABLE_MARKER } from "../../src/ui/macroTreeProvider";
 import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
 import { MACRO_DRAG_MIME } from "../../src/ui/dndMimeTypes";
+import { DuplicateIdMacroStore } from "../helpers/duplicateIdMacroStore";
 import { registerMacroCommands } from "../../src/commands/macroCommands";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import * as vscode from "vscode";
@@ -732,16 +733,23 @@ describe("MacroTreeProvider drag and drop (§4.9)", () => {
     };
   }
 
-  it("handleDrag serializes the dragged macro's stable id, never an index", async () => {
-    await testStore.save([{ id: "fixed-id", name: "M", text: "t" }]);
-    const item = provider.getChildren()[0] as MacroTreeItem;
+  it("handleDrag serializes the dragged macro's stable id, plus the row it was dragged from", async () => {
+    // The id is what survives a reorder between drag and drop; the index is the
+    // only thing that can separate two macros sharing an id, and it is honoured
+    // by `resolveMacroTarget` only while the macro at that position still
+    // carries the dragged id. Never the index alone.
+    await testStore.save([
+      { id: "other-id", name: "Other", text: "t" },
+      { id: "fixed-id", name: "M", text: "t" }
+    ]);
+    const item = provider.getChildren()[1] as MacroTreeItem;
     const dataTransfer = makeDataTransfer();
 
     await provider.handleDrag([item], dataTransfer as unknown as vscode.DataTransfer);
 
     const stored = dataTransfer.get(MACRO_DRAG_MIME) as { asString: () => Promise<string> } | undefined;
     expect(stored).toBeDefined();
-    await expect(stored!.asString()).resolves.toBe("fixed-id");
+    expect(JSON.parse(await stored!.asString())).toEqual({ id: "fixed-id", index: 1 });
   });
 
   it("folders are not draggable — handleDrag on a folder source sets no payload", async () => {
@@ -820,6 +828,44 @@ describe("MacroTreeProvider drag and drop (§4.9)", () => {
     const macros = testStore.getAll();
     expect(macros.find((m) => m.id === "m1")?.group).toBe("Cisco");
     expect(macros.find((m) => m.id === "m2")?.group).toBe("Juniper");
+  });
+
+  it("a bare id payload (no row position) still resolves — the parse is defensive, not brittle", async () => {
+    // Every drop above sends a plain id string rather than the JSON `handleDrag`
+    // now writes, and they must keep working: `DataTransfer` carries whatever the
+    // source put there, so a non-JSON payload is read as a bare id instead of
+    // being dropped on the floor.
+    await testStore.save([{ id: "m1", name: "M", text: "t" }]);
+    await testStore.saveFolders(["Cisco"]);
+    const folder = findFolder(provider.getChildren(), "Cisco");
+    const dataTransfer = makeDataTransfer({ [MACRO_DRAG_MIME]: new vscode.DataTransferItem("m1") });
+
+    await provider.handleDrop(folder, dataTransfer as unknown as vscode.DataTransfer);
+
+    expect(testStore.getAll().find((m) => m.id === "m1")?.group).toBe("Cisco");
+  });
+
+  it("dropping one of two macros that share an id moves the row that was dragged, not the first match", async () => {
+    // The drag payload's index is what makes this answerable at all — the id
+    // names both. `DuplicateIdMacroStore` because `InMemoryMacroStore.save()`
+    // re-keys duplicates and so cannot hold the state under test.
+    const dupStore = new DuplicateIdMacroStore([
+      { id: "x", name: "First", text: "t" },
+      { id: "x", name: "Second", text: "t" }
+    ]);
+    setActiveMacroStore(dupStore);
+    await dupStore.saveFolders(["Cisco"]);
+    const dupProvider = new MacroTreeProvider();
+    const folder = findFolder(dupProvider.getChildren(), "Cisco");
+    const dragged = dupProvider.getChildren()[2] as MacroTreeItem; // folder first, then both macros
+    const dataTransfer = makeDataTransfer();
+    await dupProvider.handleDrag([dragged], dataTransfer as unknown as vscode.DataTransfer);
+
+    await dupProvider.handleDrop(folder, dataTransfer as unknown as vscode.DataTransfer);
+
+    const after = dupStore.getAll();
+    expect(after[1].group).toBe("Cisco");
+    expect(after[0].group).toBeUndefined();
   });
 });
 

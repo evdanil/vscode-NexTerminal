@@ -24,7 +24,12 @@ import {
 import { repositoryBlobUrl } from "../utils/repositoryLinks";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders, withRedactedVariables } from "../services/macroVariables";
 import { collectMacroFolders, sanitizeMacroGroup } from "../services/macroFolders";
-import { mutateMacroById } from "../services/macroMutation";
+import {
+  mutateMacro,
+  resolveMacroTarget,
+  AMBIGUOUS_MACRO_TARGET_MESSAGE,
+  type MacroRef
+} from "../services/macroMutation";
 import {
   getAncestorPaths,
   folderDisplayName,
@@ -507,7 +512,7 @@ async function removeMacroFolder(path: string): Promise<void> {
   // Fix 2 (MAJOR) — `macros` above was captured BEFORE the confirmation
   // dialog, which the user can leave open indefinitely. Anything saved while
   // it was open (another macro command, the Macro Editor, a drag onto a
-  // folder, a config import — all in THIS window; see `mutateMacroById`'s
+  // folder, a config import — all in THIS window; see `mutateMacro`'s
   // note on why another window is not the threat) must not be discarded by
   // writing back that stale snapshot — the affected-count message above may
   // already be reading slightly-stale data, but the actual MUTATION below
@@ -573,14 +578,32 @@ function findNextInGroup(macros: TerminalMacro[], index: number, group: string |
 }
 
 /**
- * Position of the macro with `id` in `macros`, or -1. Only ever used for the
- * PRE-dialog read (the name to show in a confirmation, the binding to pre-fill
- * in a prompt). The index it returns is valid for `macros` and nothing else —
- * the post-dialog write must go through `mutateMacroById`, which re-resolves
- * against a freshly read array.
+ * A tree item's reference to its macro: the stable id AND the row's rendered
+ * position, because neither alone resolves every state — see
+ * `resolveMacroTarget`. Duck-typed like every other read of the arg (the
+ * `MacroTreeItem` import is `type`-only, see the top-of-file comment), so a
+ * caller that supplies no index degrades to id-only resolution rather than
+ * fabricating one.
  */
-function indexOfMacroById(macros: TerminalMacro[], id: string | undefined): number {
-  return id ? macros.findIndex((m) => m.id === id) : -1;
+function macroRefFromItem(item: MacroTreeItem): MacroRef {
+  return { id: item.macro.id, index: item.index };
+}
+
+/**
+ * The PRE-dialog read (the name to show in a confirmation, the binding to
+ * pre-fill in a prompt) — and the point at which an unresolvable target is
+ * refused before the user is asked to confirm anything. Returns the index
+ * within `macros` and nothing else; the post-dialog write must go through
+ * `mutateMacro`, which re-resolves the same `MacroRef` against a freshly read
+ * array.
+ */
+function resolveOrExplain(macros: TerminalMacro[], ref: MacroRef): number {
+  const target = resolveMacroTarget(macros, ref);
+  if (target.kind === "ambiguous") {
+    void vscode.window.showWarningMessage(AMBIGUOUS_MACRO_TARGET_MESSAGE);
+    return -1;
+  }
+  return target.kind === "resolved" ? target.index : -1;
 }
 
 export function registerMacroCommands(profileProvider?: () => MacroProfileOptionInput[]): vscode.Disposable[] {
@@ -605,44 +628,62 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       MacroEditorPanel.open();
     }),
 
+    // Opening the editor writes nothing, but it decides which macro the user is
+    // about to edit — a stale row's index names a different macro, which puts
+    // someone else's record in front of them pre-filled and one Save away. Same
+    // resolution as every write path rather than a second, laxer rule here; a
+    // target that no longer exists opens the editor with no selection (what the
+    // palette entry does) instead of landing on whatever took its slot.
     vscode.commands.registerCommand("nexus.macro.edit", (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
-      if (item) {
-        MacroEditorPanel.open(item.index);
-      } else {
+      if (!item) {
         MacroEditorPanel.open();
+        return;
       }
+      const target = resolveMacroTarget(getMacros(), macroRefFromItem(item));
+      if (target.kind === "ambiguous") {
+        void vscode.window.showWarningMessage(AMBIGUOUS_MACRO_TARGET_MESSAGE);
+        return;
+      }
+      MacroEditorPanel.open(target.kind === "resolved" ? target.index : undefined);
     }),
 
-    // Identity, not position: the id is captured up front and carried across
-    // the confirmation dialog (see `mutateMacroById`). Re-reading the array
-    // after the dialog while still indexing into it with the PRE-dialog index
-    // was worse than not re-reading at all — it confidently removed whichever
-    // macro had since slid into that slot. The overlapping writer is another
-    // flow in THIS window (the Macro Editor, a drag onto a folder, an import),
-    // not another window; `{ modal: true }` blocks the user, not the host.
+    // The clicked ROW — id and position together — is captured up front and
+    // re-resolved against a freshly read array after the confirmation dialog
+    // (see `resolveMacroTarget` / `mutateMacro`). Re-reading the array after
+    // the dialog while still indexing into it with the PRE-dialog index was
+    // worse than not re-reading at all: it confidently removed whichever macro
+    // had since slid into that slot. Resolving by id ALONE is not the answer
+    // either — on a list with duplicate ids (a reachable, deliberately
+    // unrepaired state) first-match confirmed one twin's name and deleted the
+    // other's record. The overlapping writer is another flow in THIS window
+    // (the Macro Editor, a drag onto a folder, an import), not another window;
+    // `{ modal: true }` blocks the user, not the host.
     vscode.commands.registerCommand("nexus.macro.remove", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
-      let targetId: string | undefined;
+      let ref: MacroRef;
       if (item) {
-        targetId = item.macro.id;
+        ref = macroRefFromItem(item);
       } else {
         const macros = getMacros();
         if (macros.length === 0) {
           void vscode.window.showInformationMessage("No macros defined.");
           return;
         }
+        // The quick pick carries the ordinal as well as the id for the same
+        // reason a tree item does: it is the only thing that tells two macros
+        // sharing an id apart, and the user picked one specific ROW.
         const pick = await vscode.window.showQuickPick(
-          macros.map((m) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), id: m.id })),
+          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), id: m.id, index: i })),
           { title: "Select Macro to Remove" }
         );
         if (!pick) {
           return;
         }
-        targetId = pick.id;
+        ref = { id: pick.id, index: pick.index };
       }
       const macros = getMacros();
-      const index = indexOfMacroById(macros, targetId);
+      const index = resolveOrExplain(macros, ref);
       if (index === -1) {
         return;
       }
@@ -655,10 +696,16 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (confirm !== "Remove") {
         return;
       }
-      const outcome = await mutateMacroById(targetId, (latest, i) => {
+      const outcome = await mutateMacro(ref, (latest, i) => {
         latest.splice(i, 1);
       });
-      if (outcome === "missing") {
+      if (outcome === "ambiguous") {
+        // The array shifted under the reference while the modal was up AND the
+        // id is shared, so the row the user confirmed can no longer be picked
+        // out. Refusing is the only safe answer; saying so is the difference
+        // between a fail-safe and a button that does nothing.
+        void vscode.window.showWarningMessage(AMBIGUOUS_MACRO_TARGET_MESSAGE);
+      } else if (outcome === "missing") {
         // Saying nothing here left the user staring at a confirmation they
         // answered and a sidebar that may look unchanged (the macro could
         // have been renamed away rather than deleted). The end state is what
@@ -752,9 +799,9 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
     // the wrong macro AND stripped a third macro's shortcut.
     vscode.commands.registerCommand("nexus.macro.assignSlot", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
-      let targetId: string | undefined;
+      let ref: MacroRef;
       if (item) {
-        targetId = item.macro.id;
+        ref = macroRefFromItem(item);
       } else {
         const macros = getMacros();
         if (macros.length === 0) {
@@ -762,16 +809,16 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           return;
         }
         const pick = await vscode.window.showQuickPick(
-          macros.map((m) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), id: m.id })),
+          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), id: m.id, index: i })),
           { title: "Select Macro" }
         );
         if (!pick) {
           return;
         }
-        targetId = pick.id;
+        ref = { id: pick.id, index: pick.index };
       }
       const macros = getMacros();
-      const index = indexOfMacroById(macros, targetId);
+      const index = resolveOrExplain(macros, ref);
       if (index === -1) {
         return;
       }
@@ -782,10 +829,12 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (bindingResult === undefined) {
         return; // Cancelled
       }
-      const outcome = await mutateMacroById(targetId, (latest, i) => {
+      const outcome = await mutateMacro(ref, (latest, i) => {
         assignBinding(latest, i, bindingResult);
       });
-      if (outcome === "missing") {
+      if (outcome === "ambiguous") {
+        void vscode.window.showWarningMessage(AMBIGUOUS_MACRO_TARGET_MESSAGE);
+      } else if (outcome === "missing") {
         void vscode.window.showInformationMessage(
           `"${promptedName}" no longer exists — its keyboard shortcut was not changed.`
         );
@@ -796,17 +845,29 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
     // necessarily the adjacent array element. Because same-group neighbours
     // may be non-adjacent, this can swap non-adjacent elements — acceptable,
     // and visible as a bigger jump in the flat run picker.
+    //
+    // These two are the reason the shared resolver leads with the INDEX rather
+    // than the id. A bare `item.index` reorders whatever now sits in that slot:
+    // the row for `B` built from `[A, B, C]` carries index 1, and once `A` is
+    // deleted the latest array is `[B, C]` — Move Up on that row swapped `C`
+    // and `B`, moving the selected macro DOWN and a macro the user never
+    // touched up. A bare id lookup fixes that and breaks the other half: these
+    // are the commands the tree's own tooltip names as the repair route for a
+    // duplicated id ("Reorder any macro with Move Up / Move Down to assign
+    // fresh ids"), which only works because a freshly rendered row's index
+    // still matches its macro. `resolveMacroTarget` keeps both.
     vscode.commands.registerCommand("nexus.macro.moveUp", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
-      if (!item || item.index < 0) {
+      if (!item) {
         return;
       }
       const macros = getMacros();
-      if (item.index >= macros.length) {
+      const index = resolveOrExplain(macros, macroRefFromItem(item));
+      if (index === -1) {
         return;
       }
-      const group = sanitizeMacroGroup(macros[item.index].group);
-      const prevIndex = findPreviousInGroup(macros, item.index, group);
+      const group = sanitizeMacroGroup(macros[index].group);
+      const prevIndex = findPreviousInGroup(macros, index, group);
       if (prevIndex === -1) {
         void vscode.window.setStatusBarMessage(
           group ? "Already at the top of this folder" : "Already at the top of the list",
@@ -814,21 +875,22 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         );
         return;
       }
-      [macros[prevIndex], macros[item.index]] = [macros[item.index], macros[prevIndex]];
+      [macros[prevIndex], macros[index]] = [macros[index], macros[prevIndex]];
       await saveMacros(macros);
     }),
 
     vscode.commands.registerCommand("nexus.macro.moveDown", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
-      if (!item || item.index < 0) {
+      if (!item) {
         return;
       }
       const macros = getMacros();
-      if (item.index >= macros.length) {
+      const index = resolveOrExplain(macros, macroRefFromItem(item));
+      if (index === -1) {
         return;
       }
-      const group = sanitizeMacroGroup(macros[item.index].group);
-      const nextIndex = findNextInGroup(macros, item.index, group);
+      const group = sanitizeMacroGroup(macros[index].group);
+      const nextIndex = findNextInGroup(macros, index, group);
       if (nextIndex === -1) {
         void vscode.window.setStatusBarMessage(
           group ? "Already at the bottom of this folder" : "Already at the bottom of the list",
@@ -836,7 +898,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         );
         return;
       }
-      [macros[item.index], macros[nextIndex]] = [macros[nextIndex], macros[item.index]];
+      [macros[index], macros[nextIndex]] = [macros[nextIndex], macros[index]];
       await saveMacros(macros);
     }),
 
@@ -877,18 +939,18 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
     // index that is back in bounds but now refers to a DIFFERENT macro (the
     // one it was opened for was deleted, and a later macro slid into the
     // same slot). Both the tree-item path and the palette's multi-select
-    // path therefore carry the macro's stable `id` (never a bare index)
-    // across every `await` below, and the final write re-reads the latest
-    // array and updates only entries whose id still matches.
+    // path therefore carry a full `MacroRef` (stable id + the row's rendered
+    // position) across every `await` below, and the final write re-reads the
+    // latest array and re-resolves each reference to at most ONE macro.
     vscode.commands.registerCommand("nexus.macro.moveToFolder", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
       const macros = getMacros();
-      let targetIds: string[];
+      let refs: MacroRef[];
       if (item) {
         if (!item.macro.id) {
           return;
         }
-        targetIds = [item.macro.id];
+        refs = [macroRefFromItem(item)];
       } else {
         if (macros.length === 0) {
           void vscode.window.showInformationMessage("No macros defined.");
@@ -907,8 +969,8 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         if (!picks || picks.length === 0) {
           return;
         }
-        targetIds = picks.map((p) => p.id).filter((id): id is string => !!id);
-        if (targetIds.length === 0) {
+        refs = picks.filter((p) => !!p.id).map((p): MacroRef => ({ id: p.id, index: p.index }));
+        if (refs.length === 0) {
           return;
         }
       }
@@ -919,14 +981,32 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       }
 
       // Re-read the latest array after BOTH awaits above (the quick pick(s)
-      // and the folder picker) and update only entries whose id is still in
-      // `targetIds` — a macro deleted mid-flow simply has no match (no-op,
-      // never a ghost record); a macro that slid into a stale index's old
-      // slot is untouched because its own id was never captured.
+      // and the folder picker) and re-resolve every reference against it. Each
+      // reference names ONE macro: an earlier version updated every entry whose
+      // id was in the captured set, which moved both twins of a duplicated id
+      // when the user selected one row. A macro deleted mid-flow simply
+      // resolves to nothing (no-op, never a ghost record); a macro that slid
+      // into a stale index's old slot is untouched because its own id was never
+      // captured.
       const latest = getMacros();
-      const idSet = new Set(targetIds);
-      const updated = latest.map((m) => {
-        if (!m.id || !idSet.has(m.id)) {
+      const targetIndices = new Set<number>();
+      let unresolvable = 0;
+      for (const ref of refs) {
+        const target = resolveMacroTarget(latest, ref);
+        if (target.kind === "resolved") {
+          targetIndices.add(target.index);
+        } else if (target.kind === "ambiguous") {
+          unresolvable += 1;
+        }
+      }
+      if (unresolvable > 0) {
+        void vscode.window.showWarningMessage(AMBIGUOUS_MACRO_TARGET_MESSAGE);
+      }
+      if (targetIndices.size === 0) {
+        return; // Nothing left to move — never a whole-array rewrite for a no-op.
+      }
+      const updated = latest.map((m, i) => {
+        if (!targetIndices.has(i)) {
           return m;
         }
         const next = { ...m };
@@ -1053,12 +1133,16 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       // password straight into `nexus.macros` in cleartext. So the
       // confidentiality precondition is re-checked against the FRESH record,
       // not the one the context menu was opened on.
-      const outcome = await mutateMacroById(item.macro.id, (macros, i) => {
+      const outcome = await mutateMacro(macroRefFromItem(item), (macros, i) => {
         if (!macros[i].secret) {
           return false;
         }
         macros[i] = { ...macros[i], text };
       });
+      if (outcome === "ambiguous") {
+        void vscode.window.showWarningMessage(AMBIGUOUS_MACRO_TARGET_MESSAGE);
+        return;
+      }
       if (outcome === "skipped") {
         void vscode.window.showWarningMessage(
           `"${item.macro.name}" is no longer a secret macro, so its value was NOT replaced — pasting into it would have stored the clipboard text in plain text. Re-enable Secret first, or use Edit Macro.`

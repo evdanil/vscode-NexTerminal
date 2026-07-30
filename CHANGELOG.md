@@ -12,6 +12,7 @@
 ### Changed
 
 - The Scripts sidebar scan is bounded: it stops after 10 levels of nesting or 500 examined entries and shows a note at the top of the tree (clicking it opens the `nexus.scripts.path` setting). This matters because that setting accepts an absolute path, so it can be pointed at a large directory. Dot-directories and `node_modules` are skipped, as is the generated `types/` directory at the scripts root — a folder of your own named `types` deeper in the tree is scanned normally.
+- A symlinked (or junctioned) folder inside the scripts directory is scanned and its scripts are listed, but VS Code's file watcher cannot follow links nested inside the folder it watches, so changes made in the link's target do not refresh the view on their own. Those folders now carry a link icon and a hover explaining it — use **Refresh Scripts**. **Connect and Run Script…** rescans every time and is unaffected.
 
 ## [2.8.74] — 2026-07-30
 

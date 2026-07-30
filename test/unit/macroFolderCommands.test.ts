@@ -436,6 +436,53 @@ describe("macro folder commands", () => {
       expect(mockShowWarningMessage).not.toHaveBeenCalled();
     });
 
+    /**
+     * The explicit-folder list (`nexus.macros.folders`) is the SECOND thing
+     * `removeMacroFolder` rewrites, and nothing was watching it: every
+     * assertion in this block checked either that the removed folder was gone
+     * or where the macros ended up, so replacing the whole final
+     * `saveMacroFolders([...nextExplicit])` with `saveMacroFolders([])` — "Remove
+     * Folder wipes every explicit folder in the store" — passed all 131 tests
+     * across this file, macroTreeProvider, macroCommands and
+     * macroCommandsIdentity. An explicit folder is the empty folder a user
+     * deliberately created; wiping the list destroys every one of them, and the
+     * only symptom is folders quietly vanishing from the sidebar.
+     */
+    it("an unrelated explicit folder survives the removal", async () => {
+      await store.saveFolders(["Empty", "Other"]);
+
+      await registeredCommands.get("nexus.macro.removeFolder")!(folderArg("Empty"));
+
+      expect(getMacroFolders()).toEqual(["Other"]);
+    });
+
+    it("an explicit DESCENDANT folder is re-parented, keeping its substructure", async () => {
+      // The folder-list mirror of the macro re-parenting asserted above: an
+      // explicit "Cisco/Routers/Old" must come back as "Cisco/Old", not vanish
+      // with its parent and not keep its old path.
+      await store.saveFolders(["Cisco", "Cisco/Routers", "Cisco/Routers/Old"]);
+
+      await registeredCommands.get("nexus.macro.removeFolder")!(folderArg("Cisco/Routers"));
+
+      expect(getMacroFolders().sort()).toEqual(["Cisco", "Cisco/Old"]);
+    });
+
+    it("an explicit descendant of a TOP-LEVEL folder re-parents to the root", async () => {
+      await store.saveFolders(["Cisco", "Cisco/Routers"]);
+
+      await registeredCommands.get("nexus.macro.removeFolder")!(folderArg("Cisco"));
+
+      expect(getMacroFolders()).toEqual(["Routers"]);
+    });
+
+    it("prefix-safety in the explicit list too: 'Network' survives removing 'Net'", async () => {
+      await store.saveFolders(["Net", "Net/Sub", "Network"]);
+
+      await registeredCommands.get("nexus.macro.removeFolder")!(folderArg("Net"));
+
+      expect(getMacroFolders().sort()).toEqual(["Network", "Sub"]);
+    });
+
     it("Fix 2 (MAJOR) — a macro saved WHILE the confirmation dialog is open must not be discarded by a stale pre-dialog snapshot", async () => {
       // Reproduces the exact scenario from the review: start removing "Cisco"
       // from [A(group=Cisco), B(root)]; while the modal warning is open,

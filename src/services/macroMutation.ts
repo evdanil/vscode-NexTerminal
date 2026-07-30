@@ -2,15 +2,118 @@ import { getMacros, saveMacros } from "../macroSettings";
 import type { TerminalMacro } from "../models/terminalMacro";
 
 /**
- * What `mutateMacroById` actually did.
+ * Shown when a macro cannot be resolved to exactly one record. Deliberately the
+ * SAME sentence everywhere — the Macro Editor, every macro command, and a drag
+ * onto a folder all hit it for the same reason and the fix is the same one, so
+ * two wordings would just be two ways of describing one state.
  *
- * `"missing"` and `"skipped"` are deliberately distinct. Both mean "nothing was
- * written", but they are different things to tell the user: the target is gone
- * versus the target is still there and no longer eligible. Collapsing them into
- * a bare `false` is what let `nexus.macro.remove` say nothing at all when its
- * macro vanished mid-dialog.
+ * The advice is correct even when the command that failed IS Move Up / Move
+ * Down (a stale tree item over a duplicated id, see `resolveMacroTarget`):
+ * `MacroStore.save()` re-keys duplicates on every write, so reordering ANY
+ * macro from a freshly rendered row clears the conflict for the whole list.
  */
-export type MacroMutationOutcome = "saved" | "missing" | "skipped";
+export const AMBIGUOUS_MACRO_TARGET_MESSAGE =
+  "Another macro has the same internal id, so Nexus cannot tell which one you mean. " +
+  "Reorder any macro with Move Up / Move Down to assign fresh ids, then try again.";
+
+/**
+ * How a UI surface names the macro it is acting on: the stable `id` it captured
+ * plus — when the reference came from a rendered row — the position that row was
+ * built at. Both are needed; neither alone is sufficient. See
+ * `resolveMacroTarget`.
+ */
+export interface MacroRef {
+  // `null` as well as `undefined`: the Macro Editor's webview payload carries
+  // `id: string | null`, and forcing every call site to launder that into
+  // `undefined` would be ceremony around a check that is already a falsy test.
+  readonly id: string | null | undefined;
+  /**
+   * The array position this reference was RENDERED at, when there is one. Omit
+   * it (rather than pass a guess) for a reference that never came from a row —
+   * the Macro Editor's webview payload, for instance. A wrong index is never
+   * acted on, but an absent one gives up the only signal that can separate two
+   * macros sharing an id.
+   */
+  readonly index?: number;
+}
+
+/** The outcome of resolving a `MacroRef` against a concrete array. */
+export type MacroTarget =
+  | { readonly kind: "resolved"; readonly index: number }
+  | { readonly kind: "missing" }
+  | { readonly kind: "ambiguous" };
+
+/**
+ * The one way anything in this codebase turns "the macro the user clicked" into
+ * "a position in THIS array". Every call site must use it; the two defects that
+ * produced it were a direct consequence of each site solving half the problem
+ * its own way.
+ *
+ * Precedence, in order:
+ *
+ * 1. **`macros[ref.index]` when its id matches.** This is the only thing that
+ *    can disambiguate two macros sharing an id, because the id — by
+ *    construction — cannot. Duplicate stored ids are a REACHABLE state that the
+ *    read path deliberately does not repair (`VscodeMacroStore.reloadFromState()`
+ *    and `MacroStore.save()`'s doc comment explain why re-keying at load time
+ *    would be worse than the duplication), so "first match wins" here means Remove
+ *    Macro on the second twin confirms — and deletes — the FIRST one, under the
+ *    first one's name. Position is what the user actually pointed at.
+ *
+ * 2. **The unique holder of `ref.id`.** A tree item outlives the array it was
+ *    built from: the row for `B` in `[A, B, C]` carries index 1, and if `A` is
+ *    deleted before the command runs, index 1 now names `C`. That index is not
+ *    merely stale, it is confidently wrong — and a bounds check does not help,
+ *    since 1 is perfectly in bounds. The id is what survives the reorder.
+ *
+ * 3. **Refuse.** An id claimed by more than one macro, with no index that
+ *    matched, is genuinely unresolvable: both candidates are equally plausible
+ *    and one of them is someone's password. This mirrors what the Macro Editor
+ *    has always done for its own save/delete and what `MacroAutoTrigger` does
+ *    for an ambiguous state key — refusing is a fail-safe, and it is never a
+ *    dead end, because any write re-keys duplicates.
+ *
+ * A missing id (a macro synthesised by a caller, never returned by the store)
+ * is "no target": no write at all, never a guess. Every macro `getMacros()`
+ * returns carries an id — both store implementations assign one in `save()`,
+ * and `VscodeMacroStore` assigns one again in `reloadFromState()`.
+ */
+export function resolveMacroTarget(macros: readonly TerminalMacro[], ref: MacroRef): MacroTarget {
+  const id = ref.id;
+  if (!id) {
+    return { kind: "missing" };
+  }
+  const index = ref.index;
+  if (
+    typeof index === "number" &&
+    Number.isInteger(index) &&
+    index >= 0 &&
+    index < macros.length &&
+    macros[index].id === id
+  ) {
+    return { kind: "resolved", index };
+  }
+  const first = macros.findIndex((m) => m.id === id);
+  if (first === -1) {
+    return { kind: "missing" };
+  }
+  if (macros.some((m, i) => i > first && m.id === id)) {
+    return { kind: "ambiguous" };
+  }
+  return { kind: "resolved", index: first };
+}
+
+/**
+ * What `mutateMacro` actually did.
+ *
+ * `"missing"`, `"ambiguous"` and `"skipped"` are deliberately distinct. All
+ * three mean "nothing was written", but they are different things to tell the
+ * user: the target is gone, the target cannot be identified, or the target is
+ * still there and no longer eligible. Collapsing them into a bare `false` is
+ * what let `nexus.macro.remove` say nothing at all when its macro vanished
+ * mid-dialog.
+ */
+export type MacroMutationOutcome = "saved" | "missing" | "ambiguous" | "skipped";
 
 /**
  * Receives the FRESHLY read array and the index of the target macro WITHIN THAT
@@ -42,21 +145,9 @@ export type MacroMutator = (macros: TerminalMacro[], index: number) => boolean |
  * notification is still up.
  *
  * The trap is that re-reading `getMacros()` after the dialog is only HALF the
- * fix. `getMacros()` returns a fresh array on every call, so a pre-dialog index
- * applied to a post-dialog array is not merely stale, it is confidently wrong:
- * with `[A, B]`, opening a dialog on A (index 0) and deleting A from the Macro
- * Editor while it is open leaves `[B]`, and `splice(0, 1)` /
- * `assignBinding(latest, 0, …)` then hits **B** — a macro the user never
- * selected, after a confirmation naming A. A bounds check does not help; index
- * 0 is perfectly in bounds.
- *
- * `id` is the only stable identity a macro has across those awaits. It is a
- * `MacroStore` invariant, not a hope: both store implementations assign a UUID
- * in `save()`, and `VscodeMacroStore` assigns one again in `reloadFromState()`,
- * so everything `getMacros()` ever returns — and therefore every
- * `MacroTreeItem.macro` — carries one. A missing id can only mean the caller
- * synthesised a macro that never came from the store, and is treated as "no
- * target": no write at all, never a guess.
+ * fix. `getMacros()` returns a fresh array on every call, so the reference must
+ * be re-resolved against THAT array — which is what `resolveMacroTarget` is
+ * for, and why the caller passes a `MacroRef` rather than an index.
  *
  * **Identity is not the only precondition.** Re-resolving the macro proves it
  * is the same record; it proves nothing about the record's CONTENTS, which the
@@ -66,28 +157,16 @@ export type MacroMutator = (macros: TerminalMacro[], index: number) => boolean |
  * the write stores its text in cleartext in `nexus.macros`. That is what
  * `MacroMutator`'s `false` return is for — check the fresh record, bail
  * cleanly, and let the caller say why.
- *
- * `moveToFolder` and `MacroTreeProvider.handleDrop` solve the same problem in
- * their own shape — many ids / one id, no index needed, a pure field rewrite
- * expressed as a `map` — and are left as they are rather than bent through this
- * signature.
  */
-export async function mutateMacroById(
-  // `null` as well as `undefined`: the Macro Editor's webview payload carries
-  // `id: string | null`, and forcing every call site to launder that into
-  // `undefined` would be ceremony around a check that is already a falsy test.
-  id: string | null | undefined,
-  mutate: MacroMutator
-): Promise<MacroMutationOutcome> {
-  if (!id) {
-    return "missing";
-  }
+export async function mutateMacro(ref: MacroRef, mutate: MacroMutator): Promise<MacroMutationOutcome> {
   const latest = getMacros();
-  const index = latest.findIndex((m) => m.id === id);
-  if (index === -1) {
-    return "missing"; // Deleted while the dialog was open — a no-op, never a wrong write.
+  const target = resolveMacroTarget(latest, ref);
+  if (target.kind !== "resolved") {
+    // Deleted while the dialog was open, or no longer identifiable — a no-op,
+    // never a wrong write.
+    return target.kind;
   }
-  if (mutate(latest, index) === false) {
+  if (mutate(latest, target.index) === false) {
     return "skipped"; // A precondition on the FRESH record failed — no write at all.
   }
   await saveMacros(latest);

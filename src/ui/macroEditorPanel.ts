@@ -15,7 +15,12 @@ import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
 import { collectMacroFolders, macroFolderField } from "../services/macroFolders";
-import { mutateMacroById } from "../services/macroMutation";
+import {
+  mutateMacro,
+  resolveMacroTarget,
+  AMBIGUOUS_MACRO_TARGET_MESSAGE,
+  type MacroTarget
+} from "../services/macroMutation";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
@@ -24,34 +29,33 @@ import { createWebviewNonce } from "./shared/webviewNonce";
 
 type MacroProfileProvider = () => MacroProfileOptionInput[];
 
-/** Shown when a save/delete target cannot be resolved to exactly one macro. */
-const AMBIGUOUS_TARGET_MESSAGE =
-  "Another macro has the same internal id, so Nexus cannot tell which one you were editing. " +
-  "Reorder any macro with Move Up / Move Down to assign fresh ids, then try again.";
-
 /**
  * Resolves the save/delete target by stable id, never by the render-time array index:
  * an external reorder or delete between render and save would otherwise hit the wrong
  * macro.
  *
- * Returns -1 when the id is absent, unknown, OR claimed by more than one macro. That
- * last case is reachable for a macro list that predates the unique-id invariant
- * (`MacroStore.save()`), which the read path deliberately no longer repairs — see
- * `VscodeMacroStore.reloadFromState()`. Taking the first match would write the macro
- * the user was looking at over its twin, silently destroying it; refusing is the same
- * fail-safe `MacroAutoTrigger` applies to an ambiguous state key. Every other repair
- * route (Move Up / Move Down, delete, or editing any macro with a unique id) re-saves
- * the whole list and clears the conflict, so this is never a dead end.
+ * The shared `resolveMacroTarget` takes an optional index precisely so a clicked ROW
+ * can disambiguate two macros sharing an id. The panel deliberately passes none. Its
+ * webview payload's `index` is a RENDER-time position that survives arbitrarily long
+ * — the panel stays open across any number of external writes and even clamps
+ * `selectedIndex` when the list shrinks — so it is not the "the user just pointed at
+ * this row" signal a tree item's index is. With no index, an id claimed by more than
+ * one macro resolves to `"ambiguous"` and the panel refuses, exactly as it always
+ * has: writing the macro the user was looking at over its twin would silently destroy
+ * the twin, and refusing is the same fail-safe `MacroAutoTrigger` applies to an
+ * ambiguous state key. Every other repair route (Move Up / Move Down, delete, or
+ * editing any macro with a unique id) re-saves the whole list and clears the
+ * conflict, so this is never a dead end.
  */
-function resolveUniqueMacroIndex(macros: readonly TerminalMacro[], macroId: string | null): number {
-  if (macroId === null) return -1;
-  const first = macros.findIndex((m) => m.id === macroId);
-  if (first === -1) return -1;
-  return macros.some((m, i) => i > first && m.id === macroId) ? -1 : first;
+function resolveEditorTarget(macros: readonly TerminalMacro[], macroId: string | null): MacroTarget {
+  return resolveMacroTarget(macros, { id: macroId });
 }
 
-function isAmbiguousMacroId(macros: readonly TerminalMacro[], macroId: string | null): boolean {
-  return macroId !== null && macros.filter((m) => m.id === macroId).length > 1;
+/** The right thing to say for a target that could not be resolved to one macro. */
+function unresolvedTargetMessage(target: MacroTarget, verb: "saved" | "deleted"): string {
+  return target.kind === "ambiguous"
+    ? AMBIGUOUS_MACRO_TARGET_MESSAGE
+    : `This macro changed externally and could not be ${verb}. The editor has been refreshed.`;
 }
 
 /** §4.7 `addToFolder` seeds a new macro's Folder field with the clicked folder. */
@@ -240,23 +244,19 @@ export class MacroEditorPanel {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
         // A null id means an unsaved (new) macro → push path.
-        const index = resolveUniqueMacroIndex(macros, macroId);
-        if (macroId !== null && index === -1) {
+        const target = resolveEditorTarget(macros, macroId);
+        if (macroId !== null && target.kind !== "resolved") {
           // The macro we were editing was deleted/changed externally, or its id is
           // shared with another macro. Do not fall through to the push path (that
           // would create a stray duplicate) and do not guess a target.
-          void vscode.window.showWarningMessage(
-            isAmbiguousMacroId(macros, macroId)
-              ? AMBIGUOUS_TARGET_MESSAGE
-              : "This macro changed externally and could not be saved. The editor has been refreshed."
-          );
+          void vscode.window.showWarningMessage(unresolvedTargetMessage(target, "saved"));
           this.render();
           return;
         }
         // The one read of the stored record, hoisted above the Folder-field
         // logic below (which needs it) and shared with the hidden-declaration
         // check further down, which used to re-derive the identical value.
-        const existingMacro = index >= 0 ? macros[index] : undefined;
+        const existingMacro = target.kind === "resolved" ? macros[target.index] : undefined;
         const triggerInitiallyDisabled = msg.triggerInitiallyDisabled as boolean | undefined;
         const triggerInterval = msg.triggerInterval as number | undefined | null;
         const triggerScope = msg.triggerScope as TerminalMacro["triggerScope"] | undefined;
@@ -492,8 +492,24 @@ export class MacroEditorPanel {
         if (macroId !== null) {
           let savedIndex = -1;
           const outcome = await this.withSaveGuard(() =>
-            mutateMacroById(macroId, (latest, i) => {
+            mutateMacro({ id: macroId }, (latest, i) => {
               savedIndex = i;
+              // `macro` was composed from the PRE-dialog record, so every field
+              // on it is either something the user typed in this form or
+              // something copied off that snapshot. For the fields the form
+              // owns, overwriting is the point. `group` is the exception when
+              // the Folder field was untouched: the value being written back is
+              // then not a user decision at all, it is a copy of what the store
+              // held before the dialog — so a folder move that landed while the
+              // non-modal binding warning was up (a drag onto a folder,
+              // `moveToFolder`) got silently reverted by a save that only
+              // changed the macro's NAME. Re-read the folder off the LATEST
+              // record instead, which is the same rule the untouched-field
+              // branch below already applies, just against fresh data.
+              if (folderUntouched) {
+                delete macro.group;
+                if (typeof latest[i].group === "string") macro.group = latest[i].group;
+              }
               latest[i] = macro;
               if (normalizedBinding) {
                 assignBinding(latest, i, normalizedBinding);
@@ -502,7 +518,9 @@ export class MacroEditorPanel {
           );
           if (outcome !== "saved") {
             void vscode.window.showWarningMessage(
-              "This macro changed externally and could not be saved. The editor has been refreshed."
+              outcome === "ambiguous"
+                ? AMBIGUOUS_MACRO_TARGET_MESSAGE
+                : "This macro changed externally and could not be saved. The editor has been refreshed."
             );
             this.render();
             break;
@@ -530,19 +548,16 @@ export class MacroEditorPanel {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
         // Resolve by stable id; the render-time index may be stale.
-        const index = resolveUniqueMacroIndex(macros, macroId);
-        const macro = index >= 0 ? macros[index] : undefined;
-        if (!macro) {
+        const target = resolveEditorTarget(macros, macroId);
+        if (target.kind !== "resolved") {
           if (macroId !== null) {
-            void vscode.window.showWarningMessage(
-              isAmbiguousMacroId(macros, macroId)
-                ? AMBIGUOUS_TARGET_MESSAGE
-                : "This macro changed externally and could not be deleted. The editor has been refreshed."
-            );
+            void vscode.window.showWarningMessage(unresolvedTargetMessage(target, "deleted"));
             this.render();
           }
           break;
         }
+        const index = target.index;
+        const macro = macros[index];
 
         const confirm = await vscode.window.showWarningMessage(
           `Delete macro "${macro.name}"?`,
@@ -557,14 +572,16 @@ export class MacroEditorPanel {
         // pre-dialog snapshot would discard it.
         let deletedIndex = index;
         const outcome = await this.withSaveGuard(() =>
-          mutateMacroById(macroId, (latest, i) => {
+          mutateMacro({ id: macroId }, (latest, i) => {
             deletedIndex = i;
             latest.splice(i, 1);
           })
         );
         if (outcome !== "saved") {
           void vscode.window.showWarningMessage(
-            "This macro changed externally and could not be deleted. The editor has been refreshed."
+            outcome === "ambiguous"
+              ? AMBIGUOUS_MACRO_TARGET_MESSAGE
+              : "This macro changed externally and could not be deleted. The editor has been refreshed."
           );
           this.render();
           break;
@@ -583,7 +600,7 @@ export class MacroEditorPanel {
    * save/delete handlers (which set `selectedIndex` to the just-applied target).
    *
    * Every path that persists must go through this, including
-   * `mutateMacroById` — that helper calls `saveMacros()` directly, which would
+   * `mutateMacro` — that helper calls `saveMacros()` directly, which would
    * otherwise fire the store's change event straight back into this panel's own
    * subscription mid-flow.
    */

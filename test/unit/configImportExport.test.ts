@@ -1697,6 +1697,47 @@ describe("backup import", () => {
     expect(importStore.getFolders()).toEqual([]);
   });
 
+  it("replace mode leaves macro folders alone when the payload replaces no macros at all (servers-only backup)", async () => {
+    // Fix 5c cleared the folder list on EVERY replace import, justified by
+    // "saveMacros() below unconditionally replaces the macros array". It does
+    // not: `collectIncomingMacros()` returns undefined for a payload with
+    // neither a top-level `macros` array nor `settings["nexus.terminal.macros"]`,
+    // and the macros block is skipped entirely. `isValidExport()` accepts
+    // exactly that shape (macros are optional), so replace-importing a
+    // servers-only or pre-macro-export backup kept every macro and destroyed
+    // every explicit empty folder — the one artifact this feature exists to
+    // persist.
+    //
+    // The Fix 5c fixture above cannot see this: its payload HAS a macros array,
+    // so the clear it asserts is correct there and both implementations agree.
+    const importStore = new InMemoryMacroStore();
+    await importStore.initialize();
+    await importStore.save([{ name: "Kept", text: "t", group: "Cisco" }]);
+    await importStore.saveFolders(["Cisco", "Staging"]);
+    setActiveMacroStore(importStore);
+
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [makeServer()],
+      settings: {}
+      // no `macros`, no `macroFolders` — a pre-macro-export backup
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup-servers-only.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    // Nothing replaced the macros, so nothing should have cleared their folders.
+    expect(importStore.getAll().map((m) => m.name)).toEqual(["Kept"]);
+    expect(importStore.getFolders().sort()).toEqual(["Cisco", "Staging"]);
+  });
+
   it("shows error on wrong password", async () => {
     const { encrypt } = await import("../../src/utils/configCrypto");
     const encrypted = encrypt(JSON.stringify({ passwords: {}, passphrases: {}, secretMacros: [] }), "correct");

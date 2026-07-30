@@ -438,9 +438,17 @@ secret macro that would mean deciding which macro owns the stored password. The
 rewrite happens only as part of a change you make.
 
 To fix it, use **Move Up** or **Move Down** on any macro. That re-saves the list,
-which assigns fresh ids, and both macros go back to normal. The macro editor will
-refuse to save or delete a flagged macro, because it identifies its target by id
-and cannot tell the two apart — it would otherwise overwrite the wrong one.
+which assigns fresh ids, and both macros go back to normal. Reordering keeps
+working on a flagged macro because it acts on the row you clicked — Nexus checks
+that the macro still sitting at that row is the one the row was drawn for, which
+is a question the shared id cannot answer but the position can.
+
+Everything that has to identify a flagged macro from something other than a
+clicked row refuses instead of guessing: the macro editor will not save or delete
+one (it knows only the id), and a command whose macro list shifted underneath it
+mid-dialog reports that it could not tell the two apart rather than writing to
+the wrong one. Refreshing the view and retrying resolves that, and so does
+reordering any macro.
 
 Running a macro manually, and its keyboard shortcut, are unaffected.
 

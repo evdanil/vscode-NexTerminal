@@ -138,6 +138,29 @@ describe("scanScriptsDir", () => {
     ]);
   });
 
+  it("flags a symlinked folder, and everything under it, as `linked` — the watcher cannot see inside either", async () => {
+    // Following a link is a promise this scanner keeps and the file-system
+    // watcher does not (VS Code's recursive watcher resolves only its own root),
+    // so the tree has to be able to say which rows it will not be told about.
+    // A plain directory INSIDE the link is just as unwatched as the link itself,
+    // which is why the flag is inherited downward rather than set on the link
+    // alone — a user who expands straight into `link/sub` would otherwise get no
+    // explanation at all.
+    mockFsEntries.set(ROOT, [["link", (DIR | 64) as vscode.FileType], ["plain", DIR]]);
+    mockFsEntries.set(`${ROOT}/link`, [["sub", DIR]]);
+    mockFsEntries.set(`${ROOT}/link/sub`, []);
+    mockFsEntries.set(`${ROOT}/plain`, [["nested", DIR]]);
+    mockFsEntries.set(`${ROOT}/plain/nested`, []);
+
+    const result = await scanScriptsDir(rootUri as never);
+
+    const byPath = new Map(result.folders.map((f) => [f.path, f.linked]));
+    expect(byPath.get("link")).toBe(true);
+    expect(byPath.get("link/sub")).toBe(true);
+    expect(byPath.get("plain")).toBe(false);
+    expect(byPath.get("plain/nested")).toBe(false);
+  });
+
   it(`descends fully into a folder at exactly the max depth (${SCRIPT_SCAN_MAX_DEPTH}) — normalizeFolderPath accepts a path of exactly this many segments, so the scanner must read it (Fix 2)`, async () => {
     // Build a straight-line chain d1/d2/.../d10, each containing only the
     // next directory. ROOT/d1/.../d10 (the depth-10 folder — exactly as deep
