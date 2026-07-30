@@ -151,7 +151,12 @@ export class MacroEditorPanel {
       { enableScripts: true, retainContextWhenHidden: true }
     );
     this.render();
-    this.panel.webview.onDidReceiveMessage((msg) => this.handleMessage(msg));
+    // The `.catch()` is the whole point — see `reportHandlerFailure()`. The settled promise is
+    // returned rather than discarded so a caller that CAN await one still can (VS Code does
+    // not); it never rejects, so nothing downstream has to handle it.
+    this.panel.webview.onDidReceiveMessage((msg) =>
+      this.handleMessage(msg).catch((err) => this.reportHandlerFailure(err, msg?.type))
+    );
     this.panel.onDidDispose(() => {
       this.disposed = true;
       this.unsubscribe();
@@ -725,8 +730,52 @@ export class MacroEditorPanel {
   }
 
   /**
-   * Run a write while suppressing the store's change-event re-render for our
-   * own save, so a self-save does not race the explicit `render()` calls in the
+   * Reports a rejection out of `handleMessage()`.
+   *
+   * `onDidReceiveMessage` is a VS Code EVENT listener, not a command handler. Nothing awaits
+   * the promise it returns and nothing reports its rejection, so without this every failure in
+   * `handleMessage()` is invisible: no notification, no in-panel error, and the webview keeps
+   * showing "Unsaved changes" because only a `saved` message clears the dirty flag. Every other
+   * `saveMacros()` / `replaceMacros()` call site in the extension is awaited inside a
+   * registered command handler, where VS Code surfaces a rejection itself; this one is the
+   * exception, and it is the primary secret-editing surface.
+   *
+   * The failure that reaches here in practice is `persist()` → `MacroStore.save()`. That store
+   * fails CLOSED when it cannot write a macro's secret-id marker file (unwritable global
+   * storage, a full disk, a dead network share) rather than write a vault entry nothing can
+   * name — and because a save republishes every secret the window holds, the condition fails
+   * EVERY save containing any secret macro, including an edit to an unrelated plain one. It has
+   * to be reported, and it must never be reported as success.
+   *
+   * Both channels are used deliberately: the notification is what the user sees when the panel
+   * is not focused, and the `#error-save` slot is what they see when it is — it sits beside the
+   * Save button, so the dirty flag that (correctly) stayed set has its reason next to it.
+   *
+   * It does NOT re-render. `render()` rebuilds the webview from the STORE, which for a failed
+   * save is the state the user's edit was never written into — so re-rendering here would
+   * silently discard the edit the message is telling them was not saved, which is exactly the
+   * outcome reporting the failure exists to avoid. The panel keeps the user's text, keeps the
+   * dirty flag, and shows why.
+   *
+   * `messageType` is the failing message's `type`, used only to name the operation: the same
+   * store call backs both Save and Delete, and reporting a failed delete as "could not save the
+   * macro" describes the wrong action.
+   */
+  private reportHandlerFailure(err: unknown, messageType?: unknown): void {
+    const detail = err instanceof Error ? err.message : String(err);
+    const action = messageType === "delete" ? "delete" : "save";
+    void vscode.window.showErrorMessage(`Nexus could not ${action} the macro: ${detail}`);
+    if (this.disposed) return;
+    void this.panel.webview.postMessage({
+      type: "saveError",
+      field: "save",
+      message: `Not ${action === "delete" ? "deleted" : "saved"}: ${detail}`
+    });
+  }
+
+  /**
+   * Persist macros while suppressing the store's change-event re-render for our
+   * own write, so a self-save does not race the explicit `render()` calls in the
    * save/delete handlers (which set `selectedIndex` to the just-applied target).
    *
    * Every path that persists must go through this, including

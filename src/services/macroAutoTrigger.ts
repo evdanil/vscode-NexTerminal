@@ -5,12 +5,20 @@ import { validateRegexSafety } from "../utils/regexSafety";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
 import type { ScriptMacroFilter } from "./scripts/scriptMacroFilter";
 import { getMacros } from "../macroSettings";
+import {
+  DEFAULT_TRIGGER_COOLDOWN,
+  VALID_MACRO_TRIGGER_SCOPES,
+  compiledTriggerCooldownSeconds,
+  compiledTriggerIntervalSeconds
+} from "../storage/macroStore";
 
 const MAX_INPUT_LENGTH = 8192;
 const MAX_BUFFER_LENGTH = 2048;
-export const DEFAULT_TRIGGER_COOLDOWN = 3;
 const CONTROL_CHARS_RE = /[\x00-\x08\x0b-\x1f\x7f]/g;
-const VALID_TRIGGER_SCOPES = new Set<MacroTriggerScope>(["all-terminals", "active-session", "profile"]);
+// Both defined in storage/macroStore.ts, alongside the content keys and the import sanitizer that
+// have to agree with what this file compiles. `DEFAULT_TRIGGER_COOLDOWN` is re-exported because
+// that is where its existing consumer imports it from.
+export { DEFAULT_TRIGGER_COOLDOWN };
 
 /**
  * Stable per-macro identity for every state map in this file (pause/resume,
@@ -186,7 +194,7 @@ export class MacroAutoTrigger implements vscode.Disposable {
       // ordering requirement above is about the mutual-exclusivity semantics, not
       // index integrity.
       if (Array.isArray(macro.variables) && macro.variables.length > 0) continue;
-      if (macro.triggerScope !== undefined && !VALID_TRIGGER_SCOPES.has(macro.triggerScope)) continue;
+      if (macro.triggerScope !== undefined && !VALID_MACRO_TRIGGER_SCOPES.has(macro.triggerScope)) continue;
       const stateKey = macroStateKey(macro);
       // Ambiguous identity — two or more macros in this set resolve to `stateKey`, so
       // every per-macro map in this file (pause/resume, interval ownership, cooldown,
@@ -211,16 +219,18 @@ export class MacroAutoTrigger implements vscode.Disposable {
         }
         const regex = new RegExp(macro.triggerPattern);
         if (regex.test("")) continue;
+        // The single definition of what a stored cooldown/interval MEANS, shared with the two
+        // content keys and with `sanitizeImportedMacro()` (storage/macroStore.ts). Identical
+        // arithmetic to the inline `clampSeconds(macro.triggerCooldown, DEFAULT, 0, 300) * 1000`
+        // it replaces — sharing it is what stops the three readers drifting apart again, which is
+        // how a record ended up unable to key-match its own exported copy.
+        const cooldownSeconds = compiledTriggerCooldownSeconds(macro.triggerCooldown);
+        const intervalSeconds = compiledTriggerIntervalSeconds(macro.triggerInterval);
         const rule: CompiledTriggerRule = {
           regex,
           macroText: macro.text,
-          cooldownMs: macro.triggerCooldown != null
-            ? clampSeconds(macro.triggerCooldown, DEFAULT_TRIGGER_COOLDOWN, 0, 300) * 1000
-            : this.defaultCooldownMs,
-          intervalMs:
-            typeof macro.triggerInterval === "number" && macro.triggerInterval > 0
-              ? macro.triggerInterval * 1000
-              : undefined,
+          cooldownMs: cooldownSeconds !== undefined ? cooldownSeconds * 1000 : this.defaultCooldownMs,
+          intervalMs: intervalSeconds !== undefined ? intervalSeconds * 1000 : undefined,
           stateKey,
           name: macro.name,
           triggerScope: macro.triggerScope,

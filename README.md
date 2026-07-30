@@ -80,6 +80,8 @@ A full SSH + serial + port-forwarding client inside VS Code — without Remote-S
 
 Nexus Terminal is available from both the VS Code Marketplace and Open VSX registries.
 
+**Requires VS Code 1.105 or newer** (or an Open VSX-compatible editor built on that API level). Older hosts are not offered the extension by the Marketplace, and installing the VSIX by hand on one is refused.
+
 ### First Use Flow
 
 1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, `Nexus: Add Serial Profile`, or `Nexus: Add Local Shell Profile`.

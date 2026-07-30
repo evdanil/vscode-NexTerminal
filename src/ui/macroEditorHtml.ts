@@ -354,6 +354,11 @@ ${folderOptionsHtml}
     <div class="spacer"></div>
     <button type="button" class="btn-secondary" id="new-btn">New Blank Macro</button>
   </div>
+  <!-- Storage failures (the macro store fails closed when it cannot name a secret's vault
+       entry on disk) are not about any one field, so they get their own slot beside the Save
+       button rather than blaming Name or Text. Populated only by a host-posted
+       saveError with field "save"; see MacroEditorPanel.reportHandlerFailure(). -->
+  <div class="field-error" id="error-save" aria-live="polite"></div>
 `,
     script: `    ${baseWebviewJs()}
     (function() {
@@ -800,6 +805,10 @@ ${folderOptionsHtml}
 
       // Save
       document.getElementById("save-btn").addEventListener("click", function() {
+        // A storage failure from the previous attempt must not sit there looking like the
+        // verdict on this one. Cleared here rather than on success, because success closes
+        // the loop via "saved" and a client-side validation abort below never reaches the host.
+        document.getElementById("error-save").textContent = "";
         var name = document.getElementById("macro-name").value.trim();
         var text = document.getElementById("macro-text").value;
         var secret = document.getElementById("macro-secret").checked;
@@ -902,6 +911,9 @@ ${folderOptionsHtml}
       // Delete
       document.getElementById("delete-btn").addEventListener("click", function() {
         if (currentIndex === null) return;
+        // Same reason as the save handler: a delete also goes through the store, and a
+        // previous attempt's storage error must not be read as this one's verdict.
+        document.getElementById("error-save").textContent = "";
         vscode.postMessage({ type: "delete", index: currentIndex, id: currentId, renderGeneration: currentRenderGeneration });
       });
 
