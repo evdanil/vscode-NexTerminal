@@ -266,6 +266,38 @@ describe("MacroTreeItem", () => {
       expect(item.tooltip).not.toContain("suppressed");
     });
   });
+
+  describe("identity conflict", () => {
+    it("renders a conflicted trigger macro as a non-trigger macro with a warning icon and a remedy the user can act on", () => {
+      // MacroAutoTrigger compiles no rule for an ambiguous state key, so the zap icon,
+      // the Pause/Resume items and the "active"/"paused" tooltip would all be dead
+      // controls — the same reasoning as §6.3 for variables. Unlike §6.3 this is corrupt
+      // data rather than a design rule, so it also has to say what to do about it: a
+      // macro that quietly stops firing with no explanation is its own bug.
+      const macro = { id: "dup", name: "Password", text: "hunter2\n", secret: true, triggerPattern: "[Pp]assword:" };
+      const item = new MacroTreeItem(macro, 0, undefined, false, true);
+      expect((item.iconPath as { id: string }).id).toBe("warning");
+      expect(item.contextValue).toBe("nexus.macro.secret");
+      expect(item.tooltip).toContain("Auto-trigger suppressed: another macro has the same internal id");
+      expect(item.tooltip).toContain("Move Up / Move Down");
+      expect(item.tooltip).not.toContain("Auto-trigger:");
+    });
+
+    it("takes precedence over the variables note when both suppressions apply", () => {
+      const macro = { name: "Both", text: "run $host", triggerPattern: "foo", variables: [{ name: "host" }] };
+      const item = new MacroTreeItem(macro, 0, undefined, false, true);
+      expect(item.tooltip).toContain("another macro has the same internal id");
+      expect(item.tooltip).not.toContain("macro has variables");
+    });
+
+    it("leaves a conflicted macro that has no trigger pattern rendering exactly as before — nothing is suppressed for it", () => {
+      const macro = { id: "dup", name: "Plain", text: "echo hi" };
+      const item = new MacroTreeItem(macro, 0, undefined, undefined, true);
+      expect((item.iconPath as { id: string }).id).toBe("terminal");
+      expect(item.contextValue).toBe("nexus.macro");
+      expect(item.tooltip).not.toContain("suppressed");
+    });
+  });
 });
 
 describe("MacroTreeProvider", () => {
@@ -357,5 +389,72 @@ describe("MacroTreeProvider", () => {
   it("getTreeItem returns the element itself", () => {
     const item = new MacroTreeItem({ name: "Test", text: "test" }, 0);
     expect(provider.getTreeItem(item)).toBe(item);
+  });
+
+  // InMemoryMacroStore re-keys duplicates on save (the write-time invariant), so these
+  // need a store that surfaces persisted state verbatim — which is what
+  // VscodeMacroStore.reloadFromState() does with a duplicate that predates the invariant.
+  function useRawStore(macros: Array<Record<string, unknown>>): void {
+    const rawStore = {
+      async initialize() { /* no-op */ },
+      getAll: () => macros,
+      async save() { /* no-op */ },
+      onDidChange: () => () => { /* no-op */ },
+      async clearAll() { /* no-op */ }
+    };
+    setActiveMacroStore(rawStore as unknown as Parameters<typeof setActiveMacroStore>[0]);
+  }
+
+  it("flags exactly the macros whose state key is claimed by more than one macro", async () => {
+    // Without the conflict wired through getChildren(), the first two items would render
+    // as live zap triggers for rules MacroAutoTrigger never compiled.
+    useRawStore([
+      { id: "dup", name: "A", text: "a\n", triggerPattern: "AAA" },
+      { id: "dup", name: "B", text: "b\n", triggerPattern: "BBB" },
+      { id: "solo", name: "C", text: "c\n", triggerPattern: "CCC" }
+    ]);
+
+    const children = new MacroTreeProvider().getChildren();
+    expect((children[0].iconPath as { id: string }).id).toBe("warning");
+    expect((children[1].iconPath as { id: string }).id).toBe("warning");
+    expect(children[0].contextValue).toBe("nexus.macro");
+    expect(children[1].contextValue).toBe("nexus.macro");
+
+    expect((children[2].iconPath as { id: string }).id).toBe("zap");
+    expect(children[2].contextValue).toBe("nexus.macro.triggered");
+    expect(children[2].tooltip).not.toContain("suppressed");
+  });
+
+  it("a claim by a PATTERNLESS macro still makes the key ambiguous — measured over the whole set, not the trigger-capable subset", async () => {
+    // The fixture above gives every macro a triggerPattern, so it passes just as well
+    // against a provider that computes ambiguity over trigger macros only — while that
+    // provider disagrees with MacroAutoTrigger.reload(), which measures over all macros
+    // because `setDisabled()`/`pruneState()` accept any macro. Here the secret password
+    // trigger's only rival is a plain macro with no pattern at all: narrow the set and
+    // "id:dup" is claimed once, the conflict disappears, and the secret macro renders as
+    // a live trigger for a rule that was never compiled — the exact dead control the
+    // suppression exists to prevent.
+    useRawStore([
+      { id: "dup", name: "Notes", text: "show run\n" },
+      { id: "dup", name: "Password", text: "", secret: true, triggerPattern: "[Pp]assword:" },
+      { id: "solo", name: "C", text: "c\n", triggerPattern: "CCC" }
+    ]);
+
+    const children = new MacroTreeProvider().getChildren();
+
+    // The secret trigger twin is suppressed and says so, with the secret (not
+    // `.triggered`) contextValue so Pause/Resume never appear for it.
+    expect((children[1].iconPath as { id: string }).id).toBe("warning");
+    expect(children[1].contextValue).toBe("nexus.macro.secret");
+    expect(children[1].tooltip).toContain("same internal id");
+
+    // The patternless twin shares the ambiguous key but has no auto-trigger to suppress,
+    // so it must NOT be decorated as broken — a warning icon there would be noise.
+    expect((children[0].iconPath as { id: string }).id).toBe("terminal");
+    expect(children[0].contextValue).toBe("nexus.macro");
+    expect(children[0].tooltip).not.toContain("suppressed");
+
+    expect((children[2].iconPath as { id: string }).id).toBe("zap");
+    expect(children[2].contextValue).toBe("nexus.macro.triggered");
   });
 });

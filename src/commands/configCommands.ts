@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
-import type { MacroTriggerScope, MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import type { SecretVault } from "../services/ssh/contracts";
 import {
@@ -30,7 +30,16 @@ import {
 import { sniffImportFormat, type SniffedFormat } from "../utils/importFormatSniffer";
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateLocalShellProfile } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
-import { getMacros, saveMacros, getActiveMacroStore } from "../macroSettings";
+import {
+  VALID_MACRO_TRIGGER_SCOPES,
+  canonicalMacroBinding,
+  canonicalMacroSecret,
+  canonicalMacroTriggerTerms,
+  canonicalMacroVariableTerms,
+  compiledTriggerCooldownSeconds,
+  compiledTriggerIntervalSeconds
+} from "../storage/macroStore";
+import { getMacros, saveMacros, replaceMacros, getActiveMacroStore } from "../macroSettings";
 import { validateSettingUpdate } from "../ui/settingsValidation";
 import { SETTINGS_META } from "../ui/settingsMetadata";
 import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
@@ -664,21 +673,57 @@ async function promptDecryptPassword(): Promise<string | undefined> {
   });
 }
 
-function variableNamesKey(m: TerminalMacro): string {
-  // §10 — two macros differing only in their variable declarations must not
-  // collide on import/dedupe; append the (declaration-order) variable names.
-  return Array.isArray(m.variables) ? m.variables.map((v) => v?.name ?? "").join(",") : "";
-}
-
+/**
+ * Content key for "do I already have this macro?" — used by share import and by merge-mode
+ * backup import (the latter because replace-mode restore re-keys every incoming record, so an
+ * id in a file stops naming anything local the moment a replace has run; see the merge branch).
+ *
+ * IT MUST NAME EVERY FIELD THAT MAKES TWO RECORDS DIFFERENT MACROS, because a collision here
+ * is not a merge — it is a silent DROP. The merge branch skips an incoming record whose key it
+ * already has, so any field left out of this key is a field two legitimately distinct macros
+ * can differ in while one of them is discarded with no report. An earlier revision keyed on
+ * name/secret/text/triggerPattern/keybinding plus variable NAMES only, so two records agreeing
+ * on those but scoped `active-session` versus `profile` — or differing in cooldown, interval,
+ * start-paused, target profile, or any variable's label/default/secret/remember — collided and
+ * the second was thrown away before `assignMacroIds()` could ever re-key it.
+ *
+ * `secret` is part of the key even though the share path filters secrets out before it gets
+ * here, so the term is inert for that caller. It matters for merge, which does carry secret
+ * macros: without it a secret macro whose decrypted text happens to equal a plain macro's, with
+ * the same name and trigger, is taken for the same macro and silently not imported.
+ *
+ * `id` is deliberately NOT part of the key. Identity is the merge branch's separate id skip;
+ * this key answers the different question of whether the CONTENT is already present, which is
+ * what makes importing the same file twice idempotent after a replace-mode restore has re-keyed
+ * everything in it. See the merge branch for why both are load-bearing.
+ *
+ * BEING TOO SPECIFIC IS ALSO A BUG, and the opposite one. Every term therefore names what the
+ * RUNTIME can observe, not the field as it happens to be spelled on disk — see
+ * `canonicalMacroTriggerTerms()` and friends (storage/macroStore.ts) for the collapses and the
+ * runtime lines each one mirrors. Two records this key separates are added as two macros, each
+ * with a live auto-trigger, so a spelling difference that the trigger compiler cannot see
+ * (`triggerScope: "all-terminals"` as the macro editor writes it versus the absent scope
+ * `sanitizeImportedMacro()` leaves alone) means a `Password:` responder answering one prompt
+ * twice. That regression shipped on this branch and this is where it is closed.
+ *
+ * Built with `JSON.stringify` rather than a `|` join so that a value containing the delimiter
+ * cannot forge a different record's key — with a join, a macro named `a|b` and text `c` keys
+ * the same as one named `a` with text `b|c`.
+ */
 function keyOf(m: TerminalMacro): string {
-  return `${m.name}|${m.text}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}|${variableNamesKey(m)}`;
+  return JSON.stringify([
+    m.name ?? "",
+    canonicalMacroSecret(m),
+    m.text ?? "",
+    ...canonicalMacroTriggerTerms(m),
+    canonicalMacroBinding(m),
+    canonicalMacroVariableTerms(m)
+  ]);
 }
 
 function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
   return `${count} ${count === 1 ? singular : pluralForm}`;
 }
-
-const VALID_MACRO_TRIGGER_SCOPES = new Set<MacroTriggerScope>(["all-terminals", "active-session", "profile"]);
 
 function stripMacroTrigger(macro: TerminalMacro): void {
   delete macro.triggerPattern;
@@ -766,7 +811,11 @@ function sanitizeImportedMacroVariables(macro: TerminalMacro): boolean {
 
 function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
   const macro: TerminalMacro = { ...raw };
-  if (typeof macro.keybinding === "string" && !isValidBinding(macro.keybinding)) {
+  // A non-string keybinding is dropped for the same reason a malformed string one is: it is
+  // not a binding. `normalizeBinding()` already refuses to resolve it, so this changes nothing
+  // the app applies — it keeps an unusable value out of globalState, where it would sit in a
+  // field the editor renders as empty and no consumer can act on.
+  if (macro.keybinding !== undefined && (typeof macro.keybinding !== "string" || !isValidBinding(macro.keybinding))) {
     delete macro.keybinding;
   }
 
@@ -798,14 +847,35 @@ function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
   }
 
   if (macro.triggerPattern !== undefined) {
-    if (typeof macro.triggerCooldown !== "number" || !Number.isFinite(macro.triggerCooldown) || macro.triggerCooldown < 0 || macro.triggerCooldown > 300) {
-      delete macro.triggerCooldown;
-    }
-    if (typeof macro.triggerInterval !== "number" || !Number.isFinite(macro.triggerInterval) || macro.triggerInterval < 1 || macro.triggerInterval > 86400) {
-      delete macro.triggerInterval;
-    }
+    // NORMALIZE ONTO THE RUNTIME MEANING — never delete a value the compiler would have honoured.
+    //
+    // Deleting is not a neutral rejection. `MacroAutoTrigger.reload()` reads an absent cooldown as
+    // "follow the `defaultCooldown` SETTING" and any present one as a pinned value, so dropping a
+    // `triggerCooldown: 5000` did not remove a bad number, it changed a macro pinned at 300s (the
+    // clamp's ceiling) into one that tracks a machine-local setting. The record it was exported
+    // from still keys as 300s, so the two stopped matching and the import added a SECOND copy —
+    // with its own id, its own live `Password:` rule and, for a responder macro, a second password
+    // per prompt. The same held for a quoted `"5"` (the compiler pins the shipped default for it)
+    // and, in the opposite direction, for the old 1..86400 interval window: `reload()` asks only
+    // for `> 0`, so a legacy `0.5` runs a live 500 ms rule that this path used to erase.
+    //
+    // `compiledTrigger*Seconds()` (storage/macroStore.ts) is the same pair of functions `reload()`
+    // compiles with and both content keys are built on, so what lands here is by construction the
+    // macro the file described — clamped where the runtime clamps, preserved where it does not.
+    const cooldownSeconds = compiledTriggerCooldownSeconds(macro.triggerCooldown);
+    if (cooldownSeconds === undefined) delete macro.triggerCooldown;
+    else macro.triggerCooldown = cooldownSeconds;
+
+    const intervalSeconds = compiledTriggerIntervalSeconds(macro.triggerInterval);
+    if (intervalSeconds === undefined) delete macro.triggerInterval;
+    else macro.triggerInterval = intervalSeconds;
+
+    // `reload()` tests this for TRUTHINESS (`if (macro.triggerInitiallyDisabled)`), so a
+    // hand-edited `"yes"` means "start paused" and deleting it silently started the imported copy
+    // live — one paused macro and one live one where the store held a single paused record.
     if (typeof macro.triggerInitiallyDisabled !== "boolean") {
-      delete macro.triggerInitiallyDisabled;
+      if (macro.triggerInitiallyDisabled) macro.triggerInitiallyDisabled = true;
+      else delete macro.triggerInitiallyDisabled;
     }
   }
 
@@ -1361,13 +1431,59 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     if (incomingResult !== undefined) {
       const { macros: incomingMacros, unresolvedCount } = incomingResult;
       if (mode === "replace") {
-        await saveMacros(incomingMacros);
+        // `replaceMacros`, not `saveMacros`: this is the one macro write in the extension whose
+        // input is a wholesale external list, and the store's two entry points exist for
+        // exactly that distinction (see `MacroStore.save()` / `MacroStore.replaceAll()`). The
+        // ids in a backup file are strings that were identities on some other machine; any
+        // agreement with a local macro's id is a collision. Handing them to `saveMacros()` let
+        // an imported record be treated as the local record filed under that id — and with the
+        // keyring transiently unavailable, an imported macro whose own secret failed to decrypt
+        // inherited the local macro's stored password.
+        await replaceMacros(incomingMacros);
       } else {
+        // Merge keeps the file's ids, and skips on TWO independent keys. Both are load-bearing
+        // and they close different holes.
+        //
+        // 1. THE ID SKIP is what lets these records go to `saveMacros()` at all: every
+        //    incoming record whose id the store already holds is DROPPED, so no id reaching
+        //    the store from this branch can name anything the store knows, which is exactly
+        //    `MacroStore.save()`'s precondition. It has to stay here rather than become a
+        //    store concern for that reason. It also means a macro the user edited locally is
+        //    not re-added from the backup as a second copy.
+        //
+        // 2. THE CONTENT SKIP is what makes importing the same file twice idempotent. The id
+        //    skip alone is NOT, and that is not hypothetical: replace-mode restore assigns a
+        //    fresh id to every incoming record (`MacroStore.replaceAll()` — an id in a file is
+        //    an identity from another machine, and treating it as a local one handed imported
+        //    macros local passwords). So after restoring a backup in replace mode, none of the
+        //    ids in that file name anything any more, and the ordinary follow-up — merging the
+        //    same file to pick up something added since — matched nothing and added a SECOND
+        //    copy of every macro in it. Both copies carry distinct ids, so the duplicate-id
+        //    fail-safe does not suppress either: both compile auto-trigger rules and both fire
+        //    on one match, and a secret `Password:` responder sends the password twice per
+        //    prompt. `keyOf()` is the same content key the share-import path deduplicates on,
+        //    and it names EVERY field that makes two records different macros — a collision
+        //    here is a silent drop, not a merge, so anything left out of it is a legitimate
+        //    macro this loop can throw away with no report. See `keyOf()`.
+        //
+        // Only the CONTENT key is recorded as we go, matching the share-import path: two
+        // entries in one file that agree on content are the same macro twice and the second is
+        // dropped. With the key covering every content field, "agree on content" now means the
+        // two records are indistinguishable in everything except their ids — which is the only
+        // reading under which dropping one is right. The id set is deliberately not extended,
+        // so two records in one file that share an id but differ in ANY content field are
+        // treated as the two different macros they are — both land, and the store re-keys the
+        // second (`assignMacroIds()`). Neither of them can reach the pin predicate, which only
+        // fires for ids the store already holds.
         const existing = getMacros();
         const existingIds = new Set(existing.map((m) => m.id).filter(Boolean) as string[]);
+        const existingKeys = new Set(existing.map(keyOf));
         const merged = [...existing];
         for (const m of incomingMacros) {
           if (m.id && existingIds.has(m.id)) continue;
+          const key = keyOf(m);
+          if (existingKeys.has(key)) continue;
+          existingKeys.add(key);
           merged.push({ ...m, id: m.id ?? randomUUID() });
         }
         await saveMacros(merged);

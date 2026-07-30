@@ -374,6 +374,34 @@ reevaluation arms it immediately.
 If **Start auto-trigger paused** is enabled, the macro starts paused after reload
 or startup until you resume it.
 
+Pause/resume state, interval ownership, and cooldown timers all follow the macro
+itself, not its position in the list. Reordering macros with **Move Up** /
+**Move Down**, or deleting a different macro, never moves a pause (or an active
+trigger) onto the wrong macro.
+
+### Duplicate macro identities
+
+Macros are identified internally by a unique id. Two macros can end up sharing
+one — from a hand-edited stored macro list, or from a Nexus version that predates
+the rule. Every path that writes macros today assigns fresh ids to duplicates as
+it writes, so a backup restore and a legacy `nexus.terminal.macros` absorption
+both arrive already de-duplicated; what survives is a conflict that was written
+to storage before the rule existed. Nexus cannot tell such macros apart, so it
+will not guess: while the conflict exists, **neither macro auto-triggers**. Each
+one that has an auto-trigger pattern is shown in the Macros view with a warning
+icon and a tooltip saying so (a macro with no pattern has no trigger to suppress,
+so it keeps its normal icon). Nexus does not rewrite the ids on its own, at
+startup or at any other time, because for a secret macro that would mean deciding
+which macro owns the stored password. The rewrite happens only as part of a
+change you make.
+
+To fix it, use **Move Up** or **Move Down** on any macro. That re-saves the list,
+which assigns fresh ids, and both macros go back to normal. The macro editor will
+refuse to save or delete a flagged macro, because it identifies its target by id
+and cannot tell the two apart — it would otherwise overwrite the wrong one.
+
+Running a macro manually, and its keyboard shortcut, are unaffected.
+
 ## Regex Examples
 
 Use patterns that describe the prompt you actually expect. Overly broad patterns

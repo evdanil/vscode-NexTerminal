@@ -2,15 +2,100 @@ import * as vscode from "vscode";
 import { createAnsiRegex } from "../utils/ansi";
 import { clamp } from "../utils/helpers";
 import { validateRegexSafety } from "../utils/regexSafety";
-import type { MacroTriggerScope } from "../models/terminalMacro";
+import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
 import type { ScriptMacroFilter } from "./scripts/scriptMacroFilter";
 import { getMacros } from "../macroSettings";
+import {
+  DEFAULT_TRIGGER_COOLDOWN,
+  VALID_MACRO_TRIGGER_SCOPES,
+  compiledTriggerCooldownSeconds,
+  compiledTriggerIntervalSeconds
+} from "../storage/macroStore";
 
 const MAX_INPUT_LENGTH = 8192;
 const MAX_BUFFER_LENGTH = 2048;
-export const DEFAULT_TRIGGER_COOLDOWN = 3;
 const CONTROL_CHARS_RE = /[\x00-\x08\x0b-\x1f\x7f]/g;
-const VALID_TRIGGER_SCOPES = new Set<MacroTriggerScope>(["all-terminals", "active-session", "profile"]);
+// Both defined in storage/macroStore.ts, alongside the content keys and the import sanitizer that
+// have to agree with what this file compiles. `DEFAULT_TRIGGER_COOLDOWN` is re-exported because
+// that is where its existing consumer imports it from.
+export { DEFAULT_TRIGGER_COOLDOWN };
+
+/**
+ * Stable per-macro identity for every state map in this file (pause/resume,
+ * interval ownership, cooldown/scheduling timers). Keying by array position
+ * instead of this would attach that state to a *slot*: `nexus.macro.moveUp` /
+ * `moveDown` (macroCommands.ts) swap two array elements in place, and
+ * `nexus.macro.remove` splices — either one silently reattaches a
+ * paused/armed state to whatever macro now occupies the old slot, instead of
+ * following the macro it actually belonged to. That is the bug this key
+ * exists to close: a user-paused secret-password trigger could go live after
+ * an unrelated reorder, while an unrelated active trigger silently paused.
+ *
+ * Mirrors `macroIdentityKey()` in commands/macroVariablePrompt.ts. `id` is
+ * optional on `TerminalMacro` (legacy imports; `InMemoryMacroStore` and tests
+ * may omit it) even though `VscodeMacroStore` guarantees one in production, so
+ * the name+text composite is the fallback — it is stable across reordering,
+ * which is the property that matters here (an index fallback would
+ * reintroduce the exact bug). The separator below MUST be the NUL escape
+ * sequence (four hex digits after `u`), never an actual NUL byte typed into
+ * this source file, or the file becomes binary to git.
+ *
+ * Guards with `typeof macro.id === "string" && macro.id.length > 0` rather than a
+ * bare truthy/`.length` check on `macro.id`: a corrupt import can hand this a
+ * non-string `id` (e.g. `{length: 1}`), which is truthy and has a positive
+ * `.length` yet is not the string MacroStore's uniqueness invariant actually
+ * guarantees. Two such distinct objects would both stringify to the same
+ * `id:[object Object]` key here despite never having been deduped as equal
+ * anywhere upstream — exactly the collision this key exists to prevent.
+ *
+ * This key is NOT guaranteed unique across an arbitrary macro set. `MacroStore.save()`
+ * enforces uniqueness on the way in, but a set already sitting in globalState from
+ * before that invariant existed (or one that never went through a store at all) can
+ * hold two macros that resolve to the same key: a shared `id`, or — via the fallback
+ * below — two id-less macros with identical name AND text. When that happens the key
+ * is ambiguous and no per-macro state may be recorded or acted upon under it. See
+ * `findAmbiguousMacroStateKeys()`.
+ */
+export function macroStateKey(macro: TerminalMacro): string {
+  return typeof macro.id === "string" && macro.id.length > 0 ? `id:${macro.id}` : `anon:${macro.name}\u0000${macro.text}`;
+}
+
+/**
+ * Returns every `macroStateKey()` that MORE THAN ONE macro in `macros` resolves to.
+ *
+ * Why ambiguity is resolved here rather than repaired at the storage layer: once two
+ * macros share an `id`, "which of them owns the single vault entry at
+ * `macroSecretKey(id)`" is genuinely unanswerable — pre-invariant duplicate secret
+ * saves were last-write-wins, so the stored value may belong to either. Every award
+ * heuristic tried in review either handed one macro another macro's password, deleted
+ * the only copy of a legitimate secret, or re-derived ownership from array position —
+ * which is exactly the positional keying `macroStateKey()` exists to eliminate. So the
+ * store no longer guesses: `VscodeMacroStore.reloadFromState()` preserves what is on
+ * disk verbatim, and ambiguity is handled HERE, in the only fail-safe direction
+ * available. An ambiguous macro compiles no rule, owns no interval and records no
+ * pause state — it cannot fire at all, rather than possibly firing the wrong thing.
+ *
+ * Measured across the WHOLE macro set, not just the trigger-capable subset: every
+ * macro claims its key regardless of whether it compiles a rule (`setDisabled()` /
+ * `isDisabled()` accept any macro, and `pruneState()` derives key liveness from all of
+ * them), so a non-trigger macro sharing a trigger macro's id makes that key just as
+ * ambiguous as two trigger macros would.
+ *
+ * The remedy is a WRITE, never a load-time rewrite: `MacroStore.save()` re-keys
+ * duplicates, so opening and saving either colliding macro clears the conflict
+ * permanently. `MacroTreeProvider` renders the suppressed state so the macro is never
+ * silently broken.
+ */
+export function findAmbiguousMacroStateKeys(macros: readonly TerminalMacro[]): Set<string> {
+  const seen = new Set<string>();
+  const ambiguous = new Set<string>();
+  for (const macro of macros) {
+    const key = macroStateKey(macro);
+    if (seen.has(key)) ambiguous.add(key);
+    else seen.add(key);
+  }
+  return ambiguous;
+}
 
 export interface PtyOutputObserver {
   onOutput(text: string): void;
@@ -31,7 +116,7 @@ interface CompiledTriggerRule {
   macroText: string;
   cooldownMs: number;
   intervalMs?: number;
-  macroIndex: number;
+  stateKey: string;
   name: string;
   triggerScope?: MacroTriggerScope;
   triggerProfileId?: string;
@@ -39,22 +124,23 @@ interface CompiledTriggerRule {
 
 interface ObserverState {
   evaluate(): void;
-  prune(activeRules: ReadonlyMap<number, CompiledTriggerRule>): void;
-  clearIntervalState(macroIndex: number): boolean;
+  prune(activeRules: ReadonlyMap<string, CompiledTriggerRule>): void;
+  clearIntervalState(stateKey: string): boolean;
   dispose(): void;
 }
 
 export class MacroAutoTrigger implements vscode.Disposable {
   private rules: CompiledTriggerRule[] = [];
-  private rulesByIndex = new Map<number, CompiledTriggerRule>();
+  private rulesByKey = new Map<string, CompiledTriggerRule>();
   private enabled = true;
   private defaultCooldownMs = DEFAULT_TRIGGER_COOLDOWN * 1000;
   private maxBufferLength = MAX_BUFFER_LENGTH;
-  private readonly defaultDisabledIndexes = new Set<number>();
-  private readonly disabledIndexes = new Set<number>();
-  private readonly enabledIndexes = new Set<number>();
+  private readonly defaultDisabledKeys = new Set<string>();
+  private ambiguousKeys = new Set<string>();
+  private readonly disabledKeys = new Set<string>();
+  private readonly enabledKeys = new Set<string>();
   private readonly observers = new Set<ObserverState>();
-  private readonly intervalOwners = new Map<number, ObserverState>();
+  private readonly intervalOwners = new Map<string, ObserverState>();
   private readonly observersBySession = new Map<string, ObserverState>();
   private readonly filterStacks = new Map<string, ScriptMacroFilter[]>();
   private readonly onDidChangeEmitter = new vscode.EventEmitter<void>();
@@ -67,8 +153,8 @@ export class MacroAutoTrigger implements vscode.Disposable {
   }
 
   public reload(): void {
-    const previousIntervalIndexes = new Set(
-      this.rules.filter((rule) => rule.intervalMs !== undefined).map((rule) => rule.macroIndex)
+    const previousIntervalKeys = new Set(
+      this.rules.filter((rule) => rule.intervalMs !== undefined).map((rule) => rule.stateKey)
     );
     const macros = getMacros();
     const macrosConfig = vscode.workspace.getConfiguration("nexus.terminal.macros");
@@ -87,21 +173,45 @@ export class MacroAutoTrigger implements vscode.Disposable {
     );
 
     this.rules = [];
-    this.rulesByIndex = new Map();
-    this.defaultDisabledIndexes.clear();
-    const activeRules = new Map<number, CompiledTriggerRule>();
-    for (const [macroIndex, macro] of macros.entries()) {
+    this.rulesByKey = new Map();
+    this.defaultDisabledKeys.clear();
+    // Computed over the FULL macro set before anything is compiled — see
+    // `findAmbiguousMacroStateKeys()`. Recomputed on every reload rather than cached
+    // incrementally: `macros` is the only source of truth for who claims which key.
+    this.ambiguousKeys = findAmbiguousMacroStateKeys(macros);
+    const activeRules = new Map<string, CompiledTriggerRule>();
+    for (const macro of macros) {
       if (!macro.triggerPattern) continue;
       // §6.1 — variables and auto-trigger are mutually exclusive. Untrusted shape
       // guard per §4.2 (Array.isArray + length, not `?.length`); MUST be an in-loop
-      // `continue`, never a pre-filter of `macros` — macroIndex is an array
-      // position that keys defaultDisabledIndexes/disabledIndexes/enabledIndexes/
-      // intervalOwners/pruneState()/the tree's setDisabled(); pre-filtering shifts
-      // every index after the first skipped macro and corrupts that keying.
+      // `continue` at this exact position — before `defaultDisabledKeys` is
+      // populated below — so a macro that declares both `variables` and
+      // `triggerInitiallyDisabled` never gets a default-disabled entry recorded
+      // for a rule that will never compile (it should behave as if it is not a
+      // trigger macro at all). State here is keyed by `macroStateKey(macro)` — a
+      // stable per-macro identity, not array position — so pre-filtering `macros`
+      // before this loop would no longer corrupt keying the way it used to; the
+      // ordering requirement above is about the mutual-exclusivity semantics, not
+      // index integrity.
       if (Array.isArray(macro.variables) && macro.variables.length > 0) continue;
-      if (macro.triggerScope !== undefined && !VALID_TRIGGER_SCOPES.has(macro.triggerScope)) continue;
+      if (macro.triggerScope !== undefined && !VALID_MACRO_TRIGGER_SCOPES.has(macro.triggerScope)) continue;
+      const stateKey = macroStateKey(macro);
+      // Ambiguous identity — two or more macros in this set resolve to `stateKey`, so
+      // every per-macro map in this file (pause/resume, interval ownership, cooldown,
+      // and the `rulesByKey` lookup that gates script macro filters by NAME) would
+      // silently conflate them. Compile nothing: an ambiguous macro must be unable to
+      // fire rather than able to fire as, or instead of, its twin.
+      //
+      // Position matters, exactly as for the §6.1 skip above it: this `continue` must
+      // run BEFORE `defaultDisabledKeys` is populated, so a macro that is both
+      // ambiguous and `triggerInitiallyDisabled` never records a default-disabled entry
+      // for a rule that will never compile. Nothing may be written under an ambiguous
+      // key — `setDisabled()` refuses it and `pruneState()` evicts it — because
+      // whichever macro keeps the key when the collision is later resolved by a save
+      // would otherwise inherit a toggle it never earned.
+      if (this.ambiguousKeys.has(stateKey)) continue;
       if (macro.triggerInitiallyDisabled) {
-        this.defaultDisabledIndexes.add(macroIndex);
+        this.defaultDisabledKeys.add(stateKey);
       }
       try {
         if (!validateRegexSafety(macro.triggerPattern).ok) {
@@ -109,50 +219,63 @@ export class MacroAutoTrigger implements vscode.Disposable {
         }
         const regex = new RegExp(macro.triggerPattern);
         if (regex.test("")) continue;
+        // The single definition of what a stored cooldown/interval MEANS, shared with the two
+        // content keys and with `sanitizeImportedMacro()` (storage/macroStore.ts). Identical
+        // arithmetic to the inline `clampSeconds(macro.triggerCooldown, DEFAULT, 0, 300) * 1000`
+        // it replaces — sharing it is what stops the three readers drifting apart again, which is
+        // how a record ended up unable to key-match its own exported copy.
+        const cooldownSeconds = compiledTriggerCooldownSeconds(macro.triggerCooldown);
+        const intervalSeconds = compiledTriggerIntervalSeconds(macro.triggerInterval);
         const rule: CompiledTriggerRule = {
           regex,
           macroText: macro.text,
-          cooldownMs: macro.triggerCooldown != null
-            ? clampSeconds(macro.triggerCooldown, DEFAULT_TRIGGER_COOLDOWN, 0, 300) * 1000
-            : this.defaultCooldownMs,
-          intervalMs:
-            typeof macro.triggerInterval === "number" && macro.triggerInterval > 0
-              ? macro.triggerInterval * 1000
-              : undefined,
-          macroIndex,
+          cooldownMs: cooldownSeconds !== undefined ? cooldownSeconds * 1000 : this.defaultCooldownMs,
+          intervalMs: intervalSeconds !== undefined ? intervalSeconds * 1000 : undefined,
+          stateKey,
           name: macro.name,
           triggerScope: macro.triggerScope,
           triggerProfileId: macro.triggerProfileId
         };
         this.rules.push(rule);
-        this.rulesByIndex.set(macroIndex, rule);
-        activeRules.set(macroIndex, rule);
+        this.rulesByKey.set(stateKey, rule);
+        activeRules.set(stateKey, rule);
       } catch {
         // Invalid regex — skip silently
       }
     }
-    this.pruneState(macros.length);
+    this.pruneState(macros);
     this.pruneObservers(activeRules);
-    for (const macroIndex of previousIntervalIndexes) {
-      const nextRule = activeRules.get(macroIndex);
-      if (!nextRule || nextRule.intervalMs === undefined || this.isDisabled(macroIndex)) {
-        this.clearIntervalState(macroIndex);
+    for (const stateKey of previousIntervalKeys) {
+      const nextRule = activeRules.get(stateKey);
+      if (!nextRule || nextRule.intervalMs === undefined || this.isDisabledByKey(stateKey)) {
+        this.clearIntervalState(stateKey);
       }
     }
     for (const rule of this.rules) {
-      if (rule.intervalMs !== undefined && this.isDisabled(rule.macroIndex)) {
-        this.clearIntervalState(rule.macroIndex);
+      if (rule.intervalMs !== undefined && this.isDisabledByKey(rule.stateKey)) {
+        this.clearIntervalState(rule.stateKey);
       }
     }
     this.reevaluateObservers();
   }
 
-  public setDisabled(macroIndex: number, disabled: boolean): void {
-    const disabledChanged = this.updateDisabledState(macroIndex, disabled);
-    const intervalRule = this.rulesByIndex.get(macroIndex);
+  public setDisabled(macro: TerminalMacro, disabled: boolean): void {
+    const stateKey = macroStateKey(macro);
+    // Refuse to record anything under an ambiguous key. The macro compiles no rule and
+    // cannot fire either way, so nothing is lost — but a toggle stored here would be
+    // silently inherited by whichever claimant keeps the key once a later `save()`
+    // re-keys the duplicates, handing one macro a pause/resume decision the user made
+    // while looking at another. `pruneState()` evicts keys that BECOME ambiguous after
+    // being written; this closes the other direction. Unreachable from the UI (the tree
+    // renders an ambiguous macro with a plain contextValue, so the Pause/Resume items
+    // never appear, and both commands are hidden from the palette) — this is the guard
+    // for every other caller.
+    if (this.ambiguousKeys.has(stateKey)) return;
+    const disabledChanged = this.updateDisabledState(stateKey, disabled);
+    const intervalRule = this.rulesByKey.get(stateKey);
     const intervalChanged =
       disabled && intervalRule?.intervalMs !== undefined
-        ? this.clearIntervalState(macroIndex)
+        ? this.clearIntervalState(stateKey)
         : false;
 
     if (!disabled) {
@@ -163,11 +286,15 @@ export class MacroAutoTrigger implements vscode.Disposable {
     }
   }
 
-  public isDisabled(macroIndex: number): boolean {
-    if (this.defaultDisabledIndexes.has(macroIndex)) {
-      return !this.enabledIndexes.has(macroIndex);
+  public isDisabled(macro: TerminalMacro): boolean {
+    return this.isDisabledByKey(macroStateKey(macro));
+  }
+
+  private isDisabledByKey(stateKey: string): boolean {
+    if (this.defaultDisabledKeys.has(stateKey)) {
+      return !this.enabledKeys.has(stateKey);
     }
-    return this.disabledIndexes.has(macroIndex);
+    return this.disabledKeys.has(stateKey);
   }
 
   public pushFilter(sessionId: string, filter: ScriptMacroFilter): vscode.Disposable {
@@ -184,12 +311,12 @@ export class MacroAutoTrigger implements vscode.Disposable {
     });
   }
 
-  private isMacroAllowedForSession(sessionId: string | undefined, macroIndex: number): boolean {
+  private isMacroAllowedForSession(sessionId: string | undefined, stateKey: string): boolean {
     if (!sessionId) return true;
     const stack = this.filterStacks.get(sessionId);
     if (!stack || stack.length === 0) return true;
     const filter = stack[stack.length - 1];
-    const macroName = this.rulesByIndex.get(macroIndex)?.name;
+    const macroName = this.rulesByKey.get(stateKey)?.name;
     if (macroName === undefined) return true;
     return filter.isAllowed(macroName);
   }
@@ -212,26 +339,26 @@ export class MacroAutoTrigger implements vscode.Disposable {
   ): PtyOutputObserver {
     let boundSessionId = sessionId;
     let buffer = "";
-    const lastFired = new Map<number, number>();
-    const readyMatches = new Set<number>();
-    const scheduledTimers = new Map<number, ReturnType<typeof setTimeout>>();
-    const ownedIntervals = new Set<number>();
+    const lastFired = new Map<string, number>();
+    const readyMatches = new Set<string>();
+    const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    const ownedIntervals = new Set<string>();
     let disposed = false;
     const ansiRe = createAnsiRegex();
 
-    const clearScheduledTimer = (macroIndex: number): boolean => {
-      const timer = scheduledTimers.get(macroIndex);
+    const clearScheduledTimer = (stateKey: string): boolean => {
+      const timer = scheduledTimers.get(stateKey);
       if (timer === undefined) {
         return false;
       }
       clearTimeout(timer);
-      scheduledTimers.delete(macroIndex);
+      scheduledTimers.delete(stateKey);
       return true;
     };
 
-    const clearReadyMatch = (macroIndex: number): boolean => {
-      const removed = readyMatches.delete(macroIndex);
-      return clearScheduledTimer(macroIndex) || removed;
+    const clearReadyMatch = (stateKey: string): boolean => {
+      const removed = readyMatches.delete(stateKey);
+      return clearScheduledTimer(stateKey) || removed;
     };
 
     const clearAllTimers = (): void => {
@@ -241,15 +368,15 @@ export class MacroAutoTrigger implements vscode.Disposable {
       scheduledTimers.clear();
     };
 
-    const clearIntervalState = (macroIndex: number): boolean => {
-      const clearedOwnership = ownedIntervals.delete(macroIndex);
-      const clearedLastFired = lastFired.delete(macroIndex);
-      const clearedReady = clearReadyMatch(macroIndex);
+    const clearIntervalState = (stateKey: string): boolean => {
+      const clearedOwnership = ownedIntervals.delete(stateKey);
+      const clearedLastFired = lastFired.delete(stateKey);
+      const clearedReady = clearReadyMatch(stateKey);
       return clearedOwnership || clearedLastFired || clearedReady;
     };
 
     const getRemainingDelay = (rule: CompiledTriggerRule, now: number): number => {
-      const lastTime = lastFired.get(rule.macroIndex);
+      const lastTime = lastFired.get(rule.stateKey);
       if (lastTime === undefined) {
         return 0;
       }
@@ -260,11 +387,11 @@ export class MacroAutoTrigger implements vscode.Disposable {
     };
 
     const scheduleEvaluation = (rule: CompiledTriggerRule, delayMs: number): void => {
-      clearScheduledTimer(rule.macroIndex);
+      clearScheduledTimer(rule.stateKey);
       scheduledTimers.set(
-        rule.macroIndex,
+        rule.stateKey,
         setTimeout(() => {
-          scheduledTimers.delete(rule.macroIndex);
+          scheduledTimers.delete(rule.stateKey);
           if (!disposed) {
             evaluate();
           }
@@ -273,8 +400,8 @@ export class MacroAutoTrigger implements vscode.Disposable {
     };
 
     const fireRule = (rule: CompiledTriggerRule, now: number): void => {
-      lastFired.set(rule.macroIndex, now);
-      clearReadyMatch(rule.macroIndex);
+      lastFired.set(rule.stateKey, now);
+      clearReadyMatch(rule.stateKey);
 
       if (rule.intervalMs !== undefined) {
         buffer = "";
@@ -287,7 +414,7 @@ export class MacroAutoTrigger implements vscode.Disposable {
         }
         if (
           rule.intervalMs !== undefined &&
-          (this.isDisabled(rule.macroIndex) || this.intervalOwners.get(rule.macroIndex) !== observerState)
+          (this.isDisabledByKey(rule.stateKey) || this.intervalOwners.get(rule.stateKey) !== observerState)
         ) {
           return;
         }
@@ -309,21 +436,21 @@ export class MacroAutoTrigger implements vscode.Disposable {
         if (rule.triggerScope === "profile" && (!rule.triggerProfileId || rule.triggerProfileId !== profileId)) {
           continue;
         }
-        if (!this.isMacroAllowedForSession(boundSessionId, rule.macroIndex)) {
+        if (!this.isMacroAllowedForSession(boundSessionId, rule.stateKey)) {
           continue;
         }
-        if (this.isDisabled(rule.macroIndex)) {
+        if (this.isDisabledByKey(rule.stateKey)) {
           if (rule.intervalMs !== undefined) {
-            clearIntervalState(rule.macroIndex);
+            clearIntervalState(rule.stateKey);
           }
           continue;
         }
         if (rule.intervalMs !== undefined) {
-          const owner = this.intervalOwners.get(rule.macroIndex);
+          const owner = this.intervalOwners.get(rule.stateKey);
           if (owner && owner !== observerState) {
             continue;
           }
-          if (readyMatches.has(rule.macroIndex)) {
+          if (readyMatches.has(rule.stateKey)) {
           // Interval cycle already running on this observer — continue it
           // regardless of focus.
           const remaining = getRemainingDelay(rule, now);
@@ -341,11 +468,11 @@ export class MacroAutoTrigger implements vscode.Disposable {
         if (!match) continue;
 
         if (rule.intervalMs !== undefined) {
-          const owner = this.intervalOwners.get(rule.macroIndex);
+          const owner = this.intervalOwners.get(rule.stateKey);
           if (!owner) {
             if (!active) continue;
-            this.intervalOwners.set(rule.macroIndex, observerState);
-            ownedIntervals.add(rule.macroIndex);
+            this.intervalOwners.set(rule.stateKey, observerState);
+            ownedIntervals.add(rule.stateKey);
           }
         }
 
@@ -354,7 +481,7 @@ export class MacroAutoTrigger implements vscode.Disposable {
         buffer = buffer.slice(match.index + match[0].length);
 
         if (rule.intervalMs !== undefined) {
-          readyMatches.add(rule.macroIndex);
+          readyMatches.add(rule.stateKey);
           const remaining = getRemainingDelay(rule, now);
           if (remaining > 0) {
             scheduleEvaluation(rule, remaining);
@@ -376,19 +503,19 @@ export class MacroAutoTrigger implements vscode.Disposable {
     const observerState: ObserverState = {
       evaluate,
       prune: (activeRules) => {
-        for (const macroIndex of [...lastFired.keys()]) {
-          if (!activeRules.has(macroIndex)) {
-            lastFired.delete(macroIndex);
+        for (const stateKey of [...lastFired.keys()]) {
+          if (!activeRules.has(stateKey)) {
+            lastFired.delete(stateKey);
           }
         }
-        for (const macroIndex of [...readyMatches]) {
-          if (activeRules.get(macroIndex)?.intervalMs === undefined) {
-            clearIntervalState(macroIndex);
+        for (const stateKey of [...readyMatches]) {
+          if (activeRules.get(stateKey)?.intervalMs === undefined) {
+            clearIntervalState(stateKey);
           }
         }
-        for (const macroIndex of [...ownedIntervals]) {
-          if (activeRules.get(macroIndex)?.intervalMs === undefined) {
-            clearIntervalState(macroIndex);
+        for (const stateKey of [...ownedIntervals]) {
+          if (activeRules.get(stateKey)?.intervalMs === undefined) {
+            clearIntervalState(stateKey);
           }
         }
         clearAllTimers();
@@ -449,20 +576,38 @@ export class MacroAutoTrigger implements vscode.Disposable {
     return observer;
   }
 
-  private pruneState(macroCount: number): void {
-    for (const index of [...this.disabledIndexes]) {
-      if (index >= macroCount || this.defaultDisabledIndexes.has(index)) {
-        this.disabledIndexes.delete(index);
+  /**
+   * Prunes pause/resume state keyed to macros that no longer exist in the
+   * current macro set. Contract: a key survives only if EXACTLY ONE macro
+   * currently in `macros` resolves to it via `macroStateKey()` — position is
+   * irrelevant. A key claimed by two or more macros is evicted as aggressively
+   * as one claimed by none: it compiled no rule (see `reload()`), and leaving a
+   * pause/resume decision parked under it would hand that decision to whichever
+   * claimant keeps the key when a later `save()` re-keys the duplicates — the
+   * macro the user was NOT looking at when they set it. `disabledKeys`
+   * additionally drops any key that has become
+   * default-disabled (it is now tracked via `enabledKeys` instead), and
+   * `enabledKeys` drops any key that is no longer default-disabled (now
+   * tracked via `disabledKeys` instead) — mirroring the mutual exclusivity
+   * `updateDisabledState()`/`isDisabledByKey()` rely on.
+   */
+  private pruneState(macros: readonly TerminalMacro[]): void {
+    const currentKeys = new Set(
+      macros.map((macro) => macroStateKey(macro)).filter((key) => !this.ambiguousKeys.has(key))
+    );
+    for (const key of [...this.disabledKeys]) {
+      if (!currentKeys.has(key) || this.defaultDisabledKeys.has(key)) {
+        this.disabledKeys.delete(key);
       }
     }
-    for (const index of [...this.enabledIndexes]) {
-      if (index >= macroCount || !this.defaultDisabledIndexes.has(index)) {
-        this.enabledIndexes.delete(index);
+    for (const key of [...this.enabledKeys]) {
+      if (!currentKeys.has(key) || !this.defaultDisabledKeys.has(key)) {
+        this.enabledKeys.delete(key);
       }
     }
   }
 
-  private pruneObservers(activeRules: ReadonlyMap<number, CompiledTriggerRule>): void {
+  private pruneObservers(activeRules: ReadonlyMap<string, CompiledTriggerRule>): void {
     for (const observer of this.observers) {
       observer.prune(activeRules);
     }
@@ -493,40 +638,40 @@ export class MacroAutoTrigger implements vscode.Disposable {
     }
   }
 
-  private updateDisabledState(macroIndex: number, disabled: boolean): boolean {
-    const wasDisabled = this.isDisabled(macroIndex);
-    if (this.defaultDisabledIndexes.has(macroIndex)) {
+  private updateDisabledState(stateKey: string, disabled: boolean): boolean {
+    const wasDisabled = this.isDisabledByKey(stateKey);
+    if (this.defaultDisabledKeys.has(stateKey)) {
       if (disabled) {
-        this.enabledIndexes.delete(macroIndex);
+        this.enabledKeys.delete(stateKey);
       } else {
-        this.enabledIndexes.add(macroIndex);
+        this.enabledKeys.add(stateKey);
       }
     } else {
       if (disabled) {
-        this.disabledIndexes.add(macroIndex);
+        this.disabledKeys.add(stateKey);
       } else {
-        this.disabledIndexes.delete(macroIndex);
+        this.disabledKeys.delete(stateKey);
       }
     }
-    return wasDisabled !== this.isDisabled(macroIndex);
+    return wasDisabled !== this.isDisabledByKey(stateKey);
   }
 
-  private clearIntervalState(macroIndex: number): boolean {
-    let changed = this.intervalOwners.delete(macroIndex);
+  private clearIntervalState(stateKey: string): boolean {
+    let changed = this.intervalOwners.delete(stateKey);
     for (const observer of this.observers) {
-      changed = observer.clearIntervalState(macroIndex) || changed;
+      changed = observer.clearIntervalState(stateKey) || changed;
     }
     return changed;
   }
 
   private pauseOwnedIntervals(owner: ObserverState): void {
     let changed = false;
-    for (const [macroIndex, currentOwner] of [...this.intervalOwners.entries()]) {
+    for (const [stateKey, currentOwner] of [...this.intervalOwners.entries()]) {
       if (currentOwner !== owner) {
         continue;
       }
-      changed = this.updateDisabledState(macroIndex, true) || changed;
-      changed = this.clearIntervalState(macroIndex) || changed;
+      changed = this.updateDisabledState(stateKey, true) || changed;
+      changed = this.clearIntervalState(stateKey) || changed;
     }
     if (changed) {
       this.emitDidChange();

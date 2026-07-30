@@ -34,6 +34,16 @@ export async function saveMacros(macros: TerminalMacro[], _resource?: vscode.Uri
   await getActiveMacroStore().save(macros);
 }
 
+/**
+ * Wholesale replacement from an EXTERNAL source (replace-mode backup restore). Distinct from
+ * `saveMacros()` because the store treats the two differently — see `MacroStore.replaceAll()`.
+ * Anything derived from `getMacros()` belongs in `saveMacros()`; anything parsed out of a file
+ * belongs here.
+ */
+export async function replaceMacros(macros: TerminalMacro[], _resource?: vscode.Uri): Promise<void> {
+  await getActiveMacroStore().replaceAll(macros);
+}
+
 export async function confirmBindingWarnings(binding: string): Promise<boolean> {
   const normalized = normalizeBinding(binding);
   if (!normalized) {

@@ -1,8 +1,8 @@
 {
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
-  "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, and tunnels in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.73",
+  "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, 2FA, legacy KEX for old Cisco gear.",
+  "version": "2.8.74",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -22,7 +22,7 @@
     "url": "https://buymeacoffee.com/evgeny_danilchenko"
   },
   "engines": {
-    "vscode": "^1.95.0"
+    "vscode": "^1.105.0"
   },
   "categories": [
     "Other"
@@ -50,14 +50,14 @@
     "vscodium",
     "2fa",
     "socks5",
-    "keyboard interactive",
-    "embedded",
     "expect",
     "sudo",
     "csv import",
     "bulk import",
-    "inventory",
-    "root"
+    "macro",
+    "automation",
+    "scripting",
+    "javascript"
   ],
   "main": "./dist/extension.js",
   "browser": "./dist/webExtension.js",
@@ -3451,7 +3451,7 @@
   "devDependencies": {
     "@types/node": "^22.13.10",
     "@types/ssh2": "^1.15.5",
-    "@types/vscode": "^1.95.0",
+    "@types/vscode": "^1.105.0",
     "@vitest/coverage-v8": "^4.1.9",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.1",

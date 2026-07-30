@@ -2,9 +2,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockPostMessage = vi.fn();
 const mockShowWarningMessage = vi.fn();
+const mockShowErrorMessage = vi.fn();
 let onDidReceiveMessageHandler: ((msg: Record<string, unknown>) => void) | undefined;
 let onDidDisposeHandler: (() => void) | undefined;
 let lastHtml = "";
+/**
+ * Every assignment to `webview.html`, i.e. every `render()`. Counted rather than merely
+ * captured because "did NOT re-render" is a real assertion in this file: re-rendering rebuilds
+ * the panel from the STORE, so doing it after a failed save silently discards the edit the user
+ * is being told was not saved.
+ */
+let htmlWrites = 0;
 
 vi.mock("vscode", () => ({
   window: {
@@ -12,6 +20,7 @@ vi.mock("vscode", () => ({
       webview: {
         set html(value: string) {
           lastHtml = value;
+          htmlWrites++;
         },
         get html() {
           return lastHtml;
@@ -29,7 +38,8 @@ vi.mock("vscode", () => ({
       reveal: vi.fn(),
       dispose: vi.fn()
     })),
-    showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args)
+    showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
+    showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args)
   },
   ViewColumn: { Active: 1 },
   ConfigurationTarget: { Global: 1 },
@@ -79,6 +89,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     onDidReceiveMessageHandler = undefined;
     onDidDisposeHandler = undefined;
     lastHtml = "";
+    htmlWrites = 0;
   });
 
   it("save by id targets the correct macro after an external reorder", async () => {
@@ -160,6 +171,77 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     expect(mockShowWarningMessage).toHaveBeenCalled();
   });
 
+  describe("duplicate macro ids (a list that predates the unique-id invariant)", () => {
+    // The editor resolves its target by id, so two macros sharing one make "which macro
+    // did the user open" unanswerable. InMemoryMacroStore re-keys duplicates on save, so
+    // this needs a store that surfaces persisted state verbatim — which is exactly what
+    // VscodeMacroStore.reloadFromState() now does, having stopped repairing ids on load.
+    async function harnessWithDuplicateIds(): Promise<{
+      macros: TerminalMacro[];
+      sendMessage: (msg: Record<string, unknown>) => void;
+    }> {
+      vi.resetModules();
+      const macroSettings = await import("../../src/macroSettings");
+      const macros: TerminalMacro[] = [
+        { id: "dup", name: "Alpha", text: "a" },
+        { id: "dup", name: "Beta", text: "b" }
+      ];
+      macroSettings.setActiveMacroStore({
+        async initialize() { /* no-op */ },
+        getAll: () => macros.map((m) => ({ ...m })),
+        async save(next: TerminalMacro[]) {
+          macros.splice(0, macros.length, ...next.map((m) => ({ ...m })));
+        },
+        onDidChange: () => () => { /* no-op */ },
+        async clearAll() { macros.length = 0; }
+      } as unknown as Parameters<typeof macroSettings.setActiveMacroStore>[0]);
+      const { MacroEditorPanel } = await import("../../src/ui/macroEditorPanel");
+      MacroEditorPanel.open(1); // opened on Beta
+      return { macros, sendMessage: onDidReceiveMessageHandler! };
+    }
+
+    it("refuses to save rather than write the edited macro over its twin", async () => {
+      const { macros, sendMessage } = await harnessWithDuplicateIds();
+
+      await sendMessage({
+        type: "save",
+        index: 1,
+        id: "dup",
+        name: "Beta-edited",
+        text: "b2",
+        secret: false,
+        keybinding: null,
+        triggerPattern: null,
+        triggerCooldown: 3,
+        triggerInterval: null,
+        triggerInitiallyDisabled: false,
+        triggerScope: "all-terminals",
+        triggerProfileId: null
+      });
+
+      // Taking the first match would have turned Alpha into "Beta-edited", silently
+      // destroying it — and the id conflict makes that the FIRST macro, not the one the
+      // user was looking at.
+      expect(macros.map((m) => m.name)).toEqual(["Alpha", "Beta"]);
+      expect(macros.map((m) => m.text)).toEqual(["a", "b"]);
+      expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("same internal id")
+      );
+    });
+
+    it("refuses to delete rather than remove the wrong macro", async () => {
+      const { macros, sendMessage } = await harnessWithDuplicateIds();
+
+      await sendMessage({ type: "delete", index: 1, id: "dup" });
+
+      expect(macros.map((m) => m.name)).toEqual(["Alpha", "Beta"]);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("same internal id")
+      );
+    });
+  });
+
   it("delete by id removes the correct macro after an external reorder", async () => {
     await harness([
       { name: "Alpha", text: "a" },
@@ -204,6 +286,95 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     expect(after).toHaveLength(1);
     expect(after[0].name).toBe("Alpha");
     expect(mockShowWarningMessage).toHaveBeenCalled();
+  });
+
+  it("a store failure is REPORTED rather than swallowed — notification, in-panel error, and no false 'saved'", async () => {
+    // `onDidReceiveMessage` is a VS Code EVENT listener, not a command handler: nothing awaits
+    // the promise it returns and nothing reports its rejection. So a rejecting `handleMessage`
+    // produces no notification, no in-panel error, and — because only a `saved` message clears
+    // it — a webview still showing "Unsaved changes" with no explanation.
+    //
+    // This is not theoretical. `VscodeMacroStore.save()` writes both `globalState` and
+    // `SecretStorage`, and either can reject — a locked OS keyring, a corrupt or read-only
+    // extension storage database. A save republishes every secret the window holds, so a
+    // failing keyring rejects EVERY save containing any secret macro, including an edit to an
+    // unrelated plain one. This editor is the primary secret-editing surface. Every other
+    // `saveMacros()` call site in the extension is awaited inside a registered command
+    // handler, where VS Code reports the rejection itself; this one is the exception.
+    await harness([{ name: "Alpha", text: "a\n" }]);
+    const { sendMessage } = await openPanel(0);
+    const id = getMacros()[0].id!;
+
+    const failure = new Error("EPERM: globalState is not writable, so nothing was saved.");
+    vi.spyOn(store, "save").mockRejectedValue(failure);
+    const rendersBefore = htmlWrites;
+
+    // Must not reject: nothing upstream can catch it.
+    await expect(
+      Promise.resolve(
+        sendMessage({
+          type: "save",
+          index: 0,
+          id,
+          name: "Alpha (renamed)",
+          text: "a\n",
+          secret: false,
+          keybinding: null,
+          triggerPattern: null,
+          triggerCooldown: 3,
+          triggerInterval: null,
+          triggerInitiallyDisabled: false,
+          triggerScope: "all-terminals",
+          triggerProfileId: null,
+          variables: []
+        })
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("globalState is not writable")
+    );
+    expect(mockPostMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "saveError", field: "save" })
+    );
+    // The save did not happen, so it must not be reported as one — `saved` is the only thing
+    // that clears the dirty flag, and a cleared flag on an unsaved edit is how the edit gets
+    // closed and lost.
+    expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+    // And the panel is NOT rebuilt. `render()` reads the STORE, which for a failed save still
+    // holds the pre-edit macro, so re-rendering would throw away the very text the error is
+    // telling the user was not saved — the exact outcome reporting the failure exists to
+    // avoid. Reporting the error and then calling `render()` satisfies every other assertion
+    // in this test; it fails here.
+    expect(htmlWrites).toBe(rendersBefore);
+    expect(lastHtml).toContain("Alpha");
+    expect(lastHtml).not.toContain("Alpha (renamed)");
+  });
+
+  it("a store failure on DELETE is reported as a failed delete, and does not rebuild the panel either", async () => {
+    // The same store call backs both Save and Delete, so the one `catch` at the message
+    // subscription sees both. Reporting a failed delete as "could not save the macro" describes
+    // an action the user did not take, and the in-panel slot said "Not saved:" for something
+    // that was never a save.
+    await harness([{ name: "Alpha", text: "a\n" }]);
+    const { sendMessage } = await openPanel(0);
+    const id = getMacros()[0].id!;
+    mockShowWarningMessage.mockResolvedValue("Delete");
+
+    vi.spyOn(store, "save").mockRejectedValue(new Error("EACCES: permission denied"));
+    const rendersBefore = htmlWrites;
+
+    await expect(
+      Promise.resolve(sendMessage({ type: "delete", index: 0, id }))
+    ).resolves.toBeUndefined();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("could not delete the macro")
+    );
+    expect(mockPostMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "saveError", field: "save", message: expect.stringContaining("Not deleted:") })
+    );
+    expect(htmlWrites).toBe(rendersBefore);
   });
 
   it("creating a new macro (null id) appends and assigns an id", async () => {

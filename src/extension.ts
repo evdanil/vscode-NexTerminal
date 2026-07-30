@@ -59,7 +59,7 @@ import { resolveScriptSessionForTerminal, resolveSessionForTerminal } from "./ut
 import { registerSettingsCommands } from "./commands/settingsCommands";
 import { SettingsPanel } from "./ui/settingsPanel";
 import { registerConfigCommands } from "./commands/configCommands";
-import { registerMacroCommands, updateMacroContext, migrateMacroSlots } from "./commands/macroCommands";
+import { registerMacroCommands, updateMacroContext } from "./commands/macroCommands";
 import { registerProfileCommands } from "./commands/profileCommands";
 import { registerAuthProfileCommands } from "./commands/authProfileCommands";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
@@ -849,7 +849,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push({ dispose: cwdSyncStateListener });
   renderCwdSyncState();
 
-  const macroTreeProvider = new MacroTreeProvider((_macro, index) => macroAutoTrigger.isDisabled(index));
+  const macroTreeProvider = new MacroTreeProvider((macro) => macroAutoTrigger.isDisabled(macro));
   const macroView = vscode.window.createTreeView("nexusMacros", {
     treeDataProvider: macroTreeProvider
   });
@@ -862,7 +862,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     macroTreeProvider.refresh();
   });
   context.subscriptions.push({ dispose: macroStoreSubscription });
-  await migrateMacroSlots();
+  // NOTE: nothing on this path may call `saveMacros()` / `MacroStore.save()`. The listener
+  // registered just above reaches `MacroAutoTrigger.reload()` synchronously, and `save()`
+  // re-keys duplicate macro ids — so an activation-time save would clear a duplicate-id
+  // conflict and compile both twins before the user has seen the tree's warning about it.
+  // The legacy `slot` migration that used to run here is now a read-time normalization in
+  // the store (`withMigratedSlot()`, storage/macroStore.ts).
   updateMacroContext();
   updatePassthroughContext();
 
@@ -1158,12 +1163,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
-      macroAutoTrigger.setDisabled(item.index, true);
+      macroAutoTrigger.setDisabled(item.macro, true);
     }
   });
   const enableTriggerCmd = vscode.commands.registerCommand("nexus.macro.enableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
-      macroAutoTrigger.setDisabled(item.index, false);
+      macroAutoTrigger.setDisabled(item.macro, false);
     }
   });
   const fileDisposables = registerFileCommands(ctx);

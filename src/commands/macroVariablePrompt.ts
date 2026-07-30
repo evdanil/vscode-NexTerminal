@@ -45,7 +45,13 @@ function releaseInFlight(key: string): void {
 
 /** Stable-enough identity for the re-entrancy guard across separate `getMacros()` snapshots. */
 function macroIdentityKey(macro: TerminalMacro): string {
-  return macro.id ? `id:${macro.id}` : `anon:${macro.name}\u0000${macro.text}`;
+  // `typeof` check, not just truthiness: `id` is optional in the type but the
+  // value is only array-shape-validated on import, so a non-string can reach here
+  // and two distinct macros would both key on `id:[object Object]`. Same hardening
+  // as `macroStateKey()` in macroAutoTrigger.ts, for the same reason.
+  return typeof macro.id === "string" && macro.id.length > 0
+    ? `id:${macro.id}`
+    : `anon:${macro.name}\u0000${macro.text}`;
 }
 
 function isTerminalStillValid(target: vscode.Terminal): boolean {
