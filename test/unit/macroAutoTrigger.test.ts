@@ -1453,10 +1453,20 @@ describe("MacroAutoTrigger", () => {
       obsA.onOutput("show status\nrouter#");
       expect(sentA).toEqual(["show status\n"]);
 
-      // ...and fires exactly once more when it does — ownership survived the
-      // reorder rather than being dropped (B would have fired above) or
-      // duplicated (both A and B firing here).
-      vi.advanceTimersByTime(10_000);
+      // Now step the clock in two parts rather than jumping the whole interval.
+      // Ownership surviving is not the only thing reload could get wrong: it
+      // could preserve ownership and still drop `lastFired`, in which case the
+      // remaining delay computes as 0 and the macro fires early. A single
+      // advance of the full interval cannot tell that apart from correct
+      // behaviour — both end with exactly one more send — so the cooldown has
+      // to be observed part-way through.
+      vi.advanceTimersByTime(9_000);
+      expect(sentA).toEqual(["show status\n"]);
+
+      // ...and fires exactly once more when the interval actually elapses —
+      // ownership survived the reorder rather than being dropped (B would have
+      // fired above) or duplicated (both A and B firing here).
+      vi.advanceTimersByTime(1_000);
       flush();
       expect(sentA).toEqual(["show status\n", "show status\n"]);
       expect(sentB).toEqual([]);
