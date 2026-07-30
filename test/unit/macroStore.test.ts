@@ -14,6 +14,7 @@ vi.mock("vscode", () => ({
 
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore } from "../../src/storage/vscodeMacroStore";
+import { assignUniqueMacroIds, isValidMacroId } from "../../src/storage/macroStore";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
 function makeFakeContext() {
@@ -320,26 +321,144 @@ describe("VscodeMacroStore", () => {
       expect(m.id).not.toBe("");
     });
 
-    it("reloadFromState() also dedupes a duplicate id already sitting in globalState from before this invariant existed", async () => {
+    it("reloadFromState() dedupes a duplicate id already sitting in globalState from before this invariant existed — mixed order, secret macro NOT first (Fix 1 regression)", async () => {
       const { context, stateBag, secretBag } = makeFakeContext();
-      // Simulate corrupted/legacy on-disk state: two records with the same id,
-      // written before save() enforced uniqueness.
+      // The non-secret macro sorts FIRST this time (the old "first occurrence
+      // wins" repair would hand it the shared id and strand the secret macro
+      // behind a brand-new id that has no vault entry, losing the real secret
+      // even though there is no ambiguity — only one macro here is secret).
       stateBag.set("nexus.macros", [
-        { id: "dup", name: "Password", text: "", secret: true },
-        { id: "dup", name: "Poll", text: "show status\n" }
+        { id: "dup", name: "Poll", text: "show status\n" },
+        { id: "dup", name: "Password", text: "", secret: true }
       ]);
       secretBag.set("macro-secret-text-dup", "hunter2\n");
 
       const store = new VscodeMacroStore(context, { runLegacyMigration: false });
       await store.initialize();
 
-      const [password, poll] = store.getAll();
+      const [poll, password] = store.getAll();
+      // The SECRET macro keeps the original id — it is the only member that will
+      // ever read macroSecretKey("dup"), regardless of array position.
       expect(password.id).toBe("dup");
       expect(password.text).toBe("hunter2\n");
-      // The second record must not have been silently merged into the first's
-      // identity — it now has its own, different id.
       expect(poll.id).not.toBe("dup");
       expect(poll.text).toBe("show status\n");
+    });
+
+    it("reloadFromState() fails closed on an ambiguous secret vault entry: two SECRET macros sharing an id, vault content belonging to the SECOND (Fix 1 — hostile ordering)", async () => {
+      const { context, stateBag, secretBag } = makeFakeContext();
+      // Hostile ordering, per code review: both duplicate-id claimants are
+      // secret, and the single vault entry under the shared id was last written
+      // by the SECOND one (pre-invariant duplicate secret saves were
+      // last-write-wins). A naive "first occurrence keeps the id" repair would
+      // hand macro A the secret that actually belongs to macro B.
+      stateBag.set("nexus.macros", [
+        { id: "dup", name: "Password A", text: "", secret: true },
+        { id: "dup", name: "Password B", text: "", secret: true }
+      ]);
+      secretBag.set("macro-secret-text-dup", "password-b-secret\n");
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      const [first, second] = store.getAll();
+      // Neither may keep the ambiguous id...
+      expect(first.id).not.toBe("dup");
+      expect(second.id).not.toBe("dup");
+      expect(first.id).not.toBe(second.id);
+      // ...and neither may be handed the vault's secret on a guess — fail closed.
+      expect(first.text).toBe("");
+      expect(second.text).toBe("");
+
+      // The now-permanently-unclaimed vault entry is swept, so a later import
+      // reusing the literal id "dup" can never inherit an ambiguous secret it
+      // never wrote.
+      expect(secretBag.has("macro-secret-text-dup")).toBe(false);
+    });
+
+    it("the duplicate-id repair converges: it is persisted, not re-randomised on every activation (Fix 1)", async () => {
+      const { context, stateBag, secretBag } = makeFakeContext();
+      stateBag.set("nexus.macros", [
+        { id: "dup", name: "Password A", text: "", secret: true },
+        { id: "dup", name: "Password B", text: "", secret: true }
+      ]);
+      secretBag.set("macro-secret-text-dup", "password-b-secret\n");
+
+      const store1 = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store1.initialize();
+      const idsAfterFirstLoad = store1.getAll().map((m) => m.id).sort();
+
+      // A second, independent store instance reloading the SAME persisted state
+      // (as happens on the next activation) must see the already-corrected,
+      // unique ids rather than re-randomising fresh ones.
+      const store2 = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store2.initialize();
+      const idsAfterSecondLoad = store2.getAll().map((m) => m.id).sort();
+
+      expect(idsAfterSecondLoad).toEqual(idsAfterFirstLoad);
+      // The corrected ids must actually be what's on disk, not just in-memory.
+      const persisted = stateBag.get("nexus.macros") as TerminalMacro[];
+      expect(persisted.map((m) => m.id).sort()).toEqual(idsAfterFirstLoad);
+    });
+  });
+
+  describe("shared unique-id normalizer (Fix 2) — non-string ids bypass the uniqueness invariant", () => {
+    it("isValidMacroId rejects a non-string id even when it has a positive .length", () => {
+      expect(isValidMacroId({ length: 1 })).toBe(false);
+      expect(isValidMacroId("")).toBe(false);
+      expect(isValidMacroId(undefined)).toBe(false);
+      expect(isValidMacroId(null)).toBe(false);
+      expect(isValidMacroId("x")).toBe(true);
+    });
+
+    it("assignUniqueMacroIds() treats two DIFFERENT non-string ids of the same shape as both needing a fresh, real string id — a bare truthy/.length check would let both through unchanged and indistinguishable", () => {
+      // Two SEPARATE object instances of the same shape, exactly as JSON.parse
+      // would produce for `[{"id":{"length":1}}, {"id":{"length":1}}]` — a Set
+      // never treats them as equal (different references), yet a bare
+      // `m.id && m.id.length > 0` check accepts both as "valid" ids verbatim.
+      const macros = [
+        { id: { length: 1 } as unknown as string, name: "A", text: "a" },
+        { id: { length: 1 } as unknown as string, name: "B", text: "b" }
+      ];
+      const out = assignUniqueMacroIds(macros);
+      expect(typeof out[0].id).toBe("string");
+      expect(typeof out[1].id).toBe("string");
+      expect(out[0].id).not.toBe(out[1].id);
+    });
+
+    it("InMemoryMacroStore.save() treats a non-string id as missing, not as a valid, distinguishing id", async () => {
+      const store = new InMemoryMacroStore();
+      await store.initialize();
+      await store.save([
+        { id: { length: 1 } as unknown as string, name: "A", text: "a" },
+        { id: { length: 1 } as unknown as string, name: "B", text: "b" }
+      ] as TerminalMacro[]);
+
+      const [a, b] = store.getAll();
+      expect(typeof a.id).toBe("string");
+      expect(typeof b.id).toBe("string");
+      expect(a.id).not.toBe(b.id);
+    });
+
+    it("VscodeMacroStore.save() treats a non-string id as missing: each SECRET macro gets its own real vault entry instead of colliding on a coerced '[object Object]' key", async () => {
+      const { context, secretBag } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      await store.save([
+        { id: { length: 1 } as unknown as string, name: "A", text: "secret-a", secret: true },
+        { id: { length: 1 } as unknown as string, name: "B", text: "secret-b", secret: true }
+      ] as TerminalMacro[]);
+
+      const [a, b] = store.getAll();
+      expect(typeof a.id).toBe("string");
+      expect(typeof b.id).toBe("string");
+      expect(a.id).not.toBe(b.id);
+      expect(a.text).toBe("secret-a");
+      expect(b.text).toBe("secret-b");
+      expect(secretBag.get(`macro-secret-text-${a.id}`)).toBe("secret-a");
+      expect(secretBag.get(`macro-secret-text-${b.id}`)).toBe("secret-b");
+      expect(secretBag.has("macro-secret-text-[object Object]")).toBe(false);
     });
   });
 });

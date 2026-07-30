@@ -34,9 +34,17 @@ const VALID_TRIGGER_SCOPES = new Set<MacroTriggerScope>(["all-terminals", "activ
  *
  * Two id-less macros with identical name AND text collide on this key by
  * design — see the "collide by design" test in macroAutoTrigger.test.ts.
+ *
+ * Guards with `typeof macro.id === "string" && macro.id.length > 0` rather than a
+ * bare truthy/`.length` check on `macro.id`: a corrupt import can hand this a
+ * non-string `id` (e.g. `{length: 1}`), which is truthy and has a positive
+ * `.length` yet is not the string MacroStore's uniqueness invariant actually
+ * guarantees. Two such distinct objects would both stringify to the same
+ * `id:[object Object]` key here despite never having been deduped as equal
+ * anywhere upstream — exactly the collision this key exists to prevent.
  */
 export function macroStateKey(macro: TerminalMacro): string {
-  return macro.id ? `id:${macro.id}` : `anon:${macro.name}\u0000${macro.text}`;
+  return typeof macro.id === "string" && macro.id.length > 0 ? `id:${macro.id}` : `anon:${macro.name}\u0000${macro.text}`;
 }
 
 export interface PtyOutputObserver {

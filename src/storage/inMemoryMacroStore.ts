@@ -1,6 +1,5 @@
-import { randomUUID } from "node:crypto";
 import type { TerminalMacro } from "../models/terminalMacro";
-import type { MacroStore, MacroStoreChangeListener } from "./macroStore";
+import { assignUniqueMacroIds, type MacroStore, type MacroStoreChangeListener } from "./macroStore";
 
 export class InMemoryMacroStore implements MacroStore {
   private macros: TerminalMacro[] = [];
@@ -15,18 +14,12 @@ export class InMemoryMacroStore implements MacroStore {
   }
 
   public async save(macros: TerminalMacro[]): Promise<void> {
-    // Mirrors VscodeMacroStore.save(): unique, non-empty ids are a MacroStore
+    // Mirrors VscodeMacroStore.save(): unique, non-empty, STRING ids are a MacroStore
     // invariant that MacroAutoTrigger's `macroStateKey()` relies on (two macros
-    // with equal `id` are indistinguishable for pause/resume/interval state). An
-    // explicit empty-string id is treated as missing, and a later duplicate is
-    // reassigned a fresh id.
-    const seenIds = new Set<string>();
-    this.macros = macros.map((m) => {
-      let id = m.id && m.id.length > 0 ? m.id : randomUUID();
-      while (seenIds.has(id)) id = randomUUID();
-      seenIds.add(id);
-      return { ...m, id };
-    });
+    // with equal `id` are indistinguishable for pause/resume/interval state).
+    // `assignUniqueMacroIds()` is the single implementation shared with
+    // VscodeMacroStore.save() — see its doc comment in macroStore.ts.
+    this.macros = assignUniqueMacroIds(macros);
     for (const listener of this.listeners) listener();
   }
 

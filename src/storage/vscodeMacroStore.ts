@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { TerminalMacro } from "../models/terminalMacro";
-import type { MacroStore, MacroStoreChangeListener } from "./macroStore";
+import { assignUniqueMacroIds, isValidMacroId, type MacroStore, type MacroStoreChangeListener } from "./macroStore";
 import { withRedactedVariables } from "../services/macroVariables";
 
 const MACROS_KEY = "nexus.macros";
@@ -65,23 +65,19 @@ export class VscodeMacroStore implements MacroStore {
     // write to globalState goes through `save()`, so a masked variable's plaintext
     // `default` can never be persisted regardless of which caller supplied it.
     //
-    // Unique, non-empty ids are enforced in this same chokepoint: nothing upstream
-    // guarantees it (a replace-mode backup import saves whatever ids the file
-    // contains verbatim — see configCommands.ts), and MacroAutoTrigger's
+    // Unique, non-empty, STRING ids are enforced in this same chokepoint: nothing
+    // upstream guarantees it (a replace-mode backup import saves whatever ids the
+    // file contains verbatim — see configCommands.ts), and MacroAutoTrigger's
     // `macroStateKey()` treats any two macros with equal `id` as the SAME macro for
-    // pause/resume, interval ownership and cooldown state. An empty string is
-    // treated as missing, matching `macroStateKey()`'s own falsy check. Dedup runs
-    // BEFORE the vault read/write loop below, which keys every vault entry by the
-    // final `m.id` — so by the time that loop runs, ids are already unique and no
-    // secret macro's vault entry can be overwritten or cross-read by another macro
-    // that happened to share its id.
-    const seenIds = new Set<string>();
-    const normalized: TerminalMacro[] = macros.map((m) => {
-      let id = m.id && m.id.length > 0 ? m.id : randomUUID();
-      while (seenIds.has(id)) id = randomUUID();
-      seenIds.add(id);
-      return withRedactedVariables({ ...m, id });
-    });
+    // pause/resume, interval ownership and cooldown state. `assignUniqueMacroIds()`
+    // (macroStore.ts, shared with InMemoryMacroStore.save()) treats an empty string
+    // AND any non-string value (e.g. `{length: 1}` from a corrupt import — a plain
+    // `.length` check would be fooled by that) as missing, matching
+    // `macroStateKey()`'s own guard. Dedup runs BEFORE the vault read/write loop
+    // below, which keys every vault entry by the final `m.id` — so by the time that
+    // loop runs, ids are already unique and no secret macro's vault entry can be
+    // overwritten or cross-read by another macro that happened to share its id.
+    const normalized: TerminalMacro[] = assignUniqueMacroIds(macros).map((m) => withRedactedVariables(m));
 
     const currentIds = new Set(this.resolved.map((m) => m.id).filter((v): v is string => Boolean(v)));
     const nextIds = new Set(normalized.map((m) => m.id!).filter(Boolean));
@@ -151,25 +147,73 @@ export class VscodeMacroStore implements MacroStore {
 
   private async reloadFromState(): Promise<void> {
     const raw = asArray<TerminalMacro>(this.context.globalState.get(MACROS_KEY, []));
+
+    // Fix 1 pre-scan: group entries by their (valid, non-empty, string) original id
+    // BEFORE deciding anything, so the repair below can look at an entire group
+    // sharing an id and choose who — if anyone — gets to keep it, rather than a
+    // single forward pass naively awarding it to whichever entry it reaches first.
+    const groupsById = new Map<string, number[]>();
+    raw.forEach((entry, index) => {
+      if (entry && typeof entry === "object" && isValidMacroId(entry.id)) {
+        const bucket = groupsById.get(entry.id);
+        if (bucket) bucket.push(index);
+        else groupsById.set(entry.id, [index]);
+      }
+    });
+
+    // An id shared by 2+ SECRET macros makes macroSecretKey(id) ambiguous: before
+    // the unique-id invariant existed, duplicate secret saves were last-write-wins,
+    // so the single value stored under that key may belong to ANY of the claimants —
+    // not necessarily whichever this loop reaches first. Fail closed rather than
+    // guess: nobody in the group keeps the original id, so nobody reads that vault
+    // entry. Every member resolves to a brand-new id in the loop below (and, for the
+    // secret ones, empty text — which falls out for free, since a fresh id has no
+    // vault entry to find).
+    const poisonedIds = new Set<string>();
+    for (const [id, indices] of groupsById) {
+      const secretCount = indices.filter((i) => raw[i]!.secret === true).length;
+      if (secretCount >= 2) poisonedIds.add(id);
+    }
+
+    // In a non-poisoned group that mixes exactly one secret macro with non-secret
+    // siblings, the secret macro — not whichever sibling happens to sort first —
+    // must be the one to keep the original id, since it is the only member that will
+    // ever read macroSecretKey(id). Picking by array position alone would strand the
+    // real secret behind a brand-new, never-before-used id whenever a non-secret
+    // duplicate happened to come first.
+    const idOwner = new Map<string, number>(); // original id -> the raw index that keeps it
+    for (const [id, indices] of groupsById) {
+      if (poisonedIds.has(id)) continue;
+      const secretIndex = indices.find((i) => raw[i]!.secret === true);
+      idOwner.set(id, secretIndex ?? indices[0]!);
+    }
+
     const resolved: TerminalMacro[] = [];
     // Tracks whether any on-disk record still carried a masked variable's plaintext
     // default, so it can be scrubbed rather than merely hidden from `getAll()`.
     let needsDiskScrub = false;
-    // Same unique-id invariant `save()` enforces (see its comment), applied here too:
-    // on-disk state can still contain duplicate ids from before this invariant existed
-    // (or from external corruption), and `resolved` is what MacroAutoTrigger keys its
-    // pause/resume/interval state against. A later duplicate gets a fresh id BEFORE
-    // the vault lookup below runs, so it is never fetched under an id another macro
-    // already owns — it simply resolves to no vault entry (empty text) rather than
-    // risking a cross-read of the wrong macro's secret. This is an in-memory repair
-    // only (mirrors the "minimal raw rewrite" rule below); the next `save()` persists
-    // the corrected, unique ids permanently.
+    // Tracks raw-array indices whose id needed correcting — a genuine duplicate-id
+    // repair, not merely "this record never had an id at all" — so the fix can
+    // CONVERGE below: persisted once instead of re-randomising a fresh id for the
+    // same duplicate on every single activation.
+    const correctedIds = new Map<number, string>();
     const seenIds = new Set<string>();
-    for (const entry of raw) {
+
+    for (let index = 0; index < raw.length; index++) {
+      const entry = raw[index];
       if (!entry || typeof entry !== "object") continue;
-      let id = entry.id && typeof entry.id === "string" && entry.id.length > 0 ? entry.id : randomUUID();
-      while (seenIds.has(id)) id = randomUUID();
+
+      const originalId = isValidMacroId(entry.id) ? entry.id : undefined;
+      let id: string;
+      if (originalId !== undefined && !poisonedIds.has(originalId) && idOwner.get(originalId) === index) {
+        id = originalId;
+      } else {
+        id = randomUUID();
+        while (seenIds.has(id)) id = randomUUID();
+        if (originalId !== undefined) correctedIds.set(index, id);
+      }
       seenIds.add(id);
+
       // Redacted on the way in as well as on the way out (`save()`), so a record
       // already sitting in globalState from an earlier build cannot leak a masked
       // variable's plaintext default into `getAll()` — and therefore into Copy All,
@@ -185,30 +229,46 @@ export class VscodeMacroStore implements MacroStore {
     }
     this.resolved = resolved;
 
+    // A poisoned id's vault entry is now permanently unclaimed: nothing in
+    // `resolved` references it, and the secret-id index rebuilt below won't either.
+    // Delete it so a LATER import that happens to reuse the same literal id (e.g. a
+    // hand-edited backup) can never inherit an ambiguous secret it never wrote.
+    for (const id of poisonedIds) {
+      await this.context.secrets.delete(macroSecretKey(id));
+    }
+
     // Redacting only the in-memory copy would leave the plaintext sitting in VS Code's
     // global-state storage indefinitely: nothing rewrites MACROS_KEY until the user
-    // happens to save a macro. Rewrite it now.
+    // happens to save a macro. Rewrite it now — and, in the same pass, persist any
+    // duplicate-id correction from above so THAT repair converges too, instead of
+    // re-randomising on every activation.
     //
     // Two constraints on how:
     //
-    // 1. Scrub the RAW array, minimally. Serializing `resolved` instead would persist
+    // 1. Rewrite the RAW array, minimally. Serializing `resolved` instead would persist
     //    this reload's incidental repairs — dropped non-object records, freshly
-    //    assigned UUIDs — turning a redaction into a rewrite of records that were
-    //    never the problem.
+    //    assigned UUIDs for records that never had an id at all — turning a targeted
+    //    fix into a rewrite of records that were never the problem.
     // 2. Only write if MACROS_KEY still holds what we read. globalState is shared
     //    across windows, and there is an `await` on the vault between the read and
     //    this write: another window can save, absorb legacy settings, or complete a
     //    reset in that gap, and an unconditional write would silently overwrite it —
     //    resurrecting macros the user just deleted. VS Code offers no
     //    compare-and-swap, so this is best-effort: re-read and skip if it moved.
-    //    Skipping is safe, since the next `save()` redacts anyway.
-    if (needsDiskScrub) {
+    //    Skipping is safe: the redaction scrub retries on the next reload, and the
+    //    id correction is (deliberately) re-derived in-memory every reload by the loop
+    //    above regardless, so no macro is ever left keyed to a colliding id even if
+    //    this on-disk write never lands.
+    if (needsDiskScrub || correctedIds.size > 0) {
       const current = this.context.globalState.get(MACROS_KEY);
       if (JSON.stringify(current) === JSON.stringify(raw)) {
-        const scrubbed = raw.map((entry) =>
-          entry && typeof entry === "object" ? withRedactedVariables(entry) : entry
-        );
-        await this.context.globalState.update(MACROS_KEY, scrubbed);
+        const corrected = raw.map((entry, index) => {
+          if (!entry || typeof entry !== "object") return entry;
+          const withRedaction = withRedactedVariables(entry);
+          const fixedId = correctedIds.get(index);
+          return fixedId !== undefined ? { ...withRedaction, id: fixedId } : withRedaction;
+        });
+        await this.context.globalState.update(MACROS_KEY, corrected);
       }
     }
 
@@ -274,10 +334,15 @@ export class VscodeMacroStore implements MacroStore {
     // `nexus.terminal.macros` from settings.json verbatim on every activation
     // (Settings Sync replay included), so without it a hand-written masked variable
     // carrying a plaintext `default` would be written straight into globalState.
-    const assigned = macros.map((m) => withRedactedVariables({
-      ...m,
-      id: m.id && typeof m.id === "string" ? m.id : randomUUID()
-    }));
+    //
+    // Fix 3 — `assignUniqueMacroIds()` (not a bare per-entry `m.id ?? randomUUID()`)
+    // is what enforces uniqueness here: this write path preserves every SUPPLIED
+    // string id verbatim with no seenIds check otherwise, and content-based dedup
+    // (`dedupeLegacyMacros`) doesn't help when two DIFFERENT legacy macros happen to
+    // share the same hand-written `id` — both would otherwise survive into the vault
+    // loop below and write the same `macroSecretKey(id)`, the later overwriting the
+    // earlier, with the secret-id index then also holding that id twice.
+    const assigned = assignUniqueMacroIds(macros).map((m) => withRedactedVariables(m));
 
     const onDisk: TerminalMacro[] = [];
     for (const m of assigned) {

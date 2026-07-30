@@ -158,6 +158,39 @@ describe("MacroStore legacy migration", () => {
     expect(persisted[0].variables).toEqual([{ name: "password", secret: true }]);
   });
 
+  it("Fix 3 — two DISTINCT secret macros sharing a hand-written duplicate id through legacy settings each get their own vault entry", async () => {
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    // Trigger from the review: legacy settings.json contains two genuinely
+    // different secret macros that happen to share a hand-written `id`.
+    // Content-based dedup (dedupeLegacyMacros) does not collapse these — they
+    // differ in name and text — so both must survive persistLegacyMigration
+    // with DISTINCT ids, each with its own vault entry.
+    vscode.__setConfig("nexus.terminal", {
+      global: [
+        { id: "dup", name: "First", text: "first-secret", secret: true },
+        { id: "dup", name: "Second", text: "second-secret", secret: true }
+      ] as TerminalMacro[]
+    });
+    const { ctx, state, secrets } = makeCtx();
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    const all = store.getAll();
+    expect(all).toHaveLength(2);
+    const [first, second] = all;
+    expect(first.id).toBeDefined();
+    expect(second.id).toBeDefined();
+    expect(first.id).not.toBe(second.id);
+    expect(first.text).toBe("first-secret");
+    expect(second.text).toBe("second-secret");
+    expect(secrets.get(macroSecretKey(first.id!))).toBe("first-secret");
+    expect(secrets.get(macroSecretKey(second.id!))).toBe("second-secret");
+
+    // The secret-id index must not carry the duplicate literal id twice either.
+    const persisted = state.get("nexus.macros") as TerminalMacro[];
+    expect(persisted.map((m) => m.id).sort()).toEqual([first.id, second.id].sort());
+  });
+
   it("does not duplicate secret macros when Settings Sync replays cleartext", async () => {
     const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
     vscode.__setConfig("nexus.terminal", { global: [{ name: "pw", text: "hunter2", secret: true }] });

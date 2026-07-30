@@ -1546,5 +1546,18 @@ describe("MacroAutoTrigger", () => {
       // Disabling "first" reports "second" as disabled too — they share a key.
       expect(trigger.isDisabled(second)).toBe(true);
     });
+
+    it("macroStateKey() does not let two macros with differently-shaped non-string ids collide on a coerced key (Fix 2)", () => {
+      // A bare `macro.id ? ... : ...` guard treats any truthy `id` — including a
+      // non-string object surviving a corrupt import — as valid, and the template
+      // literal below it coerces every such object to the SAME string,
+      // "[object Object]", regardless of its actual shape or which macro it came
+      // from. Two macros that differ in every other field would then collide on
+      // "id:[object Object]" even though nothing upstream ever treated their ids
+      // as equal.
+      const macroA = { id: { length: 1 } as unknown as string, name: "A", text: "textA" } as unknown as TerminalMacro;
+      const macroB = { id: { length: 1 } as unknown as string, name: "B", text: "textB" } as unknown as TerminalMacro;
+      expect(macroStateKey(macroA)).not.toBe(macroStateKey(macroB));
+    });
   });
 });
