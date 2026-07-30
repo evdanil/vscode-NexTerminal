@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [2.8.73] — 2026-07-29
+
+Adds prompted input variables to macros (#35 follow-up) — the editor, sidebar, and template surface of the feature; the underlying scan/substitution engine and the runtime prompt flow ship in the same release.
+
+### Added
+
+- **Macros can now declare named variables and prompt for them at run time.** Add one or more variables in the Macro Editor's new **Variables** section (name, optional label, optional default, mask-input, remember), reference them in the macro's text as `$name` or `${name}`, and running the macro walks a step-by-step input box for each one actually used — filling in the command before it is sent to the terminal you invoked it from, even if you switch tabs while the prompts are still open. A new **Prompted command** template (Add Macro From Template) builds the `ipmitool ... sol activate` example from the originating feature request end to end, with `host` / `username` / `password` declared and the password masked.
+- **Live editor feedback under the Text field** flags an undeclared `$foo` placeholder (with a one-click **Add variable "foo"** fix), a declared-but-unused variable, or confirms `Will prompt for: host, username, password` once the macro is well-formed — plus a live warning, shown immediately next to both the Variables section and the Auto-Trigger Pattern field, the moment a macro carries both a trigger pattern and a variable (they're mutually exclusive: prompting means opening an input box, which cannot happen safely from a background auto-trigger match). A macro that somehow has both renders in the sidebar as a plain, non-triggering macro with an explanatory tooltip rather than dead trigger controls.
+- Variable macros get a `⌸` marker and a distinct icon in the Macros sidebar and the Run Macro quick pick, and their sidebar tooltip lists the variable names the macro will actually prompt for.
+- `docs/macros.md` gains a **Variables** section: the `$host` / `${host}` syntax table, the worked ipmitool example, the `'${password}'` quoting idiom (Nexus never auto-quotes a value — quoting it automatically would corrupt commands sent to network-device CLIs), the `HISTCONTROL=ignorespace` trick for keeping a value out of the remote shell's own history, and the variables-vs-auto-trigger rule, pointing at Scripts for automated flows that need both prompted input and control flow.
+
 ## [2.8.72] — 2026-07-29
 
 Review findings against 2.8.71's directory sync fixes (#35), from a staff-engineer pass over the whole feature.

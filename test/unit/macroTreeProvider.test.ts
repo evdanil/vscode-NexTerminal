@@ -35,7 +35,7 @@ vi.mock("vscode", () => {
   };
 });
 
-import { MacroTreeProvider, MacroTreeItem } from "../../src/ui/macroTreeProvider";
+import { MacroTreeProvider, MacroTreeItem, VARIABLE_MARKER } from "../../src/ui/macroTreeProvider";
 import * as vscode from "vscode";
 
 let testStore: InMemoryMacroStore;
@@ -165,6 +165,105 @@ describe("MacroTreeItem", () => {
       command: "nexus.macro.runItem",
       title: "Run Macro",
       arguments: [item]
+    });
+  });
+
+  describe("variables (§9.6, §6.3)", () => {
+    it("tooltip lists the variable names actually used, as 'Prompts for:'", () => {
+      const macro = {
+        name: "IPMI",
+        text: "ipmitool -H $host -U $username -P $password sol activate\n",
+        variables: [
+          { name: "host" },
+          { name: "username" },
+          { name: "password", secret: true },
+          { name: "unused" }
+        ]
+      };
+      const item = new MacroTreeItem(macro, 0);
+      expect(item.tooltip).toContain("Prompts for: host, username, password");
+      expect(item.tooltip).not.toContain("unused");
+    });
+
+    it("secret macro tooltip still hides the text, even with variables declared", () => {
+      const macro = {
+        name: "IPMI",
+        text: "sekrit-text $host",
+        secret: true,
+        variables: [{ name: "host" }]
+      };
+      const item = new MacroTreeItem(macro, 0);
+      expect(item.tooltip).not.toContain("sekrit-text");
+      expect(item.tooltip).toContain("(secret)");
+      expect(item.tooltip).toContain("Prompts for: host");
+    });
+
+    it("uses the symbol-parameter icon and leaves contextValue unchanged for variable macros", () => {
+      const macro = { name: "IPMI", text: "$host", variables: [{ name: "host" }] };
+      const item = new MacroTreeItem(macro, 0);
+      expect((item.iconPath as { id: string }).id).toBe("symbol-parameter");
+      expect(item.contextValue).toBe("nexus.macro");
+    });
+
+    it("uses the symbol-parameter icon for a secret variable macro but keeps the secret contextValue", () => {
+      const macro = { name: "IPMI", text: "$host", secret: true, variables: [{ name: "host" }] };
+      const item = new MacroTreeItem(macro, 0);
+      expect((item.iconPath as { id: string }).id).toBe("symbol-parameter");
+      expect(item.contextValue).toBe("nexus.macro.secret");
+    });
+
+    it("uses the plain terminal icon (not symbol-parameter) for a declared-but-unused variable — it sends immediately (§9.6 fix)", () => {
+      const macro = { name: "IPMI", text: "hi", variables: [{ name: "host" }] };
+      const item = new MacroTreeItem(macro, 0);
+      expect((item.iconPath as { id: string }).id).toBe("terminal");
+    });
+
+    it("marks the description with the variable marker only when the macro will actually prompt", () => {
+      // Bug this pins: a macro declaring `host` whose text never references
+      // `$host` gets marked but sends immediately on click — the marker must
+      // key off scanPlaceholders (§9.6), never off the raw `variables` shape.
+      const promptingMacro = { name: "IPMI", text: "run $host", variables: [{ name: "host" }] };
+      const promptingItem = new MacroTreeItem(promptingMacro, 0);
+      expect(promptingItem.description).toContain(VARIABLE_MARKER.trim());
+
+      const nonPromptingMacro = { name: "IPMI", text: "hi", variables: [{ name: "host" }] };
+      const nonPromptingItem = new MacroTreeItem(nonPromptingMacro, 0);
+      expect(nonPromptingItem.description).not.toContain(VARIABLE_MARKER.trim());
+    });
+
+    it("does not mark the description for a macro with no variables", () => {
+      const macro = { name: "Plain", text: "hi" };
+      const item = new MacroTreeItem(macro, 0);
+      expect(item.description).not.toContain(VARIABLE_MARKER.trim());
+    });
+
+    it("ignores a malformed non-array variables shape (§4.2) — no crash, no marker", () => {
+      const macro = { name: "Legacy", text: "hi", variables: "abc" as unknown as never };
+      const item = new MacroTreeItem(macro, 0);
+      expect(item.description).not.toContain(VARIABLE_MARKER.trim());
+      expect(item.contextValue).toBe("nexus.macro");
+    });
+
+    it("renders a macro with BOTH triggerPattern and variables as a non-trigger macro with a suppression note (§6.3)", () => {
+      const macro = {
+        name: "Both",
+        text: "run $host",
+        triggerPattern: "foo",
+        variables: [{ name: "host" }]
+      };
+      const item = new MacroTreeItem(macro, 0, undefined, false);
+      expect((item.iconPath as { id: string }).id).toBe("symbol-parameter");
+      expect(item.contextValue).toBe("nexus.macro");
+      expect(item.tooltip).toContain("Auto-trigger suppressed: macro has variables");
+      expect(item.tooltip).not.toContain("Auto-trigger:");
+    });
+
+    it("a normal triggered macro (no variables) is unaffected — still zap/triggered", () => {
+      const macro = { name: "Auto", text: "yes\n", triggerPattern: "Continue\\?" };
+      const item = new MacroTreeItem(macro, 0, undefined, false);
+      expect((item.iconPath as { id: string }).id).toBe("zap");
+      expect(item.contextValue).toBe("nexus.macro.triggered");
+      expect(item.tooltip).not.toContain("suppressed");
     });
   });
 });

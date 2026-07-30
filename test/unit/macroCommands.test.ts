@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerMacroCommands } from "../../src/commands/macroCommands";
 import { MacroEditorPanel } from "../../src/ui/macroEditorPanel";
+import { getAssignedBinding } from "../../src/macroBindingHelpers";
+import { VARIABLE_MARKER } from "../../src/ui/macroVariableMarker";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockExecuteCommand = vi.fn();
@@ -13,6 +15,7 @@ const mockClipboardWriteText = vi.fn();
 const mockOpenExternal = vi.fn();
 const mockGetMacros = vi.fn();
 const mockSaveMacros = vi.fn();
+const mockRunMacro = vi.fn();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -70,6 +73,10 @@ vi.mock("../../src/macroBindings", () => ({
   slotToBinding: vi.fn((slot: number) => `alt+${slot}`)
 }));
 
+vi.mock("../../src/commands/macroVariablePrompt", () => ({
+  runMacro: (...args: unknown[]) => mockRunMacro(...args)
+}));
+
 describe("macroCommands clipboard actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -123,6 +130,62 @@ describe("macroCommands clipboard actions", () => {
   });
 });
 
+describe("macroCommands copyAllAsJson (Fix 1 — output-path sanitization)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    registerMacroCommands();
+  });
+
+  it("does not leak a masked variable's plaintext default into the clipboard JSON", async () => {
+    const macros = [
+      {
+        name: "Login",
+        text: "login $password\n",
+        variables: [{ name: "password", secret: true, default: "hunter2" }]
+      }
+    ];
+    mockGetMacros.mockReturnValue(macros);
+
+    const copyAllAsJson = registeredCommands.get("nexus.macro.copyAllAsJson");
+    expect(copyAllAsJson).toBeDefined();
+    await copyAllAsJson!();
+
+    expect(mockClipboardWriteText).toHaveBeenCalledTimes(1);
+    const written = mockClipboardWriteText.mock.calls[0][0] as string;
+    expect(written).not.toContain("hunter2");
+
+    const parsed = JSON.parse(written);
+    expect(parsed[0].variables).toEqual([{ name: "password", secret: true }]);
+  });
+
+  it("Fix C boundary — drops an array-like (non-array) variables value entirely, rather than leaking its plaintext default", async () => {
+    // The well-formed-array test above can't catch this: the pre-fix
+    // withRedactedVariables() only ran its redaction loop on real arrays, so an
+    // array-like object (e.g. reconstructed from a hand-edited settings.json) passed
+    // through untouched, plaintext default and all.
+    const macros = [
+      {
+        name: "Login",
+        text: "login $password\n",
+        variables: { 0: { name: "password", secret: true, default: "hunter2" }, length: 1 }
+      }
+    ];
+    mockGetMacros.mockReturnValue(macros);
+
+    const copyAllAsJson = registeredCommands.get("nexus.macro.copyAllAsJson");
+    expect(copyAllAsJson).toBeDefined();
+    await copyAllAsJson!();
+
+    expect(mockClipboardWriteText).toHaveBeenCalledTimes(1);
+    const written = mockClipboardWriteText.mock.calls[0][0] as string;
+    expect(written).not.toContain("hunter2");
+
+    const parsed = JSON.parse(written);
+    expect(parsed[0].variables).toBeUndefined();
+  });
+});
+
 describe("macroCommands documentation actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -164,8 +227,33 @@ describe("macroCommands template actions", () => {
       "Send command",
       "Send password when prompted",
       "Wait and send confirmation",
-      "Scoped auto-trigger example"
+      "Scoped auto-trigger example",
+      "Prompted command"
     ]);
+  });
+
+  it("creates the Prompted command template with host/username/password declared and the password masked (§9.7)", async () => {
+    const macros: unknown[] = [];
+    mockGetMacros.mockReturnValue(macros);
+    mockShowQuickPick.mockResolvedValue({ label: "Prompted command", templateId: "prompted-command" });
+
+    await registeredCommands.get("nexus.macro.addFromTemplate")!();
+
+    expect(macros[0]).toMatchObject({
+      text: expect.stringContaining("ipmitool"),
+      variables: [
+        { name: "host", label: "Host" },
+        { name: "username", label: "Username" },
+        { name: "password", label: "Password", secret: true }
+      ]
+    });
+    const created = macros[0] as { text: string; variables: Array<{ name: string; secret?: boolean; default?: string }> };
+    expect(created.text).toContain("$host");
+    expect(created.text).toContain("$username");
+    expect(created.text).toContain("$password");
+    // §7.1 — a masked variable must never carry a default (plaintext in the store).
+    expect(created.variables.find((v) => v.secret)?.default).toBeUndefined();
+    expect(mockSaveMacros).toHaveBeenCalledWith(macros);
   });
 
   it("creates the selected macro through getMacros and saveMacros then opens it", async () => {
@@ -210,5 +298,120 @@ describe("macroCommands template actions", () => {
 
     expect(mockSaveMacros).not.toHaveBeenCalled();
     expect(MacroEditorPanel.open).not.toHaveBeenCalled();
+  });
+});
+
+describe("macroCommands variable routing (§8.5)", () => {
+  const plainMacro = { name: "Plain", text: "show version\n" };
+  const variableMacro = {
+    name: "Prompted",
+    text: "$host",
+    variables: [{ name: "host" }]
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockGetMacros.mockReturnValue([]);
+    mockRunMacro.mockResolvedValue(undefined);
+    registerMacroCommands();
+  });
+
+  it("nexus.macro.run sends a variable-free macro through sendMacroText unchanged, never through runMacro", async () => {
+    mockGetMacros.mockReturnValue([plainMacro]);
+    mockShowQuickPick.mockResolvedValue({ index: 0 });
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.terminal.sendSequence", {
+      text: "show version\n"
+    });
+    expect(mockRunMacro).not.toHaveBeenCalled();
+  });
+
+  it("nexus.macro.run routes a macro with variables through runMacro, never through sendMacroText", async () => {
+    mockGetMacros.mockReturnValue([variableMacro]);
+    mockShowQuickPick.mockResolvedValue({ index: 0 });
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    expect(mockRunMacro).toHaveBeenCalledWith(variableMacro);
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
+  });
+
+  it("nexus.macro.run marks a variable macro's quick-pick description, but not a plain macro's (§9.6)", async () => {
+    mockGetMacros.mockReturnValue([plainMacro, variableMacro]);
+    mockShowQuickPick.mockResolvedValue({ index: 0 });
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    const items = mockShowQuickPick.mock.calls[0][0] as Array<{ label: string; description: string }>;
+    expect(items[0].description).not.toContain(VARIABLE_MARKER.trim());
+    expect(items[1].description).toContain(VARIABLE_MARKER.trim());
+  });
+
+  it("nexus.macro.run: a cancelled resolve (runMacro resolves without sending) results in no sendMacroText call either", async () => {
+    mockGetMacros.mockReturnValue([variableMacro]);
+    mockShowQuickPick.mockResolvedValue({ index: 0 });
+    mockRunMacro.mockResolvedValue(undefined); // simulates runMacro's own cancel path (§8.3) — it never throws
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    expect(mockRunMacro).toHaveBeenCalledTimes(1);
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
+  });
+
+  it("nexus.macro.runBinding routes through runMacro for a bound macro with variables", async () => {
+    mockGetMacros.mockReturnValue([variableMacro]);
+    vi.mocked(getAssignedBinding).mockImplementation((m) => (m === variableMacro ? "alt+1" : undefined));
+
+    await registeredCommands.get("nexus.macro.runBinding")!({ binding: "alt+1" });
+
+    expect(mockRunMacro).toHaveBeenCalledWith(variableMacro);
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
+  });
+
+  it("nexus.macro.runBinding sends a variable-free bound macro through sendMacroText unchanged", async () => {
+    mockGetMacros.mockReturnValue([plainMacro]);
+    vi.mocked(getAssignedBinding).mockImplementation((m) => (m === plainMacro ? "alt+1" : undefined));
+
+    await registeredCommands.get("nexus.macro.runBinding")!({ binding: "alt+1" });
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.terminal.sendSequence", { text: "show version\n" });
+    expect(mockRunMacro).not.toHaveBeenCalled();
+  });
+
+  it("nexus.macro.slot routes a slot-matched macro with variables through runMacro", async () => {
+    const slotMacro = { ...variableMacro, slot: 1 };
+    mockGetMacros.mockReturnValue([slotMacro]);
+
+    await registeredCommands.get("nexus.macro.slot")!({ index: 0 }); // targetSlot = (0+1)%10 = 1
+
+    expect(mockRunMacro).toHaveBeenCalledWith(slotMacro);
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
+  });
+
+  it("nexus.macro.slot sends a variable-free slot-matched macro through sendMacroText unchanged", async () => {
+    const slotMacro = { ...plainMacro, slot: 1 };
+    mockGetMacros.mockReturnValue([slotMacro]);
+
+    await registeredCommands.get("nexus.macro.slot")!({ index: 0 });
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.terminal.sendSequence", { text: "show version\n" });
+    expect(mockRunMacro).not.toHaveBeenCalled();
+  });
+
+  it("nexus.macro.runItem routes a macro with variables through runMacro", async () => {
+    await registeredCommands.get("nexus.macro.runItem")!({ index: 0, macro: variableMacro });
+
+    expect(mockRunMacro).toHaveBeenCalledWith(variableMacro);
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
+  });
+
+  it("nexus.macro.runItem sends a variable-free macro through sendMacroText unchanged", async () => {
+    await registeredCommands.get("nexus.macro.runItem")!({ index: 0, macro: plainMacro });
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.terminal.sendSequence", { text: "show version\n" });
+    expect(mockRunMacro).not.toHaveBeenCalled();
   });
 });

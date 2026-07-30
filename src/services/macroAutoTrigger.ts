@@ -92,6 +92,13 @@ export class MacroAutoTrigger implements vscode.Disposable {
     const activeRules = new Map<number, CompiledTriggerRule>();
     for (const [macroIndex, macro] of macros.entries()) {
       if (!macro.triggerPattern) continue;
+      // §6.1 — variables and auto-trigger are mutually exclusive. Untrusted shape
+      // guard per §4.2 (Array.isArray + length, not `?.length`); MUST be an in-loop
+      // `continue`, never a pre-filter of `macros` — macroIndex is an array
+      // position that keys defaultDisabledIndexes/disabledIndexes/enabledIndexes/
+      // intervalOwners/pruneState()/the tree's setDisabled(); pre-filtering shifts
+      // every index after the first skipped macro and corrupts that keying.
+      if (Array.isArray(macro.variables) && macro.variables.length > 0) continue;
       if (macro.triggerScope !== undefined && !VALID_TRIGGER_SCOPES.has(macro.triggerScope)) continue;
       if (macro.triggerInitiallyDisabled) {
         this.defaultDisabledIndexes.add(macroIndex);

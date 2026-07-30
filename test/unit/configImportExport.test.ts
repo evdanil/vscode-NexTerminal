@@ -132,6 +132,7 @@ import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroS
 import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
+import type { TerminalMacro } from "../../src/models/terminalMacro";
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
@@ -1217,6 +1218,69 @@ describe("share export command", () => {
 
     expect(mockWriteFile).not.toHaveBeenCalled();
   });
+
+  it("Fix 1 — a masked variable's plaintext default never reaches the exported share payload", async () => {
+    const shareStore = new InMemoryMacroStore();
+    await shareStore.initialize();
+    await shareStore.save([
+      {
+        name: "Login",
+        text: "login $password\n",
+        secret: false,
+        variables: [{ name: "password", secret: true, default: "hunter2" }]
+      }
+    ]);
+    setActiveMacroStore(shareStore);
+
+    const savedUri = { fsPath: "/fake/export-vars.json", scheme: "file" };
+    mockShowSaveDialog.mockResolvedValue(savedUri);
+    mockWriteFile.mockResolvedValue(undefined);
+
+    const exportCmd = registeredCommands.get("nexus.config.export")!;
+    await exportCmd();
+
+    expect(mockWriteFile).toHaveBeenCalledTimes(1);
+    const writtenText = Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8");
+    expect(writtenText).not.toContain("hunter2");
+
+    const writtenData = JSON.parse(writtenText);
+    const login = writtenData.macros.find((m: { name: string }) => m.name === "Login");
+    expect(login.variables).toEqual([{ name: "password", secret: true }]);
+  });
+
+  it("Fix C boundary — an array-like (non-array) variables value is dropped, not leaked, in the exported share payload", async () => {
+    // Well-formed-array export tests (above) can't catch this: the redaction loop in
+    // the pre-fix withRedactedVariables() only ran on real arrays, so an array-like
+    // object from a hand-edited settings.json (e.g. `{0: {...}, length: 1}`) passed
+    // through untouched, carrying a masked entry's plaintext `default` into the
+    // share file.
+    const shareStore = new InMemoryMacroStore();
+    await shareStore.initialize();
+    await shareStore.save([
+      {
+        name: "Login",
+        text: "login $password\n",
+        secret: false,
+        variables: { 0: { name: "password", secret: true, default: "hunter2" }, length: 1 }
+      } as unknown as TerminalMacro
+    ]);
+    setActiveMacroStore(shareStore);
+
+    const savedUri = { fsPath: "/fake/export-vars-arraylike.json", scheme: "file" };
+    mockShowSaveDialog.mockResolvedValue(savedUri);
+    mockWriteFile.mockResolvedValue(undefined);
+
+    const exportCmd = registeredCommands.get("nexus.config.export")!;
+    await exportCmd();
+
+    expect(mockWriteFile).toHaveBeenCalledTimes(1);
+    const writtenText = Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8");
+    expect(writtenText).not.toContain("hunter2");
+
+    const writtenData = JSON.parse(writtenText);
+    const login = writtenData.macros.find((m: { name: string }) => m.name === "Login");
+    expect(login.variables).toBeUndefined();
+  });
 });
 
 describe("backup export command", () => {
@@ -1295,6 +1359,72 @@ describe("backup export command", () => {
 
     // Original IDs preserved in backup
     expect(writtenData.servers[0].id).toBe("s1");
+  });
+
+  it("Fix 2 — strips a masked variable's plaintext default from the top-level (cleartext) macros array", async () => {
+    // The InMemoryMacroStore used here does NOT itself sanitize on save() (only
+    // VscodeMacroStore does, at its own persistence chokepoint) — so if this
+    // assertion passes, it's specifically because configCommands.ts's own
+    // `withRedactedVariables(...)` call (applied per-macro when building
+    // `nonSecretForTopLevel`) did the stripping, not because the store already
+    // cleaned the data before we saw it.
+    const backupExportStore = new InMemoryMacroStore();
+    await backupExportStore.initialize();
+    await backupExportStore.save([
+      {
+        name: "Login",
+        text: "login $password\n",
+        variables: [{ name: "password", label: "Password", secret: true, default: "hunter2" }]
+      }
+    ]);
+    setActiveMacroStore(backupExportStore);
+
+    mockShowInputBox
+      .mockResolvedValueOnce("testpass123")
+      .mockResolvedValueOnce("testpass123");
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+    mockWriteFile.mockResolvedValue(undefined);
+
+    const backupCmd = registeredCommands.get("nexus.config.export.backup")!;
+    await backupCmd();
+
+    const writtenData = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+    expect(Array.isArray(writtenData.macros)).toBe(true);
+    // The `macros` array sits OUTSIDE `encryptedSecrets` — the whole point of the
+    // fix is that this plaintext default never appears anywhere in the backup file.
+    expect(JSON.stringify(writtenData)).not.toContain("hunter2");
+    const loginMacro = writtenData.macros.find((m: { name: string }) => m.name === "Login");
+    expect(loginMacro.variables).toEqual([{ name: "password", label: "Password", secret: true }]);
+  });
+
+  it("Fix C boundary — an array-like (non-array) variables value is dropped from the top-level (cleartext) macros array", async () => {
+    // Same gap as the share-export boundary test above, exercised on the backup path's
+    // own `nonSecretForTopLevel` mapping.
+    const backupExportStore = new InMemoryMacroStore();
+    await backupExportStore.initialize();
+    await backupExportStore.save([
+      {
+        name: "Login",
+        text: "login $password\n",
+        variables: { 0: { name: "password", label: "Password", secret: true, default: "hunter2" }, length: 1 }
+      } as unknown as TerminalMacro
+    ]);
+    setActiveMacroStore(backupExportStore);
+
+    mockShowInputBox
+      .mockResolvedValueOnce("testpass123")
+      .mockResolvedValueOnce("testpass123");
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup-vars-arraylike.json", scheme: "file" });
+    mockWriteFile.mockResolvedValue(undefined);
+
+    const backupCmd = registeredCommands.get("nexus.config.export.backup")!;
+    await backupCmd();
+
+    const writtenData = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+    expect(Array.isArray(writtenData.macros)).toBe(true);
+    expect(JSON.stringify(writtenData)).not.toContain("hunter2");
+    const loginMacro = writtenData.macros.find((m: { name: string }) => m.name === "Login");
+    expect(loginMacro.variables).toBeUndefined();
   });
 
   it("exports the user .ssh folder and resolved scripts folder inside encrypted secrets", async () => {
@@ -1446,6 +1576,87 @@ describe("backup import", () => {
     const secretMacro = macros.find(m => m.name === "Secret");
     expect(secretMacro?.text).toBe("super-secret");
     expect(core.getSnapshot().authProfiles).toHaveLength(1);
+  });
+
+  it("Fix A — backup restore strips the trigger even when every declared variable entry is invalid", async () => {
+    // codex noted the existing round-trip test above has no variables-plus-trigger
+    // macro, so it can't detect a regression here: this goes through the same
+    // collectIncomingMacros() path (version-2 top-level `macros` array) with a
+    // macro whose only declaration is invalid. Before Fix A, sanitization deleted
+    // the (all-invalid) `variables` array and then keyed the §6.2 trigger-strip on
+    // the surviving (now empty) array, leaving the trigger live on import.
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [
+        { name: "Password", text: "hunter2\n", triggerPattern: "[Pp]assword:", variables: [{ name: "2bad" }] }
+      ],
+      settings: {}
+    };
+
+    const importStore = new InMemoryMacroStore();
+    await importStore.initialize();
+    setActiveMacroStore(importStore);
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup-allbad.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const macros = importStore.getAll();
+    const password = macros.find((m) => m.name === "Password");
+    expect(password).toBeDefined();
+    expect(password?.variables).toBeUndefined();
+    expect(password?.triggerPattern).toBeUndefined();
+  });
+
+  it("Fix A — backup restore strips the trigger when variables is a malformed non-array", async () => {
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [
+        { name: "Password", text: "hunter2\n", triggerPattern: "[Pp]assword:", variables: "abc" },
+        {
+          name: "PasswordArrayLike",
+          text: "hunter2\n",
+          triggerPattern: "[Pp]assword:",
+          variables: { 0: { name: "password", secret: true, default: "hunter2" }, length: 1 }
+        }
+      ],
+      settings: {}
+    };
+
+    const importStore = new InMemoryMacroStore();
+    await importStore.initialize();
+    setActiveMacroStore(importStore);
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup-malformed.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const macros = importStore.getAll();
+    const stringShape = macros.find((m) => m.name === "Password");
+    expect(stringShape?.variables).toBeUndefined();
+    expect(stringShape?.triggerPattern).toBeUndefined();
+
+    const arrayLikeShape = macros.find((m) => m.name === "PasswordArrayLike");
+    expect(arrayLikeShape?.variables).toBeUndefined();
+    expect(arrayLikeShape?.triggerPattern).toBeUndefined();
   });
 
   it("shows error on wrong password", async () => {
@@ -1729,6 +1940,296 @@ describe("share import", () => {
     const macros = shareImportStore.getAll();
     expect(macros.map(m => m.name)).toContain("hello");
     expect(macros.find(m => m.name === "hello")?.text).toBe("hi");
+  });
+
+  it("share import sanitizes variables — a masked variable's plaintext default never reaches the store", async () => {
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    setActiveMacroStore(macroStore);
+
+    // A share file is untrusted input from another machine. The editor blocks a
+    // default on a masked variable, but nothing stops a hand-written share file
+    // carrying one — and it would then sit in globalState and be picked up by
+    // "Copy All as JSON".
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [
+        {
+          name: "Login",
+          text: "login $password\n",
+          variables: [{ name: "password", secret: true, default: "hunter2" }]
+        },
+        {
+          // Variables + auto-trigger is unsupported: the trigger must be stripped,
+          // the declarations kept (§6.2).
+          name: "Both",
+          text: "connect $host\n",
+          triggerPattern: "[Pp]assword:\\s*$",
+          variables: [{ name: "host" }]
+        },
+        {
+          name: "Malformed",
+          text: "run $ok\n",
+          variables: [{ name: "2bad" }, { name: "ok" }, { name: "ok" }]
+        }
+      ]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-hostile.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    await registeredCommands.get("nexus.config.import")!();
+
+    const macros = macroStore.getAll();
+    const login = macros.find((m) => m.name === "Login")!;
+    expect(login.variables?.[0]).toEqual({ name: "password", secret: true });
+    expect(JSON.stringify(macros)).not.toContain("hunter2");
+
+    const both = macros.find((m) => m.name === "Both")!;
+    expect(both.triggerPattern).toBeUndefined();
+    expect(both.variables?.map((v) => v.name)).toEqual(["host"]);
+
+    const malformed = macros.find((m) => m.name === "Malformed")!;
+    expect(malformed.variables?.map((v) => v.name)).toEqual(["ok"]);
+  });
+
+  it("Fix A — share import strips the trigger even when every declared variable entry is invalid", async () => {
+    // Share exports never carry secret macros (importShareData filters `!m.secret`
+    // before sanitizing), so this uses a non-secret stand-in for the
+    // `{secret: true, ...}` example in the fix's rationale — the trigger-strip
+    // logic under test is identical either way.
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    setActiveMacroStore(macroStore);
+
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [
+        { name: "Password", text: "hunter2\n", triggerPattern: "[Pp]assword:", variables: [{ name: "2bad" }] }
+      ]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-allbad.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    await registeredCommands.get("nexus.config.import")!();
+
+    const macros = macroStore.getAll();
+    const password = macros.find((m) => m.name === "Password");
+    expect(password).toBeDefined();
+    expect(password?.variables).toBeUndefined();
+    expect(password?.triggerPattern).toBeUndefined();
+  });
+
+  it("Fix A — share import strips the trigger when variables is a malformed non-array or array-like value", async () => {
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    setActiveMacroStore(macroStore);
+
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [
+        { name: "Password", text: "hunter2\n", triggerPattern: "[Pp]assword:", variables: "abc" },
+        {
+          name: "PasswordArrayLike",
+          text: "hunter2\n",
+          triggerPattern: "[Pp]assword:",
+          variables: { 0: { name: "password", secret: true, default: "hunter2" }, length: 1 }
+        }
+      ]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-malformed.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    await registeredCommands.get("nexus.config.import")!();
+
+    const macros = macroStore.getAll();
+    const stringShape = macros.find((m) => m.name === "Password");
+    expect(stringShape?.variables).toBeUndefined();
+    expect(stringShape?.triggerPattern).toBeUndefined();
+
+    const arrayLikeShape = macros.find((m) => m.name === "PasswordArrayLike");
+    expect(arrayLikeShape?.variables).toBeUndefined();
+    expect(arrayLikeShape?.triggerPattern).toBeUndefined();
+  });
+
+  it("regression guard — share import keeps the trigger on a macro with no variables key at all", async () => {
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    setActiveMacroStore(macroStore);
+
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [{ name: "Router", text: "show version\n", triggerPattern: "router#" }]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-legit-trigger.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    await registeredCommands.get("nexus.config.import")!();
+
+    const macros = macroStore.getAll();
+    const router = macros.find((m) => m.name === "Router");
+    expect(router?.triggerPattern).toBe("router#");
+    expect(router?.variables).toBeUndefined();
+  });
+
+  it("keyOf includes declared variable names — two macros differing only in variables are NOT deduped (§10)", async () => {
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    await macroStore.save([{ id: "existing-1", name: "cmd", text: "run\n" }]);
+    setActiveMacroStore(macroStore);
+
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [{ name: "cmd", text: "run\n", variables: [{ name: "host" }] }]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-vars.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const macros = macroStore.getAll();
+    expect(macros).toHaveLength(2); // NOT collapsed — variables make the key distinct
+    expect(macros.filter((m) => m.name === "cmd")).toHaveLength(2);
+    expect(macros.some((m) => Array.isArray(m.variables) && m.variables[0]?.name === "host")).toBe(true);
+    expect(macros.some((m) => m.variables === undefined)).toBe(true);
+  });
+
+  it("keyOf treats a macro with identical variables as a true duplicate on share-import merge", async () => {
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    await macroStore.save([{ id: "existing-1", name: "cmd", text: "run\n", variables: [{ name: "host" }] }]);
+    setActiveMacroStore(macroStore);
+
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [{ name: "cmd", text: "run\n", variables: [{ name: "host" }] }]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-vars-dup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const macros = macroStore.getAll();
+    expect(macros).toHaveLength(1); // deduped — same name/text/trigger/keybinding/variables
+  });
+
+  it("Fix 2 — two entries in one share file that differ before sanitization but collide after it are deduped, not both stored", async () => {
+    const macroStore = new InMemoryMacroStore();
+    await macroStore.initialize();
+    setActiveMacroStore(macroStore);
+
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      macros: [
+        // Carries an extra invalid-named variable that sanitization drops —
+        // pre-sanitization this differs from the second entry, post-sanitization
+        // it is identical (same name/text/trigger/keybinding/variables=["host"]).
+        {
+          name: "cmd",
+          text: "run\n",
+          variables: [{ name: "host" }, { name: "2bad" }]
+        },
+        {
+          name: "cmd",
+          text: "run\n",
+          variables: [{ name: "host" }]
+        }
+      ]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-intra-file-dup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const macros = macroStore.getAll();
+    expect(macros).toHaveLength(1); // NOT two — the second entry collides with the first post-sanitization
+    expect(macros[0].variables?.map((v) => v.name)).toEqual(["host"]);
+  });
+});
+
+describe("legacy macro absorption with variables present (§10 — keyOfLegacy)", () => {
+  beforeEach(() => {
+    configStore.clear();
+  });
+
+  function makeLegacyMacroStoreContext() {
+    const stateMap = new Map<string, unknown>();
+    const secretMap = new Map<string, string>();
+    return {
+      globalState: {
+        get<T>(k: string, fb: T): T { return (stateMap.get(k) as T) ?? fb; },
+        async update(k: string, v: unknown): Promise<void> {
+          if (v === undefined) stateMap.delete(k); else stateMap.set(k, v);
+        },
+        keys(): readonly string[] { return [...stateMap.keys()]; }
+      },
+      secrets: {
+        async get(k: string): Promise<string | undefined> { return secretMap.get(k); },
+        async store(k: string, v: string): Promise<void> { secretMap.set(k, v); },
+        async delete(k: string): Promise<void> { secretMap.delete(k); }
+      }
+    } as unknown as import("vscode").ExtensionContext;
+  }
+
+  it("keyOfLegacy includes variable names — legacy macros differing only in variables are both absorbed, not deduped", async () => {
+    configStore.set("nexus.terminal.macros", [
+      { name: "cmd", text: "run\n" },
+      { name: "cmd", text: "run\n", variables: [{ name: "host" }] }
+    ]);
+
+    const fakeCtx = makeLegacyMacroStoreContext();
+    const macroStore = new VscodeMacroStore(fakeCtx);
+    await macroStore.initialize();
+
+    const macros = macroStore.getAll();
+    expect(macros).toHaveLength(2); // both absorbed — variables make the legacy key distinct
+    expect(macros.some((m) => m.variables === undefined)).toBe(true);
+    expect(macros.some((m) => Array.isArray(m.variables) && m.variables[0]?.name === "host")).toBe(true);
+  });
+
+  it("keyOfLegacy still dedupes a truly identical legacy macro (same variables) on re-absorption", async () => {
+    configStore.set("nexus.terminal.macros", [{ name: "cmd", text: "run\n", variables: [{ name: "host" }] }]);
+
+    const fakeCtx = makeLegacyMacroStoreContext();
+    let macroStore = new VscodeMacroStore(fakeCtx);
+    await macroStore.initialize();
+    expect(macroStore.getAll()).toHaveLength(1);
+
+    // Simulate the legacy setting reappearing (Settings Sync replay) with the SAME entry.
+    configStore.set("nexus.terminal.macros", [{ name: "cmd", text: "run\n", variables: [{ name: "host" }] }]);
+    macroStore = new VscodeMacroStore(fakeCtx);
+    await macroStore.initialize();
+    expect(macroStore.getAll()).toHaveLength(1); // not duplicated
   });
 });
 

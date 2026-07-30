@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
+import { VscodeMacroStore } from "../../src/storage/vscodeMacroStore";
 import { setActiveMacroStore } from "../../src/macroSettings";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
@@ -1016,5 +1017,182 @@ describe("MacroAutoTrigger", () => {
 
     expect(sent).toEqual([]);
     obs.dispose();
+  });
+
+  describe("macro variables (§6.1) — variables and auto-trigger are mutually exclusive", () => {
+    it("a macro with variables compiles no rule, even with an otherwise-valid trigger pattern", () => {
+      setConfig([
+        { name: "hasVars", text: "show ip route $host\n", triggerPattern: "router#", variables: [{ name: "host" }] }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    it("a corrupt `variables: \"abc\"` shape does NOT suppress a valid trigger (§4.2 — Array.isArray guard, not `?.length`)", () => {
+      setConfig([
+        { name: "corruptVars", text: "yes\n", triggerPattern: "Continue\\?", variables: "abc" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("Continue?");
+      flush();
+
+      expect(sent).toEqual(["yes\n"]);
+      obs.dispose();
+    });
+
+    it("an empty `variables: []` does NOT suppress a valid trigger", () => {
+      setConfig([
+        { name: "emptyVars", text: "yes\n", triggerPattern: "Continue\\?", variables: [] }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("Continue?");
+      flush();
+
+      expect(sent).toEqual(["yes\n"]);
+      obs.dispose();
+    });
+
+    it("positional coherence: disabling index 2 survives reload even though index 1 declares variables and compiles no rule — intervalOwners still keys the interval macro at 0", () => {
+      setConfig([
+        { name: "interval", text: "show status\n", triggerPattern: "router#", triggerInterval: 10 },
+        { name: "hasVars", text: "show ip route $host\n", triggerPattern: "router#", variables: [{ name: "host" }] },
+        { name: "pw", text: "secret123\n", triggerPattern: "[Pp]assword:\\s*$" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      // Arm the interval macro at index 0 so intervalOwners keys it there.
+      obs.onOutput("router#");
+      flush();
+      expect(sent).toEqual(["show status\n"]);
+
+      // The tree's toggle operates on raw array index — disable index 2 (the
+      // password macro), exactly as extension.ts's setDisabled(item.index, …) would.
+      trigger.setDisabled(2, true);
+      expect(trigger.isDisabled(2)).toBe(true);
+
+      // Reload (e.g. triggered by an unrelated settings change). A pre-filtering
+      // bug would compile the surviving password macro at index 1, corrupting
+      // both isDisabled(2) and the interval macro's ownership keying at index 0.
+      trigger.reload();
+
+      expect(trigger.isDisabled(2)).toBe(true);
+      expect(trigger.isDisabled(0)).toBe(false);
+
+      // Index 2 (still disabled) must not fire the password macro.
+      obs.onOutput("Password: ");
+      flush();
+      expect(sent).toEqual(["show status\n"]);
+
+      // Index 0's interval ownership survived reload — re-arm and confirm it
+      // still fires the SAME interval macro after the interval elapses.
+      obs.onOutput("Codes: C connected\r\nrouter#");
+      vi.advanceTimersByTime(10_000);
+      flush();
+      expect(sent).toEqual(["show status\n", "show status\n"]);
+
+      // Re-enabling index 2 fires the password macro — proving the index still
+      // resolves to it, not to the (compile-skipped) variables macro at index 1.
+      trigger.setDisabled(2, false);
+      obs.onOutput("Password: ");
+      flush();
+      expect(sent).toEqual(["show status\n", "show status\n", "secret123\n"]);
+
+      obs.dispose();
+    });
+  });
+
+  describe("end-to-end: store redaction composed with auto-trigger compilation (security regression)", () => {
+    // Deliberately uses VscodeMacroStore, not the InMemoryMacroStore that `setConfig()`
+    // wires up above: InMemoryMacroStore.save() never calls `withRedactedVariables` at
+    // all, so routing this scenario through it would pass regardless of whether the
+    // redaction fix works. VscodeMacroStore.save() / reloadFromState() are the actual
+    // persistence chokepoints the fix lives at, so this test drives a real instance of
+    // one (against a fake in-memory vscode context, as in macroStore.test.ts) instead
+    // of stubbing the store layer away.
+    function makeFakeVscodeContext() {
+      const stateBag = new Map<string, unknown>();
+      const secretBag = new Map<string, string>();
+      return {
+        context: {
+          globalState: {
+            get<T>(key: string, fallback: T): T {
+              return (stateBag.get(key) as T) ?? fallback;
+            },
+            async update(key: string, value: unknown): Promise<void> {
+              if (value === undefined) stateBag.delete(key);
+              else stateBag.set(key, value);
+            }
+          },
+          secrets: {
+            async get(key: string): Promise<string | undefined> {
+              return secretBag.get(key);
+            },
+            async store(key: string, value: string): Promise<void> {
+              secretBag.set(key, value);
+            },
+            async delete(key: string): Promise<void> {
+              secretBag.delete(key);
+            }
+          }
+        } as unknown as import("vscode").ExtensionContext,
+        stateBag
+      };
+    }
+
+    it("a macro whose only variable declaration is invalid-named stays suppressed end to end — the exact incident from the security fix", async () => {
+      const { context } = makeFakeVscodeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+      await store.save([
+        {
+          name: "Password",
+          text: "hunter2\n",
+          secret: true,
+          triggerPattern: "[Pp]assword:",
+          variables: [{ name: "2bad" }]
+        }
+      ]);
+
+      // Sanity check on the composed precondition: the invalid-named declaration
+      // must have survived the store round-trip as a non-empty array — that's
+      // exactly what keeps `MacroAutoTrigger.reload()`'s
+      // `Array.isArray(variables) && variables.length > 0` guard suppressing this
+      // macro's trigger. If the old `withSanitizedVariables` behaviour regressed
+      // back in, this array would be empty or the key would be gone.
+      const stored = store.getAll();
+      expect(Array.isArray(stored[0].variables)).toBe(true);
+      expect(stored[0].variables!.length).toBeGreaterThan(0);
+
+      setActiveMacroStore(store);
+      const trigger = new MacroAutoTrigger(); // constructor calls reload() synchronously
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("Password: ");
+      flush();
+
+      // The regression this guards against: a masked/secret macro whose sole
+      // declared variable has an invalid name must NOT auto-fire on matching
+      // output. Before the fix, normalization at the store boundary dropped the
+      // invalid entry, emptied `variables`, un-suppressed the trigger, and
+      // "hunter2\n" would have been sent here.
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
   });
 });

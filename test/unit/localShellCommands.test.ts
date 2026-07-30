@@ -499,6 +499,46 @@ describe("registerLocalShellCommands", () => {
     expect(ctx.localShellTerminals.size).toBe(0);
   });
 
+  it("Fix 3 — does not warn when the only all-terminal auto-trigger macro also declares variables (it can never compile to a trigger rule)", async () => {
+    mockMacros.push({
+      name: "Password prompt",
+      text: "secret\n",
+      triggerPattern: "[Pp]assword:",
+      variables: [{ name: "host" }]
+    });
+    const terminal = { show: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+    mockCreateTerminal.mockReturnValueOnce(terminal);
+    const ctx = makeCtx();
+
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.connect")!("local-1");
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(mockCreateTerminal).toHaveBeenCalled();
+    expect(ctx.localShellTerminals.size).toBe(1);
+  });
+
+  it("Fix 3 — the same macro without `variables` still warns", async () => {
+    mockMacros.push({
+      name: "Password prompt",
+      text: "secret\n",
+      triggerPattern: "[Pp]assword:"
+    });
+    mockShowWarningMessage.mockResolvedValueOnce("Review Macros");
+    const ctx = makeCtx();
+
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.connect")!("local-1");
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("Existing \"All terminals\" macros can also run in Local Shell sessions."),
+      "Review Macros",
+      "Disable Globally",
+      "Continue"
+    );
+    expect(mockCreateTerminal).not.toHaveBeenCalled();
+  });
+
   it("rejects unsupported source-only VS Code terminal profiles with explicit Custom Shell guidance", async () => {
     const ctx = makeCtx(makeProfile({
       launchMode: "vscodeProfile",

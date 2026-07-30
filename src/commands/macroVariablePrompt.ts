@@ -1,0 +1,250 @@
+import * as vscode from "vscode";
+import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import {
+  getValidMacroVariables,
+  scanPlaceholders,
+  substituteMacroVariables
+} from "../services/macroVariables";
+
+/**
+ * Runtime flow for prompted macro variables (docs/plans/2026-07-29-macro-variables.md §8).
+ *
+ * This module owns the ONLY send path that is not same-tick with the user's
+ * invocation — everything here exists to make that safe:
+ *   - §8.1 the send target is pinned at invocation, never the terminal that
+ *     happens to be active when the prompts finally resolve.
+ *   - §8.2 a single reused `InputBox` walks the declared-and-used variables in
+ *     order, with Back support.
+ *   - §8.3 every abort path reports through the status bar, never silently.
+ *   - §8.4 re-entrancy is guarded by a module-level in-flight Promise, released
+ *     in a `finally` that survives a throwing resolver.
+ *   - §7.1 non-secret values are remembered per-window, keyed by macro id —
+ *     never for secret variables, never when the macro has no id.
+ */
+
+/** In-memory only, window-scoped, lost on reload — §7.1 / §13. Key: `${macro.id}:${varName}`. */
+const rememberedValues = new Map<string, string>();
+
+/** Shared empty value map for the "declared but nothing to prompt for" path. */
+const EMPTY_VALUES: Readonly<Record<string, string>> = Object.freeze(Object.create(null));
+
+interface InFlightRun {
+  key: string;
+  macroName: string;
+  promise: Promise<void>;
+}
+
+let inFlight: InFlightRun | undefined;
+
+/** Releases the re-entrancy guard only if it is still held by `key` — never someone else's. */
+function releaseInFlight(key: string): void {
+  if (inFlight !== undefined && inFlight.key === key) {
+    inFlight = undefined;
+  }
+}
+
+/** Stable-enough identity for the re-entrancy guard across separate `getMacros()` snapshots. */
+function macroIdentityKey(macro: TerminalMacro): string {
+  return macro.id ? `id:${macro.id}` : `anon:${macro.name}\u0000${macro.text}`;
+}
+
+function isTerminalStillValid(target: vscode.Terminal): boolean {
+  return vscode.window.terminals.includes(target) && target.exitStatus === undefined;
+}
+
+type StepOutcome = { kind: "accept"; value: string } | { kind: "back" } | { kind: "cancel" };
+
+function waitForInputBoxStep(box: vscode.InputBox): Promise<StepOutcome> {
+  return new Promise<StepOutcome>((resolve) => {
+    let settled = false;
+    const disposables: vscode.Disposable[] = [];
+    const settle = (outcome: StepOutcome): void => {
+      if (settled) return;
+      settled = true;
+      for (const d of disposables) d.dispose();
+      resolve(outcome);
+    };
+
+    disposables.push(box.onDidAccept(() => settle({ kind: "accept", value: box.value })));
+    disposables.push(
+      box.onDidTriggerButton((button) => {
+        // Any button that is not Back is treated as a cancel rather than ignored:
+        // ignoring it would leave this promise pending forever, so `box.dispose()`
+        // would never run and the re-entrancy guard would never be released.
+        settle(button === vscode.QuickInputButtons.Back ? { kind: "back" } : { kind: "cancel" });
+      })
+    );
+    // Fires on ESC, and on any other dismissal — §8.2: "ESC/hide aborts everything."
+    disposables.push(box.onDidHide(() => settle({ kind: "cancel" })));
+
+    box.show();
+  });
+}
+
+/**
+ * Walks `variables` (already filtered to "used, in declaration order") through one
+ * reused InputBox. Returns the collected values, or `undefined` if the whole
+ * sequence was cancelled (ESC/hide at any step) — §8.2: cancel aborts everything,
+ * never a partial send.
+ */
+async function promptForValues(
+  macro: TerminalMacro,
+  variables: MacroVariable[]
+): Promise<Record<string, string> | undefined> {
+  const box = vscode.window.createInputBox();
+  box.ignoreFocusOut = true;
+  box.title = `Run "${macro.name}"`;
+
+  const entered: Array<string | undefined> = new Array(variables.length).fill(undefined);
+
+  try {
+    let step = 0;
+    while (step < variables.length) {
+      const variable = variables[step];
+      const rememberKey = macro.id && !variable.secret ? `${macro.id}:${variable.name}` : undefined;
+      const remembered = rememberKey ? rememberedValues.get(rememberKey) : undefined;
+
+      box.step = step + 1;
+      box.totalSteps = variables.length;
+      box.prompt = variable.label ?? variable.name;
+      box.password = !!variable.secret;
+      // A masked step never prefills — not from `remembered`/`default` (§7.1) and not
+      // from `entered` either: backing into a secret step would otherwise re-seat the
+      // previously typed secret in `box.value` and carry it across the remaining steps.
+      box.value = variable.secret ? "" : entered[step] ?? remembered ?? variable.default ?? "";
+      box.buttons = step > 0 ? [vscode.QuickInputButtons.Back] : [];
+
+      const outcome = await waitForInputBoxStep(box);
+
+      if (outcome.kind === "cancel") {
+        return undefined;
+      }
+      if (outcome.kind === "back") {
+        step = Math.max(0, step - 1);
+        continue;
+      }
+
+      entered[step] = outcome.value;
+      if (rememberKey && variable.remember !== false) {
+        rememberedValues.set(rememberKey, outcome.value);
+      }
+      step++;
+    }
+  } finally {
+    box.dispose();
+  }
+
+  // Object.create(null), not `{}`: `__proto__` is a legal variable name under
+  // MACRO_VARIABLE_NAME_PATTERN, and `values["__proto__"] = "10.0.0.1"` on a normal
+  // object literal hits Object.prototype's setter, silently creating no own property —
+  // so the user would be prompted and their answer then dropped on the floor.
+  const values = Object.create(null) as Record<string, string>;
+  variables.forEach((variable, index) => {
+    values[variable.name] = entered[index] ?? "";
+  });
+  return values;
+}
+
+/**
+ * Resolves a macro's text against its declared variables: scans for which
+ * declared placeholders actually appear (§5.3), prompts for those only, then
+ * substitutes (§5.2). Returns the ORIGINAL `macro.text` by identity when there is
+ * nothing to resolve (§4.1 — no macro without a `variables` array is ever
+ * affected), and `undefined` if the prompt sequence was cancelled.
+ *
+ * Contains no target-pinning or sending — that is `runMacro()`'s job, so this
+ * function is directly testable against the prompt/substitution flow alone.
+ */
+export async function resolveMacroText(macro: TerminalMacro): Promise<string | undefined> {
+  const declared = getValidMacroVariables(macro);
+  if (declared.length === 0) {
+    return macro.text;
+  }
+
+  const declaredNames = declared.map((v) => v.name);
+  const scan = scanPlaceholders(macro.text, declaredNames);
+
+  // No unescaped use → nothing to prompt for, but a declared name may still appear as
+  // `$${name}`, and that escape must still be un-escaped (§5.1). Returning `macro.text`
+  // here would make the escape work or not depending on whether some *other* part of
+  // the same macro happened to use the name unescaped.
+  if (scan.used.length === 0) {
+    return substituteMacroVariables(macro.text, EMPTY_VALUES, declaredNames);
+  }
+
+  const toPrompt = declared.filter((v) => scan.used.includes(v.name));
+  const values = await promptForValues(macro, toPrompt);
+  if (values === undefined) {
+    return undefined;
+  }
+  // `declaredNames` is passed separately from `values`: only *used* names were
+  // prompted, so a declared-but-escaped-only name has no value yet still needs its
+  // escape honoured.
+  return substituteMacroVariables(macro.text, values, declaredNames);
+}
+
+/**
+ * The one entry point for running a macro that declares variables (§8.5) — the
+ * four manual run paths in macroCommands.ts route here instead of
+ * `sendMacroText()` whenever `hasMacroVariables(macro)` is true. Variable-free
+ * macros never reach this module.
+ */
+export async function runMacro(macro: TerminalMacro): Promise<void> {
+  const key = macroIdentityKey(macro);
+
+  if (inFlight) {
+    if (inFlight.key === key) {
+      // Key auto-repeat firing before the first box takes focus — drop silently (§8.4).
+      return;
+    }
+    vscode.window.setStatusBarMessage(
+      `A macro is already waiting for input ("${inFlight.macroName}").`,
+      4000
+    );
+    return;
+  }
+
+  // §8.1 — captured BEFORE the first await, and never re-derived afterward.
+  const target = vscode.window.activeTerminal;
+  if (!target) {
+    vscode.window.setStatusBarMessage("No active terminal — nothing was sent.", 4000);
+    return;
+  }
+
+  // The guard entry is installed BEFORE the run starts, not after. If it were assigned
+  // afterwards, the correctness of the whole guard would rest on the run body always
+  // suspending at its first `await` — and any early `return` added above that await
+  // would run `releaseInFlight` against a still-empty `inFlight`, after which this
+  // assignment would install an already-completed run and lock out every macro until
+  // the window reloads. That is the exact failure the guard exists to prevent.
+  const entry: InFlightRun = { key, macroName: macro.name, promise: Promise.resolve() };
+  inFlight = entry;
+
+  const run = (async (): Promise<void> => {
+    try {
+      const resolved = await resolveMacroText(macro);
+      if (resolved === undefined) {
+        vscode.window.setStatusBarMessage(`Macro "${macro.name}" cancelled — nothing was sent.`, 4000);
+        return;
+      }
+      if (!isTerminalStillValid(target)) {
+        vscode.window.setStatusBarMessage("Target terminal closed — nothing was sent.", 4000);
+        return;
+      }
+      target.sendText(resolved, false);
+      // Every abort path above reports through the status bar (§8.3) — a
+      // successful send needs the same signal, or a send to a non-focused
+      // terminal is completely silent after however long the prompts took.
+      // Never include the resolved text or any entered value here.
+      vscode.window.setStatusBarMessage(`Macro "${macro.name}" sent to ${target.name}.`, 4000);
+    } finally {
+      // §8.4 — cleared in a finally wrapping the ENTIRE resolve-and-send, so a
+      // throw anywhere above still releases the guard instead of locking every
+      // macro out until the window reloads.
+      releaseInFlight(key);
+    }
+  })();
+
+  entry.promise = run;
+  await run;
+}

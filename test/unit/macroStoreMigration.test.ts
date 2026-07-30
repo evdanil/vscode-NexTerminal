@@ -137,6 +137,27 @@ describe("MacroStore legacy migration", () => {
     expect(store.getAll()).toEqual([]);
   });
 
+  it("Fix 1 — a masked variable's plaintext default in legacy settings never reaches globalState", async () => {
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    vscode.__setConfig("nexus.terminal", {
+      global: [
+        {
+          name: "Login",
+          text: "login $password\n",
+          variables: [{ name: "password", secret: true, default: "hunter2" }]
+        } as TerminalMacro
+      ]
+    });
+    const { ctx, state } = makeCtx();
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    expect(store.getAll().map((m) => m.name)).toEqual(["Login"]);
+    const persisted = state.get("nexus.macros") as TerminalMacro[];
+    expect(JSON.stringify(persisted)).not.toContain("hunter2");
+    expect(persisted[0].variables).toEqual([{ name: "password", secret: true }]);
+  });
+
   it("does not duplicate secret macros when Settings Sync replays cleartext", async () => {
     const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
     vscode.__setConfig("nexus.terminal", { global: [{ name: "pw", text: "hunter2", secret: true }] });

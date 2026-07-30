@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderMacroEditorHtml } from "../../src/ui/macroEditorHtml";
-import type { TerminalMacro } from "../../src/models/terminalMacro";
+import type { MacroVariable, TerminalMacro } from "../../src/models/terminalMacro";
 
 const nonce = "test-nonce-456";
 
@@ -239,6 +239,384 @@ describe("renderMacroEditorHtml", () => {
     expect(html).not.toContain("NESTED_QUANTIFIER_RE");
   });
 
+  it("produces syntactically valid inline JavaScript", () => {
+    // A safety net against TS-template-literal escaping mistakes (this file
+    // hand-builds JS source as text) — this would have caught a stray
+    // unescaped quote or an unintentionally "live" ${...} interpolation.
+    const macros: TerminalMacro[] = [
+      { name: "IPMI", text: "ipmitool -H $host", variables: [{ name: "host", label: "Host" }] }
+    ];
+    const html = render(macros, 0);
+    const scriptMatch = html.match(/<script[^>]*>([\s\S]*?)<\/script>/);
+    expect(scriptMatch).not.toBeNull();
+    const scriptBody = scriptMatch![1];
+    expect(() => new Function(scriptBody)).not.toThrow();
+  });
+
+  describe("Variables section (§9.1-§9.4)", () => {
+    it("places the Variables section between Text and the macro-level Secret checkbox", () => {
+      const html = render([], null);
+      const textIdx = html.indexOf('id="macro-text"');
+      const variablesIdx = html.indexOf('id="variables-list"');
+      const secretIdx = html.indexOf('id="macro-secret"');
+      expect(textIdx).toBeGreaterThan(-1);
+      expect(variablesIdx).toBeGreaterThan(textIdx);
+      expect(secretIdx).toBeGreaterThan(variablesIdx);
+    });
+
+    it("renders the Add Variable button", () => {
+      const html = render([], null);
+      expect(html).toContain('id="add-variable-btn"');
+      expect(html).toContain("+ Add Variable");
+    });
+
+    it("renders a hidden template row for cloning new rows in webview JS", () => {
+      const html = render([], null);
+      expect(html).toContain('id="variable-row-template"');
+      expect(html).toContain("<template");
+    });
+
+    it("renders existing variable rows from macro.variables, HTML-escaped", () => {
+      const macros: TerminalMacro[] = [
+        {
+          name: "IPMI",
+          text: "ipmitool -H $host",
+          variables: [{ name: "host", label: "<b>Host</b>", default: '10.0.0.1"' }]
+        }
+      ];
+      const html = render(macros, 0);
+      expect(html).toContain('class="var-name" value="host"');
+      expect(html).toContain("&lt;b&gt;Host&lt;/b&gt;");
+      expect(html).toContain("10.0.0.1&quot;");
+      expect(html).not.toContain("<b>Host</b>");
+    });
+
+    it("never renders a default value or an enabled default field for a masked variable", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$password", variables: [{ name: "password", secret: true, default: "leaked" }] }
+      ];
+      const html = render(macros, 0);
+      expect(html).not.toContain("leaked");
+      expect(html).toMatch(/class="var-default" value=""\s+disabled/);
+    });
+
+    it("uses 'Mask input (never stored)' and \"Don't remember\" — never a second 'Secret' checkbox label", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$password", variables: [{ name: "password", secret: true }] }
+      ];
+      const html = render(macros, 0);
+      expect(html).toContain("Mask input (never stored)");
+      expect(html).toContain("Don't remember");
+      // The macro-level Secret checkbox keeps its own distinct label text.
+      expect(html).toContain("Secret (hide value in sidebar and pickers");
+    });
+
+    it("checks the Don't remember checkbox when remember is explicitly false", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$host", variables: [{ name: "host", remember: false }] }
+      ];
+      const html = render(macros, 0);
+      const rowMatch = html.match(/<div class="variable-row"[^>]*>[\s\S]*?<\/div>\s*<\/div>/);
+      expect(rowMatch).not.toBeNull();
+      expect(rowMatch![0]).toContain('class="var-remember" checked');
+    });
+
+    it("sets aria-label on the remove button referencing the variable's name", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$host", variables: [{ name: "host" }] }
+      ];
+      const html = render(macros, 0);
+      expect(html).toContain('aria-label="Remove variable host"');
+    });
+
+    it("renders a per-row error slot addressed by data-var-error", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$host", variables: [{ name: "host" }] }
+      ];
+      const html = render(macros, 0);
+      expect(html).toContain('data-var-error="0"');
+    });
+
+    it("caps the variable name input at 32 characters client-side", () => {
+      const macros: TerminalMacro[] = [
+        { name: "IPMI", text: "$host", variables: [{ name: "host" }] }
+      ];
+      const html = render(macros, 0);
+      expect(html).toContain('maxlength="32"');
+    });
+
+    it("renders an array-level error slot for the Variables section header", () => {
+      const html = render([], null);
+      expect(html).toContain('id="error-variables"');
+    });
+
+    it("does not throw when a variable has a non-string label or default (legacy-absorption shape)", () => {
+      const macros: TerminalMacro[] = [
+        {
+          name: "Legacy",
+          text: "$host",
+          variables: [{ name: "host", label: 42, default: 99 } as unknown as MacroVariable]
+        }
+      ];
+      expect(() => render(macros, 0)).not.toThrow();
+    });
+  });
+
+  describe("Live diagnostics under Text (§9.3)", () => {
+    it("uses macroVariablesWebviewJs's scan — never a second scanner", () => {
+      const html = render([], null);
+      expect(html).toContain("function scanMacroPlaceholders(");
+      expect(html).toContain("function isValidVariableName(");
+      // Called by name from this file's own diagnostics code.
+      expect(html).toContain("scanMacroPlaceholders(text, declaredNames)");
+    });
+
+    it("recomputes diagnostics on a ~300ms debounce", () => {
+      const html = render([], null);
+      expect(html).toContain("function scheduleDiagnostics()");
+      expect(html).toContain("setTimeout(computeDiagnostics, 300)");
+    });
+
+    it("reserves fixed height for the diagnostics strip so hints don't bounce the layout", () => {
+      const html = render([], null);
+      expect(html).toContain('id="variables-diagnostics"');
+    });
+
+    // Fix 4: the strip must be BOUNDED, not just given a floor. `min-height` lets a
+    // macro with several undeclared placeholders (one hint line each) grow the
+    // strip without limit and push the controls below it around per keystroke —
+    // exactly the layout-bounce this reserved strip exists to prevent. A fixed
+    // `height` + `overflow-y: auto` caps it instead.
+    it("bounds the diagnostics strip's height rather than only setting a minimum (Fix 4)", () => {
+      const html = render([], null);
+      const match = /\.variables-diagnostics\s*\{[^}]*\}/.exec(html);
+      if (!match) throw new Error(".variables-diagnostics rule not found in the rendered CSS");
+      const rule = match[0];
+      expect(rule).toMatch(/(?<!-)height:\s*54px/); // bounded, not open-ended
+      expect(rule).not.toMatch(/min-height:/);
+      expect(rule).toContain("overflow-y: auto"); // content beyond the cap scrolls instead of expanding it
+    });
+
+    it("wires an Add variable button into the undeclared-placeholder hint", () => {
+      const html = render([], null);
+      expect(html).toContain("is not declared and will be sent as-is.");
+      expect(html).toContain("addVariableRow(name)");
+    });
+
+    it("wires the declared-but-unused hint", () => {
+      const html = render([], null);
+      expect(html).toContain("does not appear in the text.");
+    });
+
+    it("wires the positive confirmation", () => {
+      const html = render([], null);
+      expect(html).toContain("Will prompt for: ");
+    });
+  });
+
+  describe("Live trigger-conflict warning (§9.4)", () => {
+    it("renders a warning slot next to both the Variables header and the trigger field", () => {
+      const html = render([], null);
+      expect(html).toContain('id="variables-trigger-conflict"');
+      expect(html).toContain('id="variables-trigger-conflict-2"');
+    });
+
+    it("wires updateTriggerConflictWarning to both the trigger field and variable-row changes", () => {
+      const html = render([], null);
+      expect(html).toContain("function updateTriggerConflictWarning()");
+      expect(html).toContain("prompt for input or auto-trigger, not both");
+      expect(html).toContain("use a Script with prompt()");
+    });
+
+    // Fix 3: updateTriggerConflictWarning() now falls back to rowHasContent(row)
+    // when no row has a declared name yet, so a row where the user typed only a
+    // label (or ticked a box) still trips the conflict instead of hiding it until
+    // Save. Same no-DOM environment as the "blank vs partially-filled variable
+    // rows" block above: extract the real function from the rendered script (not
+    // a hand-copied reimplementation) and execute it against stubs, rather than
+    // asserting on source text — a pure-string assertion would pass even if the
+    // fallback branch were deleted, as long as the literal identifier
+    // "rowHasContent(row)" still appeared somewhere else in the file.
+    describe("falls back to rowHasContent for undeclared rows (Fix 3)", () => {
+      function extractUpdateTriggerConflictWarning(
+        html: string
+      ): (
+        document: unknown,
+        variablesList: unknown,
+        rowHasContent: (row: unknown) => boolean,
+        collectDeclaredVariableNames: () => string[],
+        TRIGGER_CONFLICT_MESSAGE: string
+      ) => () => void {
+        const match = /function updateTriggerConflictWarning\(\) \{[\s\S]*?\n      \}/.exec(html);
+        if (!match) throw new Error("updateTriggerConflictWarning() not found in the rendered script");
+        return new Function(
+          "document",
+          "variablesList",
+          "rowHasContent",
+          "collectDeclaredVariableNames",
+          "TRIGGER_CONFLICT_MESSAGE",
+          `${match[0]}\nreturn updateTriggerConflictWarning;`
+        ) as ReturnType<typeof extractUpdateTriggerConflictWarning>;
+      }
+
+      function stubWarningEl() {
+        return { textContent: "", classes: {} as Record<string, boolean>, classList: undefined as unknown };
+      }
+
+      function makeHarness(triggerVal: string, pendingRows: unknown[]) {
+        const w1 = stubWarningEl();
+        const w2 = stubWarningEl();
+        for (const w of [w1, w2]) {
+          w.classList = { toggle: (cls: string, val: boolean) => { w.classes[cls] = val; } };
+        }
+        const elements: Record<string, unknown> = {
+          "macro-trigger": { value: triggerVal },
+          "variables-trigger-conflict": w1,
+          "variables-trigger-conflict-2": w2
+        };
+        const stubDocument = { getElementById: (id: string) => elements[id] };
+        const stubVariablesList = { querySelectorAll: () => pendingRows };
+        return { w1, w2, stubDocument, stubVariablesList };
+      }
+
+      it("consults rowHasContent when no row has a declared name yet, and shows the conflict for a label-only row", () => {
+        const html = render([], null);
+        const updateTriggerConflictWarning = extractUpdateTriggerConflictWarning(html);
+        const labelOnlyRow = { __marker: "label-only-row" };
+        const { w1, w2, stubDocument, stubVariablesList } = makeHarness("router#", [labelOnlyRow]);
+
+        let calledWith: unknown;
+        const rowHasContent = (row: unknown) => {
+          calledWith = row;
+          return true; // simulates a row where the user typed only a label
+        };
+        const collectDeclaredVariableNames = () => []; // no row has a name yet
+
+        const run = updateTriggerConflictWarning(
+          stubDocument,
+          stubVariablesList,
+          rowHasContent,
+          collectDeclaredVariableNames,
+          "CONFLICT_MESSAGE"
+        );
+        run();
+
+        expect(calledWith).toBe(labelOnlyRow); // the fallback actually reached the row
+        expect(w1.textContent).toBe("CONFLICT_MESSAGE");
+        expect(w2.textContent).toBe("CONFLICT_MESSAGE");
+        expect(w1.classes.visible).toBe(true);
+        expect(w2.classes.visible).toBe(true);
+      });
+
+      it("stays hidden when every pending row is wholly blank, even with a trigger pattern present", () => {
+        const html = render([], null);
+        const updateTriggerConflictWarning = extractUpdateTriggerConflictWarning(html);
+        const blankRow = { __marker: "blank-row" };
+        const { w1, w2, stubDocument, stubVariablesList } = makeHarness("router#", [blankRow]);
+
+        const rowHasContent = () => false; // wholly untouched row
+        const collectDeclaredVariableNames = () => [];
+
+        const run = updateTriggerConflictWarning(
+          stubDocument,
+          stubVariablesList,
+          rowHasContent,
+          collectDeclaredVariableNames,
+          "CONFLICT_MESSAGE"
+        );
+        run();
+
+        expect(w1.textContent).toBe("");
+        expect(w1.classes.visible).toBe(false);
+      });
+
+      it("does not fall back to rowHasContent when a row already has a declared name", () => {
+        const html = render([], null);
+        const updateTriggerConflictWarning = extractUpdateTriggerConflictWarning(html);
+        const { w1, stubDocument, stubVariablesList } = makeHarness("router#", []);
+
+        let rowHasContentCalled = false;
+        const rowHasContent = () => { rowHasContentCalled = true; return false; };
+        const collectDeclaredVariableNames = () => ["host"]; // already has a declared name
+
+        const run = updateTriggerConflictWarning(
+          stubDocument,
+          stubVariablesList,
+          rowHasContent,
+          collectDeclaredVariableNames,
+          "CONFLICT_MESSAGE"
+        );
+        run();
+
+        expect(rowHasContentCalled).toBe(false); // short-circuited — hasVars already true
+        expect(w1.classes.visible).toBe(true);
+      });
+    });
+  });
+
+  describe("saveError protocol extension (§9.2, §9.5)", () => {
+    it("routes field:'variable' saveError messages to the matching data-var-error slot and scrolls it into view", () => {
+      const html = render([], null);
+      expect(html).toContain('msg.field === "variable"');
+      expect(html).toContain('data-var-error="');
+      expect(html).toContain("scrollIntoView");
+    });
+
+    it("includes variables in the save postMessage payload", () => {
+      const html = render([], null);
+      expect(html).toContain("variables: variablesForSave");
+      expect(html).toContain("collectVariablesForSave()");
+    });
+  });
+
+  describe("blank vs partially-filled variable rows", () => {
+    // `collectVariablesForSave()` drops any row with an empty name, so validation has
+    // to be the thing that distinguishes "untouched row the user added by accident"
+    // (skip silently — an extra row must never hard-block Save) from "row where a
+    // label/default was typed and only the name is missing" (must be reported, or the
+    // row vanishes on save with no explanation).
+    //
+    // The repo's vitest environment is "node" with no DOM, so rather than assert on
+    // the source text — which would pass even if the logic were wrong — extract the
+    // guard from the rendered script and run it against a stub row. It only ever
+    // reads `.value` / `.checked` off querySelector results.
+    function extractRowHasContent(html: string): (row: unknown) => boolean {
+      const match = /function rowHasContent\(row\) \{[\s\S]*?\n      \}/.exec(html);
+      if (!match) throw new Error("rowHasContent() not found in the rendered script");
+      return new Function(`${match[0]}\nreturn rowHasContent;`)() as (row: unknown) => boolean;
+    }
+
+    function stubRow(fields: { label?: string; def?: string; secret?: boolean; remember?: boolean }) {
+      const map: Record<string, { value: string; checked: boolean }> = {
+        ".var-label": { value: fields.label ?? "", checked: false },
+        ".var-default": { value: fields.def ?? "", checked: false },
+        ".var-secret": { value: "", checked: !!fields.secret },
+        ".var-remember": { value: "", checked: !!fields.remember }
+      };
+      return { querySelector: (sel: string) => map[sel] };
+    }
+
+    it("treats a wholly untouched row as empty", () => {
+      const rowHasContent = extractRowHasContent(render([], null));
+      expect(rowHasContent(stubRow({}))).toBe(false);
+      expect(rowHasContent(stubRow({ label: "   " }))).toBe(false);
+    });
+
+    it("treats a row with any label, default, or ticked box as filled in", () => {
+      const rowHasContent = extractRowHasContent(render([], null));
+      expect(rowHasContent(stubRow({ label: "Target host" }))).toBe(true);
+      expect(rowHasContent(stubRow({ def: "10.0.0.1" }))).toBe(true);
+      expect(rowHasContent(stubRow({ secret: true }))).toBe(true);
+      expect(rowHasContent(stubRow({ remember: true }))).toBe(true);
+    });
+
+    it("reports a missing name on a filled-in row rather than dropping it silently", () => {
+      const html = render([], null);
+      expect(html).toContain("rowHasContent(row)");
+      expect(html).toContain("Variable name is required.");
+    });
+  });
+
   it("renders matching profile choices by display name instead of raw ids", () => {
     const html = renderMacroEditorHtml([], null, nonce, [
       { id: "52a3b610-f871-462c-9541-20d13c0f7e56", name: "Core Router", kind: "server" },
@@ -251,5 +629,28 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("Lab Console (Serial)");
     expect(html).not.toContain('placeholder="Server or serial profile id"');
     expect(html).not.toContain('type="text" id="macro-trigger-profile"');
+  });
+
+  // NOTE: a whole-document sweep (every line of the fully rendered HTML) is NOT
+  // used here because it also flags several PRE-EXISTING whitespace-only lines
+  // that are unrelated to Fix 4 and out of scope for this change (reported
+  // separately, not fixed): a leading "\n" in baseWebviewCss() (right after
+  // `<style>`), a leading "\n" in baseWebviewJs() (right after `<script>`), a
+  // leading "\n" in regexSafetyWebviewJs(), and the `${emptyStateHtml}` slot at
+  // the top of the body template collapsing to a bare-indent line whenever at
+  // least one macro exists. This guard is scoped to the exact call site Fix 4
+  // changed — `${macroVariablesWebviewJs()}` embedded (indented) inside the
+  // `<script>` block — so it fails only if THIS class of defect returns here.
+  it("Fix 4 guard — no whitespace-only line immediately precedes the embedded macro-variable scan functions in the rendered HTML", () => {
+    const html = render(
+      [{ id: "m1", name: "Login", text: "login $password\n", variables: [{ name: "password", secret: true }] }],
+      0
+    );
+    const lines = html.split("\n");
+    const embedIndex = lines.findIndex((line) => line.includes("function isValidVariableName("));
+    expect(embedIndex).toBeGreaterThan(0);
+    const precedingLine = lines[embedIndex - 1];
+    const isWhitespaceOnly = precedingLine.length > 0 && /^\s+$/.test(precedingLine);
+    expect(isWhitespaceOnly).toBe(false);
   });
 });

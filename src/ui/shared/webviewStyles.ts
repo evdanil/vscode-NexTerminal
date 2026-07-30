@@ -212,6 +212,98 @@ export function baseWebviewCss(): string {
       margin-top: 3px;
       line-height: 1.4;
     }
+    .variables-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .variables-section-header > label {
+      margin-bottom: 0;
+    }
+    .variables-header-error {
+      display: inline-block;
+      margin-left: 8px;
+    }
+    .variable-row {
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128,128,128,0.35)));
+      border-radius: 3px;
+      padding: 8px;
+      margin-top: 10px;
+    }
+    .variable-row-line1 {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    /* Panel is user-resizable and routinely sits at 350-450px; each text input
+       shrinks with the row but never collapses below a usable width. */
+    .variable-row-line1 input {
+      flex: 1 1 120px;
+      min-width: 120px;
+      width: auto;
+    }
+    .variable-row-line2 {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    .variable-row-line2 label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: normal;
+      font-size: 12px;
+      margin-bottom: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .variable-remove-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+    .variable-row .field-error {
+      margin-top: 6px;
+    }
+    /* Reserved height so hints appearing/disappearing under Text don't bounce
+       the layout under the user's cursor (docs/plans/2026-07-29-macro-variables.md §9.3). */
+    .variables-diagnostics {
+      /* Bounded, not just a minimum: the point of reserving this strip is that
+         hints appearing and disappearing per keystroke must not shift the controls
+         below it. A macro referencing several undeclared shell-style placeholders
+         produces one hint per name, so the strip scrolls past three rather than
+         growing without limit. */
+      height: 54px;
+      overflow-y: auto;
+      font-size: 11px;
+      line-height: 1.6;
+      margin-top: 6px;
+    }
+    .variables-diagnostics .diag-hint {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-positive {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+    }
+    .variables-diagnostics .diag-add-btn {
+      margin-left: 6px;
+      padding: 1px 8px;
+      font-size: 11px;
+    }
+    .variables-trigger-conflict {
+      display: none;
+      color: var(--vscode-errorForeground);
+      font-size: 11px;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .variables-trigger-conflict.visible {
+      display: block;
+    }
     .field-error {
       color: var(--vscode-errorForeground);
       font-size: 11px;

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { TerminalMacro } from "../models/terminalMacro";
 import type { MacroStore, MacroStoreChangeListener } from "./macroStore";
+import { withRedactedVariables } from "../services/macroVariables";
 
 const MACROS_KEY = "nexus.macros";
 const SECRET_IDS_KEY = "nexus.macros.secretIds";
@@ -60,7 +61,10 @@ export class VscodeMacroStore implements MacroStore {
   }
 
   public async save(macros: TerminalMacro[]): Promise<void> {
-    const normalized: TerminalMacro[] = macros.map((m) => ({
+    // Sanitizing here rather than at each consumer makes this the chokepoint: every
+    // write to globalState goes through `save()`, so a masked variable's plaintext
+    // `default` can never be persisted regardless of which caller supplied it.
+    const normalized: TerminalMacro[] = macros.map((m) => withRedactedVariables({
       ...m,
       id: m.id && m.id.length > 0 ? m.id : randomUUID()
     }));
@@ -134,17 +138,54 @@ export class VscodeMacroStore implements MacroStore {
   private async reloadFromState(): Promise<void> {
     const raw = asArray<TerminalMacro>(this.context.globalState.get(MACROS_KEY, []));
     const resolved: TerminalMacro[] = [];
+    // Tracks whether any on-disk record still carried a masked variable's plaintext
+    // default, so it can be scrubbed rather than merely hidden from `getAll()`.
+    let needsDiskScrub = false;
     for (const entry of raw) {
       if (!entry || typeof entry !== "object") continue;
       const id = entry.id && typeof entry.id === "string" ? entry.id : randomUUID();
+      // Redacted on the way in as well as on the way out (`save()`), so a record
+      // already sitting in globalState from an earlier build cannot leak a masked
+      // variable's plaintext default into `getAll()` — and therefore into Copy All,
+      // share export, or an encrypted backup's cleartext `macros` array.
+      const redacted = withRedactedVariables(entry);
+      if (redacted !== entry) needsDiskScrub = true;
       if (entry.secret) {
         const vaulted = await this.context.secrets.get(macroSecretKey(id));
-        resolved.push({ ...entry, id, text: vaulted ?? "" });
+        resolved.push({ ...redacted, id, text: vaulted ?? "" });
       } else {
-        resolved.push({ ...entry, id });
+        resolved.push({ ...redacted, id });
       }
     }
     this.resolved = resolved;
+
+    // Redacting only the in-memory copy would leave the plaintext sitting in VS Code's
+    // global-state storage indefinitely: nothing rewrites MACROS_KEY until the user
+    // happens to save a macro. Rewrite it now.
+    //
+    // Two constraints on how:
+    //
+    // 1. Scrub the RAW array, minimally. Serializing `resolved` instead would persist
+    //    this reload's incidental repairs — dropped non-object records, freshly
+    //    assigned UUIDs — turning a redaction into a rewrite of records that were
+    //    never the problem.
+    // 2. Only write if MACROS_KEY still holds what we read. globalState is shared
+    //    across windows, and there is an `await` on the vault between the read and
+    //    this write: another window can save, absorb legacy settings, or complete a
+    //    reset in that gap, and an unconditional write would silently overwrite it —
+    //    resurrecting macros the user just deleted. VS Code offers no
+    //    compare-and-swap, so this is best-effort: re-read and skip if it moved.
+    //    Skipping is safe, since the next `save()` redacts anyway.
+    if (needsDiskScrub) {
+      const current = this.context.globalState.get(MACROS_KEY);
+      if (JSON.stringify(current) === JSON.stringify(raw)) {
+        const scrubbed = raw.map((entry) =>
+          entry && typeof entry === "object" ? withRedactedVariables(entry) : entry
+        );
+        await this.context.globalState.update(MACROS_KEY, scrubbed);
+      }
+    }
+
     // Rebuild the secret-id index from the resolved list to keep it consistent
     const secretIds = resolved.filter((m) => m.secret && m.id).map((m) => m.id!);
     await this.context.globalState.update(SECRET_IDS_KEY, secretIds.length > 0 ? secretIds : undefined);
@@ -203,7 +244,11 @@ export class VscodeMacroStore implements MacroStore {
   }
 
   private async persistLegacyMigration(macros: TerminalMacro[]): Promise<void> {
-    const assigned = macros.map((m) => ({
+    // Variables are normalized here rather than only at read time: this path absorbs
+    // `nexus.terminal.macros` from settings.json verbatim on every activation
+    // (Settings Sync replay included), so without it a hand-written masked variable
+    // carrying a plaintext `default` would be written straight into globalState.
+    const assigned = macros.map((m) => withRedactedVariables({
       ...m,
       id: m.id && typeof m.id === "string" ? m.id : randomUUID()
     }));
@@ -226,7 +271,10 @@ export class VscodeMacroStore implements MacroStore {
 
 function keyOfLegacy(m: TerminalMacro): string {
   const textKey = m.secret ? "__SECRET__" : (m.text ?? "");
-  return `${m.name ?? ""}|${textKey}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}`;
+  // §10 — same key as configCommands.ts's keyOf(): two macros differing only in
+  // their variable declarations must not collide; append the variable names.
+  const variableNames = Array.isArray(m.variables) ? m.variables.map((v) => v?.name ?? "").join(",") : "";
+  return `${m.name ?? ""}|${textKey}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}|${variableNames}`;
 }
 
 /** Dedupe legacy macros by `name|text|triggerPattern|keybinding`. First occurrence wins. */

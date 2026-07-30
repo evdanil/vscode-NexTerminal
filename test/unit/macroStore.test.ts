@@ -112,6 +112,40 @@ describe("VscodeMacroStore", () => {
     expect(secretBag.has("macro-secret-text-a")).toBe(false);
   });
 
+  it("preserves declared variables on a macro-level-secret macro across the vault split (§7.4)", async () => {
+    const { context, stateBag, secretBag } = makeFakeContext();
+    const declaredVariables = [
+      { name: "host", label: "Host" },
+      { name: "username", label: "Username" },
+      { name: "password", label: "Password", secret: true }
+    ];
+
+    const store1 = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store1.initialize();
+    await store1.save([
+      {
+        id: "b",
+        name: "IPMI SOL console",
+        text: " ipmitool -I lanplus -H $host -U $username -P $password sol activate\n",
+        secret: true,
+        variables: declaredVariables
+      }
+    ]);
+
+    // The vault split strips `text` from the on-disk record — it must never
+    // strip the variable declarations sitting alongside it.
+    const persisted = stateBag.get("nexus.macros") as TerminalMacro[];
+    expect(persisted[0].text).toBe("");
+    expect(persisted[0].variables).toEqual(declaredVariables);
+    expect(secretBag.get("macro-secret-text-b")).toContain("ipmitool");
+
+    const store2 = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store2.initialize();
+    const [m] = store2.getAll();
+    expect(m.text).toContain("ipmitool");
+    expect(m.variables).toEqual(declaredVariables);
+  });
+
   it("resolves secret text on reload", async () => {
     const { context } = makeFakeContext();
     const store1 = new VscodeMacroStore(context, { runLegacyMigration: false });
@@ -194,6 +228,172 @@ describe("VscodeMacroStore", () => {
     await store.clearAll();
     expect(secretBag.has("macro-secret-text-live")).toBe(false);
     expect(secretBag.has("macro-secret-text-orphan")).toBe(false);
+  });
+});
+
+describe("VscodeMacroStore — masked variable default sanitization at persistence chokepoints (Fix 1)", () => {
+  const dirtyVariable = { name: "password", label: "Password", secret: true, default: "hunter2" };
+  const sanitizedVariable = { name: "password", label: "Password", secret: true };
+
+  it("save() strips a masked variable's plaintext default before it reaches globalState", async () => {
+    const { context, stateBag } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+    await store.save([
+      { id: "a", name: "Login", text: "login $password\n", variables: [dirtyVariable] }
+    ]);
+
+    const persisted = stateBag.get("nexus.macros") as TerminalMacro[];
+    expect(persisted).toHaveLength(1);
+    expect(JSON.stringify(persisted)).not.toContain("hunter2");
+    // The declaration itself survives — only the plaintext default is stripped.
+    expect(persisted[0].variables).toEqual([sanitizedVariable]);
+
+    expect(JSON.stringify(store.getAll())).not.toContain("hunter2");
+    expect(store.getAll()[0].variables).toEqual([sanitizedVariable]);
+  });
+
+  it("reloadFromState() strips a masked variable's plaintext default already sitting in globalState from an earlier build", async () => {
+    const { context, stateBag } = makeFakeContext();
+    // Simulate a record persisted by a build that predates this fix — written
+    // directly into globalState, bypassing save() (and therefore its sanitization)
+    // entirely.
+    stateBag.set("nexus.macros", [
+      { id: "a", name: "Login", text: "login $password\n", variables: [dirtyVariable] }
+    ]);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    const all = store.getAll();
+    expect(all).toHaveLength(1);
+    expect(JSON.stringify(all)).not.toContain("hunter2");
+    // The variable NAME (and other non-forbidden fields) still survive — we strip
+    // the default, not the declaration.
+    expect(all[0].variables).toEqual([sanitizedVariable]);
+  });
+
+  it("reloadFromState() scrubs the RAW globalState value itself, not just getAll() — plaintext must not remain on disk", async () => {
+    const { context, stateBag } = makeFakeContext();
+    // Same pre-fix-build scenario as above, but this time we inspect the storage
+    // layer directly. A bug that redacted only the in-memory `resolved` list (and
+    // skipped rewriting MACROS_KEY) would pass every getAll()-only assertion above
+    // while leaving "hunter2" sitting in globalState indefinitely.
+    stateBag.set("nexus.macros", [
+      { id: "a", name: "Login", text: "login $password\n", variables: [dirtyVariable] }
+    ]);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    const rawOnDisk = stateBag.get("nexus.macros") as TerminalMacro[];
+    expect(JSON.stringify(rawOnDisk)).not.toContain("hunter2");
+    expect(rawOnDisk[0].variables).toEqual([sanitizedVariable]);
+  });
+
+  it("reloadFromState() does not rewrite globalState's macros entry when nothing needed redaction (no needless write)", async () => {
+    const { context, stateBag } = makeFakeContext();
+    const cleanMacro = { id: "a", name: "Login", text: "login\n", variables: [{ name: "host" }] };
+    stateBag.set("nexus.macros", [cleanMacro]);
+
+    const macrosKeyWrites: unknown[] = [];
+    const origUpdate = context.globalState.update.bind(context.globalState);
+    context.globalState.update = async (k: string, v: unknown) => {
+      if (k === "nexus.macros") macrosKeyWrites.push(v);
+      return origUpdate(k, v);
+    };
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    expect(macrosKeyWrites).toHaveLength(0);
+    expect(store.getAll()[0].variables).toEqual([{ name: "host" }]);
+  });
+
+  it("reloadFromState() scrub preserves macro-level secret text blanking on disk and leaves the vault entry untouched", async () => {
+    const { context, stateBag, secretBag } = makeFakeContext();
+    const realSecretText = "ipmitool -H $host -U $username -P $password sol activate\n";
+    // On-disk shape for a macro-level secret macro: `text` is already blanked
+    // (real text lives only in the vault) — the scrub must preserve that shape
+    // while still stripping the masked variable's plaintext default.
+    stateBag.set("nexus.macros", [
+      { id: "a", name: "IPMI console", text: "", secret: true, variables: [dirtyVariable] }
+    ]);
+    secretBag.set("macro-secret-text-a", realSecretText);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    const rawOnDisk = stateBag.get("nexus.macros") as TerminalMacro[];
+    expect(rawOnDisk[0].text).toBe(""); // still blanked — the scrub must not disturb this
+    expect(JSON.stringify(rawOnDisk)).not.toContain("hunter2");
+    expect(rawOnDisk[0].variables).toEqual([sanitizedVariable]);
+
+    // The scrub rewrites MACROS_KEY only — it must never touch the vault.
+    expect(secretBag.get("macro-secret-text-a")).toBe(realSecretText);
+
+    // Sanity: getAll() still resolves the real secret text from the (untouched) vault.
+    expect(store.getAll()[0].text).toBe(realSecretText);
+    expect(store.getAll()[0].variables).toEqual([sanitizedVariable]);
+  });
+
+  it("Fix D — scrub is built from the RAW array: a null entry survives and no fresh id is injected into a record that only needed redaction", async () => {
+    const { context, stateBag } = makeFakeContext();
+    // Serializing the hydrated `resolved` projection instead of `raw` would turn this
+    // redaction into a rewrite of records that were never the problem: `resolved`
+    // drops non-object entries (the `null` here) and assigns every entry a fresh
+    // UUID when it lacks one.
+    const seeded = [
+      null,
+      { name: "Login", text: "x", variables: [dirtyVariable] }
+    ];
+    stateBag.set("nexus.macros", seeded);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    const rawOnDisk = stateBag.get("nexus.macros") as unknown[];
+    expect(rawOnDisk).toHaveLength(2);
+    expect(rawOnDisk[0]).toBeNull();
+    const login = rawOnDisk[1] as TerminalMacro;
+    expect(login.id).toBeUndefined();
+    expect(login.name).toBe("Login");
+    expect(login.text).toBe("x");
+    expect(login.variables).toEqual([sanitizedVariable]);
+
+    // getAll() still degrades the null entry away and assigns it a runtime-only id —
+    // that in-memory repair is fine; it's the on-disk rewrite that must stay minimal.
+    const all = store.getAll();
+    expect(all).toHaveLength(1);
+    expect(all[0].name).toBe("Login");
+  });
+
+  it("Fix D — skips the scrub write when globalState changed during the await on the vault (compare-and-skip race guard)", async () => {
+    const { context, stateBag, secretBag } = makeFakeContext();
+    // A macro-level-secret entry so reloadFromState() awaits context.secrets.get()
+    // mid-loop — the exact gap between the read and the eventual scrub write.
+    const original = [
+      { id: "a", name: "Login", text: "", secret: true, variables: [dirtyVariable] }
+    ];
+    stateBag.set("nexus.macros", original);
+    secretBag.set("macro-secret-text-a", "ipmitool -H $host -P $password sol activate\n");
+
+    const newerValue = [{ id: "b", name: "SavedByAnotherWindow", text: "new" }];
+
+    const origSecretsGet = context.secrets.get.bind(context.secrets);
+    context.secrets.get = async (key: string) => {
+      // Simulate another window completing a save (or a Complete Reset) during this
+      // await: globalState.nexus.macros now differs from what reloadFromState
+      // originally read.
+      stateBag.set("nexus.macros", newerValue);
+      return origSecretsGet(key);
+    };
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    // The scrub must not have clobbered the newer value written mid-await.
+    expect(stateBag.get("nexus.macros")).toBe(newerValue);
   });
 });
 

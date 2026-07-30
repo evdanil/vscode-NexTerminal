@@ -4,7 +4,8 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
-import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
+import type { MacroTriggerScope, MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import type { SecretVault } from "../services/ssh/contracts";
 import {
   passwordSecretKey,
@@ -610,7 +611,9 @@ export function sanitizeForSharing(
 
   const sanitizedMacros = macros
     .filter((m) => !m.secret)
-    .map((m) => ({ ...m, id: randomUUID() })); // fresh ids for share exports
+    // fresh ids for share exports; variable declarations normalized so a masked
+    // variable's plaintext `default` never leaves this machine in a share file.
+    .map((m) => withRedactedVariables({ ...m, id: randomUUID() }));
 
   // Sanitize paths from the settings snapshot.
   const sanitizedSettings = { ...settings };
@@ -661,8 +664,14 @@ async function promptDecryptPassword(): Promise<string | undefined> {
   });
 }
 
+function variableNamesKey(m: TerminalMacro): string {
+  // §10 — two macros differing only in their variable declarations must not
+  // collide on import/dedupe; append the (declaration-order) variable names.
+  return Array.isArray(m.variables) ? m.variables.map((v) => v?.name ?? "").join(",") : "";
+}
+
 function keyOf(m: TerminalMacro): string {
-  return `${m.name}|${m.text}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}`;
+  return `${m.name}|${m.text}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}|${variableNamesKey(m)}`;
 }
 
 function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
@@ -691,43 +700,123 @@ function isSafeMacroTriggerPattern(pattern: string): boolean {
   }
 }
 
+/**
+ * §10 — sanitizes an imported macro's `variables`: drops a non-array shape, drops
+ * entries failing the name pattern, drops duplicate names, caps at 10, and strips
+ * `default` / `remember` from secret variables (a default would be plaintext in
+ * the store; `remember` is meaningless — secret values are never remembered).
+ * Mutates `macro` in place; leaves `macro.variables` undefined when nothing survives.
+ *
+ * Returns whether the macro carried ANY declaration before sanitization. The caller
+ * needs that, not the post-sanitization array: a macro whose declarations were all
+ * invalid ends up with no `variables` at all, and deciding the §6.2 trigger strip on
+ * the surviving array would then leave the trigger live on a macro that the store and
+ * the compiler both treat as suppressed. For a hand-crafted
+ * `{secret: true, text: "hunter2\n", triggerPattern: "[Pp]assword:",
+ * variables: [{name: "2bad"}]}` that means importing it turns the secret text into an
+ * auto-send. A malformed non-array counts as a declaration too — it can never suppress
+ * at runtime, so stripping the trigger is the fail-safe direction.
+ */
+function sanitizeImportedMacroVariables(macro: TerminalMacro): boolean {
+  const hadDeclaration =
+    macro.variables !== undefined &&
+    (!Array.isArray(macro.variables) || macro.variables.length > 0);
+
+  if (!Array.isArray(macro.variables)) {
+    delete macro.variables;
+    return hadDeclaration;
+  }
+
+  const seenNames = new Set<string>();
+  const sanitized: MacroVariable[] = [];
+  for (const raw of macro.variables as unknown[]) {
+    if (sanitized.length >= MAX_MACRO_VARIABLES) break;
+    if (!raw || typeof raw !== "object") continue;
+    const entry = raw as Record<string, unknown>;
+    if (!isValidVariableName(entry.name)) continue;
+    const name = entry.name;
+    if (seenNames.has(name)) continue;
+    seenNames.add(name);
+
+    const clean: MacroVariable = { name };
+    if (typeof entry.label === "string" && entry.label.trim() !== "") {
+      clean.label = entry.label;
+    }
+    if (entry.secret === true) {
+      clean.secret = true;
+      // `default` and `remember` deliberately stripped for secret variables (§7.1/§9.4).
+    } else {
+      if (typeof entry.default === "string") {
+        clean.default = entry.default;
+      }
+      if (entry.remember === false) {
+        clean.remember = false;
+      }
+    }
+    sanitized.push(clean);
+  }
+
+  if (sanitized.length > 0) {
+    macro.variables = sanitized;
+  } else {
+    delete macro.variables;
+  }
+  return hadDeclaration;
+}
+
 function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
   const macro: TerminalMacro = { ...raw };
   if (typeof macro.keybinding === "string" && !isValidBinding(macro.keybinding)) {
     delete macro.keybinding;
   }
 
+  // Runs unconditionally — independent of whatever the trigger-sanitization
+  // branches below decide — so a macro with no trigger at all (the common case)
+  // still gets its variables sanitized.
+  const declaredVariables = sanitizeImportedMacroVariables(macro);
+
   const triggerPattern = typeof macro.triggerPattern === "string" ? macro.triggerPattern.trim() : "";
   if (!triggerPattern || !isSafeMacroTriggerPattern(triggerPattern)) {
     stripMacroTrigger(macro);
-    return macro;
-  }
-  macro.triggerPattern = triggerPattern;
-
-  if (macro.triggerScope !== undefined && !VALID_MACRO_TRIGGER_SCOPES.has(macro.triggerScope)) {
-    stripMacroTrigger(macro);
-    return macro;
-  }
-
-  if (macro.triggerScope === "profile") {
-    const profileId = typeof macro.triggerProfileId === "string" ? macro.triggerProfileId.trim() : "";
-    if (!profileId) {
-      stripMacroTrigger(macro);
-      return macro;
-    }
-    macro.triggerProfileId = profileId;
   } else {
-    delete macro.triggerProfileId;
+    macro.triggerPattern = triggerPattern;
+
+    if (macro.triggerScope !== undefined && !VALID_MACRO_TRIGGER_SCOPES.has(macro.triggerScope)) {
+      stripMacroTrigger(macro);
+    } else {
+      if (macro.triggerScope === "profile") {
+        const profileId = typeof macro.triggerProfileId === "string" ? macro.triggerProfileId.trim() : "";
+        if (!profileId) {
+          stripMacroTrigger(macro);
+        } else {
+          macro.triggerProfileId = profileId;
+        }
+      } else {
+        delete macro.triggerProfileId;
+      }
+    }
   }
 
-  if (typeof macro.triggerCooldown !== "number" || !Number.isFinite(macro.triggerCooldown) || macro.triggerCooldown < 0 || macro.triggerCooldown > 300) {
-    delete macro.triggerCooldown;
+  if (macro.triggerPattern !== undefined) {
+    if (typeof macro.triggerCooldown !== "number" || !Number.isFinite(macro.triggerCooldown) || macro.triggerCooldown < 0 || macro.triggerCooldown > 300) {
+      delete macro.triggerCooldown;
+    }
+    if (typeof macro.triggerInterval !== "number" || !Number.isFinite(macro.triggerInterval) || macro.triggerInterval < 1 || macro.triggerInterval > 86400) {
+      delete macro.triggerInterval;
+    }
+    if (typeof macro.triggerInitiallyDisabled !== "boolean") {
+      delete macro.triggerInitiallyDisabled;
+    }
   }
-  if (typeof macro.triggerInterval !== "number" || !Number.isFinite(macro.triggerInterval) || macro.triggerInterval < 1 || macro.triggerInterval > 86400) {
-    delete macro.triggerInterval;
-  }
-  if (typeof macro.triggerInitiallyDisabled !== "boolean") {
-    delete macro.triggerInitiallyDisabled;
+
+  // §6.2 — variables and auto-trigger are mutually exclusive. If both survive
+  // independent sanitization, keep the variables and strip the trigger fields
+  // (consistent with the existing precedent here of stripping trigger config
+  // rather than dropping the macro).
+  // Keyed on the PRE-sanitization declaration, not the surviving array — see
+  // sanitizeImportedMacroVariables' doc comment for why the difference matters.
+  if (declaredVariables && macro.triggerPattern !== undefined) {
+    stripMacroTrigger(macro);
   }
 
   return macro;
@@ -835,8 +924,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
         // Collect all macros from the store
         const allMacros = getMacros(); // resolved — secret text included
+        // This array sits OUTSIDE `encryptedSecrets`, i.e. in the backup file's
+        // cleartext — so a masked variable's plaintext `default` here would be
+        // readable without the backup password.
         const nonSecretForTopLevel: TerminalMacro[] = allMacros.map((m) =>
-          m.secret ? { ...m, text: "" } : { ...m }
+          withRedactedVariables(m.secret ? { ...m, text: "" } : { ...m })
         );
         const secretMacroBlobs = allMacros
           .filter((m) => m.secret && m.id)
@@ -1168,8 +1260,18 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       const existingByKey = new Set(existing.map(keyOf));
       const merged = [...existing];
       for (const m of incoming) {
-        const remapped: TerminalMacro = { ...m, id: randomUUID() };
-        if (!existingByKey.has(keyOf(remapped))) {
+        // Sanitize before dedup and save. A share file is untrusted input from
+        // another machine: without this it can persist a masked variable carrying a
+        // plaintext `default` (which then reaches globalState and `Copy All as JSON`),
+        // an over-cap or malformed `variables` array, or a variables+trigger macro
+        // whose auto-trigger can never compile.
+        const remapped: TerminalMacro = sanitizeImportedMacro({ ...m, id: randomUUID() });
+        const key = keyOf(remapped);
+        if (!existingByKey.has(key)) {
+          // Record the key as we go: two entries in one share file can differ before
+          // sanitization and be identical after it (e.g. one carries an extra
+          // invalid-named variable that gets dropped), and would otherwise both land.
+          existingByKey.add(key);
           merged.push(remapped);
         }
       }
