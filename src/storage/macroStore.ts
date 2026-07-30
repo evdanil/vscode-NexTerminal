@@ -12,7 +12,32 @@ export interface MacroStore {
   /** Synchronous read of the resolved in-memory list. Secret text is included. */
   getAll(): TerminalMacro[];
   /**
-   * Persists the given list. Splits secret text into the vault; writes non-secret fields to state.
+   * Persists a list DERIVED FROM THIS STORE'S OWN CURRENT CONTENTS — the result of adding to,
+   * editing, removing from, or reordering `getAll()`. Splits secret text into the vault;
+   * writes non-secret fields to state.
+   *
+   * PRECONDITION, and it is load-bearing rather than descriptive: for every record in
+   * `macros` that carries an id this store currently holds, that record IS the store's record
+   * — the same macro, carried forward by the caller. `VscodeMacroStore.save()` keys side
+   * storage (the secret vault) by macro id and decides, per record, whether a colliding id may
+   * be kept or must be re-keyed; both questions are answerable only under that precondition.
+   * Records that arrive from OUTSIDE the store — a backup file, a share file, a hand-edited
+   * JSON payload — carry ids that are just strings which happen to collide, and MUST NOT be
+   * handed to this method. See `replaceAll()`.
+   *
+   * TypeScript cannot express that precondition (a `TerminalMacro` from a file and one from
+   * `getAll()` have the same type), so it is not claimed to be type-enforced. It is enforced by
+   * construction at the entry points instead, and the enumeration is short enough to check:
+   *
+   *   - `commands/macroCommands.ts`, `ui/macroEditorPanel.ts` — mutate `getMacros()`.
+   *   - `commands/configCommands.ts` share import — `[...getMacros(), ...incoming]` where every
+   *     incoming record was given `id: randomUUID()` one line earlier, so no incoming id can
+   *     name anything this store knows.
+   *   - `commands/configCommands.ts` merge import — `[...getMacros(), ...incoming]` where every
+   *     incoming record whose id is already present was skipped, so again no incoming id can
+   *     name anything this store knows.
+   *   - `commands/configCommands.ts` REPLACE import — the one wholesale-external caller. It
+   *     calls `replaceAll()`, not this.
    *
    * Invariant, enforced at WRITE TIME ONLY: every macro this call persists has a unique,
    * non-empty, STRING `id` — a non-string value (e.g. an object surviving a corrupt JSON
@@ -68,6 +93,41 @@ export interface MacroStore {
    * macro whose value was never separately stored in the first place.
    */
   save(macros: TerminalMacro[]): Promise<void>;
+  /**
+   * Replaces the entire macro set with records from an EXTERNAL source — a decrypted backup
+   * being restored in replace mode. The counterpart to `save()`, split from it because the two
+   * have materially different contracts and only one of them can honour `save()`'s precondition.
+   *
+   * An id in an external file is not an identity in this store. It is a string that was an
+   * identity somewhere else, and any agreement with an id here is a collision, not a match.
+   * So this method assigns a FRESH id to every incoming record before anything else runs, and
+   * the ordinary write path then deletes every vault entry the outgoing set owned (each such id
+   * is, by construction, absent from the incoming set).
+   *
+   * That is what makes the unsound case unrepresentable rather than merely unreached. There is
+   * no mode flag to pass wrongly: `VscodeMacroStore.save()`'s "keep this record on the id its
+   * unreadable vault entry is filed under" rule is reachable only for a record that arrived
+   * carrying a valid id, and after the re-key no record here has one. An imported record
+   * therefore cannot inherit a local macro's stored password, whatever id the file gave it —
+   * which is exactly the defect this split exists to close, and it was reachable: with the OS
+   * keyring transiently unavailable, an imported record whose own secret failed to decrypt
+   * (`text: ""`, `secret: true`) and whose id collided with a local secret's would take that
+   * local secret's vault entry, keep its own auto-trigger, and resolve to the local password
+   * once the keyring recovered.
+   *
+   * Freshening ids costs nothing here. Nothing outside this store persists a macro id: the
+   * vault keys are rewritten by this very call, and every other consumer
+   * (`macroStateKey()`, the tree, the editor) is runtime-only state rebuilt from the store.
+   *
+   * The converse is NOT true, so do not reach for this method as a general-purpose save.
+   * Freshening an id is only free when the record's secret can travel to the new id, and a
+   * secret whose vault value could not be READ (keyring outage) cannot — it would be re-keyed
+   * with nothing behind it while the entry holding the real value is deleted along with the
+   * rest of the outgoing set. For an external list that is correct and is what "replace" means:
+   * those entries belong to macros the user is discarding. For a list derived from `getAll()`
+   * it would be a data-loss bug. Such a list belongs in `save()`.
+   */
+  replaceAll(macros: TerminalMacro[]): Promise<void>;
   /** Subscribe to changes. Returns a disposer. */
   onDidChange(listener: MacroStoreChangeListener): () => void;
   /** Clear all state (macros + vault entries). Used by completeReset. */
@@ -146,6 +206,13 @@ export interface AssignMacroIdsOptions<T> {
    * `undefined`, indistinguishable from "no entry"), so it pins those records instead of
    * moving them — see its `save()`. Two records that both want the same id still cannot
    * both have it; the first in array order wins and the rest are re-keyed as usual.
+   *
+   * This function does NOT and cannot check whether a record is entitled to the id it arrived
+   * with. It applies whatever the predicate says. Deciding that a record may keep an id that
+   * names side storage is an OWNERSHIP decision, and the caller supplying the predicate owns
+   * it: `VscodeMacroStore.save()` may make it only because of the precondition on its own
+   * input (see `MacroStore.save()`), and external input never reaches it because
+   * `MacroStore.replaceAll()` strips every incoming id first.
    */
   keepIdIfPossible?: (macro: T) => boolean;
 }

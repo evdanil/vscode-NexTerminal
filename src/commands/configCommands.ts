@@ -30,7 +30,7 @@ import {
 import { sniffImportFormat, type SniffedFormat } from "../utils/importFormatSniffer";
 import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateLocalShellProfile } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
-import { getMacros, saveMacros, getActiveMacroStore } from "../macroSettings";
+import { getMacros, saveMacros, replaceMacros, getActiveMacroStore } from "../macroSettings";
 import { validateSettingUpdate } from "../ui/settingsValidation";
 import { SETTINGS_META } from "../ui/settingsMetadata";
 import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
@@ -1361,8 +1361,21 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     if (incomingResult !== undefined) {
       const { macros: incomingMacros, unresolvedCount } = incomingResult;
       if (mode === "replace") {
-        await saveMacros(incomingMacros);
+        // `replaceMacros`, not `saveMacros`: this is the one macro write in the extension whose
+        // input is a wholesale external list, and the store's two entry points exist for
+        // exactly that distinction (see `MacroStore.save()` / `MacroStore.replaceAll()`). The
+        // ids in a backup file are strings that were identities on some other machine; any
+        // agreement with a local macro's id is a collision. Handing them to `saveMacros()` let
+        // an imported record be treated as the local record filed under that id — and with the
+        // keyring transiently unavailable, an imported macro whose own secret failed to decrypt
+        // inherited the local macro's stored password.
+        await replaceMacros(incomingMacros);
       } else {
+        // Merge keeps the file's ids, because the skip below is what makes re-importing the
+        // same backup idempotent. That is safe for `saveMacros()` — and it is the reason the
+        // filter has to stay here rather than becoming a store concern: every incoming record
+        // whose id the store already holds is DROPPED, so no id reaching `saveMacros()` from
+        // this branch can name anything the store knows. See `MacroStore.save()`'s precondition.
         const existing = getMacros();
         const existingIds = new Set(existing.map((m) => m.id).filter(Boolean) as string[]);
         const merged = [...existing];

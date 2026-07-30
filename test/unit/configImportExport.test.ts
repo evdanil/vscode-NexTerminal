@@ -1578,6 +1578,87 @@ describe("backup import", () => {
     expect(core.getSnapshot().authProfiles).toHaveLength(1);
   });
 
+  it("replace-mode restore cannot hand an imported macro a local macro's stored password, even while the keyring is down", async () => {
+    // End-to-end reproduction of the review finding, through the real import command.
+    // Replace mode is the one macro write in the extension whose input is a wholesale
+    // external list, so it goes through `MacroStore.replaceAll()` rather than `save()`.
+    const stateMap = new Map<string, unknown>();
+    const secretMap = new Map<string, string>();
+    const realGet = async (k: string): Promise<string | undefined> => secretMap.get(k);
+    let keyringDown = false;
+    const fakeCtx = {
+      globalState: {
+        get<T>(k: string, fb: T): T { return (stateMap.get(k) as T) ?? fb; },
+        async update(k: string, v: unknown): Promise<void> {
+          if (v === undefined) stateMap.delete(k); else stateMap.set(k, v);
+        },
+        keys(): readonly string[] { return [...stateMap.keys()]; }
+      },
+      secrets: {
+        async get(k: string): Promise<string | undefined> { return keyringDown ? undefined : realGet(k); },
+        async store(k: string, v: string): Promise<void> { secretMap.set(k, v); },
+        async delete(k: string): Promise<void> { secretMap.delete(k); }
+      }
+    } as unknown as import("vscode").ExtensionContext;
+
+    // A local secret macro with its password in the vault, filed under id "p".
+    const seedStore = new VscodeMacroStore(fakeCtx, { runLegacyMigration: false });
+    await seedStore.initialize();
+    await seedStore.save([
+      { id: "p", name: "Existing", text: "old-local-password\n", secret: true, triggerPattern: "Password:" }
+    ]);
+    expect(secretMap.get(macroSecretKey("p"))).toBe("old-local-password\n");
+
+    // The OS keyring goes away. `SecretStorage.get()` reports that as `undefined`, which is
+    // indistinguishable from "no entry", so the local secret resolves to "" — and that is
+    // exactly the state in which the store must keep the macro on the id its entry is filed
+    // under, because it cannot carry the value anywhere.
+    keyringDown = true;
+    const importStore = new VscodeMacroStore(fakeCtx, { runLegacyMigration: false });
+    await importStore.initialize();
+    expect(importStore.getAll()[0].text).toBe("");
+    setActiveMacroStore(importStore);
+
+    // The backup carries a macro whose id COLLIDES with the local one and whose own secret
+    // is absent (no `encryptedSecrets`), so it arrives as `secret: true` with empty text —
+    // the same shape the unreadable local secret has, and the shape the import warns about.
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [
+        { id: "p", name: "Imported missing secret", text: "", secret: true, triggerPattern: "Password:" }
+      ],
+      settings: {}
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup-collide.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    const [imported] = importStore.getAll();
+    expect(imported.name).toBe("Imported missing secret");
+    expect(imported.id).not.toBe("p");
+    expect(secretMap.has(macroSecretKey("p"))).toBe(false);
+
+    // The disclosure this closes: with the id inherited, the keyring recovering would arm
+    // the imported macro's `Password:` auto-trigger with the local machine's password —
+    // after the UI had told the user this macro's secret was missing.
+    keyringDown = false;
+    const recovered = new VscodeMacroStore(fakeCtx, { runLegacyMigration: false });
+    await recovered.initialize();
+    const [after] = recovered.getAll();
+    expect(after.name).toBe("Imported missing secret");
+    expect(after.text).toBe("");
+    expect(after.text).not.toBe("old-local-password\n");
+  });
+
   it("Fix A — backup restore strips the trigger even when every declared variable entry is invalid", async () => {
     // codex noted the existing round-trip test above has no variables-plus-trigger
     // macro, so it can't detect a regression here: this goes through the same

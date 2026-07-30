@@ -381,14 +381,19 @@ trigger) onto the wrong macro.
 
 ### Duplicate macro identities
 
-Macros are identified internally by a unique id. Restoring a hand-edited backup,
-or absorbing macros from an old hand-written `nexus.terminal.macros` setting, can
-leave two macros sharing one id. Nexus cannot tell such macros apart, so it will
-not guess: while the conflict exists, **neither macro auto-triggers**. Both are
-shown in the Macros view with a warning icon and a tooltip saying so — Nexus does
-not rewrite the ids on its own, at startup or at any other time, because for a
-secret macro that would mean deciding which macro owns the stored password. The
-rewrite happens only as part of a change you make.
+Macros are identified internally by a unique id. Two macros can end up sharing
+one — from a hand-edited stored macro list, or from a Nexus version that predates
+the rule. Every path that writes macros today assigns fresh ids to duplicates as
+it writes, so a backup restore and a legacy `nexus.terminal.macros` absorption
+both arrive already de-duplicated; what survives is a conflict that was written
+to storage before the rule existed. Nexus cannot tell such macros apart, so it
+will not guess: while the conflict exists, **neither macro auto-triggers**. Each
+one that has an auto-trigger pattern is shown in the Macros view with a warning
+icon and a tooltip saying so (a macro with no pattern has no trigger to suppress,
+so it keeps its normal icon). Nexus does not rewrite the ids on its own, at
+startup or at any other time, because for a secret macro that would mean deciding
+which macro owns the stored password. The rewrite happens only as part of a
+change you make.
 
 To fix it, use **Move Up** or **Move Down** on any macro. That re-saves the list,
 which assigns fresh ids, and both macros go back to normal. The macro editor will

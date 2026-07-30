@@ -33,6 +33,10 @@ class RawMacroStore implements MacroStore {
     for (const listener of this.listeners) listener();
   }
 
+  public async replaceAll(macros: TerminalMacro[]): Promise<void> {
+    await this.save(macros); // no vault here, and no id synthesis by design
+  }
+
   public onDidChange(listener: MacroStoreChangeListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
