@@ -223,7 +223,18 @@ export function getValidMacroVariables(macro: Pick<TerminalMacro, "variables">):
  * never here.
  */
 export function withRedactedVariables<T extends Pick<TerminalMacro, "variables">>(macro: T): T {
-  if (!Array.isArray(macro.variables)) return macro;
+  if (!Array.isArray(macro.variables)) {
+    // A defined non-array `variables` (e.g. `{0: {...}, length: 1}` from a hand-edited
+    // settings.json) is dropped rather than redacted: it can carry a masked entry's
+    // plaintext `default` through every persistence and export boundary, and unlike a
+    // real array it never suppresses an auto-trigger anyway — `hasMacroVariables()`
+    // requires `Array.isArray`. So removing it closes the leak without weakening
+    // suppression.
+    if (macro.variables === undefined) return macro;
+    const dropped = { ...macro };
+    delete dropped.variables;
+    return dropped;
+  }
 
   let changed = false;
   const redacted = macro.variables.map((entry) => {

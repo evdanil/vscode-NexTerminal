@@ -382,11 +382,25 @@ describe("withRedactedVariables (security fix — redact masked fields only; nev
     expect(result.variables!.length).toBe(2);
   });
 
-  it("returns a non-array `variables` (e.g. a corrupt string) unchanged, not deleted", () => {
+  it("drops a non-array `variables` (e.g. a corrupt string) rather than passing it through", () => {
     const macro = { name: "m", variables: "abc" as unknown as MacroVariable[] };
     const result = withRedactedVariables(macro);
-    expect(result.variables as unknown).toBe("abc");
-    expect(result).toHaveProperty("variables");
+    expect(result).not.toHaveProperty("variables");
+  });
+
+  it("drops an ARRAY-LIKE `variables` object carrying a masked plaintext default", () => {
+    // The leak this closes: an array-like from a hand-edited settings.json is not an
+    // array, so the redaction loop never ran on it and its plaintext `default` reached
+    // globalState, the clipboard, and export files. Dropping it costs nothing, because
+    // `hasMacroVariables()` requires `Array.isArray` — a non-array never suppressed an
+    // auto-trigger, so removing it cannot un-suppress one.
+    const macro = {
+      name: "Login",
+      variables: { 0: { name: "password", secret: true, default: "hunter2" }, length: 1 } as unknown as MacroVariable[]
+    };
+    const result = withRedactedVariables(macro);
+    expect(result).not.toHaveProperty("variables");
+    expect(JSON.stringify(result)).not.toContain("hunter2");
   });
 
   it("returns the input unchanged when `variables` is absent", () => {

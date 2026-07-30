@@ -706,11 +706,25 @@ function isSafeMacroTriggerPattern(pattern: string): boolean {
  * `default` / `remember` from secret variables (a default would be plaintext in
  * the store; `remember` is meaningless — secret values are never remembered).
  * Mutates `macro` in place; leaves `macro.variables` undefined when nothing survives.
+ *
+ * Returns whether the macro carried ANY declaration before sanitization. The caller
+ * needs that, not the post-sanitization array: a macro whose declarations were all
+ * invalid ends up with no `variables` at all, and deciding the §6.2 trigger strip on
+ * the surviving array would then leave the trigger live on a macro that the store and
+ * the compiler both treat as suppressed. For a hand-crafted
+ * `{secret: true, text: "hunter2\n", triggerPattern: "[Pp]assword:",
+ * variables: [{name: "2bad"}]}` that means importing it turns the secret text into an
+ * auto-send. A malformed non-array counts as a declaration too — it can never suppress
+ * at runtime, so stripping the trigger is the fail-safe direction.
  */
-function sanitizeImportedMacroVariables(macro: TerminalMacro): void {
+function sanitizeImportedMacroVariables(macro: TerminalMacro): boolean {
+  const hadDeclaration =
+    macro.variables !== undefined &&
+    (!Array.isArray(macro.variables) || macro.variables.length > 0);
+
   if (!Array.isArray(macro.variables)) {
     delete macro.variables;
-    return;
+    return hadDeclaration;
   }
 
   const seenNames = new Set<string>();
@@ -747,6 +761,7 @@ function sanitizeImportedMacroVariables(macro: TerminalMacro): void {
   } else {
     delete macro.variables;
   }
+  return hadDeclaration;
 }
 
 function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
@@ -758,7 +773,7 @@ function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
   // Runs unconditionally — independent of whatever the trigger-sanitization
   // branches below decide — so a macro with no trigger at all (the common case)
   // still gets its variables sanitized.
-  sanitizeImportedMacroVariables(macro);
+  const declaredVariables = sanitizeImportedMacroVariables(macro);
 
   const triggerPattern = typeof macro.triggerPattern === "string" ? macro.triggerPattern.trim() : "";
   if (!triggerPattern || !isSafeMacroTriggerPattern(triggerPattern)) {
@@ -798,7 +813,9 @@ function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
   // independent sanitization, keep the variables and strip the trigger fields
   // (consistent with the existing precedent here of stripping trigger config
   // rather than dropping the macro).
-  if (Array.isArray(macro.variables) && macro.variables.length > 0 && macro.triggerPattern !== undefined) {
+  // Keyed on the PRE-sanitization declaration, not the surviving array — see
+  // sanitizeImportedMacroVariables' doc comment for why the difference matters.
+  if (declaredVariables && macro.triggerPattern !== undefined) {
     stripMacroTrigger(macro);
   }
 

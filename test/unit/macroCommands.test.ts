@@ -158,6 +158,32 @@ describe("macroCommands copyAllAsJson (Fix 1 — output-path sanitization)", () 
     const parsed = JSON.parse(written);
     expect(parsed[0].variables).toEqual([{ name: "password", secret: true }]);
   });
+
+  it("Fix C boundary — drops an array-like (non-array) variables value entirely, rather than leaking its plaintext default", async () => {
+    // The well-formed-array test above can't catch this: the pre-fix
+    // withRedactedVariables() only ran its redaction loop on real arrays, so an
+    // array-like object (e.g. reconstructed from a hand-edited settings.json) passed
+    // through untouched, plaintext default and all.
+    const macros = [
+      {
+        name: "Login",
+        text: "login $password\n",
+        variables: { 0: { name: "password", secret: true, default: "hunter2" }, length: 1 }
+      }
+    ];
+    mockGetMacros.mockReturnValue(macros);
+
+    const copyAllAsJson = registeredCommands.get("nexus.macro.copyAllAsJson");
+    expect(copyAllAsJson).toBeDefined();
+    await copyAllAsJson!();
+
+    expect(mockClipboardWriteText).toHaveBeenCalledTimes(1);
+    const written = mockClipboardWriteText.mock.calls[0][0] as string;
+    expect(written).not.toContain("hunter2");
+
+    const parsed = JSON.parse(written);
+    expect(parsed[0].variables).toBeUndefined();
+  });
 });
 
 describe("macroCommands documentation actions", () => {

@@ -374,6 +374,113 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     });
   });
 
+  describe("hidden variable declarations block a suppressed-trigger save (Fix B)", () => {
+    it("rejects a save that would un-suppress a trigger hidden behind malformed variable declarations", async () => {
+      // The stored macro carries an invalid-named declaration that
+      // getValidMacroVariables() filters out before the editor builds its rows — the
+      // editor renders zero variable rows for it, but MacroAutoTrigger still keys
+      // suppression on the raw (non-empty) array. Before Fix B, opening this macro
+      // and pressing Save (submitting zero variables, trigger unchanged) deleted the
+      // array and left the trigger live: the secret text would start auto-sending on
+      // any output matching "Password:".
+      await harness([
+        {
+          id: "hidden-1",
+          name: "Password",
+          text: "hunter2\n",
+          secret: true,
+          triggerPattern: "[Pp]assword:",
+          variables: [{ name: "2bad" }]
+        }
+      ]);
+      const { sendMessage } = await openPanel(0);
+
+      await sendMessage(baseSaveMsg({
+        index: 0,
+        id: "hidden-1",
+        name: "Password",
+        text: "hunter2\n",
+        secret: true,
+        triggerPattern: "[Pp]assword:",
+        variables: []
+      }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({
+        type: "saveError",
+        field: "trigger",
+        message: expect.stringContaining("malformed variable declarations")
+      });
+      expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+
+      // Nothing was mutated — the save was rejected before saveMacros() ran.
+      const after = getMacros();
+      expect(after[0].triggerPattern).toBe("[Pp]assword:");
+      expect(after[0].variables).toEqual([{ name: "2bad" }]);
+    });
+
+    it("allows clearing hidden malformed declarations when no trigger is being saved", async () => {
+      await harness([
+        {
+          id: "hidden-2",
+          name: "Cmd",
+          text: "run\n",
+          variables: [{ name: "2bad" }]
+        }
+      ]);
+      const { sendMessage } = await openPanel(0);
+
+      await sendMessage(baseSaveMsg({
+        index: 0,
+        id: "hidden-2",
+        name: "Cmd",
+        text: "run\n",
+        triggerPattern: null,
+        variables: []
+      }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+      const after = getMacros();
+      expect(after[0].variables).toBeUndefined();
+      expect(after[0].triggerPattern).toBeUndefined();
+    });
+
+    it("hidden declarations plus an incoming variables payload hits the ordinary variables/trigger conflict, not the new hidden-declaration message", async () => {
+      await harness([
+        {
+          id: "hidden-3",
+          name: "Password",
+          text: "hunter2\n",
+          secret: true,
+          triggerPattern: "[Pp]assword:",
+          variables: [{ name: "2bad" }]
+        }
+      ]);
+      const { sendMessage } = await openPanel(0);
+
+      await sendMessage(baseSaveMsg({
+        index: 0,
+        id: "hidden-3",
+        name: "Password",
+        text: "hunter2\n",
+        secret: true,
+        triggerPattern: "[Pp]assword:",
+        variables: [{ name: "host" }]
+      }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({
+        type: "saveError",
+        field: "trigger",
+        message: expect.stringContaining("prompt for input or auto-trigger")
+      });
+      expect(mockPostMessage).not.toHaveBeenCalledWith({
+        type: "saveError",
+        field: "trigger",
+        message: expect.stringContaining("malformed variable declarations")
+      });
+      expect(getMacros()[0].triggerPattern).toBe("[Pp]assword:");
+    });
+  });
+
   it("subscribes to the store and re-renders on external change; disposes the subscription", async () => {
     await harness([{ name: "Alpha", text: "a" }]);
     await openPanel(0);

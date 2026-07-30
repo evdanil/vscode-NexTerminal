@@ -161,11 +161,29 @@ export class VscodeMacroStore implements MacroStore {
 
     // Redacting only the in-memory copy would leave the plaintext sitting in VS Code's
     // global-state storage indefinitely: nothing rewrites MACROS_KEY until the user
-    // happens to save a macro. Rewrite it now, preserving the on-disk shape (secret
-    // text stays blanked and lives in the vault, which is untouched here).
+    // happens to save a macro. Rewrite it now.
+    //
+    // Two constraints on how:
+    //
+    // 1. Scrub the RAW array, minimally. Serializing `resolved` instead would persist
+    //    this reload's incidental repairs — dropped non-object records, freshly
+    //    assigned UUIDs — turning a redaction into a rewrite of records that were
+    //    never the problem.
+    // 2. Only write if MACROS_KEY still holds what we read. globalState is shared
+    //    across windows, and there is an `await` on the vault between the read and
+    //    this write: another window can save, absorb legacy settings, or complete a
+    //    reset in that gap, and an unconditional write would silently overwrite it —
+    //    resurrecting macros the user just deleted. VS Code offers no
+    //    compare-and-swap, so this is best-effort: re-read and skip if it moved.
+    //    Skipping is safe, since the next `save()` redacts anyway.
     if (needsDiskScrub) {
-      const onDisk = resolved.map((m) => (m.secret ? { ...m, text: "" } : { ...m }));
-      await this.context.globalState.update(MACROS_KEY, onDisk);
+      const current = this.context.globalState.get(MACROS_KEY);
+      if (JSON.stringify(current) === JSON.stringify(raw)) {
+        const scrubbed = raw.map((entry) =>
+          entry && typeof entry === "object" ? withRedactedVariables(entry) : entry
+        );
+        await this.context.globalState.update(MACROS_KEY, scrubbed);
+      }
     }
 
     // Rebuild the secret-id index from the resolved list to keep it consistent

@@ -12,7 +12,7 @@ import {
 } from "../macroSettings";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
-import { MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
+import { getValidMacroVariables, MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
 import type { MacroProfileOptionInput } from "./macroProfileOptions";
@@ -269,6 +269,38 @@ export class MacroEditorPanel {
         // once "too many" is ruled out); anything else array-level (only
         // "too many variables" today) goes to #error-variables.
         const variables = parseIncomingVariables(msg.variables);
+
+        // A stored macro can carry declarations the editor cannot render — entries with
+        // invalid names, which `getValidMacroVariables()` filters out before the rows
+        // are built. Those still suppress the macro's auto-trigger, because
+        // MacroAutoTrigger keys suppression on the raw array being non-empty.
+        //
+        // So the sequence "open such a macro, see no variable rows, press Save" would
+        // otherwise submit zero variables, pass the §9.4 conflict check (which only
+        // fires when variables are present), delete the array, and leave the trigger
+        // live. For a secret macro that means its text starts auto-sending on matching
+        // output — with the user having changed nothing they could see.
+        //
+        // Only the trigger-activating case is blocked. Clearing rows the user could
+        // actually see, or adding a trigger to a macro whose declarations were all
+        // visible and removed, both stay legal.
+        const existing = index >= 0 ? macros[index] : undefined;
+        const hiddenDeclarations =
+          existing !== undefined &&
+          Array.isArray(existing.variables) &&
+          existing.variables.length > getValidMacroVariables(existing).length;
+        if (hiddenDeclarations && triggerPattern && variables.length === 0) {
+          void this.panel.webview.postMessage({
+            type: "saveError",
+            field: "trigger",
+            message:
+              "This macro has malformed variable declarations that cannot be shown here, " +
+              "and they are currently suppressing its auto-trigger. Clear the auto-trigger " +
+              "pattern before saving, or delete and recreate the macro."
+          });
+          return;
+        }
+
         const variableErrors = validateMacroVariables(variables, {
           triggerPattern: triggerPattern || undefined
         });

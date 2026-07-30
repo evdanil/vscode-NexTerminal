@@ -255,4 +255,48 @@ describe("collectIncomingMacros — variable sanitization (§10)", () => {
     expect(result.variables).toBeUndefined();
     expect(result.triggerPattern).toBe("router#");
   });
+
+  // Fix A — sanitizeImportedMacroVariables() must return whether the macro carried
+  // ANY declaration BEFORE sanitization, and sanitizeImportedMacro()'s §6.2 trigger
+  // strip must key off that, not off the surviving array. Before this fix, an
+  // all-invalid declaration was deleted by sanitization and the (now variables-less)
+  // macro's trigger survived import — for
+  // `{secret: true, text: "hunter2\n", triggerPattern: "[Pp]assword:",
+  // variables: [{name: "2bad"}]}` that means the secret text starts auto-sending on
+  // any output matching `Password:`.
+  it("Fix A — strips the trigger even when every declared variable entry is invalid, though nothing survives to suppress it", () => {
+    const result = importOne({
+      name: "Password",
+      text: "hunter2\n",
+      secret: true,
+      triggerPattern: "[Pp]assword:",
+      variables: [{ name: "2bad" }]
+    });
+    expect(result.variables).toBeUndefined();
+    expect(result.triggerPattern).toBeUndefined();
+  });
+
+  it("Fix A — strips the trigger when variables is a malformed non-array string (fail-safe: a non-array can never suppress at runtime)", () => {
+    const result = importOne({
+      name: "Password",
+      text: "hunter2\n",
+      secret: true,
+      triggerPattern: "[Pp]assword:",
+      variables: "abc"
+    });
+    expect(result.variables).toBeUndefined();
+    expect(result.triggerPattern).toBeUndefined();
+  });
+
+  it("Fix A — strips the trigger when variables is an array-like (non-array) object", () => {
+    const result = importOne({
+      name: "Password",
+      text: "hunter2\n",
+      secret: true,
+      triggerPattern: "[Pp]assword:",
+      variables: { 0: { name: "password", secret: true, default: "hunter2" }, length: 1 }
+    });
+    expect(result.variables).toBeUndefined();
+    expect(result.triggerPattern).toBeUndefined();
+  });
 });
