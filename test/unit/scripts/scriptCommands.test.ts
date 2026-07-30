@@ -4,6 +4,7 @@ const state = {
   registeredCommands: new Map<string, (...args: unknown[]) => unknown>(),
   writtenFiles: new Map<string, string>(),
   inputBoxValidator: undefined as ((v: string) => string | undefined) | undefined,
+  inputBoxOptions: undefined as { value?: string; valueSelection?: [number, number] } | undefined,
   inputBoxReturn: undefined as string | undefined,
   quickPickOptions: undefined as unknown,
   quickPickReturn: undefined as unknown,
@@ -27,8 +28,9 @@ vi.mock("vscode", () => ({
   window: {
     activeTextEditor: undefined,
     activeTerminal: undefined as unknown,
-    showInputBox: (opts: { validateInput?: (v: string) => string | undefined }) => {
+    showInputBox: (opts: { validateInput?: (v: string) => string | undefined; value?: string; valueSelection?: [number, number] }) => {
       state.inputBoxValidator = opts?.validateInput;
+      state.inputBoxOptions = { value: opts?.value, valueSelection: opts?.valueSelection };
       return Promise.resolve(state.inputBoxReturn);
     },
     showWarningMessage: (...args: unknown[]) => {
@@ -121,6 +123,7 @@ describe("scriptCommands", () => {
     state.registeredCommands.clear();
     state.writtenFiles.clear();
     state.inputBoxValidator = undefined;
+    state.inputBoxOptions = undefined;
     state.inputBoxReturn = undefined;
     state.quickPickOptions = undefined;
     state.quickPickReturn = undefined;
@@ -130,6 +133,7 @@ describe("scriptCommands", () => {
     state.mockShowErrorMessage.mockClear();
     state.mockOpenExternal.mockClear();
     vi.mocked(vscode.commands.executeCommand).mockClear();
+    vi.mocked(vscode.workspace.fs.createDirectory).mockClear();
     state.mockFsDelete.mockClear();
     state.mockFsStatThrows = true;
   });
@@ -224,6 +228,212 @@ describe("scriptCommands", () => {
       expect(state.inputBoxValidator!(".js")).toBeDefined(); // empty after strip
       expect(state.inputBoxValidator!("")).toBeDefined();
       expect(state.inputBoxValidator!("bad name")).toBeDefined(); // has a space
+    });
+  });
+
+  describe("§5.7 — path grammar for New Script (folders + traversal safety)", () => {
+    it("creates intermediate directories for a folder-qualified name like 'a/b'", async () => {
+      state.inputBoxReturn = "a/b";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler();
+      const createDirCalls = vi
+        .mocked(vscode.workspace.fs.createDirectory)
+        .mock.calls.map((c) => (c[0] as { fsPath: string }).fsPath);
+      expect(createDirCalls).toContain("/ws/.nexus/scripts/a");
+      expect(state.writtenFiles.has("/ws/.nexus/scripts/a/b.js")).toBe(true);
+    });
+
+    it("pre-seeds the input box with 'folder/' when invoked from that folder's context menu", async () => {
+      state.inputBoxReturn = undefined; // cancel — only the seeded value matters here
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler({ kind: "folder", path: "cisco", name: "cisco", uri: { fsPath: "/ws/.nexus/scripts/cisco" } });
+      expect(state.inputBoxOptions?.value).toBe("cisco/");
+    });
+
+    it("the validator rejects '../' traversal in the folder part", async () => {
+      state.inputBoxReturn = "../../../../home/evgeny/startup";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler();
+      expect(state.inputBoxValidator).toBeDefined();
+      expect(state.inputBoxValidator!("../../../../home/evgeny/startup")).toBeDefined();
+      expect(state.inputBoxValidator!("cisco/../secret")).toBeDefined();
+    });
+
+    it("verified consequence stays closed: '../' traversal input never escapes the scripts directory", async () => {
+      state.inputBoxReturn = "../../../../home/evgeny/startup";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler();
+      // Nothing gets written at all — parseScriptPathInput rejects it even if
+      // some caller bypassed the input box's own validateInput.
+      expect(state.writtenFiles.size).toBe(0);
+      for (const path of state.writtenFiles.keys()) {
+        expect(path.startsWith("/ws/.nexus/scripts")).toBe(true);
+      }
+    });
+
+    it("rejects a backslash with a message telling the user to use '/'", async () => {
+      state.inputBoxReturn = "cisco\\backup";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler();
+      expect(state.inputBoxValidator).toBeDefined();
+      const message = state.inputBoxValidator!("cisco\\backup");
+      expect(message).toBeDefined();
+      expect(message!).toMatch(/use '\/'/i);
+      expect(state.writtenFiles.size).toBe(0);
+    });
+
+    it("rejects a folder part the Scripts view will never render, so a new script cannot be created somewhere invisible", async () => {
+      state.inputBoxReturn = undefined;
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler();
+      const validate = state.inputBoxValidator!;
+
+      expect(validate("node_modules/backup")).toMatch(/never shows/);
+      expect(validate(".archive/backup")).toMatch(/never shows/);
+      expect(validate("types/backup")).toMatch(/never shows/);
+      expect(validate("cisco/types/backup")).toBeUndefined();
+      expect(validate("cisco/backup")).toBeUndefined();
+      // A dot-prefixed LEAF is a file, not a directory — the scanner lists it.
+      expect(validate(".hidden")).toBeUndefined();
+    });
+
+    it("Fix 7 — a trailing slash is rejected with 'Name is required', not silently creating the folder name as a script at the root", async () => {
+      // Regression: right-click "cisco" -> New Script pre-seeds "cisco/"; if
+      // the user presses Enter without typing a leaf, the pre-fix code
+      // silently created "cisco.js" at the scripts ROOT — the opposite of
+      // what pre-seeding a folder prefix promises.
+      state.inputBoxReturn = "cisco/";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler({ kind: "folder", path: "cisco", name: "cisco", uri: { fsPath: "/ws/.nexus/scripts/cisco" } });
+
+      expect(state.inputBoxValidator).toBeDefined();
+      expect(state.inputBoxValidator!("cisco/")).toBe("Name is required");
+      // Even though the mock's showInputBox doesn't itself enforce
+      // validateInput, parseScriptPathInput independently rejects the same
+      // input — nothing gets written at all, and specifically not at the root.
+      expect(state.writtenFiles.has("/ws/.nexus/scripts/cisco.js")).toBe(false);
+      expect(state.writtenFiles.size).toBe(0);
+    });
+  });
+
+  describe("Fix 5 — filesystem failures during New Script / New Folder are reported, not left to surface as a generic 'contributed command failed'", () => {
+    it("New Script: a createDirectory failure is caught and shown via showErrorMessage", async () => {
+      vi.mocked(vscode.workspace.fs.createDirectory).mockRejectedValueOnce(new Error("EINVAL: invalid path"));
+      state.inputBoxReturn = "my-procedure";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+
+      await expect(handler()).resolves.toBeUndefined();
+
+      expect(state.mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("EINVAL"));
+      expect(state.writtenFiles.size).toBe(0);
+    });
+
+    it("New Folder: a createDirectory failure is caught and shown via showErrorMessage", async () => {
+      state.mockFsStatThrows = true; // doesn't exist yet, so creation is attempted
+      vi.mocked(vscode.workspace.fs.createDirectory).mockRejectedValueOnce(new Error("EACCES: permission denied"));
+      state.inputBoxReturn = "cisco";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+
+      await expect(handler()).resolves.toBeUndefined();
+
+      expect(state.mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("EACCES"));
+    });
+  });
+
+  describe("nexus.script.newFolder (§5.7 — New Folder)", () => {
+    it("creates a real directory on disk", async () => {
+      state.mockFsStatThrows = true; // doesn't exist yet
+      state.inputBoxReturn = "cisco/backup";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+      await handler();
+      const createDirCalls = vi
+        .mocked(vscode.workspace.fs.createDirectory)
+        .mock.calls.map((c) => (c[0] as { fsPath: string }).fsPath);
+      expect(createDirCalls).toContain("/ws/.nexus/scripts/cisco/backup");
+    });
+
+    it("is a no-op with an info message when the folder already exists", async () => {
+      state.mockFsStatThrows = false; // exists
+      state.inputBoxReturn = "cisco";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+      await handler();
+      expect(state.mockShowInformationMessage).toHaveBeenCalled();
+      expect(vi.mocked(vscode.workspace.fs.createDirectory).mock.calls.length).toBe(0);
+    });
+
+    it("pre-seeds the input with 'folder/' when invoked from a folder's context menu (nested folder creation)", async () => {
+      state.inputBoxReturn = undefined;
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+      await handler({ kind: "folder", path: "cisco", name: "cisco", uri: { fsPath: "/ws/.nexus/scripts/cisco" } });
+      expect(state.inputBoxOptions?.value).toBe("cisco/");
+    });
+
+    it("rejects a path containing '..'", async () => {
+      state.inputBoxReturn = "../escape";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+      await handler();
+      expect(state.inputBoxValidator).toBeDefined();
+      expect(state.inputBoxValidator!("../escape")).toBeDefined();
+      expect(vi.mocked(vscode.workspace.fs.createDirectory).mock.calls.length).toBe(0);
+    });
+
+    it("rejects a backslash with a 'use /' message", async () => {
+      state.inputBoxReturn = "cisco\\backup";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+      await handler();
+      const message = state.inputBoxValidator!("cisco\\backup");
+      expect(message).toBeDefined();
+      expect(message!).toMatch(/use '\/'/i);
+    });
+
+    it("rejects names the Scripts view will never render, instead of creating an invisible directory", async () => {
+      // These all pass the folder-path grammar, so the directory really got
+      // created on disk — and then `scanScriptsDir` skipped it, so it never
+      // appeared, and a second attempt reported "already exists" about a
+      // folder the user cannot see anywhere.
+      state.inputBoxReturn = undefined;
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+      await handler();
+      const validate = state.inputBoxValidator!;
+
+      expect(validate(".archive")).toMatch(/never shows/);
+      expect(validate("node_modules")).toMatch(/never shows/);
+      expect(validate("types")).toMatch(/never shows/);
+      expect(validate("cisco/.old")).toMatch(/never shows/);
+      // ...and does NOT reject the things the scanner does walk.
+      expect(validate("cisco")).toBeUndefined();
+      expect(validate("cisco/types")).toBeUndefined();
+    });
+  });
+
+  describe("nexus.script.refresh", () => {
+    it("calls the injected refresh callback", () => {
+      const refresh = vi.fn();
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs", undefined, refresh);
+      const handler = state.registeredCommands.get("nexus.script.refresh")!;
+      handler();
+      expect(refresh).toHaveBeenCalledTimes(1);
+    });
+
+    it("does nothing (does not throw) when no refresh callback was provided", () => {
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.refresh")!;
+      expect(() => handler()).not.toThrow();
     });
   });
 

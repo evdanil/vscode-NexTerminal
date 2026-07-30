@@ -47,8 +47,10 @@ export interface MacroStore {
    *
    * Invariant, enforced at WRITE TIME ONLY: every macro this call persists has a unique,
    * non-empty, STRING `id` — a non-string value (e.g. an object surviving a corrupt JSON
-   * import) and an empty string are both treated as missing, and a later duplicate is
-   * reassigned a fresh id. See `isValidMacroId()` / `assignMacroIds()` below, the single
+   * import) and an empty string are both treated as missing, and all but one holder of a
+   * duplicated id are reassigned a fresh one. WHICH holder keeps it is not fixed: the
+   * plain wrapper awards it in array order, but `keepIdIfPossible` lets a pinned record
+   * claim it ahead of array order, so an EARLIER duplicate can be the one reassigned. See `isValidMacroId()` / `assignMacroIds()` below, the single
    * implementation both `VscodeMacroStore.save()` and `InMemoryMacroStore.save()` use (the
    * latter through the `assignUniqueMacroIds()` wrapper, having no side storage to key).
    *
@@ -166,8 +168,22 @@ export interface MacroStore {
   replaceAll(macros: TerminalMacro[]): Promise<void>;
   /** Subscribe to changes. Returns a disposer. */
   onDidChange(listener: MacroStoreChangeListener): () => void;
-  /** Clear all state (macros + vault entries). Used by completeReset. */
+  /** Clear all state (macros + vault entries + explicit folders). Used by completeReset. */
   clearAll(): Promise<void>;
+  /**
+   * Explicit macro folders (`nexus.macros.folders`) — folders that exist even
+   * with zero macros assigned to them (§4.1). Sanitized: every entry is a
+   * valid, non-empty folder path. The full rendered folder set is the union
+   * of this list and folders derived from macros' `group` — see
+   * `collectMacroFolders()` in `src/services/macroFolders.ts`.
+   */
+  getFolders(): string[];
+  /**
+   * Persists the given explicit folder list. Untrusted input (§4.2) is
+   * sanitized: non-strings and structurally invalid paths are dropped,
+   * duplicates collapsed.
+   */
+  saveFolders(folders: string[]): Promise<void>;
 }
 
 /**

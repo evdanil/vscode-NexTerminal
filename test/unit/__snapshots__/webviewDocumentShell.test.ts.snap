@@ -4081,6 +4081,18 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
     <div class="hint">Macros without a shortcut can still be run via <strong>Alt+S</strong> (quick pick). Supported: Alt, Alt+Shift, Ctrl+Shift with A-Z or 0-9.</div>
   </div>
 
+  <div class="form-group">
+    <label for="macro-folder">Folder</label>
+    <div class="custom-combobox" id="macro-folder-wrapper">
+      <input type="text" id="macro-folder" value="" placeholder="Type a folder path or pick existing..." autocomplete="off" />
+      <div class="custom-select-dropdown">
+
+      </div>
+    </div>
+    <div class="field-error" id="error-folder"></div>
+    <div class="hint">Optional. Groups this macro under a sidebar folder. Use "/" for nested folders (e.g. Cisco/Routers).</div>
+  </div>
+
   <div class="bottom-actions">
     <button type="button" class="btn-primary" id="save-btn">Save</button>
     <button type="button" class="btn-secondary" id="delete-btn">Delete</button>
@@ -4238,6 +4250,10 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
       var dirty = false;
       var currentIndex = 0;
       var currentId = null;
+      // Which render drew this page (see renderGeneration). Travels with every
+      // save/delete so the host can look up what IT knew about currentId then;
+      // it is a key into the host's records, never a claim about the id.
+      var currentRenderGeneration = 0;
       var KNOWN_PROFILE_IDS = ["abc12345-0000-0000-0000-000000000000"];
 
       var VALID_PATTERN = /^(alt\\+[a-z0-9]|alt\\+shift\\+[a-z0-9]|ctrl\\+shift\\+[a-z0-9])$/;
@@ -4697,6 +4713,11 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
           errorEl.textContent = "";
         }
       });
+      document.getElementById("macro-folder").addEventListener("input", function() {
+        markDirty();
+        document.getElementById("error-folder").textContent = "";
+      });
+      initCustomComboboxes();
 
       // Macro selector — confirm discard if dirty
       initCustomSelects(function(wrapper, opt) {
@@ -4729,6 +4750,7 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
         var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
         var triggerScope = document.getElementById("macro-trigger-scope").value;
         var triggerProfileId = document.getElementById("macro-trigger-profile").value.trim();
+        var folderVal = document.getElementById("macro-folder").value.trim();
 
         // Validate
         var valid = true;
@@ -4801,6 +4823,7 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
           type: "save",
           index: currentIndex,
           id: currentId,
+          renderGeneration: currentRenderGeneration,
           name: name,
           text: text,
           secret: secret,
@@ -4811,7 +4834,8 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
           triggerInitiallyDisabled: triggerInitiallyDisabled,
           triggerScope: triggerScope,
           triggerProfileId: triggerProfileId || null,
-          variables: variablesForSave
+          variables: variablesForSave,
+          group: folderVal || null
         });
       });
 
@@ -4821,7 +4845,7 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
         // Same reason as the save handler: a delete also goes through the store, and a
         // previous attempt's storage error must not be read as this one's verdict.
         document.getElementById("error-save").textContent = "";
-        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId });
+        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId, renderGeneration: currentRenderGeneration });
       });
 
       // New

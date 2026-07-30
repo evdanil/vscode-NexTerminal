@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.74",
+  "version": "2.8.75",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -594,6 +594,30 @@
         "category": "Nexus"
       },
       {
+        "command": "nexus.macro.newFolder",
+        "title": "New Macro Folder",
+        "category": "Nexus",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "nexus.macro.moveToFolder",
+        "title": "Move to Folder",
+        "category": "Nexus"
+      },
+      {
+        "command": "nexus.macro.addToFolder",
+        "title": "Add Macro"
+      },
+      {
+        "command": "nexus.macro.renameFolder",
+        "title": "Rename Folder",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.macro.removeFolder",
+        "title": "Remove Folder (keep macros)"
+      },
+      {
         "command": "nexus.files.browse",
         "title": "Browse Files",
         "icon": "$(remote-explorer)"
@@ -724,6 +748,18 @@
         "title": "New Nexus Script",
         "category": "Nexus",
         "icon": "$(new-file)"
+      },
+      {
+        "command": "nexus.script.newFolder",
+        "title": "New Script Folder",
+        "category": "Nexus",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "nexus.script.refresh",
+        "title": "Refresh Scripts",
+        "category": "Nexus",
+        "icon": "$(refresh)"
       },
       {
         "command": "nexus.script.openOutput",
@@ -867,6 +903,11 @@
           "group": "navigation@3"
         },
         {
+          "command": "nexus.macro.newFolder",
+          "when": "view == nexusMacros",
+          "group": "navigation@4"
+        },
+        {
           "command": "nexus.files.followTerminal",
           "when": "view == nexusFileExplorer && !nexus.files.followingTerminal",
           "group": "navigation@1"
@@ -932,19 +973,29 @@
           "group": "navigation@1"
         },
         {
-          "command": "nexus.script.openScriptsFolder",
+          "command": "nexus.script.newFolder",
           "when": "view == nexusScripts",
           "group": "navigation@2"
         },
         {
-          "command": "nexus.script.openDocs",
+          "command": "nexus.script.refresh",
           "when": "view == nexusScripts",
           "group": "navigation@3"
         },
         {
-          "command": "nexus.script.openExamples",
+          "command": "nexus.script.openScriptsFolder",
           "when": "view == nexusScripts",
           "group": "navigation@4"
+        },
+        {
+          "command": "nexus.script.openDocs",
+          "when": "view == nexusScripts",
+          "group": "navigation@5"
+        },
+        {
+          "command": "nexus.script.openExamples",
+          "when": "view == nexusScripts",
+          "group": "navigation@6"
         }
       ],
       "view/item/context": [
@@ -1339,14 +1390,19 @@
           "group": "1_manage@4"
         },
         {
+          "command": "nexus.macro.moveToFolder",
+          "when": "view == nexusMacros && viewItem =~ /^nexus\\.macro/",
+          "group": "1_manage@5"
+        },
+        {
           "command": "nexus.macro.disableTrigger",
           "when": "view == nexusMacros && viewItem =~ /^nexus\\.macro(\\.secret)?\\.triggered$/",
-          "group": "1_manage@5"
+          "group": "1_manage@6"
         },
         {
           "command": "nexus.macro.enableTrigger",
           "when": "view == nexusMacros && viewItem =~ /^nexus\\.macro(\\.secret)?\\.triggered\\.disabled$/",
-          "group": "1_manage@5"
+          "group": "1_manage@6"
         },
         {
           "command": "nexus.macro.copySecret",
@@ -1361,6 +1417,21 @@
         {
           "command": "nexus.macro.remove",
           "when": "view == nexusMacros && viewItem =~ /^nexus\\.macro/",
+          "group": "2_destructive"
+        },
+        {
+          "command": "nexus.macro.addToFolder",
+          "when": "view == nexusMacros && viewItem == nexus.folder.macros",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "nexus.macro.renameFolder",
+          "when": "view == nexusMacros && viewItem == nexus.folder.macros",
+          "group": "1_manage@2"
+        },
+        {
+          "command": "nexus.macro.removeFolder",
+          "when": "view == nexusMacros && viewItem == nexus.folder.macros",
           "group": "2_destructive"
         },
         {
@@ -1462,6 +1533,21 @@
           "command": "nexus.script.delete",
           "when": "view == nexusScripts && viewItem =~ /^nexus\\.script\\.(file|running)$/",
           "group": "3_destructive"
+        },
+        {
+          "command": "nexus.script.new",
+          "when": "view == nexusScripts && viewItem == nexus.scriptFolder",
+          "group": "1_manage@0"
+        },
+        {
+          "command": "nexus.script.newFolder",
+          "when": "view == nexusScripts && viewItem == nexus.scriptFolder",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "nexus.script.revealInExplorer",
+          "when": "view == nexusScripts && viewItem == nexus.scriptFolder",
+          "group": "1_manage@2"
         }
       ],
       "commandPalette": [
@@ -1766,6 +1852,26 @@
           "when": "false"
         },
         {
+          "command": "nexus.macro.newFolder",
+          "when": "true"
+        },
+        {
+          "command": "nexus.macro.moveToFolder",
+          "when": "true"
+        },
+        {
+          "command": "nexus.macro.addToFolder",
+          "when": "false"
+        },
+        {
+          "command": "nexus.macro.renameFolder",
+          "when": "false"
+        },
+        {
+          "command": "nexus.macro.removeFolder",
+          "when": "false"
+        },
+        {
           "command": "nexus.files.browse",
           "when": "true"
         },
@@ -1852,6 +1958,14 @@
         {
           "command": "nexus.script.revealInExplorer",
           "when": "false"
+        },
+        {
+          "command": "nexus.script.newFolder",
+          "when": "true"
+        },
+        {
+          "command": "nexus.script.refresh",
+          "when": "true"
         },
         {
           "command": "nexus.terminal.reset",

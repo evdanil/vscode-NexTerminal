@@ -654,3 +654,91 @@ describe("renderMacroEditorHtml", () => {
     expect(isWhitespaceOnly).toBe(false);
   });
 });
+
+describe("renderMacroEditorHtml — Folder field (§4.11)", () => {
+  it("renders the macro's existing group as the field value, with no notice", () => {
+    const macros: TerminalMacro[] = [{ name: "M", text: "t", group: "Cisco/Routers" }];
+    const html = renderMacroEditorHtml(macros, 0, nonce);
+    expect(html).toContain('<input type="text" id="macro-folder" value="Cisco/Routers"');
+    expect(html).not.toContain("shows at the root");
+  });
+
+  it("renders an empty value for a macro with no group", () => {
+    const macros: TerminalMacro[] = [{ name: "M", text: "t" }];
+    const html = renderMacroEditorHtml(macros, 0, nonce);
+    expect(html).toContain('<input type="text" id="macro-folder" value=""');
+    expect(html).not.toContain("shows at the root");
+  });
+
+  it("never crashes and renders blank for a malformed (§4.2) group", () => {
+    const macros: TerminalMacro[] = [{ name: "M", text: "t", group: { bad: true } as unknown as string }];
+    expect(() => renderMacroEditorHtml(macros, 0, nonce)).not.toThrow();
+    const html = renderMacroEditorHtml(macros, 0, nonce);
+    expect(html).toContain('<input type="text" id="macro-folder" value=""');
+  });
+
+  it("shows a stored-but-unrenderable group RAW, with a notice, instead of an empty field with nothing to correct", () => {
+    // §4.9.3 promises such a value is "kept byte-for-byte and shown at the root
+    // until you correct it". Sanitizing it away here made the editor — the one
+    // surface where correcting it happens — display nothing to correct, and fed
+    // the save handler an empty value that then destroyed the stored path.
+    const macros: TerminalMacro[] = [{ name: "M", text: "t", group: "Cisco\\Routers" }];
+    const html = renderMacroEditorHtml(macros, 0, nonce);
+    expect(html).toContain('<input type="text" id="macro-folder" value="Cisco\\Routers"');
+    expect(html).toContain("This folder path isn&#39;t usable, so this macro shows at the root.");
+  });
+
+  it("escapes an unrenderable group rather than injecting it — it is untrusted (§4.2) and now reaches the DOM", () => {
+    const macros: TerminalMacro[] = [
+      { name: "M", text: "t", group: '"><img src=x onerror=alert(1)>' }
+    ];
+    const html = renderMacroEditorHtml(macros, 0, nonce);
+    expect(html).not.toContain("<img src=x");
+    expect(html).toContain("&quot;&gt;&lt;img src=x onerror=alert(1)&gt;");
+  });
+
+  it("withholds a group longer than the path cap from the DOM entirely, with its own notice", () => {
+    // The bound exists so an 8 MB `group` (hand-written into settings.json and
+    // absorbed verbatim) cannot be shipped into the webview on every render.
+    const macros: TerminalMacro[] = [{ name: "M", text: "t", group: "X".repeat(8_000_000) }];
+    const html = renderMacroEditorHtml(macros, 0, nonce);
+    expect(html).toContain('<input type="text" id="macro-folder" value=""');
+    expect(html).toContain("too long to show here");
+    expect(html.length).toBeLessThan(1_000_000);
+  });
+
+  it("lists the supplied folders as combobox suggestions", () => {
+    const html = renderMacroEditorHtml([], null, nonce, [], ["Cisco", "Juniper/Routers"]);
+    expect(html).toContain('data-value="Cisco"');
+    expect(html).toContain('data-value="Juniper/Routers"');
+  });
+
+  it("seeds the Folder field for a new (not-yet-saved) macro via the seedGroup param (§4.7 addToFolder)", () => {
+    const html = renderMacroEditorHtml([], null, nonce, [], ["Cisco"], "Cisco");
+    expect(html).toContain('<input type="text" id="macro-folder" value="Cisco"');
+  });
+
+  it("the seed is ignored once an existing macro is selected", () => {
+    const macros: TerminalMacro[] = [{ name: "M", text: "t", group: "Juniper" }];
+    const html = renderMacroEditorHtml(macros, 0, nonce, [], ["Cisco", "Juniper"], "Cisco");
+    expect(html).toContain('<input type="text" id="macro-folder" value="Juniper"');
+  });
+
+  it("includes `group` in the save postMessage payload, read from the Folder input itself", () => {
+    // Asserting only `group: folderVal || null` left the binding between the
+    // payload and the DOM untested: `folderVal` sourced from any other element
+    // id would still satisfy it. These two strings together pin both ends.
+    // (A jsdom execution of the rendered script would be strictly better, but
+    // vitest runs `environment: "node"` here and jsdom is not a dependency —
+    // see the report's residual-risk note.)
+    const html = render([], null);
+    expect(html).toContain('var folderVal = document.getElementById("macro-folder").value.trim();');
+    expect(html).toContain('group: folderVal || null');
+    expect(html).toContain('variables: variablesForSave,');
+  });
+
+  it("calls initCustomComboboxes() so the Folder field's suggestion dropdown is wired up", () => {
+    const html = render([], null);
+    expect(html).toContain("initCustomComboboxes();");
+  });
+});

@@ -5,9 +5,21 @@ import {
   type MacroStore,
   type MacroStoreChangeListener
 } from "./macroStore";
+import { dropNonPathGroup, sanitizeMacroFolderList } from "../services/macroFolders";
+
+/**
+ * Fix 1 — mirrors `VscodeMacroStore`'s `isUsableMacro()`: a macro is not
+ * usable without a string `name` and a string `text`; anything else (e.g. a
+ * caller writing through a stale/out-of-bounds index) is dropped here rather
+ * than persisted, so a malformed record can never reach the tree.
+ */
+function isUsableMacro(m: TerminalMacro): boolean {
+  return !!m && typeof m === "object" && typeof m.name === "string" && typeof m.text === "string";
+}
 
 export class InMemoryMacroStore implements MacroStore {
   private macros: TerminalMacro[] = [];
+  private folders: string[] = [];
   private readonly listeners = new Set<MacroStoreChangeListener>();
 
   public async initialize(): Promise<void> {
@@ -27,7 +39,18 @@ export class InMemoryMacroStore implements MacroStore {
     // Also mirrors the legacy `slot` → `keybinding` normalization VscodeMacroStore does,
     // so tests and the web-host fallback see the same macro shape the production store
     // hands out. See `withMigratedSlot()` in macroStore.ts.
-    this.macros = assignUniqueMacroIds(macros).map((m) => withMigratedSlot(m));
+    // Fix 1 — unusable records are dropped BEFORE ids are assigned, so a fresh UUID is
+    // never spent on a record that is about to be discarded.
+    //
+    // `group` gets the same ingest GUARD VscodeMacroStore applies — the two MacroStore
+    // implementations must not have different ingest contracts for the same untrusted
+    // field (§4.2). Note it is a guard, not the folder-path grammar: a string group is
+    // preserved exactly as given and sanitized only at read sites, so a `save()`
+    // triggered by an unrelated edit can never delete another macro's stored folder
+    // assignment.
+    this.macros = assignUniqueMacroIds(macros.filter(isUsableMacro)).map((m) =>
+      dropNonPathGroup(withMigratedSlot(m))
+    );
     for (const listener of this.listeners) listener();
   }
 
@@ -51,6 +74,16 @@ export class InMemoryMacroStore implements MacroStore {
 
   public async clearAll(): Promise<void> {
     this.macros = [];
+    this.folders = [];
+    for (const listener of this.listeners) listener();
+  }
+
+  public getFolders(): string[] {
+    return [...this.folders];
+  }
+
+  public async saveFolders(folders: string[]): Promise<void> {
+    this.folders = sanitizeMacroFolderList(folders);
     for (const listener of this.listeners) listener();
   }
 }

@@ -73,6 +73,7 @@ A full SSH + serial + port-forwarding client inside VS Code — without Remote-S
   log.info("kernel:", out.before.trim());
   ```
   See the **[full scripting guide](docs/scripting.md)** for the complete API reference, header fields, match-window semantics, error-handling patterns, macro coordination, and [`examples/scripts/`](examples/scripts/) for seven runnable scripts demonstrating `if` / `while` / `for` loops, retries, polling, user interaction, and complete multi-step procedures.
+- **Folders for Macros and Scripts** — Group Terminal Macros and Nexus Scripts into folders, the same way servers and serial profiles are organized in the Connectivity Hub. Create a macro folder explicitly (New Folder) or by moving/dragging a macro into it; script folders are just directories under the scripts folder — create one with New Folder, or give New Script a `folder/name` path and Nexus creates the folder for you. A folder is yours to create and persists even while empty; removing a macro folder re-parents its macros instead of deleting them. See the [macro guide](docs/macros.md#organising-macros-into-folders) and the [scripting guide](docs/scripting.md#organising-scripts-into-folders).
 - **Web Extension Fallback** — Graceful degradation in browser-based VS Code (SSH/serial features require desktop runtime).
 
 ## Getting Started
@@ -166,6 +167,16 @@ Running it prompts for the host, then the username, then the password (masked, n
 A macro can prompt for input, or auto-trigger from terminal output — not both. If a macro somehow ends up with both, Nexus treats it as a plain, non-auto-triggering macro instead of running either behavior partially.
 
 See the [macro guide](docs/macros.md) for the full variable syntax table, the `'${password}'` quoting idiom, and the `HISTCONTROL=ignorespace` trick for keeping a value out of the remote shell's history.
+
+### Organizing Macros and Scripts into Folders
+
+Both the Macros view and the Scripts view group their contents into folders, matching the Connectivity Hub. Folders are yours to create — an empty folder stays until you remove it.
+
+For macros, folders are a display grouping: use **New Folder** in the Macros view title bar to create one, then drag a macro onto it (or right-click a macro → **Move to Folder**) to move it in. Running **Move to Folder** from the Command Palette with nothing selected opens a multi-select quick pick first, so sorting a flat pile of macros into folders is a bulk operation rather than one drag per macro. Removing a folder re-parents its macros to the parent folder instead of deleting them, and reordering with **Move Up** / **Move Down** only ever swaps a macro with its neighbor in the *same* folder.
+
+For scripts, a folder is a real directory under your configured scripts folder (`nexus.scripts.path`, default `.nexus/scripts`). Use **New Folder** in the Scripts view, or give **New Script** a path like `cisco/backup` and Nexus creates `cisco/` for you if it doesn't exist yet. A folder's right-click menu repeats New Script and New Folder scoped to that folder, plus **Reveal in Explorer**. The Scripts view scans up to 10 folder levels deep and up to 500 directories/files (scripts included) before stopping, to keep a misconfigured scripts path from hanging the sidebar; if that happens, a row pinned at the top of the view links straight to the setting.
+
+Both views validate folder paths the same way: `.` and `..` segments are rejected, and a `\` is rejected with a message telling you to use `/` — a path like `../../home/you/something` can never write or move something outside where it belongs.
 
 ### Set Up Port Forwarding
 

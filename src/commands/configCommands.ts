@@ -6,6 +6,7 @@ import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
+import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
 import type { SecretVault } from "../services/ssh/contracts";
 import {
   passwordSecretKey,
@@ -39,7 +40,14 @@ import {
   compiledTriggerCooldownSeconds,
   compiledTriggerIntervalSeconds
 } from "../storage/macroStore";
-import { getMacros, saveMacros, replaceMacros, getActiveMacroStore } from "../macroSettings";
+import {
+  getMacroFolders,
+  getMacros,
+  saveMacroFolders,
+  saveMacros,
+  replaceMacros,
+  getActiveMacroStore
+} from "../macroSettings";
 import { validateSettingUpdate } from "../ui/settingsValidation";
 import { SETTINGS_META } from "../ui/settingsMetadata";
 import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
@@ -72,6 +80,8 @@ interface NexusConfigExport {
   authProfiles?: AuthProfile[];
   groups?: string[];
   macros?: TerminalMacro[]; // Non-secret fields; secret macros carry `text: ""`
+  /** Explicit macro folders (`nexus.macros.folders`, §4.1) — carried exactly as `groups` is. */
+  macroFolders?: string[];
   settings?: Record<string, unknown>;
   encryptedSecrets?: EncryptedPayload;
 }
@@ -458,6 +468,9 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
   if (obj.groups !== undefined && !Array.isArray(obj.groups)) {
     return false;
   }
+  if (obj.macroFolders !== undefined && !Array.isArray(obj.macroFolders)) {
+    return false;
+  }
   if (
     obj.settings !== undefined &&
     (typeof obj.settings !== "object" || obj.settings === null || Array.isArray(obj.settings))
@@ -709,8 +722,15 @@ async function promptDecryptPassword(): Promise<string | undefined> {
  * Built with `JSON.stringify` rather than a `|` join so that a value containing the delimiter
  * cannot forge a different record's key — with a join, a macro named `a|b` and text `c` keys
  * the same as one named `a` with text `b|c`.
+ *
+ * §7 — `group` is DELIBERATELY excluded, and exported so a unit test can pin that: two macros
+ * identical except for their sidebar folder are still "the same macro" for import and dedup
+ * purposes, exactly as `keyOfLegacy()` in `vscodeMacroStore.ts` also excludes it. A folder is a
+ * display projection, not a property the trigger compiler or the prompt path can observe, so
+ * naming it here would fail the "what the RUNTIME can see" rule above in the duplicate
+ * direction.
  */
-function keyOf(m: TerminalMacro): string {
+export function keyOf(m: TerminalMacro): string {
   return JSON.stringify([
     m.name ?? "",
     canonicalMacroSecret(m),
@@ -817,6 +837,17 @@ function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
   // field the editor renders as empty and no consumer can act on.
   if (macro.keybinding !== undefined && (typeof macro.keybinding !== "string" || !isValidBinding(macro.keybinding))) {
     delete macro.keybinding;
+  }
+
+  // §4.2 — `group` is untrusted on import too: normalize-or-drop, same rule
+  // as every other ingest path (VscodeMacroStore's `persistLegacyMigration`/
+  // `reloadFromState`). "" canonicalizes to `undefined` alongside anything
+  // structurally invalid (non-string, `..`, `.`, `\`, over-depth).
+  const normalizedGroup = sanitizeMacroGroup(macro.group);
+  if (normalizedGroup) {
+    macro.group = normalizedGroup;
+  } else {
+    delete macro.group;
   }
 
   // Runs unconditionally — independent of whatever the trigger-sanitization
@@ -1021,6 +1052,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           authProfiles: snapshot.authProfiles,
           groups: snapshot.explicitGroups,
           macros: nonSecretForTopLevel,
+          macroFolders: getMacroFolders(),
           settings, // no longer contains nexus.terminal.macros
           encryptedSecrets
         };
@@ -1071,6 +1103,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       authProfiles: sanitized.authProfiles.length > 0 ? sanitized.authProfiles : undefined,
       groups: snapshot.explicitGroups,
       macros: sanitized.macros.length > 0 ? sanitized.macros : undefined,
+      macroFolders: getMacroFolders(),
       settings: sanitized.settings
     };
 
@@ -1312,6 +1345,16 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       }
     }
 
+    // §4.1 — explicit macro folders carried exactly as `groups` is: merge
+    // (union), sanitizing untrusted input the same way as everywhere else (§4.2).
+    if (Array.isArray(data.macroFolders)) {
+      const incomingFolders = sanitizeMacroFolderList(data.macroFolders);
+      if (incomingFolders.length > 0) {
+        const merged = new Set([...getMacroFolders(), ...incomingFolders]);
+        await saveMacroFolders([...merged]);
+      }
+    }
+
     if (data.settings && typeof data.settings === "object") {
       await applySettings(data.settings);
     }
@@ -1426,8 +1469,50 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       }
     }
 
-    // Apply macros from import payload
+    // Read the incoming macros BEFORE the folder block: whether this payload
+    // replaces the macros array at all is what decides whether clearing the
+    // folder list is a correction or a deletion. See below.
     const incomingResult = collectIncomingMacros(data, decryptedSecrets);
+
+    // §4.1 — explicit macro folders, carried exactly as `groups` is. Replace
+    // mode overwrites the persisted list outright (mirrors the macros-array
+    // replace just below, and `saveFolders()` itself replaces — no separate
+    // upfront-clear step is needed the way `groups` needs one for `addGroup`'s
+    // additive API); merge mode unions with what already exists.
+    //
+    // Fix 5 — a pre-2.8.75 backup predates `macroFolders` entirely, so
+    // `data.macroFolders` is `undefined` rather than `[]`. In REPLACE mode that
+    // must still clear the list WHEN THE MACROS ARE ALSO BEING REPLACED,
+    // otherwise the store shows folders left over from a config the import just
+    // discarded.
+    //
+    // "When the macros are also being replaced" is the whole condition, and the
+    // earlier unconditional clear got it wrong by asserting `saveMacros()`
+    // always runs below. It does not: `collectIncomingMacros()` returns
+    // `undefined` for a payload carrying neither a top-level `macros` array nor
+    // `settings["nexus.terminal.macros"]`, and the macros block is then skipped
+    // entirely. `isValidExport()` accepts exactly that shape — a servers-only
+    // export, or any pre-macro-export backup — so replace-importing one used to
+    // keep every macro and destroy every explicit empty folder, which is the
+    // one artifact this feature exists to persist. Nothing was replaced;
+    // nothing should have been cleared.
+    //
+    // Merge mode has no such gap — unioning with nothing already sitting there
+    // is a correct no-op.
+    if (mode === "replace") {
+      if (Array.isArray(data.macroFolders)) {
+        await saveMacroFolders(sanitizeMacroFolderList(data.macroFolders));
+      } else if (incomingResult !== undefined) {
+        await saveMacroFolders([]);
+      }
+    } else if (Array.isArray(data.macroFolders)) {
+      const incomingFolders = sanitizeMacroFolderList(data.macroFolders);
+      if (incomingFolders.length > 0) {
+        await saveMacroFolders([...new Set([...getMacroFolders(), ...incomingFolders])]);
+      }
+    }
+
+    // Apply macros from import payload
     if (incomingResult !== undefined) {
       const { macros: incomingMacros, unresolvedCount } = incomingResult;
       if (mode === "replace") {

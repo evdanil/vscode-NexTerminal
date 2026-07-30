@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
 import { getAssignedBinding } from "../../src/macroBindingHelpers";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
+import { macroGroup } from "../../src/services/macroFolders";
 
 // There is deliberately no `workspace.fs` in this mock: the absorb path stores secrets, and it
 // no longer writes anything to the filesystem to do so. The per-secret-id marker files it used
@@ -678,5 +679,151 @@ describe("MacroStore legacy migration", () => {
     store = new VscodeMacroStore(ctx);
     await store.initialize();
     expect(store.getAll().map((m) => m.name)).toEqual(["pw"]); // no duplicate
+  });
+
+  describe("§4.2 — `group` is untrusted on the absorption path too", () => {
+    // Isolates `persistLegacyMigration()` specifically: `initialize()` always
+    // runs `reloadFromState()` right after absorption, and THAT method's own
+    // scrub would clean up a malformed group even if persistLegacyMigration did
+    // nothing — so asserting only the post-initialize() state cannot tell the
+    // two ingest sites apart. Capturing the FIRST write to `nexus.macros`
+    // (persistLegacyMigration's own write, before reloadFromState ever runs)
+    // isolates it.
+    it("a non-string group from a hand-edited settings.json is dropped BEFORE reloadFromState ever sees it", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        global: [{ name: "a", text: "echo a", group: { nope: true } } as unknown as TerminalMacro]
+      });
+      const { ctx } = makeCtx();
+      const writes: unknown[] = [];
+      const origUpdate = ctx.globalState.update.bind(ctx.globalState);
+      ctx.globalState.update = async (key: string, value: unknown) => {
+        if (key === "nexus.macros") writes.push(value);
+        return origUpdate(key, value);
+      };
+      const store = new VscodeMacroStore(ctx);
+
+      await expect(store.initialize()).resolves.toBeUndefined();
+
+      expect(writes.length).toBeGreaterThan(0);
+      const firstWrite = writes[0] as Array<{ group?: unknown }>;
+      expect(firstWrite[0].group).toBeUndefined();
+    });
+
+    it("a '..' path-traversal group from legacy settings is absorbed as written, and renders as ungrouped", async () => {
+      // Absorption is the one moment this value crosses from settings.json
+      // into permanent storage. Dropping it here loses the user's stated
+      // intent for a macro they are migrating; sanitizing it at every READ
+      // site is what stops it ever rendering as a `..` folder.
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        global: [{ name: "a", text: "echo a", group: "../secrets" } as TerminalMacro]
+      });
+      const { ctx } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+
+      await store.initialize();
+
+      expect(store.getAll()[0].group).toBe("../secrets");
+      expect(macroGroup(store.getAll()[0])).toBeUndefined();
+    });
+
+    it("a pathologically long SINGLE-SEGMENT group from legacy settings never renders, and absorption does not hang", async () => {
+      // `group: "X".repeat(8_000_000)` has a segment count of 1 — comfortably
+      // under MAX_FOLDER_DEPTH — so only a length bound catches it, and that
+      // bound lives at the read site where it rejects in O(1).
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      const huge = "X".repeat(8_000_000);
+      vscode.__setConfig("nexus.terminal", {
+        global: [{ name: "a", text: "echo a", group: huge } as TerminalMacro]
+      });
+      const { ctx } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+
+      await expect(store.initialize()).resolves.toBeUndefined();
+
+      expect(macroGroup(store.getAll()[0])).toBeUndefined();
+      expect(store.getAll()[0].group).toHaveLength(8_000_000);
+    });
+
+    it("a valid group from legacy settings survives absorption", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        global: [{ name: "a", text: "echo a", group: "Cisco/Routers" } as TerminalMacro]
+      });
+      const { ctx } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+
+      await store.initialize();
+
+      expect(store.getAll()[0].group).toBe("Cisco/Routers");
+    });
+  });
+
+  describe("Fix 1 (this review round) — persistLegacyMigration() enforces isUsableMacro too", () => {
+    // Isolates `persistLegacyMigration()` the same way the §4.2 block above
+    // does: capture the FIRST write to `nexus.macros` (persistLegacyMigration's
+    // own write), before `reloadFromState()` ever runs, so a fix living only
+    // in `reloadFromState()` can't make this pass by accident.
+    it("a macro missing `text` in legacy settings never reaches globalState, not even transiently", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        // The exact settings.json trigger from the review.
+        global: [{ name: "Broken", group: "Cisco" } as unknown as TerminalMacro]
+      });
+      const { ctx } = makeCtx();
+      const writes: unknown[] = [];
+      const origUpdate = ctx.globalState.update.bind(ctx.globalState);
+      ctx.globalState.update = async (key: string, value: unknown) => {
+        if (key === "nexus.macros") writes.push(value);
+        return origUpdate(key, value);
+      };
+      const store = new VscodeMacroStore(ctx);
+
+      await expect(store.initialize()).resolves.toBeUndefined();
+
+      expect(writes.length).toBeGreaterThan(0);
+      const firstWrite = writes[0] as unknown[];
+      expect(firstWrite).toHaveLength(0); // dropped before persistence, not merely hidden later
+      expect(store.getAll()).toEqual([]);
+    });
+
+    it("a usable macro alongside a broken one in legacy settings: only the broken one is dropped", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        global: [
+          { name: "Good", text: "echo good" },
+          { name: "Broken", group: "Cisco" } as unknown as TerminalMacro
+        ]
+      });
+      const { ctx } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+
+      await store.initialize();
+
+      expect(store.getAll().map((m) => m.name)).toEqual(["Good"]);
+    });
+  });
+
+  describe("§7 — keyOfLegacy() deliberately excludes `group` (assert the decision)", () => {
+    it("an on-disk macro and a legacy-settings entry differing ONLY by group are treated as the same macro (no duplicate added)", async () => {
+      const { ctx, state } = makeCtx();
+      // Simulate a macro already migrated once (now living at MACROS_KEY, no group).
+      state.set("nexus.macros", [{ id: "existing-id", name: "reload", text: "reload\n" }]);
+
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      // Legacy settings still carries what LOOKS like the same macro, but with
+      // a `group` the user assigned through some other path. If `keyOfLegacy`
+      // included `group`, this would be absorbed as a SECOND, duplicate macro.
+      vscode.__setConfig("nexus.terminal", {
+        global: [{ name: "reload", text: "reload\n", group: "Cisco" } as TerminalMacro]
+      });
+
+      const store = new VscodeMacroStore(ctx);
+      await store.initialize();
+
+      expect(store.getAll()).toHaveLength(1); // not duplicated
+      expect(store.getAll()[0].id).toBe("existing-id");
+    });
   });
 });

@@ -8,6 +8,7 @@ import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./macroProfileOptions";
 import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } from "../services/macroVariables";
+import { macroFolderField } from "../services/macroFolders";
 
 /**
  * One repeatable variable row (docs/plans/2026-07-29-macro-variables.md §9.1):
@@ -46,11 +47,38 @@ function renderVariableRow(variable: MacroVariable, index: number): string {
     </div>`;
 }
 
+/**
+ * @param renderGeneration Which of the panel's renders this page IS. Baked in
+ * next to `currentId` and posted straight back with every save/delete, where it
+ * is the key the panel looks its own render-time answer up under
+ * (`MacroEditorPanel.renderedRefs`) — not an answer in itself.
+ *
+ * The distinction is the point. The form is the longest-lived reference to a
+ * macro in this feature, and the id alone cannot carry what was true when the
+ * form was drawn: `MacroStore.save()` re-keys duplicates, so by the time the
+ * message arrives the id can look perfectly unique while naming the OTHER twin.
+ * A previous revision posted that fact back as a boolean, which cannot work —
+ * a stale `false`, a forged `false` and a defaulted `false` are indistinguishable
+ * from an honest one, so the page could assert its way past the check. A
+ * generation can only ever NAME one of the host's records; the record itself
+ * stays where the webview cannot reach it.
+ *
+ * The panel owns the numbering (`macroEditorPanel.ts`), because the one
+ * definition of "how many macros carry this id" lives in
+ * `services/macroMutation.ts`, which reaches `vscode` through `macroSettings`
+ * and so cannot be imported here. It defaults to `0`, which the panel never
+ * issues: a render-only caller (the byte-identity snapshot, a test) produces a
+ * page whose save would be refused as coming from no render at all, rather than
+ * one that claims something about an id.
+ */
 export function renderMacroEditorHtml(
   macros: TerminalMacro[],
   selectedIndex: number | null,
   nonce: string,
-  profiles: MacroProfileOptionInput[] = []
+  profiles: MacroProfileOptionInput[] = [],
+  folders: string[] = [],
+  seedGroup?: string,
+  renderGeneration = 0
 ): string {
   const macro = selectedIndex !== null ? macros[selectedIndex] : undefined;
 
@@ -87,6 +115,40 @@ export function renderMacroEditorHtml(
 
   const nameValue = macro?.name ?? "";
   const textValue = macro?.text?.replace(/\n/g, "\n") ?? "";
+  // §4.11 — the Folder field. For an existing macro, whatever
+  // `macroFolderField()` says its stored group looks like in this input; for a
+  // new macro, the caller's seed (e.g. `addToFolder`, §4.7).
+  //
+  // This deliberately does NOT sanitize. Sanitizing showed an empty field for a
+  // stored-but-unrenderable group, which meant the one surface where §4.9.3
+  // says the user can "correct it" displayed nothing to correct — and, worse,
+  // handed the save path an empty value that deleted the stored path. The raw
+  // string is rendered instead (escaped by `escapeHtml`, and withheld entirely
+  // above `MAX_FOLDER_PATH_LENGTH` so a pathological multi-megabyte group can
+  // never reach the DOM), with a notice explaining why the macro is at the
+  // root. `macroEditorPanel.ts` preserves it verbatim if the user leaves it
+  // alone, and validates normally the moment they touch it.
+  const storedFolder = macro ? macroFolderField(macro.group) : undefined;
+  const groupValue = storedFolder ? storedFolder.value : (seedGroup ?? "");
+  const folderNotice =
+    storedFolder?.state === "unrenderable"
+      ? "This folder path isn't usable, so this macro shows at the root. Fix it (or clear it) and save; leaving it untouched keeps the stored value exactly as it is."
+      : storedFolder?.state === "oversize"
+        ? "This macro's stored folder path is too long to show here, so the macro shows at the root. Type a new path to replace it, or use Move to Folder → (root) to clear it; leaving this field empty keeps the stored value."
+        : "";
+  // Folded into the existing hint rather than added as its own element: an
+  // empty conditional block on its own line leaves a whitespace-only line in
+  // the rendered HTML, which `git diff --check` fails on via the snapshot test.
+  const folderNoticeHtml = folderNotice ? `<strong>${escapeHtml(folderNotice)}</strong> ` : "";
+  // Each option carries its own indentation and the whole block is empty when there
+  // are no folders yet — which is the normal starting state. Interpolating an empty
+  // string into an already-indented line would leave the indent behind as a
+  // whitespace-only line, which `git diff --check` fails on via the rendered-HTML
+  // snapshot. The other dropdowns in this file never hit that because their option
+  // lists are static and always non-empty.
+  const folderOptionsHtml = folders.map((f) =>
+    `        <div class="custom-select-option" data-value="${escapeHtml(f)}">${escapeHtml(f)}</div>`
+  ).join("\n");
   const isSecret = macro?.secret ?? false;
   // §4.2 — `variables` is untrusted at every read site; `getValidMacroVariables`
   // applies the shape guard so a corrupt legacy/Settings-Sync record never
@@ -274,6 +336,18 @@ export function renderMacroEditorHtml(
     <div class="hint">Macros without a shortcut can still be run via <strong>Alt+S</strong> (quick pick). Supported: Alt, Alt+Shift, Ctrl+Shift with A-Z or 0-9.</div>
   </div>
 
+  <div class="form-group">
+    <label for="macro-folder">Folder</label>
+    <div class="custom-combobox" id="macro-folder-wrapper">
+      <input type="text" id="macro-folder" value="${escapeHtml(groupValue)}" placeholder="Type a folder path or pick existing..." autocomplete="off" />
+      <div class="custom-select-dropdown">
+${folderOptionsHtml}
+      </div>
+    </div>
+    <div class="field-error" id="error-folder"></div>
+    <div class="hint">${folderNoticeHtml}Optional. Groups this macro under a sidebar folder. Use "/" for nested folders (e.g. Cisco/Routers).</div>
+  </div>
+
   <div class="bottom-actions">
     <button type="button" class="btn-primary" id="save-btn">${escapeHtml(saveLabel)}</button>
     <button type="button" class="btn-secondary" id="delete-btn"${deleteDisabled}>Delete</button>
@@ -292,6 +366,10 @@ export function renderMacroEditorHtml(
       var dirty = false;
       var currentIndex = ${selectedIndex !== null ? selectedIndex : "null"};
       var currentId = ${macro?.id ? JSON.stringify(macro.id) : "null"};
+      // Which render drew this page (see renderGeneration). Travels with every
+      // save/delete so the host can look up what IT knew about currentId then;
+      // it is a key into the host's records, never a claim about the id.
+      var currentRenderGeneration = ${Number.isSafeInteger(renderGeneration) ? renderGeneration : 0};
       var KNOWN_PROFILE_IDS = ${profileIdsJson};
 
       var VALID_PATTERN = /^(alt\\+[a-z0-9]|alt\\+shift\\+[a-z0-9]|ctrl\\+shift\\+[a-z0-9])$/;
@@ -704,6 +782,11 @@ export function renderMacroEditorHtml(
           errorEl.textContent = "";
         }
       });
+      document.getElementById("macro-folder").addEventListener("input", function() {
+        markDirty();
+        document.getElementById("error-folder").textContent = "";
+      });
+      initCustomComboboxes();
 
       // Macro selector — confirm discard if dirty
       initCustomSelects(function(wrapper, opt) {
@@ -736,6 +819,7 @@ export function renderMacroEditorHtml(
         var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
         var triggerScope = document.getElementById("macro-trigger-scope").value;
         var triggerProfileId = document.getElementById("macro-trigger-profile").value.trim();
+        var folderVal = document.getElementById("macro-folder").value.trim();
 
         // Validate
         var valid = true;
@@ -808,6 +892,7 @@ export function renderMacroEditorHtml(
           type: "save",
           index: currentIndex,
           id: currentId,
+          renderGeneration: currentRenderGeneration,
           name: name,
           text: text,
           secret: secret,
@@ -818,7 +903,8 @@ export function renderMacroEditorHtml(
           triggerInitiallyDisabled: triggerInitiallyDisabled,
           triggerScope: triggerScope,
           triggerProfileId: triggerProfileId || null,
-          variables: variablesForSave
+          variables: variablesForSave,
+          group: folderVal || null
         });
       });
 
@@ -828,7 +914,7 @@ export function renderMacroEditorHtml(
         // Same reason as the save handler: a delete also goes through the store, and a
         // previous attempt's storage error must not be read as this one's verdict.
         document.getElementById("error-save").textContent = "";
-        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId });
+        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId, renderGeneration: currentRenderGeneration });
       });
 
       // New

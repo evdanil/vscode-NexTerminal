@@ -1,8 +1,20 @@
 # Changelog
 
-## [Unreleased]
+## [2.8.75] — 2026-07-31
 
-## [2.8.74] — 2026-07-30
+### Added
+
+- **Folders in the Terminal Macros sidebar.** Create one with **New Folder** in the view title, then drag a macro onto it or use **Move to Folder** from its context menu. Folders nest (`Cisco/Access`), sort above macros, and persist even while empty — an empty folder stays until you remove it, so you can set up a structure before filling it. Macros keep their manual order inside a folder, and **Move Up** / **Move Down** now move a macro within its own folder rather than jumping it out. **Remove Folder (keep macros)** never deletes anything: it moves the folder's contents up to its parent, preserving any subfolders. The Macro Editor gained a **Folder** field with suggestions from your existing folders, and the Run/Remove/Assign-Shortcut pickers now show which folder each macro is in, so two macros called `reload` in different folders are no longer indistinguishable.
+- **Folders in the Scripts sidebar, backed by real directories.** A folder in the sidebar is an actual directory under your scripts path — nothing is stored separately, so organising scripts on disk and organising them in the sidebar are the same act. **New Folder** creates a directory; **New Script** accepts a path (`cisco/backup`) and creates any directories it needs; folders also offer **New Script** and **Reveal in Explorer**. Subdirectories previously existed on disk but were silently ignored by the sidebar.
+- **Connect and Run Script now finds scripts in subfolders.** It previously scanned only the top level of the scripts directory, so a script moved into a folder disappeared from that flow with a misleading "no compatible scripts" message. It now scans recursively and shows each script's folder path.
+- A **Refresh** button on the Scripts view, and the file watcher now notices directories being renamed or deleted — previously it only watched `.js` files, so renaming a folder left stale entries in the sidebar with no way to clear them short of reloading the window.
+
+### Changed
+
+- The Scripts sidebar scan is bounded: it stops after 10 levels of nesting or 500 examined entries and shows a note at the top of the tree (clicking it opens the `nexus.scripts.path` setting). This matters because that setting accepts an absolute path, so it can be pointed at a large directory. Dot-directories and `node_modules` are skipped, as is the generated `types/` directory at the scripts root — a folder of your own named `types` deeper in the tree is scanned normally.
+- A symlinked (or junctioned) folder inside the scripts directory is scanned and its scripts are listed, but VS Code's file watcher cannot follow links nested inside the folder it watches, so changes made in the link's target do not refresh the view on their own. Those folders now carry a link icon and a hover explaining it — use **Refresh Scripts**. **Connect and Run Script…** rescans every time and is unaffected.
+
+## [2.8.74] — 2026-07-31
 
 ### Changed
 

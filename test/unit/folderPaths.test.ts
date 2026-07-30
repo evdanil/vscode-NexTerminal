@@ -6,7 +6,8 @@ import {
   parentPath,
   folderDisplayName,
   getAncestorPaths,
-  MAX_FOLDER_DEPTH
+  MAX_FOLDER_DEPTH,
+  MAX_FOLDER_PATH_LENGTH
 } from "../../src/utils/folderPaths";
 
 describe("normalizeFolderPath", () => {
@@ -59,6 +60,67 @@ describe("normalizeFolderPath", () => {
 
   it("returns undefined for whitespace-only input", () => {
     expect(normalizeFolderPath("   ")).toBeUndefined();
+  });
+
+  // The length bound exists to stop a pathological allocation, and for NO
+  // other purpose. Both halves of that are load-bearing and tested below.
+  describe("length bound", () => {
+    it("rejects a pathologically long single-segment value — depth (segment COUNT = 1) alone never bounds this", () => {
+      // The original repro: a single-segment `group` with no slashes at all
+      // sails through the MAX_FOLDER_DEPTH check (its segment count is 1) and,
+      // without a length bound, straight through normalizeFolderPath too.
+      const huge = "X".repeat(8_000_000);
+      expect(normalizeFolderPath(huge)).toBeUndefined();
+    });
+
+    it("accepts a path at exactly MAX_FOLDER_PATH_LENGTH, rejects one character more", () => {
+      const exact = "a".repeat(MAX_FOLDER_PATH_LENGTH);
+      expect(normalizeFolderPath(exact)).toBe(exact);
+      expect(normalizeFolderPath("a".repeat(MAX_FOLDER_PATH_LENGTH + 1))).toBeUndefined();
+    });
+
+    // The regression the previous caps introduced: `MAX_FOLDER_SEGMENT_LENGTH
+    // = 64` / `MAX_FOLDER_PATH_LENGTH = 200` rejected paths that are entirely
+    // ordinary at the depth the product itself allows. Every case below is
+    // something a user can legitimately create, and each one was rejected.
+    it("accepts a full-depth path of realistically-named folders (200-character cap territory)", () => {
+      // 10 levels averaging ~24 characters — comfortably past the old
+      // 200-character total cap, nowhere near pathological.
+      const segments = [
+        "Customer Networks",
+        "Asia Pacific Region",
+        "Australia South East",
+        "Melbourne Data Centre",
+        "Building C Level 12",
+        "Comms Room 12-04",
+        "Core Distribution Layer",
+        "Cisco Catalyst 9500",
+        "Production Change Window",
+        "Verification Commands"
+      ];
+      const path = segments.join("/");
+      expect(segments).toHaveLength(MAX_FOLDER_DEPTH);
+      expect(path.length).toBeGreaterThan(200);
+      expect(normalizeFolderPath(path)).toBe(path);
+    });
+
+    it("accepts a single folder name longer than 64 characters — the bound must not police naming", () => {
+      const name = "Quarterly Compliance Audit Evidence Collection Scripts 2026 Q3";
+      const longer = `${name} (do not delete)`;
+      expect(longer.length).toBeGreaterThan(64);
+      expect(normalizeFolderPath(longer)).toBe(longer);
+    });
+
+    it("accepts a path a real filesystem could produce at MAX_FOLDER_DEPTH — 10 x NAME_MAX(255)", () => {
+      // The justification for 4096: it can never reject what a filesystem
+      // would have accepted at our own depth limit. 10*255 + 9 separators
+      // = 2559.
+      const segments = Array.from({ length: MAX_FOLDER_DEPTH }, () => "n".repeat(255));
+      const path = segments.join("/");
+      expect(path.length).toBe(2559);
+      expect(path.length).toBeLessThanOrEqual(MAX_FOLDER_PATH_LENGTH);
+      expect(normalizeFolderPath(path)).toBe(path);
+    });
   });
 });
 

@@ -11,11 +11,18 @@ export class FolderTreeItem extends vscode.TreeItem {
     public readonly folderPath: string,
     displayName: string,
     collapsibleState: vscode.TreeItemCollapsibleState = vscode.TreeItemCollapsibleState.Expanded,
-    hasDirectServers = false
+    hasDirectServers = false,
+    // §4.10 of docs/plans/2026-07-30-macro-script-folders.md — both parameterised
+    // so the Macros view can reuse this class with `contextValue =
+    // "nexus.folder.macros"` (outside the unanchored `/^nexus\.macro/` prefix six
+    // menu entries match on) and a distinct id prefix, without duplicating this
+    // class. Defaults preserve the Connectivity Hub's existing behavior exactly.
+    contextValue?: string,
+    idPrefix = "folder"
   ) {
     super(displayName, collapsibleState);
-    this.contextValue = hasDirectServers ? "nexus.folderWithServers" : "nexus.folder";
-    this.id = `folder:${folderPath}`;
+    this.contextValue = contextValue ?? (hasDirectServers ? "nexus.folderWithServers" : "nexus.folder");
+    this.id = `${idPrefix}:${folderPath}`;
     this.tooltip = folderPath;
     this.iconPath = new vscode.ThemeIcon("folder");
   }

@@ -84,6 +84,9 @@ const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
 /** Set during activate(); lets repairMacroKeybindings mark its writes as Nexus-own. */
 let activeSettingsGuard: SettingsGuardController | undefined;
 const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
+// §4.10 — a SEPARATE key from the Hub's, so macro-folder collapse state never
+// collides with the Connectivity Hub's folder-of-the-same-name collapse state.
+const MACRO_COLLAPSED_FOLDERS_KEY = "nexus.macros.ui.collapsedFolders";
 
 function resolveLogRotationOptions(): LoggerRotationOptions {
   const loggingConfig = vscode.workspace.getConfiguration("nexus.logging");
@@ -407,17 +410,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     resolveScriptSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals);
   const globalStoragePath = context.globalStorageUri.fsPath;
   SettingsPanel.setGlobalStoragePath(globalStoragePath);
+  const scriptTreeProvider = new ScriptTreeProvider(scriptRuntimeManager, globalStoragePath);
   const scriptCommandDisposables = registerScriptCommands(
     scriptRuntimeManager,
     scriptOutputChannel,
     globalStoragePath,
-    resolveScriptCapableSessionForTerminal
+    resolveScriptCapableSessionForTerminal,
+    () => scriptTreeProvider.refresh()
   );
-  const scriptTreeProvider = new ScriptTreeProvider(scriptRuntimeManager, globalStoragePath);
   const scriptCodeLensProvider = new ScriptCodeLensProvider(scriptRuntimeManager);
+  // §5.5 — now hierarchical (folders can nest scripts many levels deep), same
+  // as the other tree-shaped sidebars (Hub, Tunnels, Macros, File Explorer).
   const scriptsView = vscode.window.createTreeView("nexusScripts", {
     treeDataProvider: scriptTreeProvider,
-    showCollapseAll: false
+    showCollapseAll: true
   });
   // F11 — register CodeLens for file://, vscode-remote://, and untitled:// so the
   // ▶ Run / ◼ Stop lens surfaces for scripts opened over Remote-SSH or as untitled drafts.
@@ -850,8 +856,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   renderCwdSyncState();
 
   const macroTreeProvider = new MacroTreeProvider((macro) => macroAutoTrigger.isDisabled(macro));
+  const savedMacroCollapsed = context.globalState.get<string[]>(MACRO_COLLAPSED_FOLDERS_KEY, []);
+  macroTreeProvider.loadCollapsedFolders(savedMacroCollapsed);
+  // §4.10 — adopts the Hub's hand-rolled collapse persistence with a SEPARATE
+  // globalState key: reusing the Hub's `collapsedFolderStatePersistence`/
+  // `handleFolderStateChange` would let a macro folder path collapse/expand
+  // the Hub's OWN folder of the same name (both are `FolderTreeItem`
+  // instances, but each view's collapse state must stay independent).
+  const macroCollapsedFolderStatePersistence = createCollapsedFolderStatePersistence(
+    (paths) => context.globalState.update(MACRO_COLLAPSED_FOLDERS_KEY, paths),
+    {
+      onError: (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Failed to persist macro collapsed folder state: ${message}`);
+      }
+    }
+  );
+  const persistMacroCollapsedFolders = (): void => {
+    macroCollapsedFolderStatePersistence.schedule(macroTreeProvider.getCollapsedFolders());
+  };
+  const handleMacroFolderStateChange = (element: unknown, isCollapsed: boolean): void => {
+    if (!(element instanceof FolderTreeItem)) {
+      return;
+    }
+    if (isCollapsed) {
+      macroTreeProvider.collapseFolder(element.folderPath);
+    } else {
+      macroTreeProvider.expandFolder(element.folderPath);
+    }
+    persistMacroCollapsedFolders();
+  };
   const macroView = vscode.window.createTreeView("nexusMacros", {
-    treeDataProvider: macroTreeProvider
+    treeDataProvider: macroTreeProvider,
+    dragAndDropController: macroTreeProvider,
+    showCollapseAll: true
+  });
+  const macroCollapseListener = macroView.onDidCollapseElement((e) => {
+    handleMacroFolderStateChange(e.element, true);
+  });
+  const macroExpandListener = macroView.onDidExpandElement((e) => {
+    handleMacroFolderStateChange(e.element, false);
   });
   const macroAutoTriggerListener = macroAutoTrigger.onDidChange(() => {
     macroTreeProvider.refresh();
@@ -1193,6 +1237,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     settingsTreeProvider,
     macroAutoTrigger,
     macroView,
+    macroCollapseListener,
+    macroExpandListener,
     macroAutoTriggerListener,
     scriptRuntimeManager,
     scriptOutputChannel,
@@ -1249,6 +1295,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       dispose: () => {
         void collapsedFolderStatePersistence.flush();
         collapsedFolderStatePersistence.dispose();
+      }
+    },
+    {
+      dispose: () => {
+        void macroCollapsedFolderStatePersistence.flush();
+        macroCollapsedFolderStatePersistence.dispose();
       }
     },
     {

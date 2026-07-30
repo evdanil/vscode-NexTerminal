@@ -130,6 +130,7 @@ import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigReposi
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
 import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
+import { INVALID_FOLDER_PATH_MESSAGE } from "../../src/utils/folderPaths";
 import { getAssignedBinding } from "../../src/macroBindingHelpers";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
@@ -2468,6 +2469,84 @@ describe("backup import", () => {
     expect(arrayLikeShape?.triggerPattern).toBeUndefined();
   });
 
+  it("Fix 5c — replace mode clears macroFolders when the backup predates the field (pre-2.8.75)", async () => {
+    // A pre-2.8.75 backup has no `macroFolders` key at all (`undefined`, not
+    // `[]`). Replace mode unconditionally replaces the macros array via
+    // `saveMacros()` below — leaving the OLD store's folder list untouched
+    // would show folders left over from a config the import just discarded.
+    const importStore = new InMemoryMacroStore();
+    await importStore.initialize();
+    await importStore.save([{ name: "Stale", text: "t", group: "Cisco" }]);
+    await importStore.saveFolders(["Cisco", "Empty"]);
+    setActiveMacroStore(importStore);
+
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [{ name: "Fresh", text: "echo hi" }],
+      settings: {}
+      // no macroFolders — pre-2.8.75 shape
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup-no-folders.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(importStore.getAll().map((m) => m.name)).toEqual(["Fresh"]);
+    // Before Fix 5c this stayed ["Cisco", "Empty"] — folders from the
+    // discarded config, dangling after the macros they belonged to were wiped.
+    expect(importStore.getFolders()).toEqual([]);
+  });
+
+  it("replace mode leaves macro folders alone when the payload replaces no macros at all (servers-only backup)", async () => {
+    // Fix 5c cleared the folder list on EVERY replace import, justified by
+    // "saveMacros() below unconditionally replaces the macros array". It does
+    // not: `collectIncomingMacros()` returns undefined for a payload with
+    // neither a top-level `macros` array nor `settings["nexus.terminal.macros"]`,
+    // and the macros block is skipped entirely. `isValidExport()` accepts
+    // exactly that shape (macros are optional), so replace-importing a
+    // servers-only or pre-macro-export backup kept every macro and destroyed
+    // every explicit empty folder — the one artifact this feature exists to
+    // persist.
+    //
+    // The Fix 5c fixture above cannot see this: its payload HAS a macros array,
+    // so the clear it asserts is correct there and both implementations agree.
+    const importStore = new InMemoryMacroStore();
+    await importStore.initialize();
+    await importStore.save([{ name: "Kept", text: "t", group: "Cisco" }]);
+    await importStore.saveFolders(["Cisco", "Staging"]);
+    setActiveMacroStore(importStore);
+
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [makeServer()],
+      settings: {}
+      // no `macros`, no `macroFolders` — a pre-macro-export backup
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup-servers-only.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    // Nothing replaced the macros, so nothing should have cleared their folders.
+    expect(importStore.getAll().map((m) => m.name)).toEqual(["Kept"]);
+    expect(importStore.getFolders().sort()).toEqual(["Cisco", "Staging"]);
+  });
+
   it("shows error on wrong password", async () => {
     const { encrypt } = await import("../../src/utils/configCrypto");
     const encrypted = encrypt(JSON.stringify({ passwords: {}, passphrases: {}, secretMacros: [] }), "correct");
@@ -3672,9 +3751,7 @@ describe("import inventory list command", () => {
     const cmd = registeredCommands.get("nexus.config.import.inventory")!;
     await cmd();
 
-    expect(mockShowErrorMessage).toHaveBeenCalledWith(
-      "Invalid folder path. Use up to 10 levels and avoid '.', '..', or '\\'."
-    );
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(INVALID_FOLDER_PATH_MESSAGE);
     expect(core.getSnapshot().servers).toHaveLength(0);
   });
 

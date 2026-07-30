@@ -14,9 +14,25 @@ import {
   type MacroStoreChangeListener
 } from "./macroStore";
 import { withRedactedVariables } from "../services/macroVariables";
+import { dropNonPathGroup, sanitizeMacroFolderList } from "../services/macroFolders";
 
 const MACROS_KEY = "nexus.macros";
 const SECRET_PREFIX = "macro-secret-text-";
+const MACRO_FOLDERS_KEY = "nexus.macros.folders";
+
+/**
+ * Fix 1 — the persistence chokepoint (`save()`) is documented as guaranteeing
+ * every stored macro is usable, but previously only enforced id uniqueness.
+ * A caller bug (e.g. `moveToFolder` writing through a stale/out-of-bounds
+ * index) can turn `{ ...undefined }` into `{}` and have it survive a save —
+ * the tree then crashes forever after on `macro.text.replace(...)`
+ * (`macroTreeProvider.ts`), because nothing sanitizes an already-malformed
+ * record out of existence. A macro is not usable without a string `name` and
+ * a string `text`; anything else is dropped here rather than persisted.
+ */
+function isUsableMacro(m: TerminalMacro): boolean {
+  return !!m && typeof m === "object" && typeof m.name === "string" && typeof m.text === "string";
+}
 
 /**
  * `globalState.get(key, [])` returns the default only when the key is ABSENT.
@@ -54,6 +70,7 @@ export class VscodeMacroStore implements MacroStore {
    * post-dedup `macro.id`.
    */
   private unresolvedSecretIds = new Set<string>();
+  private resolvedFolders: string[] = [];
   /**
    * Tail of the serialization chain for this store's MUTATING operations — see
    * `runExclusive()`.
@@ -106,6 +123,15 @@ export class VscodeMacroStore implements MacroStore {
    * between `save()`'s stores and its `MACROS_KEY` commit, publishing `secret: true` records
    * with no values behind them — the same torn state the cross-window race produces, but from
    * a single window and entirely within this file's reach.
+   *
+   * `saveFolders()` is enrolled for a related reason rather than that one. It has a single
+   * `await` and touches a single key, so it cannot tear halfway; what it can do is FINISH
+   * OUT OF ORDER. `clearAll()` erases `MACRO_FOLDERS_KEY`, so an unenrolled folder save
+   * issued before Complete Reset is free to resume after it and put the folder list back —
+   * an operation that began before the reset landing after it, with globalState and
+   * `resolvedFolders` both showing folders the user was told had been deleted. What the lock
+   * buys here is not an untorn write but an ORDER, and that is enough to keep "All Nexus
+   * data has been deleted" true of the folder list as well.
    *
    * So it is fixed here, and only here. This is a WITHIN-WINDOW lock and makes no claim
    * beyond that: it does not serialize two VS Code windows against each other, because
@@ -207,11 +233,21 @@ export class VscodeMacroStore implements MacroStore {
     // Legacy `slot` is normalized here as well as on the read path, so a restored slot-era
     // backup (configCommands.ts hands `save()` the file's records verbatim) converges to
     // `keybinding` on disk instead of only in memory.
-    const assignments = assignMacroIds(macros, {
+    //
+    // §4.2 — `group` is GUARDED here, but NOT normalized: `save()` rewrites the whole
+    // array, including macros this command never touched, so applying the folder-path
+    // grammar here would silently delete a stored folder assignment as a side effect of
+    // an unrelated edit. Only a value that holds no path at all (non-string, or blank) is
+    // dropped; see `dropNonPathGroup()`. `variables` and `slot` ARE normalized, and the
+    // three touch disjoint fields, so the order they compose in does not matter.
+    //
+    // Fix 1 — `isUsableMacro` runs FIRST, so a fresh UUID is never spent on a record
+    // that is about to be dropped, and no vault key is ever derived from one.
+    const assignments = assignMacroIds(macros.filter(isUsableMacro), {
       keepIdIfPossible: (m) => this.cannotCarrySecret(m)
     });
     const normalized: TerminalMacro[] = assignments.map(({ macro }) =>
-      withRedactedVariables(withMigratedSlot(macro))
+      dropNonPathGroup(withRedactedVariables(withMigratedSlot(macro)))
     );
 
     const currentIds = new Set(this.resolved.map((m) => m.id).filter((v): v is string => Boolean(v)));
@@ -393,6 +429,21 @@ export class VscodeMacroStore implements MacroStore {
     return () => this.listeners.delete(listener);
   }
 
+  public getFolders(): string[] {
+    return [...this.resolvedFolders];
+  }
+
+  public async saveFolders(folders: string[]): Promise<void> {
+    await this.runExclusive(() => this.writeFolders(folders));
+  }
+
+  private async writeFolders(folders: string[]): Promise<void> {
+    const sanitized = sanitizeMacroFolderList(folders);
+    await this.context.globalState.update(MACRO_FOLDERS_KEY, sanitized.length > 0 ? sanitized : undefined);
+    this.resolvedFolders = sanitized;
+    this.emit();
+  }
+
   public async clearAll(): Promise<void> {
     await this.runExclusive(() => this.clearAllExclusive());
   }
@@ -406,6 +457,8 @@ export class VscodeMacroStore implements MacroStore {
     await this.context.globalState.update(MACROS_KEY, undefined);
     this.resolved = [];
     this.unresolvedSecretIds = new Set<string>();
+    await this.context.globalState.update(MACRO_FOLDERS_KEY, undefined);
+    this.resolvedFolders = [];
 
     // And the dead `nexus.macros.secretIds` ledger, which a profile upgrading from an earlier
     // build is still holding. Nothing reads it and nothing else writes it (see below), so it can
@@ -539,6 +592,19 @@ export class VscodeMacroStore implements MacroStore {
 
     for (const entry of raw) {
       if (!entry || typeof entry !== "object") continue;
+      // Fix 1 (BLOCKER) — `isUsableMacro` was previously enforced only by `save()`. A
+      // malformed record can reach MACROS_KEY by other means (a hand-edited settings.json
+      // absorbed verbatim, storage corruption, or a caller bug elsewhere writing through a
+      // stale index) — admitting it into `resolved` here means it reaches `MacroTreeItem`,
+      // where `macro.text.replace(...)` throws on every render, killing the Macros view
+      // permanently, surviving restart. Drop it before it is ever inserted into
+      // `resolved`, the same gate `save()` applies.
+      //
+      // Dropping is all this does. It does NOT re-key: the read path deliberately leaves
+      // stored ids alone (see `MacroStore.save()`'s doc comment and the removed
+      // activation-time caller), so a duplicate id is surfaced verbatim and suppressed
+      // downstream rather than silently repaired here.
+      if (!isUsableMacro(entry)) continue;
 
       const id = isValidMacroId(entry.id) ? entry.id : randomUUID();
 
@@ -547,11 +613,23 @@ export class VscodeMacroStore implements MacroStore {
       // variable's plaintext default into `getAll()` — and therefore into Copy All,
       // share export, or an encrypted backup's cleartext `macros` array.
       const redacted = withRedactedVariables(entry);
+      // ONLY a variables change may trigger the disk scrub below. `group` is
+      // deliberately excluded: the scrub exists because a plaintext secret
+      // must not linger on disk, and a folder path is not a secret. Letting a
+      // `group` difference set this flag is what made a stored folder
+      // assignment disappear permanently on the next activation.
       if (redacted !== entry) needsDiskScrub = true;
-      // `withMigratedSlot` is applied to the RESOLVED copy only; `raw` (and therefore the
-      // scrub below, and `absorbLegacySettingsIfPresent()`'s `keyOfLegacy()` dedupe, which
-      // reads globalState directly) keeps seeing the record exactly as stored.
-      const migrated = withMigratedSlot(redacted);
+      // §4.2 — in-memory guard only, and only against a value that cannot be a
+      // path at all (see `dropNonPathGroup()`). An unrenderable STRING is
+      // kept exactly as stored and simply renders at the root.
+      const cleaned = dropNonPathGroup(redacted);
+      // `withMigratedSlot` is applied to the RESOLVED copy only, and — like the `group`
+      // guard above — deliberately does NOT set `needsDiskScrub`: the whole point of
+      // moving the slot migration to the read path was to stop it writing. `raw` (and
+      // therefore the scrub below, and `absorbLegacySettingsIfPresent()`'s
+      // `keyOfLegacy()` dedupe, which reads globalState directly) keeps seeing the
+      // record exactly as stored.
+      const migrated = withMigratedSlot(cleaned);
       if (entry.secret) {
         const vaulted = await this.context.secrets.get(macroSecretKey(id));
         if (vaulted === undefined) unresolvedSecretIds.add(id);
@@ -571,8 +649,9 @@ export class VscodeMacroStore implements MacroStore {
     //
     // 1. Scrub the RAW array, minimally. Serializing `resolved` instead would persist
     //    this reload's incidental repairs — dropped non-object records, runtime-only
-    //    UUIDs — turning a redaction into a rewrite of records that were never the
-    //    problem.
+    //    UUIDs, a dropped non-string `group`, a migrated `slot` — turning a redaction
+    //    into a rewrite of records that were never the problem. Only `variables` is
+    //    scrubbed here; neither `group` nor `slot` is ever rewritten on disk by a reload.
     // 2. Only write if MACROS_KEY still holds what we read. globalState is shared
     //    across windows, and there is an `await` on the vault between the read and
     //    this write: another window can save, absorb legacy settings, or complete a
@@ -589,6 +668,13 @@ export class VscodeMacroStore implements MacroStore {
         await this.context.globalState.update(MACROS_KEY, scrubbed);
       }
     }
+
+    // §4.2 — the persisted folder list is untrusted the same way: filter to
+    // strings, normalize, drop the rest. No eager rewrite of MACRO_FOLDERS_KEY
+    // here (unlike the variables scrub above) — a malformed folder entry
+    // carries no secret to scrub urgently off disk, and the next
+    // `saveFolders()` call naturally persists the clean list.
+    this.resolvedFolders = sanitizeMacroFolderList(this.context.globalState.get(MACRO_FOLDERS_KEY, []));
   }
 
   /**
@@ -676,10 +762,17 @@ export class VscodeMacroStore implements MacroStore {
    * entry, so re-keying a collision costs nothing and prevents its
    * `secrets.store(macroSecretKey(id), ...)` from overwriting an existing macro's secret.
    *
-   * Variables are normalized here rather than only at read time: this path absorbs
-   * `nexus.terminal.macros` verbatim on every activation (Settings Sync replay
-   * included), so without it a hand-written masked variable carrying a plaintext
-   * `default` would be written straight into globalState.
+   * Variables are redacted here rather than only at read time: this path absorbs
+   * `nexus.terminal.macros` verbatim on every activation (Settings Sync replay included),
+   * so without it a hand-written masked variable carrying a plaintext `default` would be
+   * written straight into globalState.
+   *
+   * §4.2 — `group` gets the ingest GUARD (non-string dropped) but NOT the folder-path
+   * grammar: a hand-written `group: "Cisco\\Routers"` is the user's stated intent for a
+   * macro they are migrating, and absorbing it as ungrouped-forever would lose that
+   * intent at the one moment the value crosses from settings.json into permanent storage.
+   * It renders at the root until corrected, and the raw value survives for them to
+   * correct.
    *
    * @returns `false` when the records did not land, because another window moved MACROS_KEY
    * while this one was awaiting the vault. The caller must then leave the legacy setting in
@@ -693,9 +786,21 @@ export class VscodeMacroStore implements MacroStore {
     existingOnDisk: readonly TerminalMacro[],
     absorbed: readonly TerminalMacro[]
   ): Promise<boolean> {
-    const keyed = assignIdsForAbsorbedMacros(existingOnDisk, absorbed);
+    // Fix 1 (BLOCKER) — the ABSORBED half gets the same `isUsableMacro` gate `save()`
+    // applies. A hand-edited settings.json entry missing `name`/`text` (e.g.
+    // `{"name":"Broken","group":"Cisco"}`) would otherwise be persisted straight into
+    // globalState and then crash the tree on every subsequent render.
+    //
+    // The EXISTING half is deliberately NOT filtered. Those records are already in
+    // MACROS_KEY, and this routine runs at every activation: dropping one here would be
+    // an activation-time deletion of user data, the exact class of write this branch
+    // removed. They are already harmless — `reloadFromState()` applies `isUsableMacro`
+    // on the read side, so a malformed stored record never reaches the tree, and the
+    // per-record loop below passes non-objects through verbatim. It stays on disk until
+    // a save the user actually asks for rewrites the list.
+    const keyed = assignIdsForAbsorbedMacros(existingOnDisk, absorbed.filter(isUsableMacro));
     const assigned = [...keyed.existing, ...keyed.absorbed].map((m) =>
-      m && typeof m === "object" ? withRedactedVariables(m) : m
+      m && typeof m === "object" ? dropNonPathGroup(withRedactedVariables(m)) : m
     );
 
     const vaultStores: Array<{ id: string; value: string }> = [];

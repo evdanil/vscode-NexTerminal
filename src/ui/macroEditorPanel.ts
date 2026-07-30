@@ -7,12 +7,23 @@ import {
 import {
   confirmBindingWarnings,
   getActiveMacroStore,
+  getMacroFolders,
   getMacros,
   saveMacros
 } from "../macroSettings";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
+import { collectMacroFolders, macroFolderField } from "../services/macroFolders";
+import {
+  captureMacroRef,
+  mutateMacro,
+  resolveMacroTarget,
+  AMBIGUOUS_MACRO_TARGET_MESSAGE,
+  type MacroRef,
+  type MacroTarget
+} from "../services/macroMutation";
+import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
 import type { MacroProfileOptionInput } from "./macroProfileOptions";
@@ -20,34 +31,32 @@ import { createWebviewNonce } from "./shared/webviewNonce";
 
 type MacroProfileProvider = () => MacroProfileOptionInput[];
 
-/** Shown when a save/delete target cannot be resolved to exactly one macro. */
-const AMBIGUOUS_TARGET_MESSAGE =
-  "Another macro has the same internal id, so Nexus cannot tell which one you were editing. " +
-  "Reorder any macro with Move Up / Move Down to assign fresh ids, then try again.";
+/**
+ * How many renders' worth of references the panel keeps (see
+ * `MacroEditorPanel.renderedRefs`). Small on purpose: the page is replaced on
+ * every render, so the only ones that can still post are the page on screen and
+ * the handful whose messages are already in IPC flight. A message naming a
+ * render older than this fails closed, which is the same answer it gets for a
+ * render that never happened.
+ */
+const MAX_RETAINED_RENDERS = 8;
 
 /**
- * Resolves the save/delete target by stable id, never by the render-time array index:
- * an external reorder or delete between render and save would otherwise hit the wrong
- * macro.
- *
- * Returns -1 when the id is absent, unknown, OR claimed by more than one macro. That
- * last case is reachable for a macro list that predates the unique-id invariant
- * (`MacroStore.save()`), which the read path deliberately no longer repairs — see
- * `VscodeMacroStore.reloadFromState()`. Taking the first match would write the macro
- * the user was looking at over its twin, silently destroying it; refusing is the same
- * fail-safe `MacroAutoTrigger` applies to an ambiguous state key. Every other repair
- * route (Move Up / Move Down, delete, or editing any macro with a unique id) re-saves
- * the whole list and clears the conflict, so this is never a dead end.
+ * The right thing to say for a target that could not be resolved to one macro.
+ * `undefined` means no reference could be taken at all — the message did not
+ * come from any page this panel still has a record of (see
+ * `MacroEditorPanel.resolveEditorTarget`), which is the stale-form case and
+ * reads as one.
  */
-function resolveUniqueMacroIndex(macros: readonly TerminalMacro[], macroId: string | null): number {
-  if (macroId === null) return -1;
-  const first = macros.findIndex((m) => m.id === macroId);
-  if (first === -1) return -1;
-  return macros.some((m, i) => i > first && m.id === macroId) ? -1 : first;
+function unresolvedTargetMessage(target: MacroTarget | undefined, verb: "saved" | "deleted"): string {
+  return target?.kind === "ambiguous"
+    ? AMBIGUOUS_MACRO_TARGET_MESSAGE
+    : `This macro changed externally and could not be ${verb}. The editor has been refreshed.`;
 }
 
-function isAmbiguousMacroId(macros: readonly TerminalMacro[], macroId: string | null): boolean {
-  return macroId !== null && macros.filter((m) => m.id === macroId).length > 1;
+/** §4.7 `addToFolder` seeds a new macro's Folder field with the clicked folder. */
+export interface MacroEditorSeed {
+  group?: string;
 }
 
 /**
@@ -88,6 +97,8 @@ export class MacroEditorPanel {
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
   private selectedIndex: number | null = null;
+  /** Set only by `openNew(seed)`; consumed while composing that one new macro (§4.7). */
+  private pendingSeedGroup: string | undefined;
   private unsubscribe: () => void = () => {};
   /**
    * Set while this panel is persisting its own save/delete. The macro store's
@@ -95,13 +106,44 @@ export class MacroEditorPanel {
    * would re-render mid-flow and could clobber the just-applied `selectedIndex`.
    */
   private isSaving = false;
+  /**
+   * Which page this panel has drawn so far. Bumped by every `render()` and baked
+   * into that page, which posts it back with save and delete — the KEY to
+   * `renderedRefs`, and the only thing about identity the webview gets to say.
+   */
+  private renderGeneration = 0;
+  /**
+   * What this panel knew about the selected macro's id at each render, kept
+   * HOST-SIDE and keyed by the generation of the page that carries it.
+   *
+   * This is the editor's equivalent of `MacroTreeItem.identityConflict` — the
+   * render-time witness a row has and a form previously did not — and it is
+   * retained rather than posted because a witness that travels through the
+   * webview is not one. `[First(x), Second(x)]`, form open on `Second`, any
+   * write at all re-keys to `[First(x), Second(x')]`, and a click in the
+   * still-displayed old form (or a message already in flight) arrives carrying
+   * `x` over an array in which `x` now has exactly one holder: `First`. Nothing
+   * about that array is ambiguous, so a save resolved against it goes through,
+   * onto the wrong macro, under a "saved" toast. Only what was true at RENDER
+   * rules that out — and a boolean posted back from the page cannot establish
+   * it, because a stale one, a forged one and a defaulted one are the same
+   * bytes as an honest one.
+   *
+   * Keyed by generation rather than collapsed to "the latest": a message from a
+   * page one render old is ordinary (any external write re-renders), and it must
+   * still be answered with what THAT page was drawn knowing. Answering it with
+   * the current render's knowledge would refuse the ordinary save-after-external-
+   * reorder this whole feature exists to make work.
+   */
+  private readonly renderedRefs = new Map<number, MacroRef>();
 
   public static setProfileProvider(provider: MacroProfileProvider): void {
     MacroEditorPanel.profileProvider = provider;
   }
 
-  private constructor(initialIndex: number | null) {
+  private constructor(initialIndex: number | null, seedGroup?: string) {
     this.selectedIndex = initialIndex;
+    this.pendingSeedGroup = seedGroup;
     this.panel = vscode.window.createWebviewPanel(
       "nexus.macroEditor",
       "Macro Editor",
@@ -120,8 +162,13 @@ export class MacroEditorPanel {
       this.unsubscribe();
       MacroEditorPanel.instance = undefined;
     });
-    // Re-render when the macro store changes externally (second window, Settings
-    // Sync, legacy absorption, clearAll) so index/id resolution stays current.
+    // Re-render when the macro store changes underneath us so index/id
+    // resolution stays current. "Underneath us" means THIS window: the store's
+    // change event fires only for this instance's own `save()` / `saveFolders()`
+    // / `clearAll()`, so the writers are a macro command, a drag onto a folder,
+    // a config import, or legacy absorption at activation. A second window's
+    // `globalState` write is invisible here until reload — `Memento` has no
+    // change event.
     this.unsubscribe = getActiveMacroStore().onDidChange(() => {
       if (this.isSaving) return;
       this.render();
@@ -141,14 +188,15 @@ export class MacroEditorPanel {
     MacroEditorPanel.instance = new MacroEditorPanel(index);
   }
 
-  public static openNew(): void {
+  public static openNew(seed?: MacroEditorSeed): void {
     if (MacroEditorPanel.instance) {
       MacroEditorPanel.instance.panel.reveal();
       MacroEditorPanel.instance.selectedIndex = null;
+      MacroEditorPanel.instance.pendingSeedGroup = seed?.group;
       MacroEditorPanel.instance.render();
       return;
     }
-    MacroEditorPanel.instance = new MacroEditorPanel(null);
+    MacroEditorPanel.instance = new MacroEditorPanel(null, seed?.group);
   }
 
   private render(): void {
@@ -159,7 +207,99 @@ export class MacroEditorPanel {
     if (this.selectedIndex !== null && this.selectedIndex >= macros.length) {
       this.selectedIndex = macros.length > 0 ? macros.length - 1 : null;
     }
-    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider());
+    // §4.11 — the seed only ever applies while composing a not-yet-saved new
+    // macro; irrelevant once an existing macro is selected.
+    const seedGroup = this.selectedIndex === null ? this.pendingSeedGroup : undefined;
+    const folders = collectMacroFolders(macros, getMacroFolders());
+    // The render-time identity witness for the page about to be drawn — see
+    // `renderedRefs`. Computed AFTER the clamp above, off the same array the
+    // HTML is built from, through the one shared definition of "how many macros
+    // carry this id" rather than a local count. The page is given only the
+    // generation; the answer itself stays here.
+    const selected = this.selectedIndex === null ? undefined : macros[this.selectedIndex];
+    const generation = ++this.renderGeneration;
+    this.renderedRefs.set(generation, captureMacroRef(macros, selected?.id));
+    // Insertion-ordered, so the first key is always the oldest render.
+    while (this.renderedRefs.size > MAX_RETAINED_RENDERS) {
+      const oldest = this.renderedRefs.keys().next().value;
+      if (oldest === undefined) break;
+      this.renderedRefs.delete(oldest);
+    }
+    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider(), folders, seedGroup, generation);
+  }
+
+  /**
+   * Resolves the save/delete target by stable id, never by the render-time array
+   * index: an external reorder or delete between render and save would otherwise
+   * hit the wrong macro.
+   *
+   * The shared `resolveMacroTarget` takes an optional index precisely so a clicked
+   * ROW can disambiguate two macros sharing an id. The panel deliberately passes
+   * none. Its webview payload's `index` is a RENDER-time position that survives
+   * arbitrarily long — the panel stays open across any number of external writes
+   * and even clamps `selectedIndex` when the list shrinks — so it is not the "the
+   * user just pointed at this row" signal a tree item's index is. With no index, an
+   * id claimed by more than one macro resolves to `"ambiguous"` and the panel
+   * refuses: writing the macro the user was looking at over its twin would silently
+   * destroy the twin, and refusing is the same fail-safe `MacroAutoTrigger` applies
+   * to an ambiguous state key. Every repair route (Move Up / Move Down, delete, or
+   * editing any macro with a unique id) re-saves the whole list and clears the
+   * conflict, so this is never a dead end.
+   *
+   * **The reference is not rebuilt from the arriving message.** It is looked up in
+   * `renderedRefs` under the generation the message names, so the provenance the
+   * write is resolved with is one this panel computed, off the array it drew the
+   * page from, before the message existed. `captureMacroRef(macros, id)` here would
+   * check the array as it stands when the MESSAGE arrives, which is the interleaving
+   * `resolveMacroTarget`'s rule 2 exists to catch (see `renderedRefs`).
+   *
+   * What the webview supplies is a lookup key and an id, and both are checked
+   * against this panel's own record:
+   * - no entry for the named generation (never issued, or aged out) — refused. A
+   *   message this panel cannot place is one it has no witness for.
+   * - an entry whose id is not the one the message carries — refused. The page at
+   *   that generation was drawn over a different macro, so its witness says nothing
+   *   about this id.
+   * - otherwise the retained reference, verbatim.
+   *
+   * Naming a *different* render is therefore worth nothing: every generation this
+   * panel issued for this id was answered honestly when it was issued, so the best a
+   * forged key can do is ask a question this panel already knows the answer to.
+   *
+   * `macroId === null` — a not-yet-saved macro — is exempt, and that exemption is
+   * about identity, not about trust: the push path appends, so there is no existing
+   * record for a wrong answer to land on. It does NOT mean the generation goes
+   * unread for a new macro; both handlers read the field off the message before
+   * calling this, so a hostile *object* (a throwing getter) would be observed there.
+   * No such object can exist in production — the webview boundary structured-clones
+   * everything through it — but "the null id short-circuits first" is a statement
+   * about this function, not about the message.
+   *
+   * Returns the retained `ref` alongside the target so the WRITE that follows the
+   * dialog re-resolves the very same reference — `idWhenCaptured` and all. That is
+   * required for correctness in the ambiguous case above (a ref rebuilt after the
+   * dialog would have lost the render-time answer), and it is what makes the
+   * pre-dialog check and the write agree by construction rather than by two separate
+   * code paths happening to say the same thing.
+   *
+   * `undefined` means no reference could be taken at all: the message did not come
+   * from any page this panel still has a record of.
+   */
+  private resolveEditorTarget(
+    macros: readonly TerminalMacro[],
+    macroId: string | null,
+    renderGenerationClaim: unknown
+  ): { ref: MacroRef; target: MacroTarget } | undefined {
+    if (macroId === null) {
+      const ref = captureMacroRef(macros, null);
+      return { ref, target: resolveMacroTarget(macros, ref) };
+    }
+    const rendered =
+      typeof renderGenerationClaim === "number" ? this.renderedRefs.get(renderGenerationClaim) : undefined;
+    if (rendered === undefined || rendered.id !== macroId) {
+      return undefined;
+    }
+    return { ref: rendered, target: resolveMacroTarget(macros, rendered) };
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
@@ -168,6 +308,9 @@ export class MacroEditorPanel {
         const value = msg.value as string;
         if (value === "__new__") {
           this.selectedIndex = null;
+          // A user-driven "+ New Blank Macro" pick, not the addToFolder seed
+          // path — an earlier seed must not leak into this genuinely blank macro.
+          this.pendingSeedGroup = undefined;
         } else {
           const parsed = parseInt(value, 10);
           this.selectedIndex = Number.isNaN(parsed) ? null : parsed;
@@ -185,6 +328,7 @@ export class MacroEditorPanel {
         if (answer === "Discard") {
           if (target === "__new__") {
             this.selectedIndex = null;
+            this.pendingSeedGroup = undefined;
           } else {
             const parsed = parseInt(target, 10);
             this.selectedIndex = Number.isNaN(parsed) ? null : parsed;
@@ -219,19 +363,27 @@ export class MacroEditorPanel {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
         // A null id means an unsaved (new) macro → push path.
-        const index = resolveUniqueMacroIndex(macros, macroId);
-        if (macroId !== null && index === -1) {
-          // The macro we were editing was deleted/changed externally, or its id is
-          // shared with another macro. Do not fall through to the push path (that
-          // would create a stray duplicate) and do not guess a target.
-          void vscode.window.showWarningMessage(
-            isAmbiguousMacroId(macros, macroId)
-              ? AMBIGUOUS_TARGET_MESSAGE
-              : "This macro changed externally and could not be saved. The editor has been refreshed."
-          );
+        const resolved = this.resolveEditorTarget(macros, macroId, msg.renderGeneration);
+        if (!resolved) {
+          // Not from a page this panel still has a witness for. Never guess a
+          // target from the message alone — that is the whole defect.
+          void vscode.window.showWarningMessage(unresolvedTargetMessage(undefined, "saved"));
           this.render();
           return;
         }
+        const { ref: macroRef, target } = resolved;
+        if (macroId !== null && target.kind !== "resolved") {
+          // The macro we were editing was deleted/changed externally, or its id is
+          // shared with another macro. Do not fall through to the push path (that
+          // would create a stray duplicate) and do not guess a target.
+          void vscode.window.showWarningMessage(unresolvedTargetMessage(target, "saved"));
+          this.render();
+          return;
+        }
+        // The one read of the stored record, hoisted above the Folder-field
+        // logic below (which needs it) and shared with the hidden-declaration
+        // check further down, which used to re-derive the identical value.
+        const existingMacro = target.kind === "resolved" ? macros[target.index] : undefined;
         const triggerInitiallyDisabled = msg.triggerInitiallyDisabled as boolean | undefined;
         const triggerInterval = msg.triggerInterval as number | undefined | null;
         const triggerScope = msg.triggerScope as TerminalMacro["triggerScope"] | undefined;
@@ -293,6 +445,38 @@ export class MacroEditorPanel {
           }
         }
 
+        // §4.11 — Folder field validation, same helper every profile form uses.
+        // "" canonicalizes to `undefined` (§4.1); anything else structurally
+        // invalid (`..`, `.`, `\`, over-depth) is rejected rather than silently
+        // dropped, since here (unlike ingest, §4.2) the user is right there to fix it.
+        //
+        // ...but ONLY when the user actually touched the field. §4.9.3 promises
+        // that a stored folder path is "kept byte-for-byte and shown at the
+        // root until you correct it", and this handler was the one place that
+        // broke the promise: for a stored `Cisco\Routers` the renderer produced
+        // an EMPTY Folder field, the webview posted `group: null`, and the
+        // unconditional `delete macro.group` below destroyed the value on a
+        // save that only changed the macro's NAME — the most ordinary write
+        // path there is. `macroFolderField()` is the single shared definition
+        // of what the field shows for a given stored value (see its doc
+        // comment), so "the submitted text still equals the stored value's
+        // field representation" is exactly "the user did not touch it", and
+        // that case is carried through verbatim, unvalidated. Any real edit
+        // goes through the grammar as before — so an unrenderable path the
+        // user does touch forces an explicit, validated decision.
+        const groupInput = typeof msg.group === "string" ? msg.group : "";
+        const folderUntouched =
+          existingMacro !== undefined && groupInput.trim() === macroFolderField(existingMacro.group).value;
+        const normalizedGroup = folderUntouched ? undefined : normalizeOptionalFolderPath(groupInput);
+        if (normalizedGroup === null) {
+          void this.panel.webview.postMessage({
+            type: "saveError",
+            field: "folder",
+            message: INVALID_FOLDER_PATH_MESSAGE
+          });
+          return;
+        }
+
         // §9.4 — host-side enforcement of every variable rule via the single
         // shared validator (never re-implemented here or trusted from the
         // webview alone; retainContextWhenHidden means the webview's own
@@ -320,11 +504,10 @@ export class MacroEditorPanel {
         // Only the trigger-activating case is blocked. Clearing rows the user could
         // actually see, or adding a trigger to a macro whose declarations were all
         // visible and removed, both stay legal.
-        const existing = index >= 0 ? macros[index] : undefined;
         const hiddenDeclarations =
-          existing !== undefined &&
-          Array.isArray(existing.variables) &&
-          existing.variables.length > getValidMacroVariables(existing).length;
+          existingMacro !== undefined &&
+          Array.isArray(existingMacro.variables) &&
+          existingMacro.variables.length > getValidMacroVariables(existingMacro).length;
         if (hiddenDeclarations && triggerPattern && variables.length === 0) {
           void this.panel.webview.postMessage({
             type: "saveError",
@@ -365,7 +548,6 @@ export class MacroEditorPanel {
           return;
         }
 
-        const existingMacro = index >= 0 ? macros[index] : undefined;
         const macro: TerminalMacro = { ...existingMacro, name, text };
         delete macro.keybinding;
         delete macro.slot;
@@ -378,6 +560,17 @@ export class MacroEditorPanel {
         // in the UI (variables === []) would silently resurrect the old array
         // through the `{ ...existingMacro }` spread above.
         delete macro.variables;
+        // §4.1 — "" canonicalizes to `undefined`; only a non-empty normalized
+        // path is ever persisted. The untouched case re-attaches the stored
+        // string byte-for-byte instead (see the Folder-field comment above);
+        // the `delete` first keeps this in the same delete-then-re-add shape
+        // as `variables` (§9.5), so nothing survives the spread by accident.
+        delete macro.group;
+        if (folderUntouched) {
+          if (typeof existingMacro?.group === "string") macro.group = existingMacro.group;
+        } else if (normalizedGroup) {
+          macro.group = normalizedGroup;
+        }
         if (secret) macro.secret = true;
         else delete macro.secret;
         const triggerCooldown = msg.triggerCooldown as number | undefined;
@@ -406,32 +599,74 @@ export class MacroEditorPanel {
           macro.variables = variables;
         }
         const normalizedBinding = normalizeBinding(bindingRaw);
-        if (normalizedBinding) {
-          if (!isValidBinding(normalizedBinding)) {
-            break;
-          }
-          if (!(await confirmBindingWarnings(normalizedBinding))) {
-            break;
-          }
-          if (index >= 0) {
-            macros[index] = macro;
-            assignBinding(macros, index, normalizedBinding);
-            this.selectedIndex = index;
-          } else {
-            macros.push(macro);
-            const newIndex = macros.length - 1;
-            assignBinding(macros, newIndex, normalizedBinding);
-            this.selectedIndex = newIndex;
-          }
-        } else if (index >= 0) {
-          macros[index] = macro;
-          this.selectedIndex = index;
-        } else {
-          macros.push(macro);
-          this.selectedIndex = macros.length - 1;
+        if (normalizedBinding && !isValidBinding(normalizedBinding)) {
+          break;
+        }
+        if (normalizedBinding && !(await confirmBindingWarnings(normalizedBinding))) {
+          break;
         }
 
-        await this.persist(macros);
+        // `confirmBindingWarnings` is a NON-modal `showWarningMessage`
+        // (macroSettings.ts) — the window stays fully interactive while its
+        // "Use Anyway / Cancel" toast is up, and the panel's own store
+        // subscription re-renders from concurrent writes, so they are plainly
+        // expected here. Writing back `macros` — read before that await — then
+        // silently reverted whatever landed in between (a macro dragged into a
+        // folder, a `moveToFolder`, an import), and `assignBinding`'s
+        // clear-the-binding-from-every-other-macro pass compounded it across
+        // the whole stale array. Re-resolve by id against a freshly read array,
+        // exactly as every macro command now does.
+        if (macroId !== null) {
+          let savedIndex = -1;
+          const outcome = await this.withSaveGuard(() =>
+            mutateMacro(macroRef, (latest, i) => {
+              savedIndex = i;
+              // `macro` was composed from the PRE-dialog record, so every field
+              // on it is either something the user typed in this form or
+              // something copied off that snapshot. For the fields the form
+              // owns, overwriting is the point. `group` is the exception when
+              // the Folder field was untouched: the value being written back is
+              // then not a user decision at all, it is a copy of what the store
+              // held before the dialog — so a folder move that landed while the
+              // non-modal binding warning was up (a drag onto a folder,
+              // `moveToFolder`) got silently reverted by a save that only
+              // changed the macro's NAME. Re-read the folder off the LATEST
+              // record instead, which is the same rule the untouched-field
+              // branch below already applies, just against fresh data.
+              if (folderUntouched) {
+                delete macro.group;
+                if (typeof latest[i].group === "string") macro.group = latest[i].group;
+              }
+              latest[i] = macro;
+              if (normalizedBinding) {
+                assignBinding(latest, i, normalizedBinding);
+              }
+            })
+          );
+          if (outcome !== "saved") {
+            void vscode.window.showWarningMessage(
+              outcome === "ambiguous"
+                ? AMBIGUOUS_MACRO_TARGET_MESSAGE
+                : "This macro changed externally and could not be saved. The editor has been refreshed."
+            );
+            this.render();
+            break;
+          }
+          this.selectedIndex = savedIndex;
+        } else {
+          // A brand-new macro has no id to re-resolve, so the append is the
+          // whole operation; it still reads the array fresh rather than
+          // reusing the pre-dialog snapshot.
+          const latest = getMacros();
+          latest.push(macro);
+          const newIndex = latest.length - 1;
+          if (normalizedBinding) {
+            assignBinding(latest, newIndex, normalizedBinding);
+          }
+          await this.persist(latest);
+          this.selectedIndex = newIndex;
+        }
+
         this.render();
         void this.panel.webview.postMessage({ type: "saved" });
         break;
@@ -439,20 +674,25 @@ export class MacroEditorPanel {
       case "delete": {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
-        // Resolve by stable id; the render-time index may be stale.
-        const index = resolveUniqueMacroIndex(macros, macroId);
-        const macro = index >= 0 ? macros[index] : undefined;
-        if (!macro) {
+        // Resolve by stable id; the render-time index may be stale. The
+        // render-time witness is not — see `resolveEditorTarget`.
+        const resolved = this.resolveEditorTarget(macros, macroId, msg.renderGeneration);
+        if (!resolved) {
+          // Only reachable with a non-null id, so this always has something to say.
+          void vscode.window.showWarningMessage(unresolvedTargetMessage(undefined, "deleted"));
+          this.render();
+          break;
+        }
+        const { ref: macroRef, target } = resolved;
+        if (target.kind !== "resolved") {
           if (macroId !== null) {
-            void vscode.window.showWarningMessage(
-              isAmbiguousMacroId(macros, macroId)
-                ? AMBIGUOUS_TARGET_MESSAGE
-                : "This macro changed externally and could not be deleted. The editor has been refreshed."
-            );
+            void vscode.window.showWarningMessage(unresolvedTargetMessage(target, "deleted"));
             this.render();
           }
           break;
         }
+        const index = target.index;
+        const macro = macros[index];
 
         const confirm = await vscode.window.showWarningMessage(
           `Delete macro "${macro.name}"?`,
@@ -461,9 +701,28 @@ export class MacroEditorPanel {
         );
         if (confirm !== "Delete") break;
 
-        macros.splice(index, 1);
-        await this.persist(macros);
-        this.selectedIndex = macros.length > 0 ? Math.min(index, macros.length - 1) : null;
+        // Same discipline as the save path above. `{ modal: true }` blocks the
+        // USER, not the extension host: an auto-trigger write, a watcher, or an
+        // import can still land while the confirmation is up, and splicing a
+        // pre-dialog snapshot would discard it.
+        let deletedIndex = index;
+        const outcome = await this.withSaveGuard(() =>
+          mutateMacro(macroRef, (latest, i) => {
+            deletedIndex = i;
+            latest.splice(i, 1);
+          })
+        );
+        if (outcome !== "saved") {
+          void vscode.window.showWarningMessage(
+            outcome === "ambiguous"
+              ? AMBIGUOUS_MACRO_TARGET_MESSAGE
+              : "This macro changed externally and could not be deleted. The editor has been refreshed."
+          );
+          this.render();
+          break;
+        }
+        const remaining = getMacros();
+        this.selectedIndex = remaining.length > 0 ? Math.min(deletedIndex, remaining.length - 1) : null;
         this.render();
         break;
       }
@@ -482,11 +741,14 @@ export class MacroEditorPanel {
    * exception, and it is the primary secret-editing surface.
    *
    * The failure that reaches here in practice is `persist()` → `MacroStore.save()`. That store
-   * fails CLOSED when it cannot write a macro's secret-id marker file (unwritable global
-   * storage, a full disk, a dead network share) rather than write a vault entry nothing can
-   * name — and because a save republishes every secret the window holds, the condition fails
-   * EVERY save containing any secret macro, including an edit to an unrelated plain one. It has
-   * to be reported, and it must never be reported as success.
+   * awaits `SecretStorage.store()` for every secret it is republishing and then
+   * `globalState.update()` for `nexus.macros`, and it guards neither: a rejection from either
+   * propagates out of `save()` with `nexus.macros` uncommitted, so the save fails CLOSED rather
+   * than publishing a `secret: true` record with nothing behind it. A keyring that REJECTS is
+   * the reachable case (an unavailable one that answers `undefined` instead is handled inside
+   * the store, not raised), and because a save republishes every secret the window holds it
+   * then fails EVERY save containing any secret macro, including an edit to an unrelated plain
+   * one. It has to be reported, and it must never be reported as success.
    *
    * Both channels are used deliberately: the notification is what the user sees when the panel
    * is not focused, and the `#error-save` slot is what they see when it is — it sits beside the
@@ -518,13 +780,22 @@ export class MacroEditorPanel {
    * Persist macros while suppressing the store's change-event re-render for our
    * own write, so a self-save does not race the explicit `render()` calls in the
    * save/delete handlers (which set `selectedIndex` to the just-applied target).
+   *
+   * Every path that persists must go through this, including
+   * `mutateMacro` — that helper calls `saveMacros()` directly, which would
+   * otherwise fire the store's change event straight back into this panel's own
+   * subscription mid-flow.
    */
-  private async persist(macros: TerminalMacro[]): Promise<void> {
+  private async withSaveGuard<T>(run: () => Promise<T>): Promise<T> {
     this.isSaving = true;
     try {
-      await saveMacros(macros);
+      return await run();
     } finally {
       this.isSaving = false;
     }
+  }
+
+  private async persist(macros: TerminalMacro[]): Promise<void> {
+    await this.withSaveGuard(() => saveMacros(macros));
   }
 }
