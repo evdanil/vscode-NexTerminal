@@ -49,6 +49,11 @@ describe("webview document shell (byte-identity guard)", () => {
   });
 
   it("macro editor", () => {
+    // The snapshot's `<textarea id="macro-text">` opens with a newline before
+    // `echo hi`, and that is load-bearing rather than stray whitespace: the HTML
+    // parser eats exactly one there, so it is what keeps a macro's own leading
+    // blank line (`TEXTAREA_LEADING_NEWLINE` in `macroEditorHtml.ts`). Deleting
+    // it from the snapshot to tidy the diff re-breaks 2.8.76.
     expect(
       renderMacroEditorHtml(
         [{ name: "Hello", text: "echo hi", secret: true, triggerPattern: "x", triggerInterval: 5 }],

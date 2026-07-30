@@ -11,6 +11,28 @@ import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } 
 import { macroFolderField } from "../services/macroFolders";
 
 /**
+ * Emitted immediately after `<textarea>`, before the macro's own text.
+ *
+ * The HTML parser drops exactly ONE U+000A that follows a `<textarea>` start
+ * tag — "newlines at the start of textarea elements are ignored as an authoring
+ * convenience" (HTML Standard, "in body" insertion mode). Rendering the text
+ * bare therefore hands the form a macro whose leading blank line is already
+ * gone, and `MacroEditorPanel` saves `msg.text` verbatim (no trim, by design —
+ * §4.9 "Text is sent exactly as saved"), so merely opening the editor on such a
+ * macro and pressing Save rewrites it one line shorter with nothing reported.
+ * Giving the parser a newline of our own to drop makes the strip land on a
+ * character the macro does not own. Exactly one is dropped whatever follows, so
+ * this is a no-op for every macro that does not start with a newline.
+ *
+ * This is the same mechanism, in the opposite direction, that the HTML
+ * serialization spec mandates for `pre` / `textarea` / `listing`.
+ *
+ * It replaces a `text.replace(/\n/g, "\n")` that had stood on this line since
+ * the editor was written and, replacing "\n" with itself, did nothing at all.
+ */
+const TEXTAREA_LEADING_NEWLINE = "\n";
+
+/**
  * One repeatable variable row (docs/plans/2026-07-29-macro-variables.md §9.1):
  * two visible lines (name/label/default, then the two checkboxes + Remove) plus
  * a per-row error slot addressed by `data-var-error` (§9.2). `index` seeds the
@@ -114,7 +136,7 @@ export function renderMacroEditorHtml(
   const triggerProfileId = macro?.triggerProfileId ?? "";
 
   const nameValue = macro?.name ?? "";
-  const textValue = macro?.text?.replace(/\n/g, "\n") ?? "";
+  const textValue = macro?.text ?? "";
   // §4.11 — the Folder field. For an existing macro, whatever
   // `macroFolderField()` says its stored group looks like in this input; for a
   // new macro, the caller's seed (e.g. `addToFolder`, §4.7).
@@ -248,7 +270,7 @@ export function renderMacroEditorHtml(
 
   <div class="form-group">
     <label for="macro-text">Text</label>
-    <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">${escapeHtml(textValue)}</textarea>
+    <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">${TEXTAREA_LEADING_NEWLINE}${escapeHtml(textValue)}</textarea>
     <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline.</div>
     <div class="field-error" id="error-text"></div>
     <div class="variables-diagnostics" id="variables-diagnostics" aria-live="polite"></div>

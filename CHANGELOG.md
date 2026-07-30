@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.76] — 2026-07-31
+
+### Fixed
+
+- **A macro whose text began with a blank line lost that line whenever the Macro Editor was opened and saved.** The HTML parser discards one newline immediately after a `<textarea>`, so the form came up already missing it, and the editor saves the text exactly as the form returns it — pressing **Save** with no edit at all silently rewrote the macro one line shorter. The editor now emits a newline of its own for the parser to discard.
+
 ## [2.8.75] — 2026-07-31
 
 ### Added

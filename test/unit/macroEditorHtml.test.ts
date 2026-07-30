@@ -225,6 +225,46 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("newline");
   });
 
+  describe("the newline the HTML parser eats after <textarea>", () => {
+    /** The raw child text of `#macro-text`, before any parsing. */
+    function textareaSource(html: string): string {
+      const match = html.match(/<textarea id="macro-text"[^>]*>([\s\S]*?)<\/textarea\s*>/i);
+      expect(match).not.toBeNull();
+      return match![1];
+    }
+
+    /**
+     * What a spec-compliant parser hands the form element: "if the next token
+     * is a U+000A LINE FEED character token, then ignore that token" (HTML
+     * Standard, "in body" insertion mode, `textarea` start tag). Exactly one,
+     * and only immediately after the start tag.
+     */
+    function afterParse(source: string): string {
+      return source.startsWith("\n") ? source.slice(1) : source;
+    }
+
+    it("gives the parser a newline of its own to eat, so a leading blank line survives", () => {
+      // Without a newline of ours the parser eats the macro's, the form comes
+      // up one line short, and `MacroEditorPanel` saves `msg.text` verbatim —
+      // so opening the editor on this macro and pressing Save with no edit at
+      // all rewrites it, silently, to something the user did not type.
+      const text = "\nsudo reboot\n";
+      const source = textareaSource(render([{ name: "Leading blank", text }], 0));
+      expect(source.startsWith("\n\n")).toBe(true);
+      expect(afterParse(source)).toBe(text);
+    });
+
+    it("is a no-op for text that does not start with a newline", () => {
+      const text = "sudo reboot\nexit\n";
+      const source = textareaSource(render([{ name: "Ordinary", text }], 0));
+      expect(afterParse(source)).toBe(text);
+    });
+
+    it("is a no-op for the empty new-macro form", () => {
+      expect(afterParse(textareaSource(render([], null)))).toBe("");
+    });
+  });
+
   it("includes client-side binding validation script", () => {
     const html = render([], null);
     expect(html).toContain("isValidBinding");
@@ -247,7 +287,12 @@ describe("renderMacroEditorHtml", () => {
       { name: "IPMI", text: "ipmitool -H $host", variables: [{ name: "host", label: "Host" }] }
     ];
     const html = render(macros, 0);
-    const scriptMatch = html.match(/<script[^>]*>([\s\S]*?)<\/script>/);
+    // Case-insensitive, and the tag name is followed by a space-or-`>` rather
+    // than by `[^>]*` alone: `<script` is emitted with an optional nonce
+    // attribute (`formHtml.ts`), so the boundary has to be explicit or the
+    // pattern would also claim a hypothetical `<scriptish>`. CodeQL's
+    // `js/bad-tag-filter` flags the loose form.
+    const scriptMatch = html.match(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script\s*>/i);
     expect(scriptMatch).not.toBeNull();
     const scriptBody = scriptMatch![1];
     expect(() => new Function(scriptBody)).not.toThrow();

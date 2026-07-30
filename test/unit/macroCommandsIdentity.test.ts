@@ -779,11 +779,17 @@ describe("macro commands resolve their target by identity across every dialog aw
 
     it("moveToFolder over a multi-select moves what it can still identify and REPORTS the twin it cannot", async () => {
       // Both twins selected from the palette. The re-key during the folder
-      // prompt leaves the first one exactly where its reference says it is (it
-      // keeps the shared id, so row-and-id still match) and the second one
-      // unidentifiable. Moving one and saying nothing about the other is the
-      // silent-skip this reports instead: the user asked for two macros to move
-      // and would otherwise have to notice for themselves that one did not.
+      // prompt leaves ONE of them still where its reference says it is (it kept
+      // the shared id, so row-and-id still match) and the other unidentifiable.
+      // Which one that is comes from `DuplicateIdMacroStore`, which re-keys with
+      // `assignUniqueMacroIds()` and so awards a contested id in array order —
+      // hence "login" below. Desktop persistence supplies `keepIdIfPossible` and
+      // can award it the other way round; nothing under test here depends on
+      // which twin wins, only on there being exactly one.
+      //
+      // Moving that one and saying nothing about the other is the silent-skip
+      // this reports instead: the user asked for two macros to move and would
+      // otherwise have to notice for themselves that one did not.
       const dupStore = seedThree();
       mockShowQuickPick.mockImplementation(
         async (items: Array<{ label: string }>, options?: { canPickMany?: boolean }) =>
@@ -875,8 +881,14 @@ describe("resolveMacroTarget (services/macroMutation.ts)", () => {
     const ref = captureMacroRef(stored, "x", 2);
     expect(ref.idWhenCaptured).toBe("ambiguous");
 
-    // Exactly what `MacroStore.save()` does, run for real: "First" keeps "x",
-    // "Second" is handed a fresh UUID.
+    // The real re-key, run for real rather than hand-written. This wrapper is
+    // what `InMemoryMacroStore.save()` calls and it awards in array order, so
+    // "First" keeps "x" and "Second" is handed a fresh UUID — the arrangement
+    // this case needs, because the reference names row 2. Desktop persistence
+    // adds `keepIdIfPossible` and can award it the other way round, which would
+    // leave the reference exact-matching and resolving; that direction is not
+    // this case. Both leave the id with exactly one holder, which is the part
+    // every case in this describe turns on.
     const afterSave = assignUniqueMacroIds(stored);
     expect(afterSave[1].id).toBe("x");
     expect(afterSave[2].id).not.toBe("x");
@@ -993,8 +1005,10 @@ describe("resolveMacroTarget (services/macroMutation.ts)", () => {
     // all beside it; nothing written into a `DataTransfer` is proof of provenance,
     // which is why `parseMacroDragPayload` reads none of it and every payload
     // arrives here as `"unverified"`. So the leniency that lets a BARE id resolve
-    // cannot extend to a stale position. `[Other, First(x),
-    // Second(x)]` after a save: First keeps "x", Second is re-keyed. A payload
+    // cannot extend to a stale position. `[Other, First(x), Second(x)]` put
+    // through the array-order re-key below: First keeps "x", Second is re-keyed.
+    // (Desktop persistence can award it the other way round — immaterial here,
+    // where all that matters is that the payload's row no longer holds it.) A payload
     // naming index 2 is then pointing at a macro that no longer carries the id it
     // named, and falling back to the unique holder moves First — the twin the user
     // did not drag, and precisely what rule 2 refuses for references this extension

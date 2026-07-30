@@ -3979,7 +3979,8 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
 
   <div class="form-group">
     <label for="macro-text">Text</label>
-    <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">echo hi</textarea>
+    <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">
+echo hi</textarea>
     <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline.</div>
     <div class="field-error" id="error-text"></div>
     <div class="variables-diagnostics" id="variables-diagnostics" aria-live="polite"></div>
