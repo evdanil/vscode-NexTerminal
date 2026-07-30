@@ -852,6 +852,48 @@ describe("MacroTreeProvider drag and drop (§4.9)", () => {
     expect(after.find((m) => m.id === "second")?.group).toBeUndefined();
   });
 
+  it("...and a mismatched id inherits the capture's PROVENANCE no more than its index", async () => {
+    // The other half of the id check, and the half the test above cannot see.
+    // `dragRefFor` returning `{ ...captured.ref, id: parsed.ref.id }` on a
+    // token-only match survives every other case in this file: the payload keeps
+    // its own id, so the macro it names is usually still the one that resolves.
+    //
+    // What it silently hands over is `idWhenCaptured`. This view checked "dragged"
+    // and found it unique; it never looked at "bystander" at all. Stamping that
+    // answer onto a foreign payload that CLAIMS A POSITION launders it straight
+    // past rule 2b — the rule whose entire job is to refuse a producer whose
+    // stated position does not check out — and it resolves by rule 3 instead.
+    // Under that mutation Bystander, a macro nothing dragged and nothing named as
+    // a target, is the macro that moves into Cisco.
+    await testStore.save([
+      { id: "bystander", name: "Bystander", text: "t" },
+      { id: "dragged", name: "Dragged", text: "t" }
+    ]);
+    await testStore.saveFolders(["Cisco"]);
+    const dragged = provider.getChildren()[2] as MacroTreeItem; // folder, Bystander, Dragged
+    expect(dragged.macro.name).toBe("Dragged");
+    const dataTransfer = makeDataTransfer();
+    await provider.handleDrag([dragged], dataTransfer as unknown as vscode.DataTransfer);
+    const token = JSON.parse(
+      await (dataTransfer.get(MACRO_DRAG_MIME) as { asString: () => Promise<string> }).asString()
+    ).dragToken;
+
+    // Valid token, a DIFFERENT id, and a position that does not hold that id —
+    // index 1 is the dragged macro's row, not Bystander's.
+    const forged = makeDataTransfer({
+      [MACRO_DRAG_MIME]: new vscode.DataTransferItem(
+        JSON.stringify({ id: "bystander", index: 1, dragToken: token })
+      )
+    });
+    const folder = findFolder(provider.getChildren(), "Cisco");
+    await provider.handleDrop(folder, forged as unknown as vscode.DataTransfer);
+
+    // Named by macro, so a failure says WHICH macro moved rather than which slot
+    // changed.
+    expect(testStore.getAll().filter((m) => m.group !== undefined).map((m) => m.name)).toEqual([]);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+  });
+
   it("a drop refuses a FOREIGN payload whose claimed position no longer holds its id", async () => {
     // `{"id":"x","index":1}` from a producer this view is not holding a capture for
     // (a bare id is still honoured; claiming a position is what changes the rules).
