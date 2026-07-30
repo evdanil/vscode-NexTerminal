@@ -151,27 +151,56 @@ export class MacroTreeItem extends vscode.TreeItem {
 export type MacroTreeElement = MacroTreeItem | FolderTreeItem;
 
 /**
+ * Correlates a `handleDrag` with the reference that drag captured, which stays
+ * HOST-SIDE (`MacroTreeProvider.lastDragCapture`). Module-level so two provider
+ * instances can never mint the same token and read each other's capture.
+ *
+ * It is only a lookup key, never evidence: a payload naming the current token is
+ * treated as the drag this view most recently started, and the provenance it
+ * gets is the one this view computed for that drag. There is nothing to gain by
+ * guessing it — a payload must also name the same id, so the most a forged token
+ * can do is replay this view's own last drag.
+ */
+let dragSequence = 0;
+
+/** What a drop payload is worth on its own, before the retained capture is consulted. */
+interface ParsedDragPayload {
+  /**
+   * Provenance is always `"unverified"`: the payload is a string in a
+   * `DataTransfer` and nothing in it can establish what was true when the drag
+   * started. Only `MacroTreeProvider.lastDragCapture` can, and only for the drag
+   * it actually recorded.
+   */
+  readonly ref: MacroRef;
+  /** Present only when the payload named one; matched against the retained capture. */
+  readonly dragToken?: string;
+}
+
+/**
  * Reads back what `handleDrag` wrote. Defensive rather than a bare
  * `JSON.parse`: `DataTransfer` contents are whatever the drag source put there,
  * and a plain (non-JSON) string is treated as a bare macro id so a payload from
  * any other producer still resolves by identity instead of being dropped on the
  * floor. Returns `undefined` only when there is no id to act on at all.
  *
- * A payload this view did not write carries no capture-time knowledge of the id,
- * so its reference is `"unverified"` rather than a claim it cannot back — see
- * `MacroIdProvenance`. Refusing every such drop instead would break the bare-id
- * payload contract above without protecting anything: an unknown producer has no
- * capture state for this module to preserve in the first place.
+ * **Nothing in the payload sets provenance.** It cannot: a boolean written into
+ * this MIME by `handleDrag` and one written by anything else are the same bytes,
+ * so honouring `idAmbiguous: false` as "checked, and it was unique" was a claim
+ * of uniqueness available to any producer — including a stale one — which is
+ * exactly what `resolveMacroTarget`'s rule 2b exists to refuse. Every payload
+ * therefore parses as `"unverified"`, and a drag this view actually started gets
+ * its real provenance back from `lastDragCapture`, which no payload can reach.
  *
- * That leniency stops at the index. An unverified payload that also names a
- * POSITION is refused unless the macro still sitting there carries its id
- * (`resolveMacroTarget`'s rule 2b) — a wrong position is proof the producer's
- * view of the list is stale, and falling back to the id from there is how
- * `{"id":"x","index":2}` naming the second of two twins ends up moving the
- * first one after a save re-keys them. Bare ids are unaffected.
+ * So an indexed payload from anywhere else is honoured at the position it names
+ * or refused (rule 2b): a wrong position is proof the producer's view of the
+ * list is stale, and falling back to the id from there is how
+ * `{"id":"x","index":1}` naming the second of two twins ends up moving the first
+ * one after a save re-keys them. Bare ids are unaffected — with no position
+ * claimed there is nothing to be stale about, and that contract predates the
+ * index.
  */
-function parseMacroDragPayload(payload: string): MacroRef | undefined {
-  const unverified = (id: string): MacroRef => ({ id, idWhenCaptured: "unverified" });
+function parseMacroDragPayload(payload: string): ParsedDragPayload | undefined {
+  const unverified = (id: string): ParsedDragPayload => ({ ref: { id, idWhenCaptured: "unverified" } });
   let parsed: unknown;
   try {
     parsed = JSON.parse(payload);
@@ -186,27 +215,13 @@ function parseMacroDragPayload(payload: string): MacroRef | undefined {
     // `JSON.parse` happily turns into a number. The raw text is the id.
     return unverified(payload);
   }
-  const { id, index, idAmbiguous } = parsed as { id?: unknown; index?: unknown; idAmbiguous?: unknown };
+  const { id, index, dragToken } = parsed as { id?: unknown; index?: unknown; dragToken?: unknown };
   if (typeof id !== "string" || !id) {
     return undefined;
   }
-  // A boolean here is a CLAIM about drag time, not proof of origin: any producer
-  // can write `idAmbiguous: false` into this MIME just as easily as `handleDrag`
-  // does. Be precise about what claiming it is worth. `true` only ever costs the
-  // payload capability. `false` does buy one thing — it escapes rule 2b, so a
-  // stale POSITION no longer refuses the drop — but what it buys back is exactly
-  // resolution by unique id, which the bare-id payload above already grants
-  // unconditionally to anyone who simply omits the index. It cannot make a wrong
-  // position be honoured (rule 1 checks the id sitting there) and it cannot beat
-  // a duplication visible in the array being resolved against (rule 4). So the
-  // flag is worth stating for a producer that is HONEST and stale — which is the
-  // case rule 2b exists for — and worth nothing to one that is not.
-  //
-  // A payload with no boolean at all made no claim, so it stays "unverified" and
-  // is held to rule 2b: honoured at its stated position, or refused.
-  const idWhenCaptured =
-    typeof idAmbiguous === "boolean" ? (idAmbiguous ? "ambiguous" : "unique") : "unverified";
-  return typeof index === "number" ? { id, index, idWhenCaptured } : { id, idWhenCaptured };
+  const ref: MacroRef =
+    typeof index === "number" ? { id, index, idWhenCaptured: "unverified" } : { id, idWhenCaptured: "unverified" };
+  return typeof dragToken === "string" && dragToken ? { ref, dragToken } : { ref };
 }
 
 function makeMacroFolderItem(path: string, collapsibleState: vscode.TreeItemCollapsibleState): FolderTreeItem {
@@ -233,6 +248,18 @@ export class MacroTreeProvider
   // Hub's server/serial/folder drags (and vice versa).
   public readonly dragMimeTypes = [MACRO_DRAG_MIME];
   public readonly dropMimeTypes = [MACRO_DRAG_MIME];
+
+  /**
+   * The reference the most recent `handleDrag` captured, kept HERE rather than
+   * serialized into the payload. Both halves of a drag run in the extension
+   * host, so the one fact a drop needs and cannot recompute — what was true
+   * about the dragged id when the gesture STARTED — never has to survive a trip
+   * through a string a stranger could have written.
+   *
+   * Only one is kept: a `DataTransfer` belongs to exactly one drag, and starting
+   * another replaces the one before it.
+   */
+  private lastDragCapture: { readonly token: string; readonly ref: MacroRef } | undefined;
 
   public constructor(
     private readonly isTriggerDisabled: (macro: TerminalMacro) => boolean = () => false
@@ -310,9 +337,10 @@ export class MacroTreeProvider
   }
 
   /**
-   * §4.9 — the payload is the dragged macro's stable `id`, plus the position of
-   * the row it was dragged FROM. Never the index alone: a bare index is what a
-   * drop would misapply the moment the array shifts between drag and drop.
+   * §4.9 — the payload is the dragged macro's stable `id`, the position of the
+   * row it was dragged FROM, and a token naming the capture this view retained
+   * for that drag. Never the index alone: a bare index is what a drop would
+   * misapply the moment the array shifts between drag and drop.
    *
    * The index rides along because the id cannot separate two macros that share
    * one (a reachable, deliberately unrepaired state — see
@@ -321,13 +349,16 @@ export class MacroTreeProvider
    * macro at that position still carries the dragged id, so a stale payload
    * falls back to id resolution rather than moving a bystander.
    *
-   * `idAmbiguous` rides along for the same reason and is NOT redundant with the
-   * check the drop performs: a drop is a second gesture, arbitrarily later, and
-   * a re-keying `save()` in between (any macro write at all) splits a shared id
-   * so that the drop sees a perfectly unique one — pointing at the twin the
-   * user did not drag. Only what was true when the drag STARTED can rule that
-   * out. Captured here, at the one moment this view is looking at the same list
-   * the user is.
+   * The capture is what makes that fallback safe, and it deliberately does NOT
+   * ride along. A drop is a second gesture, arbitrarily later, and a re-keying
+   * `save()` in between (any macro write at all) splits a shared id so the drop
+   * sees a perfectly unique one — pointing at the twin the user did not drag. An
+   * id that was already GONE at drag time is the mirror image: a config import
+   * or an undo can hand that id to a macro the user has never seen, and rule 0
+   * is what stops the drop landing on it. Only what was true when the drag
+   * STARTED rules either out, so it is taken here — the one moment this view is
+   * looking at the same list the user is — and kept in `lastDragCapture`, where
+   * no payload can contradict it.
    */
   public async handleDrag(
     source: readonly MacroTreeElement[],
@@ -335,19 +366,37 @@ export class MacroTreeProvider
   ): Promise<void> {
     const item = source[0];
     if (item instanceof MacroTreeItem && item.macro.id) {
-      const ref = captureMacroRefFromRow(getMacros(), item);
+      const token = `drag-${++dragSequence}`;
+      this.lastDragCapture = { token, ref: captureMacroRefFromRow(getMacros(), item) };
       dataTransfer.set(
         MACRO_DRAG_MIME,
         new vscode.DataTransferItem(
           JSON.stringify({
             id: item.macro.id,
             index: item.index,
-            idAmbiguous: ref.idWhenCaptured === "ambiguous"
+            dragToken: token
           })
         )
       );
     }
     // Folders are not draggable in v1 (§4.9) — nothing else to serialize.
+  }
+
+  /**
+   * The reference a drop acts on: the retained capture when the payload names
+   * the drag this view is holding AND the same macro id it was taken for,
+   * otherwise whatever the payload alone is worth (`"unverified"`).
+   *
+   * The id check is not ceremony. The token identifies a GESTURE; the capture's
+   * provenance describes one specific id, and applying it to any other id would
+   * be attaching this view's word to a macro it never looked at.
+   */
+  private dragRefFor(parsed: ParsedDragPayload): MacroRef {
+    const captured = this.lastDragCapture;
+    if (captured !== undefined && parsed.dragToken === captured.token && captured.ref.id === parsed.ref.id) {
+      return captured.ref;
+    }
+    return parsed.ref;
   }
 
   /**
@@ -368,10 +417,11 @@ export class MacroTreeProvider
     if (!payload) {
       return;
     }
-    const ref = parseMacroDragPayload(payload);
-    if (!ref) {
+    const parsed = parseMacroDragPayload(payload);
+    if (!parsed) {
       return;
     }
+    const ref = this.dragRefFor(parsed);
 
     let targetFolder: string | undefined;
     if (target === undefined) {

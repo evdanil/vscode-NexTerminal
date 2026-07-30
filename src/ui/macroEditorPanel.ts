@@ -32,66 +32,24 @@ import { createWebviewNonce } from "./shared/webviewNonce";
 type MacroProfileProvider = () => MacroProfileOptionInput[];
 
 /**
- * Resolves the save/delete target by stable id, never by the render-time array index:
- * an external reorder or delete between render and save would otherwise hit the wrong
- * macro.
- *
- * The shared `resolveMacroTarget` takes an optional index precisely so a clicked ROW
- * can disambiguate two macros sharing an id. The panel deliberately passes none. Its
- * webview payload's `index` is a RENDER-time position that survives arbitrarily long
- * — the panel stays open across any number of external writes and even clamps
- * `selectedIndex` when the list shrinks — so it is not the "the user just pointed at
- * this row" signal a tree item's index is. With no index, an id claimed by more than
- * one macro resolves to `"ambiguous"` and the panel refuses: writing the macro the
- * user was looking at over its twin would silently destroy the twin, and refusing is
- * the same fail-safe `MacroAutoTrigger` applies to an ambiguous state key. Every
- * repair route (Move Up / Move Down, delete, or editing any macro with a unique id)
- * re-saves the whole list and clears the conflict, so this is never a dead end.
- *
- * **`idAmbiguousAtRender` is the reason this is not just `captureMacroRef(macros,
- * id)`.** The array checked here is read when the MESSAGE arrives; the id in that
- * message was baked into the form at RENDER time, and the form outlives any number
- * of writes. So the capture contract `captureMacroRef` states — check the list the
- * surface was actually looking at — cannot be met from inside this function, and
- * checking the fresh array instead is precisely the interleaving
- * `resolveMacroTarget`'s rule 2 exists to catch: `[First(x), Second(x)]`, form open
- * on `Second`, any write at all re-keys to `[First(x), Second(x')]`, and a click in
- * the still-displayed old form (or a message already in flight) arrives carrying `x`
- * over an array in which `x` now has exactly one holder — `First`. Nothing about
- * that array is ambiguous, so the save would go through, onto the wrong macro,
- * under a "saved" toast. The webview therefore carries the render-time answer back,
- * exactly as `MacroTreeItem.identityConflict` does for a clicked row.
- *
- * The flag is a CLAIM from the webview, so it is read as one:
- * - `false` — the only value treated as "checked, and it was unique". The live
- *   array is still checked (`captureMacroRef`), so a stale or forged `false`
- *   cannot suppress a duplication that is visible right now.
- * - anything else, INCLUDING absent — treated as ambiguous, i.e. refused. Every
- *   message this panel's own HTML posts carries the boolean (macroEditorHtml.ts),
- *   so the only senders that lose are ones this module did not render.
- *
- * Returns the captured `ref` alongside the target so the WRITE that follows the
- * dialog re-resolves the very same reference — `idWhenCaptured` and all. That is
- * required for correctness in the ambiguous case above (a ref rebuilt after the
- * dialog would have lost the render-time flag), and it is what makes the
- * pre-dialog check and the write agree by construction rather than by two
- * separate code paths happening to say the same thing.
+ * How many renders' worth of references the panel keeps (see
+ * `MacroEditorPanel.renderedRefs`). Small on purpose: the page is replaced on
+ * every render, so the only ones that can still post are the page on screen and
+ * the handful whose messages are already in IPC flight. A message naming a
+ * render older than this fails closed, which is the same answer it gets for a
+ * render that never happened.
  */
-function resolveEditorTarget(
-  macros: readonly TerminalMacro[],
-  macroId: string | null,
-  idAmbiguousAtRender: unknown
-): { ref: MacroRef; target: MacroTarget } {
-  const ref: MacroRef =
-    macroId !== null && idAmbiguousAtRender !== false
-      ? { id: macroId, idWhenCaptured: "ambiguous" }
-      : captureMacroRef(macros, macroId);
-  return { ref, target: resolveMacroTarget(macros, ref) };
-}
+const MAX_RETAINED_RENDERS = 8;
 
-/** The right thing to say for a target that could not be resolved to one macro. */
-function unresolvedTargetMessage(target: MacroTarget, verb: "saved" | "deleted"): string {
-  return target.kind === "ambiguous"
+/**
+ * The right thing to say for a target that could not be resolved to one macro.
+ * `undefined` means no reference could be taken at all — the message did not
+ * come from any page this panel still has a record of (see
+ * `MacroEditorPanel.resolveEditorTarget`), which is the stale-form case and
+ * reads as one.
+ */
+function unresolvedTargetMessage(target: MacroTarget | undefined, verb: "saved" | "deleted"): string {
+  return target?.kind === "ambiguous"
     ? AMBIGUOUS_MACRO_TARGET_MESSAGE
     : `This macro changed externally and could not be ${verb}. The editor has been refreshed.`;
 }
@@ -148,6 +106,36 @@ export class MacroEditorPanel {
    * would re-render mid-flow and could clobber the just-applied `selectedIndex`.
    */
   private isSaving = false;
+  /**
+   * Which page this panel has drawn so far. Bumped by every `render()` and baked
+   * into that page, which posts it back with save and delete — the KEY to
+   * `renderedRefs`, and the only thing about identity the webview gets to say.
+   */
+  private renderGeneration = 0;
+  /**
+   * What this panel knew about the selected macro's id at each render, kept
+   * HOST-SIDE and keyed by the generation of the page that carries it.
+   *
+   * This is the editor's equivalent of `MacroTreeItem.identityConflict` — the
+   * render-time witness a row has and a form previously did not — and it is
+   * retained rather than posted because a witness that travels through the
+   * webview is not one. `[First(x), Second(x)]`, form open on `Second`, any
+   * write at all re-keys to `[First(x), Second(x')]`, and a click in the
+   * still-displayed old form (or a message already in flight) arrives carrying
+   * `x` over an array in which `x` now has exactly one holder: `First`. Nothing
+   * about that array is ambiguous, so a save resolved against it goes through,
+   * onto the wrong macro, under a "saved" toast. Only what was true at RENDER
+   * rules that out — and a boolean posted back from the page cannot establish
+   * it, because a stale one, a forged one and a defaulted one are the same
+   * bytes as an honest one.
+   *
+   * Keyed by generation rather than collapsed to "the latest": a message from a
+   * page one render old is ordinary (any external write re-renders), and it must
+   * still be answered with what THAT page was drawn knowing. Answering it with
+   * the current render's knowledge would refuse the ordinary save-after-external-
+   * reorder this whole feature exists to make work.
+   */
+  private readonly renderedRefs = new Map<number, MacroRef>();
 
   public static setProfileProvider(provider: MacroProfileProvider): void {
     MacroEditorPanel.profileProvider = provider;
@@ -218,13 +206,95 @@ export class MacroEditorPanel {
     // macro; irrelevant once an existing macro is selected.
     const seedGroup = this.selectedIndex === null ? this.pendingSeedGroup : undefined;
     const folders = collectMacroFolders(macros, getMacroFolders());
-    // The render-time identity witness that travels with the form — see
-    // `resolveEditorTarget`. Computed AFTER the clamp above, off the same array
-    // the HTML is built from, through the one shared definition of "how many
-    // macros carry this id" rather than a local count.
+    // The render-time identity witness for the page about to be drawn — see
+    // `renderedRefs`. Computed AFTER the clamp above, off the same array the
+    // HTML is built from, through the one shared definition of "how many macros
+    // carry this id" rather than a local count. The page is given only the
+    // generation; the answer itself stays here.
     const selected = this.selectedIndex === null ? undefined : macros[this.selectedIndex];
-    const idAmbiguousAtRender = captureMacroRef(macros, selected?.id).idWhenCaptured === "ambiguous";
-    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider(), folders, seedGroup, idAmbiguousAtRender);
+    const generation = ++this.renderGeneration;
+    this.renderedRefs.set(generation, captureMacroRef(macros, selected?.id));
+    // Insertion-ordered, so the first key is always the oldest render.
+    while (this.renderedRefs.size > MAX_RETAINED_RENDERS) {
+      const oldest = this.renderedRefs.keys().next().value;
+      if (oldest === undefined) break;
+      this.renderedRefs.delete(oldest);
+    }
+    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider(), folders, seedGroup, generation);
+  }
+
+  /**
+   * Resolves the save/delete target by stable id, never by the render-time array
+   * index: an external reorder or delete between render and save would otherwise
+   * hit the wrong macro.
+   *
+   * The shared `resolveMacroTarget` takes an optional index precisely so a clicked
+   * ROW can disambiguate two macros sharing an id. The panel deliberately passes
+   * none. Its webview payload's `index` is a RENDER-time position that survives
+   * arbitrarily long — the panel stays open across any number of external writes
+   * and even clamps `selectedIndex` when the list shrinks — so it is not the "the
+   * user just pointed at this row" signal a tree item's index is. With no index, an
+   * id claimed by more than one macro resolves to `"ambiguous"` and the panel
+   * refuses: writing the macro the user was looking at over its twin would silently
+   * destroy the twin, and refusing is the same fail-safe `MacroAutoTrigger` applies
+   * to an ambiguous state key. Every repair route (Move Up / Move Down, delete, or
+   * editing any macro with a unique id) re-saves the whole list and clears the
+   * conflict, so this is never a dead end.
+   *
+   * **The reference is not rebuilt from the arriving message.** It is looked up in
+   * `renderedRefs` under the generation the message names, so the provenance the
+   * write is resolved with is one this panel computed, off the array it drew the
+   * page from, before the message existed. `captureMacroRef(macros, id)` here would
+   * check the array as it stands when the MESSAGE arrives, which is the interleaving
+   * `resolveMacroTarget`'s rule 2 exists to catch (see `renderedRefs`).
+   *
+   * What the webview supplies is a lookup key and an id, and both are checked
+   * against this panel's own record:
+   * - no entry for the named generation (never issued, or aged out) — refused. A
+   *   message this panel cannot place is one it has no witness for.
+   * - an entry whose id is not the one the message carries — refused. The page at
+   *   that generation was drawn over a different macro, so its witness says nothing
+   *   about this id.
+   * - otherwise the retained reference, verbatim.
+   *
+   * Naming a *different* render is therefore worth nothing: every generation this
+   * panel issued for this id was answered honestly when it was issued, so the best a
+   * forged key can do is ask a question this panel already knows the answer to.
+   *
+   * `macroId === null` — a not-yet-saved macro — is exempt, and that exemption is
+   * about identity, not about trust: the push path appends, so there is no existing
+   * record for a wrong answer to land on. It does NOT mean the generation goes
+   * unread for a new macro; both handlers read the field off the message before
+   * calling this, so a hostile *object* (a throwing getter) would be observed there.
+   * No such object can exist in production — the webview boundary structured-clones
+   * everything through it — but "the null id short-circuits first" is a statement
+   * about this function, not about the message.
+   *
+   * Returns the retained `ref` alongside the target so the WRITE that follows the
+   * dialog re-resolves the very same reference — `idWhenCaptured` and all. That is
+   * required for correctness in the ambiguous case above (a ref rebuilt after the
+   * dialog would have lost the render-time answer), and it is what makes the
+   * pre-dialog check and the write agree by construction rather than by two separate
+   * code paths happening to say the same thing.
+   *
+   * `undefined` means no reference could be taken at all: the message did not come
+   * from any page this panel still has a record of.
+   */
+  private resolveEditorTarget(
+    macros: readonly TerminalMacro[],
+    macroId: string | null,
+    renderGenerationClaim: unknown
+  ): { ref: MacroRef; target: MacroTarget } | undefined {
+    if (macroId === null) {
+      const ref = captureMacroRef(macros, null);
+      return { ref, target: resolveMacroTarget(macros, ref) };
+    }
+    const rendered =
+      typeof renderGenerationClaim === "number" ? this.renderedRefs.get(renderGenerationClaim) : undefined;
+    if (rendered === undefined || rendered.id !== macroId) {
+      return undefined;
+    }
+    return { ref: rendered, target: resolveMacroTarget(macros, rendered) };
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
@@ -288,7 +358,15 @@ export class MacroEditorPanel {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
         // A null id means an unsaved (new) macro → push path.
-        const { ref: macroRef, target } = resolveEditorTarget(macros, macroId, msg.idAmbiguous);
+        const resolved = this.resolveEditorTarget(macros, macroId, msg.renderGeneration);
+        if (!resolved) {
+          // Not from a page this panel still has a witness for. Never guess a
+          // target from the message alone — that is the whole defect.
+          void vscode.window.showWarningMessage(unresolvedTargetMessage(undefined, "saved"));
+          this.render();
+          return;
+        }
+        const { ref: macroRef, target } = resolved;
         if (macroId !== null && target.kind !== "resolved") {
           // The macro we were editing was deleted/changed externally, or its id is
           // shared with another macro. Do not fall through to the push path (that
@@ -592,8 +670,15 @@ export class MacroEditorPanel {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
         // Resolve by stable id; the render-time index may be stale. The
-        // render-time ambiguity flag is not — see `resolveEditorTarget`.
-        const { ref: macroRef, target } = resolveEditorTarget(macros, macroId, msg.idAmbiguous);
+        // render-time witness is not — see `resolveEditorTarget`.
+        const resolved = this.resolveEditorTarget(macros, macroId, msg.renderGeneration);
+        if (!resolved) {
+          // Only reachable with a non-null id, so this always has something to say.
+          void vscode.window.showWarningMessage(unresolvedTargetMessage(undefined, "deleted"));
+          this.render();
+          break;
+        }
+        const { ref: macroRef, target } = resolved;
         if (target.kind !== "resolved") {
           if (macroId !== null) {
             void vscode.window.showWarningMessage(unresolvedTargetMessage(target, "deleted"));

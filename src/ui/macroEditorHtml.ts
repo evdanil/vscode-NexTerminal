@@ -48,27 +48,28 @@ function renderVariableRow(variable: MacroVariable, index: number): string {
 }
 
 /**
- * @param idAmbiguousAtRender Whether the selected macro's `id` was carried by
- * MORE THAN ONE macro in `macros` at the moment this form was built. Baked into
- * the page next to `currentId` and posted straight back with every save/delete,
- * because the form is the longest-lived reference to a macro in the whole
- * feature and the id alone cannot carry that fact: `MacroStore.save()` re-keys
- * duplicates, so by the time the message arrives the id can look perfectly
- * unique while naming the OTHER twin. This is the editor's equivalent of
- * `MacroTreeItem.identityConflict` — the render-time witness a row has and a
- * form previously did not.
+ * @param renderGeneration Which of the panel's renders this page IS. Baked in
+ * next to `currentId` and posted straight back with every save/delete, where it
+ * is the key the panel looks its own render-time answer up under
+ * (`MacroEditorPanel.renderedRefs`) — not an answer in itself.
  *
- * The panel computes it (`macroEditorPanel.ts`) rather than this module,
- * because the one definition of "how many macros carry this id" lives in
+ * The distinction is the point. The form is the longest-lived reference to a
+ * macro in this feature, and the id alone cannot carry what was true when the
+ * form was drawn: `MacroStore.save()` re-keys duplicates, so by the time the
+ * message arrives the id can look perfectly unique while naming the OTHER twin.
+ * A previous revision posted that fact back as a boolean, which cannot work —
+ * a stale `false`, a forged `false` and a defaulted `false` are indistinguishable
+ * from an honest one, so the page could assert its way past the check. A
+ * generation can only ever NAME one of the host's records; the record itself
+ * stays where the webview cannot reach it.
+ *
+ * The panel owns the numbering (`macroEditorPanel.ts`), because the one
+ * definition of "how many macros carry this id" lives in
  * `services/macroMutation.ts`, which reaches `vscode` through `macroSettings`
- * and so cannot be imported here. It defaults to `false` for the render-only
- * callers (the byte-identity snapshot), and a caller that forgets it does not
- * fail open into a wrong write: the page then claims uniqueness, and the host
- * falls back to checking the LIVE array, which is the protection the editor had
- * before this argument existed. What is lost is only the extra case that
- * argument adds — a conflict that had already been re-keyed away by the time
- * the message landed. The production caller (`MacroEditorPanel.render`) always
- * passes it.
+ * and so cannot be imported here. It defaults to `0`, which the panel never
+ * issues: a render-only caller (the byte-identity snapshot, a test) produces a
+ * page whose save would be refused as coming from no render at all, rather than
+ * one that claims something about an id.
  */
 export function renderMacroEditorHtml(
   macros: TerminalMacro[],
@@ -77,7 +78,7 @@ export function renderMacroEditorHtml(
   profiles: MacroProfileOptionInput[] = [],
   folders: string[] = [],
   seedGroup?: string,
-  idAmbiguousAtRender = false
+  renderGeneration = 0
 ): string {
   const macro = selectedIndex !== null ? macros[selectedIndex] : undefined;
 
@@ -360,9 +361,10 @@ ${folderOptionsHtml}
       var dirty = false;
       var currentIndex = ${selectedIndex !== null ? selectedIndex : "null"};
       var currentId = ${macro?.id ? JSON.stringify(macro.id) : "null"};
-      // Provenance for currentId, fixed at render (see idAmbiguousAtRender).
-      // Travels with every save/delete; the host refuses anything but false.
-      var currentIdAmbiguous = ${idAmbiguousAtRender && macro?.id ? "true" : "false"};
+      // Which render drew this page (see renderGeneration). Travels with every
+      // save/delete so the host can look up what IT knew about currentId then;
+      // it is a key into the host's records, never a claim about the id.
+      var currentRenderGeneration = ${Number.isSafeInteger(renderGeneration) ? renderGeneration : 0};
       var KNOWN_PROFILE_IDS = ${profileIdsJson};
 
       var VALID_PATTERN = /^(alt\\+[a-z0-9]|alt\\+shift\\+[a-z0-9]|ctrl\\+shift\\+[a-z0-9])$/;
@@ -881,7 +883,7 @@ ${folderOptionsHtml}
           type: "save",
           index: currentIndex,
           id: currentId,
-          idAmbiguous: currentIdAmbiguous,
+          renderGeneration: currentRenderGeneration,
           name: name,
           text: text,
           secret: secret,
@@ -900,7 +902,7 @@ ${folderOptionsHtml}
       // Delete
       document.getElementById("delete-btn").addEventListener("click", function() {
         if (currentIndex === null) return;
-        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId, idAmbiguous: currentIdAmbiguous });
+        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId, renderGeneration: currentRenderGeneration });
       });
 
       // New

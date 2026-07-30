@@ -4245,9 +4245,10 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
       var dirty = false;
       var currentIndex = 0;
       var currentId = null;
-      // Provenance for currentId, fixed at render (see idAmbiguousAtRender).
-      // Travels with every save/delete; the host refuses anything but false.
-      var currentIdAmbiguous = false;
+      // Which render drew this page (see renderGeneration). Travels with every
+      // save/delete so the host can look up what IT knew about currentId then;
+      // it is a key into the host's records, never a claim about the id.
+      var currentRenderGeneration = 0;
       var KNOWN_PROFILE_IDS = ["abc12345-0000-0000-0000-000000000000"];
 
       var VALID_PATTERN = /^(alt\\+[a-z0-9]|alt\\+shift\\+[a-z0-9]|ctrl\\+shift\\+[a-z0-9])$/;
@@ -4813,7 +4814,7 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
           type: "save",
           index: currentIndex,
           id: currentId,
-          idAmbiguous: currentIdAmbiguous,
+          renderGeneration: currentRenderGeneration,
           name: name,
           text: text,
           secret: secret,
@@ -4832,7 +4833,7 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
       // Delete
       document.getElementById("delete-btn").addEventListener("click", function() {
         if (currentIndex === null) return;
-        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId, idAmbiguous: currentIdAmbiguous });
+        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId, renderGeneration: currentRenderGeneration });
       });
 
       // New

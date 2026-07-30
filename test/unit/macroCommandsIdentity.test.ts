@@ -983,9 +983,11 @@ describe("resolveMacroTarget (services/macroMutation.ts)", () => {
   });
 
   it("an unverified reference that also named a POSITION is honoured there or refused — never by id alone", () => {
-    // A foreign payload can say `{"id":"x","index":2}`, and it can equally say
-    // `idAmbiguous:false`; neither is proof of anything, so the leniency that lets a
-    // BARE id resolve cannot extend to a stale position. `[Other, First(x),
+    // A foreign payload can say `{"id":"x","index":2}`, and it can say anything at
+    // all beside it; nothing written into a `DataTransfer` is proof of provenance,
+    // which is why `parseMacroDragPayload` reads none of it and every payload
+    // arrives here as `"unverified"`. So the leniency that lets a BARE id resolve
+    // cannot extend to a stale position. `[Other, First(x),
     // Second(x)]` after a save: First keeps "x", Second is re-keyed. A payload
     // naming index 2 is then pointing at a macro that no longer carries the id it
     // named, and falling back to the unique holder moves First — the twin the user

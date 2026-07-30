@@ -281,9 +281,21 @@ export function resolveMacroTarget(macros: readonly TerminalMacro[], ref: MacroR
     return { kind: "ambiguous" };
   }
   if (ref.idWhenCaptured === "unverified" && index !== undefined) {
-    // Rule 2b. `index !== undefined` rather than `typeof index === "number"`:
-    // the point is that a position was CLAIMED and did not check out, and a
-    // claim made in a shape this module does not accept is not a better one.
+    // Rule 2b. Reaching here means rule 1 declined the position: it was out of
+    // range, not an integer, or the macro sitting there carries a different id.
+    // Either way a position was CLAIMED and did not check out.
+    //
+    // `index !== undefined` rather than `typeof index === "number"` only so this
+    // does not re-state rule 1's guard; it does not widen the rule to other
+    // shapes, and no such shape reaches it. `MacroRef.index` is typed `number |
+    // undefined`, and the one producer of an unverified reference
+    // (`parseMacroDragPayload`) keeps the field only when it already is a
+    // number. A foreign payload writing `{"id":"x","index":"2"}` therefore
+    // arrives as a BARE id and resolves by rule 3 — the sanctioned bare-id
+    // contract (nothing was claimed that this module could check), not a way
+    // around this rule. What `index !== undefined` does still cover is the
+    // numbers rule 1 rejects: `NaN`, a fraction, a negative or out-of-range
+    // position.
     return { kind: "ambiguous" };
   }
   const first = macros.findIndex((m) => m.id === id);

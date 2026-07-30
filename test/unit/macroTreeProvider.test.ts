@@ -733,15 +733,17 @@ describe("MacroTreeProvider drag and drop (§4.9)", () => {
     };
   }
 
-  it("handleDrag serializes the dragged macro's stable id, the row it was dragged from, and whether that id was shared at drag time", async () => {
+  it("handleDrag serializes the dragged macro's stable id, the row it was dragged from, and a key to the capture it kept", async () => {
     // The id is what survives a reorder between drag and drop; the index is the
     // only thing that can separate two macros sharing an id, and it is honoured
     // by `resolveMacroTarget` only while the macro at that position still
     // carries the dragged id. Never the index alone.
     //
-    // `idAmbiguous` is the third: a drop is a separate gesture, and any macro
-    // write in between re-keys duplicates, which would leave the drop looking at
-    // a unique id that names the twin the user did NOT drag.
+    // The third field is a KEY, not a fact: what was true about the id when the
+    // drag started stays in the provider (`lastDragCapture`), because a drop is a
+    // separate gesture and any macro write in between re-keys duplicates, which
+    // would leave the drop looking at a unique id that names the twin the user did
+    // NOT drag. A payload cannot carry that — see the sibling test below.
     await testStore.save([
       { id: "other-id", name: "Other", text: "t" },
       { id: "fixed-id", name: "M", text: "t" }
@@ -753,10 +755,20 @@ describe("MacroTreeProvider drag and drop (§4.9)", () => {
 
     const stored = dataTransfer.get(MACRO_DRAG_MIME) as { asString: () => Promise<string> } | undefined;
     expect(stored).toBeDefined();
-    expect(JSON.parse(await stored!.asString())).toEqual({ id: "fixed-id", index: 1, idAmbiguous: false });
+    expect(JSON.parse(await stored!.asString())).toEqual({
+      id: "fixed-id",
+      index: 1,
+      dragToken: expect.stringMatching(/^drag-\d+$/)
+    });
   });
 
-  it("handleDrag records a SHARED id as ambiguous, so the drop can refuse instead of guessing after a re-key", async () => {
+  it("the payload over a SHARED id is byte-identical in shape to one over a unique id — the witness is not in it", async () => {
+    // The reason `idAmbiguous` had to go. A boolean in this MIME is the same bytes
+    // whoever wrote it, so honouring `false` as "checked, and it was unique" handed
+    // that claim to every producer — including a stale one. Nothing here
+    // distinguishes an ambiguous drag from an unambiguous one; the difference lives
+    // in `lastDragCapture`, and the drop tests below are where it shows up.
+    //
     // `DuplicateIdMacroStore` because `InMemoryMacroStore.save()` re-keys
     // duplicates and so cannot hold the state under test.
     const dupStore = new DuplicateIdMacroStore([
@@ -766,49 +778,88 @@ describe("MacroTreeProvider drag and drop (§4.9)", () => {
     setActiveMacroStore(dupStore);
     const dupProvider = new MacroTreeProvider();
     const dragged = dupProvider.getChildren()[1] as MacroTreeItem;
+    expect(dragged.identityConflict).toBe(true);
     const dataTransfer = makeDataTransfer();
 
     await dupProvider.handleDrag([dragged], dataTransfer as unknown as vscode.DataTransfer);
 
     const stored = dataTransfer.get(MACRO_DRAG_MIME) as { asString: () => Promise<string> };
-    expect(JSON.parse(await stored.asString())).toEqual({ id: "x", index: 1, idAmbiguous: true });
+    const payload = JSON.parse(await stored.asString());
+    expect(payload).toEqual({ id: "x", index: 1, dragToken: expect.stringMatching(/^drag-\d+$/) });
+    expect(Object.keys(payload).sort()).toEqual(["dragToken", "id", "index"]);
   });
 
   it("handleDrag reports the ROW's render-time conflict, not a fresh count taken at drag time", async () => {
     // The two can disagree, and the row is the one that is right. The tree paints
     // `[First(x), Second(x)]` with both rows flagged; a save lands (anything at all)
     // and `assignUniqueMacroIds()` re-keys Second, so the array `handleDrag` reads
-    // is unambiguous. Deriving the flag from that array writes `idAmbiguous: false`
-    // into the payload and throws away the only witness — the drop then resolves
-    // "x" to First and moves the macro the user did not drag.
+    // is unambiguous. Capturing from THAT array throws away the only witness — the
+    // drop then resolves "x" to First and moves the macro the user did not drag.
     const dupStore = new DuplicateIdMacroStore([
       { id: "x", name: "First", text: "t" },
       { id: "x", name: "Second", text: "t" }
     ]);
     setActiveMacroStore(dupStore);
+    await dupStore.saveFolders(["Cisco"]);
     const dupProvider = new MacroTreeProvider();
-    const dragged = dupProvider.getChildren()[1] as MacroTreeItem; // painted over the conflict
-    expect(dragged.identityConflict).toBe(true);
+    const dragged = dupProvider.getChildren()[2] as MacroTreeItem; // folder, First, Second
+    expect(dragged.macro.name).toBe("Second");
+    expect(dragged.identityConflict).toBe(true); // painted over the conflict
 
     await dupStore.save(dupStore.getAll()); // the re-key, between paint and drag
     expect(dupStore.getAll().filter((m) => m.id === "x")).toHaveLength(1);
 
     const dataTransfer = makeDataTransfer();
     await dupProvider.handleDrag([dragged], dataTransfer as unknown as vscode.DataTransfer);
+    const folder = findFolder(dupProvider.getChildren(), "Cisco");
+    await dupProvider.handleDrop(folder, dataTransfer as unknown as vscode.DataTransfer);
 
-    const stored = dataTransfer.get(MACRO_DRAG_MIME) as { asString: () => Promise<string> };
-    expect(JSON.parse(await stored.asString())).toEqual({ id: "x", index: 1, idAmbiguous: true });
+    // Neither twin moves: the row's flag survives the re-key, so the drop refuses
+    // instead of resolving the now-unique "x" to First.
+    expect(dupStore.getAll().map((m) => m.group)).toEqual([undefined, undefined]);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+  });
+
+  it("a drop uses the capture for the id it was taken for, never for a different one", async () => {
+    // The token names a GESTURE. Applying that gesture's provenance to some other
+    // id would attach this view's word to a macro it never looked at — and would
+    // also drag the capture's INDEX along, which is what picks a target here:
+    // honouring the payload's own bare id moves Other, inheriting the capture moves
+    // the row that was actually dragged.
+    await testStore.save([
+      { id: "first", name: "First", text: "t" },
+      { id: "second", name: "Second", text: "t" },
+      { id: "other", name: "Other", text: "t" }
+    ]);
+    await testStore.saveFolders(["Cisco"]);
+    const dragged = provider.getChildren()[2] as MacroTreeItem; // folder, then macros
+    expect(dragged.macro.name).toBe("Second");
+    const dataTransfer = makeDataTransfer();
+    await provider.handleDrag([dragged], dataTransfer as unknown as vscode.DataTransfer);
+    const token = JSON.parse(
+      await (dataTransfer.get(MACRO_DRAG_MIME) as { asString: () => Promise<string> }).asString()
+    ).dragToken;
+
+    // Same (valid) token, different id, no position claimed.
+    const forged = makeDataTransfer({
+      [MACRO_DRAG_MIME]: new vscode.DataTransferItem(JSON.stringify({ id: "other", dragToken: token }))
+    });
+    const folder = findFolder(provider.getChildren(), "Cisco");
+    await provider.handleDrop(folder, forged as unknown as vscode.DataTransfer);
+
+    const after = testStore.getAll();
+    expect(after.find((m) => m.id === "other")?.group).toBe("Cisco");
+    expect(after.find((m) => m.id === "second")?.group).toBeUndefined();
   });
 
   it("a drop refuses a FOREIGN payload whose claimed position no longer holds its id", async () => {
-    // `{"id":"x","index":1}` with no `idAmbiguous` at all — a payload this view did
-    // not write (a bare id is still honoured; claiming a position is what changes
-    // the rules). It names the second twin. A save re-keys before the drop, leaving
-    // "x" with exactly one holder — First — and its stated position holding a macro
-    // with a different id. Resolving by that id moves First, which the user never
-    // touched. The payload also cannot buy its way out with `idAmbiguous: false`:
-    // that claim is checked against the live array, which is what the sibling drop
-    // tests cover.
+    // `{"id":"x","index":1}` from a producer this view is not holding a capture for
+    // (a bare id is still honoured; claiming a position is what changes the rules).
+    // It names the second twin. A save re-keys before the drop, leaving "x" with
+    // exactly one holder — First — and its stated position holding a macro with a
+    // different id. Resolving by that id moves First, which the user never touched.
+    // The sibling test below is the same payload with `idAmbiguous: false` added,
+    // which buys it nothing: no field in a payload sets provenance.
     const dupStore = new DuplicateIdMacroStore([
       { id: "x", name: "First", text: "t" },
       { id: "x", name: "Second", text: "t" }
@@ -826,6 +877,66 @@ describe("MacroTreeProvider drag and drop (§4.9)", () => {
 
     expect(dupStore.getAll().map((m) => m.group)).toEqual([undefined, undefined]);
     expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+  });
+
+  it("...and cannot buy its way out by asserting `idAmbiguous: false`", async () => {
+    // The same payload plus the one claim the previous design honoured. It reads as
+    // "checked at drag time, and it was unique", which is exactly what a stale or
+    // forged payload would say, and it converted the reference to `"unique"` —
+    // escaping rule 2b and falling back to the sole holder of "x". Observed
+    // outcome: First moved into Cisco, a macro this payload never named.
+    const dupStore = new DuplicateIdMacroStore([
+      { id: "x", name: "First", text: "t" },
+      { id: "x", name: "Second", text: "t" }
+    ]);
+    setActiveMacroStore(dupStore);
+    await dupStore.saveFolders(["Cisco"]);
+    const dupProvider = new MacroTreeProvider();
+    await dupStore.save(dupStore.getAll()); // the re-key
+    const folder = findFolder(dupProvider.getChildren(), "Cisco");
+    const dataTransfer = makeDataTransfer({
+      [MACRO_DRAG_MIME]: new vscode.DataTransferItem(
+        JSON.stringify({ id: "x", index: 1, idAmbiguous: false })
+      )
+    });
+
+    await dupProvider.handleDrop(folder, dataTransfer as unknown as vscode.DataTransfer);
+
+    expect(dupStore.getAll().map((m) => m.group)).toEqual([undefined, undefined]);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+  });
+
+  it("a drag captured after its macro was deleted never lands on a macro that later inherits the id", async () => {
+    // Rule 0's reason to exist, reached through a drag. The row is painted over
+    // `Original(x)`; `Original` is deleted before the gesture starts, so the capture
+    // is `"absent"` — checked, and NOTHING carried that id. A config import (or an
+    // undo) then hands "x" to a macro the user has never seen, and the drop's own
+    // fresh read cannot tell the impostor from the original: same id, same position.
+    //
+    // Serializing that capture as a boolean lost it — "absent" and "unique" both
+    // wrote `false` — so the drop resolved and MOVED the imported macro. Keeping the
+    // capture host-side keeps the distinction rule 0 was introduced for.
+    await testStore.save([{ id: "x", name: "Original", text: "t" }]);
+    await testStore.saveFolders(["Cisco"]);
+    const row = provider.getChildren()[1] as MacroTreeItem; // folder first, then the macro
+    expect(row.macro.name).toBe("Original");
+
+    await testStore.save([]); // deleted between paint and drag
+    const dataTransfer = makeDataTransfer();
+    await provider.handleDrag([row], dataTransfer as unknown as vscode.DataTransfer);
+
+    // The resurrection: a different macro arrives carrying the dragged id.
+    await testStore.save([{ id: "x", name: "Impostor", text: "t" }]);
+    const folder = findFolder(provider.getChildren(), "Cisco");
+
+    await provider.handleDrop(folder, dataTransfer as unknown as vscode.DataTransfer);
+
+    const after = testStore.getAll();
+    expect(after.map((m) => m.name)).toEqual(["Impostor"]);
+    expect(after[0].group).toBeUndefined();
+    // A reference that was already gone is "missing", not "unresolvable": there is
+    // nothing to tell the user to repair.
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 
   it("...while a foreign payload whose position still checks out is honoured", async () => {
