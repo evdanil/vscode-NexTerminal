@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { slotToBinding } from "../macroBindings";
 import { getAssignedBinding } from "../macroBindingHelpers";
+import { clamp } from "../utils/helpers";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 
 export interface MacroStoreChangeListener {
@@ -283,6 +284,38 @@ export function canonicalMacroBinding(macro: TerminalMacro): string {
   return getAssignedBinding(macro) ?? "";
 }
 
+/** `reload()`'s explicit-cooldown bounds — `clampSeconds(macro.triggerCooldown, DEFAULT, 0, 300)`. */
+const TRIGGER_COOLDOWN_MIN_SECONDS = 0;
+const TRIGGER_COOLDOWN_MAX_SECONDS = 300;
+
+/**
+ * A cooldown as `MacroAutoTrigger.reload()` resolves it. THREE outcomes, not two:
+ *
+ *   - absent or `null` → `null` here. `reload()` takes the `this.defaultCooldownMs` branch,
+ *     which comes from the `nexus.terminal.macros.defaultCooldown` SETTING.
+ *   - a finite number → the CLAMPED value. `reload()` applies `clampSeconds(v, DEFAULT, 0, 300)`,
+ *     so `300` and `301` (and `0` and `-5`) are one timing, not two. Keying the raw number let
+ *     two records the clamp flattens together survive as two macros with identical live rules —
+ *     for a `Password:` responder, the password sent twice per prompt.
+ *   - anything else present (a quoted number from a hand-edited settings.json, `NaN`,
+ *     `Infinity`, an object) → the fixed `"__DEFAULT__"`. `clampSeconds()` returns its
+ *     `DEFAULT_TRIGGER_COOLDOWN` fallback for all of them, so they are one macro too.
+ *
+ * The third state is kept apart from the first deliberately, and it is the same argument that
+ * keeps absent apart from an explicit `3`: absent follows a machine-local SETTING while a value
+ * the clamp rejects pins the shipped constant, so they coincide only while that setting is left
+ * alone. Collapsing them would make the key depend on a mutable setting and would DROP a macro
+ * the moment the user changed it. A string can never collide with the clamped-number branch:
+ * `JSON.stringify` writes `"__DEFAULT__"` and `300` differently.
+ */
+function canonicalMacroCooldown(value: unknown): unknown {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return clamp(value, TRIGGER_COOLDOWN_MIN_SECONDS, TRIGGER_COOLDOWN_MAX_SECONDS);
+  }
+  return "__DEFAULT__";
+}
+
 /**
  * The six auto-trigger fields, reduced to what `MacroAutoTrigger.reload()` can observe.
  *
@@ -293,15 +326,12 @@ export function canonicalMacroBinding(macro: TerminalMacro): string {
  * strips the whole group, so the two shapes must collapse or the same macro imports twice.
  *
  * Per-field, when there IS a pattern:
- *   - cooldown is kept VERBATIM (`?? null`), and this is the one default that is deliberately
- *     NOT collapsed. `reload()` reads `macro.triggerCooldown != null ? clamp(...) :
- *     this.defaultCooldownMs`, and `defaultCooldownMs` comes from the
- *     `nexus.terminal.macros.defaultCooldown` SETTING. So absent means "follow the configured
- *     default" and an explicit `3` means "pin to 3": identical only while that setting is left
- *     at its shipped value, and different the moment a user changes it. Collapsing them would
- *     make the key depend on a mutable machine-local setting and would DROP a pinned macro.
+ *   - cooldown goes through `canonicalMacroCooldown()` above: clamped exactly as `reload()`
+ *     clamps it, with absent (follow the configured default) kept apart from an explicit value.
  *   - interval mirrors `typeof x === "number" && x > 0 ? x * 1000 : undefined`, so `0`, a
- *     negative, a string and absent are all "no interval".
+ *     negative, a string and absent are all "no interval". NOT clamped, because `reload()` does
+ *     not clamp it either — `sanitizeImportedMacro()`'s 1..86400 window is an import-path
+ *     rule, and a legacy record outside it still runs at whatever it says.
  *   - start-paused mirrors `if (macro.triggerInitiallyDisabled)` — truthy, not `=== true`.
  *   - scope: absent is `"all-terminals"`. `evaluate()` tests only for `"active-session"` and
  *     `"profile"`; everything else, absent included, falls through to "every terminal". An
@@ -321,7 +351,7 @@ export function canonicalMacroTriggerTerms(macro: TerminalMacro): unknown[] {
   const scope = macro.triggerScope ?? "all-terminals";
   return [
     pattern,
-    macro.triggerCooldown ?? null,
+    canonicalMacroCooldown(macro.triggerCooldown),
     typeof macro.triggerInterval === "number" && macro.triggerInterval > 0 ? macro.triggerInterval : null,
     Boolean(macro.triggerInitiallyDisabled),
     scope,
@@ -343,21 +373,51 @@ export function canonicalMacroTriggerTerms(macro: TerminalMacro): unknown[] {
  * `default` there would make the two copies never match and re-absorb the macro on every single
  * activation.
  *
- * A non-array `variables` keys as `null` — distinct from an empty array, because
- * `withRedactedVariables()` DROPS a non-array while keeping an empty one, and from the trigger's
- * point of view (§6.1, `Array.isArray && length > 0`) they behave the same but persist
- * differently.
+ * NO DECLARATION AT ALL keys as `null`, and an EMPTY ARRAY is exactly that. An earlier revision
+ * kept `[]` distinct from absent on the grounds that they persist differently
+ * (`withRedactedVariables()` drops a non-array while keeping an empty one), but persistence is
+ * not the rule this file states — both runtime readers see one thing: §6.1's suppression is
+ * `Array.isArray && length > 0`, false for both, and `getValidMacroVariables()` returns `[]` for
+ * both. Separating them duplicated a macro across its own backup: absorption persists
+ * `variables: []` from settings.json verbatim, export writes it out unchanged, and
+ * `sanitizeImportedMacroVariables()` then DELETES it on the way back in while leaving the trigger
+ * alone (`hadDeclaration` is false for a zero-length array, so §6.2 does not strip) — so the same
+ * macro came back in a shape its own key no longer recognised, and the second copy carried a
+ * second live `Password:` rule. A non-array keys as `null` for the same reason it always did,
+ * and the redaction boundary is symmetric for both shapes, so `keyOfLegacy()` cannot desync.
+ *
+ * `label` reports the STRING or `null` for anything else — absent and `""` are NOT the same
+ * prompt. `promptForValues()` sets `box.prompt = variable.label ?? variable.name`, so an absent
+ * label asks for "host" and an empty one asks for nothing; collapsing them dropped the second of
+ * two otherwise-identical legacy records in `keyOfLegacy()`, before absorption cleared the
+ * setting that held the only copy. Non-string values fold in with absent because
+ * `toValidMacroVariable()` discards them, and `default` folds a non-string in with `""` for the
+ * same reason (its prefill is `… ?? variable.default ?? ""`, so absent and `""` genuinely are
+ * one state there). Neither shape reaches here from the editor or an import — both drop an empty
+ * label — which is why legacy absorption is the only path that can see one.
+ *
+ * NOT collapsed, deliberately: a declared variable the macro's TEXT never references. The prompt
+ * path reads nothing about it (`resolveMacroText()` scans the text for uses, finds none, and
+ * sends the text as-is), so by the rule at the top of this section the two records ought to key
+ * as one — and they do not. The declaration is real user data that goes live again the moment
+ * the TEXT gains `$host`, with no edit to the variables array at all, so collapsing would delete
+ * whichever record the user listed second on the strength of a relationship a single character
+ * elsewhere restores. The exception is bounded in the only way that matters: every macro this
+ * term can separate has a non-empty `variables` array, and §6.1 suppresses the auto-trigger of
+ * every such macro — so an extra copy here can never be an extra live rule, which is the harm
+ * the collapses above exist to prevent. An invalid variable NAME (`2bad`) is kept verbatim on
+ * the same grounds.
  */
 export function canonicalMacroVariableTerms(macro: TerminalMacro): unknown {
-  if (!Array.isArray(macro.variables)) return null;
+  if (!Array.isArray(macro.variables) || macro.variables.length === 0) return null;
   return macro.variables.map((v: MacroVariable | null | undefined) => {
     if (!v || typeof v !== "object") return null;
     const secret = v.secret === true;
     return [
       v.name ?? "",
-      v.label ?? "",
+      typeof v.label === "string" ? v.label : null,
       secret,
-      secret ? "" : (v.default ?? ""),
+      secret ? "" : (typeof v.default === "string" ? v.default : ""),
       secret ? false : v.remember === false
     ];
   });

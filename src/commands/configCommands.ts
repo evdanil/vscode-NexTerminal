@@ -810,7 +810,11 @@ function sanitizeImportedMacroVariables(macro: TerminalMacro): boolean {
 
 function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
   const macro: TerminalMacro = { ...raw };
-  if (typeof macro.keybinding === "string" && !isValidBinding(macro.keybinding)) {
+  // A non-string keybinding is dropped for the same reason a malformed string one is: it is
+  // not a binding. `normalizeBinding()` already refuses to resolve it, so this changes nothing
+  // the app applies — it keeps an unusable value out of globalState, where it would sit in a
+  // field the editor renders as empty and no consumer can act on.
+  if (macro.keybinding !== undefined && (typeof macro.keybinding !== "string" || !isValidBinding(macro.keybinding))) {
     delete macro.keybinding;
   }
 

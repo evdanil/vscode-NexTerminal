@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
+import { getAssignedBinding } from "../../src/macroBindingHelpers";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
 // `workspace.fs` is part of this mock because `VscodeMacroStore` writes one marker FILE per
@@ -535,6 +536,156 @@ describe("MacroStore legacy migration", () => {
     expect(pick("Sep").map((m) => m.text).sort()).toEqual(["x", "x|p"]);
   });
 
+  it("a legacy variable's ABSENT label and an EMPTY one are two different prompts, and the absorb keeps both", async () => {
+    // `promptForValues()` sets `box.prompt = variable.label ?? variable.name`, so an absent
+    // label asks for "host" and an empty one asks for nothing at all. Keying both as `""`
+    // collapsed them — and this dedupe runs BEFORE `absorbLegacySettingsIfPresent()` clears
+    // `nexus.terminal.macros` from every scope, so the loser was not merged into anything, it
+    // was deleted from the only place it existed. The one-way direction is what makes this
+    // worse than the duplicate direction: nothing the user can do afterwards brings it back.
+    //
+    // Neither shape can be produced by the macro editor or by an import (both drop an empty
+    // label — macroEditorPanel.ts and `sanitizeImportedMacroVariables()`), which is exactly why
+    // legacy absorption is where it has to be handled: a hand-written settings.json is the only
+    // thing that makes one, and absorption is the only path that reads it.
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    vscode.__setConfig("nexus.terminal", {
+      global: [
+        { name: "Ping", text: "ping $host\n", variables: [{ name: "host" }] },
+        { name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "" }] }
+      ] as TerminalMacro[]
+    });
+    const { ctx } = makeCtx();
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    const all = store.getAll();
+    expect(all).toHaveLength(2);
+    expect(all.map((m) => m.variables?.[0].label ?? "<absent>").sort()).toEqual(["", "<absent>"]);
+  });
+
+  it("legacy cooldowns the trigger compiler cannot tell apart are absorbed once — and the ones it can are not", async () => {
+    // `reload()` reads an explicit cooldown as `clampSeconds(value, DEFAULT, 0, 300)`, so the
+    // key has to name the CLAMPED value rather than the number on disk. Two records the clamp
+    // flattens together are one macro at runtime: absorbing both leaves two live rules with
+    // identical timing, and for a `Password:` responder that is the password sent twice per
+    // prompt — the same double-send this canonicalization exists to stop, arriving through the
+    // one field that was still keyed verbatim.
+    //
+    // The clamp has THREE outcomes, not two, and the fixture pins all of them.
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    vscode.__setConfig("nexus.terminal", {
+      global: [
+        // Above the ceiling: both run at 300s.
+        { name: "Poll", text: "show status\n", triggerPattern: "#", triggerCooldown: 300 },
+        { name: "Poll", text: "show status\n", triggerPattern: "#", triggerCooldown: 301 },
+        // Below the floor: both run at 0s.
+        { name: "Floor", text: "f\n", triggerPattern: "more:", triggerCooldown: 0 },
+        { name: "Floor", text: "f\n", triggerPattern: "more:", triggerCooldown: -5 },
+        // Not a number at all: `clampSeconds()` hands both the shipped fallback, so a
+        // hand-edited settings.json that quoted its cooldowns produces one macro, not two.
+        { name: "Ack", text: "y\n", triggerPattern: "confirm:", triggerCooldown: "5" },
+        { name: "Ack", text: "y\n", triggerPattern: "confirm:", triggerCooldown: "30" },
+        // INSIDE the clamp two cooldowns are two macros — the collapse above must not widen
+        // into this, which is the direction that silently deletes a record.
+        { name: "Keep", text: "k\n", triggerPattern: ">", triggerCooldown: 5 },
+        { name: "Keep", text: "k\n", triggerPattern: ">", triggerCooldown: 30 },
+        // Absent is not the same as unusable: absent follows the `defaultCooldown` SETTING,
+        // an unusable value pins the shipped constant, and the two part company the moment the
+        // user changes that setting.
+        { name: "Dflt", text: "d\n", triggerPattern: "confirm" },
+        { name: "Dflt", text: "d\n", triggerPattern: "confirm", triggerCooldown: "nope" }
+      ] as unknown as TerminalMacro[]
+    });
+    const { ctx } = makeCtx();
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    const all = store.getAll();
+    const pick = (name: string) => all.filter((m) => m.name === name);
+    expect(all).toHaveLength(7);
+    // First occurrence wins, so the survivor is the one the user listed first.
+    expect(pick("Poll").map((m) => m.triggerCooldown)).toEqual([300]);
+    expect(pick("Floor").map((m) => m.triggerCooldown)).toEqual([0]);
+    expect(pick("Ack").map((m) => m.triggerCooldown)).toEqual(["5"]);
+    expect(pick("Keep").map((m) => m.triggerCooldown).sort()).toEqual([30, 5]);
+    expect(pick("Dflt").map((m) => m.triggerCooldown ?? "<absent>").sort()).toEqual(["<absent>", "nope"]);
+  });
+
+  it("legacy records neither the trigger compiler nor the prompt path can tell apart are absorbed once", async () => {
+    // `variables: []` versus no `variables` key. Both runtime readers treat them identically —
+    // §6.1's suppression is `Array.isArray && length > 0` and `getValidMacroVariables()` returns
+    // `[]` for either — so keying them apart absorbs the same macro twice, and because neither
+    // is suppressed BOTH copies compile a live `Password:` rule. `withRedactedVariables()` keeps
+    // an empty array verbatim, so the empty shape is what lands on disk and the next activation
+    // has to recognise the settings.json copy in it.
+    //
+    // An explicit `triggerScope: "all-terminals"` beside an absent one is the same collapse one
+    // field over: `evaluate()` only ever tests for "active-session" and "profile".
+    //
+    // A `default` that is not a string is the third: `toValidMacroVariable()` discards it, so the
+    // prompt prefills the same empty box it would with no default at all. It survives the
+    // redaction boundary (only a MASKED variable's default is stripped), so both sides of the
+    // comparison see it and the collapse cannot desync.
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    const settings = [
+      { name: "Enable", text: "enable\n", triggerPattern: "Password:", variables: [] },
+      { name: "Enable", text: "enable\n", triggerPattern: "Password:" },
+      { name: "Scope", text: "s\n", triggerPattern: "confirm:", triggerScope: "all-terminals" },
+      { name: "Scope", text: "s\n", triggerPattern: "confirm:" },
+      { name: "Ssh", text: "ssh $user\n", variables: [{ name: "user", default: 5 }] },
+      { name: "Ssh", text: "ssh $user\n", variables: [{ name: "user" }] }
+    ] as unknown as TerminalMacro[];
+    vscode.__setConfig("nexus.terminal", { global: settings });
+    const { ctx, state } = makeCtx();
+    let store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    expect(store.getAll().map((m) => m.name)).toEqual(["Enable", "Scope", "Ssh"]);
+    // The empty array is what crossed the boundary, so the next activation compares the
+    // settings.json shape against THAT.
+    expect((state.get("nexus.macros") as TerminalMacro[])[0].variables).toEqual([]);
+    // ...and so is the unusable default, which is what makes the collapse symmetric.
+    expect((state.get("nexus.macros") as TerminalMacro[])[2].variables).toEqual([{ name: "user", default: 5 }]);
+
+    vscode.__setConfig("nexus.terminal", { global: settings });
+    store = new VscodeMacroStore(ctx);
+    await store.initialize();
+    expect(store.getAll().map((m) => m.name)).toEqual(["Enable", "Scope", "Ssh"]);
+    expect(store.getLastAbsorbedCount()).toBe(0);
+  });
+
+  it("a legacy macro whose `keybinding` is not a string does not take activation down with it", async () => {
+    // `keybinding: 1` is a plausible hand-edit — the slot number written into the field that
+    // superseded it. Nothing on this path type-checks it: the non-object filter in
+    // `absorbLegacySettingsIfPresent()` waves a well-formed object straight through, and
+    // `keyOfLegacy()` then asks `getAssignedBinding()` for the record's effective binding.
+    // With `normalizeBinding()` calling `.trim()` on whatever it was handed, that threw a
+    // TypeError out of `initialize()` — which `extension.ts` awaits uncaught, so activation
+    // failed outright. And it never self-healed: the throw happens before
+    // `nexus.terminal.macros` is cleared, so the same record was still there on the next
+    // start, and on every start after that.
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    const settings = [{ name: "Bounce", text: "bounce\n", keybinding: 1 }] as unknown as TerminalMacro[];
+    vscode.__setConfig("nexus.terminal", { global: settings });
+    const { ctx } = makeCtx();
+    let store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    expect(store.getAll().map((m) => m.name)).toEqual(["Bounce"]);
+    // An unusable value binds nothing, exactly as it does everywhere else that asks for the
+    // effective binding — there is no slot here to fall back to.
+    expect(getAssignedBinding(store.getAll()[0])).toBeUndefined();
+
+    // ...and the record keys the same on both sides of the redaction boundary, so a Settings
+    // Sync replay of the same value absorbs nothing further.
+    vscode.__setConfig("nexus.terminal", { global: settings });
+    store = new VscodeMacroStore(ctx);
+    await store.initialize();
+    expect(store.getAll().map((m) => m.name)).toEqual(["Bounce"]);
+    expect(store.getLastAbsorbedCount()).toBe(0);
+  });
+
   it("re-absorbing the identical settings does not multiply a macro across the redaction boundary", async () => {
     // The no-multiplication property, and the reason the widened key still cannot name
     // everything. The absorb runs on EVERY activation and Settings Sync can replay the cleared
@@ -556,6 +707,11 @@ describe("MacroStore legacy migration", () => {
         slot: 1,
         triggerPattern: "Password:",
         triggerCooldown: 5,
+        // Present so that "a full trigger configuration" really is full: without it an
+        // implementation that mishandled the interval term ONLY across this boundary — the
+        // one place the two sides of the comparison are not the same object — would still
+        // pass, and would re-absorb this macro on every activation.
+        triggerInterval: 60,
         triggerScope: "profile",
         triggerProfileId: "prod-1",
         triggerInitiallyDisabled: true

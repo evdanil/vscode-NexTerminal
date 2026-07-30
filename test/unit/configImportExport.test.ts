@@ -1805,11 +1805,26 @@ describe("backup import", () => {
         // remembered.
         { id: "vl1", name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "Target host" }] },
         { id: "vl2", name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "Jump host" }] },
-        // The variable NAME itself, which nothing exercised: a declaration the text does not
-        // reference still prompts, and the name is what the prompt is titled with when no
-        // label is given. Two macros asking for different things are two macros.
-        { id: "vn1", name: "Connect", text: "connect\n", variables: [{ name: "host" }] },
-        { id: "vn2", name: "Connect", text: "connect\n", variables: [{ name: "target" }] },
+        // The variable NAME itself, which nothing exercised. The two records here carry the
+        // SAME text, referencing BOTH names, so the declared name is what decides which
+        // placeholder is prompted for and substituted and which is left standing on the wire
+        // (`resolveMacroText()` → `scanPlaceholders()`, macroVariablePrompt.ts). Two macros
+        // asking for different things are two macros.
+        { id: "vn1", name: "Connect", text: "connect ${host} ${target}\n", variables: [{ name: "host" }] },
+        { id: "vn2", name: "Connect", text: "connect ${host} ${target}\n", variables: [{ name: "target" }] },
+        // The same field again, on a text that references NEITHER name — a declaration the
+        // prompt path never reads. `resolveMacroText()` scans no use of either, prompts for
+        // nothing, and sends `connect\n` for both, so these two ARE runtime-identical today and
+        // the key separates them anyway. That is a deliberate exception to the rule the rest of
+        // this fixture pins, and it is argued where the collapse would have to be written —
+        // `canonicalMacroVariableTerms()` in storage/macroStore.ts. In short: the declaration is
+        // real user data that goes live again the moment the TEXT gains `$host`, no edit to the
+        // variables array required, and collapsing costs whichever of the two the user listed
+        // second — permanently, on the legacy path, since absorption clears the setting it read.
+        // A duplicate here cannot double-send: §6.1 suppresses the auto-trigger of any macro
+        // whose `variables` is a non-empty array, which is every macro this term can separate.
+        { id: "vu1", name: "Deploy", text: "deploy\n", variables: [{ name: "host" }] },
+        { id: "vu2", name: "Deploy", text: "deploy\n", variables: [{ name: "target" }] },
         { id: "vd1", name: "Ssh", text: "ssh $user\n", variables: [{ name: "user" }] },
         { id: "vd2", name: "Ssh", text: "ssh $user\n", variables: [{ name: "user", default: "admin" }] },
         { id: "vs1", name: "Login", text: "login $pw\n", variables: [{ name: "pw" }] },
@@ -1834,7 +1849,7 @@ describe("backup import", () => {
     await runBackupImport(file, "merge");
 
     const macros = getMacros();
-    expect(macros).toHaveLength(28);
+    expect(macros).toHaveLength(30);
     // Both halves of every pair landed, and are distinguishable by the field they differ in.
     const pick = (name: string) => macros.filter((m) => m.name === name);
     expect(pick("Enable").map((m) => m.triggerScope).sort()).toEqual(["active-session", "all-terminals"]);
@@ -1844,6 +1859,7 @@ describe("backup import", () => {
     expect(pick("Reload").map((m) => m.triggerInitiallyDisabled === true).sort()).toEqual([false, true]);
     expect(pick("Ping").map((m) => m.variables?.[0].label).sort()).toEqual(["Jump host", "Target host"]);
     expect(pick("Connect").map((m) => m.variables?.[0].name).sort()).toEqual(["host", "target"]);
+    expect(pick("Deploy").map((m) => m.variables?.[0].name).sort()).toEqual(["host", "target"]);
     expect(pick("Ssh").map((m) => m.variables?.[0].default ?? "").sort()).toEqual(["", "admin"]);
     expect(pick("Login").map((m) => m.variables?.[0].secret === true).sort()).toEqual([false, true]);
     expect(pick("Trace").map((m) => m.variables?.[0].remember === false).sort()).toEqual([false, true]);
@@ -1861,6 +1877,84 @@ describe("backup import", () => {
     const before = getMacros().map((m) => m.id).sort();
     await runBackupImport(file, "merge");
     expect(getMacros().map((m) => m.id).sort()).toEqual(before);
+  });
+
+  it("a macro whose `keybinding` is not a string does not break the import — on either side of the content key", async () => {
+    // The content key asks `getAssignedBinding()` for the binding the app actually applies, and
+    // that call is made for EVERY record on both sides of the comparison: the local set
+    // (`existing.map(keyOf)`) and each incoming one. A `keybinding: 1` — the slot number written
+    // into the field that superseded it — threw a TypeError out of `normalizeBinding()`, so a
+    // single such record anywhere in either set aborted the whole import: no macros, no servers
+    // past that point, and an error the user cannot act on. The local set is the reachable half,
+    // because legacy absorption persists settings.json records verbatim.
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    await store.save([{ name: "Local", text: "local\n", keybinding: 1 } as unknown as TerminalMacro]);
+    setActiveMacroStore(store);
+
+    await runBackupImport(
+      {
+        version: 2,
+        exportType: "backup",
+        exportedAt: new Date().toISOString(),
+        servers: [],
+        tunnels: [],
+        serialProfiles: [],
+        macros: [{ id: "f1", name: "Fromfile", text: "file\n", keybinding: 2 }],
+        settings: {}
+      },
+      "merge"
+    );
+
+    const macros = getMacros();
+    expect(macros.map((m) => m.name).sort()).toEqual(["Fromfile", "Local"]);
+    // Neither record binds anything: an unusable value is not a binding, and the imported one
+    // does not keep it either — `sanitizeImportedMacro()` drops a keybinding it cannot validate,
+    // the same as it does for a malformed string.
+    expect(macros.map((m) => getAssignedBinding(m))).toEqual([undefined, undefined]);
+    expect(macros.find((m) => m.name === "Fromfile")!.keybinding).toBeUndefined();
+  });
+
+  it("a macro carrying `variables: []` merges back from its own backup as ONE macro", async () => {
+    // The round trip that the empty array used to break, end to end. `variables: []` reaches the
+    // store from a hand-written `nexus.terminal.macros` (absorption persists it verbatim —
+    // `withRedactedVariables()` drops only a NON-array), export writes it out unchanged, and
+    // `sanitizeImportedMacroVariables()` then DELETES it on the way back in while leaving the
+    // trigger alone (`hadDeclaration` is false for a zero-length array, so §6.2 does not strip).
+    // So the same macro exists in two shapes that no runtime reader can tell apart — §6.1 is
+    // `Array.isArray && length > 0` and `getValidMacroVariables()` returns `[]` for both — and
+    // keying them apart put a second copy in the store with its own id and its own live
+    // `Password:` rule. Two rules, one prompt, the password sent twice.
+    //
+    // The ids differ here because that is what makes the CONTENT key the only thing left: the
+    // backup came from another machine (or from before a replace-mode restore freshened every
+    // id), while this machine absorbed the same synced settings.json under an id of its own.
+    const exportStore = new InMemoryMacroStore();
+    await exportStore.initialize();
+    await exportStore.save([
+      { id: "machine-a-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", variables: [] }
+    ]);
+    setActiveMacroStore(exportStore);
+
+    mockShowInputBox.mockResolvedValue("testpass123");
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup-empty-vars.json", scheme: "file" });
+    mockWriteFile.mockResolvedValue(undefined);
+    await registeredCommands.get("nexus.config.export.backup")!();
+
+    const written = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+    // The boundary really is crossed: the file carries the empty array, not an absent key.
+    expect(written.macros[0].variables).toEqual([]);
+
+    const localStore = new InMemoryMacroStore();
+    await localStore.initialize();
+    await localStore.save([
+      { id: "machine-b-1", name: "Enable", text: "enable\n", triggerPattern: "Password:", variables: [] }
+    ]);
+    setActiveMacroStore(localStore);
+
+    await runBackupImport(written, "merge");
+    expect(localStore.getAll()).toHaveLength(1);
+    expect(localStore.getAll()[0].id).toBe("machine-b-1");
   });
 
   it("merge does not drop a secret macro whose decrypted text happens to equal a plain macro's", async () => {
@@ -2460,6 +2554,40 @@ describe("share import", () => {
     const macros = shareImportStore.getAll();
     expect(macros.map(m => m.name)).toContain("hello");
     expect(macros.find(m => m.name === "hello")?.text).toBe("hi");
+  });
+
+  it("share import survives a local macro whose `keybinding` is not a string", async () => {
+    // The share path builds the same content key over the same two sides as merge does
+    // (`existing.map(keyOf)`, then `keyOf()` per incoming record), so the third and last place
+    // a non-string binding used to throw is here. The local record is the reachable half:
+    // legacy absorption persists a hand-written `nexus.terminal.macros` verbatim, and nothing
+    // between there and here type-checks the field.
+    const shareImportStore = new InMemoryMacroStore();
+    await shareImportStore.initialize();
+    await shareImportStore.save([{ name: "Local", text: "local\n", keybinding: 1 } as unknown as TerminalMacro]);
+    setActiveMacroStore(shareImportStore);
+
+    const shareData = {
+      version: 2,
+      exportType: "share",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [{ name: "Shared", text: "shared\n", keybinding: 2 }],
+      settings: {}
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-binding.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(shareData), "utf8"));
+
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const macros = shareImportStore.getAll();
+    expect(macros.map((m) => m.name).sort()).toEqual(["Local", "Shared"]);
+    expect(macros.map((m) => getAssignedBinding(m))).toEqual([undefined, undefined]);
+    expect(macros.find((m) => m.name === "Shared")!.keybinding).toBeUndefined();
   });
 
   it("share import sanitizes variables — a masked variable's plaintext default never reaches the store", async () => {
