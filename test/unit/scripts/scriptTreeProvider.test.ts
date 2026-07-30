@@ -176,6 +176,18 @@ describe("ScriptTreeProvider", () => {
     (vscode.workspace.fs as unknown as { readDirectory: (u: { fsPath: string }) => Promise<Array<[string, number]>> }).readDirectory = vi.fn(
       async (uri: { fsPath: string }) => mockFsEntries.get(uri.fsPath) ?? []
     );
+    // …and readFile, for the same reason. Without this, the Fix 5 test's stub
+    // (which pins ONE path to a promise it controls and rejects for anything it
+    // has no content for) stayed installed for every test after it: a later test
+    // seeding that same path got the earlier test's content instead of its own,
+    // and which tests those are depends purely on declaration order.
+    (vscode.workspace.fs as unknown as { readFile: (u: { fsPath: string }) => Promise<Uint8Array> }).readFile = vi.fn(
+      async (uri: { fsPath: string }) => {
+        const content = mockFiles.get(uri.fsPath);
+        if (content === undefined) throw new Error(`ENOENT: ${uri.fsPath}`);
+        return new TextEncoder().encode(content);
+      }
+    );
   });
 
   it("lists .js files whose leading JSDoc contains @nexus-script", async () => {
@@ -889,11 +901,21 @@ describe("ScriptTreeProvider", () => {
       }
       expect(result?.map((n) => n.kind)).toEqual(["scanning"]);
 
-      // A repaint is scheduled without any user action. Wait past the debounce
-      // and confirm the view was told to re-ask (refresh() fires the same
-      // event, so count only what arrives after the storm ends).
+      // A repaint is scheduled without any user action. Confirm the view was
+      // told to re-ask (refresh() fires the same event, so count only what
+      // arrives after the storm ends).
+      //
+      // POLL, rather than sleep a fixed 400ms and assert once. The repaint runs
+      // on a REAL 300ms timer, so a fixed deadline 100ms past it fails whenever
+      // this worker is stalled longer than that — which a full-suite run on a
+      // loaded machine does routinely, and which has nothing to do with what is
+      // under test. The assertion itself is unchanged and just as strict: a
+      // repaint MUST arrive with no user action. Only the patience is.
       const before = repaints.length;
-      await new Promise<void>((resolve) => { setTimeout(resolve, 400); });
+      const deadline = Date.now() + 5000;
+      while (repaints.length === before && Date.now() < deadline) {
+        await new Promise<void>((resolve) => { setTimeout(resolve, 25); });
+      }
       expect(repaints.length).toBeGreaterThan(before);
 
       // ...and re-asking now that generations have settled yields the real

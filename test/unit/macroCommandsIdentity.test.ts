@@ -83,6 +83,12 @@ vi.mock("../../src/commands/macroVariablePrompt", () => ({
 }));
 
 import { registerMacroCommands } from "../../src/commands/macroCommands";
+import {
+  captureMacroRef,
+  captureMacroRefFromRow,
+  resolveMacroTarget
+} from "../../src/services/macroMutation";
+import { assignUniqueMacroIds } from "../../src/storage/macroStore";
 import { MacroEditorPanel } from "../../src/ui/macroEditorPanel";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { DuplicateIdMacroStore } from "../helpers/duplicateIdMacroStore";
@@ -477,6 +483,28 @@ describe("macro commands resolve their target by identity across every dialog aw
       expect(MacroEditorPanel.open).toHaveBeenCalledWith(0);
     });
 
+    it("Edit Macro on a row whose macro is GONE opens nothing and says so — it must not reveal whatever the editor already had", async () => {
+      // This used to call `MacroEditorPanel.open(undefined)`, described in the
+      // adjacent comment as "opens the editor with no selection". That is only
+      // true of a panel that does not exist yet: `open()` with no index REVEALS
+      // an already-open panel and leaves its selection untouched
+      // (macroEditorPanel.ts). So a stale row for a deleted macro brought
+      // whatever the user last had open to the front — a different macro
+      // entirely, pre-filled and one Save away, with nothing saying why.
+      await store.save([
+        { name: "A", text: "a" },
+        { name: "B", text: "b" }
+      ]);
+      const staleItem = macroArg(0);
+      const survivor = getMacros()[1];
+      await store.save([survivor]); // A is gone; index 0 now names B
+
+      await registeredCommands.get("nexus.macro.edit")!(staleItem);
+
+      expect(MacroEditorPanel.open).not.toHaveBeenCalled();
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining('"A"'));
+    });
+
     it("moveUp still swaps normally when the row is fresh — the guard must not turn reordering into a no-op", async () => {
       await store.save([
         { name: "A", text: "a" },
@@ -611,5 +639,270 @@ describe("macro commands resolve their target by identity across every dialog aw
       expect(dupStore.getAll().map((m) => m.name)).toEqual(["login", "reboot", "Other"]);
       expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
     });
+  });
+
+  /**
+   * The interleaving every one of these drives, and the reason a reference has
+   * to remember what it knew:
+   *
+   *   stored  [Unrelated(u), login(x), reboot(x)]
+   *   click   reboot — id "x", row 2
+   *   dialog  ANY save lands (here: a rename of Unrelated, the most innocuous
+   *           write there is). `MacroStore.save()` runs `assignUniqueMacroIds()`,
+   *           which lets the FIRST holder of "x" keep it and hands "reboot" a
+   *           fresh id.
+   *   store   [Unrelated'(u), login(x), reboot(new-id)]
+   *   write   row 2 no longer carries "x" — and "x" now has exactly ONE holder.
+   *
+   * At that last step the array is indistinguishable from an ordinary stale
+   * index over a unique id, which every command is REQUIRED to resolve by
+   * falling back to the id. The difference is entirely in the past: this id was
+   * shared when the user pointed at it. So the reference carries that
+   * (`MacroIdProvenance`), and a reference taken over a shared id is honoured
+   * only by an exact row-and-id match — never by the id alone.
+   *
+   * Without it, every command below quietly writes to "login": deletes it,
+   * rebinds it, pastes another macro's clipboard password into it, moves it.
+   */
+  describe("an id that was shared WHEN THE REFERENCE WAS TAKEN is never resolved by id alone", () => {
+    function seedThree(extra: Partial<TerminalMacro> = {}): DuplicateIdMacroStore {
+      const dupStore = new DuplicateIdMacroStore([
+        { id: "u", name: "Unrelated", text: "u" },
+        { id: "x", name: "login", text: "login\n", ...extra },
+        { id: "x", name: "reboot", text: "reboot\n", ...extra }
+      ]);
+      setActiveMacroStore(dupStore);
+      return dupStore;
+    }
+
+    /** The unrelated, id-preserving write that nevertheless re-keys the twins. */
+    async function renameUnrelated(dupStore: DuplicateIdMacroStore): Promise<void> {
+      const latest = dupStore.getAll();
+      await dupStore.save([{ ...latest[0], name: "Unrelated (edited)" }, latest[1], latest[2]]);
+    }
+
+    it("remove refuses instead of deleting the other twin", async () => {
+      const dupStore = seedThree();
+      const item = { macro: dupStore.getAll()[2], index: 2 };
+      mockShowWarningMessage.mockImplementation(async (message: string) => {
+        if (!message.startsWith("Remove macro")) return undefined;
+        await renameUnrelated(dupStore);
+        return "Remove";
+      });
+
+      await registeredCommands.get("nexus.macro.remove")!(item);
+
+      // The confirmation named "reboot"; "login" must survive it.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining('"reboot"'),
+        expect.anything(),
+        "Remove"
+      );
+      expect(dupStore.getAll().map((m) => m.name)).toEqual(["Unrelated (edited)", "login", "reboot"]);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+    });
+
+    it("assignSlot refuses instead of rebinding the other twin", async () => {
+      const dupStore = seedThree();
+      const item = { macro: dupStore.getAll()[2], index: 2 };
+      mockShowInputBox.mockImplementation(async () => {
+        await renameUnrelated(dupStore);
+        return "alt+7";
+      });
+
+      await registeredCommands.get("nexus.macro.assignSlot")!(item);
+
+      expect(dupStore.getAll().map((m) => m.keybinding)).toEqual([undefined, undefined, undefined]);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+    });
+
+    it("pasteSecret refuses instead of overwriting the other twin's stored password", async () => {
+      // The worst of the four: the reference used to be built at the WRITE site,
+      // from an array read after the prompt — by which point the re-key had
+      // already happened and its provenance said "unique". Capturing at the top
+      // of the handler is half of what makes this pass; the other half is the
+      // resolver refusing to fall back.
+      const dupStore = seedThree({ secret: true });
+      const item = { macro: dupStore.getAll()[2], index: 2 };
+      mockClipboardReadText.mockResolvedValue("hunter2"); // no trailing \n → the prompt fires
+      mockShowInformationMessage.mockImplementation(async (message: string) => {
+        if (!message.startsWith("Append newline")) return undefined;
+        await renameUnrelated(dupStore);
+        return "No";
+      });
+
+      await registeredCommands.get("nexus.macro.pasteSecret")!(item);
+
+      expect(dupStore.getAll().map((m) => m.text)).toEqual(["u", "login\n", "reboot\n"]);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+    });
+
+    it("moveToFolder refuses instead of moving the other twin", async () => {
+      const dupStore = seedThree();
+      const item = { macro: dupStore.getAll()[2], index: 2 };
+      mockShowQuickPick.mockImplementation(async (items: Array<{ label: string }>) =>
+        items.find((i) => i.label === "$(new-folder) New folder…")
+      );
+      mockShowInputBox.mockImplementation(async () => {
+        await renameUnrelated(dupStore);
+        return "Cisco";
+      });
+
+      await registeredCommands.get("nexus.macro.moveToFolder")!(item);
+
+      expect(dupStore.getAll().map((m) => m.group)).toEqual([undefined, undefined, undefined]);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+    });
+
+    it("moveToFolder over a multi-select moves what it can still identify and REPORTS the twin it cannot", async () => {
+      // Both twins selected from the palette. The re-key during the folder
+      // prompt leaves the first one exactly where its reference says it is (it
+      // keeps the shared id, so row-and-id still match) and the second one
+      // unidentifiable. Moving one and saying nothing about the other is the
+      // silent-skip this reports instead: the user asked for two macros to move
+      // and would otherwise have to notice for themselves that one did not.
+      const dupStore = seedThree();
+      mockShowQuickPick.mockImplementation(
+        async (items: Array<{ label: string }>, options?: { canPickMany?: boolean }) =>
+          options?.canPickMany
+            ? items.filter((i) => i.label === "login" || i.label === "reboot")
+            : items.find((i) => i.label === "$(new-folder) New folder…")
+      );
+      mockShowInputBox.mockImplementation(async () => {
+        await renameUnrelated(dupStore);
+        return "Cisco";
+      });
+
+      await registeredCommands.get("nexus.macro.moveToFolder")!();
+
+      expect(dupStore.getAll().map((m) => [m.name, m.group])).toEqual([
+        ["Unrelated (edited)", undefined],
+        ["login", "Cisco"],
+        ["reboot", undefined]
+      ]);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+    });
+
+    it("moveUp refuses on a row DRAWN over the conflict, even though the list looks unambiguous by the time it is clicked", async () => {
+      // No dialog at all here — the re-key lands between the tree painting the
+      // row and the user clicking it, which the tree cannot repaint fast enough
+      // to prevent. By command time the array is clean, so an ambiguity check
+      // made now sees nothing; the row's own render-time flag
+      // (`MacroTreeItem.identityConflict`, already computed for the warning
+      // icon) is the only surviving witness.
+      const dupStore = seedThree();
+      const row = { macro: dupStore.getAll()[2], index: 2, identityConflict: true };
+      await renameUnrelated(dupStore);
+
+      await registeredCommands.get("nexus.macro.moveUp")!(row);
+
+      expect(dupStore.getAll().map((m) => m.name)).toEqual(["Unrelated (edited)", "login", "reboot"]);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+    });
+
+    it("still resolves normally when the id was NOT shared at capture — the stale-index fallback must survive all of this", async () => {
+      // The counterweight. `[A, B, C]`, click B (row 1), A is deleted mid-modal:
+      // row 1 now names C, and B must still be the macro that gets removed. A
+      // rule that refused every mismatched index would pass every test above and
+      // break this one.
+      await store.save([
+        { name: "A", text: "a" },
+        { name: "B", text: "b" },
+        { name: "C", text: "c" }
+      ]);
+      const item = macroArg(1);
+      const [, b, c] = getMacros();
+      mockShowWarningMessage.mockImplementation(async (message: string) => {
+        if (!message.startsWith("Remove macro")) return undefined;
+        await store.save([b, c]);
+        return "Remove";
+      });
+
+      await registeredCommands.get("nexus.macro.remove")!(item);
+
+      expect(getMacros().map((m) => m.name)).toEqual(["C"]);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("same internal id"));
+    });
+  });
+});
+
+/**
+ * The primitive underneath every command above, exercised directly against the
+ * REAL `assignUniqueMacroIds()` — the same function both production stores run
+ * on every `save()`. Going through the real re-keying rather than hand-writing
+ * "and now the ids look like this" is the point: the whole defect was a wrong
+ * belief about what a save does to a duplicated id.
+ */
+describe("resolveMacroTarget (services/macroMutation.ts)", () => {
+  const stored: TerminalMacro[] = [
+    { id: "u", name: "Unrelated", text: "u" },
+    { id: "x", name: "First", text: "f" },
+    { id: "x", name: "Second", text: "s" }
+  ];
+
+  it("honours the clicked row while the twins are still twins", () => {
+    const ref = captureMacroRef(stored, "x", 2);
+    expect(resolveMacroTarget(stored, ref)).toEqual({ kind: "resolved", index: 2 });
+  });
+
+  it("refuses after a save re-keys the twins — the surviving holder of the id is the OTHER macro", () => {
+    const ref = captureMacroRef(stored, "x", 2);
+    expect(ref.idWhenCaptured).toBe("ambiguous");
+
+    // Exactly what `MacroStore.save()` does, run for real: "First" keeps "x",
+    // "Second" is handed a fresh UUID.
+    const afterSave = assignUniqueMacroIds(stored);
+    expect(afterSave[1].id).toBe("x");
+    expect(afterSave[2].id).not.toBe("x");
+    expect(afterSave.filter((m) => m.id === "x")).toHaveLength(1); // NOT ambiguous any more
+
+    expect(resolveMacroTarget(afterSave, ref)).toEqual({ kind: "ambiguous" });
+  });
+
+  it("still refuses when the id has vanished entirely — 'deleted' and 're-keyed' are the same array", () => {
+    // `"missing"` is not a silent no-op: callers report it ("…was already
+    // removed"). After a re-key that sentence is a fabrication, so the refusal
+    // stands.
+    const ref = captureMacroRef(stored, "x", 2);
+    expect(resolveMacroTarget([{ id: "u", name: "Unrelated", text: "u" }], ref)).toEqual({ kind: "ambiguous" });
+  });
+
+  it("a reference taken over a UNIQUE id still falls back to the id when its row moves", () => {
+    const unique: TerminalMacro[] = [
+      { id: "a", name: "A", text: "a" },
+      { id: "b", name: "B", text: "b" },
+      { id: "c", name: "C", text: "c" }
+    ];
+    const ref = captureMacroRef(unique, "b", 1);
+    expect(ref.idWhenCaptured).toBe("unique");
+    // "A" deleted: row 1 now names "C".
+    expect(resolveMacroTarget([unique[1], unique[2]], ref)).toEqual({ kind: "resolved", index: 0 });
+  });
+
+  it("a row's render-time conflict flag wins over an array that has already been repaired", () => {
+    const afterSave = assignUniqueMacroIds(stored);
+    const row = { macro: stored[2], index: 2, identityConflict: true };
+    // The array the command reads is clean, so checking it now proves nothing.
+    expect(captureMacroRef(afterSave, "x", 2).idWhenCaptured).toBe("unique");
+    expect(captureMacroRefFromRow(afterSave, row).idWhenCaptured).toBe("ambiguous");
+    expect(resolveMacroTarget(afterSave, captureMacroRefFromRow(afterSave, row))).toEqual({ kind: "ambiguous" });
+  });
+
+  it("an unverified reference (a drag payload from an unknown producer) resolves by id", () => {
+    const unique: TerminalMacro[] = [
+      { id: "a", name: "A", text: "a" },
+      { id: "b", name: "B", text: "b" }
+    ];
+    expect(resolveMacroTarget(unique, { id: "b", idWhenCaptured: "unverified" })).toEqual({
+      kind: "resolved",
+      index: 1
+    });
+    // …and still refuses a genuinely ambiguous array.
+    expect(
+      resolveMacroTarget(
+        [unique[0], { id: "b", name: "B1", text: "b" }, { id: "b", name: "B2", text: "b" }],
+        { id: "b", idWhenCaptured: "unverified" }
+      )
+    ).toEqual({ kind: "ambiguous" });
   });
 });

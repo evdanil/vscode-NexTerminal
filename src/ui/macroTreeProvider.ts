@@ -6,7 +6,12 @@ import { getMacroFolders, getMacros, saveMacros } from "../macroSettings";
 import { findAmbiguousMacroStateKeys, macroStateKey } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders } from "../services/macroVariables";
 import { collectMacroFolders, sanitizeMacroGroup } from "../services/macroFolders";
-import { resolveMacroTarget, AMBIGUOUS_MACRO_TARGET_MESSAGE, type MacroRef } from "../services/macroMutation";
+import {
+  captureMacroRefFromRow,
+  resolveMacroTarget,
+  AMBIGUOUS_MACRO_TARGET_MESSAGE,
+  type MacroRef
+} from "../services/macroMutation";
 import { folderDisplayName, parentPath } from "../utils/folderPaths";
 import { naturalComparePath } from "../utils/naturalCompare";
 import { MACRO_DRAG_MIME } from "./dndMimeTypes";
@@ -25,7 +30,17 @@ export class MacroTreeItem extends vscode.TreeItem {
     public readonly index: number,
     public readonly displayBinding?: string,
     triggerDisabled?: boolean,
-    identityConflict?: boolean
+    /**
+     * Another macro in the list this row was drawn from resolves to the same
+     * `macroStateKey()` — for a macro with a real id, that means the same id.
+     *
+     * PUBLIC, and read back off the row by `captureMacroRefFromRow()`
+     * (services/macroMutation.ts), because it is the earliest and therefore
+     * most trustworthy answer to "was this id shared when the user pointed at
+     * it?": it predates the click, so a re-keying save landing between the
+     * paint and the click cannot erase it. See `resolveMacroTarget`'s rule 2.
+     */
+    public readonly identityConflict?: boolean
   ) {
     const prefix = displayBinding ? `[${bindingToDisplayLabel(displayBinding)}] ` : "";
     super(`${prefix}${macro.name}`, vscode.TreeItemCollapsibleState.None);
@@ -141,27 +156,39 @@ export type MacroTreeElement = MacroTreeItem | FolderTreeItem;
  * and a plain (non-JSON) string is treated as a bare macro id so a payload from
  * any other producer still resolves by identity instead of being dropped on the
  * floor. Returns `undefined` only when there is no id to act on at all.
+ *
+ * A payload this view did not write carries no capture-time knowledge of the id,
+ * so its reference is `"unverified"` rather than a claim it cannot back — see
+ * `MacroIdProvenance`. Refusing every such drop instead would break the bare-id
+ * payload contract above without protecting anything: an unknown producer has no
+ * capture state for this module to preserve in the first place.
  */
 function parseMacroDragPayload(payload: string): MacroRef | undefined {
+  const unverified = (id: string): MacroRef => ({ id, idWhenCaptured: "unverified" });
   let parsed: unknown;
   try {
     parsed = JSON.parse(payload);
   } catch {
-    return { id: payload }; // A bare id string — resolve by identity alone.
+    return unverified(payload); // A bare id string — resolve by identity alone.
   }
   if (typeof parsed === "string") {
-    return parsed ? { id: parsed } : undefined;
+    return parsed ? unverified(parsed) : undefined;
   }
   if (!parsed || typeof parsed !== "object") {
     // Valid JSON but not an object or string — e.g. a numeric-looking id, which
     // `JSON.parse` happily turns into a number. The raw text is the id.
-    return { id: payload };
+    return unverified(payload);
   }
-  const { id, index } = parsed as { id?: unknown; index?: unknown };
+  const { id, index, idAmbiguous } = parsed as { id?: unknown; index?: unknown; idAmbiguous?: unknown };
   if (typeof id !== "string" || !id) {
     return undefined;
   }
-  return typeof index === "number" ? { id, index } : { id };
+  // Only a payload that states the flag either way came from `handleDrag`; a
+  // third-party object payload that happens to carry `id`/`index` stays
+  // "unverified".
+  const idWhenCaptured =
+    typeof idAmbiguous === "boolean" ? (idAmbiguous ? "ambiguous" : "unique") : "unverified";
+  return typeof index === "number" ? { id, index, idWhenCaptured } : { id, idWhenCaptured };
 }
 
 function makeMacroFolderItem(path: string, collapsibleState: vscode.TreeItemCollapsibleState): FolderTreeItem {
@@ -275,6 +302,14 @@ export class MacroTreeProvider
    * right here" gesture in the whole view. It is only ever honoured when the
    * macro at that position still carries the dragged id, so a stale payload
    * falls back to id resolution rather than moving a bystander.
+   *
+   * `idAmbiguous` rides along for the same reason and is NOT redundant with the
+   * check the drop performs: a drop is a second gesture, arbitrarily later, and
+   * a re-keying `save()` in between (any macro write at all) splits a shared id
+   * so that the drop sees a perfectly unique one — pointing at the twin the
+   * user did not drag. Only what was true when the drag STARTED can rule that
+   * out. Captured here, at the one moment this view is looking at the same list
+   * the user is.
    */
   public async handleDrag(
     source: readonly MacroTreeElement[],
@@ -282,9 +317,16 @@ export class MacroTreeProvider
   ): Promise<void> {
     const item = source[0];
     if (item instanceof MacroTreeItem && item.macro.id) {
+      const ref = captureMacroRefFromRow(getMacros(), item);
       dataTransfer.set(
         MACRO_DRAG_MIME,
-        new vscode.DataTransferItem(JSON.stringify({ id: item.macro.id, index: item.index }))
+        new vscode.DataTransferItem(
+          JSON.stringify({
+            id: item.macro.id,
+            index: item.index,
+            idAmbiguous: ref.idWhenCaptured === "ambiguous"
+          })
+        )
       );
     }
     // Folders are not draggable in v1 (§4.9) — nothing else to serialize.

@@ -1,30 +1,43 @@
 import type { TerminalMacro } from "../../src/models/terminalMacro";
-import type { MacroStore, MacroStoreChangeListener } from "../../src/storage/macroStore";
+import { assignUniqueMacroIds, type MacroStore, type MacroStoreChangeListener } from "../../src/storage/macroStore";
 
 /**
- * A `MacroStore` that persists exactly what it is handed — no id re-keying, no
- * ingest guards.
+ * A `MacroStore` whose LOADED state can contain two macros sharing an `id` —
+ * and whose `save()` re-keys them exactly as production does.
  *
- * It exists because `InMemoryMacroStore` deliberately mirrors the store WRITE
- * path, where `assignUniqueMacroIds()` re-keys duplicates, so it cannot express
- * the one state these tests are about: a macro list where two records share an
- * `id`. That state is real and reachable — `VscodeMacroStore.reloadFromState()`
- * reads a hand-edited backup or absorbed legacy settings verbatim and
- * deliberately does NOT repair duplicate ids (deciding which twin owns the
- * single vault entry behind a shared id is unanswerable; see
- * `MacroStore.save()`'s doc comment). Everything that acts on a macro therefore
- * has to cope with it, and this store is how a test can put the code in front
- * of it.
+ * It exists because `InMemoryMacroStore` can only ever be populated through
+ * `save()`, and `save()` is where `assignUniqueMacroIds()` repairs duplicates,
+ * so it cannot express the one state these tests are about: a macro list where
+ * two records share an `id`. That state is real and reachable —
+ * `VscodeMacroStore.reloadFromState()` reads a hand-edited backup or absorbed
+ * legacy settings verbatim and deliberately does NOT repair duplicate ids
+ * (deciding which twin owns the single vault entry behind a shared id is
+ * unanswerable; see `MacroStore.save()`'s doc comment). Everything that acts on
+ * a macro therefore has to cope with it, and this store is how a test can put
+ * the code in front of it.
  *
- * It also leaves ids alone across `save()`, which keeps assertions legible: a
- * re-keying store would answer "which twin was written?" with two fresh UUIDs.
+ * **That is a property of the initial state, not of `save()`.** An earlier
+ * version of this double also preserved duplicate ids across `save()`, on the
+ * grounds that it kept assertions legible (a re-keying store answers "which twin
+ * was written?" with a fresh UUID). It bought that legibility by simulating a
+ * store that cannot exist: BOTH production implementations re-key on every
+ * write. The concurrent-write tests here are specifically about what happens
+ * when a save lands mid-dialog, so the one detail the double got wrong was the
+ * one detail under test — a reference captured while its id was shared, then
+ * re-keyed by that save, resolved to the wrong twin in production while every
+ * test said otherwise. Any divergence from production `save()` in a double used
+ * for concurrency tests is a hole in exactly that shape.
  */
 export class DuplicateIdMacroStore implements MacroStore {
   private macros: TerminalMacro[] = [];
   private folders: string[] = [];
   private readonly listeners = new Set<MacroStoreChangeListener>();
 
-  /** Seeds the store without going through `save()`, mirroring a load from disk. */
+  /**
+   * Seeds the store without going through `save()`, mirroring a load from disk
+   * — the only way a duplicate-id list gets in here, and the only thing about
+   * this double that differs from `InMemoryMacroStore`.
+   */
   public constructor(initial: TerminalMacro[] = []) {
     this.macros = initial.map((m) => ({ ...m }));
   }
@@ -38,7 +51,10 @@ export class DuplicateIdMacroStore implements MacroStore {
   }
 
   public async save(macros: TerminalMacro[]): Promise<void> {
-    this.macros = macros.map((m) => ({ ...m }));
+    // The SAME `assignUniqueMacroIds()` both production stores call, not a
+    // re-implementation: the first holder of a duplicated id keeps it and every
+    // later twin gets a fresh UUID. See the class doc comment.
+    this.macros = assignUniqueMacroIds(macros).map((m) => ({ ...m }));
     for (const listener of this.listeners) listener();
   }
 

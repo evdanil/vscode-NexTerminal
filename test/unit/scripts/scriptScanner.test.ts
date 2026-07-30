@@ -48,11 +48,17 @@ function folderPaths(result: Awaited<ReturnType<typeof scanScriptsDir>>): string
   return result.folders.map((f) => f.path).sort();
 }
 
-describe("scanScriptsDir", () => {
-  beforeEach(() => {
-    mockFsEntries.clear();
-  });
+// FILE scope, not inside `describe("scanScriptsDir")`. `mockFsEntries` is a
+// module-level map shared by every test here, and a `beforeEach` nested in one
+// describe leaves the OTHER describe's tests running against whatever the last
+// test in this one happened to leave behind. That is an ordering dependence
+// waiting to become a mystery failure the moment a test is added, moved, or the
+// suite is ever run shuffled — and it costs nothing to not have.
+beforeEach(() => {
+  mockFsEntries.clear();
+});
 
+describe("scanScriptsDir", () => {
   it("returns an empty result when the root directory does not exist", async () => {
     const result = await scanScriptsDir(rootUri as never);
     expect(result).toEqual({ scripts: [], folders: [], truncated: false, examined: 0, depthTruncated: false });

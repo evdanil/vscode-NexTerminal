@@ -16,9 +16,11 @@ import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
 import { collectMacroFolders, macroFolderField } from "../services/macroFolders";
 import {
+  captureMacroRef,
   mutateMacro,
   resolveMacroTarget,
   AMBIGUOUS_MACRO_TARGET_MESSAGE,
+  type MacroRef,
   type MacroTarget
 } from "../services/macroMutation";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
@@ -46,9 +48,21 @@ type MacroProfileProvider = () => MacroProfileOptionInput[];
  * ambiguous state key. Every other repair route (Move Up / Move Down, delete, or
  * editing any macro with a unique id) re-saves the whole list and clears the
  * conflict, so this is never a dead end.
+ *
+ * Returns the captured `ref` alongside the target so the WRITE that follows the
+ * dialog re-resolves the very same reference — `idWhenCaptured` and all. A
+ * freshly built `{ id: macroId }` at the write site would carry provenance from
+ * after the dialog, and the case that matters is precisely the one where the
+ * list was re-keyed in between: the panel's binding-conflict warning is a
+ * non-modal toast, so an ambiguous id can be split apart by another flow while
+ * it is up, after which the id resolves cleanly — to the OTHER twin.
  */
-function resolveEditorTarget(macros: readonly TerminalMacro[], macroId: string | null): MacroTarget {
-  return resolveMacroTarget(macros, { id: macroId });
+function resolveEditorTarget(
+  macros: readonly TerminalMacro[],
+  macroId: string | null
+): { ref: MacroRef; target: MacroTarget } {
+  const ref = captureMacroRef(macros, macroId);
+  return { ref, target: resolveMacroTarget(macros, ref) };
 }
 
 /** The right thing to say for a target that could not be resolved to one macro. */
@@ -244,7 +258,7 @@ export class MacroEditorPanel {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
         // A null id means an unsaved (new) macro → push path.
-        const target = resolveEditorTarget(macros, macroId);
+        const { ref: macroRef, target } = resolveEditorTarget(macros, macroId);
         if (macroId !== null && target.kind !== "resolved") {
           // The macro we were editing was deleted/changed externally, or its id is
           // shared with another macro. Do not fall through to the push path (that
@@ -492,7 +506,7 @@ export class MacroEditorPanel {
         if (macroId !== null) {
           let savedIndex = -1;
           const outcome = await this.withSaveGuard(() =>
-            mutateMacro({ id: macroId }, (latest, i) => {
+            mutateMacro(macroRef, (latest, i) => {
               savedIndex = i;
               // `macro` was composed from the PRE-dialog record, so every field
               // on it is either something the user typed in this form or
@@ -548,7 +562,7 @@ export class MacroEditorPanel {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
         // Resolve by stable id; the render-time index may be stale.
-        const target = resolveEditorTarget(macros, macroId);
+        const { ref: macroRef, target } = resolveEditorTarget(macros, macroId);
         if (target.kind !== "resolved") {
           if (macroId !== null) {
             void vscode.window.showWarningMessage(unresolvedTargetMessage(target, "deleted"));
@@ -572,7 +586,7 @@ export class MacroEditorPanel {
         // pre-dialog snapshot would discard it.
         let deletedIndex = index;
         const outcome = await this.withSaveGuard(() =>
-          mutateMacro({ id: macroId }, (latest, i) => {
+          mutateMacro(macroRef, (latest, i) => {
             deletedIndex = i;
             latest.splice(i, 1);
           })

@@ -101,6 +101,34 @@ function isJsFile(name: string): boolean {
   return name.toLowerCase().endsWith(".js");
 }
 
+/**
+ * A `.js` file found by the scan.
+ *
+ * Deliberately has no `linked` counterpart to `ScannedFolder.linked`, even
+ * though a symlinked `.js` FILE is scanned exactly like a real one (the type
+ * test is `isJsFile(name)` on a non-directory entry, which a `File |
+ * SymbolicLink` bitmask satisfies). The two cases are not the same size of
+ * problem:
+ *
+ * - A symlinked DIRECTORY hides an unbounded amount of state. The watcher does
+ *   not follow it, so scripts created, renamed or deleted anywhere beneath it
+ *   never fire an event and the tree keeps serving a listing that has no
+ *   relationship to what is on disk. Nothing on screen would say why, hence the
+ *   marker and the "press Refresh" tooltip.
+ * - A symlinked FILE is a single row whose EXISTENCE is watched normally: the
+ *   link itself lives inside the watched root, so creating, renaming or
+ *   deleting it is an ordinary directory-entry change and fires an event like
+ *   any other file. Only edits made through the link's target go unnoticed, and
+ *   the only thing this scanner's consumers re-read from a script's contents is
+ *   its `@nexus-script` header — so the visible consequence is a stale label or
+ *   `@target-type` on one row, corrected by the same Refresh, and never a script
+ *   that silently is not there.
+ *
+ * Marking every symlinked file would put a warning icon on rows whose worst case
+ * is a stale name, which is the kind of noise that teaches people to ignore the
+ * marker that does matter. If script CONTENT ever becomes something the tree
+ * depends on more strongly, revisit this.
+ */
 export interface ScannedScript {
   readonly uri: vscode.Uri;
   /** File name including extension, e.g. "backup.js". */

@@ -733,11 +733,15 @@ describe("MacroTreeProvider drag and drop (§4.9)", () => {
     };
   }
 
-  it("handleDrag serializes the dragged macro's stable id, plus the row it was dragged from", async () => {
+  it("handleDrag serializes the dragged macro's stable id, the row it was dragged from, and whether that id was shared at drag time", async () => {
     // The id is what survives a reorder between drag and drop; the index is the
     // only thing that can separate two macros sharing an id, and it is honoured
     // by `resolveMacroTarget` only while the macro at that position still
     // carries the dragged id. Never the index alone.
+    //
+    // `idAmbiguous` is the third: a drop is a separate gesture, and any macro
+    // write in between re-keys duplicates, which would leave the drop looking at
+    // a unique id that names the twin the user did NOT drag.
     await testStore.save([
       { id: "other-id", name: "Other", text: "t" },
       { id: "fixed-id", name: "M", text: "t" }
@@ -749,7 +753,57 @@ describe("MacroTreeProvider drag and drop (§4.9)", () => {
 
     const stored = dataTransfer.get(MACRO_DRAG_MIME) as { asString: () => Promise<string> } | undefined;
     expect(stored).toBeDefined();
-    expect(JSON.parse(await stored!.asString())).toEqual({ id: "fixed-id", index: 1 });
+    expect(JSON.parse(await stored!.asString())).toEqual({ id: "fixed-id", index: 1, idAmbiguous: false });
+  });
+
+  it("handleDrag records a SHARED id as ambiguous, so the drop can refuse instead of guessing after a re-key", async () => {
+    // `DuplicateIdMacroStore` because `InMemoryMacroStore.save()` re-keys
+    // duplicates and so cannot hold the state under test.
+    const dupStore = new DuplicateIdMacroStore([
+      { id: "x", name: "First", text: "t" },
+      { id: "x", name: "Second", text: "t" }
+    ]);
+    setActiveMacroStore(dupStore);
+    const dupProvider = new MacroTreeProvider();
+    const dragged = dupProvider.getChildren()[1] as MacroTreeItem;
+    const dataTransfer = makeDataTransfer();
+
+    await dupProvider.handleDrag([dragged], dataTransfer as unknown as vscode.DataTransfer);
+
+    const stored = dataTransfer.get(MACRO_DRAG_MIME) as { asString: () => Promise<string> };
+    expect(JSON.parse(await stored.asString())).toEqual({ id: "x", index: 1, idAmbiguous: true });
+  });
+
+  it("a drop refuses when the dragged id was shared at drag time and a save re-keyed the twins in between", async () => {
+    // Codex's sequence, as a drag: `[Other, First(x), Second(x)]`, drag Second.
+    // Anything at all saves before the drop — here, Other being moved into a
+    // folder — and `assignUniqueMacroIds()` lets First KEEP `x` while Second
+    // gets a fresh id. The payload's index no longer matches, and `x` now has
+    // exactly one holder: First. Resolving by that unique id would move First,
+    // a macro the user never touched, into the drop target.
+    const dupStore = new DuplicateIdMacroStore([
+      { id: "other", name: "Other", text: "t" },
+      { id: "x", name: "First", text: "t" },
+      { id: "x", name: "Second", text: "t" }
+    ]);
+    setActiveMacroStore(dupStore);
+    await dupStore.saveFolders(["Cisco"]);
+    const dupProvider = new MacroTreeProvider();
+    const dragged = dupProvider.getChildren()[3] as MacroTreeItem; // folder, Other, First, Second
+    expect((dragged as MacroTreeItem).macro.name).toBe("Second");
+    const dataTransfer = makeDataTransfer();
+    await dupProvider.handleDrag([dragged], dataTransfer as unknown as vscode.DataTransfer);
+
+    // The re-keying write, between drag and drop.
+    const before = dupStore.getAll();
+    await dupStore.save([{ ...before[0], group: "Cisco" }, before[1], before[2]]);
+
+    const folder = findFolder(dupProvider.getChildren(), "Cisco");
+    await dupProvider.handleDrop(folder, dataTransfer as unknown as vscode.DataTransfer);
+
+    const after = dupStore.getAll();
+    expect(after.map((m) => m.group)).toEqual(["Cisco", undefined, undefined]);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("same internal id"));
   });
 
   it("folders are not draggable — handleDrag on a folder source sets no payload", async () => {

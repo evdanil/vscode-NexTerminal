@@ -445,10 +445,20 @@ is a question the shared id cannot answer but the position can.
 
 Everything that has to identify a flagged macro from something other than a
 clicked row refuses instead of guessing: the macro editor will not save or delete
-one (it knows only the id), and a command whose macro list shifted underneath it
-mid-dialog reports that it could not tell the two apart rather than writing to
-the wrong one. Refreshing the view and retrying resolves that, and so does
-reordering any macro.
+one, because all it has is the id.
+
+A click on a flagged row is acted on only while that macro is still exactly where
+the row was drawn. If the list changes underneath an open dialog — you confirm a
+delete, type a shortcut, answer the paste prompt — Nexus tells you it can no
+longer tell the two apart rather than writing to the wrong one. That holds even
+though the change that shifted the list also assigned fresh ids: what decides it
+is that the id was shared **at the moment you clicked**, not whether it still
+looks shared by the time the write happens. (Fresh ids are handed out to the
+later duplicate, so the shared id survives on the *other* macro — which is
+exactly the macro a write must not land on.)
+
+Refreshing the view and retrying resolves that, and so does reordering any
+macro.
 
 Running a macro manually, and its keyboard shortcut, are unaffected.
 

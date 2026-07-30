@@ -25,6 +25,8 @@ import { repositoryBlobUrl } from "../utils/repositoryLinks";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders, withRedactedVariables } from "../services/macroVariables";
 import { collectMacroFolders, sanitizeMacroGroup } from "../services/macroFolders";
 import {
+  captureMacroRef,
+  captureMacroRefFromRow,
   mutateMacro,
   resolveMacroTarget,
   AMBIGUOUS_MACRO_TARGET_MESSAGE,
@@ -578,15 +580,17 @@ function findNextInGroup(macros: TerminalMacro[], index: number, group: string |
 }
 
 /**
- * A tree item's reference to its macro: the stable id AND the row's rendered
- * position, because neither alone resolves every state — see
- * `resolveMacroTarget`. Duck-typed like every other read of the arg (the
- * `MacroTreeItem` import is `type`-only, see the top-of-file comment), so a
- * caller that supplies no index degrades to id-only resolution rather than
- * fabricating one.
+ * A tree item's reference to its macro: the stable id, the row's rendered
+ * position, AND what was known about that id when the reference was taken,
+ * because no two of the three resolve every state — see `resolveMacroTarget`.
+ * Duck-typed like every other read of the arg (the `MacroTreeItem` import is
+ * `type`-only, see the top-of-file comment).
+ *
+ * `macros` must be the array as it stood when the user clicked — read it at the
+ * top of the handler, before any `await`. See `mutateMacro`'s doc comment.
  */
-function macroRefFromItem(item: MacroTreeItem): MacroRef {
-  return { id: item.macro.id, index: item.index };
+function macroRefFromItem(macros: readonly TerminalMacro[], item: MacroTreeItem): MacroRef {
+  return captureMacroRefFromRow(macros, item);
 }
 
 /**
@@ -631,21 +635,36 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
     // Opening the editor writes nothing, but it decides which macro the user is
     // about to edit — a stale row's index names a different macro, which puts
     // someone else's record in front of them pre-filled and one Save away. Same
-    // resolution as every write path rather than a second, laxer rule here; a
-    // target that no longer exists opens the editor with no selection (what the
-    // palette entry does) instead of landing on whatever took its slot.
+    // resolution as every write path rather than a second, laxer rule here.
+    //
+    // A target that no longer exists ABORTS, saying so. It used to fall through
+    // to `MacroEditorPanel.open(undefined)` on the theory that this "opens with
+    // no selection", which is only true for a panel that does not exist yet:
+    // `open()` with no index REVEALS an already-open panel and leaves its
+    // selection exactly as it was (macroEditorPanel.ts). So Edit on a stale row
+    // for a deleted macro brought whatever the user last had open to the front,
+    // pre-filled and one Save away — the same wrong-macro-in-front-of-you
+    // failure this resolution exists to prevent, arrived at from the "we could
+    // not resolve it" branch.
     vscode.commands.registerCommand("nexus.macro.edit", (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
       if (!item) {
         MacroEditorPanel.open();
         return;
       }
-      const target = resolveMacroTarget(getMacros(), macroRefFromItem(item));
+      const macros = getMacros();
+      const target = resolveMacroTarget(macros, macroRefFromItem(macros, item));
       if (target.kind === "ambiguous") {
         void vscode.window.showWarningMessage(AMBIGUOUS_MACRO_TARGET_MESSAGE);
         return;
       }
-      MacroEditorPanel.open(target.kind === "resolved" ? target.index : undefined);
+      if (target.kind !== "resolved") {
+        void vscode.window.showInformationMessage(
+          `"${item.macro.name}" no longer exists — nothing was opened.`
+        );
+        return;
+      }
+      MacroEditorPanel.open(target.index);
     }),
 
     // The clicked ROW — id and position together — is captured up front and
@@ -663,24 +682,27 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
       let ref: MacroRef;
       if (item) {
-        ref = macroRefFromItem(item);
+        ref = macroRefFromItem(getMacros(), item);
       } else {
-        const macros = getMacros();
-        if (macros.length === 0) {
+        const listed = getMacros();
+        if (listed.length === 0) {
           void vscode.window.showInformationMessage("No macros defined.");
           return;
         }
         // The quick pick carries the ordinal as well as the id for the same
         // reason a tree item does: it is the only thing that tells two macros
-        // sharing an id apart, and the user picked one specific ROW.
+        // sharing an id apart, and the user picked one specific ROW. The
+        // reference is captured against `listed` — the array the picks were
+        // BUILT from — not a fresh read from after the pick resolved, so its
+        // provenance describes the list the user was choosing from.
         const pick = await vscode.window.showQuickPick(
-          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), id: m.id, index: i })),
+          listed.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), id: m.id, index: i })),
           { title: "Select Macro to Remove" }
         );
         if (!pick) {
           return;
         }
-        ref = { id: pick.id, index: pick.index };
+        ref = captureMacroRef(listed, pick.id, pick.index);
       }
       const macros = getMacros();
       const index = resolveOrExplain(macros, ref);
@@ -801,21 +823,21 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
       let ref: MacroRef;
       if (item) {
-        ref = macroRefFromItem(item);
+        ref = macroRefFromItem(getMacros(), item);
       } else {
-        const macros = getMacros();
-        if (macros.length === 0) {
+        const listed = getMacros();
+        if (listed.length === 0) {
           void vscode.window.showInformationMessage("No macros defined.");
           return;
         }
         const pick = await vscode.window.showQuickPick(
-          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), id: m.id, index: i })),
+          listed.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), id: m.id, index: i })),
           { title: "Select Macro" }
         );
         if (!pick) {
           return;
         }
-        ref = { id: pick.id, index: pick.index };
+        ref = captureMacroRef(listed, pick.id, pick.index);
       }
       const macros = getMacros();
       const index = resolveOrExplain(macros, ref);
@@ -862,7 +884,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         return;
       }
       const macros = getMacros();
-      const index = resolveOrExplain(macros, macroRefFromItem(item));
+      const index = resolveOrExplain(macros, macroRefFromItem(macros, item));
       if (index === -1) {
         return;
       }
@@ -885,7 +907,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         return;
       }
       const macros = getMacros();
-      const index = resolveOrExplain(macros, macroRefFromItem(item));
+      const index = resolveOrExplain(macros, macroRefFromItem(macros, item));
       if (index === -1) {
         return;
       }
@@ -950,7 +972,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         if (!item.macro.id) {
           return;
         }
-        refs = [macroRefFromItem(item)];
+        refs = [macroRefFromItem(macros, item)];
       } else {
         if (macros.length === 0) {
           void vscode.window.showInformationMessage("No macros defined.");
@@ -969,7 +991,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
         if (!picks || picks.length === 0) {
           return;
         }
-        refs = picks.filter((p) => !!p.id).map((p): MacroRef => ({ id: p.id, index: p.index }));
+        refs = picks.filter((p) => !!p.id).map((p): MacroRef => captureMacroRef(macros, p.id, p.index));
         if (refs.length === 0) {
           return;
         }
@@ -994,6 +1016,27 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       for (const ref of refs) {
         const target = resolveMacroTarget(latest, ref);
         if (target.kind === "resolved") {
+          // Two selected rows resolving to ONE macro is not a duplicate click
+          // to be quietly collapsed by the Set — it means two references the
+          // user made separately can no longer be told apart, so at most one of
+          // them is being honoured and the other macro is silently skipped.
+          // Same cause and same remedy as `"ambiguous"` (a shared id), so it is
+          // counted and reported the same way rather than swallowed.
+          //
+          // Unreachable as the resolver stands, and kept deliberately. Two
+          // picks can only carry the same id if that id was duplicated in the
+          // array the picks were built from, which makes BOTH references
+          // `"ambiguous"` — and an ambiguous reference resolves only by exact
+          // index, so any two that resolve at all resolve to different indices.
+          // That argument is entirely a property of `resolveMacroTarget`'s rule
+          // 2; without that rule, this line is the only thing that still
+          // reports the skipped macro. The multi-select case in
+          // macroCommandsIdentity.test.ts fails only when BOTH are gone, which
+          // is exactly what a second line of defence looks like.
+          if (targetIndices.has(target.index)) {
+            unresolvable += 1;
+            continue;
+          }
           targetIndices.add(target.index);
         } else if (target.kind === "ambiguous") {
           unresolvable += 1;
@@ -1101,6 +1144,11 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (!item?.macro.secret) {
         return;
       }
+      // Captured HERE, before the clipboard read and the append-newline prompt.
+      // Building it at the write site instead (as this did) reads the macro
+      // list as it stands AFTER those awaits, which is the one moment its
+      // provenance must not come from — see `mutateMacro`'s doc comment.
+      const ref = macroRefFromItem(getMacros(), item);
       const clipText = await vscode.env.clipboard.readText();
       if (!clipText) {
         void vscode.window.showInformationMessage("Clipboard is empty.");
@@ -1133,7 +1181,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       // password straight into `nexus.macros` in cleartext. So the
       // confidentiality precondition is re-checked against the FRESH record,
       // not the one the context menu was opened on.
-      const outcome = await mutateMacro(macroRefFromItem(item), (macros, i) => {
+      const outcome = await mutateMacro(ref, (macros, i) => {
         if (!macros[i].secret) {
           return false;
         }
