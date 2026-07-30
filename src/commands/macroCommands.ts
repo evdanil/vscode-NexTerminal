@@ -6,8 +6,7 @@ import type { TerminalMacro } from "../models/terminalMacro";
 import {
   bindingToContextKey,
   bindingToDisplayLabel,
-  isValidBinding,
-  slotToBinding
+  isValidBinding
 } from "../macroBindings";
 import {
   confirmBindingWarnings,
@@ -224,21 +223,15 @@ export function updateMacroContext(): void {
   updateBindingContextKeys();
 }
 
-/** Migrate old slot-based macros to keybinding-based. */
-export async function migrateMacroSlots(): Promise<void> {
-  const macros = getMacros();
-  let changed = false;
-  for (const macro of macros) {
-    if (macro.slot !== undefined && !macro.keybinding) {
-      macro.keybinding = slotToBinding(macro.slot);
-      delete macro.slot;
-      changed = true;
-    }
-  }
-  if (changed) {
-    await saveMacros(macros);
-  }
-}
+// `migrateMacroSlots()` used to live here and was called from `activate()`. It rewrote
+// every macro's legacy `slot` into `keybinding` and then `saveMacros()`d the whole list,
+// which made `MacroStore.save()` — the one place that re-keys duplicate macro ids — an
+// ACTIVATION path. The duplicate-id fail-safe is built on that never happening: re-keying
+// at startup turns "neither twin auto-triggers" into "both compile", so a secret twin can
+// auto-send the other's password before the user has seen any warning. It is now
+// `withMigratedSlot()` (storage/macroStore.ts), applied when the store resolves records,
+// so no write is needed at all and the on-disk `slot` is rewritten by the next save the
+// user actually asks for. See that function and `MacroStore.save()`'s doc comment.
 
 async function promptForBinding(
   macros: ReturnType<typeof getMacros>,

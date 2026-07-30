@@ -1755,6 +1755,24 @@ describe("MacroAutoTrigger", () => {
       vi.advanceTimersByTime(60_000);
       flush();
       expect(sent).toEqual(["show status\n"]);
+
+      // Silence is guaranteed by reload()'s ambiguity `continue` on its own, so asserting
+      // only silence says nothing about whether `intervalOwners` still names `obs` as the
+      // owner of "id:poll". A leaked owner is invisible until the conflict is resolved —
+      // and then it locks every OTHER observer out of that macro permanently, because
+      // evaluate() bails on `owner && owner !== observerState` before it ever looks at the
+      // pattern. Resolve the conflict and require a second observer to take ownership;
+      // that is the assertion a leak cannot pass.
+      void store.save([poll, { id: "clone", name: "Clone", text: "clone\n", triggerPattern: "ZZZ" }] as TerminalMacro[]);
+      trigger.reload();
+
+      const sent2: string[] = [];
+      const obs2 = trigger.createObserver((text) => sent2.push(text), () => true);
+      obs2.onOutput("router#");
+      flush();
+      expect(sent2).toEqual(["show status\n"]);
+
+      obs2.dispose();
       obs.dispose();
     });
   });

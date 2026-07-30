@@ -1,5 +1,10 @@
 import type { TerminalMacro } from "../models/terminalMacro";
-import { assignUniqueMacroIds, type MacroStore, type MacroStoreChangeListener } from "./macroStore";
+import {
+  assignUniqueMacroIds,
+  withMigratedSlot,
+  type MacroStore,
+  type MacroStoreChangeListener
+} from "./macroStore";
 
 export class InMemoryMacroStore implements MacroStore {
   private macros: TerminalMacro[] = [];
@@ -19,7 +24,10 @@ export class InMemoryMacroStore implements MacroStore {
     // with equal `id` are indistinguishable for pause/resume/interval state).
     // `assignUniqueMacroIds()` is the single implementation shared with
     // VscodeMacroStore.save() — see its doc comment in macroStore.ts.
-    this.macros = assignUniqueMacroIds(macros);
+    // Also mirrors the legacy `slot` → `keybinding` normalization VscodeMacroStore does,
+    // so tests and the web-host fallback see the same macro shape the production store
+    // hands out. See `withMigratedSlot()` in macroStore.ts.
+    this.macros = assignUniqueMacroIds(macros).map((m) => withMigratedSlot(m));
     for (const listener of this.listeners) listener();
   }
 

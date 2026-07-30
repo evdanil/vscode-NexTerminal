@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { slotToBinding } from "../macroBindings";
 import type { TerminalMacro } from "../models/terminalMacro";
 
 export interface MacroStoreChangeListener {
@@ -22,18 +23,37 @@ export interface MacroStore {
    * "Write time only" is deliberate and load-bearing. `save()` is reached exclusively from
    * user-initiated command paths (macro add/edit/remove/reorder, the macro editor panel,
    * config import) — never from activation — so re-keying here is a repair the user asked
-   * for, applied to values already resolved in memory, and it is loss-free: a duplicated
-   * secret's vault value was read into `text` at load, so writing it back under a fresh key
-   * preserves it. The READ path deliberately does NOT do this. `reloadFromState()` never
-   * rewrites a stored id and never touches the vault, because deciding which of two macros
-   * sharing an id owns the single vault entry behind it is unanswerable, and every heuristic
-   * attempted (award to the first entry, award to the secret one, award to nobody) either
-   * leaks one macro's password to another, destroys the only copy of a legitimate secret, or
-   * re-derives identity from array position. Duplicates that already exist on disk are left
-   * alone and handled fail-safe at the use site by `findAmbiguousMacroStateKeys()`
-   * (services/macroAutoTrigger.ts): an ambiguous macro compiles no auto-trigger rule and
-   * carries no pause state, so it cannot fire at all. Saving either colliding macro is what
-   * clears the conflict.
+   * for, applied to values already resolved in memory. The READ path deliberately does NOT
+   * do this. `reloadFromState()` never rewrites a stored id and never touches the vault,
+   * because deciding which of two macros sharing an id owns the single vault entry behind it
+   * is unanswerable, and every heuristic attempted (award to the first entry, award to the
+   * secret one, award to nobody) either leaks one macro's password to another, destroys the
+   * only copy of a legitimate secret, or re-derives identity from array position. Duplicates
+   * that already exist on disk are left alone and handled fail-safe at the use site by
+   * `findAmbiguousMacroStateKeys()` (services/macroAutoTrigger.ts): an ambiguous macro
+   * compiles no auto-trigger rule and carries no pause state, so it cannot fire at all.
+   * Saving either colliding macro is what clears the conflict.
+   *
+   * "Never from activation" is a REQUIREMENT on callers, not an observation. An
+   * activation-time `save()` re-keys duplicates before the user has seen the tree warning
+   * or been asked anything, which silently converts the fail-safe (neither twin fires) into
+   * the failure it exists to prevent (both twins compile, and a secret twin can auto-send
+   * the other's password — `MacroStore.onDidChange` reaches `MacroAutoTrigger.reload()`
+   * synchronously). One such caller existed and was removed: `migrateMacroSlots()` ran at
+   * `activate()` and saved the whole list whenever ANY macro still carried a legacy `slot`
+   * — reachable on the very first startup that absorbs a slot-era settings.json. It is now
+   * `withMigratedSlot()` below, applied on the read path, so the shape the app sees is
+   * already migrated and no write is needed. Do not reintroduce an activation-time save.
+   *
+   * Loss-free, with one stated limit: a duplicated secret's vault value is read into `text`
+   * at load, so writing it back under a fresh key preserves it — WHEN that read succeeded.
+   * `SecretStorage.get()` resolves `undefined` rather than rejecting when the OS keyring is
+   * unavailable, which is indistinguishable at the type level from "no entry". A macro whose
+   * value could not be read therefore carries `text: ""`, and `VscodeMacroStore.save()`
+   * deliberately does not overwrite that macro's existing vault entry with the empty string
+   * (see its `unresolvedSecretIds` guard). The consequence is the opposite trade: while a
+   * value is unreadable it also cannot be cleared, and a re-keyed twin gets no vault entry
+   * at all rather than an empty one.
    */
   save(macros: TerminalMacro[]): Promise<void>;
   /** Subscribe to changes. Returns a disposer. */
@@ -71,6 +91,37 @@ export function isValidMacroId(id: unknown): id is string {
  *
  * WRITE PATHS ONLY. Nothing on a load path may call this — see `MacroStore.save()`.
  */
+/**
+ * Legacy `slot` → `keybinding` normalization, applied on the READ path (and again on the
+ * write path so an old backup restored through `save()` converges too).
+ *
+ * This used to be `migrateMacroSlots()` in commands/macroCommands.ts, called from
+ * `activate()`, which rewrote the field IN PLACE and then called `saveMacros()` whenever
+ * any macro still carried a `slot`. That made `MacroStore.save()` an ACTIVATION path,
+ * which is precisely what the duplicate-id fail-safe is built on it not being — see
+ * `MacroStore.save()`'s doc comment. Worse, it was deterministically reachable: legacy
+ * settings absorption copies slot-era records out of `nexus.terminal.macros` verbatim, so
+ * the first activation that absorbed one also ran the save on that same startup.
+ *
+ * Doing it at read time needs no write at all. Nothing downstream can tell the difference:
+ * `getAssignedBinding()` (macroBindingHelpers.ts) already derived `alt+{slot}` for a macro
+ * with no `keybinding`, so every consumer — keybinding context keys, the tree label, the
+ * quick pick, the editor — saw the same value before and sees the same value now. The
+ * on-disk record keeps its `slot` until the next write the user actually asks for, at
+ * which point `save()` persists the migrated shape.
+ *
+ * Byte-identical semantics to the routine it replaces, deliberately: a macro carrying BOTH
+ * `slot` and an explicit `keybinding` keeps its `slot` untouched (the keybinding already
+ * wins everywhere), which is what keeps the `nexus.macro.slot` back-compat command's
+ * `m.slot === targetSlot` fallback meaningful for exactly that shape.
+ */
+export function withMigratedSlot<T extends { slot?: number; keybinding?: string }>(macro: T): T {
+  if (macro.slot === undefined || macro.keybinding) return macro;
+  const migrated: T = { ...macro, keybinding: slotToBinding(macro.slot) };
+  delete (migrated as { slot?: number }).slot;
+  return migrated;
+}
+
 export function assignUniqueMacroIds<T extends { id?: string }>(macros: readonly T[]): T[] {
   const seenIds = new Set<string>();
   return macros.map((m) => {

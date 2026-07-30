@@ -283,6 +283,49 @@ describe("MacroStore legacy migration", () => {
     expect(store.getAll().map((m) => m.name)).toEqual(["Real", "new"]);
   });
 
+  it("does not clobber a MACROS_KEY another window moved while the vault write was in flight — and keeps the legacy setting so the absorb retries", async () => {
+    const vscode = await import("vscode") as unknown as {
+      __setConfig: (s: string, v: Record<string, unknown>) => void;
+      __getConfig: (s: string) => unknown;
+    };
+    const { ctx, state, secrets } = makeCtx();
+    state.set("nexus.macros", [{ id: "a", name: "Existing", text: "x" }] as TerminalMacro[]);
+    const legacy = [{ name: "Absorbed", text: "absorbed-secret", secret: true }] as TerminalMacro[];
+    vscode.__setConfig("nexus.terminal", { global: legacy });
+
+    // Absorption runs on EVERY activation, so a second window starting at the same time —
+    // or the user deleting a macro in another window — lands inside the `await` on the
+    // vault store. Writing MACROS_KEY unconditionally after that resurrects what the other
+    // window deleted, or drops what it added. `reloadFromState()` already documents this
+    // guard as mandatory; this path needs the same one.
+    const mutableSecrets = ctx.secrets as unknown as { store(k: string, v: string): Promise<void> };
+    const origStore = mutableSecrets.store.bind(ctx.secrets);
+    mutableSecrets.store = async (k: string, v: string) => {
+      state.set("nexus.macros", [{ id: "b", name: "From other window", text: "z" }] as TerminalMacro[]);
+      return origStore(k, v);
+    };
+
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    // The other window's write survives untouched.
+    expect((state.get("nexus.macros") as TerminalMacro[]).map((m) => m.name)).toEqual(["From other window"]);
+    expect(store.getAll().map((m) => m.name)).toEqual(["From other window"]);
+    expect(store.getLastAbsorbedCount()).toBe(0);
+
+    // The legacy setting is still there, so the next activation absorbs it against
+    // whatever the other window left behind. Clearing it here would have been the only
+    // remaining copy of "Absorbed" disappearing.
+    expect((vscode.__getConfig("nexus.terminal") as { global: unknown }).global).toEqual(legacy);
+
+    // The vault value that was written before the guard fired is an orphan, but a NAMED
+    // one: the ledger grows before the store, so Complete Reset can still sweep it.
+    const orphanKeys = [...secrets.keys()];
+    expect(orphanKeys).toHaveLength(1);
+    const indexed = ctx.globalState.get<string[]>("nexus.macros.secretIds", []);
+    expect(orphanKeys[0]).toBe(macroSecretKey(indexed[0]));
+  });
+
   it("does not duplicate secret macros when Settings Sync replays cleartext", async () => {
     const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
     vscode.__setConfig("nexus.terminal", { global: [{ name: "pw", text: "hunter2", secret: true }] });

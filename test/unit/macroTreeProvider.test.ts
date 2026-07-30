@@ -391,24 +391,28 @@ describe("MacroTreeProvider", () => {
     expect(provider.getTreeItem(item)).toBe(item);
   });
 
-  it("flags exactly the macros whose state key is claimed by more than one macro", async () => {
-    // InMemoryMacroStore re-keys duplicates on save (the write-time invariant), so this
-    // needs a store that surfaces persisted state verbatim — which is what
-    // VscodeMacroStore.reloadFromState() now does with a duplicate that predates the
-    // invariant. Without the conflict wired through getChildren(), the first two items
-    // would render as live zap triggers for rules MacroAutoTrigger never compiled.
+  // InMemoryMacroStore re-keys duplicates on save (the write-time invariant), so these
+  // need a store that surfaces persisted state verbatim — which is what
+  // VscodeMacroStore.reloadFromState() does with a duplicate that predates the invariant.
+  function useRawStore(macros: Array<Record<string, unknown>>): void {
     const rawStore = {
       async initialize() { /* no-op */ },
-      getAll: () => [
-        { id: "dup", name: "A", text: "a\n", triggerPattern: "AAA" },
-        { id: "dup", name: "B", text: "b\n", triggerPattern: "BBB" },
-        { id: "solo", name: "C", text: "c\n", triggerPattern: "CCC" }
-      ],
+      getAll: () => macros,
       async save() { /* no-op */ },
       onDidChange: () => () => { /* no-op */ },
       async clearAll() { /* no-op */ }
     };
     setActiveMacroStore(rawStore as unknown as Parameters<typeof setActiveMacroStore>[0]);
+  }
+
+  it("flags exactly the macros whose state key is claimed by more than one macro", async () => {
+    // Without the conflict wired through getChildren(), the first two items would render
+    // as live zap triggers for rules MacroAutoTrigger never compiled.
+    useRawStore([
+      { id: "dup", name: "A", text: "a\n", triggerPattern: "AAA" },
+      { id: "dup", name: "B", text: "b\n", triggerPattern: "BBB" },
+      { id: "solo", name: "C", text: "c\n", triggerPattern: "CCC" }
+    ]);
 
     const children = new MacroTreeProvider().getChildren();
     expect((children[0].iconPath as { id: string }).id).toBe("warning");
@@ -419,5 +423,38 @@ describe("MacroTreeProvider", () => {
     expect((children[2].iconPath as { id: string }).id).toBe("zap");
     expect(children[2].contextValue).toBe("nexus.macro.triggered");
     expect(children[2].tooltip).not.toContain("suppressed");
+  });
+
+  it("a claim by a PATTERNLESS macro still makes the key ambiguous — measured over the whole set, not the trigger-capable subset", async () => {
+    // The fixture above gives every macro a triggerPattern, so it passes just as well
+    // against a provider that computes ambiguity over trigger macros only — while that
+    // provider disagrees with MacroAutoTrigger.reload(), which measures over all macros
+    // because `setDisabled()`/`pruneState()` accept any macro. Here the secret password
+    // trigger's only rival is a plain macro with no pattern at all: narrow the set and
+    // "id:dup" is claimed once, the conflict disappears, and the secret macro renders as
+    // a live trigger for a rule that was never compiled — the exact dead control the
+    // suppression exists to prevent.
+    useRawStore([
+      { id: "dup", name: "Notes", text: "show run\n" },
+      { id: "dup", name: "Password", text: "", secret: true, triggerPattern: "[Pp]assword:" },
+      { id: "solo", name: "C", text: "c\n", triggerPattern: "CCC" }
+    ]);
+
+    const children = new MacroTreeProvider().getChildren();
+
+    // The secret trigger twin is suppressed and says so, with the secret (not
+    // `.triggered`) contextValue so Pause/Resume never appear for it.
+    expect((children[1].iconPath as { id: string }).id).toBe("warning");
+    expect(children[1].contextValue).toBe("nexus.macro.secret");
+    expect(children[1].tooltip).toContain("same internal id");
+
+    // The patternless twin shares the ambiguous key but has no auto-trigger to suppress,
+    // so it must NOT be decorated as broken — a warning icon there would be noise.
+    expect((children[0].iconPath as { id: string }).id).toBe("terminal");
+    expect(children[0].contextValue).toBe("nexus.macro");
+    expect(children[0].tooltip).not.toContain("suppressed");
+
+    expect((children[2].iconPath as { id: string }).id).toBe("zap");
+    expect(children[2].contextValue).toBe("nexus.macro.triggered");
   });
 });

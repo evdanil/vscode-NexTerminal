@@ -386,8 +386,9 @@ or absorbing macros from an old hand-written `nexus.terminal.macros` setting, ca
 leave two macros sharing one id. Nexus cannot tell such macros apart, so it will
 not guess: while the conflict exists, **neither macro auto-triggers**. Both are
 shown in the Macros view with a warning icon and a tooltip saying so — Nexus does
-not silently rewrite the ids, because for a secret macro that would mean deciding
-which macro owns the stored password.
+not rewrite the ids on its own, at startup or at any other time, because for a
+secret macro that would mean deciding which macro owns the stored password. The
+rewrite happens only as part of a change you make.
 
 To fix it, use **Move Up** or **Move Down** on any macro. That re-saves the list,
 which assigns fresh ids, and both macros go back to normal. The macro editor will
