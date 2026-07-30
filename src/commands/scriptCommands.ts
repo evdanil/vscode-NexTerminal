@@ -3,6 +3,7 @@ import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeMana
 import { parseScriptHeader } from "../services/scripts/scriptHeader";
 import { resolveScriptsDir } from "../services/scripts/resolveScriptsDir";
 import { repositoryBlobUrl, repositoryTreeUrl } from "../utils/repositoryLinks";
+import { normalizeFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 
 /**
  * Structural check for a URI — `instanceof vscode.Uri` is unreliable across module
@@ -45,6 +46,19 @@ function toScriptUri(arg: unknown): vscode.Uri | undefined {
     if (isUriLike(maybe.resourceUri)) return maybe.resourceUri;
   }
   return undefined;
+}
+
+/**
+ * True when `arg` is a folder `ScriptNode` from the tree view's context menu
+ * (`{ kind: "folder"; path; uri; name }` — see `scriptTreeProvider.ts`). Used
+ * so "New Script" / "New Folder" invoked from a folder's context menu can
+ * pre-seed that folder as the destination (§5.7).
+ */
+function scriptFolderArgPath(arg: unknown): string | undefined {
+  if (!arg || typeof arg !== "object") return undefined;
+  const maybe = arg as { kind?: unknown; path?: unknown };
+  if (maybe.kind !== "folder") return undefined;
+  return typeof maybe.path === "string" ? maybe.path : undefined;
 }
 
 /**
@@ -208,6 +222,76 @@ function stripJsExtension(raw: string): string {
   return raw.replace(/\.js$/i, "");
 }
 
+/**
+ * §5.7 — the path grammar defect v2 introduced: the pre-existing leaf regex
+ * (`/^[A-Za-z0-9._-]+$/`) is safe ONLY because the old validator forbade "/"
+ * entirely. Once "/" is allowed so New Script can create into a folder
+ * (`cisco/backup`), the directory segments must be validated SEPARATELY with
+ * `normalizeFolderPath` (which rejects "..", ".", and "\" per segment and caps
+ * depth) — the leaf regex alone would accept ".." as a segment, and
+ * `Uri.joinPath(scriptsDir, "..", "..", "home", "evgeny", "startup.js")`
+ * resolves outside the scripts directory entirely. `\` is rejected up front
+ * with an explicit "use /" message, since this user base is on Windows/WSL
+ * and will type `cisco\backup`.
+ */
+export interface ScriptPathParts {
+  /** Normalized folder path the leaf lives in, or undefined for the scripts root. */
+  dirPath?: string;
+  /** The bare script name (no extension, no "/"). */
+  leaf: string;
+}
+
+function splitScriptPathSegments(raw: string): string[] {
+  return stripJsExtension(raw.trim())
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+}
+
+export function parseScriptPathInput(raw: string): ScriptPathParts | undefined {
+  if (raw.includes("\\")) return undefined;
+  const segments = splitScriptPathSegments(raw);
+  if (segments.length === 0) return undefined;
+  const leaf = segments[segments.length - 1];
+  if (!/^[A-Za-z0-9._-]+$/.test(leaf)) return undefined;
+  const dirSegments = segments.slice(0, -1);
+  if (dirSegments.length === 0) return { leaf };
+  const dirPath = normalizeFolderPath(dirSegments.join("/"));
+  if (dirPath === undefined) return undefined;
+  return { dirPath, leaf };
+}
+
+function validateScriptPathInput(raw: string): string | undefined {
+  if (raw.includes("\\")) {
+    return "Use '/' to separate folders, not '\\'.";
+  }
+  const segments = splitScriptPathSegments(raw);
+  if (segments.length === 0) return "Name is required";
+  const leaf = segments[segments.length - 1];
+  if (!/^[A-Za-z0-9._-]+$/.test(leaf)) {
+    return "Use letters, digits, '.', '_', or '-' for the script name";
+  }
+  if (segments.length > 1) {
+    const dirPath = normalizeFolderPath(segments.slice(0, -1).join("/"));
+    if (dirPath === undefined) {
+      return INVALID_FOLDER_PATH_MESSAGE;
+    }
+  }
+  return undefined;
+}
+
+function validateNewScriptFolderPath(raw: string): string | undefined {
+  if (raw.includes("\\")) {
+    return "Use '/' to separate folders, not '\\'.";
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) return "Folder path is required";
+  if (normalizeFolderPath(trimmed) === undefined) {
+    return INVALID_FOLDER_PATH_MESSAGE;
+  }
+  return undefined;
+}
+
 function resolveScriptTemplate(picked: unknown): ScriptTemplate | undefined {
   if (!picked || typeof picked !== "object") return undefined;
   const maybe = picked as { template?: ScriptTemplate; templateId?: string; id?: string; label?: string };
@@ -233,39 +317,82 @@ async function pickScriptTemplate(): Promise<ScriptTemplate | undefined> {
   return resolveScriptTemplate(picked);
 }
 
-async function createNewScript(globalStoragePath: string): Promise<void> {
+/**
+ * @param initialFolder - when invoked from a folder's context menu, the
+ * folder-relative path to pre-seed as a `folder/` prefix (§5.7) so the user
+ * just types the leaf name.
+ */
+async function createNewScript(globalStoragePath: string, initialFolder?: string): Promise<void> {
   const template = await pickScriptTemplate();
   if (!template) return;
 
+  const initialValue = initialFolder ? `${initialFolder}/` : "";
   const input = await vscode.window.showInputBox({
-    prompt: "Name for the new Nexus script",
+    prompt: "Name for the new Nexus script (use / for a folder, e.g. cisco/backup)",
     placeHolder: "my-procedure",
-    validateInput: (value) => {
-      const stripped = stripJsExtension(value ?? "");
-      if (!stripped) return "Name is required";
-      if (!/^[A-Za-z0-9._-]+$/.test(stripped)) return "Use letters, digits, '.', '_', or '-' only";
-      return undefined;
-    }
+    value: initialValue || undefined,
+    valueSelection: initialValue ? [initialValue.length, initialValue.length] : undefined,
+    validateInput: validateScriptPathInput
   });
   if (!input) return;
-  const name = stripJsExtension(input);
-  if (!name) return;
+  const parsed = parseScriptPathInput(input);
+  if (!parsed) return;
+  const { dirPath, leaf } = parsed;
   const scriptsDir = resolveScriptsDir(globalStoragePath);
-  const target = vscode.Uri.joinPath(scriptsDir, `${name}.js`);
+  const targetDir = dirPath ? vscode.Uri.joinPath(scriptsDir, dirPath) : scriptsDir;
+  const target = vscode.Uri.joinPath(targetDir, `${leaf}.js`);
   try {
-    await vscode.workspace.fs.createDirectory(scriptsDir);
+    // Recursive (mkdir -p semantics) — also creates any intermediate folders
+    // in `dirPath` (§5.7 — "New Script accepts a path, creating intermediate
+    // directories").
+    await vscode.workspace.fs.createDirectory(targetDir);
   } catch {
     /* idempotent */
   }
   try {
     await vscode.workspace.fs.stat(target);
-    void vscode.window.showWarningMessage(`${name}.js already exists. Opening the existing file.`);
+    void vscode.window.showWarningMessage(`${leaf}.js already exists. Opening the existing file.`);
   } catch {
-    const body = template.body.replaceAll("{{NAME}}", name);
+    const body = template.body.replaceAll("{{NAME}}", leaf);
     await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(body));
   }
   const doc = await vscode.workspace.openTextDocument(target);
   await vscode.window.showTextDocument(doc);
+}
+
+/**
+ * §5.7 — "New Folder" creates a real directory under the scripts root; it
+ * renders in the Scripts tree immediately (all directories show, whether or
+ * not they contain scripts — §5.4) and survives empty, same as the other two
+ * sidebars' folders (§1.1). Naming an existing folder is a no-op with an info
+ * message, not an error.
+ *
+ * @param initialFolder - when invoked from a folder's context menu, seeds a
+ * `folder/` prefix so the created folder nests under it.
+ */
+async function createNewScriptFolder(globalStoragePath: string, initialFolder?: string): Promise<void> {
+  const initialValue = initialFolder ? `${initialFolder}/` : "";
+  const input = await vscode.window.showInputBox({
+    title: "New Script Folder",
+    prompt: "Enter a folder path (use / for nested folders)",
+    placeHolder: "e.g. cisco/backup",
+    value: initialValue || undefined,
+    valueSelection: initialValue ? [initialValue.length, initialValue.length] : undefined,
+    validateInput: validateNewScriptFolderPath
+  });
+  if (!input) return;
+  const normalized = normalizeFolderPath(input.trim());
+  if (!normalized) return;
+  const scriptsDir = resolveScriptsDir(globalStoragePath);
+  const target = vscode.Uri.joinPath(scriptsDir, normalized);
+  try {
+    await vscode.workspace.fs.stat(target);
+    void vscode.window.showInformationMessage(`Folder "${normalized}" already exists.`);
+    return;
+  } catch {
+    // Doesn't exist yet — fall through and create it.
+  }
+  await vscode.workspace.fs.createDirectory(target);
 }
 
 function scriptingDocsUrl(): string {
@@ -309,7 +436,8 @@ export function registerScriptCommands(
   manager: ScriptRuntimeManager,
   outputChannel: vscode.OutputChannel,
   globalStoragePath: string,
-  resolveSessionForTerminal?: TerminalToSessionResolver
+  resolveSessionForTerminal?: TerminalToSessionResolver,
+  refreshScriptTree?: () => void
 ): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.script.run", async (arg?: unknown) => {
@@ -388,8 +516,24 @@ export function registerScriptCommands(
       outputChannel.show(true);
     }),
 
-    vscode.commands.registerCommand("nexus.script.new", async () => {
-      await createNewScript(globalStoragePath);
+    // Invoked with no arg from the view-title button / CodeLens / Palette, or
+    // with a folder `ScriptNode` from a folder's right-click menu (§5.7) — in
+    // the latter case the folder path pre-seeds the input box.
+    vscode.commands.registerCommand("nexus.script.new", async (arg?: unknown) => {
+      await createNewScript(globalStoragePath, scriptFolderArgPath(arg));
+    }),
+
+    // §5.7 — View-title button + folder context menu. Creates a real
+    // directory that renders immediately and persists empty (§1.1, §5.4).
+    vscode.commands.registerCommand("nexus.script.newFolder", async (arg?: unknown) => {
+      await createNewScriptFolder(globalStoragePath, scriptFolderArgPath(arg));
+    }),
+
+    // §5.2 — manual rescan button on the Scripts view title bar. Bypasses the
+    // watcher's debounce so a user who just renamed a folder outside VS Code
+    // doesn't have to wait ~300ms or trigger another filesystem event.
+    vscode.commands.registerCommand("nexus.script.refresh", () => {
+      refreshScriptTree?.();
     }),
 
     vscode.commands.registerCommand("nexus.script.openDocs", async () => {

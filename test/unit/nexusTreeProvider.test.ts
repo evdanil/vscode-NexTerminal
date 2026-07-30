@@ -988,3 +988,25 @@ describe("NexusTreeProvider session activity indicators", () => {
     expect(sessions[1].description).toBe("▶ active");
   });
 });
+
+describe("FolderTreeItem — parameterised contextValue/id (§4.10)", () => {
+  it("defaults preserve the Connectivity Hub's existing behaviour exactly", () => {
+    const item = new FolderTreeItem("Cisco", "Cisco");
+    expect(item.contextValue).toBe("nexus.folder");
+    expect(item.id).toBe("folder:Cisco");
+  });
+
+  it("hasDirectServers still selects nexus.folderWithServers when contextValue is not overridden", () => {
+    const item = new FolderTreeItem("Cisco", "Cisco", undefined, true);
+    expect(item.contextValue).toBe("nexus.folderWithServers");
+  });
+
+  it("an explicit contextValue and idPrefix override both — used by the Macros view (§4.10) to reuse this class", () => {
+    const item = new FolderTreeItem("Cisco", "Cisco", undefined, false, "nexus.folder.macros", "macro-folder");
+    expect(item.contextValue).toBe("nexus.folder.macros");
+    expect(item.id).toBe("macro-folder:Cisco");
+    // And critically: this contextValue must NOT match the six menu entries
+    // gated on the unanchored /^nexus\.macro/ prefix (§4.10's actual bug).
+    expect(/^nexus\.macro/.test(item.contextValue!)).toBe(false);
+  });
+});

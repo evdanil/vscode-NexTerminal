@@ -58,8 +58,22 @@ export interface MacroStore {
   save(macros: TerminalMacro[]): Promise<void>;
   /** Subscribe to changes. Returns a disposer. */
   onDidChange(listener: MacroStoreChangeListener): () => void;
-  /** Clear all state (macros + vault entries). Used by completeReset. */
+  /** Clear all state (macros + vault entries + explicit folders). Used by completeReset. */
   clearAll(): Promise<void>;
+  /**
+   * Explicit macro folders (`nexus.macros.folders`) — folders that exist even
+   * with zero macros assigned to them (§4.1). Sanitized: every entry is a
+   * valid, non-empty folder path. The full rendered folder set is the union
+   * of this list and folders derived from macros' `group` — see
+   * `collectMacroFolders()` in `src/services/macroFolders.ts`.
+   */
+  getFolders(): string[];
+  /**
+   * Persists the given explicit folder list. Untrusted input (§4.2) is
+   * sanitized: non-strings and structurally invalid paths are dropped,
+   * duplicates collapsed.
+   */
+  saveFolders(folders: string[]): Promise<void>;
 }
 
 /**

@@ -21,6 +21,7 @@ Nexus Scripts let you automate multi-step terminal procedures in plain JavaScrip
 - [Input locking](#input-locking)
 - [Common recipes](#common-recipes)
 - [Settings](#settings)
+- [Organising scripts into folders](#organising-scripts-into-folders)
 - [Commands and views](#commands-and-views)
 - [Troubleshooting](#troubleshooting)
 - [Security and trust](#security-and-trust)
@@ -590,6 +591,40 @@ Settings changes take effect on the **next** script run — they don't retroacti
 
 ---
 
+## Organising scripts into folders
+
+The scripts directory is a real filesystem folder, so the Scripts view mirrors
+whatever directory structure you put under it — subfolders show up, in any
+depth, whether or not they contain a script. Folders are yours to create — an
+empty folder stays until you remove it.
+
+- **New Script** accepts a `/`-separated path (e.g. `cisco/backup`), and
+  creates any missing intermediate folders for you. A folder's right-click
+  menu also has its own **New Script**, which pre-fills that folder as a
+  prefix so you only type the leaf name.
+- **New Folder** — the view's title bar button, or a folder's right-click
+  menu for a nested folder — creates a real directory. It shows up
+  immediately, even before you put anything in it.
+- A folder's right-click menu also has **Reveal in Explorer**, which opens
+  that directory in your OS file manager.
+- Path segments are validated the same way folders are validated everywhere
+  else in Nexus: `.` and `..` are rejected, depth is capped at 10 levels, and
+  a `\` is rejected outright with a message telling you to use `/` instead —
+  typing `cisco\backup` (a natural mistake on Windows) does not silently
+  create a folder literally named `cisco\backup`, nor does it let a path like
+  `../../../home/you/startup` escape the scripts directory.
+- The Scripts view has its own `$(refresh)` **Refresh Scripts** button. Under
+  the hood it also refreshes on its own when the scripts directory changes on
+  disk — Nexus watches every file and folder in it, debounced by about
+  300ms so a burst of saves or a directory rename only triggers one rescan.
+- **Scan limits.** To keep a misconfigured `nexus.scripts.path` (e.g.
+  pointing at your whole home directory) from hanging the sidebar, the scan
+  stops after 10 levels of nesting or 500 examined directories/non-script
+  files (`.js` files themselves don't count against that limit). If the limit
+  is hit, a "Stopped after 500 entries — some scripts may be hidden" row
+  pins to the very top of the Scripts view; clicking it opens the
+  `nexus.scripts.path` setting so you can point Nexus at a narrower folder.
+
 ## Commands and views
 
 Registered under the `nexus.script.*` namespace and available in the Command Palette:
@@ -599,7 +634,9 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | `Nexus: Run Nexus Script` | `Ctrl+Alt+R` (macOS `⌘⌥R`) when an editor is focused on a `.js` file | Pick a script from a file dialog (or pass a URI argument from a CodeLens) and always show the session picker. |
 | `Nexus: Quick Run in Active Terminal` | — | Bind the script to whichever Nexus terminal is currently focused — no picker. Falls back to the session picker if no terminal is focused or the focused terminal isn't a Nexus session. Wired to the sidebar's inline ▶ button. |
 | `Nexus: Stop Nexus Script` | `Ctrl+Alt+S` (macOS `⌘⌥S`) when a script is running | Stop a running script. Prompts if more than one is running. |
-| `Nexus: New Nexus Script` | — | Create a new script from a starter template in your configured scripts directory. |
+| `Nexus: New Nexus Script` | — | Create a new script from a starter template in your configured scripts directory. Accepts a `/`-separated path (`cisco/backup`) to create it inside a folder, creating missing intermediate folders. |
+| `Nexus: New Folder` (Scripts view title bar, or a folder's right-click menu) | — | Create a real directory under the scripts folder. Shows up immediately, even while empty. |
+| `Nexus: Refresh Scripts` | — | Manually rescan the scripts directory, bypassing the ~300ms watcher debounce. |
 | `Nexus: Edit Script` | — | Right-click a script → Edit. Opens the file in the editor. (Clicking the row no longer auto-opens the editor — it would be noisy.) |
 | `Nexus: Delete Script` | — | Right-click a script in the sidebar. Asks for confirmation, then moves to Trash. |
 | `Nexus: Open Scripts Folder` | — | Reveal the configured scripts directory in the OS file manager. |
@@ -610,7 +647,7 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 
 **UI surfaces:**
 
-- **Nexus sidebar → Scripts** — lists all `.js` files under the configured directory that carry the `@nexus-script` marker. Clicking the row does **nothing by default** (prevents accidental editor churn); use the right-click menu for Edit / Run / Stop / Reveal / Delete, or the inline **▶** button for quick-run. The view's title bar has buttons for New Script, Open Scripts Folder, Open Scripting Guide, and Open Script Examples. Empty state (no folder / no scripts) shows inline help links for those same getting-started actions.
+- **Nexus sidebar → Scripts** — mirrors the folder structure under the configured scripts directory: subfolders render as folders (whether or not they hold a script), sorted ahead of scripts, both alphabetically. Only `.js` files that carry the `@nexus-script` marker show as script rows; a folder's own right-click menu adds New Script (into that folder), New Folder, and Reveal in Explorer. Clicking a script row does **nothing by default** (prevents accidental editor churn); use the right-click menu for Edit / Run / Stop / Reveal / Delete, or the inline **▶** button for quick-run. The view's title bar has buttons for New Script, New Folder, Refresh Scripts, Open Scripts Folder, Open Scripting Guide, and Open Script Examples. The three-link empty state (New Script / Open Scripting Guide / Open Script Examples) shows only when there isn't a single marked script anywhere in the tree, and only at the root — a folder with no scripts of its own just renders empty, the same as any empty folder in a file explorer.
 - **Editor CodeLens** — the inline `▶ Run in Nexus` action at the top of any script file. Flips to `◼ Stop` while a run is active on that file. Works on `file://`, `vscode-remote://`, and `untitled:` schemes. Always shows the session picker (the editor context is "I'm authoring" — deliberate target choice).
 - **Nexus Settings panel → Scripts** — the same four settings as in `Settings` below, surfaced in the Nexus Settings panel webview (no need to open `settings.json`).
 - **Connectivity Hub right-click → Connect/Open and Run Script…** — available on SSH, serial, and Local Shell profile items. Picks a compatible script (filtered by `@target-type`), opens the profile, then auto-runs the script once the session registers.
@@ -635,6 +672,8 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | Web extension shows "not available in browser" | Expected — desktop-only for v1 | Use VS Code Desktop |
 | Can't find where my scripts are stored without a workspace | No folder is open — Nexus uses the extension's global-storage folder | Run `Nexus: Open Scripts Folder` (or check `nexus.scripts.path` — absolute paths always win). |
 | Error toast says the script "failed" on a normal `Timeout` | Shouldn't happen — expected codes are filtered | File an issue; include the Output Channel contents |
+| A folder named `types` in the scripts sidebar doesn't show its contents | The generated `types/` at the *root* of the scripts directory (`<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json`) is intentionally hidden from the tree — it's Nexus's own scaffolding, not yours | Only the root-level `types/` is hidden. A `types/` folder anywhere else — e.g. `cisco/types/probe.js` — is a normal folder and shows its scripts like any other |
+| Some scripts or folders seem to be missing from a very large or deeply nested scripts directory | The scan stops after 10 levels of nesting or 500 examined directories/non-script files, to keep a misconfigured `nexus.scripts.path` from hanging the sidebar | Point `nexus.scripts.path` at a narrower folder — click the "Stopped after 500 entries" row pinned at the top of the Scripts view to jump straight to that setting |
 
 ---
 

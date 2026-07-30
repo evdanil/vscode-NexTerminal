@@ -8,6 +8,7 @@ import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./macroProfileOptions";
 import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } from "../services/macroVariables";
+import { sanitizeMacroGroup } from "../services/macroFolders";
 
 /**
  * One repeatable variable row (docs/plans/2026-07-29-macro-variables.md §9.1):
@@ -50,7 +51,9 @@ export function renderMacroEditorHtml(
   macros: TerminalMacro[],
   selectedIndex: number | null,
   nonce: string,
-  profiles: MacroProfileOptionInput[] = []
+  profiles: MacroProfileOptionInput[] = [],
+  folders: string[] = [],
+  seedGroup?: string
 ): string {
   const macro = selectedIndex !== null ? macros[selectedIndex] : undefined;
 
@@ -87,6 +90,18 @@ export function renderMacroEditorHtml(
 
   const nameValue = macro?.name ?? "";
   const textValue = macro?.text?.replace(/\n/g, "\n") ?? "";
+  // §4.11 — the Folder field. For an existing macro, its own (sanitized, §4.2)
+  // group; for a new macro, the caller's seed (e.g. `addToFolder`, §4.7).
+  const groupValue = macro ? (sanitizeMacroGroup(macro.group) ?? "") : (seedGroup ?? "");
+  // Each option carries its own indentation and the whole block is empty when there
+  // are no folders yet — which is the normal starting state. Interpolating an empty
+  // string into an already-indented line would leave the indent behind as a
+  // whitespace-only line, which `git diff --check` fails on via the rendered-HTML
+  // snapshot. The other dropdowns in this file never hit that because their option
+  // lists are static and always non-empty.
+  const folderOptionsHtml = folders.map((f) =>
+    `        <div class="custom-select-option" data-value="${escapeHtml(f)}">${escapeHtml(f)}</div>`
+  ).join("\n");
   const isSecret = macro?.secret ?? false;
   // §4.2 — `variables` is untrusted at every read site; `getValidMacroVariables`
   // applies the shape guard so a corrupt legacy/Settings-Sync record never
@@ -272,6 +287,18 @@ export function renderMacroEditorHtml(
     <input type="text" id="macro-binding" value="${escapeHtml(bindingValue)}" placeholder="e.g., alt+m, alt+shift+5, ctrl+shift+a" />
     <div class="field-error" id="error-binding"></div>
     <div class="hint">Macros without a shortcut can still be run via <strong>Alt+S</strong> (quick pick). Supported: Alt, Alt+Shift, Ctrl+Shift with A-Z or 0-9.</div>
+  </div>
+
+  <div class="form-group">
+    <label for="macro-folder">Folder</label>
+    <div class="custom-combobox" id="macro-folder-wrapper">
+      <input type="text" id="macro-folder" value="${escapeHtml(groupValue)}" placeholder="Type a folder path or pick existing..." autocomplete="off" />
+      <div class="custom-select-dropdown">
+${folderOptionsHtml}
+      </div>
+    </div>
+    <div class="field-error" id="error-folder"></div>
+    <div class="hint">Optional. Groups this macro under a sidebar folder. Use "/" for nested folders (e.g. Cisco/Routers).</div>
   </div>
 
   <div class="bottom-actions">
@@ -699,6 +726,11 @@ export function renderMacroEditorHtml(
           errorEl.textContent = "";
         }
       });
+      document.getElementById("macro-folder").addEventListener("input", function() {
+        markDirty();
+        document.getElementById("error-folder").textContent = "";
+      });
+      initCustomComboboxes();
 
       // Macro selector — confirm discard if dirty
       initCustomSelects(function(wrapper, opt) {
@@ -727,6 +759,7 @@ export function renderMacroEditorHtml(
         var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
         var triggerScope = document.getElementById("macro-trigger-scope").value;
         var triggerProfileId = document.getElementById("macro-trigger-profile").value.trim();
+        var folderVal = document.getElementById("macro-folder").value.trim();
 
         // Validate
         var valid = true;
@@ -809,7 +842,8 @@ export function renderMacroEditorHtml(
           triggerInitiallyDisabled: triggerInitiallyDisabled,
           triggerScope: triggerScope,
           triggerProfileId: triggerProfileId || null,
-          variables: variablesForSave
+          variables: variablesForSave,
+          group: folderVal || null
         });
       });
 

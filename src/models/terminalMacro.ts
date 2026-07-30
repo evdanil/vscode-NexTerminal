@@ -42,4 +42,14 @@ export interface TerminalMacro {
    * existing macro's text is returned by identity (see src/services/macroVariables.ts).
    */
   variables?: MacroVariable[];
+  /**
+   * Sidebar folder path (e.g. `"Cisco/Routers"`). `""` canonicalizes to
+   * `undefined` at every read and write (see `sanitizeMacroGroup()` in
+   * `src/services/macroFolders.ts`). UNTRUSTED at every read site (§4.2 of
+   * docs/plans/2026-07-30-macro-script-folders.md) — legacy-settings
+   * absorption and a value already sitting in `MACROS_KEY` can both carry a
+   * non-string, `".."`, or over-depth value. Never consult this field
+   * directly; always go through `sanitizeMacroGroup()` / `macroGroup()`.
+   */
+  group?: string;
 }

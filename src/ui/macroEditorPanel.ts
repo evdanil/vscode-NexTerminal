@@ -7,12 +7,15 @@ import {
 import {
   confirmBindingWarnings,
   getActiveMacroStore,
+  getMacroFolders,
   getMacros,
   saveMacros
 } from "../macroSettings";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
+import { collectMacroFolders } from "../services/macroFolders";
+import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { renderMacroEditorHtml } from "./macroEditorHtml";
 import type { MacroProfileOptionInput } from "./macroProfileOptions";
@@ -48,6 +51,11 @@ function resolveUniqueMacroIndex(macros: readonly TerminalMacro[], macroId: stri
 
 function isAmbiguousMacroId(macros: readonly TerminalMacro[], macroId: string | null): boolean {
   return macroId !== null && macros.filter((m) => m.id === macroId).length > 1;
+}
+
+/** §4.7 `addToFolder` seeds a new macro's Folder field with the clicked folder. */
+export interface MacroEditorSeed {
+  group?: string;
 }
 
 /**
@@ -88,6 +96,8 @@ export class MacroEditorPanel {
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
   private selectedIndex: number | null = null;
+  /** Set only by `openNew(seed)`; consumed while composing that one new macro (§4.7). */
+  private pendingSeedGroup: string | undefined;
   private unsubscribe: () => void = () => {};
   /**
    * Set while this panel is persisting its own save/delete. The macro store's
@@ -100,8 +110,9 @@ export class MacroEditorPanel {
     MacroEditorPanel.profileProvider = provider;
   }
 
-  private constructor(initialIndex: number | null) {
+  private constructor(initialIndex: number | null, seedGroup?: string) {
     this.selectedIndex = initialIndex;
+    this.pendingSeedGroup = seedGroup;
     this.panel = vscode.window.createWebviewPanel(
       "nexus.macroEditor",
       "Macro Editor",
@@ -136,14 +147,15 @@ export class MacroEditorPanel {
     MacroEditorPanel.instance = new MacroEditorPanel(index);
   }
 
-  public static openNew(): void {
+  public static openNew(seed?: MacroEditorSeed): void {
     if (MacroEditorPanel.instance) {
       MacroEditorPanel.instance.panel.reveal();
       MacroEditorPanel.instance.selectedIndex = null;
+      MacroEditorPanel.instance.pendingSeedGroup = seed?.group;
       MacroEditorPanel.instance.render();
       return;
     }
-    MacroEditorPanel.instance = new MacroEditorPanel(null);
+    MacroEditorPanel.instance = new MacroEditorPanel(null, seed?.group);
   }
 
   private render(): void {
@@ -154,7 +166,11 @@ export class MacroEditorPanel {
     if (this.selectedIndex !== null && this.selectedIndex >= macros.length) {
       this.selectedIndex = macros.length > 0 ? macros.length - 1 : null;
     }
-    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider());
+    // §4.11 — the seed only ever applies while composing a not-yet-saved new
+    // macro; irrelevant once an existing macro is selected.
+    const seedGroup = this.selectedIndex === null ? this.pendingSeedGroup : undefined;
+    const folders = collectMacroFolders(macros, getMacroFolders());
+    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider(), folders, seedGroup);
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
@@ -163,6 +179,9 @@ export class MacroEditorPanel {
         const value = msg.value as string;
         if (value === "__new__") {
           this.selectedIndex = null;
+          // A user-driven "+ New Blank Macro" pick, not the addToFolder seed
+          // path — an earlier seed must not leak into this genuinely blank macro.
+          this.pendingSeedGroup = undefined;
         } else {
           const parsed = parseInt(value, 10);
           this.selectedIndex = Number.isNaN(parsed) ? null : parsed;
@@ -180,6 +199,7 @@ export class MacroEditorPanel {
         if (answer === "Discard") {
           if (target === "__new__") {
             this.selectedIndex = null;
+            this.pendingSeedGroup = undefined;
           } else {
             const parsed = parseInt(target, 10);
             this.selectedIndex = Number.isNaN(parsed) ? null : parsed;
@@ -288,6 +308,21 @@ export class MacroEditorPanel {
           }
         }
 
+        // §4.11 — Folder field validation, same helper every profile form uses.
+        // "" canonicalizes to `undefined` (§4.1); anything else structurally
+        // invalid (`..`, `.`, `\`, over-depth) is rejected rather than silently
+        // dropped, since here (unlike ingest, §4.2) the user is right there to fix it.
+        const groupInput = typeof msg.group === "string" ? msg.group : "";
+        const normalizedGroup = normalizeOptionalFolderPath(groupInput);
+        if (normalizedGroup === null) {
+          void this.panel.webview.postMessage({
+            type: "saveError",
+            field: "folder",
+            message: INVALID_FOLDER_PATH_MESSAGE
+          });
+          return;
+        }
+
         // §9.4 — host-side enforcement of every variable rule via the single
         // shared validator (never re-implemented here or trusted from the
         // webview alone; retainContextWhenHidden means the webview's own
@@ -373,6 +408,10 @@ export class MacroEditorPanel {
         // in the UI (variables === []) would silently resurrect the old array
         // through the `{ ...existingMacro }` spread above.
         delete macro.variables;
+        // §4.1 — "" canonicalizes to `undefined`; only a non-empty normalized
+        // path is ever persisted.
+        delete macro.group;
+        if (normalizedGroup) macro.group = normalizedGroup;
         if (secret) macro.secret = true;
         else delete macro.secret;
         const triggerCooldown = msg.triggerCooldown as number | undefined;

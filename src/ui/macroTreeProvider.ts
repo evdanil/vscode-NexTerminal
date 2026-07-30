@@ -2,12 +2,21 @@ import * as vscode from "vscode";
 import { bindingToDisplayLabel } from "../macroBindings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { TerminalMacro } from "../models/terminalMacro";
-import { getMacros } from "../macroSettings";
+import { getMacroFolders, getMacros, saveMacros } from "../macroSettings";
 import { findAmbiguousMacroStateKeys, macroStateKey } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders } from "../services/macroVariables";
+import { collectMacroFolders, sanitizeMacroGroup } from "../services/macroFolders";
+import { folderDisplayName, parentPath } from "../utils/folderPaths";
+import { naturalComparePath } from "../utils/naturalCompare";
+import { MACRO_DRAG_MIME } from "./dndMimeTypes";
+import { FolderTreeItem } from "./nexusTreeProvider";
 import { VARIABLE_MARKER } from "./macroVariableMarker";
 
 export { VARIABLE_MARKER };
+
+/** §4.10 — reuses the Hub's `FolderTreeItem`, parameterised (see its doc comment). */
+const MACRO_FOLDER_CONTEXT_VALUE = "nexus.folder.macros";
+const MACRO_FOLDER_ID_PREFIX = "macro-folder";
 
 export class MacroTreeItem extends vscode.TreeItem {
   public constructor(
@@ -110,9 +119,33 @@ export class MacroTreeItem extends vscode.TreeItem {
   }
 }
 
-export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem> {
-  private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<MacroTreeItem | undefined>();
+/** Everything the Macros tree can render: a macro leaf, or a folder (§4.3, §4.10). */
+export type MacroTreeElement = MacroTreeItem | FolderTreeItem;
+
+function makeMacroFolderItem(path: string, collapsibleState: vscode.TreeItemCollapsibleState): FolderTreeItem {
+  return new FolderTreeItem(
+    path,
+    folderDisplayName(path),
+    collapsibleState,
+    false,
+    MACRO_FOLDER_CONTEXT_VALUE,
+    MACRO_FOLDER_ID_PREFIX
+  );
+}
+
+export class MacroTreeProvider
+  implements vscode.TreeDataProvider<MacroTreeElement>, vscode.TreeDragAndDropController<MacroTreeElement>
+{
+  private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<MacroTreeElement | undefined>();
   public readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
+  // §4.10 — folders default EXPANDED; this set only ever holds explicitly
+  // collapsed paths (mirrors NexusTreeProvider's collapsedFolders).
+  private readonly collapsedFolders = new Set<string>();
+
+  // §4.9 — a distinct MIME so this view does not advertise acceptance of the
+  // Hub's server/serial/folder drags (and vice versa).
+  public readonly dragMimeTypes = [MACRO_DRAG_MIME];
+  public readonly dropMimeTypes = [MACRO_DRAG_MIME];
 
   public constructor(
     private readonly isTriggerDisabled: (macro: TerminalMacro) => boolean = () => false
@@ -122,22 +155,128 @@ export class MacroTreeProvider implements vscode.TreeDataProvider<MacroTreeItem>
     this.onDidChangeTreeDataEmitter.fire(undefined);
   }
 
-  public getTreeItem(element: MacroTreeItem): vscode.TreeItem {
+  public getTreeItem(element: MacroTreeElement): vscode.TreeItem {
     return element;
   }
 
-  public getChildren(): MacroTreeItem[] {
+  public collapseFolder(path: string): void {
+    this.collapsedFolders.add(path);
+  }
+
+  public expandFolder(path: string): void {
+    this.collapsedFolders.delete(path);
+  }
+
+  public getCollapsedFolders(): string[] {
+    return [...this.collapsedFolders];
+  }
+
+  public loadCollapsedFolders(paths: string[]): void {
+    this.collapsedFolders.clear();
+    for (const p of paths) {
+      this.collapsedFolders.add(p);
+    }
+  }
+
+  /**
+   * §4.3 — folders are a display projection; `MacroTreeItem.index` stays the
+   * TRUE index into `getMacros()`, computed against the FULL flat array
+   * before any per-folder filtering — never a filtered ordinal. §4.4 —
+   * folders sort by `naturalComparePath` and render first; macros render in
+   * ARRAY ORDER (both inside a folder and at root), since that order is what
+   * `moveUp`/`moveDown` (and the flat run quick pick) operate on.
+   */
+  public getChildren(element?: MacroTreeElement): MacroTreeElement[] {
     const macros = getMacros();
     // Derived from THIS render's macro list via the same helper `MacroAutoTrigger.reload()`
     // uses, rather than queried off the trigger instance: identical input, identical
-    // rule, no way for the tree to disagree with what actually compiled.
+    // rule, no way for the tree to disagree with what actually compiled. Computed over the
+    // FULL flat array, not the current folder's slice — ambiguity is a property of the
+    // whole macro list, and two twins can sit in different folders.
     const ambiguousKeys = findAmbiguousMacroStateKeys(macros);
+    const explicitFolders = getMacroFolders();
+    const allFolders = collectMacroFolders(macros, explicitFolders);
+    const targetPath = element instanceof FolderTreeItem ? element.folderPath : undefined;
 
-    return macros.map((macro, index) => {
+    const childFolders = allFolders
+      .filter((f) => parentPath(f) === targetPath)
+      .sort((a, b) => naturalComparePath(a, b))
+      .map((f) =>
+        makeMacroFolderItem(
+          f,
+          this.collapsedFolders.has(f)
+            ? vscode.TreeItemCollapsibleState.Collapsed
+            : vscode.TreeItemCollapsibleState.Expanded
+        )
+      );
+
+    const macroItems: MacroTreeItem[] = [];
+    macros.forEach((macro, index) => {
+      if (sanitizeMacroGroup(macro.group) !== targetPath) return;
       const displayBinding = getAssignedBinding(macro);
       const triggerDisabled = macro.triggerPattern ? this.isTriggerDisabled(macro) : undefined;
       const identityConflict = ambiguousKeys.has(macroStateKey(macro));
-      return new MacroTreeItem(macro, index, displayBinding, triggerDisabled, identityConflict);
+      macroItems.push(new MacroTreeItem(macro, index, displayBinding, triggerDisabled, identityConflict));
     });
+
+    return [...childFolders, ...macroItems];
+  }
+
+  /** §4.9 — the payload is the dragged macro's stable `id`, never an index. */
+  public async handleDrag(
+    source: readonly MacroTreeElement[],
+    dataTransfer: vscode.DataTransfer
+  ): Promise<void> {
+    const item = source[0];
+    if (item instanceof MacroTreeItem && item.macro.id) {
+      dataTransfer.set(MACRO_DRAG_MIME, new vscode.DataTransferItem(item.macro.id));
+    }
+    // Folders are not draggable in v1 (§4.9) — nothing else to serialize.
+  }
+
+  /**
+   * A drop onto a folder sets that macro's `group`; onto another macro row,
+   * targets THAT macro's own folder; onto root (`target === undefined`)
+   * clears `group` — the inverse gesture, mirroring the Hub's
+   * `NexusTreeProvider.handleDrop()` treatment of a root drop.
+   */
+  public async handleDrop(
+    target: MacroTreeElement | undefined,
+    dataTransfer: vscode.DataTransfer
+  ): Promise<void> {
+    const transferItem = dataTransfer.get(MACRO_DRAG_MIME);
+    if (!transferItem) {
+      return;
+    }
+    const macroId = await transferItem.asString();
+    if (!macroId) {
+      return;
+    }
+
+    let targetFolder: string | undefined;
+    if (target === undefined) {
+      targetFolder = undefined;
+    } else if (target instanceof FolderTreeItem) {
+      targetFolder = target.folderPath;
+    } else {
+      targetFolder = sanitizeMacroGroup(target.macro.group);
+    }
+
+    const macros = getMacros();
+    const index = macros.findIndex((m) => m.id === macroId);
+    if (index === -1) {
+      return;
+    }
+    if (sanitizeMacroGroup(macros[index].group) === targetFolder) {
+      return; // no-op — already in the target folder
+    }
+    const updated = { ...macros[index] };
+    if (targetFolder) {
+      updated.group = targetFolder;
+    } else {
+      delete updated.group;
+    }
+    macros[index] = updated;
+    await saveMacros(macros);
   }
 }

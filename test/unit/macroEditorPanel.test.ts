@@ -182,7 +182,11 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
           macros.splice(0, macros.length, ...next.map((m) => ({ ...m })));
         },
         onDidChange: () => () => { /* no-op */ },
-        async clearAll() { macros.length = 0; }
+        async clearAll() { macros.length = 0; },
+        // Neither fixture macro carries a `group`, so the editor's folder datalist is
+        // empty and the ambiguity behaviour under test is unaffected.
+        getFolders: () => [] as string[],
+        async saveFolders() { /* no-op */ }
       } as unknown as Parameters<typeof macroSettings.setActiveMacroStore>[0]);
       const { MacroEditorPanel } = await import("../../src/ui/macroEditorPanel");
       MacroEditorPanel.open(1); // opened on Beta
@@ -549,6 +553,62 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
         message: expect.stringContaining("malformed variable declarations")
       });
       expect(getMacros()[0].triggerPattern).toBe("[Pp]assword:");
+    });
+  });
+
+  describe("Folder field round-trip (§4.11)", () => {
+    it("persists a valid folder on a new macro", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({ group: "Cisco/Routers" }));
+
+      expect(getMacros()[0].group).toBe("Cisco/Routers");
+      expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+    });
+
+    it("null/absent group persists as no group at all", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({ group: null }));
+
+      expect(getMacros()[0].group).toBeUndefined();
+    });
+
+    it("clearing a previously-set group on an existing macro actually removes it (not resurrected via the spread)", async () => {
+      await harness([{ name: "M", text: "t", group: "Cisco" }]);
+      const macroId = getMacros()[0].id!;
+      const { sendMessage } = await openPanel(0);
+
+      await sendMessage(baseSaveMsg({ index: 0, id: macroId, group: null }));
+
+      expect(getMacros()[0].group).toBeUndefined();
+    });
+
+    it("rejects a path-traversal group and does not persist the macro", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({ group: "../secrets" }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({
+        type: "saveError",
+        field: "folder",
+        message: expect.stringContaining("Invalid folder path")
+      });
+      expect(getMacros()).toHaveLength(0);
+    });
+
+    it("addToFolder's seed (openNew({ group })) round-trips into the rendered HTML, and a save with no folder change persists that seeded value", async () => {
+      await harness([]);
+      const { MacroEditorPanel } = await import("../../src/ui/macroEditorPanel");
+      MacroEditorPanel.openNew({ group: "Cisco" });
+      expect(lastHtml).toContain('<input type="text" id="macro-folder" value="Cisco"');
+
+      await onDidReceiveMessageHandler!(baseSaveMsg({ group: "Cisco" }));
+
+      expect(getMacros()[0].group).toBe("Cisco");
     });
   });
 

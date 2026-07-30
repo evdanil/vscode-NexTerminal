@@ -18,6 +18,7 @@ let activeStore: InMemoryMacroStore;
  */
 class RawMacroStore implements MacroStore {
   private macros: TerminalMacro[] = [];
+  private folders: string[] = [];
   private readonly listeners = new Set<MacroStoreChangeListener>();
 
   public async initialize(): Promise<void> {
@@ -40,6 +41,19 @@ class RawMacroStore implements MacroStore {
 
   public async clearAll(): Promise<void> {
     this.macros = [];
+    this.folders = [];
+    for (const listener of this.listeners) listener();
+  }
+
+  // Kept in step with the MacroStore interface by hand: tsconfig.json only includes
+  // src/**/*.ts, so `implements MacroStore` is never actually checked here and this
+  // class silently drifted out of shape when folders were added.
+  public getFolders(): string[] {
+    return [...this.folders];
+  }
+
+  public async saveFolders(folders: string[]): Promise<void> {
+    this.folders = [...folders];
     for (const listener of this.listeners) listener();
   }
 }

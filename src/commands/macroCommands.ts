@@ -10,7 +10,9 @@ import {
 } from "../macroBindings";
 import {
   confirmBindingWarnings,
+  getMacroFolders,
   getMacros,
+  saveMacroFolders,
   saveMacros
 } from "../macroSettings";
 import {
@@ -21,6 +23,16 @@ import {
 } from "../macroBindingHelpers";
 import { repositoryBlobUrl } from "../utils/repositoryLinks";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders, withRedactedVariables } from "../services/macroVariables";
+import { collectMacroFolders, sanitizeMacroGroup } from "../services/macroFolders";
+import {
+  getAncestorPaths,
+  folderDisplayName,
+  isDescendantOrSelf,
+  normalizeFolderPath,
+  normalizeOptionalFolderPath,
+  parentPath,
+  INVALID_FOLDER_PATH_MESSAGE
+} from "../utils/folderPaths";
 import { runMacro } from "./macroVariablePrompt";
 // NOT imported from "../ui/macroTreeProvider": that module's `class MacroTreeItem
 // extends vscode.TreeItem` executes at load time, and a plain value import from
@@ -282,6 +294,224 @@ async function promptForBinding(
   return normalized;
 }
 
+// ---------------------------------------------------------------------------
+// Folders (§4 of docs/plans/2026-07-30-macro-script-folders.md)
+// ---------------------------------------------------------------------------
+
+/**
+ * Duck-typed, mirroring the existing `"macro" in arg` check just above: a
+ * value import of `FolderTreeItem` from `../ui/nexusTreeProvider` would force
+ * this module (and every test importing it) to load `vscode` fully shaped —
+ * the same reason `MacroTreeItem` is imported as `type` only (see the
+ * top-of-file comment on that import).
+ */
+function asFolderArg(arg: unknown): { folderPath: string } | undefined {
+  return arg instanceof Object && "folderPath" in arg && typeof (arg as { folderPath: unknown }).folderPath === "string"
+    ? (arg as { folderPath: string })
+    : undefined;
+}
+
+/** §4.8 — folder path goes in `detail`, never `description` (already carries the variable marker + `***`/text preview). */
+function macroFolderDetail(macro: TerminalMacro): string | undefined {
+  const group = sanitizeMacroGroup(macro.group);
+  return group ? `Folder: ${group}` : undefined;
+}
+
+/** The full rendered folder set (explicit ∪ derived from macro groups), per §4.1. */
+function allMacroFolders(macros: TerminalMacro[] = getMacros()): string[] {
+  return collectMacroFolders(macros, getMacroFolders());
+}
+
+/**
+ * Persists `path` (and every ancestor of it) as an explicit folder — mirrors
+ * `NexusCore.addGroup()`, which likewise seeds every ancestor so a nested
+ * folder created in one step leaves each ancestor independently existing and
+ * empty-persistable (§1.1).
+ */
+async function ensureMacroFolderExists(path: string): Promise<void> {
+  const next = new Set(getMacroFolders());
+  for (const ancestor of getAncestorPaths(path)) next.add(ancestor);
+  await saveMacroFolders([...next]);
+}
+
+function validateNewFolderPath(value: string): string | null {
+  const normalized = normalizeOptionalFolderPath(value);
+  if (normalized === null) {
+    return INVALID_FOLDER_PATH_MESSAGE;
+  }
+  if (!normalized) {
+    return "Folder path cannot be empty";
+  }
+  return null;
+}
+
+/**
+ * §4.7 — the shared folder picker behind `moveToFolder`: existing folders,
+ * "New folder…", and "(root)". Returns a folder path, `null` for "(root)"
+ * (clears `group`), or `undefined` if the user cancelled at any step.
+ */
+async function pickFolderDestination(macros: TerminalMacro[]): Promise<string | null | undefined> {
+  const folders = allMacroFolders(macros);
+  // `folderKind`, not `kind` — `vscode.QuickPickItem` already declares its own
+  // `kind?: QuickPickItemKind` (for separators); intersecting a same-named
+  // string-literal property with that numeric-enum one collapses to `never`.
+  type Choice = vscode.QuickPickItem & { folderKind: "root" | "new" | "folder"; path?: string };
+  const items: Choice[] = [
+    { label: "(root)", folderKind: "root" },
+    { label: "$(new-folder) New folder…", folderKind: "new" },
+    ...folders.map((f): Choice => ({ label: f, folderKind: "folder", path: f }))
+  ];
+  const picked = await vscode.window.showQuickPick(items, {
+    title: "Move to Folder",
+    placeHolder: "Select a destination folder"
+  });
+  if (!picked) {
+    return undefined;
+  }
+  if (picked.folderKind === "root") {
+    return null;
+  }
+  if (picked.folderKind === "folder") {
+    return picked.path;
+  }
+
+  const name = await vscode.window.showInputBox({
+    title: "New Macro Folder",
+    prompt: "Enter a folder path (use / for nested folders)",
+    placeHolder: "e.g. Cisco/Routers",
+    validateInput: validateNewFolderPath
+  });
+  if (!name) {
+    return undefined;
+  }
+  const normalized = normalizeOptionalFolderPath(name);
+  if (!normalized) {
+    return undefined;
+  }
+  await ensureMacroFolderExists(normalized);
+  return normalized;
+}
+
+/**
+ * §4.7 / §4.4 — `renameFolder` rewrites `group` on every descendant macro and
+ * remaps the explicit-folder list, prefix-safe via `isDescendantOrSelf` (so
+ * `Net` never touches `Network`). Renaming onto an existing path merges,
+ * matching the Hub's behavior.
+ */
+async function renameMacroFolder(oldPath: string, newPath: string): Promise<void> {
+  const explicit = getMacroFolders();
+  const nextExplicit = new Set<string>();
+  for (const f of explicit) {
+    if (isDescendantOrSelf(f, oldPath)) {
+      nextExplicit.add(newPath + f.slice(oldPath.length));
+    } else {
+      nextExplicit.add(f);
+    }
+  }
+  for (const ancestor of getAncestorPaths(newPath)) {
+    nextExplicit.add(ancestor);
+  }
+  await saveMacroFolders([...nextExplicit]);
+
+  const macros = getMacros();
+  let changed = false;
+  const updated = macros.map((m) => {
+    const group = sanitizeMacroGroup(m.group);
+    if (group !== undefined && isDescendantOrSelf(group, oldPath)) {
+      changed = true;
+      return { ...m, group: newPath + group.slice(oldPath.length) };
+    }
+    return m;
+  });
+  if (changed) {
+    await saveMacros(updated);
+  }
+}
+
+/**
+ * §4.7 — re-parents descendants to the removed folder's parent, preserving
+ * substructure; drops the explicit-folder entry. Never deletes macros. The
+ * `suffix.slice(1) || undefined` idiom mirrors `removeFolderCascade`
+ * (`nexusCore.ts:445-463`) exactly: it handles nested paths, root-level
+ * removal, and `""` canonicalization identically.
+ */
+async function removeMacroFolder(path: string): Promise<void> {
+  const macros = getMacros();
+  const affected = macros.filter((m) => {
+    const group = sanitizeMacroGroup(m.group);
+    return group !== undefined && isDescendantOrSelf(group, path);
+  });
+  if (affected.length > 0) {
+    const choice = await vscode.window.showWarningMessage(
+      `Remove folder "${folderDisplayName(path)}"? It contains ${affected.length} macro${affected.length === 1 ? "" : "s"} — they will be moved to the parent folder.`,
+      { modal: true },
+      "Remove Folder"
+    );
+    if (choice !== "Remove Folder") {
+      return;
+    }
+  }
+
+  const parent = parentPath(path);
+  let changed = false;
+  const updatedMacros = macros.map((m) => {
+    const group = sanitizeMacroGroup(m.group);
+    if (group === undefined || !isDescendantOrSelf(group, path)) {
+      return m;
+    }
+    changed = true;
+    const suffix = group.slice(path.length);
+    const newGroup = parent ? parent + suffix : (suffix.slice(1) || undefined);
+    const next = { ...m };
+    if (newGroup) {
+      next.group = newGroup;
+    } else {
+      delete next.group;
+    }
+    return next;
+  });
+  if (changed) {
+    await saveMacros(updatedMacros);
+  }
+
+  const explicit = getMacroFolders();
+  const nextExplicit = new Set<string>();
+  for (const f of explicit) {
+    if (!isDescendantOrSelf(f, path)) {
+      nextExplicit.add(f);
+      continue;
+    }
+    if (f === path) {
+      continue; // drop the removed folder's own explicit entry
+    }
+    const suffix = f.slice(path.length);
+    const newFolder = parent ? parent + suffix : suffix.slice(1);
+    if (newFolder) {
+      nextExplicit.add(newFolder);
+    }
+  }
+  await saveMacroFolders([...nextExplicit]);
+}
+
+/** §4.4 — same-`group` neighbours may be non-adjacent in the array. */
+function findPreviousInGroup(macros: TerminalMacro[], index: number, group: string | undefined): number {
+  for (let i = index - 1; i >= 0; i--) {
+    if (sanitizeMacroGroup(macros[i].group) === group) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function findNextInGroup(macros: TerminalMacro[], index: number, group: string | undefined): number {
+  for (let i = index + 1; i < macros.length; i++) {
+    if (sanitizeMacroGroup(macros[i].group) === group) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 export function registerMacroCommands(profileProvider?: () => MacroProfileOptionInput[]): vscode.Disposable[] {
   if (profileProvider) {
     MacroEditorPanel.setProfileProvider(profileProvider);
@@ -325,7 +555,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           return;
         }
         const pick = await vscode.window.showQuickPick(
-          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), index: i })),
+          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), index: i })),
           { title: "Select Macro to Remove" }
         );
         if (!pick) {
@@ -374,6 +604,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           return {
             label: `${prefix}${m.name}`,
             description: `${marker}${m.secret ? "***" : m.text.replace(/\n/g, "\\n")}`,
+            detail: macroFolderDetail(m),
             index: i
           };
         }),
@@ -440,7 +671,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           return;
         }
         const pick = await vscode.window.showQuickPick(
-          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), index: i })),
+          macros.map((m, i) => ({ label: m.name, description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"), detail: macroFolderDetail(m), index: i })),
           { title: "Select Macro" }
         );
         if (!pick) {
@@ -461,30 +692,173 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       await saveMacros(macros);
     }),
 
+    // §4.4 — swaps with the previous/next macro SHARING THE SAME `group`, not
+    // necessarily the adjacent array element. Because same-group neighbours
+    // may be non-adjacent, this can swap non-adjacent elements — acceptable,
+    // and visible as a bigger jump in the flat run picker.
     vscode.commands.registerCommand("nexus.macro.moveUp", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
-      if (!item || item.index <= 0) {
+      if (!item || item.index < 0) {
         return;
       }
       const macros = getMacros();
       if (item.index >= macros.length) {
         return;
       }
-      [macros[item.index - 1], macros[item.index]] = [macros[item.index], macros[item.index - 1]];
+      const group = sanitizeMacroGroup(macros[item.index].group);
+      const prevIndex = findPreviousInGroup(macros, item.index, group);
+      if (prevIndex === -1) {
+        void vscode.window.setStatusBarMessage(
+          group ? "Already at the top of this folder" : "Already at the top of the list",
+          2000
+        );
+        return;
+      }
+      [macros[prevIndex], macros[item.index]] = [macros[item.index], macros[prevIndex]];
       await saveMacros(macros);
     }),
 
     vscode.commands.registerCommand("nexus.macro.moveDown", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
-      if (!item) {
+      if (!item || item.index < 0) {
         return;
       }
       const macros = getMacros();
-      if (item.index >= macros.length - 1) {
+      if (item.index >= macros.length) {
         return;
       }
-      [macros[item.index], macros[item.index + 1]] = [macros[item.index + 1], macros[item.index]];
+      const group = sanitizeMacroGroup(macros[item.index].group);
+      const nextIndex = findNextInGroup(macros, item.index, group);
+      if (nextIndex === -1) {
+        void vscode.window.setStatusBarMessage(
+          group ? "Already at the bottom of this folder" : "Already at the bottom of the list",
+          2000
+        );
+        return;
+      }
+      [macros[item.index], macros[nextIndex]] = [macros[nextIndex], macros[item.index]];
       await saveMacros(macros);
+    }),
+
+    // ---- Folders (§4.5, §4.7) ----------------------------------------------
+
+    vscode.commands.registerCommand("nexus.macro.newFolder", async () => {
+      const name = await vscode.window.showInputBox({
+        title: "New Macro Folder",
+        prompt: "Enter a folder path (use / for nested folders)",
+        placeHolder: "e.g. Cisco/Routers",
+        validateInput: validateNewFolderPath
+      });
+      if (!name) {
+        return;
+      }
+      const normalized = normalizeOptionalFolderPath(name);
+      if (!normalized) {
+        return;
+      }
+      if (allMacroFolders().includes(normalized)) {
+        void vscode.window.showInformationMessage(`Folder "${normalized}" already exists.`);
+        return;
+      }
+      await ensureMacroFolderExists(normalized);
+    }),
+
+    // On a tree item: that macro. From the palette: a multi-select quick pick
+    // of macros first, then the folder picker — the bulk path (§4.6).
+    vscode.commands.registerCommand("nexus.macro.moveToFolder", async (arg?: unknown) => {
+      const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
+      const macros = getMacros();
+      let targetIndices: number[];
+      if (item) {
+        targetIndices = [item.index];
+      } else {
+        if (macros.length === 0) {
+          void vscode.window.showInformationMessage("No macros defined.");
+          return;
+        }
+        const picks = await vscode.window.showQuickPick(
+          macros.map((m, i) => ({
+            label: m.name,
+            description: m.secret ? "***" : m.text.replace(/\n/g, "\\n"),
+            detail: macroFolderDetail(m),
+            index: i
+          })),
+          { title: "Move to Folder", placeHolder: "Select macros to move", canPickMany: true }
+        );
+        if (!picks || picks.length === 0) {
+          return;
+        }
+        targetIndices = picks.map((p) => p.index);
+      }
+
+      const destination = await pickFolderDestination(macros);
+      if (destination === undefined) {
+        return;
+      }
+      const updated = [...macros];
+      for (const idx of targetIndices) {
+        const next = { ...updated[idx] };
+        if (destination) {
+          next.group = destination;
+        } else {
+          delete next.group;
+        }
+        updated[idx] = next;
+      }
+      await saveMacros(updated);
+    }),
+
+    // On a folder: opens the editor with the Folder field pre-seeded (mirrors
+    // profileCommands.ts:174-176 seeding the Hub's profile form).
+    vscode.commands.registerCommand("nexus.macro.addToFolder", (arg?: unknown) => {
+      const folder = asFolderArg(arg);
+      if (!folder) {
+        return;
+      }
+      MacroEditorPanel.openNew({ group: folder.folderPath });
+    }),
+
+    vscode.commands.registerCommand("nexus.macro.renameFolder", async (arg?: unknown) => {
+      const folder = asFolderArg(arg);
+      if (!folder) {
+        return;
+      }
+      const oldPath = folder.folderPath;
+      const currentName = folderDisplayName(oldPath);
+      const newName = await vscode.window.showInputBox({
+        title: "Rename Folder",
+        value: currentName,
+        prompt: "Enter new folder name",
+        validateInput: (value) => {
+          const trimmed = value.trim();
+          if (!trimmed) {
+            return "Folder name cannot be empty";
+          }
+          if (trimmed.includes("/")) {
+            return "Folder name cannot contain '/'";
+          }
+          return null;
+        }
+      });
+      if (!newName || newName.trim() === currentName) {
+        return;
+      }
+      const parent = parentPath(oldPath);
+      const candidatePath = parent ? `${parent}/${newName.trim()}` : newName.trim();
+      const normalized = normalizeFolderPath(candidatePath);
+      if (!normalized) {
+        return;
+      }
+      await renameMacroFolder(oldPath, normalized);
+    }),
+
+    // Re-parents descendants, preserving substructure; never deletes macros.
+    vscode.commands.registerCommand("nexus.macro.removeFolder", async (arg?: unknown) => {
+      const folder = asFolderArg(arg);
+      if (!folder) {
+        return;
+      }
+      await removeMacroFolder(folder.folderPath);
     }),
 
     vscode.commands.registerCommand("nexus.macro.copySecret", async (arg?: unknown) => {

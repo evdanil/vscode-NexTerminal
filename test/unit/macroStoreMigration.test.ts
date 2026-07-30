@@ -340,4 +340,82 @@ describe("MacroStore legacy migration", () => {
     await store.initialize();
     expect(store.getAll().map((m) => m.name)).toEqual(["pw"]); // no duplicate
   });
+
+  describe("§4.2 — `group` is untrusted on the absorption path too", () => {
+    // Isolates `persistLegacyMigration()` specifically: `initialize()` always
+    // runs `reloadFromState()` right after absorption, and THAT method's own
+    // scrub would clean up a malformed group even if persistLegacyMigration did
+    // nothing — so asserting only the post-initialize() state cannot tell the
+    // two ingest sites apart. Capturing the FIRST write to `nexus.macros`
+    // (persistLegacyMigration's own write, before reloadFromState ever runs)
+    // isolates it.
+    it("a non-string group from a hand-edited settings.json is dropped BEFORE reloadFromState ever sees it", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        global: [{ name: "a", text: "echo a", group: { nope: true } } as unknown as TerminalMacro]
+      });
+      const { ctx } = makeCtx();
+      const writes: unknown[] = [];
+      const origUpdate = ctx.globalState.update.bind(ctx.globalState);
+      ctx.globalState.update = async (key: string, value: unknown) => {
+        if (key === "nexus.macros") writes.push(value);
+        return origUpdate(key, value);
+      };
+      const store = new VscodeMacroStore(ctx);
+
+      await expect(store.initialize()).resolves.toBeUndefined();
+
+      expect(writes.length).toBeGreaterThan(0);
+      const firstWrite = writes[0] as Array<{ group?: unknown }>;
+      expect(firstWrite[0].group).toBeUndefined();
+    });
+
+    it("a '..' path-traversal group from legacy settings is dropped", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        global: [{ name: "a", text: "echo a", group: "../secrets" } as TerminalMacro]
+      });
+      const { ctx } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+
+      await store.initialize();
+
+      expect(store.getAll()[0].group).toBeUndefined();
+    });
+
+    it("a valid group from legacy settings survives absorption", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        global: [{ name: "a", text: "echo a", group: "Cisco/Routers" } as TerminalMacro]
+      });
+      const { ctx } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+
+      await store.initialize();
+
+      expect(store.getAll()[0].group).toBe("Cisco/Routers");
+    });
+  });
+
+  describe("§7 — keyOfLegacy() deliberately excludes `group` (assert the decision)", () => {
+    it("an on-disk macro and a legacy-settings entry differing ONLY by group are treated as the same macro (no duplicate added)", async () => {
+      const { ctx, state } = makeCtx();
+      // Simulate a macro already migrated once (now living at MACROS_KEY, no group).
+      state.set("nexus.macros", [{ id: "existing-id", name: "reload", text: "reload\n" }]);
+
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      // Legacy settings still carries what LOOKS like the same macro, but with
+      // a `group` the user assigned through some other path. If `keyOfLegacy`
+      // included `group`, this would be absorbed as a SECOND, duplicate macro.
+      vscode.__setConfig("nexus.terminal", {
+        global: [{ name: "reload", text: "reload\n", group: "Cisco" } as TerminalMacro]
+      });
+
+      const store = new VscodeMacroStore(ctx);
+      await store.initialize();
+
+      expect(store.getAll()).toHaveLength(1); // not duplicated
+      expect(store.getAll()[0].id).toBe("existing-id");
+    });
+  });
 });

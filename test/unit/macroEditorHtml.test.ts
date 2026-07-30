@@ -654,3 +654,52 @@ describe("renderMacroEditorHtml", () => {
     expect(isWhitespaceOnly).toBe(false);
   });
 });
+
+describe("renderMacroEditorHtml — Folder field (§4.11)", () => {
+  it("renders the macro's existing (sanitized) group as the field value", () => {
+    const macros: TerminalMacro[] = [{ name: "M", text: "t", group: "Cisco/Routers" }];
+    const html = renderMacroEditorHtml(macros, 0, nonce);
+    expect(html).toContain('<input type="text" id="macro-folder" value="Cisco/Routers"');
+  });
+
+  it("renders an empty value for a macro with no group", () => {
+    const macros: TerminalMacro[] = [{ name: "M", text: "t" }];
+    const html = renderMacroEditorHtml(macros, 0, nonce);
+    expect(html).toContain('<input type="text" id="macro-folder" value=""');
+  });
+
+  it("never crashes and renders blank for a malformed (§4.2) group", () => {
+    const macros: TerminalMacro[] = [{ name: "M", text: "t", group: { bad: true } as unknown as string }];
+    expect(() => renderMacroEditorHtml(macros, 0, nonce)).not.toThrow();
+    const html = renderMacroEditorHtml(macros, 0, nonce);
+    expect(html).toContain('<input type="text" id="macro-folder" value=""');
+  });
+
+  it("lists the supplied folders as combobox suggestions", () => {
+    const html = renderMacroEditorHtml([], null, nonce, [], ["Cisco", "Juniper/Routers"]);
+    expect(html).toContain('data-value="Cisco"');
+    expect(html).toContain('data-value="Juniper/Routers"');
+  });
+
+  it("seeds the Folder field for a new (not-yet-saved) macro via the seedGroup param (§4.7 addToFolder)", () => {
+    const html = renderMacroEditorHtml([], null, nonce, [], ["Cisco"], "Cisco");
+    expect(html).toContain('<input type="text" id="macro-folder" value="Cisco"');
+  });
+
+  it("the seed is ignored once an existing macro is selected", () => {
+    const macros: TerminalMacro[] = [{ name: "M", text: "t", group: "Juniper" }];
+    const html = renderMacroEditorHtml(macros, 0, nonce, [], ["Cisco", "Juniper"], "Cisco");
+    expect(html).toContain('<input type="text" id="macro-folder" value="Juniper"');
+  });
+
+  it("includes `group` in the save postMessage payload, alongside the existing fields", () => {
+    const html = render([], null);
+    expect(html).toContain('group: folderVal || null');
+    expect(html).toContain('variables: variablesForSave,');
+  });
+
+  it("calls initCustomComboboxes() so the Folder field's suggestion dropdown is wired up", () => {
+    const html = render([], null);
+    expect(html).toContain("initCustomComboboxes();");
+  });
+});

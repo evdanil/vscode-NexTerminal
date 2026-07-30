@@ -5,9 +5,11 @@ import {
   type MacroStore,
   type MacroStoreChangeListener
 } from "./macroStore";
+import { sanitizeMacroFolderList } from "../services/macroFolders";
 
 export class InMemoryMacroStore implements MacroStore {
   private macros: TerminalMacro[] = [];
+  private folders: string[] = [];
   private readonly listeners = new Set<MacroStoreChangeListener>();
 
   public async initialize(): Promise<void> {
@@ -38,6 +40,16 @@ export class InMemoryMacroStore implements MacroStore {
 
   public async clearAll(): Promise<void> {
     this.macros = [];
+    this.folders = [];
+    for (const listener of this.listeners) listener();
+  }
+
+  public getFolders(): string[] {
+    return [...this.folders];
+  }
+
+  public async saveFolders(folders: string[]): Promise<void> {
+    this.folders = sanitizeMacroFolderList(folders);
     for (const listener of this.listeners) listener();
   }
 }

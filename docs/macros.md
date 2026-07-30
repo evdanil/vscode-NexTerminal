@@ -265,6 +265,53 @@ must be `false`. Nexus shows a one-time hint when it detects this (or a missing
 shortcuts); clicking **Fix Keybindings** on that hint, or running **Nexus: Fix
 Macro Keybindings** from the Command Palette, corrects all three.
 
+## Organising macros into folders
+
+The Macros view groups macros into folders, the same way the Connectivity Hub
+groups servers and serial profiles.
+
+Folders are yours to create — an empty folder stays until you remove it.
+
+- **New Folder** — the `$(new-folder)` button in the Macros view title bar.
+  Enter a path (`Cisco/Routers` for a nested folder); it appears immediately,
+  empty, and survives a reload. Naming a folder that already exists is a
+  no-op with an info message rather than an error.
+- **Move to Folder** — right-click a macro and choose **Move to Folder** to
+  move just that one macro. Run the same command from the Command Palette
+  with nothing selected and it opens a multi-select quick pick of every
+  macro first, then a folder picker (existing folders, **New folder…**, or
+  **(root)**) — this is the fastest way to sort a flat pile of macros into
+  folders in one pass.
+- **Drag a macro onto a folder** — moves that one macro into the folder.
+  Dragging onto the root of the tree clears the macro's folder. The Macros
+  view does not support multi-select drag; use **Move to Folder** from the
+  palette for moving several macros at once.
+- **Reordering inside a folder** — **Move Up** / **Move Down** swap a macro
+  with the previous or next macro in the *same* folder, not the physically
+  adjacent row in the tree. At the top or bottom of a folder, the status bar
+  says "Already at the top/bottom of this folder"; at the root it says
+  "...of the list". Folders themselves always sort alphabetically ahead of
+  macros — only the macros inside a folder (and at the root) keep the order
+  you put them in, which is what **Move Up** / **Move Down** and the **Run
+  Macro** quick pick both honor.
+- **Remove Folder** — right-click a folder and choose **Remove Folder (keep
+  macros)**. This never deletes a macro: every macro directly in that folder,
+  and any macro in a nested subfolder, moves up to the removed folder's
+  parent (or to the root, if the removed folder had no parent), keeping its
+  place in any sub-structure that's left. Renaming a folder works the same
+  way — it only rewrites the folder path stored on affected macros.
+- **Add Macro from a folder** — right-click a folder and choose **Add Macro**
+  to open the Macro Editor with that folder pre-filled in the **Folder**
+  field.
+
+The Macro Editor's **Folder** field accepts the same `/`-separated paths and
+offers your existing folders in a dropdown as you type. Leaving it blank (or
+clearing it) puts the macro at the root.
+
+Two same-named macros in different folders are only distinguished from each
+other by folder in **Run Macro**'s quick pick — check the `detail` line under
+each entry if you have duplicates across folders.
+
 ## Auto-Trigger Basics
 
 Add a **Trigger Pattern** to make a macro run when terminal output matches a

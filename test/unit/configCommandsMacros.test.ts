@@ -23,7 +23,7 @@ vi.mock("vscode", () => ({
   Uri: { file: vi.fn((p: string) => ({ fsPath: p })) }
 }));
 
-import { sanitizeForSharing, collectIncomingMacros } from "../../src/commands/configCommands";
+import { sanitizeForSharing, collectIncomingMacros, keyOf } from "../../src/commands/configCommands";
 import { encrypt } from "../../src/utils/configCrypto";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
@@ -298,5 +298,52 @@ describe("collectIncomingMacros — variable sanitization (§10)", () => {
     });
     expect(result.variables).toBeUndefined();
     expect(result.triggerPattern).toBeUndefined();
+  });
+});
+
+describe("collectIncomingMacros — `group` is untrusted at every ingest site (§4.2)", () => {
+  function importOne(macro: Record<string, unknown>): TerminalMacro {
+    const payload = {
+      version: 2 as const,
+      exportedAt: "",
+      macros: [macro] as TerminalMacro[]
+    };
+    return collectIncomingMacros(payload)!.macros[0];
+  }
+
+  it("keeps a valid group", () => {
+    expect(importOne({ name: "m", text: "t", group: "Cisco/Routers" }).group).toBe("Cisco/Routers");
+  });
+
+  it("canonicalizes an empty-string group to undefined", () => {
+    expect(importOne({ name: "m", text: "t", group: "" }).group).toBeUndefined();
+  });
+
+  it("drops a non-string group without throwing (a malformed import must not break the whole import)", () => {
+    expect(() => importOne({ name: "m", text: "t", group: { nope: true } })).not.toThrow();
+    expect(importOne({ name: "m", text: "t", group: { nope: true } }).group).toBeUndefined();
+  });
+
+  it("rejects a '..' path-traversal group", () => {
+    expect(importOne({ name: "m", text: "t", group: "../secrets" }).group).toBeUndefined();
+  });
+
+  it("rejects an over-depth group", () => {
+    const huge = Array.from({ length: 200 }, () => "a").join("/");
+    expect(importOne({ name: "m", text: "t", group: huge }).group).toBeUndefined();
+  });
+});
+
+describe("§7 — keyOf() deliberately excludes `group` (assert the decision)", () => {
+  it("two macros identical except for `group` hash to the SAME dedup key", () => {
+    const inFolder: TerminalMacro = { name: "reload", text: "reload\n", group: "Cisco" };
+    const atRoot: TerminalMacro = { name: "reload", text: "reload\n" };
+    expect(keyOf(inFolder)).toBe(keyOf(atRoot));
+  });
+
+  it("two macros in DIFFERENT folders still hash to the same key as each other", () => {
+    const inCisco: TerminalMacro = { name: "reload", text: "reload\n", group: "Cisco" };
+    const inJuniper: TerminalMacro = { name: "reload", text: "reload\n", group: "Juniper" };
+    expect(keyOf(inCisco)).toBe(keyOf(inJuniper));
   });
 });

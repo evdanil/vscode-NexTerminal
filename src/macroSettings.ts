@@ -34,6 +34,15 @@ export async function saveMacros(macros: TerminalMacro[], _resource?: vscode.Uri
   await getActiveMacroStore().save(macros);
 }
 
+/** Explicit macro folders (`nexus.macros.folders`) — see MacroStore.getFolders(). */
+export function getMacroFolders(): string[] {
+  return getActiveMacroStore().getFolders();
+}
+
+export async function saveMacroFolders(folders: string[]): Promise<void> {
+  await getActiveMacroStore().saveFolders(folders);
+}
+
 export async function confirmBindingWarnings(binding: string): Promise<boolean> {
   const normalized = normalizeBinding(binding);
   if (!normalized) {

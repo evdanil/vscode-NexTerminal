@@ -1015,3 +1015,163 @@ describe("VscodeMacroStore corrupt globalState shape", () => {
     await expect(store.clearAll()).resolves.toBeUndefined();
   });
 });
+
+describe("VscodeMacroStore — explicit folders (§4.1, nexus.macros.folders)", () => {
+  it("saveFolders persists, getFolders reads it back", async () => {
+    const { context, stateBag } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    await store.saveFolders(["Cisco", "Cisco/Routers"]);
+
+    expect(store.getFolders().sort()).toEqual(["Cisco", "Cisco/Routers"]);
+    expect((stateBag.get("nexus.macros.folders") as string[]).sort()).toEqual(["Cisco", "Cisco/Routers"]);
+  });
+
+  it("an explicit folder survives a reload while EMPTY (zero macros assigned) — §1.1", async () => {
+    const { context } = makeFakeContext();
+    const store1 = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store1.initialize();
+    await store1.saveFolders(["Empty/Nested"]);
+
+    const store2 = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store2.initialize();
+    expect(store2.getFolders()).toEqual(["Empty/Nested"]);
+    expect(store2.getAll()).toEqual([]); // genuinely zero macros — the folder is not derived
+  });
+
+  it("clearAll clears the explicit folder list", async () => {
+    const { context, stateBag } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+    await store.saveFolders(["Cisco"]);
+
+    await store.clearAll();
+
+    expect(store.getFolders()).toEqual([]);
+    expect(stateBag.has("nexus.macros.folders")).toBe(false);
+  });
+
+  it("saveFolders sanitizes untrusted input: drops non-strings, invalid paths, and dedupes", async () => {
+    const { context } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    await store.saveFolders(["Cisco", 42 as unknown as string, "../bad", "Cisco"]);
+
+    expect(store.getFolders()).toEqual(["Cisco"]);
+  });
+
+  it("a malformed folder list already sitting in globalState degrades to [] rather than throwing on initialize()", async () => {
+    // `get(key, fallback)` returns the fallback only when the key is ABSENT
+    // (mirrors real VS Code) — a corrupt stored value must be returned verbatim.
+    const state: Record<string, unknown> = { "nexus.macros.folders": { not: "an array" } };
+    const context = {
+      globalState: {
+        get<T>(key: string, fallback: T): T {
+          return (key in state ? state[key] : fallback) as T;
+        },
+        async update(key: string, value: unknown): Promise<void> {
+          if (value === undefined) delete state[key];
+          else state[key] = value;
+        }
+      },
+      secrets: {
+        async get(): Promise<string | undefined> { return undefined; },
+        async store(): Promise<void> {},
+        async delete(): Promise<void> {}
+      }
+    } as unknown as import("vscode").ExtensionContext;
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await expect(store.initialize()).resolves.toBeUndefined();
+    expect(store.getFolders()).toEqual([]);
+  });
+});
+
+describe("VscodeMacroStore — `group` is untrusted at every ingest site (§4.2)", () => {
+  it("save() canonicalizes an empty-string group to undefined", async () => {
+    const { context } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    await store.save([{ id: "a", name: "m", text: "t", group: "" }]);
+
+    expect(store.getAll()[0].group).toBeUndefined();
+  });
+
+  it("save() drops a structurally invalid group ('..') rather than persisting it", async () => {
+    const { context, stateBag } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    await store.save([{ id: "a", name: "m", text: "t", group: "../secrets" }]);
+
+    expect(store.getAll()[0].group).toBeUndefined();
+    const persisted = stateBag.get("nexus.macros") as Array<{ group?: string }>;
+    expect(persisted[0].group).toBeUndefined();
+  });
+
+  it("save() keeps a valid group untouched", async () => {
+    const { context } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    await store.save([{ id: "a", name: "m", text: "t", group: "Cisco/Routers" }]);
+
+    expect(store.getAll()[0].group).toBe("Cisco/Routers");
+  });
+
+  // §4.2's three concrete failure inputs, applied to a value ALREADY sitting in
+  // MACROS_KEY (reloadFromState — not save()) — the untrusted-input path the
+  // design calls out explicitly: "a malformed value can already be sitting in
+  // MACROS_KEY". None of these may throw and break the whole macro view.
+  it("reloadFromState() degrades a non-string (object) group already in MACROS_KEY without crashing", async () => {
+    const { context, stateBag } = makeFakeContext();
+    stateBag.set("nexus.macros", [
+      { id: "a", name: "m", text: "t", group: { a: 1 } }
+    ]);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await expect(store.initialize()).resolves.toBeUndefined();
+
+    expect(store.getAll()[0].group).toBeUndefined();
+  });
+
+  it("reloadFromState() rejects a '..' path traversal already sitting in MACROS_KEY", async () => {
+    const { context, stateBag } = makeFakeContext();
+    stateBag.set("nexus.macros", [
+      { id: "a", name: "m", text: "t", group: "../secrets" }
+    ]);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    expect(store.getAll()[0].group).toBeUndefined();
+  });
+
+  it("reloadFromState() rejects an over-depth group already sitting in MACROS_KEY (bounds an O(n^2) stall)", async () => {
+    const { context, stateBag } = makeFakeContext();
+    const huge = Array.from({ length: 200 }, () => "a").join("/");
+    stateBag.set("nexus.macros", [
+      { id: "a", name: "m", text: "t", group: huge }
+    ]);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await expect(store.initialize()).resolves.toBeUndefined();
+
+    expect(store.getAll()[0].group).toBeUndefined();
+  });
+
+  it("reloadFromState() scrubs a malformed group off the RAW disk value too, not just getAll()", async () => {
+    const { context, stateBag } = makeFakeContext();
+    stateBag.set("nexus.macros", [
+      { id: "a", name: "m", text: "t", group: "../secrets" }
+    ]);
+
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+
+    const rawOnDisk = stateBag.get("nexus.macros") as Array<{ group?: string }>;
+    expect(rawOnDisk[0].group).toBeUndefined();
+  });
+});

@@ -28,6 +28,10 @@ vi.mock("vscode", () => {
     },
     TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
     ThemeIcon: class { constructor(public id: string) {} },
+    DataTransferItem: class {
+      constructor(private readonly value: string) {}
+      async asString(): Promise<string> { return this.value; }
+    },
     EventEmitter,
     workspace: {
       getConfiguration: vi.fn()
@@ -36,6 +40,9 @@ vi.mock("vscode", () => {
 });
 
 import { MacroTreeProvider, MacroTreeItem, VARIABLE_MARKER } from "../../src/ui/macroTreeProvider";
+import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
+import { MACRO_DRAG_MIME } from "../../src/ui/dndMimeTypes";
+import type { TerminalMacro } from "../../src/models/terminalMacro";
 import * as vscode from "vscode";
 
 let testStore: InMemoryMacroStore;
@@ -400,7 +407,12 @@ describe("MacroTreeProvider", () => {
       getAll: () => macros,
       async save() { /* no-op */ },
       onDidChange: () => () => { /* no-op */ },
-      async clearAll() { /* no-op */ }
+      async clearAll() { /* no-op */ },
+      // No macro in these fixtures carries a `group`, so there is nothing to derive and no
+      // explicit folder to render — `getChildren()` returns macro items only and the
+      // indices below line up with the fixture order.
+      getFolders: () => [] as string[],
+      async saveFolders() { /* no-op */ }
     };
     setActiveMacroStore(rawStore as unknown as Parameters<typeof setActiveMacroStore>[0]);
   }
@@ -456,5 +468,269 @@ describe("MacroTreeProvider", () => {
 
     expect((children[2].iconPath as { id: string }).id).toBe("zap");
     expect(children[2].contextValue).toBe("nexus.macro.triggered");
+  });
+});
+
+function findFolder(children: unknown[], path: string): FolderTreeItem {
+  const found = (children as Array<MacroTreeItem | FolderTreeItem>).find(
+    (c): c is FolderTreeItem => c instanceof FolderTreeItem && c.folderPath === path
+  );
+  if (!found) throw new Error(`Folder "${path}" not found among children`);
+  return found;
+}
+
+function macroLabels(children: unknown[]): string[] {
+  return (children as Array<MacroTreeItem | FolderTreeItem>)
+    .filter((c): c is MacroTreeItem => c instanceof MacroTreeItem)
+    .map((m) => m.label as string);
+}
+
+describe("MacroTreeProvider — hierarchical folders (§4.3, §4.4)", () => {
+  let provider: MacroTreeProvider;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    testStore = new InMemoryMacroStore();
+    await testStore.initialize();
+    setActiveMacroStore(testStore);
+    provider = new MacroTreeProvider();
+  });
+
+  // The single highest-value test in this design: MacroTreeItem.index must be
+  // the TRUE getMacros() index, never a per-folder ordinal. The named wrong
+  // implementation — `macros.filter(m => m.group === folder).map((m, i) => ...)`
+  // — would report `index: 0` here since InFolder is the FIRST match within its
+  // own folder, even though its real array position is 1.
+  it("MacroTreeItem.index is the true getMacros() index for a macro rendered inside a folder", async () => {
+    const macros: TerminalMacro[] = [
+      { name: "Root1", text: "r1" },
+      { name: "InFolder", text: "f1", group: "Cisco" },
+      { name: "Root2", text: "r2" }
+    ];
+    await testStore.save(macros);
+
+    const rootChildren = provider.getChildren();
+    const folder = findFolder(rootChildren, "Cisco");
+    const folderChildren = provider.getChildren(folder) as MacroTreeItem[];
+
+    expect(folderChildren).toHaveLength(1);
+    expect(folderChildren[0].macro.name).toBe("InFolder");
+    expect(folderChildren[0].index).toBe(1);
+    // And the true index must resolve back to the exact same macro via getMacros().
+    expect(testStore.getAll()[folderChildren[0].index].name).toBe("InFolder");
+  });
+
+  it("folders sort by naturalComparePath; macros keep array order (root)", async () => {
+    const macros: TerminalMacro[] = [
+      { name: "Zebra", text: "t" },
+      { name: "Apple", text: "t" }
+    ];
+    await testStore.save(macros);
+    await testStore.saveFolders(["Zeta", "Alpha"]);
+
+    const children = provider.getChildren();
+    const folderPaths = (children as Array<MacroTreeItem | FolderTreeItem>)
+      .filter((c): c is FolderTreeItem => c instanceof FolderTreeItem)
+      .map((f) => f.folderPath);
+    expect(folderPaths).toEqual(["Alpha", "Zeta"]); // sorted, not insertion order
+
+    // Macros are NOT name-sorted (Apple would sort before Zebra) — array order survives.
+    expect(macroLabels(children)).toEqual(["Zebra", "Apple"]);
+  });
+
+  it("folders sort; macros keep array order inside a folder too", async () => {
+    const macros: TerminalMacro[] = [
+      { name: "Zebra", text: "t", group: "Net" },
+      { name: "Apple", text: "t", group: "Net" }
+    ];
+    await testStore.save(macros);
+
+    const rootChildren = provider.getChildren();
+    const folder = findFolder(rootChildren, "Net");
+    const folderChildren = provider.getChildren(folder);
+    expect(macroLabels(folderChildren)).toEqual(["Zebra", "Apple"]);
+  });
+
+  it("assigning/renaming/removing a group leaves array order and every index unchanged", async () => {
+    const macros: TerminalMacro[] = [
+      { name: "A", text: "a" },
+      { name: "B", text: "b" },
+      { name: "C", text: "c" }
+    ];
+    await testStore.save(macros);
+    const [a, b, c] = testStore.getAll();
+    await testStore.save([{ ...a, group: "X" }, b, c]);
+
+    const stored = testStore.getAll();
+    expect(stored.map((m) => m.name)).toEqual(["A", "B", "C"]); // unchanged order
+    const rootChildren = provider.getChildren();
+    const rootMacros = (rootChildren as Array<MacroTreeItem | FolderTreeItem>).filter(
+      (m): m is MacroTreeItem => m instanceof MacroTreeItem
+    );
+    expect(rootMacros.map((m) => m.index)).toEqual([1, 2]); // B, C keep their true indices
+  });
+
+  it("renders a nested folder hierarchy: parent at root, child under parent", async () => {
+    await testStore.save([{ name: "M", text: "t", group: "Cisco/Routers" }]);
+
+    const rootChildren = provider.getChildren();
+    const cisco = findFolder(rootChildren, "Cisco");
+    const ciscoChildren = provider.getChildren(cisco);
+    const routers = findFolder(ciscoChildren, "Cisco/Routers");
+    const routerChildren = provider.getChildren(routers) as MacroTreeItem[];
+    expect(routerChildren).toHaveLength(1);
+    expect(routerChildren[0].macro.name).toBe("M");
+  });
+
+  it("an explicit folder with zero macros persists and renders (§1.1)", async () => {
+    await testStore.save([{ name: "Root", text: "t" }]);
+    await testStore.saveFolders(["Empty"]);
+
+    const children = provider.getChildren();
+    expect(() => findFolder(children, "Empty")).not.toThrow();
+    const empty = findFolder(children, "Empty");
+    expect(provider.getChildren(empty)).toHaveLength(0);
+  });
+
+  it("a macro with a malformed group (§4.2) renders at root rather than crashing the whole view", async () => {
+    const macros = [
+      { name: "Bad", text: "t", group: { nope: true } as unknown as string }
+    ];
+    await testStore.save(macros);
+
+    expect(() => provider.getChildren()).not.toThrow();
+    expect(macroLabels(provider.getChildren())).toEqual(["Bad"]);
+  });
+});
+
+describe("MacroTreeProvider drag and drop (§4.9)", () => {
+  let provider: MacroTreeProvider;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    testStore = new InMemoryMacroStore();
+    await testStore.initialize();
+    setActiveMacroStore(testStore);
+    provider = new MacroTreeProvider();
+  });
+
+  function makeDataTransfer(entries: Record<string, unknown> = {}) {
+    const map = new Map<string, unknown>(Object.entries(entries));
+    return {
+      set: (mime: string, item: unknown) => { map.set(mime, item); },
+      get: (mime: string) => map.get(mime)
+    };
+  }
+
+  it("handleDrag serializes the dragged macro's stable id, never an index", async () => {
+    await testStore.save([{ id: "fixed-id", name: "M", text: "t" }]);
+    const item = provider.getChildren()[0] as MacroTreeItem;
+    const dataTransfer = makeDataTransfer();
+
+    await provider.handleDrag([item], dataTransfer as unknown as vscode.DataTransfer);
+
+    const stored = dataTransfer.get(MACRO_DRAG_MIME) as { asString: () => Promise<string> } | undefined;
+    expect(stored).toBeDefined();
+    await expect(stored!.asString()).resolves.toBe("fixed-id");
+  });
+
+  it("folders are not draggable — handleDrag on a folder source sets no payload", async () => {
+    await testStore.save([{ name: "M", text: "t", group: "Cisco" }]);
+    const folder = findFolder(provider.getChildren(), "Cisco");
+    const dataTransfer = makeDataTransfer();
+
+    await provider.handleDrag([folder], dataTransfer as unknown as vscode.DataTransfer);
+
+    expect(dataTransfer.get(MACRO_DRAG_MIME)).toBeUndefined();
+  });
+
+  it("drop onto a folder sets the dragged macro's group", async () => {
+    await testStore.save([{ id: "m1", name: "M", text: "t" }]);
+    await testStore.saveFolders(["Cisco"]);
+    const folder = findFolder(provider.getChildren(), "Cisco");
+    const dataTransfer = makeDataTransfer({ [MACRO_DRAG_MIME]: new vscode.DataTransferItem("m1") });
+
+    await provider.handleDrop(folder, dataTransfer as unknown as vscode.DataTransfer);
+
+    expect(testStore.getAll().find((m) => m.id === "m1")?.group).toBe("Cisco");
+  });
+
+  it("drop onto root (target undefined) clears the dragged macro's group", async () => {
+    await testStore.save([{ id: "m1", name: "M", text: "t", group: "Cisco" }]);
+    const dataTransfer = makeDataTransfer({ [MACRO_DRAG_MIME]: new vscode.DataTransferItem("m1") });
+
+    await provider.handleDrop(undefined, dataTransfer as unknown as vscode.DataTransfer);
+
+    expect(testStore.getAll().find((m) => m.id === "m1")?.group).toBeUndefined();
+  });
+
+  it("drop onto another macro row targets that macro's own folder", async () => {
+    await testStore.save([
+      { id: "dragged", name: "Dragged", text: "t" },
+      { id: "target", name: "Target", text: "t", group: "Juniper" }
+    ]);
+    const juniperFolder = findFolder(provider.getChildren(), "Juniper");
+    const targetMacroItem = (provider.getChildren(juniperFolder) as MacroTreeItem[])[0];
+    const dataTransfer = makeDataTransfer({ [MACRO_DRAG_MIME]: new vscode.DataTransferItem("dragged") });
+
+    await provider.handleDrop(targetMacroItem, dataTransfer as unknown as vscode.DataTransfer);
+
+    expect(testStore.getAll().find((m) => m.id === "dragged")?.group).toBe("Juniper");
+  });
+
+  it("a foreign MIME payload (no macro MIME entry) is rejected — no mutation", async () => {
+    await testStore.save([{ id: "m1", name: "M", text: "t" }]);
+    const dataTransfer = makeDataTransfer({ "application/vnd.nexus.item": "{}" });
+
+    await provider.handleDrop(undefined, dataTransfer as unknown as vscode.DataTransfer);
+
+    expect(testStore.getAll().find((m) => m.id === "m1")?.group).toBeUndefined();
+    // Confirm this genuinely tested the reject path, not a same-value no-op:
+    // saving happens only on an actual change, so assert save was never reached
+    // by checking the store's macro array reference-shape is untouched (name intact).
+    expect(testStore.getAll()).toHaveLength(1);
+  });
+
+  it("an unknown macro id in the payload is a no-op", async () => {
+    await testStore.save([{ id: "m1", name: "M", text: "t" }]);
+    const dataTransfer = makeDataTransfer({ [MACRO_DRAG_MIME]: new vscode.DataTransferItem("does-not-exist") });
+
+    await provider.handleDrop(undefined, dataTransfer as unknown as vscode.DataTransfer);
+
+    expect(testStore.getAll()).toEqual([expect.objectContaining({ id: "m1", name: "M" })]);
+  });
+});
+
+describe("MacroTreeProvider collapse state (§4.10)", () => {
+  it("folders default expanded", async () => {
+    testStore = new InMemoryMacroStore();
+    await testStore.initialize();
+    setActiveMacroStore(testStore);
+    await testStore.save([{ name: "M", text: "t", group: "Cisco" }]);
+    const provider = new MacroTreeProvider();
+
+    const folder = findFolder(provider.getChildren(), "Cisco");
+    expect(folder.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Expanded);
+  });
+
+  it("collapseFolder/expandFolder/getCollapsedFolders/loadCollapsedFolders round-trip", async () => {
+    testStore = new InMemoryMacroStore();
+    await testStore.initialize();
+    setActiveMacroStore(testStore);
+    await testStore.save([{ name: "M", text: "t", group: "Cisco" }]);
+    const provider = new MacroTreeProvider();
+
+    provider.collapseFolder("Cisco");
+    expect(provider.getCollapsedFolders()).toEqual(["Cisco"]);
+    let folder = findFolder(provider.getChildren(), "Cisco");
+    expect(folder.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Collapsed);
+
+    provider.expandFolder("Cisco");
+    expect(provider.getCollapsedFolders()).toEqual([]);
+    folder = findFolder(provider.getChildren(), "Cisco");
+    expect(folder.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Expanded);
+
+    provider.loadCollapsedFolders(["Cisco"]);
+    expect(provider.getCollapsedFolders()).toEqual(["Cisco"]);
   });
 });

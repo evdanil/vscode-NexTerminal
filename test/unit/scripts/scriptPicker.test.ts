@@ -160,4 +160,75 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
     const result = await pickScriptFromWorkspace(GLOBAL_STORAGE);
     expect(result).toBeUndefined();
   });
+
+  // ---- §5.8 — the picker that actually regresses: nested scripts must not
+  // silently vanish once moved into a subdirectory. -----------------------
+
+  it("finds a script nested in a subdirectory and shows the folder-relative path as description", async () => {
+    mockFsEntries.set("/ws/.nexus/scripts", [["cisco", 2]]);
+    mockFsEntries.set("/ws/.nexus/scripts/cisco", [["reload.js", 1]]);
+    mockFiles.set("/ws/.nexus/scripts/cisco/reload.js", "/**\n * @nexus-script\n * @name Reload\n */\n");
+
+    const result = await pickScriptFromWorkspace(GLOBAL_STORAGE);
+    const items = (quickPickItems as Array<{ label: string; description?: string; uri: { fsPath: string } }>) ?? [];
+    expect(items.map((i) => i.label)).toEqual(["Reload"]);
+    expect(items[0].description).toBe("cisco");
+    expect(result).toBeUndefined(); // no quickPickReturn set for this test — dismissed
+  });
+
+  it("finds a script nested several levels deep", async () => {
+    mockFsEntries.set("/ws/.nexus/scripts", [["cisco", 2]]);
+    mockFsEntries.set("/ws/.nexus/scripts/cisco", [["routers", 2]]);
+    mockFsEntries.set("/ws/.nexus/scripts/cisco/routers", [["backup.js", 1]]);
+    mockFiles.set(
+      "/ws/.nexus/scripts/cisco/routers/backup.js",
+      "/**\n * @nexus-script\n * @name Backup\n */\n"
+    );
+
+    await pickScriptFromWorkspace(GLOBAL_STORAGE);
+    const items = (quickPickItems as Array<{ label: string; description?: string }>) ?? [];
+    expect(items.map((i) => i.label)).toEqual(["Backup"]);
+    expect(items[0].description).toBe("cisco/routers");
+  });
+
+  it("disambiguates two same-named scripts living in different folders by their folder-relative description", async () => {
+    mockFsEntries.set("/ws/.nexus/scripts", [["cisco", 2], ["juniper", 2]]);
+    mockFsEntries.set("/ws/.nexus/scripts/cisco", [["reload.js", 1]]);
+    mockFsEntries.set("/ws/.nexus/scripts/juniper", [["reload.js", 1]]);
+    mockFiles.set("/ws/.nexus/scripts/cisco/reload.js", "/**\n * @nexus-script\n * @name Reload\n */\n");
+    mockFiles.set("/ws/.nexus/scripts/juniper/reload.js", "/**\n * @nexus-script\n * @name Reload\n */\n");
+
+    await pickScriptFromWorkspace(GLOBAL_STORAGE);
+    const items = (quickPickItems as Array<{ label: string; description?: string; uri: { fsPath: string } }>) ?? [];
+    expect(items).toHaveLength(2);
+    expect(items.map((i) => i.label)).toEqual(["Reload", "Reload"]);
+    expect(items.map((i) => i.description).sort()).toEqual(["cisco", "juniper"]);
+    expect(items.map((i) => i.uri.fsPath).sort()).toEqual([
+      "/ws/.nexus/scripts/cisco/reload.js",
+      "/ws/.nexus/scripts/juniper/reload.js"
+    ]);
+  });
+
+  it("works with no dependency on the Scripts tree view ever having been constructed", async () => {
+    // Deliberately never import/construct ScriptTreeProvider in this test
+    // file — pickScriptFromWorkspace must not rely on any cache the tree
+    // view would otherwise populate (§5.8 — the scan is a shared FUNCTION,
+    // not a shared cache, precisely so this works on a cold start).
+    mockFsEntries.set("/ws/.nexus/scripts", [["cisco", 2]]);
+    mockFsEntries.set("/ws/.nexus/scripts/cisco", [["deep.js", 1]]);
+    mockFiles.set("/ws/.nexus/scripts/cisco/deep.js", "/**\n * @nexus-script\n * @name Deep\n */\n");
+
+    await pickScriptFromWorkspace(GLOBAL_STORAGE);
+    const labels = ((quickPickItems as Array<{ label: string }>) ?? []).map((i) => i.label);
+    expect(labels).toEqual(["Deep"]);
+  });
+
+  it("root-level scripts show an empty description (nothing to disambiguate)", async () => {
+    mockFsEntries.set("/ws/.nexus/scripts", [["top.js", 1]]);
+    mockFiles.set("/ws/.nexus/scripts/top.js", "/**\n * @nexus-script\n * @name Top\n */\n");
+
+    await pickScriptFromWorkspace(GLOBAL_STORAGE);
+    const items = (quickPickItems as Array<{ label: string; description?: string }>) ?? [];
+    expect(items).toEqual([expect.objectContaining({ label: "Top", description: "" })]);
+  });
 });

@@ -10,11 +10,30 @@ import {
   type MacroStoreChangeListener
 } from "./macroStore";
 import { withRedactedVariables } from "../services/macroVariables";
+import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
 
 const MACROS_KEY = "nexus.macros";
 const SECRET_IDS_KEY = "nexus.macros.secretIds";
 const SECRET_PREFIX = "macro-secret-text-";
 const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
+const MACRO_FOLDERS_KEY = "nexus.macros.folders";
+
+/**
+ * §4.2 — normalizes a macro's untrusted `group` in place at an ingest
+ * chokepoint (mirrors `withRedactedVariables()`'s role for `variables`).
+ * Returns a new object only when the value actually changes, matching
+ * `withRedactedVariables()`'s identity-preserving convention.
+ */
+function withNormalizedGroup<T extends Pick<TerminalMacro, "group">>(macro: T): T {
+  const normalized = sanitizeMacroGroup(macro.group);
+  if (normalized === macro.group) return macro;
+  if (normalized === undefined) {
+    if (macro.group === undefined) return macro;
+    const { group: _drop, ...rest } = macro;
+    return rest as T;
+  }
+  return { ...macro, group: normalized };
+}
 
 /**
  * `globalState.get(key, [])` returns the default only when the key is ABSENT.
@@ -46,6 +65,7 @@ export class VscodeMacroStore implements MacroStore {
    * that empty string back over whatever is really in the vault. See `save()`.
    */
   private unresolvedSecretIds = new Set<string>();
+  private resolvedFolders: string[] = [];
   private readonly listeners = new Set<MacroStoreChangeListener>();
   private readonly runMigration: boolean;
   private _lastAbsorbedCount = 0;
@@ -110,8 +130,12 @@ export class VscodeMacroStore implements MacroStore {
     // Legacy `slot` is normalized here as well as on the read path, so a restored slot-era
     // backup (configCommands.ts hands `save()` the file's records verbatim) converges to
     // `keybinding` on disk instead of only in memory.
+    //
+    // §4.2 — `group` gets the same ingest-time normalization as `variables` and `slot`,
+    // for the same chokepoint reason. The three touch disjoint fields, so the order they
+    // compose in does not matter.
     const normalized: TerminalMacro[] = assignUniqueMacroIds(macros).map((m) =>
-      withRedactedVariables(withMigratedSlot(m))
+      withNormalizedGroup(withRedactedVariables(withMigratedSlot(m)))
     );
 
     const currentIds = new Set(this.resolved.map((m) => m.id).filter((v): v is string => Boolean(v)));
@@ -200,6 +224,17 @@ export class VscodeMacroStore implements MacroStore {
     return () => this.listeners.delete(listener);
   }
 
+  public getFolders(): string[] {
+    return [...this.resolvedFolders];
+  }
+
+  public async saveFolders(folders: string[]): Promise<void> {
+    const sanitized = sanitizeMacroFolderList(folders);
+    await this.context.globalState.update(MACRO_FOLDERS_KEY, sanitized.length > 0 ? sanitized : undefined);
+    this.resolvedFolders = sanitized;
+    this.emit();
+  }
+
   public async clearAll(): Promise<void> {
     // Snapshot ids before wiping state — once globalState is cleared, `this.resolved`
     // is authoritative and will not survive a reload.
@@ -209,6 +244,8 @@ export class VscodeMacroStore implements MacroStore {
     await this.context.globalState.update(MACROS_KEY, undefined);
     this.resolved = [];
     this.unresolvedSecretIds = new Set<string>();
+    await this.context.globalState.update(MACRO_FOLDERS_KEY, undefined);
+    this.resolvedFolders = [];
 
     // Also read the persisted index to sweep orphaned vault entries `resolved` no longer
     // accounts for. This covers every entry either writer in this file can leave behind,
@@ -286,12 +323,16 @@ export class VscodeMacroStore implements MacroStore {
       // already sitting in globalState from an earlier build cannot leak a masked
       // variable's plaintext default into `getAll()` — and therefore into Copy All,
       // share export, or an encrypted backup's cleartext `macros` array.
-      const redacted = withRedactedVariables(entry);
-      if (redacted !== entry) needsDiskScrub = true;
-      // `withMigratedSlot` is applied to the RESOLVED copy only; `raw` (and therefore the
-      // scrub below, and `absorbLegacySettingsIfPresent()`'s `keyOfLegacy()` dedupe, which
-      // reads globalState directly) keeps seeing the record exactly as stored.
-      const migrated = withMigratedSlot(redacted);
+      // §4.2 — `group` gets the same ingest-time normalization: a malformed value
+      // (non-string, `..`, over-depth) can already be sitting in MACROS_KEY.
+      const cleaned = withNormalizedGroup(withRedactedVariables(entry));
+      if (cleaned !== entry) needsDiskScrub = true;
+      // `withMigratedSlot` is applied to the RESOLVED copy only, and deliberately does NOT
+      // set `needsDiskScrub` — the whole point of moving the slot migration to the read
+      // path was to stop it writing. `raw` (and therefore the scrub below, and
+      // `absorbLegacySettingsIfPresent()`'s `keyOfLegacy()` dedupe, which reads globalState
+      // directly) keeps seeing the record exactly as stored.
+      const migrated = withMigratedSlot(cleaned);
       if (entry.secret) {
         const vaulted = await this.context.secrets.get(macroSecretKey(id));
         if (vaulted === undefined) unresolvedSecretIds.add(id);
@@ -324,13 +365,20 @@ export class VscodeMacroStore implements MacroStore {
       const current = this.context.globalState.get(MACROS_KEY);
       if (JSON.stringify(current) === JSON.stringify(raw)) {
         const scrubbed = raw.map((entry) =>
-          entry && typeof entry === "object" ? withRedactedVariables(entry) : entry
+          entry && typeof entry === "object" ? withNormalizedGroup(withRedactedVariables(entry)) : entry
         );
         await this.context.globalState.update(MACROS_KEY, scrubbed);
       }
     }
 
     await this.updateSecretIndex(persistedSecretIds, EMPTY_ID_SET);
+
+    // §4.2 — the persisted folder list is untrusted the same way: filter to
+    // strings, normalize, drop the rest. No eager rewrite of MACRO_FOLDERS_KEY
+    // here (unlike the variables scrub above) — a malformed folder entry
+    // carries no secret to scrub urgently off disk, and the next
+    // `saveFolders()` call naturally persists the clean list.
+    this.resolvedFolders = sanitizeMacroFolderList(this.context.globalState.get(MACRO_FOLDERS_KEY, []));
   }
 
   /**
@@ -456,10 +504,11 @@ export class VscodeMacroStore implements MacroStore {
    * entry, so re-keying a collision costs nothing and prevents its
    * `secrets.store(macroSecretKey(id), ...)` from overwriting an existing macro's secret.
    *
-   * Variables are normalized here rather than only at read time: this path absorbs
-   * `nexus.terminal.macros` verbatim on every activation (Settings Sync replay
-   * included), so without it a hand-written masked variable carrying a plaintext
-   * `default` would be written straight into globalState.
+   * Variables — and `group` (§4.2) — are normalized here rather than only at read time:
+   * this path absorbs `nexus.terminal.macros` verbatim on every activation (Settings Sync
+   * replay included), so without it a hand-written masked variable carrying a plaintext
+   * `default`, or a malformed `group` (non-string, `..`, over-depth), would be written
+   * straight into globalState.
    *
    * @returns `false` when the MACROS_KEY write was skipped because another window moved
    * the key while this one was awaiting the vault — the caller must then leave the legacy
@@ -475,7 +524,7 @@ export class VscodeMacroStore implements MacroStore {
   ): Promise<boolean> {
     const keyed = assignIdsForAbsorbedMacros(existingOnDisk, absorbed);
     const assigned = [...keyed.existing, ...keyed.absorbed].map((m) =>
-      m && typeof m === "object" ? withRedactedVariables(m) : m
+      m && typeof m === "object" ? withNormalizedGroup(withRedactedVariables(m)) : m
     );
 
     const storedVaultIds = new Set<string>();
