@@ -497,7 +497,7 @@ describe("VscodeMacroStore", () => {
       expect(store.getAll().map((m) => m.id)).toEqual(["keep"]);
     });
 
-    it("bounds the added I/O: nothing at all for a save with no secrets, and one marker write per id per window however many times it is saved", async () => {
+    it("bounds the added I/O: nothing at all for a save with no secrets, and one marker write per SECRET id per save — never per macro", async () => {
       const { context } = makeFakeContext();
       const store = new VscodeMacroStore(context, { runLegacyMigration: false });
       await store.initialize();
@@ -526,16 +526,38 @@ describe("VscodeMacroStore", () => {
         ]);
         expect(calls).toEqual(["createDirectory", "writeFile"]);
 
-        // Saving the same secret again — a rename, a reorder, a new value — re-writes the
-        // vault entry but not the marker: the bytes are already the ones this window put
-        // there. Without the memo this would be one filesystem write per secret macro per
-        // save, on a path that can be a network share.
+        // Saving the same secret again re-writes the marker, UNCONDITIONALLY. An earlier
+        // revision memoized "this window already wrote it" and skipped the repeat; that memo
+        // described this process, not the disk, and another window deleting the macro removes
+        // the marker while this window's next save still republishes the vault entry — leaving
+        // a live secret named by nothing. Same id, same bytes, so the repeat write costs one
+        // idempotent `writeFile` and cannot race anything.
+        //
+        // What stays bounded is the SHAPE of the cost: one write per SECRET id, never per
+        // macro. The plain macro in this list contributes nothing, and neither does renaming
+        // it.
         calls.length = 0;
         await store.save([
           { id: "plain", name: "Poll (prod)", text: "show status\n" },
           { id: "s", name: "Password", text: "new-pass\n", secret: true }
         ]);
-        expect(calls).toEqual([]);
+        expect(calls).toEqual(["createDirectory", "writeFile"]);
+
+        // Ten more plain macros do not add a single filesystem call; a second secret adds
+        // exactly one. That is the property worth pinning — the I/O tracks secret count, and a
+        // long macro list is free.
+        calls.length = 0;
+        await store.save([
+          ...Array.from({ length: 10 }, (_, i) => ({
+            id: `p${i}`,
+            name: `Poll ${i}`,
+            text: "show status\n"
+          })),
+          { id: "plain", name: "Poll (prod)", text: "show status\n" },
+          { id: "s", name: "Password", text: "new-pass\n", secret: true },
+          { id: "s2", name: "Enable", text: "enable-pass\n", secret: true }
+        ]);
+        expect(calls).toEqual(["createDirectory", "writeFile", "writeFile"]);
       } finally {
         for (const [name, orig] of wrapped) fs[name] = orig;
       }
@@ -1132,7 +1154,7 @@ describe("VscodeMacroStore", () => {
 
   describe("cross-window secret writes — a save publishes this window's whole view", () => {
     it("republishes every secret it holds, so a deleted entry comes back whole — and, as the documented cost, another window's newer value is reverted with the rest of that window's edits", async () => {
-      const { context, secretBag } = makeFakeContext();
+      const { context, secretBag, markedIds } = makeFakeContext();
       const seed = new VscodeMacroStore(context, { runLegacyMigration: false });
       await seed.initialize();
       await seed.save([
@@ -1183,6 +1205,9 @@ describe("VscodeMacroStore", () => {
       const a2 = windowA.getAll().filter((m) => m.id !== "p");
       await windowA.save(a2);
       expect(secretBag.has("macro-secret-text-p")).toBe(false);
+      // A's delete takes the MARKER with the entry, which is the state that made a per-window
+      // "already marked" memo unsound: B's memo still says it marked "p".
+      expect(markedIds()).toEqual([]);
 
       const b2 = windowB.getAll();
       b2[1].name = "Poll (prod 2)";
@@ -1191,10 +1216,45 @@ describe("VscodeMacroStore", () => {
       const persisted = context.globalState.get("nexus.macros", []) as TerminalMacro[];
       expect(persisted.find((m) => m.id === "p")?.secret).toBe(true);
       expect(secretBag.get("macro-secret-text-p")).toBe("old\n");
+      // ...and the id naming that republished entry is BACK ON DISK. This is the assertion the
+      // memo failed: markers are shared cross-window state that another window legitimately
+      // deletes, so "this window already wrote it" is never a statement about what is there.
+      // Skipping the write here leaves a live plaintext secret in the OS keyring that no marker
+      // names, sweepable only via `SECRET_IDS_KEY` + MACROS_KEY — the correlated lost-union race
+      // `updateSecretIndex()` documents as sufficient, on its own, to strand a credential.
+      expect(markedIds()).toEqual(["p"]);
 
       const reloaded = new VscodeMacroStore(context, { runLegacyMigration: false });
       await reloaded.initialize();
       expect(reloaded.getAll().find((m) => m.id === "p")?.text).toBe("old\n");
+
+      // Part 3 — what that marker BUYS for the republished entry, i.e. exactly what skipping
+      // the write would have cost. A adds a secret of its own while its cached ledger still
+      // predates B's write: the correlated lost-union race `updateSecretIndex()` documents.
+      // A's ledger write is its own union, `["q"]`, and A's MACROS_KEY write drops the record
+      // for "p" — the same window wins both, because both writers write in the same order.
+      // Afterwards NEITHER globalState key names `macro-secret-text-p`; only the marker does.
+      const origGet = context.globalState.get.bind(context.globalState);
+      context.globalState.get = ((key: string, fallback: unknown) =>
+        key === "nexus.macros.secretIds" ? [] : origGet(key, fallback)) as typeof context.globalState.get;
+      await windowA.save([...windowA.getAll(), { id: "q", name: "Enable", text: "enable\n", secret: true }]);
+      context.globalState.get = origGet;
+
+      expect(secretBag.get("macro-secret-text-p")).toBe("old\n");
+      expect(
+        (context.globalState.get("nexus.macros", []) as TerminalMacro[]).some((m) => m.id === "p")
+      ).toBe(false);
+      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual(["q"]);
+      expect(markedIds()).toEqual(["p", "q"]);
+
+      // Complete Reset still reaches the stranded entry, and the marker is the only record
+      // that could have led it there.
+      const sweeper = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await sweeper.initialize();
+      await sweeper.clearAll();
+      expect(secretBag.has("macro-secret-text-p")).toBe(false);
+      expect(secretBag.has("macro-secret-text-q")).toBe(false);
+      expect(markedIds()).toEqual([]);
     });
 
     it("restores the vault entry when another window ran Complete Reset between this window's load and its save", async () => {

@@ -1756,6 +1756,148 @@ describe("backup import", () => {
     expect(macros[0].text).toBe("enable-secret\n");
   });
 
+  it("merge does not collapse macros that differ only in trigger or variable METADATA — a content-key collision here is a silent drop, not a merge", async () => {
+    // The content key decides which incoming records are thrown away, with no report to
+    // anyone, so anything it omits is a field two legitimate macros can differ in while one
+    // of them vanishes. An earlier key covered name / secret / text / triggerPattern /
+    // keybinding plus variable NAMES, and nothing else — so every pair below collided.
+    //
+    // Each pair is identical on every term that key DID cover AND on every term it did not,
+    // except the ONE the pair is named for. That isolation is the point: with a pair that
+    // differs in two omitted fields at once, restoring either one alone makes the case pass,
+    // and the other term stays untested. Mutating any single term out of `keyOf()` must fail
+    // this test.
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
+
+    const file = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [
+        // Scope, on a SHARED id — the reported case. The id skip cannot separate these
+        // (neither id is held locally), so the content key is the only thing standing between
+        // them, and it dropped the second before the store's `assignMacroIds()` ever saw it to
+        // re-key. Neither carries a profile id, so scope is the only difference.
+        { id: "dup", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerScope: "all-terminals" },
+        { id: "dup", name: "Enable", text: "enable\n", triggerPattern: "Password:", triggerScope: "active-session" },
+        // Target profile — same scope, different profile. "Send this password to prod" and
+        // "send it to staging" are emphatically not one macro.
+        { id: "pf1", name: "Enable (scoped)", text: "enable\n", triggerPattern: "Password:", triggerScope: "profile", triggerProfileId: "prod-1" },
+        { id: "pf2", name: "Enable (scoped)", text: "enable\n", triggerPattern: "Password:", triggerScope: "profile", triggerProfileId: "staging-1" },
+        // Cooldown.
+        { id: "c1", name: "Poll", text: "show status\n", triggerPattern: "#", triggerCooldown: 5 },
+        { id: "c2", name: "Poll", text: "show status\n", triggerPattern: "#", triggerCooldown: 30 },
+        // Repeat interval.
+        { id: "i1", name: "Keepalive", text: " \n", triggerPattern: ">", triggerInterval: 60 },
+        { id: "i2", name: "Keepalive", text: " \n", triggerPattern: ">", triggerInterval: 300 },
+        // Start-paused.
+        { id: "d1", name: "Reload", text: "reload\n", triggerPattern: "confirm" },
+        { id: "d2", name: "Reload", text: "reload\n", triggerPattern: "confirm", triggerInitiallyDisabled: true },
+        // Variable metadata, one omitted field per pair, all under the same variable NAME —
+        // which is all the old key looked at. Each changes what running the macro does: the
+        // prompt text, the prefilled value, whether the input is masked, whether it is
+        // remembered.
+        { id: "vl1", name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "Target host" }] },
+        { id: "vl2", name: "Ping", text: "ping $host\n", variables: [{ name: "host", label: "Jump host" }] },
+        { id: "vd1", name: "Ssh", text: "ssh $user\n", variables: [{ name: "user" }] },
+        { id: "vd2", name: "Ssh", text: "ssh $user\n", variables: [{ name: "user", default: "admin" }] },
+        { id: "vs1", name: "Login", text: "login $pw\n", variables: [{ name: "pw" }] },
+        { id: "vs2", name: "Login", text: "login $pw\n", variables: [{ name: "pw", secret: true }] },
+        { id: "vr1", name: "Trace", text: "trace $dest\n", variables: [{ name: "dest" }] },
+        { id: "vr2", name: "Trace", text: "trace $dest\n", variables: [{ name: "dest", remember: false }] },
+        // The four terms the key ALREADY had. They were vacuous under the previous fixture —
+        // every pair in it happened to differ in a second field as well — so they are pinned
+        // here too rather than left resting on inspection.
+        { id: "n1", name: "Alpha", text: "same text\n" },
+        { id: "n2", name: "Beta", text: "same text\n" },
+        { id: "t1", name: "Save", text: "write mem\n" },
+        { id: "t2", name: "Save", text: "copy run start\n" },
+        { id: "tp1", name: "Ack", text: "y\n", triggerPattern: "confirm:" },
+        { id: "tp2", name: "Ack", text: "y\n", triggerPattern: "proceed:" },
+        { id: "kb1", name: "Shortcut", text: "bounce\n", keybinding: "alt+1" },
+        { id: "kb2", name: "Shortcut", text: "bounce\n", keybinding: "alt+2" }
+      ],
+      settings: {}
+    };
+
+    await runBackupImport(file, "merge");
+
+    const macros = getMacros();
+    expect(macros).toHaveLength(26);
+    // Both halves of every pair landed, and are distinguishable by the field they differ in.
+    const pick = (name: string) => macros.filter((m) => m.name === name);
+    expect(pick("Enable").map((m) => m.triggerScope).sort()).toEqual(["active-session", "all-terminals"]);
+    expect(pick("Enable (scoped)").map((m) => m.triggerProfileId).sort()).toEqual(["prod-1", "staging-1"]);
+    expect(pick("Poll").map((m) => m.triggerCooldown).sort()).toEqual([30, 5]);
+    expect(pick("Keepalive").map((m) => m.triggerInterval).sort()).toEqual([300, 60]);
+    expect(pick("Reload").map((m) => m.triggerInitiallyDisabled === true).sort()).toEqual([false, true]);
+    expect(pick("Ping").map((m) => m.variables?.[0].label).sort()).toEqual(["Jump host", "Target host"]);
+    expect(pick("Ssh").map((m) => m.variables?.[0].default ?? "").sort()).toEqual(["", "admin"]);
+    expect(pick("Login").map((m) => m.variables?.[0].secret === true).sort()).toEqual([false, true]);
+    expect(pick("Trace").map((m) => m.variables?.[0].remember === false).sort()).toEqual([false, true]);
+    expect([pick("Alpha").length, pick("Beta").length]).toEqual([1, 1]);
+    expect(pick("Save").map((m) => m.text).sort()).toEqual(["copy run start\n", "write mem\n"]);
+    expect(pick("Ack").map((m) => m.triggerPattern).sort()).toEqual(["confirm:", "proceed:"]);
+    expect(pick("Shortcut").map((m) => m.keybinding).sort()).toEqual(["alt+1", "alt+2"]);
+
+    // The shared id did not survive as one: the store re-keys the second, which is exactly
+    // what the drop used to prevent from ever happening.
+    expect(new Set(pick("Enable").map((m) => m.id)).size).toBe(2);
+
+    // ...and the key has not become so strict that re-importing the same file duplicates it.
+    // Idempotency is the property the content key exists for; widening it must not cost that.
+    const before = getMacros().map((m) => m.id).sort();
+    await runBackupImport(file, "merge");
+    expect(getMacros().map((m) => m.id).sort()).toEqual(before);
+  });
+
+  it("merge does not drop a secret macro whose decrypted text happens to equal a plain macro's", async () => {
+    // The `secret` term in the content key, which nothing exercised. Merge is the only caller
+    // that carries secret macros (share import filters them out before the key is built), and
+    // by the time the key is computed the secret's text has already been decrypted — so a
+    // secret macro and a plain one that agree on name, text and trigger are indistinguishable
+    // without the term, and the incoming one is silently discarded. That is the user's
+    // credential not being restored from their own backup, reported to nobody.
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    await store.save([{ id: "local", name: "Enable", text: "cisco\n" }]);
+    setActiveMacroStore(store);
+
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [{ id: "file-s", name: "Enable", text: "", secret: true }],
+      settings: {},
+      encryptedSecrets: encrypt(
+        JSON.stringify({ secretMacros: [{ id: "file-s", text: "cisco\n" }] }),
+        "testpass"
+      )
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup-secret-collision.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Merge", value: "merge" });
+    mockShowInputBox.mockResolvedValueOnce("testpass"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const macros = getMacros();
+    expect(macros).toHaveLength(2);
+    expect(macros.map((m) => m.secret === true).sort()).toEqual([false, true]);
+    expect(macros.find((m) => m.secret)!.text).toBe("cisco\n");
+    expect(macros.find((m) => !m.secret)!.id).toBe("local");
+  });
+
   it("Fix A — backup restore strips the trigger even when every declared variable entry is invalid", async () => {
     // codex noted the existing round-trip test above has no variables-plus-trigger
     // macro, so it can't detect a regression here: this goes through the same

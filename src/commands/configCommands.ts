@@ -664,10 +664,20 @@ async function promptDecryptPassword(): Promise<string | undefined> {
   });
 }
 
-function variableNamesKey(m: TerminalMacro): string {
-  // §10 — two macros differing only in their variable declarations must not
-  // collide on import/dedupe; append the (declaration-order) variable names.
-  return Array.isArray(m.variables) ? m.variables.map((v) => v?.name ?? "").join(",") : "";
+/**
+ * §10 — two macros differing only in their variable declarations must not collide on
+ * import/dedupe. EVERY declared field participates, not just the name: `label`, `default`,
+ * `secret` and `remember` each change what the macro does when it runs (what the prompt says,
+ * what it is prefilled with, whether the input is masked, whether the value is remembered), so
+ * two records that differ in any of them are two different macros.
+ */
+function variablesKey(m: TerminalMacro): unknown {
+  if (!Array.isArray(m.variables)) return null;
+  return m.variables.map((v) =>
+    v && typeof v === "object"
+      ? [v.name ?? "", v.label ?? "", v.default ?? "", v.secret === true, v.remember === false]
+      : null
+  );
 }
 
 /**
@@ -675,13 +685,43 @@ function variableNamesKey(m: TerminalMacro): string {
  * backup import (the latter because replace-mode restore re-keys every incoming record, so an
  * id in a file stops naming anything local the moment a replace has run; see the merge branch).
  *
+ * IT MUST NAME EVERY FIELD THAT MAKES TWO RECORDS DIFFERENT MACROS, because a collision here
+ * is not a merge — it is a silent DROP. The merge branch skips an incoming record whose key it
+ * already has, so any field left out of this key is a field two legitimately distinct macros
+ * can differ in while one of them is discarded with no report. An earlier revision keyed on
+ * name/secret/text/triggerPattern/keybinding plus variable NAMES only, so two records agreeing
+ * on those but scoped `active-session` versus `profile` — or differing in cooldown, interval,
+ * start-paused, target profile, or any variable's label/default/secret/remember — collided and
+ * the second was thrown away before `assignMacroIds()` could ever re-key it.
+ *
  * `secret` is part of the key even though the share path filters secrets out before it gets
  * here, so the term is inert for that caller. It matters for merge, which does carry secret
  * macros: without it a secret macro whose decrypted text happens to equal a plain macro's, with
  * the same name and trigger, is taken for the same macro and silently not imported.
+ *
+ * `id` is deliberately NOT part of the key. Identity is the merge branch's separate id skip;
+ * this key answers the different question of whether the CONTENT is already present, which is
+ * what makes importing the same file twice idempotent after a replace-mode restore has re-keyed
+ * everything in it. See the merge branch for why both are load-bearing.
+ *
+ * Built with `JSON.stringify` rather than a `|` join so that a value containing the delimiter
+ * cannot forge a different record's key — with a join, a macro named `a|b` and text `c` keys
+ * the same as one named `a` with text `b|c`.
  */
 function keyOf(m: TerminalMacro): string {
-  return `${m.name}|${m.secret ? "secret" : "plain"}|${m.text}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}|${variableNamesKey(m)}`;
+  return JSON.stringify([
+    m.name ?? "",
+    m.secret === true,
+    m.text ?? "",
+    m.triggerPattern ?? "",
+    m.triggerCooldown ?? null,
+    m.triggerInterval ?? null,
+    m.triggerInitiallyDisabled === true,
+    m.triggerScope ?? "",
+    m.triggerProfileId ?? "",
+    m.keybinding ?? "",
+    variablesKey(m)
+  ]);
 }
 
 function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
@@ -1401,14 +1441,20 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         //    copy of every macro in it. Both copies carry distinct ids, so the duplicate-id
         //    fail-safe does not suppress either: both compile auto-trigger rules and both fire
         //    on one match, and a secret `Password:` responder sends the password twice per
-        //    prompt. `keyOf()` is the same content key the share-import path deduplicates on.
+        //    prompt. `keyOf()` is the same content key the share-import path deduplicates on,
+        //    and it names EVERY field that makes two records different macros — a collision
+        //    here is a silent drop, not a merge, so anything left out of it is a legitimate
+        //    macro this loop can throw away with no report. See `keyOf()`.
         //
         // Only the CONTENT key is recorded as we go, matching the share-import path: two
         // entries in one file that agree on content are the same macro twice and the second is
-        // dropped. The id set is deliberately not extended, so two records in one file that
-        // share an id but differ in content are treated as the two different macros they are —
-        // both land, and the store re-keys the second (`assignMacroIds()`). Neither of them can
-        // reach the pin predicate, which only fires for ids the store already holds.
+        // dropped. With the key covering every content field, "agree on content" now means the
+        // two records are indistinguishable in everything except their ids — which is the only
+        // reading under which dropping one is right. The id set is deliberately not extended,
+        // so two records in one file that share an id but differ in ANY content field are
+        // treated as the two different macros they are — both land, and the store re-keys the
+        // second (`assignMacroIds()`). Neither of them can reach the pin predicate, which only
+        // fires for ids the store already holds.
         const existing = getMacros();
         const existingIds = new Set(existing.map((m) => m.id).filter(Boolean) as string[]);
         const existingKeys = new Set(existing.map(keyOf));

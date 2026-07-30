@@ -371,6 +371,55 @@ describe("MacroStore legacy migration", () => {
     expect(orphanKeys[0]).toBe(macroSecretKey(indexed[0]));
   });
 
+  it("a legacy absorb whose secret-id marker cannot be written stores NOTHING, keeps the legacy setting, and does not take activation down", async () => {
+    const vscode = (await import("vscode")) as unknown as {
+      __setConfig: (s: string, v: Record<string, unknown>) => void;
+      __getConfig: (s: string) => unknown;
+      workspace: { fs: Record<string, (...args: never[]) => unknown> };
+    };
+    const { ctx, state, secrets } = makeCtx();
+    const existing = [{ id: "a", name: "Existing", text: "x" }] as TerminalMacro[];
+    state.set("nexus.macros", existing);
+    const legacy = [{ name: "Absorbed", text: "absorbed-secret", secret: true }] as TerminalMacro[];
+    vscode.__setConfig("nexus.terminal", { global: legacy });
+
+    const fs = vscode.workspace.fs;
+    const origWriteFile = fs.writeFile;
+    fs.writeFile = (async () => {
+      throw new Error("EACCES: permission denied");
+    }) as typeof origWriteFile;
+    const store = new VscodeMacroStore(ctx);
+    try {
+      // Fail closed, and QUIETLY. Unlike `save()`, this path runs during activation, where a
+      // throw is a failed activation rather than a failed command — so it returns false and
+      // the caller abandons the absorb instead of propagating.
+      await expect(store.initialize()).resolves.toBeUndefined();
+    } finally {
+      fs.writeFile = origWriteFile;
+    }
+
+    // NOTHING was written. Not the vault entry the marker could not name, not the legacy
+    // ledger, not MACROS_KEY. Proceeding past the marker failure — writing the secret and
+    // hoping — is exactly how an unsweepable plaintext credential is created.
+    expect([...secrets.keys()]).toEqual([]);
+    expect(ctx.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual([]);
+    expect(state.get("nexus.macros")).toEqual(existing);
+    expect(store.getAll().map((m) => m.name)).toEqual(["Existing"]);
+    expect(store.getLastAbsorbedCount()).toBe(0);
+
+    // The legacy setting is untouched, so those records still exist somewhere. Clearing it
+    // after abandoning the absorb would have destroyed the only remaining copy.
+    expect((vscode.__getConfig("nexus.terminal") as { global: unknown }).global).toEqual(legacy);
+
+    // ...and it really is a RETRY, not a loss: with the filesystem healthy the next
+    // activation absorbs the same records, secret value intact.
+    const store2 = new VscodeMacroStore(ctx);
+    await store2.initialize();
+    expect(store2.getAll().map((m) => m.name)).toEqual(["Existing", "Absorbed"]);
+    expect(store2.getAll().find((m) => m.name === "Absorbed")!.text).toBe("absorbed-secret");
+    expect((vscode.__getConfig("nexus.terminal") as { global: unknown }).global).toBeUndefined();
+  });
+
   it("does not duplicate secret macros when Settings Sync replays cleartext", async () => {
     const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
     vscode.__setConfig("nexus.terminal", { global: [{ name: "pw", text: "hunter2", secret: true }] });

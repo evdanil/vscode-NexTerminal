@@ -109,7 +109,12 @@ export class MacroEditorPanel {
       { enableScripts: true, retainContextWhenHidden: true }
     );
     this.render();
-    this.panel.webview.onDidReceiveMessage((msg) => this.handleMessage(msg));
+    // The `.catch()` is the whole point — see `reportHandlerFailure()`. The settled promise is
+    // returned rather than discarded so a caller that CAN await one still can (VS Code does
+    // not); it never rejects, so nothing downstream has to handle it.
+    this.panel.webview.onDidReceiveMessage((msg) =>
+      this.handleMessage(msg).catch((err) => this.reportHandlerFailure(err))
+    );
     this.panel.onDidDispose(() => {
       this.disposed = true;
       this.unsubscribe();
@@ -463,6 +468,39 @@ export class MacroEditorPanel {
         break;
       }
     }
+  }
+
+  /**
+   * Reports a rejection out of `handleMessage()`.
+   *
+   * `onDidReceiveMessage` is a VS Code EVENT listener, not a command handler. Nothing awaits
+   * the promise it returns and nothing reports its rejection, so without this every failure in
+   * `handleMessage()` is invisible: no notification, no in-panel error, and the webview keeps
+   * showing "Unsaved changes" because only a `saved` message clears the dirty flag. Every other
+   * `saveMacros()` / `replaceMacros()` call site in the extension is awaited inside a
+   * registered command handler, where VS Code surfaces a rejection itself; this one is the
+   * exception, and it is the primary secret-editing surface.
+   *
+   * The failure that reaches here in practice is `persist()` → `MacroStore.save()`. That store
+   * fails CLOSED when it cannot write a macro's secret-id marker file (unwritable global
+   * storage, a full disk, a dead network share) rather than write a vault entry nothing can
+   * name — and because a save republishes every secret the window holds, the condition fails
+   * EVERY save containing any secret macro, including an edit to an unrelated plain one. It has
+   * to be reported, and it must never be reported as success.
+   *
+   * Both channels are used deliberately: the notification is what the user sees when the panel
+   * is not focused, and the `#error-save` slot is what they see when it is — it sits beside the
+   * Save button, so the dirty flag that (correctly) stayed set has its reason next to it.
+   */
+  private reportHandlerFailure(err: unknown): void {
+    const detail = err instanceof Error ? err.message : String(err);
+    void vscode.window.showErrorMessage(`Nexus could not save the macro: ${detail}`);
+    if (this.disposed) return;
+    void this.panel.webview.postMessage({
+      type: "saveError",
+      field: "save",
+      message: `Not saved: ${detail}`
+    });
   }
 
   /**

@@ -82,20 +82,6 @@ export class VscodeMacroStore implements MacroStore {
    */
   private unresolvedSecretIds = new Set<string>();
   /**
-   * Secret ids this window has already written a marker file for, so the save path does not
-   * re-write a marker whose bytes it knows are already on disk. Bounds the filesystem I/O
-   * this store adds to a save at ONE `writeFile()` per secret id per window, rather than one
-   * per secret macro per save.
-   *
-   * Deliberately a cache of "this process wrote it", not of "it exists": nothing here reads
-   * the directory to populate it, because a read would be exactly the cross-process
-   * read-modify-write this mechanism exists to avoid. If something outside the extension
-   * deletes a marker, the entry is not re-created until the next window — the cost is a
-   * vault key `clearAll()` cannot sweep from the marker set, which is the same cost the
-   * legacy `SECRET_IDS_KEY` array already carries and no worse than not having markers.
-   */
-  private readonly markedSecretIds = new Set<string>();
-  /**
    * Tail of the serialization chain for this store's MUTATING operations — see
    * `runExclusive()`.
    */
@@ -261,8 +247,11 @@ export class VscodeMacroStore implements MacroStore {
     // deliberately wider than that — it names every non-secret macro's id, because the delete
     // for those is incidental and unconditional — and dropping a marker for each of them would
     // put one filesystem call per plain macro on every save. Marker removal is therefore
-    // narrowed to ids that plausibly HAVE a marker: ones that were secret a moment ago, and
-    // ones this window wrote a marker for itself.
+    // narrowed to ids that plausibly HAVE a marker: ones that were secret a moment ago, which
+    // is every id this window has ever marked that is still in play (`ensureSecretMarkers()`
+    // marks exactly `storedVaultIds`, and every id in it lands in `this.resolved` as a secret).
+    // Missing one is the cheap direction — an unremoved marker costs one no-op
+    // `secrets.delete()` at the next Complete Reset.
     const previouslySecretIds = new Set(
       this.resolved.filter((m) => m.secret && isValidMacroId(m.id)).map((m) => m.id)
     );
@@ -425,11 +414,7 @@ export class VscodeMacroStore implements MacroStore {
     }
     await this.updateSecretIndex(EMPTY_ID_SET, deletedVaultIds);
     await this.removeSecretMarkers(
-      new Set(
-        [...deletedVaultIds].filter(
-          (id) => previouslySecretIds.has(id) || this.markedSecretIds.has(id)
-        )
-      )
+      new Set([...deletedVaultIds].filter((id) => previouslySecretIds.has(id)))
     );
     this.resolved = normalized;
     this.emit();
@@ -508,21 +493,43 @@ export class VscodeMacroStore implements MacroStore {
    * the command handler is a diagnosis rather than a bare `EACCES` from a layer the user has
    * never heard of.
    *
+   * UNCONDITIONAL, on every save, for every secret id the save is about to store. An earlier
+   * revision memoized "this window already wrote this marker" and skipped the repeat write.
+   * That is wrong, and the reasoning is recorded here so it is not proposed a third time:
+   *
+   *   - A marker is SHARED cross-window state, and the extension itself deletes markers
+   *     through the front door — `write()`'s `removeSecretMarkers()` when a secret macro is
+   *     deleted or turned plain, and `clearAll()`'s sweep. A per-window memo describes what
+   *     THIS window wrote, never what is on disk, and nothing invalidates it when another
+   *     window removes the file.
+   *   - Combined with the unconditional secret republish in `write()`, the memo broke the one
+   *     invariant markers exist for. Window B saves and memoizes `p`; window A deletes macro
+   *     P, taking its vault entry AND its marker; B's next save re-stores
+   *     `macro-secret-text-p` (by design — see the republish block in `write()`) but skips the
+   *     marker on the memo. The entry is then back in the OS keyring named by no marker at
+   *     all, and sweepability rests on `SECRET_IDS_KEY` + MACROS_KEY alone — the correlated
+   *     lost-union race `updateSecretIndex()` documents as sufficient to strand a credential.
+   *   - There is no read-modify-write hazard to avoid here, which is what the memo's own
+   *     justification claimed. The write is one fixed-name file whose content is a pure
+   *     function of the id: same id, same bytes, every time. Two windows writing it race to
+   *     write identical bytes.
+   *
    * COST, stated plainly: this puts filesystem I/O on the macro save path. It is bounded to
    * one `createDirectory()` (idempotent, and cheap when the directory exists) plus one
-   * `writeFile()` per secret id this window has not already marked — zero on a save with no
-   * secret macros, and zero on every subsequent save of the same secrets. An unwritable
-   * storage directory, a full disk or a dead network share therefore blocks saving a SECRET
-   * macro and nothing else: a save that touches no secret never opens the directory.
+   * `writeFile()` per SECRET id in the save — so it scales with the number of secret macros,
+   * not with the size of the macro list, and a user with no secret macros never opens the
+   * directory from here at all. An unwritable storage directory, a full disk or a dead network
+   * share therefore blocks saving a SECRET macro and nothing else. (`removeSecretMarkers()` is
+   * the other filesystem caller on the save path; it runs only when a formerly-secret id's
+   * vault entry has just been deleted, and it is best-effort rather than fail-closed.)
    */
   private async ensureSecretMarkers(ids: ReadonlySet<string>): Promise<void> {
-    const pending = [...ids].filter((id) => !this.markedSecretIds.has(id));
-    if (pending.length === 0) return;
+    if (ids.size === 0) return;
     let dir: vscode.Uri | undefined;
     try {
       dir = this.secretMarkerDir();
       await vscode.workspace.fs.createDirectory(dir);
-      for (const id of pending) {
+      for (const id of ids) {
         await vscode.workspace.fs.writeFile(
           vscode.Uri.joinPath(dir, secretMarkerFileName(id)),
           new TextEncoder().encode(id)
@@ -538,7 +545,6 @@ export class VscodeMacroStore implements MacroStore {
           `disk space and save again. (${detail})`
       );
     }
-    for (const id of pending) this.markedSecretIds.add(id);
   }
 
   /**
@@ -549,7 +555,6 @@ export class VscodeMacroStore implements MacroStore {
    */
   private async removeSecretMarkers(ids: ReadonlySet<string>): Promise<void> {
     if (ids.size === 0) return;
-    for (const id of ids) this.markedSecretIds.delete(id);
     let dir: vscode.Uri;
     try {
       dir = this.secretMarkerDir();
@@ -624,18 +629,24 @@ export class VscodeMacroStore implements MacroStore {
     this.unresolvedSecretIds = new Set<string>();
 
     // Also sweep from the two persisted records of "vault keys this extension may have
-    // written", so orphans `resolved` no longer accounts for still go. This covers every
-    // entry either writer in this file can leave behind, because both name an id BEFORE
-    // storing it (see `save()`'s write-order contract and `persistLegacyMigration()`): a
-    // crash anywhere after the naming leaves the entry named.
+    // written", so orphans `resolved` no longer accounts for still go. For entries THIS build
+    // wrote this covers every one, because both writers in this file name an id BEFORE storing
+    // it (see `save()`'s write-order contract and `persistLegacyMigration()`): a crash anywhere
+    // after the naming leaves the entry named.
     //
     //   - marker files, the authoritative record: per-file writes, so two windows adding
     //     different secrets at the same moment cannot lose each other's id;
-    //   - `SECRET_IDS_KEY`, kept as a LEGACY FALLBACK. It is what builds before the marker
-    //     files wrote, so entries those builds created — including ones whose ledger write
-    //     lost the cross-window race and are named by nothing else — are still swept here.
+    //   - `SECRET_IDS_KEY`, kept as a LEGACY FALLBACK for entries created by builds that
+    //     predate the marker files — whatever that array still names is still swept.
     //
-    // Neither covers an entry written by a build that predates the ordering contract.
+    // WHAT IS NOT SWEPT, stated rather than glossed: a pre-marker entry whose `SECRET_IDS_KEY`
+    // write lost the cross-window race. Such an entry is named by no marker (its build wrote
+    // none), by no ledger entry (that write is the one that was lost), and by no record in
+    // MACROS_KEY (the same window won both writes, so the macro is gone from there too). There
+    // is nothing left to find it by: `SecretStorage` has no enumeration API, so a sweep can
+    // only delete keys something names, and the only remedy for one of these is the OS keyring
+    // manager. The marker files exist precisely so that no FUTURE entry can end up in that
+    // state. Entries written by a build predating the ordering contract are likewise unreachable.
     const indexedIds = this.readSecretIndex();
     const markerIds = await this.readSecretMarkerIds();
 
@@ -765,10 +776,11 @@ export class VscodeMacroStore implements MacroStore {
    * IT IS NO LONGER THE AUTHORITATIVE RECORD. `ensureSecretMarkers()` — one file per secret
    * id under `context.globalStorageUri` — is, because it is the one that survives two windows
    * writing at once. This array is kept in step beside it, and read by `clearAll()`, for one
-   * reason: it is what builds before the marker files wrote, so an entry created by such a
-   * build (including one this array's own race left named by nothing else) is still swept.
-   * A save that cannot write its markers never reaches this function, so the array can no
-   * longer name an id the markers do not.
+   * reason: it is what builds before the marker files wrote, so whatever it still names from
+   * such a build is swept. It does NOT rescue a pre-marker entry whose own write lost the race
+   * below — that entry is named by nothing, anywhere, and `SecretStorage` has no enumeration
+   * API to find it without a name. A save that cannot write its markers never reaches this
+   * function, so the array can no longer name an id the markers do not.
    *
    * Rebuilding it would defeat the delete-order guarantee `clearAll()` documents. Every
    * `clearAll()` is preceded by an `initialize()`, so a reload that replaced the index
@@ -1013,10 +1025,28 @@ export class VscodeMacroStore implements MacroStore {
   }
 }
 
+/**
+ * Dedupe key for LEGACY SETTINGS ABSORPTION only. Deliberately NOT the same key as
+ * configCommands.ts's `keyOf()`, which was widened to cover the whole trigger configuration
+ * and every variable field; the comment here used to claim they were the same and they are not.
+ *
+ * They answer different questions and have opposite failure directions. `keyOf()` decides
+ * whether an IMPORTED record is dropped, so a key that is too coarse silently discards a
+ * legitimate macro — it must be as specific as possible. This one decides whether a record
+ * already written to MACROS_KEY is absorbed from settings.json AGAIN, on every activation and
+ * on every Settings Sync replay, so a key that is too specific duplicates a macro on every
+ * start. It is compared across a redaction boundary: `persistLegacyMigration()` runs the
+ * absorbed record through `withRedactedVariables()` before persisting, so the settings copy can
+ * carry a masked variable's `default` that the on-disk copy does not. Keying on that field
+ * would make the two copies never match and multiply the macro indefinitely.
+ *
+ * `text` is `__SECRET__` for a secret macro for the same reason: on-disk it is `""` (the value
+ * is in the vault) while in settings.json it is the cleartext.
+ */
 function keyOfLegacy(m: TerminalMacro): string {
   const textKey = m.secret ? "__SECRET__" : (m.text ?? "");
-  // §10 — same key as configCommands.ts's keyOf(): two macros differing only in
-  // their variable declarations must not collide; append the variable names.
+  // §10 — two macros differing only in their variable declarations must not collide; append
+  // the variable names, which are the one part of a declaration that survives redaction.
   const variableNames = Array.isArray(m.variables) ? m.variables.map((v) => v?.name ?? "").join(",") : "";
   return `${m.name ?? ""}|${textKey}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}|${variableNames}`;
 }

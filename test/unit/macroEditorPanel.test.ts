@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockPostMessage = vi.fn();
 const mockShowWarningMessage = vi.fn();
+const mockShowErrorMessage = vi.fn();
 let onDidReceiveMessageHandler: ((msg: Record<string, unknown>) => void) | undefined;
 let onDidDisposeHandler: (() => void) | undefined;
 let lastHtml = "";
@@ -29,7 +30,8 @@ vi.mock("vscode", () => ({
       reveal: vi.fn(),
       dispose: vi.fn()
     })),
-    showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args)
+    showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
+    showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args)
   },
   ViewColumn: { Active: 1 },
   ConfigurationTarget: { Global: 1 },
@@ -275,6 +277,62 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     expect(after).toHaveLength(1);
     expect(after[0].name).toBe("Alpha");
     expect(mockShowWarningMessage).toHaveBeenCalled();
+  });
+
+  it("a store failure is REPORTED rather than swallowed — notification, in-panel error, and no false 'saved'", async () => {
+    // `onDidReceiveMessage` is a VS Code EVENT listener, not a command handler: nothing awaits
+    // the promise it returns and nothing reports its rejection. So a rejecting `handleMessage`
+    // produces no notification, no in-panel error, and — because only a `saved` message clears
+    // it — a webview still showing "Unsaved changes" with no explanation.
+    //
+    // This is not theoretical. `VscodeMacroStore` fails CLOSED when it cannot write a secret
+    // id's marker file (unwritable global storage, full disk, dead network share), and a save
+    // republishes every secret the window holds — so that condition rejects EVERY save
+    // containing any secret macro, including an edit to an unrelated plain one. This editor is
+    // the primary secret-editing surface. Every other `saveMacros()` call site in the extension
+    // is awaited inside a registered command handler, where VS Code reports the rejection
+    // itself; this one is the exception.
+    await harness([{ name: "Alpha", text: "a\n" }]);
+    const { sendMessage } = await openPanel(0);
+    const id = getMacros()[0].id!;
+
+    const failure = new Error(
+      "Nexus could not record macro secret ids in /storage/macro-secret-ids, so nothing was saved."
+    );
+    vi.spyOn(store, "save").mockRejectedValue(failure);
+
+    // Must not reject: nothing upstream can catch it.
+    await expect(
+      Promise.resolve(
+        sendMessage({
+          type: "save",
+          index: 0,
+          id,
+          name: "Alpha (renamed)",
+          text: "a\n",
+          secret: false,
+          keybinding: null,
+          triggerPattern: null,
+          triggerCooldown: 3,
+          triggerInterval: null,
+          triggerInitiallyDisabled: false,
+          triggerScope: "all-terminals",
+          triggerProfileId: null,
+          variables: []
+        })
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("could not record macro secret ids")
+    );
+    expect(mockPostMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "saveError", field: "save" })
+    );
+    // The save did not happen, so it must not be reported as one — `saved` is the only thing
+    // that clears the dirty flag, and a cleared flag on an unsaved edit is how the edit gets
+    // closed and lost.
+    expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
   });
 
   it("creating a new macro (null id) appends and assigns an id", async () => {
