@@ -670,8 +670,18 @@ function variableNamesKey(m: TerminalMacro): string {
   return Array.isArray(m.variables) ? m.variables.map((v) => v?.name ?? "").join(",") : "";
 }
 
+/**
+ * Content key for "do I already have this macro?" — used by share import and by merge-mode
+ * backup import (the latter because replace-mode restore re-keys every incoming record, so an
+ * id in a file stops naming anything local the moment a replace has run; see the merge branch).
+ *
+ * `secret` is part of the key even though the share path filters secrets out before it gets
+ * here, so the term is inert for that caller. It matters for merge, which does carry secret
+ * macros: without it a secret macro whose decrypted text happens to equal a plain macro's, with
+ * the same name and trigger, is taken for the same macro and silently not imported.
+ */
 function keyOf(m: TerminalMacro): string {
-  return `${m.name}|${m.text}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}|${variableNamesKey(m)}`;
+  return `${m.name}|${m.secret ? "secret" : "plain"}|${m.text}|${m.triggerPattern ?? ""}|${m.keybinding ?? ""}|${variableNamesKey(m)}`;
 }
 
 function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
@@ -1371,16 +1381,43 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         // inherited the local macro's stored password.
         await replaceMacros(incomingMacros);
       } else {
-        // Merge keeps the file's ids, because the skip below is what makes re-importing the
-        // same backup idempotent. That is safe for `saveMacros()` — and it is the reason the
-        // filter has to stay here rather than becoming a store concern: every incoming record
-        // whose id the store already holds is DROPPED, so no id reaching `saveMacros()` from
-        // this branch can name anything the store knows. See `MacroStore.save()`'s precondition.
+        // Merge keeps the file's ids, and skips on TWO independent keys. Both are load-bearing
+        // and they close different holes.
+        //
+        // 1. THE ID SKIP is what lets these records go to `saveMacros()` at all: every
+        //    incoming record whose id the store already holds is DROPPED, so no id reaching
+        //    the store from this branch can name anything the store knows, which is exactly
+        //    `MacroStore.save()`'s precondition. It has to stay here rather than become a
+        //    store concern for that reason. It also means a macro the user edited locally is
+        //    not re-added from the backup as a second copy.
+        //
+        // 2. THE CONTENT SKIP is what makes importing the same file twice idempotent. The id
+        //    skip alone is NOT, and that is not hypothetical: replace-mode restore assigns a
+        //    fresh id to every incoming record (`MacroStore.replaceAll()` — an id in a file is
+        //    an identity from another machine, and treating it as a local one handed imported
+        //    macros local passwords). So after restoring a backup in replace mode, none of the
+        //    ids in that file name anything any more, and the ordinary follow-up — merging the
+        //    same file to pick up something added since — matched nothing and added a SECOND
+        //    copy of every macro in it. Both copies carry distinct ids, so the duplicate-id
+        //    fail-safe does not suppress either: both compile auto-trigger rules and both fire
+        //    on one match, and a secret `Password:` responder sends the password twice per
+        //    prompt. `keyOf()` is the same content key the share-import path deduplicates on.
+        //
+        // Only the CONTENT key is recorded as we go, matching the share-import path: two
+        // entries in one file that agree on content are the same macro twice and the second is
+        // dropped. The id set is deliberately not extended, so two records in one file that
+        // share an id but differ in content are treated as the two different macros they are —
+        // both land, and the store re-keys the second (`assignMacroIds()`). Neither of them can
+        // reach the pin predicate, which only fires for ids the store already holds.
         const existing = getMacros();
         const existingIds = new Set(existing.map((m) => m.id).filter(Boolean) as string[]);
+        const existingKeys = new Set(existing.map(keyOf));
         const merged = [...existing];
         for (const m of incomingMacros) {
           if (m.id && existingIds.has(m.id)) continue;
+          const key = keyOf(m);
+          if (existingKeys.has(key)) continue;
+          existingKeys.add(key);
           merged.push({ ...m, id: m.id ?? randomUUID() });
         }
         await saveMacros(merged);

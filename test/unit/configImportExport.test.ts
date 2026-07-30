@@ -1519,6 +1519,15 @@ describe("backup import", () => {
     registerConfigCommands(core, vault);
   });
 
+  /** Drives the real `nexus.config.import` command over an unencrypted export payload. */
+  async function runBackupImport(exportData: unknown, mode: "merge" | "replace"): Promise<void> {
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: mode === "merge" ? "Merge" : "Replace", value: mode });
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+  }
+
   it("decrypts and restores passwords, passphrases, and secret macros", async () => {
     const { encrypt } = await import("../../src/utils/configCrypto");
     // Use version 2 backup format: top-level macros array + id-keyed secret blobs
@@ -1587,6 +1596,10 @@ describe("backup import", () => {
     const realGet = async (k: string): Promise<string | undefined> => secretMap.get(k);
     let keyringDown = false;
     const fakeCtx = {
+      // `VscodeMacroStore` writes one marker file per secret id under `globalStorageUri`
+      // before the vault entry it names, and fails closed if it cannot — see
+      // `ensureSecretMarkers()`.
+      globalStorageUri: { path: "/global-storage", fsPath: "/global-storage", scheme: "file" },
       globalState: {
         get<T>(k: string, fb: T): T { return (stateMap.get(k) as T) ?? fb; },
         async update(k: string, v: unknown): Promise<void> {
@@ -1657,6 +1670,90 @@ describe("backup import", () => {
     expect(after.name).toBe("Imported missing secret");
     expect(after.text).toBe("");
     expect(after.text).not.toBe("old-local-password\n");
+  });
+
+  it("merging a backup that was previously restored in REPLACE mode adds nothing — the id skip alone stopped being idempotent once replace started freshening ids", async () => {
+    // The regression this pins is a two-command sequence a user has every reason to run:
+    // restore a backup in Replace mode, then later merge the same file to pick up whatever
+    // was added since. Replace assigns a fresh id to every incoming record — it has to, an id
+    // in a file is an identity from another machine — so after it runs, none of the ids in
+    // that file names anything locally. Merge's only dedupe used to be the id, so every macro
+    // in the file landed a SECOND time, with a distinct id, which means the ambiguous-id
+    // fail-safe does not suppress either copy: both compile auto-trigger rules and both fire
+    // on one match. A `Password:` responder answers a single prompt twice.
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
+
+    const backup = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [
+        { id: "file-a", name: "Enable", text: "enable\n", triggerPattern: "Password:" },
+        { id: "file-b", name: "Poll", text: "show status\n" }
+      ],
+      settings: {}
+    };
+
+    await runBackupImport(backup, "replace");
+    const afterReplace = getMacros();
+    expect(afterReplace.map((m) => m.name)).toEqual(["Enable", "Poll"]);
+    // The premise: the file's ids are gone, so the id skip below cannot match anything.
+    expect(afterReplace.map((m) => m.id)).not.toContain("file-a");
+    expect(afterReplace.map((m) => m.id)).not.toContain("file-b");
+
+    await runBackupImport(backup, "merge");
+
+    const afterMerge = getMacros();
+    expect(afterMerge).toHaveLength(2);
+    expect(afterMerge.map((m) => m.name)).toEqual(["Enable", "Poll"]);
+    // Not merely "the right count": the records are the SAME records, still on the ids the
+    // replace gave them, so nothing was replaced-in-place either.
+    expect(afterMerge.map((m) => m.id)).toEqual(afterReplace.map((m) => m.id));
+
+    // ...and the content key has not made merge inert. A macro the file has and the store
+    // does not still lands, exactly once.
+    await runBackupImport(
+      { ...backup, macros: [...backup.macros, { id: "file-c", name: "Reload", text: "reload\n" }] },
+      "merge"
+    );
+    const afterSecondMerge = getMacros();
+    expect(afterSecondMerge.map((m) => m.name)).toEqual(["Enable", "Poll", "Reload"]);
+    expect(afterSecondMerge[2].id).toBe("file-c");
+  });
+
+  it("merge still skips by ID, so a macro edited locally is not re-added from the backup as a second copy", async () => {
+    // The two dedupe keys are independent and this is the half the content key cannot do:
+    // the record's content has DIVERGED from the file's, so only the id identifies it. This
+    // is also what keeps `MacroStore.save()`'s precondition true for this branch — every
+    // incoming id the store already holds is dropped before the list reaches the store.
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    await store.save([{ id: "shared", name: "Enable (renamed locally)", text: "enable-secret\n" }]);
+    setActiveMacroStore(store);
+
+    await runBackupImport(
+      {
+        version: 2,
+        exportType: "backup",
+        exportedAt: new Date().toISOString(),
+        servers: [],
+        tunnels: [],
+        serialProfiles: [],
+        macros: [{ id: "shared", name: "Enable", text: "enable\n" }],
+        settings: {}
+      },
+      "merge"
+    );
+
+    const macros = getMacros();
+    expect(macros).toHaveLength(1);
+    expect(macros[0].name).toBe("Enable (renamed locally)");
+    expect(macros[0].text).toBe("enable-secret\n");
   });
 
   it("Fix A — backup restore strips the trigger even when every declared variable entry is invalid", async () => {
@@ -2267,6 +2364,10 @@ describe("legacy macro absorption with variables present (§10 — keyOfLegacy)"
     const stateMap = new Map<string, unknown>();
     const secretMap = new Map<string, string>();
     return {
+      // `VscodeMacroStore` writes one marker file per secret id under `globalStorageUri`
+      // before the vault entry it names, and fails closed if it cannot — see
+      // `ensureSecretMarkers()`.
+      globalStorageUri: { path: "/global-storage", fsPath: "/global-storage", scheme: "file" },
       globalState: {
         get<T>(k: string, fb: T): T { return (stateMap.get(k) as T) ?? fb; },
         async update(k: string, v: unknown): Promise<void> {
@@ -3299,6 +3400,10 @@ describe("complete reset", () => {
     const stateMap = new Map<string, unknown>();
     const secretMap = new Map<string, string>();
     const fakeCtx = {
+      // `VscodeMacroStore` writes one marker file per secret id under `globalStorageUri`
+      // before the vault entry it names, and fails closed if it cannot — see
+      // `ensureSecretMarkers()`.
+      globalStorageUri: { path: "/global-storage", fsPath: "/global-storage", scheme: "file" },
       globalState: {
         get<T>(k: string, fb: T): T { return (stateMap.get(k) as T) ?? fb; },
         async update(k: string, v: unknown): Promise<void> {

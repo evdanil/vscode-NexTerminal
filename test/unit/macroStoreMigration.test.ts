@@ -2,10 +2,42 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
+// `workspace.fs` is part of this mock because `VscodeMacroStore` writes one marker FILE per
+// secret id under `globalStorageUri` before it writes the vault entry that id names — see
+// `ensureSecretMarkers()`. Legacy absorption stores secrets, so it goes through that path too,
+// and it fails CLOSED: a no-op fs stub would let the absorb quietly stop happening.
 vi.mock("vscode", () => {
   const configs = new Map<string, { global: unknown; workspace: unknown; workspaceFolder: unknown }>();
+  const files = new Map<string, Uint8Array>();
+  const dirs = new Set<string>();
   const api = {
     workspace: {
+      fs: {
+        async createDirectory(uri: { path: string }): Promise<void> {
+          const parts = uri.path.split("/").filter(Boolean);
+          for (let i = 1; i <= parts.length; i++) dirs.add(`/${parts.slice(0, i).join("/")}`);
+        },
+        async writeFile(uri: { path: string }, content: Uint8Array): Promise<void> {
+          const parent = uri.path.slice(0, uri.path.lastIndexOf("/"));
+          if (!dirs.has(parent)) throw new Error(`ENOENT: no such directory, open '${uri.path}'`);
+          files.set(uri.path, content);
+        },
+        async readFile(uri: { path: string }): Promise<Uint8Array> {
+          const found = files.get(uri.path);
+          if (!found) throw new Error(`ENOENT: no such file, open '${uri.path}'`);
+          return found;
+        },
+        async readDirectory(uri: { path: string }): Promise<Array<[string, number]>> {
+          if (!dirs.has(uri.path)) throw new Error(`ENOENT: no such directory, scandir '${uri.path}'`);
+          const prefix = `${uri.path}/`;
+          return [...files.keys()]
+            .filter((p) => p.startsWith(prefix) && !p.slice(prefix.length).includes("/"))
+            .map((p) => [p.slice(prefix.length), 1] as [string, number]);
+        },
+        async delete(uri: { path: string }): Promise<void> {
+          if (!files.delete(uri.path)) throw new Error(`ENOENT: no such file, unlink '${uri.path}'`);
+        }
+      },
       getConfiguration(section: string) {
         const get = () => configs.get(section) ?? { global: undefined, workspace: undefined, workspaceFolder: undefined };
         return {
@@ -34,6 +66,12 @@ vi.mock("vscode", () => {
         };
       }
     },
+    Uri: {
+      joinPath(base: { path: string; scheme?: string }, ...parts: string[]) {
+        const path = [base.path.replace(/\/$/, ""), ...parts].join("/");
+        return { path, fsPath: path, scheme: base.scheme ?? "file" };
+      }
+    },
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     __setConfig(section: string, value: { global?: unknown; workspace?: unknown; workspaceFolder?: unknown }) {
       configs.set(section, { global: value.global, workspace: value.workspace, workspaceFolder: value.workspaceFolder });
@@ -41,16 +79,23 @@ vi.mock("vscode", () => {
     __getConfig(section: string) {
       return configs.get(section);
     },
+    __files: files,
     __reset() { configs.clear(); }
   };
   return api;
 });
 
+let ctxSeq = 0;
+
 function makeCtx() {
   const state = new Map<string, unknown>();
   const secrets = new Map<string, string>();
+  // A per-context storage root: the mocked filesystem is module state shared by every test
+  // in this file, so without it one test's marker files would be visible to the next.
+  const globalStoragePath = `/global-storage/ctx-${++ctxSeq}`;
   return {
     ctx: {
+      globalStorageUri: { path: globalStoragePath, fsPath: globalStoragePath, scheme: "file" },
       globalState: {
         get<T>(k: string, fb: T): T { return (state.get(k) as T) ?? fb; },
         async update(k: string, v: unknown): Promise<void> { if (v === undefined) state.delete(k); else state.set(k, v); },

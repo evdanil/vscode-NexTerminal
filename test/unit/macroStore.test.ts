@@ -1,27 +1,84 @@
 import { describe, it, expect, vi } from "vitest";
 
-// VscodeMacroStore imports vscode for migration only; the tests with
-// { runLegacyMigration: false } never touch these stubs.
-vi.mock("vscode", () => ({
-  workspace: {
-    getConfiguration: vi.fn(() => ({
-      inspect: vi.fn(() => ({})),
-      update: vi.fn()
-    }))
-  },
-  ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 }
-}));
+// VscodeMacroStore imports vscode for the legacy migration (tests with
+// { runLegacyMigration: false } never touch those stubs) AND for `workspace.fs`, which it
+// uses on every save that writes a secret: the secret-id ledger is one marker FILE per id
+// under `globalStorageUri`, because a `globalState` array is a read-modify-write that two
+// windows can lose. So the mock below is a real (if tiny) in-memory filesystem rather than
+// a set of no-op spies — a no-op `writeFile` would make every "the marker was written"
+// assertion vacuous, and a no-op `readDirectory` would hide the sweep entirely.
+vi.mock("vscode", () => {
+  const files = new Map<string, Uint8Array>();
+  const dirs = new Set<string>();
+  return {
+    workspace: {
+      getConfiguration: vi.fn(() => ({
+        inspect: vi.fn(() => ({})),
+        update: vi.fn()
+      })),
+      fs: {
+        async createDirectory(uri: { path: string }): Promise<void> {
+          // Idempotent, like the real one, and it creates parents.
+          const parts = uri.path.split("/").filter(Boolean);
+          for (let i = 1; i <= parts.length; i++) dirs.add(`/${parts.slice(0, i).join("/")}`);
+        },
+        async writeFile(uri: { path: string }, content: Uint8Array): Promise<void> {
+          const parent = uri.path.slice(0, uri.path.lastIndexOf("/"));
+          if (!dirs.has(parent)) throw new Error(`ENOENT: no such directory, open '${uri.path}'`);
+          files.set(uri.path, content);
+        },
+        async readFile(uri: { path: string }): Promise<Uint8Array> {
+          const found = files.get(uri.path);
+          if (!found) throw new Error(`ENOENT: no such file, open '${uri.path}'`);
+          return found;
+        },
+        async readDirectory(uri: { path: string }): Promise<Array<[string, number]>> {
+          if (!dirs.has(uri.path)) throw new Error(`ENOENT: no such directory, scandir '${uri.path}'`);
+          const prefix = `${uri.path}/`;
+          return [...files.keys()]
+            .filter((p) => p.startsWith(prefix) && !p.slice(prefix.length).includes("/"))
+            .map((p) => [p.slice(prefix.length), 1] as [string, number]);
+        },
+        async delete(uri: { path: string }): Promise<void> {
+          if (!files.delete(uri.path)) throw new Error(`ENOENT: no such file, unlink '${uri.path}'`);
+        }
+      }
+    },
+    Uri: {
+      joinPath(base: { path: string; scheme?: string }, ...parts: string[]) {
+        const path = [base.path.replace(/\/$/, ""), ...parts].join("/");
+        return { path, fsPath: path, scheme: base.scheme ?? "file" };
+      }
+    },
+    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+    __fsFiles: files,
+    __fsDirs: dirs
+  };
+});
 
+import * as vscodeMock from "vscode";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore } from "../../src/storage/vscodeMacroStore";
 import { assignMacroIds, assignUniqueMacroIds, isValidMacroId } from "../../src/storage/macroStore";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
+const fsFiles = (vscodeMock as unknown as { __fsFiles: Map<string, Uint8Array> }).__fsFiles;
+const fsDirs = (vscodeMock as unknown as { __fsDirs: Set<string> }).__fsDirs;
+
+/**
+ * The mocked filesystem is module state and therefore shared by every test in this file, so
+ * each context gets its OWN global-storage root. Without that, one test's marker files would
+ * be visible to the next test's `clearAll()` sweep and a leak would read as a pass.
+ */
+let contextSeq = 0;
+
 function makeFakeContext() {
   const stateBag = new Map<string, unknown>();
   const secretBag = new Map<string, string>();
+  const globalStoragePath = `/global-storage/ctx-${++contextSeq}`;
   return {
     context: {
+      globalStorageUri: { path: globalStoragePath, fsPath: globalStoragePath, scheme: "file" },
       globalState: {
         get<T>(key: string, fallback: T): T {
           return (stateBag.get(key) as T) ?? fallback;
@@ -47,7 +104,24 @@ function makeFakeContext() {
       }
     } as unknown as import("vscode").ExtensionContext,
     stateBag,
-    secretBag
+    secretBag,
+    /** Marker-file names currently under this context's global storage, sorted. */
+    markerNames(): string[] {
+      const prefix = `${globalStoragePath}/macro-secret-ids/`;
+      return [...fsFiles.keys()]
+        .filter((p) => p.startsWith(prefix))
+        .map((p) => p.slice(prefix.length))
+        .sort();
+    },
+    /** Secret ids recoverable from this context's marker files — the ids are the CONTENTS. */
+    markedIds(): string[] {
+      const prefix = `${globalStoragePath}/macro-secret-ids/`;
+      return [...fsFiles.entries()]
+        .filter(([p]) => p.startsWith(prefix))
+        .map(([, bytes]) => new TextDecoder().decode(bytes))
+        .sort();
+    },
+    globalStoragePath
   };
 }
 
@@ -237,6 +311,9 @@ describe("VscodeMacroStore", () => {
     expect(ops[ops.length - 1]).toBe("secretIds");
   });
 
+  // Also the LEGACY-FALLBACK contract: "orphan" below is seeded into `nexus.macros.secretIds`
+  // and into the vault by hand and has no marker file, which is exactly the shape a build
+  // predating the marker files leaves behind. Complete Reset must still find it.
   it("clearAll sweeps an orphan vault entry the index knows about but `resolved` does not", async () => {
     const { context, secretBag } = makeFakeContext();
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });
@@ -313,6 +390,196 @@ describe("VscodeMacroStore", () => {
       const runtimeId = store.getAll()[0].id!;
       expect(runtimeId).toBeTruthy();
       expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).not.toContain(runtimeId);
+    });
+  });
+
+  describe("secret-id MARKER FILES — the per-entity ledger the globalState array could not be", () => {
+    it("writes the marker BEFORE the vault entry it names, with the id as the file's contents", async () => {
+      const { context, markerNames, markedIds } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      const markedAtStore = new Map<string, string[]>();
+      const origStore = context.secrets.store.bind(context.secrets);
+      context.secrets.store = async (k: string, v: string) => {
+        markedAtStore.set(k, markedIds());
+        return origStore(k, v);
+      };
+
+      await store.save([{ id: "s", name: "Password", text: "hunter2\n", secret: true }]);
+
+      // The guarantee: at the instant the value hit the vault, the id naming it was already
+      // on disk in a medium that a second window cannot overwrite. Writing the marker
+      // afterwards leaves a window in which a crash strands a plaintext credential under a
+      // key nothing names — not `nexus.macros`, not the ledger, not Complete Reset.
+      expect(markedAtStore.get("macro-secret-text-s")).toEqual(["s"]);
+      // One file, named by a hash (macro ids are only promised to be non-empty strings, and a
+      // hand-edited backup can put a path separator in one), with the id as its contents so
+      // the sweep can recover it.
+      expect(markerNames()).toHaveLength(1);
+      expect(markerNames()[0]).toMatch(/^[0-9a-f]{64}\.id$/);
+      expect(markedIds()).toEqual(["s"]);
+    });
+
+    it("Complete Reset sweeps a vault entry that only a marker still names — the entry the globalState ledger loses to a second window", async () => {
+      const { context, stateBag, secretBag, markedIds } = makeFakeContext();
+      const windowA = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await windowA.initialize();
+      const windowB = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await windowB.initialize();
+
+      await windowA.save([{ id: "a", name: "A", text: "secret-a\n", secret: true }]);
+      expect(stateBag.get("nexus.macros.secretIds")).toEqual(["a"]);
+
+      // Window B is running on a globalState cache from BEFORE A's save. That is not a
+      // contrivance — it is what VS Code hands a second window, and extension code cannot
+      // invalidate or lock it, which is the whole reason the array ledger cannot be the
+      // authoritative record. B's ledger read therefore answers `[]`, its union write drops
+      // "a", and its wholesale `nexus.macros` write drops A's macro too.
+      const origGet = context.globalState.get.bind(context.globalState);
+      context.globalState.get = ((key: string, fallback: unknown) =>
+        key === "nexus.macros.secretIds" ? [] : origGet(key, fallback)) as typeof context.globalState.get;
+      await windowB.save([{ id: "b", name: "B", text: "secret-b\n", secret: true }]);
+      context.globalState.get = origGet;
+
+      // The lost race, reproduced: nothing in globalState names "a" any more...
+      expect(stateBag.get("nexus.macros.secretIds")).toEqual(["b"]);
+      expect((stateBag.get("nexus.macros") as TerminalMacro[]).map((m) => m.id)).toEqual(["b"]);
+      expect(secretBag.get("macro-secret-text-a")).toBe("secret-a\n");
+      // ...but the marker files do, because two windows creating two different files cannot
+      // lose one another's write.
+      expect(markedIds()).toEqual(["a", "b"]);
+
+      const later = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await later.initialize();
+      await later.clearAll();
+
+      expect(secretBag.has("macro-secret-text-a")).toBe(false);
+      expect(secretBag.has("macro-secret-text-b")).toBe(false);
+      // And the markers go with the entries they named, so the directory does not grow
+      // without bound.
+      expect(markedIds()).toEqual([]);
+    });
+
+    it("a save whose marker cannot be written writes NOTHING — not the vault entry, not the ledger, not nexus.macros", async () => {
+      const { context, stateBag, secretBag, markedIds } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+      await store.save([{ id: "keep", name: "Existing", text: "show version\n" }]);
+      const before = JSON.stringify(stateBag.get("nexus.macros"));
+
+      const fs = (vscodeMock as unknown as { workspace: { fs: Record<string, unknown> } }).workspace.fs;
+      const origWriteFile = fs.writeFile;
+      fs.writeFile = async () => {
+        throw new Error("EACCES: permission denied");
+      };
+      try {
+        await expect(
+          store.save([
+            { id: "keep", name: "Existing", text: "show version\n" },
+            { id: "new", name: "Password", text: "hunter2\n", secret: true }
+          ])
+        ).rejects.toThrow(/could not record macro secret ids/);
+      } finally {
+        fs.writeFile = origWriteFile;
+      }
+
+      // Fail CLOSED, and fail early: the marker is the first write of the save, so an
+      // unwritable storage folder loses the save rather than producing a vault entry no key
+      // names. The opposite choice — store the secret and hope — is how an unsweepable
+      // plaintext credential is created, which is the whole point of the marker.
+      expect(secretBag.has("macro-secret-text-new")).toBe(false);
+      expect(markedIds()).toEqual([]);
+      expect(context.globalState.get<string[]>("nexus.macros.secretIds", [])).toEqual([]);
+      expect(JSON.stringify(stateBag.get("nexus.macros"))).toBe(before);
+      // ...and the in-memory list is not advanced either, so the UI still shows what is
+      // actually on disk rather than the save the user thinks succeeded.
+      expect(store.getAll().map((m) => m.id)).toEqual(["keep"]);
+    });
+
+    it("bounds the added I/O: nothing at all for a save with no secrets, and one marker write per id per window however many times it is saved", async () => {
+      const { context } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      const fs = (vscodeMock as unknown as {
+        workspace: { fs: Record<string, (...args: never[]) => unknown> };
+      }).workspace.fs;
+      const calls: string[] = [];
+      const wrapped = ["createDirectory", "writeFile", "readFile", "readDirectory", "delete"].map((name) => {
+        const orig = fs[name];
+        fs[name] = ((...args: never[]) => {
+          calls.push(name);
+          return orig(...args);
+        }) as typeof orig;
+        return [name, orig] as const;
+      });
+      try {
+        // A macro list with no secrets in it never opens the storage folder — an unwritable
+        // one therefore blocks saving a SECRET macro and nothing else.
+        await store.save([{ id: "plain", name: "Poll", text: "show status\n" }]);
+        expect(calls).toEqual([]);
+
+        await store.save([
+          { id: "plain", name: "Poll", text: "show status\n" },
+          { id: "s", name: "Password", text: "hunter2\n", secret: true }
+        ]);
+        expect(calls).toEqual(["createDirectory", "writeFile"]);
+
+        // Saving the same secret again — a rename, a reorder, a new value — re-writes the
+        // vault entry but not the marker: the bytes are already the ones this window put
+        // there. Without the memo this would be one filesystem write per secret macro per
+        // save, on a path that can be a network share.
+        calls.length = 0;
+        await store.save([
+          { id: "plain", name: "Poll (prod)", text: "show status\n" },
+          { id: "s", name: "Password", text: "new-pass\n", secret: true }
+        ]);
+        expect(calls).toEqual([]);
+      } finally {
+        for (const [name, orig] of wrapped) fs[name] = orig;
+      }
+    });
+
+    it("serializes its own mutations: Complete Reset issued while a save is blocked on the keyring cannot interleave with it", async () => {
+      const { context, stateBag, secretBag } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      // The save blocks inside `secrets.store()`, which is exactly where a real one blocks:
+      // an OS keychain that needs unlocking can sit on that call for as long as the user
+      // takes to answer the prompt. Complete Reset is a command like any other and can be
+      // invoked in the meantime.
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let gated = false;
+      const origStore = context.secrets.store.bind(context.secrets);
+      context.secrets.store = async (k: string, v: string) => {
+        if (!gated) {
+          gated = true;
+          await gate;
+        }
+        return origStore(k, v);
+      };
+
+      const saving = store.save([{ id: "p", name: "Password", text: "hunter2\n", secret: true }]);
+      const clearing = store.clearAll();
+      release();
+      await Promise.all([saving, clearing]);
+
+      // Interleaved, the reset's vault deletes land between the save's `secrets.store()` and
+      // its `nexus.macros` commit, and the commit then republishes `secret: true` with
+      // nothing behind it. Serialized, the two run whole, in the order they were issued, and
+      // the reset is what the user sees.
+      expect(stateBag.has("nexus.macros")).toBe(false);
+      expect(secretBag.size).toBe(0);
+      // The property that must hold whatever the order: no record on disk names a vault entry
+      // that is not there.
+      for (const m of (stateBag.get("nexus.macros") ?? []) as TerminalMacro[]) {
+        if (m.secret) expect(secretBag.has(`macro-secret-text-${m.id}`)).toBe(true);
+      }
     });
   });
 
@@ -694,8 +961,18 @@ describe("VscodeMacroStore", () => {
       expect(poll.id).not.toBe("dup");
       // The re-keyed NON-secret twin runs an incidental vault delete on every save. It must
       // name the id that twin ended up with, never the one it arrived carrying — the id it
-      // arrived with is the one holding the other macro's password. An end-state-only test
-      // misses this whenever the delete happens to be a no-op for other reasons.
+      // arrived with is the one holding the other macro's password.
+      //
+      // COVERAGE CAVEAT, recorded rather than implied. This line does NOT independently
+      // discriminate today, and the round-3 commit message that introduced it should have
+      // said so. Mutating the incidental delete to name `priorId` instead of the record's
+      // final id — the wrong implementation it was written for — destroys the password, so
+      // the `secretBag.get("macro-secret-text-dup")` assertion four lines up fails first and
+      // this one is never reached. (Verified by applying exactly that mutation: the run
+      // fails at the end-state assertion.) It is kept because it states the ORDERING
+      // requirement in a form a reader can check, and because an end-state-only test would
+      // miss a delete that happens to be a no-op for some other reason — not because it is
+      // currently the thing catching anything.
       expect(vaultOps).not.toContain("delete:macro-secret-text-dup");
       // And no empty entry was minted under the re-keyed twin's fresh id.
       expect([...secretBag.keys()]).toEqual(["macro-secret-text-dup"]);
@@ -748,7 +1025,7 @@ describe("VscodeMacroStore", () => {
       expect([...secretBag.keys()]).toEqual(["macro-secret-text-dup"]);
     });
 
-    it("re-keys an unreadable secret normally once the user supplies a new value, storing it under the new key BEFORE the old key is deleted", async () => {
+    it("re-keys an unreadable secret normally once the user supplies a new value, storing it under the new key BEFORE nexus.macros is committed and the old key deleted", async () => {
       const { context, stateBag, secretBag } = makeFakeContext();
       stateBag.set("nexus.macros", [
         { id: "dup", name: "Poll", text: "show status\n" },
@@ -763,8 +1040,13 @@ describe("VscodeMacroStore", () => {
       const ops: string[] = [];
       const origStore = context.secrets.store.bind(context.secrets);
       const origDelete = context.secrets.delete.bind(context.secrets);
+      const origUpdate = context.globalState.update.bind(context.globalState);
       context.secrets.store = async (k: string, v: string) => { ops.push(`store:${k}`); return origStore(k, v); };
       context.secrets.delete = async (k: string) => { ops.push(`delete:${k}`); return origDelete(k); };
+      context.globalState.update = async (k: string, v: unknown) => {
+        if (k === "nexus.macros") ops.push("commit");
+        return origUpdate(k, v);
+      };
 
       const macros = store.getAll();
       macros[1].text = "new-pass\n";
@@ -778,28 +1060,39 @@ describe("VscodeMacroStore", () => {
       expect(secretBag.get(`macro-secret-text-${password.id}`)).toBe("new-pass\n");
       expect(secretBag.has("macro-secret-text-dup")).toBe(false);
 
-      // Order, not just the end state. Until the fresh key holds a value there is exactly
-      // one durable copy of anything on this macro, and it is under "dup"; a delete that ran
-      // ahead of the store would leave a crash right there with neither. Every end-state
-      // assertion above still holds if the two are swapped.
+      // Order, not just the end state — and all THREE points of it, because the commit is
+      // what makes the delete safe rather than merely late. Until the fresh key holds a
+      // value there is exactly one durable copy of anything on this macro and it is under
+      // "dup", so a delete ahead of the store leaves a crash right there with neither; and a
+      // delete ahead of the commit leaves `nexus.macros` still naming "dup" with nothing
+      // behind it. `store → delete → commit` satisfies the first and fails the second, and
+      // every end-state assertion above holds for all three orderings.
       const iStore = ops.indexOf(`store:macro-secret-text-${password.id}`);
+      const iCommit = ops.indexOf("commit");
       const iDelete = ops.indexOf("delete:macro-secret-text-dup");
       expect(iStore).toBeGreaterThanOrEqual(0);
-      expect(iDelete).toBeGreaterThan(iStore);
+      expect(iCommit).toBeGreaterThan(iStore);
+      expect(iDelete).toBeGreaterThan(iCommit);
     });
 
     it("the pin keys off the failed READ, not off the empty value: in ONE save an unreadable secret keeps its id and a genuinely empty one does not", async () => {
       const { context, stateBag, secretBag } = makeFakeContext();
-      // Two contested ids in one stored list. "u" holds a real password the keyring refuses
-      // to hand over; "e" holds a secret that really is empty and reads back fine. A negative
-      // control on its own is satisfied by an implementation with no pinning at all, so the
-      // positive case is put in the same save: the two halves cannot both pass unless the
-      // decision is made per record, on whether that record's READ failed.
+      // Two contested ids in one stored list. "e" holds a secret that really is empty and
+      // reads back fine; "u" holds a real password the keyring refuses to hand over. A
+      // negative control on its own is satisfied by an implementation with no pinning at all,
+      // so the positive case is put in the same save: the two halves cannot both pass unless
+      // the decision is made per record, on whether that record's READ failed.
+      //
+      // The order of the two groups is deliberate. The group that NEEDS the pin is the
+      // SECOND one, so an implementation that resolves only the first contested id it sees
+      // and then falls back to plain array order — which is what a fixture with one contested
+      // group, or with the pinned group first, cannot distinguish from a correct one — hands
+      // "u" to the plain twin and deletes the password.
       stateBag.set("nexus.macros", [
-        { id: "u", name: "Plain twin", text: "show status\n" },
-        { id: "u", name: "Unreadable", text: "", secret: true },
         { id: "e", name: "Poll", text: "show status\n" },
-        { id: "e", name: "Empty password", text: "", secret: true }
+        { id: "e", name: "Empty password", text: "", secret: true },
+        { id: "u", name: "Plain twin", text: "show status\n" },
+        { id: "u", name: "Unreadable", text: "", secret: true }
       ]);
       secretBag.set("macro-secret-text-u", "keyring-value\n");
       secretBag.set("macro-secret-text-e", "");
@@ -819,25 +1112,26 @@ describe("VscodeMacroStore", () => {
       ]);
 
       const macros = store.getAll();
-      macros[0].name = "Plain twin (prod)";
+      macros[0].name = "Poll (prod)";
       await store.save(macros);
 
-      const [plainTwin, unreadable, poll, empty] = store.getAll();
-      // "u": the pin beats array order, and the password behind the key is untouched.
-      expect(unreadable.id).toBe("u");
-      expect(plainTwin.id).not.toBe("u");
-      expect(secretBag.get("macro-secret-text-u")).toBe("keyring-value\n");
+      const [poll, empty, plainTwin, unreadable] = store.getAll();
       // "e": nothing failed to read, so array order decides as usual and the empty value
       // travels to the re-keyed record's own key.
       expect(poll.id).toBe("e");
       expect(empty.id).not.toBe("e");
       expect(secretBag.get(`macro-secret-text-${empty.id}`)).toBe("");
       expect(secretBag.has("macro-secret-text-e")).toBe(false);
+      // "u", the second contested group: the pin beats array order, and the password behind
+      // the key is untouched.
+      expect(unreadable.id).toBe("u");
+      expect(plainTwin.id).not.toBe("u");
+      expect(secretBag.get("macro-secret-text-u")).toBe("keyring-value\n");
     });
   });
 
-  describe("cross-window secret writes — a stale window must not resurrect its own copy", () => {
-    it("defers to the vault only while the entry is still there: another window's newer value survives, but a DELETED entry is restored rather than republished empty", async () => {
+  describe("cross-window secret writes — a save publishes this window's whole view", () => {
+    it("republishes every secret it holds, so a deleted entry comes back whole — and, as the documented cost, another window's newer value is reverted with the rest of that window's edits", async () => {
       const { context, secretBag } = makeFakeContext();
       const seed = new VscodeMacroStore(context, { runLegacyMigration: false });
       await seed.initialize();
@@ -853,7 +1147,19 @@ describe("VscodeMacroStore", () => {
       await windowB.initialize();
       expect(windowB.getAll()[0].text).toBe("old\n");
 
-      // Part 1 — A CHANGES the password. B, still holding "old", edits something else.
+      // Part 1 — the TRADE, asserted rather than left implicit. A changes the password. B,
+      // still holding "old", edits something else and saves; B's wholesale MACROS_KEY write
+      // already reverts A's rename, and its vault write now reverts A's password with it.
+      //
+      // Two earlier revisions tried to keep A's value here by not rewriting a secret B had not
+      // changed — first unconditionally, then after reading the key back and restoring it only
+      // when it had gone. Both published a MIXTURE of the two windows' views, and the second
+      // could not even be correct in principle: `SecretStorage` has no compare-and-swap, so the
+      // read-back is separated from the commit it guards by every remaining await in `save()`,
+      // and a delete landing in that gap produces exactly the torn record it was meant to
+      // prevent (see part 2 for what "torn" costs). The rule shipped instead is one sentence
+      // long: a save publishes this window's whole view. This assertion is what pins it — the
+      // read-back implementation leaves "new\n" here and fails.
       const a = windowA.getAll();
       a[0].text = "new\n";
       await windowA.save(a);
@@ -863,15 +1169,17 @@ describe("VscodeMacroStore", () => {
       b[1].name = "Poll (prod)";
       await windowB.save(b);
 
-      // B's user never typed a password, so B must not have written one.
-      expect(secretBag.get("macro-secret-text-p")).toBe("new\n");
+      expect(secretBag.get("macro-secret-text-p")).toBe("old\n");
+      // ...and the rest of B's view landed too, which is what makes it a coherent revert
+      // rather than a stray write: A's rename is gone by the same wholesale rule.
+      expect((context.globalState.get("nexus.macros", []) as TerminalMacro[])[1].name).toBe("Poll (prod)");
 
-      // Part 2 — A DELETES the macro, taking its vault entry with it. B still holds the old
-      // list, so B's next save republishes the record through its wholesale MACROS_KEY write.
-      // The deferral B made in part 1 is no longer a no-op: there is nothing behind the key
-      // for it to defer TO. Deferring anyway leaves `secret: true` on disk with no value —
-      // an empty secret at the next load, silently, which is neither what A's user asked for
-      // nor what B's did. Part 1 alone passes for an implementation that always defers.
+      // Part 2 — what the trade BUYS. A deletes the macro, taking its vault entry with it. B
+      // still holds the old list, so B's next save republishes the record through the same
+      // wholesale MACROS_KEY write. Because B writes every secret it holds, the record it
+      // republishes is whole. Skipping the write would leave `secret: true` on disk with no
+      // value behind it — an empty secret at the next load, reported to nobody, which is
+      // neither what A's user asked for nor what B's did.
       const a2 = windowA.getAll().filter((m) => m.id !== "p");
       await windowA.save(a2);
       expect(secretBag.has("macro-secret-text-p")).toBe(false);
@@ -925,13 +1233,14 @@ describe("VscodeMacroStore", () => {
       expect(reloaded.getAll().find((m) => m.id === "p")?.text).toBe("old\n");
     });
 
-    it("still writes a secret whose value this window actually changed — and only that one", async () => {
+    it("writes EVERY secret it holds, not only the one this window changed — and the changed one is not the first", async () => {
       const { context, secretBag } = makeFakeContext();
       const seed = new VscodeMacroStore(context, { runLegacyMigration: false });
       await seed.initialize();
       await seed.save([
-        { id: "p", name: "Password", text: "old\n", secret: true },
-        { id: "q", name: "Enable", text: "enable-pass\n", secret: true }
+        { id: "p", name: "Password", text: "p-old\n", secret: true },
+        { id: "q", name: "Enable", text: "q-old\n", secret: true },
+        { id: "s", name: "Console", text: "s-old\n", secret: true }
       ]);
 
       const store = new VscodeMacroStore(context, { runLegacyMigration: false });
@@ -941,32 +1250,37 @@ describe("VscodeMacroStore", () => {
       const origStore = context.secrets.store.bind(context.secrets);
       context.secrets.store = async (k: string, v: string) => { stores.push(k); return origStore(k, v); };
 
+      // The edited macro sits at index 1, with an untouched secret on either side of it. An
+      // implementation that decides what to write from ARRAY POSITION — "the first one", "the
+      // one being edited is index 0" — passes a two-record fixture whose changed record
+      // happens to be at position zero. Here it cannot: whichever single key such an
+      // implementation picks, the list below has three.
       const macros = store.getAll();
-      macros[0].text = "new\n";
+      macros[1].text = "q-new\n";
       await store.save(macros);
 
-      expect(secretBag.get("macro-secret-text-p")).toBe("new\n");
-      expect(secretBag.get("macro-secret-text-q")).toBe("enable-pass\n");
-      // The pair is the point, and the count is the assertion. With only the changed macro
-      // in the fixture, an implementation that never defers at all passes — and that is the
-      // implementation that puts a stale window's copy back over another window's newer
-      // value. One that defers unconditionally loses the edit the user just made.
-      expect(stores).toEqual(["macro-secret-text-p"]);
+      expect(secretBag.get("macro-secret-text-p")).toBe("p-old\n");
+      expect(secretBag.get("macro-secret-text-q")).toBe("q-new\n");
+      expect(secretBag.get("macro-secret-text-s")).toBe("s-old\n");
+      // The count and the order are the assertion. Every secret this window holds is written
+      // back on every save — the unchanged ones with the same bytes they were read with —
+      // because a write elided on the strength of a snapshot is a write elided on the strength
+      // of something another window may have deleted since. An implementation that writes only
+      // the changed record produces `["macro-secret-text-q"]` here.
+      expect(stores).toEqual([
+        "macro-secret-text-p",
+        "macro-secret-text-q",
+        "macro-secret-text-s"
+      ]);
     });
 
-    it("the deferral is selective: a re-keyed secret is stored under its new key while an unmoved, unchanged one beside it is deferred", async () => {
+    it("a re-keyed secret is stored under its NEW key, and the unmoved secret beside it is written too", async () => {
       const { context, secretBag } = makeFakeContext();
       // No caller produces this shape today: `save()`'s input is a mutation of `getAll()`
       // (whose ids are unique after any write) and the only wholesale-external list goes
       // through `replaceAll()`, which strips ids. It is kept for the caller that does not
-      // exist yet — a record whose id MOVES has nothing behind its new key.
-      //
-      // Note on what this does NOT pin: the `priorId === id` term of the deferral condition
-      // is no longer load-bearing, because the confirm-and-restore step catches the same
-      // case one layer down. Dropping the term (deferring on the value alone) makes this
-      // save defer the moved record, find nothing under its new key, and store it anyway —
-      // same end state, one extra vault read. Verified by mutation; the term is kept as the
-      // semantically correct condition and to avoid that read, not as the safety net.
+      // exist yet — a record whose id MOVES has nothing behind its new key, so a write keyed
+      // off the id it arrived with would put the value somewhere no macro names.
       const seed = new VscodeMacroStore(context, { runLegacyMigration: false });
       await seed.initialize();
       await seed.save([
@@ -991,9 +1305,10 @@ describe("VscodeMacroStore", () => {
       expect(secretBag.has("macro-secret-text-dup")).toBe(false);
       expect(unmovedEnable.id).toBe("q");
       expect(secretBag.get("macro-secret-text-q")).toBe("enable-pass\n");
-      // Exactly one write: the moved key. `q` did not move and did not change, so it is
-      // deferred — which is what distinguishes this from "never defer at all".
-      expect(stores).toEqual([`macro-secret-text-${movedPassword.id}`]);
+      // Both keys, and the moved one keyed by where the record ENDED UP rather than where it
+      // came from. `macro-secret-text-dup` appears nowhere in the store list: it is deleted,
+      // never written.
+      expect(stores).toEqual([`macro-secret-text-${movedPassword.id}`, "macro-secret-text-q"]);
     });
   });
 
@@ -1162,6 +1477,12 @@ describe("VscodeMacroStore", () => {
       for (const { macro } of out) {
         expect(isValidMacroId(macro.id)).toBe(true);
       }
+      // ...and "every record has SOME valid id" is not the same claim as "an uncontested id
+      // is left alone". Without this line an implementation that mints a fresh UUID for
+      // `solo` satisfies everything above: the id is valid, it is unique, and nothing else
+      // looks at it. `save()` keys the vault by the final id, so re-keying an uncontested
+      // record is what orphans its entry.
+      expect(out[3].macro.id).toBe("solo");
       expect(new Set(out.map((a) => a.macro.id)).size).toBe(4);
     });
 
@@ -1182,61 +1503,82 @@ describe("VscodeMacroStore", () => {
       // collision is seen" agree; a fixture that stops there cannot tell them apart.
       expect(out[3].macro.id).toBe("solo");
       expect(new Set(out.map((a) => a.macro.id)).size).toBe(4);
+      // Provenance is part of "the plain array-order rule", not a separate feature of the
+      // pinned path, and this is the only test of the no-option call that says so. Inspecting
+      // final ids alone is satisfied by an implementation that reports `priorId: undefined`
+      // for everything — which is precisely the value that tells `save()` "this record has no
+      // vault entry of its own", the mistake that let a keyring outage destroy a password.
+      // An empty-string id is NOT provenance: `isValidMacroId()` rejects it.
+      expect(out.map((a) => a.priorId)).toEqual(["dup", "dup", undefined, "solo"]);
     });
 
-    it("keepIdIfPossible gives a MIDDLE record first claim on a contested id, and is consulted per record until one claims it", () => {
+    it("keepIdIfPossible gives a MIDDLE record first claim on a contested id, in EVERY contested group, and is consulted per record until each id is claimed", () => {
       const seen: string[] = [];
       const out = assignMacroIds(
         [
-          { id: "dup", name: "A", text: "a" },
-          { id: "dup", name: "B", text: "b" },
-          { id: "dup", name: "C", text: "c" }
+          { id: "one", name: "A", text: "a" },
+          { id: "one", name: "B", text: "b" },
+          { id: "two", name: "C", text: "c" },
+          { id: "two", name: "D", text: "d" },
+          { id: "two", name: "E", text: "e" }
         ] as TerminalMacro[],
         {
           keepIdIfPossible: (m) => {
             seen.push(m.name);
-            return m.name === "B";
+            return m.name === "B" || m.name === "D";
           }
         }
       );
-      // Three claimants with the winner in the MIDDLE: neither "the first wins" nor "the
-      // last wins" reproduces this, and the two-record fixture it replaces was satisfied by
-      // hard-coding the latter.
-      expect(out[1].macro.id).toBe("dup");
-      expect(out[0].macro.id).not.toBe("dup");
-      expect(out[2].macro.id).not.toBe("dup");
-      expect(new Set(out.map((a) => a.macro.id)).size).toBe(3);
+      // TWO contested groups, and in neither of them is the winner first. One group cannot
+      // distinguish "the pin pass runs over the whole list" from "the first contested id is
+      // resolved by the pin and the rest fall back to array order" — the second is a real
+      // implementation, and under it a save with two unreadable secrets destroys the second
+      // one's password. Three claimants in the second group also rule out "the last wins".
+      expect(out[1].macro.id).toBe("one");
+      expect(out[0].macro.id).not.toBe("one");
+      expect(out[3].macro.id).toBe("two");
+      expect(out[2].macro.id).not.toBe("two");
+      expect(out[4].macro.id).not.toBe("two");
+      expect(new Set(out.map((a) => a.macro.id)).size).toBe(5);
       // The predicate receives the RECORD — not an id, not an index — and is not asked
-      // again once the id is spoken for.
-      expect(seen).toEqual(["A", "B"]);
-      // Provenance is unaffected by who won: all three arrived carrying "dup".
-      expect(out.map((a) => a.priorId)).toEqual(["dup", "dup", "dup"]);
+      // again once the id it would claim is spoken for, which is why "E" never appears.
+      expect(seen).toEqual(["A", "B", "C", "D"]);
+      // Provenance is unaffected by who won.
+      expect(out.map((a) => a.priorId)).toEqual(["one", "one", "two", "two", "two"]);
     });
 
-    it("pinned records claim ahead of array order, and among several pinned claimants the first in array order wins", () => {
+    it("pinned records claim ahead of array order, among several pinned claimants the first in array order wins, and an uncontested id elsewhere is left alone", () => {
       const out = assignMacroIds(
         [
           { id: "dup", name: "Unpinned", text: "u" },
           { id: "dup", name: "Pinned A", text: "a" },
+          { id: "solo", name: "Bystander", text: "s" },
           { id: "dup", name: "Pinned B", text: "b" }
         ] as TerminalMacro[],
         { keepIdIfPossible: (m) => m.name.startsWith("Pinned") }
       );
       // An UNPINNED record stands first, so "pinned records claim ahead of array order" and
-      // plain "first in array order wins" give different answers. With all three pinned —
+      // plain "first in array order wins" give different answers. With all of them pinned —
       // the fixture this replaces — they agree, and ignoring the option entirely passed.
       expect(out[1].macro.id).toBe("dup");
       expect(out[0].macro.id).not.toBe("dup");
-      expect(out[2].macro.id).not.toBe("dup");
-      expect(new Set(out.map((a) => a.macro.id)).size).toBe(3);
-      expect(out.map((a) => a.priorId)).toEqual(["dup", "dup", "dup"]);
+      expect(out[3].macro.id).not.toBe("dup");
+      // `solo` is uncontested and unpinned, and it must survive the pin pass untouched. A
+      // fixture containing nothing but the contested id cannot see an implementation that
+      // regenerates every id it did not explicitly award — which would orphan the vault entry
+      // of every secret macro that was not part of a collision, on every save.
+      expect(out[2].macro.id).toBe("solo");
+      expect(new Set(out.map((a) => a.macro.id)).size).toBe(4);
+      expect(out.map((a) => a.priorId)).toEqual(["dup", "dup", "solo", "dup"]);
     });
 
-    it("a pinned record with no usable id gets a fresh one like any other, and never consumes the claim of a record that does have one", () => {
+    it("a pinned record with an UNUSABLE id — missing, empty, or not a string — gets a fresh one like any other, and never consumes the claim of a record that does have one", () => {
       const seen: string[] = [];
       const out = assignMacroIds(
         [
           { name: "No id", text: "n" },
+          { id: "", name: "Empty id", text: "e" },
+          { id: { length: 1 } as unknown as string, name: "Object id", text: "o" },
           { id: "dup", name: "Unpinned", text: "u" },
           { id: "dup", name: "Pinned", text: "p" }
         ] as TerminalMacro[],
@@ -1248,15 +1590,22 @@ describe("VscodeMacroStore", () => {
         }
       );
       expect(out[0].priorId).toBeUndefined();
+      expect(out[1].priorId).toBeUndefined();
+      expect(out[2].priorId).toBeUndefined();
       expect(isValidMacroId(out[0].macro.id)).toBe(true);
-      // The id-less record is pinned too. The pin pass has to pass over it rather than treat
-      // "no id" as a claim — a single id-less record proves nothing, because plain missing-id
-      // UUID assignment produces the same answer with no pinning implemented at all. The
-      // contested pair beside it is what makes the two diverge.
-      expect(out[2].macro.id).toBe("dup");
-      expect(out[1].macro.id).not.toBe("dup");
-      expect(new Set(out.map((a) => a.macro.id)).size).toBe(3);
-      // And the id-less record never reaches the predicate: it has nothing to claim.
+      expect(isValidMacroId(out[1].macro.id)).toBe(true);
+      expect(isValidMacroId(out[2].macro.id)).toBe(true);
+      // All three id-less records are pinned too. The pin pass has to pass over them rather
+      // than treat "no id" as a claim — a single record with `id: undefined` proves nothing,
+      // because plain missing-id UUID assignment produces the same answer with no pinning
+      // implemented at all. The contested pair beside them is what makes the two diverge.
+      expect(out[4].macro.id).toBe("dup");
+      expect(out[3].macro.id).not.toBe("dup");
+      expect(new Set(out.map((a) => a.macro.id)).size).toBe(5);
+      // And none of them reaches the predicate: they have nothing to claim. `undefined` alone
+      // is exercised by any `priorId === undefined` guard; `""` and a non-string with a
+      // positive `.length` are what a `!m.id` or a bare `.length` check lets through, and a
+      // pinned `""` would then claim the empty string and starve a later record of it.
       expect(seen).toEqual(["Unpinned", "Pinned"]);
     });
   });

@@ -35,7 +35,11 @@ export interface MacroStore {
    *     name anything this store knows.
    *   - `commands/configCommands.ts` merge import — `[...getMacros(), ...incoming]` where every
    *     incoming record whose id is already present was skipped, so again no incoming id can
-   *     name anything this store knows.
+   *     name anything this store knows. (It ALSO skips by content key, which is what makes a
+   *     merge of a file that was previously restored in replace mode idempotent — replace
+   *     freshens every id, so the file's ids no longer name anything and the id skip alone
+   *     would add a second copy of every macro in it. That is a separate concern from this
+   *     precondition and is argued at the call site.)
    *   - `commands/configCommands.ts` REPLACE import — the one wholesale-external caller. It
    *     calls `replaceAll()`, not this.
    *
@@ -91,6 +95,25 @@ export interface MacroStore {
    * vault entry between them, so exactly one keeps the id and the other is re-keyed — it gets
    * no vault entry at all rather than an empty one, which is the honest description of a
    * macro whose value was never separately stored in the first place.
+   *
+   * NOT ATOMIC ACROSS VS CODE WINDOWS, and this is the whole of what that means. A save
+   * publishes this window's ENTIRE view of the macro list: `globalState` is rewritten
+   * wholesale, and every secret whose value this window holds is written back to the vault.
+   * So a window holding a stale snapshot reverts another window's concurrent edits — a name,
+   * a trigger, an order, AND a secret value it never saw changed. `globalState` and
+   * `SecretStorage` offer no compare-and-swap and no shared lock, so the alternatives are
+   * only: revert wholesale (this), publish a mixture of the two windows' views (which is how
+   * a record ends up marked `secret: true` with no value behind it), or silently discard a
+   * save the user just made and the UI just reported as succeeding. The first is the one
+   * whose result a user can see and correct.
+   *
+   * Two residual races are therefore accepted and are NOT closed by this method:
+   *   - another window's delete landing between this save's `secrets.store()` and its
+   *     `globalState` commit still publishes a record naming an entry that is gone;
+   *   - another window's `secrets.store()` landing in the same gap is overwritten.
+   * Both need a genuine interleaving inside one save, not merely a stale snapshot.
+   * `VscodeMacroStore` does serialize its OWN mutations (`save` / `replaceAll` / `clearAll`
+   * within one window) so that neither race can be produced from a single window.
    */
   save(macros: TerminalMacro[]): Promise<void>;
   /**
@@ -115,9 +138,20 @@ export interface MacroStore {
    * local secret's vault entry, keep its own auto-trigger, and resolve to the local password
    * once the keyring recovered.
    *
-   * Freshening ids costs nothing here. Nothing outside this store persists a macro id: the
-   * vault keys are rewritten by this very call, and every other consumer
-   * (`macroStateKey()`, the tree, the editor) is runtime-only state rebuilt from the store.
+   * Freshening ids costs nothing IN THIS STORE. The vault keys are rewritten by this very
+   * call, and every other in-process consumer (`macroStateKey()`, the tree, the editor) is
+   * runtime-only state rebuilt from the store.
+   *
+   * It is NOT free outside this process, and an earlier revision of this paragraph claimed
+   * otherwise ("nothing outside this store persists a macro id"). A BACKUP FILE persists
+   * them, and merge-mode import used to key its "have I already got this one?" test solely on
+   * them — so restoring a backup in replace mode and later merging that same file added a
+   * second copy of every macro in it, each copy with a live auto-trigger, and a `Password:`
+   * responder answered one prompt twice. That is fixed where it belongs, at the merge site,
+   * by also skipping on the content key the share-import path already uses; the ids stay
+   * fresh here, because the alternative is the credential reassignment this method exists to
+   * prevent. Any future consumer that treats a macro id as durable across an export/import
+   * round trip has to make the same accommodation.
    *
    * The converse is NOT true, so do not reach for this method as a general-purpose save.
    * Freshening an id is only free when the record's secret can travel to the new id, and a

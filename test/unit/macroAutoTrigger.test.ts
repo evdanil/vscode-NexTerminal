@@ -78,7 +78,47 @@ vi.mock("vscode", () => ({
         if (sectionConfig && key in sectionConfig) return sectionConfig[key];
         return defaultValue;
       })
-    }))
+    })),
+    // Only the end-to-end test at the bottom of this file drives a real VscodeMacroStore, and
+    // that store writes one marker FILE per secret id before the vault entry it names (see
+    // `ensureSecretMarkers()`). It fails closed, so this has to be a working in-memory
+    // filesystem rather than a no-op stub, or that test's save would simply throw.
+    fs: (() => {
+      const files = new Map<string, Uint8Array>();
+      const dirs = new Set<string>();
+      return {
+        async createDirectory(uri: { path: string }): Promise<void> {
+          const parts = uri.path.split("/").filter(Boolean);
+          for (let i = 1; i <= parts.length; i++) dirs.add(`/${parts.slice(0, i).join("/")}`);
+        },
+        async writeFile(uri: { path: string }, content: Uint8Array): Promise<void> {
+          const parent = uri.path.slice(0, uri.path.lastIndexOf("/"));
+          if (!dirs.has(parent)) throw new Error(`ENOENT: no such directory, open '${uri.path}'`);
+          files.set(uri.path, content);
+        },
+        async readFile(uri: { path: string }): Promise<Uint8Array> {
+          const found = files.get(uri.path);
+          if (!found) throw new Error(`ENOENT: no such file, open '${uri.path}'`);
+          return found;
+        },
+        async readDirectory(uri: { path: string }): Promise<Array<[string, number]>> {
+          if (!dirs.has(uri.path)) throw new Error(`ENOENT: no such directory, scandir '${uri.path}'`);
+          const prefix = `${uri.path}/`;
+          return [...files.keys()]
+            .filter((p) => p.startsWith(prefix) && !p.slice(prefix.length).includes("/"))
+            .map((p) => [p.slice(prefix.length), 1] as [string, number]);
+        },
+        async delete(uri: { path: string }): Promise<void> {
+          if (!files.delete(uri.path)) throw new Error(`ENOENT: no such file, unlink '${uri.path}'`);
+        }
+      };
+    })()
+  },
+  Uri: {
+    joinPath(base: { path: string; scheme?: string }, ...parts: string[]) {
+      const path = [base.path.replace(/\/$/, ""), ...parts].join("/");
+      return { path, fsPath: path, scheme: base.scheme ?? "file" };
+    }
   }
 }));
 
@@ -1242,6 +1282,11 @@ describe("MacroAutoTrigger", () => {
       const secretBag = new Map<string, string>();
       return {
         context: {
+          globalStorageUri: {
+            path: "/global-storage/macro-auto-trigger",
+            fsPath: "/global-storage/macro-auto-trigger",
+            scheme: "file"
+          },
           globalState: {
             get<T>(key: string, fallback: T): T {
               return (stateBag.get(key) as T) ?? fallback;
