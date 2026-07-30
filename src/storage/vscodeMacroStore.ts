@@ -407,6 +407,18 @@ export class VscodeMacroStore implements MacroStore {
     this.resolved = [];
     this.unresolvedSecretIds = new Set<string>();
 
+    // And the dead `nexus.macros.secretIds` ledger, which a profile upgrading from an earlier
+    // build is still holding. Nothing reads it and nothing else writes it (see below), so it can
+    // cause neither a wrong deletion nor a missed sweep — but Complete Reset tells the user "All
+    // Nexus data has been deleted", and that has to be true of the bytes as well as of the
+    // behaviour. It cost one line here because this method was already writing globalState;
+    // erasing it on FIRST RUN would have cost a mechanism, which is why that was not done.
+    //
+    // Spelled inline rather than as a module-level constant on purpose: a named `SECRET_IDS_KEY`
+    // sitting beside `MACROS_KEY` reads as live state, and this is the one line in the extension
+    // that names it.
+    await this.context.globalState.update("nexus.macros.secretIds", undefined);
+
     // Sweep the union of what this window knows about and what the HOST itself reports, so
     // orphans `resolved` no longer accounts for still go. The second half is the whole of the
     // guarantee: `readVaultSecretIds()` asks the storage that actually holds the values which
@@ -423,8 +435,8 @@ export class VscodeMacroStore implements MacroStore {
     // therefore lose an id — which is a stranded plaintext credential in the OS keyring — and
     // no ordering of writes fixed that, because the write that UNNAMES an entry happens after
     // the writes that name it. Enumeration has no such race: it is not a record of what was
-    // written, it is a question asked of the thing that holds it. Neither record is read or
-    // written any more; see the release notes for what an upgrading profile is left holding.
+    // written, it is a question asked of the thing that holds it. Neither record is read any
+    // more, and the only write either one has left is the erase above.
     //
     // `this.resolved` is kept in the union because it is free and it is what still answers on
     // a host whose `keys()` rejects (a locked keyring), where `readVaultSecretIds()` degrades

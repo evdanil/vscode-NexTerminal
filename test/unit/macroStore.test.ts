@@ -216,13 +216,23 @@ describe("VscodeMacroStore", () => {
     expect(store.getAll()[0].text).toBe("now-public");
   });
 
-  it("clearAll removes both globalState and all secret vault entries", async () => {
+  it("clearAll removes every globalState key this store has ever written — including the dead secret-id ledger — and all secret vault entries", async () => {
     const { context, stateBag, secretBag } = makeFakeContext();
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });
     await store.initialize();
     await store.save([{ id: "b", name: "m2", text: "classified", secret: true }]);
+
+    // Seeded AFTER the save, because the save is not what has to erase it: `nexus.macros.secretIds`
+    // is the ledger an earlier build maintained and this one neither reads nor writes, so the only
+    // thing that can account for its absence below is `clearAll()` itself. This is what a profile
+    // upgrading from 2.8.73 is still holding. The key is inert — a stale id in it can cause neither
+    // a wrong deletion nor a missed sweep — but Complete Reset reports "All Nexus data has been
+    // deleted", and a reset that leaves a key of Nexus's own behind has not said something true.
+    stateBag.set("nexus.macros.secretIds", ["b"]);
+
     await store.clearAll();
     expect(stateBag.has("nexus.macros")).toBe(false);
+    expect(stateBag.has("nexus.macros.secretIds")).toBe(false);
     expect(secretBag.has("macro-secret-text-b")).toBe(false);
   });
 
