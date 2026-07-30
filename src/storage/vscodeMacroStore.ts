@@ -64,10 +64,24 @@ export class VscodeMacroStore implements MacroStore {
     // Sanitizing here rather than at each consumer makes this the chokepoint: every
     // write to globalState goes through `save()`, so a masked variable's plaintext
     // `default` can never be persisted regardless of which caller supplied it.
-    const normalized: TerminalMacro[] = macros.map((m) => withRedactedVariables({
-      ...m,
-      id: m.id && m.id.length > 0 ? m.id : randomUUID()
-    }));
+    //
+    // Unique, non-empty ids are enforced in this same chokepoint: nothing upstream
+    // guarantees it (a replace-mode backup import saves whatever ids the file
+    // contains verbatim — see configCommands.ts), and MacroAutoTrigger's
+    // `macroStateKey()` treats any two macros with equal `id` as the SAME macro for
+    // pause/resume, interval ownership and cooldown state. An empty string is
+    // treated as missing, matching `macroStateKey()`'s own falsy check. Dedup runs
+    // BEFORE the vault read/write loop below, which keys every vault entry by the
+    // final `m.id` — so by the time that loop runs, ids are already unique and no
+    // secret macro's vault entry can be overwritten or cross-read by another macro
+    // that happened to share its id.
+    const seenIds = new Set<string>();
+    const normalized: TerminalMacro[] = macros.map((m) => {
+      let id = m.id && m.id.length > 0 ? m.id : randomUUID();
+      while (seenIds.has(id)) id = randomUUID();
+      seenIds.add(id);
+      return withRedactedVariables({ ...m, id });
+    });
 
     const currentIds = new Set(this.resolved.map((m) => m.id).filter((v): v is string => Boolean(v)));
     const nextIds = new Set(normalized.map((m) => m.id!).filter(Boolean));
@@ -141,9 +155,21 @@ export class VscodeMacroStore implements MacroStore {
     // Tracks whether any on-disk record still carried a masked variable's plaintext
     // default, so it can be scrubbed rather than merely hidden from `getAll()`.
     let needsDiskScrub = false;
+    // Same unique-id invariant `save()` enforces (see its comment), applied here too:
+    // on-disk state can still contain duplicate ids from before this invariant existed
+    // (or from external corruption), and `resolved` is what MacroAutoTrigger keys its
+    // pause/resume/interval state against. A later duplicate gets a fresh id BEFORE
+    // the vault lookup below runs, so it is never fetched under an id another macro
+    // already owns — it simply resolves to no vault entry (empty text) rather than
+    // risking a cross-read of the wrong macro's secret. This is an in-memory repair
+    // only (mirrors the "minimal raw rewrite" rule below); the next `save()` persists
+    // the corrected, unique ids permanently.
+    const seenIds = new Set<string>();
     for (const entry of raw) {
       if (!entry || typeof entry !== "object") continue;
-      const id = entry.id && typeof entry.id === "string" ? entry.id : randomUUID();
+      let id = entry.id && typeof entry.id === "string" && entry.id.length > 0 ? entry.id : randomUUID();
+      while (seenIds.has(id)) id = randomUUID();
+      seenIds.add(id);
       // Redacted on the way in as well as on the way out (`save()`), so a record
       // already sitting in globalState from an earlier build cannot leak a masked
       // variable's plaintext default into `getAll()` — and therefore into Copy All,

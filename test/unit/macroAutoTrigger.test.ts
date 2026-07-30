@@ -1116,16 +1116,58 @@ describe("MacroAutoTrigger", () => {
       obs.dispose();
     });
 
-    // Rewritten from a "positional coherence" test (see git history / PR review)
-    // that asserted INDEX semantics: it proved that disabling the macro at raw
-    // array index 2 kept working even though the macro at index 1 (declaring
-    // `variables`) compiles no rule and could have shifted indices via
-    // pre-filtering. Now that state is keyed by macro identity
+    // Pins the EXACT position of the §6.1 skip relative to the `triggerInitiallyDisabled`
+    // bookkeeping in reload() — the ordering that was the subject of four review rounds
+    // in the PR that introduced it (see macroAutoTrigger.ts's §6.1 comment). The variables
+    // `continue` must run BEFORE `defaultDisabledKeys.add(stateKey)`, so a macro that
+    // declares both `variables` and `triggerInitiallyDisabled` never gets a disabled-state
+    // entry recorded for a rule that will never compile. If that `continue` were moved
+    // below the bookkeeping, `isDisabled()` below would flip to `true` (the key would land
+    // in `defaultDisabledKeys` with nothing in `enabledKeys` to counter it) even though no
+    // rule compiled — this test fails immediately under that regression, unlike the
+    // "identity coherence" test further below, which doesn't move or change any identity
+    // and so passes under either ordering.
+    it("§6.1 skip position: variables + triggerInitiallyDisabled produces no compiled rule AND no disabled-state entry", () => {
+      setConfig([
+        {
+          name: "hasVarsDisabled",
+          text: "show ip route $host\n",
+          triggerPattern: "router#",
+          variables: [{ name: "host" }],
+          triggerInitiallyDisabled: true
+        }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const macro = macroAt(0);
+
+      // The key must never have entered `defaultDisabledKeys`: if it had,
+      // isDisabledByKey() would report `true` (default-disabled with nothing in
+      // enabledKeys to counter it) even though the rule never compiled.
+      expect(trigger.isDisabled(macro)).toBe(false);
+
+      // And, as a consequence of no rule compiling, it must never auto-fire.
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+      obs.onOutput("router#");
+      flush();
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    // NOTE: unlike the test above, this one does NOT pin the exact position of the
+    // §6.1 `continue` relative to the `triggerInitiallyDisabled` bookkeeping — no
+    // identity here changes position or value, so moving that `continue` below the
+    // bookkeeping would still pass this test unchanged. Rewritten from a "positional
+    // coherence" test (see git history / PR review) that asserted INDEX semantics: it
+    // proved that disabling the macro at raw array index 2 kept working even though
+    // the macro at index 1 (declaring `variables`) compiles no rule and could have
+    // shifted indices via pre-filtering. Now that state is keyed by macro identity
     // (`macroStateKey()`), not array position, that specific hazard no longer
     // exists — indices are never used as keys anywhere in MacroAutoTrigger. This
     // test is rewritten to assert the equivalent IDENTITY guarantee instead: a
     // sibling macro that compiles no rule (variables) must not disturb the
-    // disable-state or interval-ownership keying of the macros around it.
+    // disable-state or interval-ownership keying of the macros around it. General
+    // per-macro-identity lifecycle coverage across reload — not a skip-position guard.
     it("identity coherence: disabling the password macro survives reload even though a sibling macro declares variables and compiles no rule", () => {
       setConfig([
         { name: "interval", text: "show status\n", triggerPattern: "router#", triggerInterval: 10 },
@@ -1348,8 +1390,15 @@ describe("MacroAutoTrigger", () => {
       expect(trigger.isDisabled(macroRoute)).toBe(false);
       expect(trigger.isDisabled(macroC)).toBe(true);
 
-      // Reorder: [A, route, C] -> [C, route, A]
-      void activeStore.save([macroC, macroRoute, macroA]);
+      // Reorder: [A, route, C] -> [A, C, route] — route and C actually swap slots
+      // (route: index 1 -> 2, C: index 2 -> 1). Under array-position-keyed state
+      // this flips both: whatever now sits at index 1 (C) would read as "resumed"
+      // (that slot's key is in enabledKeys), and whatever sits at index 2 (route)
+      // would read as still "default-disabled" (that slot's key never entered
+      // enabledKeys). A reorder that leaves the overridden macro at the same index
+      // (e.g. [A, route, C] -> [C, route, A]) can't tell the two implementations
+      // apart, since route never changes slot.
+      void activeStore.save([macroA, macroC, macroRoute]);
       trigger.reload();
 
       expect(trigger.isDisabled(macroRoute)).toBe(false); // still resumed
@@ -1357,6 +1406,16 @@ describe("MacroAutoTrigger", () => {
     });
 
     it("interval ownership survives a reorder — the interval macro keeps its owner and does not double-fire", () => {
+      // Uses TWO observers deliberately. A single-observer version of this test
+      // can't tell a correct reorder-survives-reload implementation apart from a
+      // buggy one that wrongly clears ownership/lastFired/timers on reload: with
+      // only one observer around, feeding it a fresh matching prompt after reload
+      // just makes it reacquire ownership from scratch and fire — producing the
+      // exact same "fires exactly once more" output either way. A second observer
+      // (B) that never owned this interval macro exposes the difference: if
+      // reload dropped ownership, B's matching prompt (delivered first, before A
+      // gets a chance) would let B steal ownership and fire — which the "B stays
+      // silent" assertion below catches.
       setConfig([
         { name: "A", text: "a\n", triggerPattern: "AAA" },
         { name: "poll", text: "show status\n", triggerPattern: "router#", triggerInterval: 10 }
@@ -1364,24 +1423,46 @@ describe("MacroAutoTrigger", () => {
       const trigger = new MacroAutoTrigger();
       const macroA = macroAt(0);
       const macroPoll = macroAt(1);
-      const sent: string[] = [];
-      const obs = trigger.createObserver((text) => sent.push(text));
+      const sentA: string[] = [];
+      const sentB: string[] = [];
+      const obsA = trigger.createObserver((text) => sentA.push(text));
+      const obsB = trigger.createObserver((text) => sentB.push(text));
 
-      obs.onOutput("router#");
+      // Arm the interval on observer A only — A becomes its owner.
+      obsA.onOutput("router#");
       flush();
-      expect(sent).toEqual(["show status\n"]);
+      expect(sentA).toEqual(["show status\n"]);
+      expect(sentB).toEqual([]);
 
       // Reorder: [A, poll] -> [poll, A]
       void activeStore.save([macroPoll, macroA]);
       trigger.reload();
 
-      obs.onOutput("show status\nrouter#");
+      // A fresh matching prompt delivered to B (which never owned this macro)
+      // must NOT let B acquire ownership — A still owns it after the reorder.
+      obsB.onOutput("router#");
+      flush();
+      expect(sentB).toEqual([]);
+
+      // A does not fire again before the interval elapses. Deliberately no
+      // flush() here: evaluate() runs synchronously inside onOutput and, since
+      // the interval hasn't elapsed, only *schedules* a future evaluation — it
+      // never touches sentA. flush() (vi.runAllTimers()) would run that
+      // schedule to completion regardless of its 10s delay, so calling it here
+      // would defeat this exact assertion.
+      obsA.onOutput("show status\nrouter#");
+      expect(sentA).toEqual(["show status\n"]);
+
+      // ...and fires exactly once more when it does — ownership survived the
+      // reorder rather than being dropped (B would have fired above) or
+      // duplicated (both A and B firing here).
       vi.advanceTimersByTime(10_000);
       flush();
-      // Fires exactly once more — ownership survived the reorder rather than
-      // being dropped (zero fires) or duplicated (double fire).
-      expect(sent).toEqual(["show status\n", "show status\n"]);
-      obs.dispose();
+      expect(sentA).toEqual(["show status\n", "show status\n"]);
+      expect(sentB).toEqual([]);
+
+      obsA.dispose();
+      obsB.dispose();
     });
 
     it("macros without an id (anon: fallback identity) also survive a reorder", () => {
@@ -1427,9 +1508,12 @@ describe("MacroAutoTrigger", () => {
       // macro has no `id`. Two macros that are byte-for-byte identical in both
       // name and text produce the SAME key in that case — there is no other
       // stable, position-independent identity available for a macro the store
-      // hasn't assigned an id to (both InMemoryMacroStore and VscodeMacroStore
-      // always assign one in practice, which is why this only matters for the
-      // rare id-less path). This test asserts and documents that collision
+      // hasn't assigned an id to. Both InMemoryMacroStore and VscodeMacroStore
+      // enforce a unique, non-empty id for every macro on save() (an explicit
+      // empty string is normalized the same as a missing id, and a later
+      // duplicate id is reassigned a fresh one — see macroStore.test.ts), which
+      // is why this collision only matters for the rare id-less `RawMacroStore`
+      // path exercised below. This test asserts and documents that collision
       // rather than pretending it can't happen: give macros an id, or vary
       // their text, to avoid it.
       const rawStore = new RawMacroStore();

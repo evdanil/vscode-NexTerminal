@@ -374,6 +374,11 @@ reevaluation arms it immediately.
 If **Start auto-trigger paused** is enabled, the macro starts paused after reload
 or startup until you resume it.
 
+Pause/resume state, interval ownership, and cooldown timers all follow the macro
+itself, not its position in the list. Reordering macros with **Move Up** /
+**Move Down**, or deleting a different macro, never moves a pause (or an active
+trigger) onto the wrong macro.
+
 ## Regex Examples
 
 Use patterns that describe the prompt you actually expect. Overly broad patterns

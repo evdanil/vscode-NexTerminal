@@ -15,10 +15,18 @@ export class InMemoryMacroStore implements MacroStore {
   }
 
   public async save(macros: TerminalMacro[]): Promise<void> {
-    this.macros = macros.map((m) => ({
-      ...m,
-      id: m.id ?? randomUUID()
-    }));
+    // Mirrors VscodeMacroStore.save(): unique, non-empty ids are a MacroStore
+    // invariant that MacroAutoTrigger's `macroStateKey()` relies on (two macros
+    // with equal `id` are indistinguishable for pause/resume/interval state). An
+    // explicit empty-string id is treated as missing, and a later duplicate is
+    // reassigned a fresh id.
+    const seenIds = new Set<string>();
+    this.macros = macros.map((m) => {
+      let id = m.id && m.id.length > 0 ? m.id : randomUUID();
+      while (seenIds.has(id)) id = randomUUID();
+      seenIds.add(id);
+      return { ...m, id };
+    });
     for (const listener of this.listeners) listener();
   }
 

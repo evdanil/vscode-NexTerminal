@@ -92,6 +92,29 @@ describe("MacroStore (in-memory)", () => {
     expect(m.secret).toBe(true);
     expect(m.text).toBe("super-secret"); // resolved transparently
   });
+
+  it("reassigns a fresh id to a later duplicate on save (Fix 1 — unique-id invariant)", async () => {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    await store.save([
+      { id: "duplicate", name: "Password", text: "hunter2\n" },
+      { id: "duplicate", name: "Poll", text: "show status\n" }
+    ]);
+    const [first, second] = store.getAll();
+    expect(first.id).toBe("duplicate");
+    expect(second.id).toBeDefined();
+    expect(second.id).not.toBe("duplicate");
+    expect(second.id!.length).toBeGreaterThan(0);
+  });
+
+  it("treats an explicit empty-string id as missing, not as a real id (Fix 5)", async () => {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    await store.save([{ id: "", name: "m", text: "x" }]);
+    const [m] = store.getAll();
+    expect(m.id).toBeTruthy();
+    expect(m.id).not.toBe("");
+  });
 });
 
 describe("VscodeMacroStore", () => {
@@ -228,6 +251,96 @@ describe("VscodeMacroStore", () => {
     await store.clearAll();
     expect(secretBag.has("macro-secret-text-live")).toBe(false);
     expect(secretBag.has("macro-secret-text-orphan")).toBe(false);
+  });
+
+  describe("unique-id invariant (Fix 1) — save() rejects duplicate ids", () => {
+    it("reassigns a fresh id to a later duplicate, and each secret macro keeps its own vault entry", async () => {
+      const { context, secretBag } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      // The exact triggering input from the review: a replace-mode backup import
+      // saving two macros with the same id verbatim, one of them secret.
+      await store.save([
+        {
+          id: "duplicate",
+          name: "Password",
+          text: "hunter2\n",
+          secret: true,
+          triggerPattern: "Password:",
+          triggerInitiallyDisabled: true
+        },
+        {
+          id: "duplicate",
+          name: "Poll",
+          text: "show status\n",
+          triggerPattern: "router#"
+        }
+      ]);
+
+      const [password, poll] = store.getAll();
+      expect(password.id).toBe("duplicate");
+      expect(poll.id).toBeDefined();
+      expect(poll.id).not.toBe("duplicate");
+
+      // The secret macro's text must resolve correctly under its own id...
+      expect(password.text).toBe("hunter2\n");
+      expect(secretBag.get("macro-secret-text-duplicate")).toBe("hunter2\n");
+      // ...and the reassigned macro must not have clobbered or inherited it.
+      expect(poll.text).toBe("show status\n");
+      expect(secretBag.has(`macro-secret-text-${poll.id}`)).toBe(false);
+    });
+
+    it("dedup runs before the vault write loop: two SECRET macros sharing an id each get a distinct, non-colliding vault entry", async () => {
+      const { context, secretBag } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      await store.save([
+        { id: "dup", name: "First", text: "first-secret", secret: true },
+        { id: "dup", name: "Second", text: "second-secret", secret: true }
+      ]);
+
+      const [first, second] = store.getAll();
+      expect(first.id).toBe("dup");
+      expect(second.id).not.toBe("dup");
+      expect(first.text).toBe("first-secret");
+      expect(second.text).toBe("second-secret");
+      expect(secretBag.get("macro-secret-text-dup")).toBe("first-secret");
+      expect(secretBag.get(`macro-secret-text-${second.id}`)).toBe("second-secret");
+    });
+
+    it("treats an explicit empty-string id as missing on save", async () => {
+      const { context } = makeFakeContext();
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+      await store.save([{ id: "", name: "m", text: "x" }]);
+      const [m] = store.getAll();
+      expect(m.id).toBeTruthy();
+      expect(m.id).not.toBe("");
+    });
+
+    it("reloadFromState() also dedupes a duplicate id already sitting in globalState from before this invariant existed", async () => {
+      const { context, stateBag, secretBag } = makeFakeContext();
+      // Simulate corrupted/legacy on-disk state: two records with the same id,
+      // written before save() enforced uniqueness.
+      stateBag.set("nexus.macros", [
+        { id: "dup", name: "Password", text: "", secret: true },
+        { id: "dup", name: "Poll", text: "show status\n" }
+      ]);
+      secretBag.set("macro-secret-text-dup", "hunter2\n");
+
+      const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+      await store.initialize();
+
+      const [password, poll] = store.getAll();
+      expect(password.id).toBe("dup");
+      expect(password.text).toBe("hunter2\n");
+      // The second record must not have been silently merged into the first's
+      // identity — it now has its own, different id.
+      expect(poll.id).not.toBe("dup");
+      expect(poll.text).toBe("show status\n");
+    });
   });
 });
 
