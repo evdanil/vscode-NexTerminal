@@ -162,6 +162,13 @@ export type MacroTreeElement = MacroTreeItem | FolderTreeItem;
  * `MacroIdProvenance`. Refusing every such drop instead would break the bare-id
  * payload contract above without protecting anything: an unknown producer has no
  * capture state for this module to preserve in the first place.
+ *
+ * That leniency stops at the index. An unverified payload that also names a
+ * POSITION is refused unless the macro still sitting there carries its id
+ * (`resolveMacroTarget`'s rule 2b) — a wrong position is proof the producer's
+ * view of the list is stale, and falling back to the id from there is how
+ * `{"id":"x","index":2}` naming the second of two twins ends up moving the
+ * first one after a save re-keys them. Bare ids are unaffected.
  */
 function parseMacroDragPayload(payload: string): MacroRef | undefined {
   const unverified = (id: string): MacroRef => ({ id, idWhenCaptured: "unverified" });
@@ -183,9 +190,20 @@ function parseMacroDragPayload(payload: string): MacroRef | undefined {
   if (typeof id !== "string" || !id) {
     return undefined;
   }
-  // Only a payload that states the flag either way came from `handleDrag`; a
-  // third-party object payload that happens to carry `id`/`index` stays
-  // "unverified".
+  // A boolean here is a CLAIM about drag time, not proof of origin: any producer
+  // can write `idAmbiguous: false` into this MIME just as easily as `handleDrag`
+  // does. Be precise about what claiming it is worth. `true` only ever costs the
+  // payload capability. `false` does buy one thing — it escapes rule 2b, so a
+  // stale POSITION no longer refuses the drop — but what it buys back is exactly
+  // resolution by unique id, which the bare-id payload above already grants
+  // unconditionally to anyone who simply omits the index. It cannot make a wrong
+  // position be honoured (rule 1 checks the id sitting there) and it cannot beat
+  // a duplication visible in the array being resolved against (rule 4). So the
+  // flag is worth stating for a producer that is HONEST and stale — which is the
+  // case rule 2b exists for — and worth nothing to one that is not.
+  //
+  // A payload with no boolean at all made no claim, so it stays "unverified" and
+  // is held to rule 2b: honoured at its stated position, or refused.
   const idWhenCaptured =
     typeof idAmbiguous === "boolean" ? (idAmbiguous ? "ambiguous" : "unique") : "unverified";
   return typeof index === "number" ? { id, index, idWhenCaptured } : { id, idWhenCaptured };

@@ -42,26 +42,50 @@ type MacroProfileProvider = () => MacroProfileOptionInput[];
  * — the panel stays open across any number of external writes and even clamps
  * `selectedIndex` when the list shrinks — so it is not the "the user just pointed at
  * this row" signal a tree item's index is. With no index, an id claimed by more than
- * one macro resolves to `"ambiguous"` and the panel refuses, exactly as it always
- * has: writing the macro the user was looking at over its twin would silently destroy
- * the twin, and refusing is the same fail-safe `MacroAutoTrigger` applies to an
- * ambiguous state key. Every other repair route (Move Up / Move Down, delete, or
- * editing any macro with a unique id) re-saves the whole list and clears the
- * conflict, so this is never a dead end.
+ * one macro resolves to `"ambiguous"` and the panel refuses: writing the macro the
+ * user was looking at over its twin would silently destroy the twin, and refusing is
+ * the same fail-safe `MacroAutoTrigger` applies to an ambiguous state key. Every
+ * repair route (Move Up / Move Down, delete, or editing any macro with a unique id)
+ * re-saves the whole list and clears the conflict, so this is never a dead end.
+ *
+ * **`idAmbiguousAtRender` is the reason this is not just `captureMacroRef(macros,
+ * id)`.** The array checked here is read when the MESSAGE arrives; the id in that
+ * message was baked into the form at RENDER time, and the form outlives any number
+ * of writes. So the capture contract `captureMacroRef` states — check the list the
+ * surface was actually looking at — cannot be met from inside this function, and
+ * checking the fresh array instead is precisely the interleaving
+ * `resolveMacroTarget`'s rule 2 exists to catch: `[First(x), Second(x)]`, form open
+ * on `Second`, any write at all re-keys to `[First(x), Second(x')]`, and a click in
+ * the still-displayed old form (or a message already in flight) arrives carrying `x`
+ * over an array in which `x` now has exactly one holder — `First`. Nothing about
+ * that array is ambiguous, so the save would go through, onto the wrong macro,
+ * under a "saved" toast. The webview therefore carries the render-time answer back,
+ * exactly as `MacroTreeItem.identityConflict` does for a clicked row.
+ *
+ * The flag is a CLAIM from the webview, so it is read as one:
+ * - `false` — the only value treated as "checked, and it was unique". The live
+ *   array is still checked (`captureMacroRef`), so a stale or forged `false`
+ *   cannot suppress a duplication that is visible right now.
+ * - anything else, INCLUDING absent — treated as ambiguous, i.e. refused. Every
+ *   message this panel's own HTML posts carries the boolean (macroEditorHtml.ts),
+ *   so the only senders that lose are ones this module did not render.
  *
  * Returns the captured `ref` alongside the target so the WRITE that follows the
- * dialog re-resolves the very same reference — `idWhenCaptured` and all. A
- * freshly built `{ id: macroId }` at the write site would carry provenance from
- * after the dialog, and the case that matters is precisely the one where the
- * list was re-keyed in between: the panel's binding-conflict warning is a
- * non-modal toast, so an ambiguous id can be split apart by another flow while
- * it is up, after which the id resolves cleanly — to the OTHER twin.
+ * dialog re-resolves the very same reference — `idWhenCaptured` and all. That is
+ * required for correctness in the ambiguous case above (a ref rebuilt after the
+ * dialog would have lost the render-time flag), and it is what makes the
+ * pre-dialog check and the write agree by construction rather than by two
+ * separate code paths happening to say the same thing.
  */
 function resolveEditorTarget(
   macros: readonly TerminalMacro[],
-  macroId: string | null
+  macroId: string | null,
+  idAmbiguousAtRender: unknown
 ): { ref: MacroRef; target: MacroTarget } {
-  const ref = captureMacroRef(macros, macroId);
+  const ref: MacroRef =
+    macroId !== null && idAmbiguousAtRender !== false
+      ? { id: macroId, idWhenCaptured: "ambiguous" }
+      : captureMacroRef(macros, macroId);
   return { ref, target: resolveMacroTarget(macros, ref) };
 }
 
@@ -194,7 +218,13 @@ export class MacroEditorPanel {
     // macro; irrelevant once an existing macro is selected.
     const seedGroup = this.selectedIndex === null ? this.pendingSeedGroup : undefined;
     const folders = collectMacroFolders(macros, getMacroFolders());
-    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider(), folders, seedGroup);
+    // The render-time identity witness that travels with the form — see
+    // `resolveEditorTarget`. Computed AFTER the clamp above, off the same array
+    // the HTML is built from, through the one shared definition of "how many
+    // macros carry this id" rather than a local count.
+    const selected = this.selectedIndex === null ? undefined : macros[this.selectedIndex];
+    const idAmbiguousAtRender = captureMacroRef(macros, selected?.id).idWhenCaptured === "ambiguous";
+    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider(), folders, seedGroup, idAmbiguousAtRender);
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
@@ -258,7 +288,7 @@ export class MacroEditorPanel {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
         // A null id means an unsaved (new) macro → push path.
-        const { ref: macroRef, target } = resolveEditorTarget(macros, macroId);
+        const { ref: macroRef, target } = resolveEditorTarget(macros, macroId, msg.idAmbiguous);
         if (macroId !== null && target.kind !== "resolved") {
           // The macro we were editing was deleted/changed externally, or its id is
           // shared with another macro. Do not fall through to the push path (that
@@ -561,8 +591,9 @@ export class MacroEditorPanel {
       case "delete": {
         const macroId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
         const macros = getMacros();
-        // Resolve by stable id; the render-time index may be stale.
-        const { ref: macroRef, target } = resolveEditorTarget(macros, macroId);
+        // Resolve by stable id; the render-time index may be stale. The
+        // render-time ambiguity flag is not — see `resolveEditorTarget`.
+        const { ref: macroRef, target } = resolveEditorTarget(macros, macroId, msg.idAmbiguous);
         if (target.kind !== "resolved") {
           if (macroId !== null) {
             void vscode.window.showWarningMessage(unresolvedTargetMessage(target, "deleted"));

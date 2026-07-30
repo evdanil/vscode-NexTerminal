@@ -14,6 +14,15 @@ import type { TerminalMacro } from "../models/terminalMacro";
  * `resolveMacroTarget`'s rule 2). A present-tense sentence would be a false
  * statement about the second case, which is the more dangerous of the two.
  *
+ * One refusal it does NOT literally describe: an `"unverified"` reference that
+ * names a position which no longer holds its id (rule 2b — a drag payload from
+ * a producer outside this extension). Nothing is known about that id's history,
+ * so no sentence can be a statement of fact about it; this one is still the
+ * right thing to show, because the state it describes is the one that CANNOT be
+ * ruled out — a foreign payload may well have been captured over a duplicated
+ * id — and its advice (reorder to re-key, then repeat the gesture) is sound
+ * either way. That path is unreachable from payloads this extension writes.
+ *
  * The advice is correct even when the command that failed IS Move Up / Move
  * Down (a stale tree item over a duplicated id, see `resolveMacroTarget`):
  * `MacroStore.save()` re-keys duplicates on every write, so reordering ANY
@@ -35,13 +44,25 @@ export const AMBIGUOUS_MACRO_TARGET_MESSAGE =
  *
  * - `"unique"` — checked: exactly one macro carried the id.
  * - `"ambiguous"` — checked: more than one did.
+ * - `"absent"` — checked: NONE did. Distinct from `"unique"` because "exactly
+ *   one" and "none at all" are opposite facts about the future: a later array
+ *   can only ever have FEWER holders of a unique id, but an id with none can
+ *   gain one (a config import, legacy absorption, an undo that re-adds a
+ *   record). Folding the two together is what let a reference to a row that was
+ *   already deleted resolve, one await later, to a freshly imported macro that
+ *   merely inherited the id — with `pasteSecret` that is a clipboard password
+ *   written into a record the user has never seen. An absent reference
+ *   therefore resolves to `"missing"` and never to a holder that appeared after
+ *   the fact.
  * - `"unverified"` — could not be checked, because there was no array to check
  *   against. Reserved for a drag payload produced by something other than this
- *   extension (`parseMacroDragPayload`); treated like `"unique"`, since a
- *   payload from an unknown producer has no capture-time state to preserve and
- *   the alternative is to refuse every such drop outright.
+ *   extension (`parseMacroDragPayload`). Treated like `"unique"` ONLY while the
+ *   reference names no position: a payload from an unknown producer has no
+ *   capture-time state to preserve, and refusing every bare-id drop would break
+ *   that contract without protecting anything. An unverified reference that DOES
+ *   claim a position is a different matter — see `resolveMacroTarget`'s rule 2b.
  */
-export type MacroIdProvenance = "unique" | "ambiguous" | "unverified";
+export type MacroIdProvenance = "unique" | "ambiguous" | "absent" | "unverified";
 
 /**
  * How a UI surface names the macro it is acting on: the stable `id` it captured,
@@ -64,16 +85,27 @@ export interface MacroRef {
    * the Macro Editor's webview payload, for instance. A wrong index is never
    * acted on, but an absent one gives up the only signal that can separate two
    * macros sharing an id.
+   *
+   * Present-but-wrong is not the same as absent, and rule 2b treats them
+   * differently for an `"unverified"` reference: claiming a position and being
+   * wrong about it is evidence the producer's view of the list is stale, which
+   * is exactly when falling back to the id can land on the wrong twin.
    */
   readonly index?: number;
   /** See `MacroIdProvenance`. Required — there is no safe default. */
   readonly idWhenCaptured: MacroIdProvenance;
 }
 
-/** How many macros in `macros` carry `id`, saturating at 2 — the only distinction that matters. */
+/**
+ * How many macros in `macros` carry `id`, saturating at 2 — none, one, or more
+ * than one. All three are distinct answers; see `MacroIdProvenance` for why
+ * "none" must not be reported as "one".
+ */
 function idProvenance(macros: readonly TerminalMacro[], id: string | null | undefined): MacroIdProvenance {
   if (!id) {
-    return "unique"; // A falsy id resolves to "missing" regardless; nothing to disambiguate.
+    // Resolves to "missing" before provenance is ever consulted, so this label
+    // is never load-bearing — but "absent" is the true one.
+    return "absent";
   }
   let seen = 0;
   for (const macro of macros) {
@@ -81,7 +113,7 @@ function idProvenance(macros: readonly TerminalMacro[], id: string | null | unde
       return "ambiguous";
     }
   }
-  return "unique";
+  return seen === 1 ? "unique" : "absent";
 }
 
 /**
@@ -150,6 +182,13 @@ export type MacroTarget =
  *
  * Precedence, in order:
  *
+ * 0. **Refuse to look, when the id was ALREADY absent at capture time.** A
+ *    reference whose `idWhenCaptured` is `"absent"` is `"missing"` and nothing
+ *    else — not even by index, since a position that matches an id which was
+ *    not in the capture-time array can only be matching a record that arrived
+ *    afterwards. See `MacroIdProvenance`: "no holder" and "one holder" diverge
+ *    in the future, so they cannot share a label.
+ *
  * 1. **`macros[ref.index]` when its id matches.** This is the only thing that
  *    can disambiguate two macros sharing an id, because the id — by
  *    construction — cannot. Duplicate stored ids are a REACHABLE state that the
@@ -175,6 +214,19 @@ export type MacroTarget =
  *    perfectly ordinary stale-index case in rule 3; only what was true when the
  *    reference was taken does, which is why `MacroRef` carries it.
  *
+ * 2b. **Refuse, when an `"unverified"` reference named a position and that
+ *    position did not check out.** A payload from a producer outside this
+ *    extension is trusted to name a macro by id (rule 3) precisely because it
+ *    claims nothing more. The moment it also claims a POSITION and that claim
+ *    turns out to be wrong, its view of the list is demonstrably stale — and
+ *    "stale view of the list, id no longer where it said it was" is the exact
+ *    shape of rule 2's re-keyed twin, minus the capture-time knowledge that
+ *    would let the two be told apart. Falling back to the id there is the same
+ *    guess rule 2 refuses, made with strictly less information. Bare-id
+ *    payloads keep resolving by id: with no position claimed there is nothing
+ *    to be stale about, and that contract (`parseMacroDragPayload`) predates
+ *    the index.
+ *
  * 3. **The unique holder of `ref.id`.** A tree item outlives the array it was
  *    built from: the row for `B` in `[A, B, C]` carries index 1, and if `A` is
  *    deleted before the command runs, index 1 now names `C`. That index is not
@@ -199,10 +251,20 @@ export type MacroTarget =
  * there under a new id" produce the identical array, so `"missing"` would be a
  * guess dressed up as a fact — and `"missing"` is a state callers report to the
  * user ("…was already removed"), not merely a no-op.
+ *
+ * Rule 0 is the opposite trade for the opposite reason: there, `"missing"` IS
+ * the fact — the id was already gone when the user pointed at it — and the only
+ * thing that could turn up later is an impostor.
  */
 export function resolveMacroTarget(macros: readonly TerminalMacro[], ref: MacroRef): MacroTarget {
   const id = ref.id;
   if (!id) {
+    return { kind: "missing" };
+  }
+  if (ref.idWhenCaptured === "absent") {
+    // Rule 0. Deliberately ahead of the index check: an index that "matches"
+    // an id which was not in the capture-time array is matching an arrival, not
+    // the record the user pointed at.
     return { kind: "missing" };
   }
   const index = ref.index;
@@ -216,6 +278,12 @@ export function resolveMacroTarget(macros: readonly TerminalMacro[], ref: MacroR
     return { kind: "resolved", index };
   }
   if (ref.idWhenCaptured === "ambiguous") {
+    return { kind: "ambiguous" };
+  }
+  if (ref.idWhenCaptured === "unverified" && index !== undefined) {
+    // Rule 2b. `index !== undefined` rather than `typeof index === "number"`:
+    // the point is that a position was CLAIMED and did not check out, and a
+    // claim made in a shape this module does not accept is not a better one.
     return { kind: "ambiguous" };
   }
   const first = macros.findIndex((m) => m.id === id);

@@ -45,6 +45,7 @@ vi.mock("node:crypto", async (importOriginal) => {
 });
 
 import type { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
+import type { DuplicateIdMacroStore } from "../helpers/duplicateIdMacroStore";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
 // macroSettings holds module-level `activeStore`; resetModules() between cases
@@ -117,6 +118,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       type: "save",
       index: 1,
       id: betaId,
+      idAmbiguous: false,
       name: "Beta-edited",
       text: "b2",
       secret: false,
@@ -156,6 +158,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       type: "save",
       index: 1,
       id: betaId,
+      idAmbiguous: false,
       name: "Beta-edited",
       text: "b2",
       secret: false,
@@ -182,41 +185,39 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     // did the user open" unanswerable. InMemoryMacroStore re-keys duplicates on save, so
     // this needs a store that surfaces persisted state verbatim — which is exactly what
     // VscodeMacroStore.reloadFromState() now does, having stopped repairing ids on load.
-    async function harnessWithDuplicateIds(): Promise<{
-      macros: TerminalMacro[];
+    //
+    // `DuplicateIdMacroStore` rather than a store double written inline here: its
+    // `save()` runs the REAL `assignUniqueMacroIds()`, which is the whole mechanism
+    // the render-time-witness cases below turn on. A double that carried duplicates
+    // across `save()` would make those cases unwritable (see that class's doc).
+    async function harnessWithDuplicateIds(
+      initial: TerminalMacro[] = [
+        { id: "dup", name: "Alpha", text: "a" },
+        { id: "dup", name: "Beta", text: "b" }
+      ],
+      openIndex = 1 // opened on the SECOND twin
+    ): Promise<{
+      store: DuplicateIdMacroStore;
+      macros: () => TerminalMacro[];
       sendMessage: (msg: Record<string, unknown>) => void;
     }> {
       vi.resetModules();
       const macroSettings = await import("../../src/macroSettings");
-      const macros: TerminalMacro[] = [
-        { id: "dup", name: "Alpha", text: "a" },
-        { id: "dup", name: "Beta", text: "b" }
-      ];
-      macroSettings.setActiveMacroStore({
-        async initialize() { /* no-op */ },
-        getAll: () => macros.map((m) => ({ ...m })),
-        async save(next: TerminalMacro[]) {
-          macros.splice(0, macros.length, ...next.map((m) => ({ ...m })));
-        },
-        onDidChange: () => () => { /* no-op */ },
-        async clearAll() { macros.length = 0; },
-        // Neither fixture macro carries a `group`, so the editor's folder datalist is
-        // empty and the ambiguity behaviour under test is unaffected.
-        getFolders: () => [] as string[],
-        async saveFolders() { /* no-op */ }
-      } as unknown as Parameters<typeof macroSettings.setActiveMacroStore>[0]);
+      const { DuplicateIdMacroStore: FreshStore } = await import("../helpers/duplicateIdMacroStore");
+      const dupStore = new FreshStore(initial);
+      macroSettings.setActiveMacroStore(dupStore);
       const { MacroEditorPanel } = await import("../../src/ui/macroEditorPanel");
-      MacroEditorPanel.open(1); // opened on Beta
-      return { macros, sendMessage: onDidReceiveMessageHandler! };
+      MacroEditorPanel.open(openIndex);
+      return { store: dupStore, macros: () => dupStore.getAll(), sendMessage: onDidReceiveMessageHandler! };
     }
 
-    it("refuses to save rather than write the edited macro over its twin", async () => {
-      const { macros, sendMessage } = await harnessWithDuplicateIds();
-
-      await sendMessage({
+    /** `handleDrag`'s payload shape, as the webview posts it (macroEditorHtml.ts). */
+    function dupSaveMsg(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+      return {
         type: "save",
         index: 1,
         id: "dup",
+        idAmbiguous: false,
         name: "Beta-edited",
         text: "b2",
         secret: false,
@@ -226,14 +227,25 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
         triggerInterval: null,
         triggerInitiallyDisabled: false,
         triggerScope: "all-terminals",
-        triggerProfileId: null
-      });
+        triggerProfileId: null,
+        ...overrides
+      };
+    }
+
+    it("refuses to save rather than write the edited macro over its twin", async () => {
+      const { macros, sendMessage } = await harnessWithDuplicateIds();
+
+      // `idAmbiguous: false` deliberately UNDERSTATES the conflict (the real render
+      // would have baked `true` here), so what this test proves is the independent
+      // half: the check against the array as it stands when the message arrives. A
+      // stale or forged `false` buys the sender nothing.
+      await sendMessage(dupSaveMsg());
 
       // Taking the first match would have turned Alpha into "Beta-edited", silently
       // destroying it — and the id conflict makes that the FIRST macro, not the one the
       // user was looking at.
-      expect(macros.map((m) => m.name)).toEqual(["Alpha", "Beta"]);
-      expect(macros.map((m) => m.text)).toEqual(["a", "b"]);
+      expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
+      expect(macros().map((m) => m.text)).toEqual(["a", "b"]);
       expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
       expect(mockShowWarningMessage).toHaveBeenCalledWith(
         expect.stringContaining("same internal id")
@@ -243,12 +255,126 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     it("refuses to delete rather than remove the wrong macro", async () => {
       const { macros, sendMessage } = await harnessWithDuplicateIds();
 
-      await sendMessage({ type: "delete", index: 1, id: "dup" });
+      await sendMessage({ type: "delete", index: 1, id: "dup", idAmbiguous: false });
 
-      expect(macros.map((m) => m.name)).toEqual(["Alpha", "Beta"]);
+      expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
       expect(mockShowWarningMessage).toHaveBeenCalledWith(
         expect.stringContaining("same internal id")
       );
+    });
+
+    /**
+     * The form is the longest-lived reference to a macro in this feature, and until
+     * now the only ref-taking surface with no render-time witness: a tree row carries
+     * `MacroTreeItem.identityConflict`, a drag payload carries `idAmbiguous`, and the
+     * webview carried an id and nothing else.
+     *
+     * That gap is reachable without any exotic timing. `[Alpha(dup), Beta(dup)]`, form
+     * open on Beta; ANY write at all lands (a drag onto a folder, another command,
+     * an import) and `assignUniqueMacroIds()` lets Alpha KEEP `dup` while Beta is
+     * handed a fresh one. The panel re-renders, but a click in the old DOM — or a
+     * message already in IPC flight — still carries `dup`. Checked against the array
+     * as it stands then, `dup` has exactly ONE holder and nothing looks wrong, so the
+     * form's contents (Beta's name, text, secret flag) are written over ALPHA, under
+     * a "saved" toast. Only what was true at render can rule that out.
+     */
+    describe("render-time identity witness", () => {
+      /** The unrelated, id-preserving write that nevertheless re-keys the twins. */
+      async function rekey(store: DuplicateIdMacroStore): Promise<void> {
+        const latest = store.getAll();
+        await store.save(latest);
+      }
+
+      it("bakes the witness into the rendered form: true over a shared id, false over a unique one", async () => {
+        await harnessWithDuplicateIds();
+        expect(lastHtml).toContain("var currentIdAmbiguous = true;");
+
+        await harnessWithDuplicateIds(
+          [
+            { id: "a", name: "Alpha", text: "a" },
+            { id: "b", name: "Beta", text: "b" }
+          ]
+        );
+        expect(lastHtml).toContain("var currentIdAmbiguous = false;");
+      });
+
+      it("refuses a save from a form rendered over a shared id, even though the id is unique by the time the message lands", async () => {
+        const { store, macros, sendMessage } = await harnessWithDuplicateIds();
+        await rekey(store);
+        // The state the resolver now faces: `dup` has exactly one holder, and it is
+        // ALPHA — the macro the user never opened.
+        expect(macros().filter((m) => m.id === "dup")).toHaveLength(1);
+        expect(macros()[0].id).toBe("dup");
+
+        await sendMessage(dupSaveMsg({ idAmbiguous: true }));
+
+        expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
+        expect(macros().map((m) => m.text)).toEqual(["a", "b"]);
+        expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+        expect(mockShowWarningMessage).toHaveBeenCalledWith(
+          expect.stringContaining("same internal id")
+        );
+      });
+
+      it("refuses a delete from a form rendered over a shared id after the same re-key", async () => {
+        const { store, macros, sendMessage } = await harnessWithDuplicateIds();
+        await rekey(store);
+        mockShowWarningMessage.mockResolvedValue("Delete");
+
+        await sendMessage({ type: "delete", index: 1, id: "dup", idAmbiguous: true });
+
+        // Both survive. Without the witness this deletes Alpha, after a modal that
+        // names Alpha — so the confirmation reads correct and the wrong macro dies.
+        expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
+        expect(mockShowWarningMessage).toHaveBeenCalledWith(
+          expect.stringContaining("same internal id")
+        );
+      });
+
+      it("refuses a save message that carries NO witness at all — absent fails closed", async () => {
+        // Nothing this panel renders can post such a message; anything that does is
+        // a sender the panel did not draw, and a missing claim is not a safe one.
+        const { store, macros, sendMessage } = await harnessWithDuplicateIds();
+        await rekey(store);
+        const withoutWitness = dupSaveMsg();
+        delete withoutWitness.idAmbiguous;
+
+        await sendMessage(withoutWitness);
+
+        expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
+        expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+        expect(mockShowWarningMessage).toHaveBeenCalledWith(
+          expect.stringContaining("same internal id")
+        );
+      });
+
+      it("refuses a witness of the wrong TYPE — only the boolean false is a claim of uniqueness", async () => {
+        const { store, macros, sendMessage } = await harnessWithDuplicateIds();
+        await rekey(store);
+
+        await sendMessage(dupSaveMsg({ idAmbiguous: "false" }));
+
+        expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
+        expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+      });
+
+      it("a witness of false still saves normally — the guard must not refuse every form", async () => {
+        // The counterweight. Same re-key, same stale index, but the id was never
+        // shared: `Beta` must still be the macro that gets written. A rule that
+        // refused whenever the rendered index no longer matched would pass every
+        // case above and break this one.
+        const { store, macros, sendMessage } = await harnessWithDuplicateIds([
+          { id: "a", name: "Alpha", text: "a" },
+          { id: "b", name: "Beta", text: "b" }
+        ]);
+        await store.save([store.getAll()[1], store.getAll()[0]]); // Beta now at index 0
+
+        await sendMessage(dupSaveMsg({ id: "b", idAmbiguous: false }));
+
+        expect(macros().find((m) => m.id === "b")?.name).toBe("Beta-edited");
+        expect(macros().find((m) => m.id === "a")?.name).toBe("Alpha");
+        expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+      });
     });
   });
 
@@ -268,7 +394,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     await store.save([before[1], before[0]]);
 
     // Delete carries the stale render-time index 1 but the stable Beta id
-    await sendMessage({ type: "delete", index: 1, id: betaId });
+    await sendMessage({ type: "delete", index: 1, id: betaId, idAmbiguous: false });
 
     const after = getMacros();
     expect(after).toHaveLength(1);
@@ -290,7 +416,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     // Beta deleted externally
     await store.save([before[0]]);
 
-    await sendMessage({ type: "delete", index: 1, id: betaId });
+    await sendMessage({ type: "delete", index: 1, id: betaId, idAmbiguous: false });
 
     const after = getMacros();
     expect(after).toHaveLength(1);
@@ -325,11 +451,19 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
   });
 
+  /**
+   * `idAmbiguous: false` is part of the base because the webview always sends
+   * it: it is baked next to `currentId` at render and posted back with every
+   * save and delete (macroEditorHtml.ts). A message without it is not a message
+   * this panel's own HTML can produce, and the host refuses it — see the
+   * "render-time identity witness" block for the tests that pin that down.
+   */
   function baseSaveMsg(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     return {
       type: "save",
       index: null,
       id: null,
+      idAmbiguous: false,
       name: "Test",
       text: "run $host",
       secret: false,
@@ -844,7 +978,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
         return "Delete";
       });
 
-      await sendMessage({ type: "delete", index: 1, id: betaId });
+      await sendMessage({ type: "delete", index: 1, id: betaId, idAmbiguous: false });
 
       expect(getMacros().map((m) => m.name)).toEqual(["Alpha", "Gamma"]);
     });

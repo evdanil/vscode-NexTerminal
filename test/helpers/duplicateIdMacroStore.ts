@@ -24,9 +24,18 @@ import { assignUniqueMacroIds, type MacroStore, type MacroStoreChangeListener } 
  * write. The concurrent-write tests here are specifically about what happens
  * when a save lands mid-dialog, so the one detail the double got wrong was the
  * one detail under test — a reference captured while its id was shared, then
- * re-keyed by that save, resolved to the wrong twin in production while every
- * test said otherwise. Any divergence from production `save()` in a double used
- * for concurrency tests is a hole in exactly that shape.
+ * re-keyed by that save, resolved to the wrong twin in production.
+ *
+ * State that accurately, because it is easy to overstate. Deleting the
+ * `assignUniqueMacroIds()` call below does NOT leave the suite green: measured
+ * against `test/unit` as it stands, it fails 10 tests — the 6 `seedThree`
+ * command cases in `macroCommandsIdentity.test.ts`, 3 drag-and-drop cases in
+ * `macroTreeProvider.test.ts`, and 1 Macro Editor render-witness case. Those
+ * tests were written in response to this hole and detect it directly. What the
+ * old double bought was that none of the tests written ALONGSIDE it failed —
+ * it invalidated its own contemporaries, which is the whole argument for
+ * keeping a concurrency double byte-faithful to production `save()`, and a
+ * strictly weaker claim than "every test passes".
  */
 export class DuplicateIdMacroStore implements MacroStore {
   private macros: TerminalMacro[] = [];

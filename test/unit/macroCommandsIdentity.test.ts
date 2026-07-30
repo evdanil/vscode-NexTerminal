@@ -505,6 +505,26 @@ describe("macro commands resolve their target by identity across every dialog aw
       expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining('"A"'));
     });
 
+    it("Edit Macro decides 'gone' by id, not by name — a surviving namesake is a different record", async () => {
+      // The sibling case above cannot see the difference: its survivor is named "B",
+      // so "is there still a macro called A?" and "is the record the row was built
+      // for still there?" answer the same way. Two macros called "A" separate them —
+      // a name check opens the survivor, pre-filled and one Save away from
+      // overwriting it with the wrong record's edits.
+      await store.save([
+        { name: "A", text: "a" },
+        { name: "A", text: "a-namesake" }
+      ]);
+      const staleItem = macroArg(0);
+      const survivor = getMacros()[1];
+      await store.save([survivor]);
+
+      await registeredCommands.get("nexus.macro.edit")!(staleItem);
+
+      expect(MacroEditorPanel.open).not.toHaveBeenCalled();
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining('"A"'));
+    });
+
     it("moveUp still swaps normally when the row is fresh — the guard must not turn reordering into a no-op", async () => {
       await store.save([
         { name: "A", text: "a" },
@@ -877,6 +897,52 @@ describe("resolveMacroTarget (services/macroMutation.ts)", () => {
     expect(ref.idWhenCaptured).toBe("unique");
     // "A" deleted: row 1 now names "C".
     expect(resolveMacroTarget([unique[1], unique[2]], ref)).toEqual({ kind: "resolved", index: 0 });
+    // ...and the fallback is a SEARCH, not "take the first row". Reordered so the
+    // holder of "b" sits last, an implementation that answers index 0 — which the
+    // case above cannot tell apart from a correct one — moves "C" instead.
+    expect(resolveMacroTarget([unique[2], unique[0], unique[1]], ref)).toEqual({ kind: "resolved", index: 2 });
+  });
+
+  it("a UNIQUE reference whose id has since vanished is 'missing', not 'ambiguous' — the two are different reports", () => {
+    // The counterweight to the re-key case above. `"missing"` is what callers turn
+    // into "…was already removed"; `"ambiguous"` is what they turn into "reorder to
+    // assign fresh ids". An implementation that answers `"ambiguous"` for every
+    // unresolvable id passes every refusal test in this file and tells the user to
+    // repair a conflict that does not exist.
+    const unique: TerminalMacro[] = [
+      { id: "a", name: "A", text: "a" },
+      { id: "b", name: "B", text: "b" }
+    ];
+    const ref = captureMacroRef(unique, "b", 1);
+    expect(resolveMacroTarget([unique[0]], ref)).toEqual({ kind: "missing" });
+  });
+
+  it("an id that was ALREADY gone at capture stays missing — a later arrival under that id is not the record that was pointed at", () => {
+    // A stale row whose macro was deleted before the command even read the array:
+    // zero holders, not one. Reporting that as `"unique"` (which is what "not more
+    // than one" collapses to) hands the reference to whatever turns up under the id
+    // during the dialog — a config import, legacy absorption, an undo. For
+    // `pasteSecret` that is a clipboard password written into a macro the user has
+    // never seen; `moveToFolder` has the same shape.
+    const listed: TerminalMacro[] = [{ id: "u", name: "Unrelated", text: "u" }];
+    const ref = captureMacroRef(listed, "gone", 1);
+    expect(ref.idWhenCaptured).toBe("absent");
+
+    // The import lands the newcomer exactly where the stale row said its macro was…
+    expect(
+      resolveMacroTarget(
+        [{ id: "u", name: "Unrelated", text: "u" }, { id: "gone", name: "Imported", text: "i" }],
+        ref
+      )
+    ).toEqual({ kind: "missing" });
+    // …and, separately, anywhere else at all: neither the position nor the id may
+    // be honoured, so guarding only one of the two routes still leaks.
+    expect(
+      resolveMacroTarget(
+        [{ id: "gone", name: "Imported", text: "i" }, { id: "u", name: "Unrelated", text: "u" }],
+        ref
+      )
+    ).toEqual({ kind: "missing" });
   });
 
   it("a row's render-time conflict flag wins over an array that has already been repaired", () => {
@@ -886,6 +952,16 @@ describe("resolveMacroTarget (services/macroMutation.ts)", () => {
     expect(captureMacroRef(afterSave, "x", 2).idWhenCaptured).toBe("unique");
     expect(captureMacroRefFromRow(afterSave, row).idWhenCaptured).toBe("ambiguous");
     expect(resolveMacroTarget(afterSave, captureMacroRefFromRow(afterSave, row))).toEqual({ kind: "ambiguous" });
+  });
+
+  it("...and the array still counts when the row carries no flag — two witnesses, either one is enough", () => {
+    // The other direction of the same OR. A hand-built `{ macro, index }` (every
+    // command handler accepts one) has no render-time flag at all; taking that as
+    // "not ambiguous" would make an id shared RIGHT NOW resolve to its first holder.
+    const rowWithoutFlag = { macro: stored[2], index: 2 };
+    expect(captureMacroRefFromRow(stored, rowWithoutFlag).idWhenCaptured).toBe("ambiguous");
+    expect(captureMacroRefFromRow(stored, { ...rowWithoutFlag, identityConflict: false }).idWhenCaptured)
+      .toBe("ambiguous");
   });
 
   it("an unverified reference (a drag payload from an unknown producer) resolves by id", () => {
@@ -904,5 +980,33 @@ describe("resolveMacroTarget (services/macroMutation.ts)", () => {
         { id: "b", idWhenCaptured: "unverified" }
       )
     ).toEqual({ kind: "ambiguous" });
+  });
+
+  it("an unverified reference that also named a POSITION is honoured there or refused — never by id alone", () => {
+    // A foreign payload can say `{"id":"x","index":2}`, and it can equally say
+    // `idAmbiguous:false`; neither is proof of anything, so the leniency that lets a
+    // BARE id resolve cannot extend to a stale position. `[Other, First(x),
+    // Second(x)]` after a save: First keeps "x", Second is re-keyed. A payload
+    // naming index 2 is then pointing at a macro that no longer carries the id it
+    // named, and falling back to the unique holder moves First — the twin the user
+    // did not drag, and precisely what rule 2 refuses for references this extension
+    // took itself.
+    const afterSave = assignUniqueMacroIds([
+      { id: "other", name: "Other", text: "o" },
+      { id: "x", name: "First", text: "f" },
+      { id: "x", name: "Second", text: "s" }
+    ]);
+    expect(afterSave[1].id).toBe("x");
+    expect(afterSave[2].id).not.toBe("x");
+
+    expect(resolveMacroTarget(afterSave, { id: "x", index: 2, idWhenCaptured: "unverified" }))
+      .toEqual({ kind: "ambiguous" });
+    // The position it claimed still being right is the whole point of sending one:
+    // a rule that refused every indexed foreign payload would break the ordinary drop.
+    expect(resolveMacroTarget(afterSave, { id: "x", index: 1, idWhenCaptured: "unverified" }))
+      .toEqual({ kind: "resolved", index: 1 });
+    // ...and a payload that claimed no position at all is untouched by any of this.
+    expect(resolveMacroTarget(afterSave, { id: "x", idWhenCaptured: "unverified" }))
+      .toEqual({ kind: "resolved", index: 1 });
   });
 });

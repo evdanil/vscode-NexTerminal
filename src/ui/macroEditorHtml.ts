@@ -47,13 +47,37 @@ function renderVariableRow(variable: MacroVariable, index: number): string {
     </div>`;
 }
 
+/**
+ * @param idAmbiguousAtRender Whether the selected macro's `id` was carried by
+ * MORE THAN ONE macro in `macros` at the moment this form was built. Baked into
+ * the page next to `currentId` and posted straight back with every save/delete,
+ * because the form is the longest-lived reference to a macro in the whole
+ * feature and the id alone cannot carry that fact: `MacroStore.save()` re-keys
+ * duplicates, so by the time the message arrives the id can look perfectly
+ * unique while naming the OTHER twin. This is the editor's equivalent of
+ * `MacroTreeItem.identityConflict` — the render-time witness a row has and a
+ * form previously did not.
+ *
+ * The panel computes it (`macroEditorPanel.ts`) rather than this module,
+ * because the one definition of "how many macros carry this id" lives in
+ * `services/macroMutation.ts`, which reaches `vscode` through `macroSettings`
+ * and so cannot be imported here. It defaults to `false` for the render-only
+ * callers (the byte-identity snapshot), and a caller that forgets it does not
+ * fail open into a wrong write: the page then claims uniqueness, and the host
+ * falls back to checking the LIVE array, which is the protection the editor had
+ * before this argument existed. What is lost is only the extra case that
+ * argument adds — a conflict that had already been re-keyed away by the time
+ * the message landed. The production caller (`MacroEditorPanel.render`) always
+ * passes it.
+ */
 export function renderMacroEditorHtml(
   macros: TerminalMacro[],
   selectedIndex: number | null,
   nonce: string,
   profiles: MacroProfileOptionInput[] = [],
   folders: string[] = [],
-  seedGroup?: string
+  seedGroup?: string,
+  idAmbiguousAtRender = false
 ): string {
   const macro = selectedIndex !== null ? macros[selectedIndex] : undefined;
 
@@ -336,6 +360,9 @@ ${folderOptionsHtml}
       var dirty = false;
       var currentIndex = ${selectedIndex !== null ? selectedIndex : "null"};
       var currentId = ${macro?.id ? JSON.stringify(macro.id) : "null"};
+      // Provenance for currentId, fixed at render (see idAmbiguousAtRender).
+      // Travels with every save/delete; the host refuses anything but false.
+      var currentIdAmbiguous = ${idAmbiguousAtRender && macro?.id ? "true" : "false"};
       var KNOWN_PROFILE_IDS = ${profileIdsJson};
 
       var VALID_PATTERN = /^(alt\\+[a-z0-9]|alt\\+shift\\+[a-z0-9]|ctrl\\+shift\\+[a-z0-9])$/;
@@ -854,6 +881,7 @@ ${folderOptionsHtml}
           type: "save",
           index: currentIndex,
           id: currentId,
+          idAmbiguous: currentIdAmbiguous,
           name: name,
           text: text,
           secret: secret,
@@ -872,7 +900,7 @@ ${folderOptionsHtml}
       // Delete
       document.getElementById("delete-btn").addEventListener("click", function() {
         if (currentIndex === null) return;
-        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId });
+        vscode.postMessage({ type: "delete", index: currentIndex, id: currentId, idAmbiguous: currentIdAmbiguous });
       });
 
       // New
