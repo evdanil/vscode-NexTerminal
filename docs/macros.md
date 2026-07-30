@@ -458,9 +458,10 @@ delete, type a shortcut, answer the paste prompt — Nexus tells you it can no
 longer tell the two apart rather than writing to the wrong one. That holds even
 though the change that shifted the list also assigned fresh ids: what decides it
 is that the id was shared **at the moment you clicked**, not whether it still
-looks shared by the time the write happens. (Fresh ids are handed out to the
-later duplicate, so the shared id survives on the *other* macro — which is
-exactly the macro a write must not land on.)
+looks shared by the time the write happens. (The write gives one of the two a
+fresh id, so the shared id survives on exactly one macro — and which one that
+is depends on details you cannot see, so it may well be the macro a write must
+not land on.)
 
 Refreshing the view and retrying resolves that, and so does reordering any
 macro.

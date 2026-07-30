@@ -124,6 +124,15 @@ export class VscodeMacroStore implements MacroStore {
    * with no values behind them — the same torn state the cross-window race produces, but from
    * a single window and entirely within this file's reach.
    *
+   * `saveFolders()` is enrolled for a related reason rather than that one. It has a single
+   * `await` and touches a single key, so it cannot tear halfway; what it can do is FINISH
+   * OUT OF ORDER. `clearAll()` erases `MACRO_FOLDERS_KEY`, so an unenrolled folder save
+   * issued before Complete Reset is free to resume after it and put the folder list back —
+   * an operation that began before the reset landing after it, with globalState and
+   * `resolvedFolders` both showing folders the user was told had been deleted. What the lock
+   * buys here is not an untorn write but an ORDER, and that is enough to keep "All Nexus
+   * data has been deleted" true of the folder list as well.
+   *
    * So it is fixed here, and only here. This is a WITHIN-WINDOW lock and makes no claim
    * beyond that: it does not serialize two VS Code windows against each other, because
    * `globalState` and `SecretStorage` expose no cross-process lock and no compare-and-swap.
@@ -425,6 +434,10 @@ export class VscodeMacroStore implements MacroStore {
   }
 
   public async saveFolders(folders: string[]): Promise<void> {
+    await this.runExclusive(() => this.writeFolders(folders));
+  }
+
+  private async writeFolders(folders: string[]): Promise<void> {
     const sanitized = sanitizeMacroFolderList(folders);
     await this.context.globalState.update(MACRO_FOLDERS_KEY, sanitized.length > 0 ? sanitized : undefined);
     this.resolvedFolders = sanitized;

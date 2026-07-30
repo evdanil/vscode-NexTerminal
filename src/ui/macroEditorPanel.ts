@@ -741,11 +741,14 @@ export class MacroEditorPanel {
    * exception, and it is the primary secret-editing surface.
    *
    * The failure that reaches here in practice is `persist()` → `MacroStore.save()`. That store
-   * fails CLOSED when it cannot write a macro's secret-id marker file (unwritable global
-   * storage, a full disk, a dead network share) rather than write a vault entry nothing can
-   * name — and because a save republishes every secret the window holds, the condition fails
-   * EVERY save containing any secret macro, including an edit to an unrelated plain one. It has
-   * to be reported, and it must never be reported as success.
+   * awaits `SecretStorage.store()` for every secret it is republishing and then
+   * `globalState.update()` for `nexus.macros`, and it guards neither: a rejection from either
+   * propagates out of `save()` with `nexus.macros` uncommitted, so the save fails CLOSED rather
+   * than publishing a `secret: true` record with nothing behind it. A keyring that REJECTS is
+   * the reachable case (an unavailable one that answers `undefined` instead is handled inside
+   * the store, not raised), and because a save republishes every secret the window holds it
+   * then fails EVERY save containing any secret macro, including an edit to an unrelated plain
+   * one. It has to be reported, and it must never be reported as success.
    *
    * Both channels are used deliberately: the notification is what the user sees when the panel
    * is not focused, and the `#error-save` slot is what they see when it is — it sits beside the

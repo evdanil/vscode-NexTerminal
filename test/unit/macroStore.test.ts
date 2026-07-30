@@ -2039,6 +2039,58 @@ describe("VscodeMacroStore — explicit folders (§4.1, nexus.macros.folders)", 
     expect(stateBag.has("nexus.macros.folders")).toBe(false);
   });
 
+  it("a folder save already in flight cannot finish AFTER Complete Reset — saveFolders is on the same mutation queue", async () => {
+    // The gap the mutation lock and the explicit folder list opened between them: `save()`,
+    // `replaceAll()` and `clearAll()` all run through `runExclusive()`, and `saveFolders()`
+    // did not. It writes one key behind one `await`, so it cannot tear halfway — but
+    // `clearAll()` ERASES that key, and an unenrolled write is free to resume after the reset
+    // has finished and put the folder list back. Complete Reset then reports "All Nexus data
+    // has been deleted" over a `nexus.macros.folders` that is still there, and a tree that
+    // still renders the folders.
+    const { context, stateBag } = makeFakeContext();
+    const store = new VscodeMacroStore(context, { runLegacyMigration: false });
+    await store.initialize();
+    await store.save([{ id: "m", name: "Reload", text: "reload\n" }]);
+
+    // Block the folder save inside `globalState.update`, which is where a real one blocks.
+    // Only the first write that carries a VALUE is held, so the reset's own
+    // `update(MACRO_FOLDERS_KEY, undefined)` passes straight through.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let gated = false;
+    const origUpdate = context.globalState.update.bind(context.globalState);
+    (context.globalState as unknown as { update: typeof origUpdate }).update = async (
+      key: string,
+      value: unknown
+    ) => {
+      if (!gated && key === "nexus.macros.folders" && value !== undefined) {
+        gated = true;
+        await gate;
+      }
+      return origUpdate(key, value);
+    };
+
+    const saving = store.saveFolders(["Cisco"]);
+    const clearing = store.clearAll();
+
+    // Drain to a macrotask boundary, giving the reset every chance to run: against this fake
+    // context its whole path is microtasks, so UNSERIALIZED it completes right here while the
+    // folder save is still on the gate — exactly the reviewer's reproduction. Serialized it
+    // has not begun, which is why this is a timer rather than `await clearing`: awaiting the
+    // reset would hang on the fixed store instead of failing on the broken one.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    release();
+    await Promise.all([saving, clearing]);
+
+    // Both halves matter, and they fail together on the unenrolled version: `getFolders()` is
+    // what the macros tree renders now, and the key is what the next window loads.
+    expect(store.getFolders()).toEqual([]);
+    expect(stateBag.has("nexus.macros.folders")).toBe(false);
+    expect(stateBag.has("nexus.macros")).toBe(false);
+  });
+
   it("saveFolders sanitizes untrusted input: drops non-strings, invalid paths, and dedupes", async () => {
     const { context } = makeFakeContext();
     const store = new VscodeMacroStore(context, { runLegacyMigration: false });

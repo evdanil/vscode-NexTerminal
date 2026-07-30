@@ -203,16 +203,21 @@ export type MacroTarget =
  *    nothing else — it never falls through to rule 3.
  *
  *    This is not the same check as rule 3, and rule 3 does not subsume it,
- *    because `MacroStore.save()` re-keys duplicates: `assignUniqueMacroIds()`
- *    lets the FIRST twin keep the shared id and hands every later twin a fresh
- *    one. So take `[U(u), First(x), Second(x)]`, click `Second` (id `x`, index
- *    2), and let any unrelated save land while the dialog is up — an edit to
- *    `U` is enough. The store now holds `[U(u), First(x), Second(new-id)]`:
- *    index 2 no longer matches, and `x` now has exactly ONE holder, so rule 3
- *    would resolve — confidently, and to `First`, a macro the user never
- *    touched. Nothing in the resolved array distinguishes that from the
- *    perfectly ordinary stale-index case in rule 3; only what was true when the
- *    reference was taken does, which is why `MacroRef` carries it.
+ *    because `MacroStore.save()` re-keys duplicates: after any save the
+ *    contested id has exactly ONE holder. WHICH twin keeps it is not fixed —
+ *    `assignUniqueMacroIds()` awards it in array order, while
+ *    `VscodeMacroStore.save()` supplies `keepIdIfPossible`, so a secret whose
+ *    vault value it could not read claims the id it arrived with ahead of array
+ *    order and an EARLIER twin is re-keyed instead. This rule needs only the
+ *    "exactly one holder" part. So take `[U(u), First(x), Second(x)]`, click
+ *    `Second` (id `x`, index 2), and let any unrelated save land while the
+ *    dialog is up — an edit to `U` is enough. Say `x` stays with `First`: the
+ *    store now holds `[U(u), First(x), Second(new-id)]`, index 2 no longer
+ *    matches, and `x` now has exactly ONE holder, so rule 3 would resolve —
+ *    confidently, and to `First`, a macro the user never touched. Nothing in
+ *    the resolved array distinguishes that from the perfectly ordinary
+ *    stale-index case in rule 3; only what was true when the reference was
+ *    taken does, which is why `MacroRef` carries it.
  *
  * 2b. **Refuse, when an `"unverified"` reference named a position and that
  *    position did not check out.** A payload from a producer outside this

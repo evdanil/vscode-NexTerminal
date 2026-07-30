@@ -668,9 +668,12 @@ describe("macro commands resolve their target by identity across every dialog aw
    *   stored  [Unrelated(u), login(x), reboot(x)]
    *   click   reboot — id "x", row 2
    *   dialog  ANY save lands (here: a rename of Unrelated, the most innocuous
-   *           write there is). `MacroStore.save()` runs `assignUniqueMacroIds()`,
-   *           which lets the FIRST holder of "x" keep it and hands "reboot" a
-   *           fresh id.
+   *           write there is). The save re-keys the twins, leaving "x" with
+   *           exactly ONE holder. Here that is "login" and "reboot" gets the
+   *           fresh id, because this store runs `assignUniqueMacroIds()` and it
+   *           awards in array order; `VscodeMacroStore.save()` supplies
+   *           `keepIdIfPossible` and can award it the other way round. Nothing
+   *           below depends on which twin wins, only on there being one.
    *   store   [Unrelated'(u), login(x), reboot(new-id)]
    *   write   row 2 no longer carries "x" — and "x" now has exactly ONE holder.
    *
@@ -848,10 +851,13 @@ describe("macro commands resolve their target by identity across every dialog aw
 
 /**
  * The primitive underneath every command above, exercised directly against the
- * REAL `assignUniqueMacroIds()` — the same function both production stores run
- * on every `save()`. Going through the real re-keying rather than hand-writing
- * "and now the ids look like this" is the point: the whole defect was a wrong
- * belief about what a save does to a duplicated id.
+ * REAL `assignUniqueMacroIds()` — the same implementation both production stores
+ * re-key with on every `save()` (`VscodeMacroStore.save()` reaches it as
+ * `assignMacroIds()` and adds a `keepIdIfPossible` predicate, which can hand the
+ * contested id to a different twin but never leaves more than one holder, and it
+ * is the one holder these cases turn on). Going through the real re-keying rather
+ * than hand-writing "and now the ids look like this" is the point: the whole
+ * defect was a wrong belief about what a save does to a duplicated id.
  */
 describe("resolveMacroTarget (services/macroMutation.ts)", () => {
   const stored: TerminalMacro[] = [

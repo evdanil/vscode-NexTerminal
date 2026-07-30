@@ -47,8 +47,10 @@ export interface MacroStore {
    *
    * Invariant, enforced at WRITE TIME ONLY: every macro this call persists has a unique,
    * non-empty, STRING `id` — a non-string value (e.g. an object surviving a corrupt JSON
-   * import) and an empty string are both treated as missing, and a later duplicate is
-   * reassigned a fresh id. See `isValidMacroId()` / `assignMacroIds()` below, the single
+   * import) and an empty string are both treated as missing, and all but one holder of a
+   * duplicated id are reassigned a fresh one. WHICH holder keeps it is not fixed: the
+   * plain wrapper awards it in array order, but `keepIdIfPossible` lets a pinned record
+   * claim it ahead of array order, so an EARLIER duplicate can be the one reassigned. See `isValidMacroId()` / `assignMacroIds()` below, the single
    * implementation both `VscodeMacroStore.save()` and `InMemoryMacroStore.save()` use (the
    * latter through the `assignUniqueMacroIds()` wrapper, having no side storage to key).
    *
