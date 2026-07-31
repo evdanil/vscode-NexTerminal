@@ -15,6 +15,11 @@ let mockScriptsPath = ".nexus/scripts";
 // rebuilt when the target directory changed.
 let createWatcherCalls = 0;
 
+// Every rename that reached `workspace.applyEdit`, oldest first — the drag-and-
+// drop tests assert on this rather than on the tree, because "nothing moved" and
+// "moved somewhere the next scan hides" look identical from the tree alone.
+const appliedRenames: Array<{ from: string; to: string }> = [];
+
 // Captured watcher event callbacks, each tagged with the glob pattern its
 // watcher was created with, so `fireWatcherEvent()` below can emulate real
 // FileSystemWatcher pattern-matching rather than blindly invoking every
@@ -103,6 +108,21 @@ vi.mock("vscode", () => ({
       toString: () => [base.fsPath, ...parts].join("/")
     })
   },
+  DataTransferItem: class MockDataTransferItem {
+    public constructor(public readonly value: string) {}
+    public async asString(): Promise<string> {
+      return this.value;
+    }
+  },
+  WorkspaceEdit: class MockWorkspaceEdit {
+    public pending: Array<{ from: string; to: string }> = [];
+    public renameFile(from: { fsPath: string }, to: { fsPath: string }): void {
+      this.pending.push({ from: from.fsPath, to: to.fsPath });
+    }
+  },
+  window: {
+    showWarningMessage: vi.fn(async () => undefined)
+  },
   workspace: {
     workspaceFolders: [],
     fs: {
@@ -111,8 +131,24 @@ vi.mock("vscode", () => ({
         const content = mockFiles.get(uri.fsPath);
         if (content === undefined) throw new Error(`ENOENT: ${uri.fsPath}`);
         return new TextEncoder().encode(content);
+      }),
+      // Drag-and-drop only: the destination-exists check in `moveScriptIntoFolder`.
+      stat: vi.fn(async (uri: { fsPath: string }) => {
+        if (!mockFiles.has(uri.fsPath)) throw new Error(`ENOENT: ${uri.fsPath}`);
+        return { type: 1, ctime: 0, mtime: 0, size: 1 };
       })
     },
+    applyEdit: vi.fn(async (edit: { pending: Array<{ from: string; to: string }> }) => {
+      for (const op of edit.pending) {
+        appliedRenames.push(op);
+        const content = mockFiles.get(op.from);
+        if (content !== undefined) {
+          mockFiles.delete(op.from);
+          mockFiles.set(op.to, content);
+        }
+      }
+      return true;
+    }),
     getConfiguration: vi.fn(() => ({
       // Return the pretend scripts path for `nexus.scripts.path`, fall through
       // to the provided default for anything else so existing tests still see
@@ -146,7 +182,7 @@ vi.mock("vscode", () => ({
 }));
 
 import * as vscode from "vscode";
-import { ScriptTreeProvider } from "../../../src/ui/scriptTreeProvider";
+import { ScriptTreeProvider, type ScriptNode } from "../../../src/ui/scriptTreeProvider";
 import type { ScriptRuntimeManager } from "../../../src/services/scripts/scriptRuntimeManager";
 
 function mockManager(): ScriptRuntimeManager {
@@ -165,6 +201,8 @@ describe("ScriptTreeProvider", () => {
     mockFiles.clear();
     configChangeListeners.clear();
     createWatcherCalls = 0;
+    appliedRenames.length = 0;
+    vi.mocked(vscode.window.showWarningMessage).mockClear();
     watcherHandlers.create.length = 0;
     watcherHandlers.change.length = 0;
     watcherHandlers.delete.length = 0;
@@ -942,6 +980,192 @@ describe("ScriptTreeProvider", () => {
       // No fixed id: a storm starves every expanded folder at once, and a
       // duplicate TreeItem id makes VS Code reject the whole render.
       expect(item.id).toBeUndefined();
+
+      provider.dispose();
+    });
+  });
+
+  describe("drag and drop (§5.9)", () => {
+    const SCRIPT_MIME = "application/vnd.nexus.script";
+    const ROOT = "/workspace/.nexus/scripts";
+
+    /** The two methods of `vscode.DataTransfer` this feature touches. */
+    class FakeDataTransfer {
+      private readonly items = new Map<string, { asString(): Promise<string> }>();
+      public set(mime: string, item: { asString(): Promise<string> }): void {
+        this.items.set(mime, item);
+      }
+      public get(mime: string): { asString(): Promise<string> } | undefined {
+        return this.items.get(mime);
+      }
+    }
+
+    function scriptNode(fsPath: string, name = "Probe"): ScriptNode {
+      return {
+        kind: "script",
+        uri: vscode.Uri.file(fsPath),
+        name,
+        description: "",
+        running: false,
+        parseErrors: []
+      };
+    }
+
+    function folderNode(relPath: string): ScriptNode {
+      return {
+        kind: "folder",
+        uri: vscode.Uri.file(`${ROOT}/${relPath}`),
+        path: relPath,
+        name: relPath,
+        linked: false
+      };
+    }
+
+    /** Runs a whole gesture and hands back the transfer, so tests can inspect the wire. */
+    async function drag(
+      provider: ScriptTreeProvider,
+      source: ScriptNode
+    ): Promise<FakeDataTransfer> {
+      const transfer = new FakeDataTransfer();
+      await provider.handleDrag([source], transfer as unknown as vscode.DataTransfer);
+      return transfer;
+    }
+
+    it("puts a lookup token on the wire and NOTHING about the file", async () => {
+      // The drop ends in `applyEdit(renameFile)`. A payload naming a path would
+      // be an instruction to move that path, available to any producer that can
+      // write this MIME — so the wire carries a key to a host-side record and
+      // the record never leaves the process.
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      const transfer = await drag(provider, scriptNode(`${ROOT}/probe.js`));
+      const payload = await transfer.get(SCRIPT_MIME)!.asString();
+
+      expect(payload).not.toContain("probe.js");
+      expect(payload).not.toContain(ROOT);
+      expect(payload).not.toContain("/");
+
+      provider.dispose();
+    });
+
+    it("a token this view never minted moves nothing at all", async () => {
+      mockFiles.set(`${ROOT}/probe.js`, "/**\n * @nexus-script\n */\n");
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+      // A real drag happened, so there IS a capture to hijack — the forged
+      // payload is refused because it names a different token, not because the
+      // view happens to be holding nothing.
+      await drag(provider, scriptNode(`${ROOT}/probe.js`));
+
+      const forged = new FakeDataTransfer();
+      forged.set(SCRIPT_MIME, { asString: async () => "script-drag-9999" });
+      await provider.handleDrop(folderNode("cisco"), forged as unknown as vscode.DataTransfer);
+
+      expect(appliedRenames).toEqual([]);
+
+      provider.dispose();
+    });
+
+    it("moves the script into the folder it was dropped on", async () => {
+      mockFiles.set(`${ROOT}/probe.js`, "/**\n * @nexus-script\n */\n");
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      const transfer = await drag(provider, scriptNode(`${ROOT}/probe.js`));
+      await provider.handleDrop(folderNode("cisco"), transfer as unknown as vscode.DataTransfer);
+
+      expect(appliedRenames).toEqual([{ from: `${ROOT}/probe.js`, to: `${ROOT}/cisco/probe.js` }]);
+      expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+
+      provider.dispose();
+    });
+
+    it("dropping onto another SCRIPT targets that script's folder, not the script", async () => {
+      mockFiles.set(`${ROOT}/probe.js`, "/**\n * @nexus-script\n */\n");
+      mockFiles.set(`${ROOT}/cisco/neighbour.js`, "/**\n * @nexus-script\n */\n");
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      const transfer = await drag(provider, scriptNode(`${ROOT}/probe.js`));
+      await provider.handleDrop(
+        scriptNode(`${ROOT}/cisco/neighbour.js`, "Neighbour"),
+        transfer as unknown as vscode.DataTransfer
+      );
+
+      expect(appliedRenames).toEqual([{ from: `${ROOT}/probe.js`, to: `${ROOT}/cisco/probe.js` }]);
+
+      provider.dispose();
+    });
+
+    it("dropping on empty space moves the script back to the root", async () => {
+      mockFiles.set(`${ROOT}/cisco/probe.js`, "/**\n * @nexus-script\n */\n");
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      const transfer = await drag(provider, scriptNode(`${ROOT}/cisco/probe.js`));
+      await provider.handleDrop(undefined, transfer as unknown as vscode.DataTransfer);
+
+      expect(appliedRenames).toEqual([{ from: `${ROOT}/cisco/probe.js`, to: `${ROOT}/probe.js` }]);
+
+      provider.dispose();
+    });
+
+    it("a banner row is a root drop, not a dead spot", async () => {
+      // The truncation / depth-truncation / scanning rows all render AT the
+      // root and are all under the pointer at the top of the list. Treating
+      // only `undefined` as root would make releasing over one of them do
+      // nothing and say nothing — the failure this whole feature answers.
+      mockFiles.set(`${ROOT}/cisco/probe.js`, "/**\n * @nexus-script\n */\n");
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      const transfer = await drag(provider, scriptNode(`${ROOT}/cisco/probe.js`));
+      await provider.handleDrop(
+        { kind: "truncated", examined: 500 },
+        transfer as unknown as vscode.DataTransfer
+      );
+
+      expect(appliedRenames).toEqual([{ from: `${ROOT}/cisco/probe.js`, to: `${ROOT}/probe.js` }]);
+
+      provider.dispose();
+    });
+
+    it("the same token cannot be replayed for a second move", async () => {
+      // The capture is cleared by the drop it belongs to. Without that, a
+      // payload kept from an earlier gesture would move the script again —
+      // against a tree that has since changed underneath it.
+      mockFiles.set(`${ROOT}/probe.js`, "/**\n * @nexus-script\n */\n");
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      const transfer = await drag(provider, scriptNode(`${ROOT}/probe.js`));
+      await provider.handleDrop(folderNode("cisco"), transfer as unknown as vscode.DataTransfer);
+      await provider.handleDrop(folderNode("juniper"), transfer as unknown as vscode.DataTransfer);
+
+      expect(appliedRenames).toEqual([{ from: `${ROOT}/probe.js`, to: `${ROOT}/cisco/probe.js` }]);
+
+      provider.dispose();
+    });
+
+    it("refuses a running script and says so, rather than moving it quietly", async () => {
+      mockFiles.set(`${ROOT}/probe.js`, "/**\n * @nexus-script\n */\n");
+      const manager = mockManager();
+      vi.mocked(manager.getRuns).mockReturnValue([
+        { scriptPath: `${ROOT}/probe.js` } as unknown as ReturnType<ScriptRuntimeManager["getRuns"]>[number]
+      ]);
+      const provider = new ScriptTreeProvider(manager, "/tmp/fake-gs");
+
+      const transfer = await drag(provider, scriptNode(`${ROOT}/probe.js`));
+      await provider.handleDrop(folderNode("cisco"), transfer as unknown as vscode.DataTransfer);
+
+      expect(appliedRenames).toEqual([]);
+      expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("it is running")
+      );
+
+      provider.dispose();
+    });
+
+    it("does not start a drag for a folder row", async () => {
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      const transfer = await drag(provider, folderNode("cisco"));
+
+      expect(transfer.get(SCRIPT_MIME)).toBeUndefined();
 
       provider.dispose();
     });
