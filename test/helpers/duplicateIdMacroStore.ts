@@ -60,9 +60,18 @@ export class DuplicateIdMacroStore implements MacroStore {
   }
 
   public async save(macros: TerminalMacro[]): Promise<void> {
-    // The SAME `assignUniqueMacroIds()` both production stores call, not a
-    // re-implementation: the first holder of a duplicated id keeps it and every
-    // later twin gets a fresh UUID. See the class doc comment.
+    // The SAME `assignUniqueMacroIds()` `InMemoryMacroStore` calls, not a
+    // re-implementation: a contested id is awarded in array order, so the first
+    // holder keeps it and every later twin gets a fresh UUID.
+    //
+    // That last sentence is a property of THIS wrapper, not of saving. Desktop
+    // persistence goes through `assignMacroIds(…, { keepIdIfPossible })`, which
+    // can award the id to a later twin — a secret whose vault value could not be
+    // read is pinned to the entry it arrived with, and an EARLIER twin is the one
+    // re-keyed. What both share, and all these tests turn on, is the part that
+    // does not vary: after any write the id has exactly ONE holder. Assertions
+    // below that name a specific surviving twin are reading this wrapper's order,
+    // and say so where they do. See the class doc comment.
     this.macros = assignUniqueMacroIds(macros).map((m) => ({ ...m }));
     for (const listener of this.listeners) listener();
   }
