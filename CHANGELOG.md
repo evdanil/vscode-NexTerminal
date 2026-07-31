@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.8.77] — 2026-07-31
+
+### Added
+
+- **Drag a script onto a folder to move it there.** 2.8.75 added folders to the Scripts sidebar but no way to put an *existing* script into one — not by drag, not by any command — so the only route was moving the file in VS Code's Explorer. Drop a script on a folder to move it in, on another script to put it in that script's folder, or on empty space to move it back to the root. Because a script folder is a real directory, the drop renames the file: an editor you have open on it follows along, and Undo puts it back. Nexus refuses and says why in three cases — the script is running (stop it first), a file of the same name is already in the target folder (nothing is ever overwritten), or the file is not inside the scripts folder. Folders themselves are not draggable, and one script moves per drag.
+
+### Fixed
+
+- **Open Scripts Folder opened the wrong folder.** It used VS Code's "reveal in OS" action, which reveals its target *inside the containing folder* — so, handed a directory, it opened that directory's parent: `.nexus` rather than `.nexus/scripts`, or the extension's global-storage folder when no workspace is open. Neither contains a script. It now opens the scripts folder itself.
+
 ## [2.8.76] — 2026-07-31
 
 ### Fixed

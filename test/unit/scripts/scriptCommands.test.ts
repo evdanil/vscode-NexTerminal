@@ -675,29 +675,80 @@ describe("scriptCommands", () => {
   });
 
   describe("openScriptsFolder command", () => {
-    it("reveals the configured scripts dir via revealFileInOS", async () => {
+    function revealArg(): { fsPath: string } | undefined {
+      const call = vi.mocked(vscode.commands.executeCommand).mock.calls.find(
+        (c) => c[0] === "revealFileInOS"
+      );
+      return call?.[1] as { fsPath: string } | undefined;
+    }
+
+    it("opens the scripts folder ITSELF, not the folder that contains it", async () => {
+      // `revealFileInOS` is Electron's `showItemInFolder`: given a directory it
+      // opens that directory's PARENT with the directory selected. For the
+      // default `.nexus/scripts` that means a window on `<workspace>/.nexus`,
+      // which holds no scripts — the command is called Open Scripts Folder and
+      // it was opening the wrong one. `openExternal` opens the directory.
+      state.mockOpenExternal.mockResolvedValue(true);
       registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.openScriptsFolder");
       expect(handler).toBeDefined();
+
       await handler!();
-      const revealCall = vi.mocked(vscode.commands.executeCommand).mock.calls.find(
-        (c) => c[0] === "revealFileInOS"
+
+      expect(state.mockOpenExternal).toHaveBeenCalledTimes(1);
+      expect((state.mockOpenExternal.mock.calls[0][0] as { fsPath: string }).fsPath).toBe(
+        "/ws/.nexus/scripts"
       );
-      expect(revealCall).toBeDefined();
-      expect((revealCall![1] as { fsPath: string }).fsPath).toBe("/ws/.nexus/scripts");
+      // Not also revealed — one window, and never the parent when the right
+      // one opened.
+      expect(revealArg()).toBeUndefined();
+    });
+
+    it("falls back to revealFileInOS when openExternal reports it did not open", async () => {
+      // From a remote window a `file:` URI resolves on the local machine, so
+      // `openExternal` can decline. Landing on the parent folder beats landing
+      // nowhere.
+      state.mockOpenExternal.mockResolvedValue(false);
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+
+      await state.registeredCommands.get("nexus.script.openScriptsFolder")!();
+
+      expect(revealArg()?.fsPath).toBe("/ws/.nexus/scripts");
+    });
+
+    it("falls back to revealFileInOS when openExternal throws", async () => {
+      state.mockOpenExternal.mockRejectedValue(new Error("no handler"));
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+
+      await state.registeredCommands.get("nexus.script.openScriptsFolder")!();
+
+      expect(revealArg()?.fsPath).toBe("/ws/.nexus/scripts");
+    });
+
+    it("says where the folder is when neither route works, instead of failing silently", async () => {
+      state.mockOpenExternal.mockResolvedValue(false);
+      vi.mocked(vscode.commands.executeCommand).mockRejectedValue(new Error("unsupported"));
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+
+      await state.registeredCommands.get("nexus.script.openScriptsFolder")!();
+
+      expect(state.mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("/ws/.nexus/scripts")
+      );
     });
 
     it("falls back to globalStoragePath when no workspace is open", async () => {
       const prevFolders = (await import("vscode")).workspace.workspaceFolders;
       try {
         (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
+        state.mockOpenExternal.mockResolvedValue(true);
         registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+
         await state.registeredCommands.get("nexus.script.openScriptsFolder")!();
-        const revealCall = vi.mocked(vscode.commands.executeCommand).mock.calls.find(
-          (c) => c[0] === "revealFileInOS"
+
+        expect((state.mockOpenExternal.mock.calls[0][0] as { fsPath: string }).fsPath).toBe(
+          "/tmp/fake-gs/scripts"
         );
-        expect(revealCall).toBeDefined();
-        expect((revealCall![1] as { fsPath: string }).fsPath).toBe("/tmp/fake-gs/scripts");
       } finally {
         (await import("vscode")).workspace.workspaceFolders = prevFolders;
       }

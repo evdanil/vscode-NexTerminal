@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import { parseScriptHeader } from "../services/scripts/scriptHeader";
 import { resolveScriptsDir } from "../services/scripts/resolveScriptsDir";
+import { moveScriptIntoFolder } from "../services/scripts/moveScripts";
+import { SCRIPT_DRAG_MIME } from "./dndMimeTypes";
 import { scanScriptsDir, SCRIPT_SCAN_MAX_ENTRIES, SCRIPT_SCAN_MAX_DEPTH, type ScriptScanResult } from "../services/scripts/scriptScanner";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 import { createCoalescedInvoker, type CoalescedInvoker } from "../utils/coalescedInvoker";
@@ -18,6 +20,14 @@ const SCRIPT_WATCH_DEBOUNCE_MS = 300;
  * place.
  */
 const SCRIPT_STARVED_REPAINT_MS = 300;
+
+/**
+ * Correlates a `handleDrag` with the URI that drag captured, which stays
+ * HOST-SIDE (`ScriptTreeProvider.lastDragCapture`). Module-level so two
+ * provider instances can never mint the same token and read each other's
+ * capture.
+ */
+let dragSequence = 0;
 
 export type ScriptNode =
   | { kind: "script"; uri: vscode.Uri; name: string; description: string; running: boolean; parseErrors: string[] }
@@ -65,9 +75,33 @@ function scriptPlaceholders(): ScriptNode[] {
   ];
 }
 
-export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
+export class ScriptTreeProvider
+  implements vscode.TreeDataProvider<ScriptNode>, vscode.TreeDragAndDropController<ScriptNode>
+{
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
   public readonly onDidChangeTreeData: vscode.Event<void> = this._onDidChangeTreeData.event;
+
+  // §5.9 — its own MIME, so this view neither offers nor accepts the Hub's and
+  // the Macros view's drags. See `dndMimeTypes.ts`.
+  public readonly dragMimeTypes = [SCRIPT_DRAG_MIME];
+  public readonly dropMimeTypes = [SCRIPT_DRAG_MIME];
+
+  /**
+   * What the most recent `handleDrag` picked up. Kept HERE, never on the wire.
+   *
+   * A `DataTransfer` payload is whatever its producer wrote, and this drop ends
+   * in `workspace.applyEdit(renameFile)` — so a payload naming a path would be
+   * an instruction to move that path, from any producer that can write this
+   * MIME. There is nothing a script drag needs to say that the host does not
+   * already know, so the wire carries a lookup token and nothing else, and a
+   * token this view did not mint resolves to nothing at all. That is strictly
+   * stronger than validating a path out of the payload would be, and it costs
+   * a `Map` lookup.
+   *
+   * Cleared on the drop it belongs to, so a replayed token cannot repeat a
+   * move against a tree that has since changed underneath it.
+   */
+  private lastDragCapture?: { token: string; uri: vscode.Uri };
   private watcher?: vscode.FileSystemWatcher;
   private watchedDir?: string;
   private readonly managerListener: vscode.Disposable;
@@ -171,6 +205,83 @@ export class ScriptTreeProvider implements vscode.TreeDataProvider<ScriptNode> {
     this.ensureWatcher();
     this.startScan();
     this._onDidChangeTreeData.fire();
+  }
+
+  /**
+   * §5.9 — only scripts are draggable. Folders are directories, so dragging one
+   * would move a whole subtree, and the cases that opens (a folder dropped into
+   * its own descendant, collisions nested many levels down, a running script
+   * anywhere beneath it) are not paid for by this gesture.
+   *
+   * One script per drag. The view does not set `canSelectMany` (see
+   * `extension.ts`), so `source` is a single row in practice; taking the first
+   * script in it rather than indexing blindly is just not depending on that.
+   */
+  public async handleDrag(source: readonly ScriptNode[], dataTransfer: vscode.DataTransfer): Promise<void> {
+    const dragged = source.find((node) => node.kind === "script");
+    if (!dragged) {
+      return;
+    }
+    const token = `script-drag-${++dragSequence}`;
+    this.lastDragCapture = { token, uri: dragged.uri };
+    dataTransfer.set(SCRIPT_DRAG_MIME, new vscode.DataTransferItem(token));
+  }
+
+  /**
+   * A drop onto a folder moves into that folder; onto another script, into the
+   * folder that script is in (the usual tree convention — you dropped it *next
+   * to* that row); onto anything else, including empty space, into the scripts
+   * root.
+   *
+   * That last clause is deliberately a catch-all rather than a list. The root
+   * can also render a truncation banner, a depth-truncation banner, a "scanning"
+   * row and the onboarding placeholders, and every one of them is a row the
+   * pointer can be over when the button comes up. Enumerating only `undefined`
+   * as "root" would make those rows dead spots where a drag does nothing and
+   * says nothing — which is the complaint that got this feature written.
+   */
+  public async handleDrop(target: ScriptNode | undefined, dataTransfer: vscode.DataTransfer): Promise<void> {
+    const transferItem = dataTransfer.get(SCRIPT_DRAG_MIME);
+    if (!transferItem) {
+      return;
+    }
+    const token = await transferItem.asString();
+    const capture = this.lastDragCapture;
+    if (!capture || !token || token !== capture.token) {
+      return;
+    }
+    this.lastDragCapture = undefined;
+
+    const root = resolveScriptsDir(this.globalStoragePath);
+    const targetDir =
+      target?.kind === "folder"
+        ? target.uri
+        // `joinPath(uri, "..")` rather than `Uri.file(dirname(uri.fsPath))`:
+        // the parent has to keep the dropped-on row's own scheme and authority.
+        // In a Remote-SSH or Codespaces window with the default relative scripts
+        // path, every scanned node carries the workspace's scheme
+        // (`vscode-remote://…`), and rebuilding the directory as a `file:` URI
+        // would hand `renameFile` a remote source and a local destination — so
+        // dropping onto a script would fail with the generic "Could not move"
+        // while folder and root drops worked. `joinPath` normalizes `..` and
+        // preserves everything else about the URI.
+        : target?.kind === "script"
+          ? vscode.Uri.joinPath(target.uri, "..")
+          : root;
+
+    const runningPaths = new Set(this.manager.getRuns().map((r) => r.scriptPath));
+    const result = await moveScriptIntoFolder(capture.uri, targetDir, runningPaths, root);
+
+    if (result.kind === "refused") {
+      void vscode.window.showWarningMessage(result.message);
+    }
+    if (result.kind === "moved") {
+      // The watcher fires for the rename too, but debounced — and not at all
+      // when either side is under a symlinked folder, which the watcher cannot
+      // follow (see `ensureWatcher`). Refresh directly so the tree is correct
+      // the moment the drop finishes, in every case.
+      this.refresh();
+    }
   }
 
   private startScan(): Promise<ScriptScanResult> {

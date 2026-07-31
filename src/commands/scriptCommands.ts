@@ -627,12 +627,39 @@ export function registerScriptCommands(
       } catch {
         // Already exists — that's the normal case.
       }
+      // `openExternal` FIRST, and `revealFileInOS` only as the fallback — the
+      // opposite of what this used to do, which is why the command opened the
+      // wrong folder.
+      //
+      // `revealFileInOS` is Electron's `shell.showItemInFolder`: it reveals its
+      // argument *inside the containing folder* and selects it. Handed a
+      // DIRECTORY, it therefore opens that directory's PARENT — for the default
+      // `.nexus/scripts` that is `<workspace>/.nexus`, a folder holding no
+      // scripts at all, and for the no-workspace fallback it is the extension's
+      // global-storage directory, which holds `state.vscdb` and nothing a user
+      // would recognise. The command is called Open Scripts Folder and it was
+      // never opening the scripts folder.
+      //
+      // `openExternal` on a `file:` URI opens the directory ITSELF in the OS
+      // file manager, which is what the title promises. It is kept honest about
+      // its own limit: from a remote window a `file:` URI resolves on the local
+      // machine, so if it reports failure the reveal is still tried — landing on
+      // the parent is a worse answer than the right one, and a better answer
+      // than nothing.
+      let opened = false;
       try {
-        await vscode.commands.executeCommand("revealFileInOS", target);
+        opened = await vscode.env.openExternal(target);
       } catch {
-        // revealFileInOS can fail on some platforms (e.g. remote); fall back
-        // to openExternal which may open a browser or the OS default handler.
-        await vscode.env.openExternal(target);
+        opened = false;
+      }
+      if (!opened) {
+        try {
+          await vscode.commands.executeCommand("revealFileInOS", target);
+        } catch {
+          void vscode.window.showWarningMessage(
+            `Could not open the scripts folder. It is at: ${target.fsPath}`
+          );
+        }
       }
     })
   ];

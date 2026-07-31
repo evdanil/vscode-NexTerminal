@@ -423,7 +423,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // as the other tree-shaped sidebars (Hub, Tunnels, Macros, File Explorer).
   const scriptsView = vscode.window.createTreeView("nexusScripts", {
     treeDataProvider: scriptTreeProvider,
-    showCollapseAll: true
+    showCollapseAll: true,
+    // §5.9 — drag a script onto a folder to move it there.
+    //
+    // `canSelectMany` is deliberately NOT set. It would let a drag carry several
+    // scripts, but it also changes what every EXISTING script context command
+    // receives: VS Code starts passing the whole selection, and Run / Stop /
+    // Delete / Edit all act on the first row only. Silently deleting one of
+    // three selected scripts is a worse bug than the one this fixes. The
+    // provider's drag handler already takes an array, so enabling it later is a
+    // one-line change once those commands handle a multi-selection.
+    dragAndDropController: scriptTreeProvider
   });
   // F11 — register CodeLens for file://, vscode-remote://, and untitled:// so the
   // ▶ Run / ◼ Stop lens surfaces for scripts opened over Remote-SSH or as untitled drafts.
