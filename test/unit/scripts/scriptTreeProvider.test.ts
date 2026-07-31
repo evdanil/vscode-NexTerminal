@@ -18,7 +18,7 @@ let createWatcherCalls = 0;
 // Every rename that reached `workspace.applyEdit`, oldest first — the drag-and-
 // drop tests assert on this rather than on the tree, because "nothing moved" and
 // "moved somewhere the next scan hides" look identical from the tree alone.
-const appliedRenames: Array<{ from: string; to: string }> = [];
+const appliedRenames: Array<{ from: string; to: string; toScheme: string }> = [];
 
 // Captured watcher event callbacks, each tagged with the glob pattern its
 // watcher was created with, so `fireWatcherEvent()` below can emulate real
@@ -101,12 +101,34 @@ vi.mock("vscode", () => ({
       path: p,
       toString: () => p
     }),
-    joinPath: (base: { fsPath: string }, ...parts: string[]) => ({
-      fsPath: [base.fsPath, ...parts].join("/"),
-      scheme: "file",
-      path: [base.fsPath, ...parts].join("/"),
-      toString: () => [base.fsPath, ...parts].join("/")
-    })
+    // Normalizes "." / ".." and PRESERVES scheme + authority, because
+    // `handleDrop` derives a script's parent folder with `joinPath(uri, "..")`
+    // and the whole point of that call is that a `vscode-remote` row does not
+    // come back as a `file:` URI. A mock that always answered "file" could not
+    // tell the fix from the bug.
+    joinPath: (base: { path: string; scheme?: string; authority?: string }, ...parts: string[]) => {
+      const segments: string[] = [];
+      for (const raw of [base.path, ...parts]) {
+        for (const seg of raw.split("/")) {
+          if (seg === "" || seg === ".") continue;
+          if (seg === "..") {
+            segments.pop();
+            continue;
+          }
+          segments.push(seg);
+        }
+      }
+      const joined = `/${segments.join("/")}`;
+      const scheme = base.scheme ?? "file";
+      const authority = base.authority ?? "";
+      return {
+        fsPath: joined,
+        scheme,
+        authority,
+        path: joined,
+        toString: () => (scheme === "file" ? joined : `${scheme}://${authority}${joined}`)
+      };
+    }
   },
   DataTransferItem: class MockDataTransferItem {
     public constructor(public readonly value: string) {}
@@ -115,9 +137,12 @@ vi.mock("vscode", () => ({
     }
   },
   WorkspaceEdit: class MockWorkspaceEdit {
-    public pending: Array<{ from: string; to: string }> = [];
-    public renameFile(from: { fsPath: string }, to: { fsPath: string }): void {
-      this.pending.push({ from: from.fsPath, to: to.fsPath });
+    public pending: Array<{ from: string; to: string; toScheme: string }> = [];
+    public renameFile(
+      from: { fsPath: string },
+      to: { fsPath: string; scheme?: string }
+    ): void {
+      this.pending.push({ from: from.fsPath, to: to.fsPath, toScheme: to.scheme ?? "file" });
     }
   },
   window: {
@@ -138,7 +163,7 @@ vi.mock("vscode", () => ({
         return { type: 1, ctime: 0, mtime: 0, size: 1 };
       })
     },
-    applyEdit: vi.fn(async (edit: { pending: Array<{ from: string; to: string }> }) => {
+    applyEdit: vi.fn(async (edit: { pending: Array<{ from: string; to: string; toScheme: string }> }) => {
       for (const op of edit.pending) {
         appliedRenames.push(op);
         const content = mockFiles.get(op.from);
@@ -1072,7 +1097,7 @@ describe("ScriptTreeProvider", () => {
       const transfer = await drag(provider, scriptNode(`${ROOT}/probe.js`));
       await provider.handleDrop(folderNode("cisco"), transfer as unknown as vscode.DataTransfer);
 
-      expect(appliedRenames).toEqual([{ from: `${ROOT}/probe.js`, to: `${ROOT}/cisco/probe.js` }]);
+      expect(appliedRenames).toEqual([{ from: `${ROOT}/probe.js`, to: `${ROOT}/cisco/probe.js`, toScheme: "file" }]);
       expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
 
       provider.dispose();
@@ -1089,7 +1114,7 @@ describe("ScriptTreeProvider", () => {
         transfer as unknown as vscode.DataTransfer
       );
 
-      expect(appliedRenames).toEqual([{ from: `${ROOT}/probe.js`, to: `${ROOT}/cisco/probe.js` }]);
+      expect(appliedRenames).toEqual([{ from: `${ROOT}/probe.js`, to: `${ROOT}/cisco/probe.js`, toScheme: "file" }]);
 
       provider.dispose();
     });
@@ -1101,7 +1126,7 @@ describe("ScriptTreeProvider", () => {
       const transfer = await drag(provider, scriptNode(`${ROOT}/cisco/probe.js`));
       await provider.handleDrop(undefined, transfer as unknown as vscode.DataTransfer);
 
-      expect(appliedRenames).toEqual([{ from: `${ROOT}/cisco/probe.js`, to: `${ROOT}/probe.js` }]);
+      expect(appliedRenames).toEqual([{ from: `${ROOT}/cisco/probe.js`, to: `${ROOT}/probe.js`, toScheme: "file" }]);
 
       provider.dispose();
     });
@@ -1120,7 +1145,7 @@ describe("ScriptTreeProvider", () => {
         transfer as unknown as vscode.DataTransfer
       );
 
-      expect(appliedRenames).toEqual([{ from: `${ROOT}/cisco/probe.js`, to: `${ROOT}/probe.js` }]);
+      expect(appliedRenames).toEqual([{ from: `${ROOT}/cisco/probe.js`, to: `${ROOT}/probe.js`, toScheme: "file" }]);
 
       provider.dispose();
     });
@@ -1136,7 +1161,7 @@ describe("ScriptTreeProvider", () => {
       await provider.handleDrop(folderNode("cisco"), transfer as unknown as vscode.DataTransfer);
       await provider.handleDrop(folderNode("juniper"), transfer as unknown as vscode.DataTransfer);
 
-      expect(appliedRenames).toEqual([{ from: `${ROOT}/probe.js`, to: `${ROOT}/cisco/probe.js` }]);
+      expect(appliedRenames).toEqual([{ from: `${ROOT}/probe.js`, to: `${ROOT}/cisco/probe.js`, toScheme: "file" }]);
 
       provider.dispose();
     });
@@ -1156,6 +1181,51 @@ describe("ScriptTreeProvider", () => {
       expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(
         expect.stringContaining("it is running")
       );
+
+      provider.dispose();
+    });
+
+    it("keeps the workspace's scheme when the drop target is another script", async () => {
+      // Remote-SSH / Codespaces with the default RELATIVE scripts path: every
+      // scanned node carries the workspace's scheme. Deriving the target folder
+      // as `Uri.file(dirname(uri.fsPath))` hands `renameFile` a remote source
+      // and a LOCAL destination, so this one drop shape fails with the generic
+      // "Could not move" while folder and root drops work. `joinPath(uri, "..")`
+      // preserves scheme and authority.
+      const remote = (p: string): vscode.Uri =>
+        ({
+          fsPath: p,
+          scheme: "vscode-remote",
+          authority: "ssh-remote+box",
+          path: p,
+          toString: () => `vscode-remote://ssh-remote+box${p}`
+        }) as unknown as vscode.Uri;
+
+      (vscode.workspace as unknown as { workspaceFolders: unknown[] }).workspaceFolders = [
+        { uri: remote("/home/u"), name: "remote", index: 0 }
+      ];
+      const REMOTE_ROOT = "/home/u/.nexus/scripts";
+      mockFiles.set(`${REMOTE_ROOT}/probe.js`, "/**\n * @nexus-script\n */\n");
+      const provider = new ScriptTreeProvider(mockManager(), "/tmp/fake-gs");
+
+      const transfer = new FakeDataTransfer();
+      await provider.handleDrag(
+        [{ ...scriptNode(""), uri: remote(`${REMOTE_ROOT}/probe.js`) }],
+        transfer as unknown as vscode.DataTransfer
+      );
+      await provider.handleDrop(
+        { ...scriptNode(""), uri: remote(`${REMOTE_ROOT}/cisco/neighbour.js`) },
+        transfer as unknown as vscode.DataTransfer
+      );
+
+      expect(appliedRenames).toEqual([
+        {
+          from: `${REMOTE_ROOT}/probe.js`,
+          to: `${REMOTE_ROOT}/cisco/probe.js`,
+          toScheme: "vscode-remote"
+        }
+      ]);
+      expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
 
       provider.dispose();
     });

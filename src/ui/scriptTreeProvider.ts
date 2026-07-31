@@ -1,4 +1,3 @@
-import * as path from "node:path";
 import * as vscode from "vscode";
 import { parseScriptHeader } from "../services/scripts/scriptHeader";
 import { resolveScriptsDir } from "../services/scripts/resolveScriptsDir";
@@ -257,8 +256,17 @@ export class ScriptTreeProvider
     const targetDir =
       target?.kind === "folder"
         ? target.uri
+        // `joinPath(uri, "..")` rather than `Uri.file(dirname(uri.fsPath))`:
+        // the parent has to keep the dropped-on row's own scheme and authority.
+        // In a Remote-SSH or Codespaces window with the default relative scripts
+        // path, every scanned node carries the workspace's scheme
+        // (`vscode-remote://…`), and rebuilding the directory as a `file:` URI
+        // would hand `renameFile` a remote source and a local destination — so
+        // dropping onto a script would fail with the generic "Could not move"
+        // while folder and root drops worked. `joinPath` normalizes `..` and
+        // preserves everything else about the URI.
         : target?.kind === "script"
-          ? vscode.Uri.file(path.dirname(target.uri.fsPath))
+          ? vscode.Uri.joinPath(target.uri, "..")
           : root;
 
     const runningPaths = new Set(this.manager.getRuns().map((r) => r.scriptPath));
