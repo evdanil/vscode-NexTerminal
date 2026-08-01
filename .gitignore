@@ -159,3 +159,6 @@ native/**/target/
 # Internal design/planning docs (kept local, not published)
 docs/plans/
 docs/superpowers/
+
+# Local-only demo recording lab (README GIF)
+.demo-lab/

@@ -30,6 +30,9 @@ specs/**
 .worktrees/**
 CLAUDE.md
 
+# Media file
+media/demo-jump-host.gif
+
 # Node modules — only serialport (native) is needed at runtime; everything else is bundled
 node_modules/.package-lock.json
 
@@ -124,3 +127,6 @@ tmp/
 # Design source SVGs (inlined into src/ui/tunnelIllustrations.ts)
 media/*-type-forward.svg
 media/*-type-forward-l.svg
+
+# Local-only demo recording lab
+.demo-lab/**

@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.78] — 2026-08-01
+
+### Changed
+
+- **The README and Marketplace listing now open with a demo of multi-hop jump-host connectivity.** The page described chaining through jump hosts but never showed it, and the listing is where most people decide whether this replaces their current client. The recording sets a two-level chain — an access switch reached through an NMS host, which is itself reached through a bastion — then connects, authenticating each hop in turn before the shell lands on the switch. No code changed in this release; the Marketplace only picks up a README change when a new version is published.
+
 ## [2.8.77] — 2026-07-31
 
 ### Added
