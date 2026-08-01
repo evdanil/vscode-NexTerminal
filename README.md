@@ -13,8 +13,7 @@ A full SSH + serial + port-forwarding client inside VS Code — without Remote-S
 - **Onboard a whole rack in one paste** — feed it a CSV export or a plain list of hostnames and it creates the connections in bulk, with folders, ports, and usernames picked up from the columns. Duplicates are skipped and unparsable lines are reported with their line numbers instead of failing the batch.
 - **Edit root-owned files without dropping to a shell** — save `/etc/*` over SFTP with `sudo`, writing through the file's existing inode so owner, mode, and ACLs are preserved. Your sudo password goes to the SSH channel's stdin only: never to disk, never to secret storage, never to a log.
 
-<!-- TODO: record GIF — jump-host A→B→C chain. ~15s, loopable. -->
-![Nexus Terminal connecting through a multi-hop jump-host chain (A → B → C) and opening a remote shell](media/demo-jump-host.gif)
+![Nexus Terminal setting up a two-level jump-host chain — access switch reached through an NMS host, which is itself reached through a bastion — then authenticating each hop in turn and opening a shell on the switch](media/demo-jump-host.gif)
 
 ## Who it's for
 
