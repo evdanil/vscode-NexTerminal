@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.79] — 2026-08-06
+
+### Security
+
+- **Dependency updates close advisories in the SSH proxy path and in the packaging toolchain.** `ip-address` (10.2.0 → 10.4.0) is the only one of these that ships inside the extension — it reaches the bundle through `socks`, which handles SOCKS proxying for SSH connections. The rest are build-time only and never leave the repository: `undici` (7.28.0 → 7.29.0) and `fast-uri` (3.1.4 → 3.1.5) arrive via `@vscode/vsce`, and `brace-expansion` (5.0.7 → 5.0.9) fixes two high-severity denial-of-service advisories in the glob matcher `vsce` uses while packaging. No extension code changed; `npm audit` now reports no vulnerabilities in either the runtime or the development tree.
+
 ## [2.8.78] — 2026-08-01
 
 ### Changed
