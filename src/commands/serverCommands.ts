@@ -30,6 +30,7 @@ import { formatAuthProfileLabel, formatKeyPathDisplayName, normalizeKeyPathForCo
 import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
+import { configMutationLock } from "../services/configMutationLock";
 
 async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -1034,8 +1035,27 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // next sync sees an unowned server squatting on the deterministic id and
           // skips the device forever (id-collision guard in syncEngine.ts).
           const updated = existing.origin !== undefined ? { ...linked, origin: existing.origin } : linked;
-          await ctx.core.addOrUpdateServer(updated);
-          await syncProxyPasswordSecret(ctx, updated.id, values);
+          // FINDING 2 (P2, edit-race review) — the record persist and the
+          // proxy-secret sync must commit as ONE generation with respect to
+          // captureBackupStateForExport (configCommands.ts), which reads a
+          // fresh server snapshot AND every server's proxy-password secret
+          // together inside this SAME configMutationLock. Previously these
+          // two awaits ran unlocked back-to-back: a backup capture landing
+          // between them could pair this edit's NEW server record (new
+          // proxy host/port/type) with the OLD proxy password still sitting
+          // in the vault (capture runs first, reads pre-edit vault value,
+          // edit's addOrUpdateServer already committed) — or the reverse,
+          // pairing the OLD record with a NEW password if the capture's
+          // server-snapshot read lands before this addOrUpdateServer but its
+          // vault.get for this server's proxy password lands after
+          // syncProxyPasswordSecret. Both are torn pairs. Nothing below this
+          // point shows UI — see the lock's own contract — the info message
+          // just after is fire-and-forget (`void`, never awaited) and stays
+          // outside the lock regardless.
+          await configMutationLock.runExclusive(async () => {
+            await ctx.core.addOrUpdateServer(updated);
+            await syncProxyPasswordSecret(ctx, updated.id, values);
+          });
           if (ctx.core.isServerConnected(existing.id)) {
             void vscode.window.showInformationMessage(
               "Server profile updated. Existing sessions keep current connection settings until reconnect."

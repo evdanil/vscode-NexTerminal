@@ -5,6 +5,7 @@ import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, LocalShellProfileTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
+import { configMutationLock } from "../services/configMutationLock";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
 import { formValuesToLocalShell, getConfiguredVscodeTerminalProfileNames } from "./localShellCommands";
 import type { CommandContext } from "./types";
@@ -73,8 +74,18 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         if (!server) {
           return;
         }
-        await ctx.core.addOrUpdateServer(server);
-        await syncProxyPasswordSecret(ctx, server.id, values);
+        // FINDING 2 (P2, edit-race review, sibling) — same record+secret
+        // pairing as nexus.server.edit (serverCommands.ts), for the
+        // add/create path: addOrUpdateServer and syncProxyPasswordSecret
+        // must commit as one generation against captureBackupStateForExport,
+        // which reads server records + proxy-password secrets together
+        // under this SAME configMutationLock — see the edit-path comment in
+        // serverCommands.ts for the full torn-pair scenario. No UI runs
+        // inside this span.
+        await configMutationLock.runExclusive(async () => {
+          await ctx.core.addOrUpdateServer(server);
+          await syncProxyPasswordSecret(ctx, server.id, values);
+        });
       }
     },
     onBrowse: browseForKey,

@@ -499,6 +499,47 @@ describe("inventoryCommands", () => {
       expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("old-tok");
     });
 
+    it("FINDING 1 (P2, rollback-classification review) — a field declared in secretFieldIds but ACTUALLY ABSENT from the vault (declared-but-absent) is classified as newly-written by actual vault state, so a persist rejection deletes the re-entered value instead of leaving it stuck (kills declared-means-existing classification)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider(); // host (string) + apiToken (password, required)
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      // secretFieldIds DECLARES apiToken as existing, but the vault key was
+      // never actually stored — e.g. after a restore that warned about a
+      // missing credential. This is the "declared-but-absent" case.
+      await core.addOrUpdateInventorySource(
+        makeSource({ targetFolder: "Infra", config: { host: "netbox.local" }, secretFieldIds: ["apiToken"] })
+      );
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBeUndefined();
+
+      vi.spyOn(core, "addOrUpdateInventorySource").mockRejectedValueOnce(new Error("disk full"));
+
+      mockShowInputBox
+        .mockResolvedValueOnce("My Source") // name
+        .mockResolvedValueOnce("Infra") // targetFolder
+        .mockResolvedValueOnce("admin") // defaultUsername
+        .mockResolvedValueOnce("netbox.local") // host
+        .mockResolvedValueOnce("new-tok"); // apiToken re-entered — vault had nothing to overwrite
+      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
+
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd();
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("was not applied"));
+
+      // If the fix were reverted (classification by secretFieldIds
+      // membership instead of actual vault.get result), apiToken would be
+      // classified "existing" — captured nothing to restore (correct) AND
+      // never pushed to newlyWrittenFieldIds (incorrect) — so the freshly
+      // stored "new-tok" would survive the rollback undeleted. The fix must
+      // delete it, restoring the true pre-edit absence.
+      expect(vault.delete).toHaveBeenCalledWith(inventorySecretKey("src-1", "apiToken"));
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBeUndefined();
+    });
+
     it("ITEM 3 — a second field's store rejecting mid-loop (persist never even attempted) rolls back the earlier field's overwritten value and the later field's brand-new key (kills partial-edit-write)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();

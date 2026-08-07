@@ -67,6 +67,7 @@ vi.mock("../../src/commands/inlineAuthProfileCreation", () => ({
 
 import { openUnifiedForm, registerProfileCommands } from "../../src/commands/profileCommands";
 import { LocalShellProfileTreeItem } from "../../src/ui/nexusTreeProvider";
+import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 
 function makeCtx() {
   return {
@@ -201,5 +202,106 @@ describe("openUnifiedForm test action", () => {
     expect(picks.map((pick) => pick.label)).toContain("Open and Run Script");
     expect(picks.map((pick) => pick.label)).not.toContain("Test Connection");
     expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.localShell.runWithScript", item);
+  });
+});
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+describe("openUnifiedForm SSH submit — record+secret mutation locking (FINDING 2, P2 sibling)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetConfiguration.mockReturnValue({
+      get: vi.fn((_key: string, fallback: unknown) => fallback)
+    });
+    mockShowQuickPick.mockReset();
+    mockWebviewOpen.mockReturnValue({ dispose: vi.fn() });
+    mockFormValuesToServer.mockReturnValue({ id: "srv-1" });
+  });
+
+  it("queues the add/create SSH submit's addOrUpdateServer+syncProxyPasswordSecret pair behind an in-flight locked backup capture, so the captured record and secret are a consistent pre-submit pair (kills the unlocked add-path sibling of the nexus.server.edit race)", async () => {
+    const events: string[] = [];
+    const ctx = {
+      core: {
+        getSnapshot: vi.fn(() => ({ servers: [], authProfiles: [] })),
+        getAuthProfile: vi.fn(),
+        addOrUpdateServer: vi.fn(async () => {
+          events.push("addOrUpdateServer");
+        }),
+        addOrUpdateSerialProfile: vi.fn(),
+        addOrUpdateLocalShellProfile: vi.fn()
+      }
+    } as any;
+    mockSyncProxyPasswordSecret.mockImplementation(async () => {
+      events.push("syncProxyPasswordSecret");
+    });
+
+    // Same call-ordering spy as test/unit/configMutationLockRace.test.ts and
+    // the sibling test in test/unit/serverCommands.test.ts — logs when each
+    // acquirer's body actually starts/finishes RUNNING against the REAL
+    // AsyncMutex, not a bypassed test double.
+    const labels = ["capture", "submit"];
+    let nextLabel = 0;
+    const realRunExclusive = AsyncMutex.prototype.runExclusive;
+    vi.spyOn(configMutationLock, "runExclusive").mockImplementation(function (
+      this: AsyncMutex,
+      fn: () => Promise<unknown>
+    ) {
+      const label = labels[nextLabel] ?? `call-${nextLabel}`;
+      nextLabel++;
+      return realRunExclusive.call(this, async () => {
+        events.push(`${label}:start`);
+        try {
+          return await fn();
+        } finally {
+          events.push(`${label}:end`);
+        }
+      });
+    } as typeof configMutationLock.runExclusive);
+
+    // Stand-in for captureBackupStateForExport's locked span — acquires the
+    // lock first and blocks (gated) before its body would resolve.
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const capturePromise = configMutationLock.runExclusive(async () => {
+      await gate;
+      return "captured";
+    });
+
+    await delay(10);
+    expect(events).toEqual(["capture:start"]);
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+    const submitPromise = onSubmit({ profileType: "ssh", name: "Server", host: "example.com", username: "me" });
+
+    // Give onSubmit's UI-free body time to reach its own
+    // configMutationLock.runExclusive call — it must queue there, not run
+    // addOrUpdateServer/syncProxyPasswordSecret ahead of the in-flight capture.
+    await delay(10);
+    expect(events).toEqual(["capture:start"]);
+
+    releaseGate();
+    await capturePromise;
+    await submitPromise;
+
+    // The submit's record write and its proxy-secret sync only ran AFTER
+    // the capture's locked span fully finished, and ran back-to-back as one
+    // generation within the same lock acquisition. If FINDING 2's fix were
+    // reverted (this call site left unlocked), "addOrUpdateServer" and
+    // "syncProxyPasswordSecret" would appear immediately after
+    // "capture:start" — well before "capture:end" — since nothing would
+    // make the submit wait for the capture's lock at all.
+    expect(events).toEqual([
+      "capture:start",
+      "capture:end",
+      "submit:start",
+      "addOrUpdateServer",
+      "syncProxyPasswordSecret",
+      "submit:end"
+    ]);
   });
 });

@@ -592,6 +592,20 @@ export function registerInventoryCommands(
         // overwrite, so a failed persist below can put it back — the previous
         // rollback only deleted newly-added keys, leaving an overwritten token
         // stuck at its new value even though the source record reverted to old.
+        // FINDING 1 (P2, rollback-classification review) — the split between
+        // "newly-written" and "overwritten" is decided by what vault.get
+        // ACTUALLY returned for this field, never by secretFieldIds
+        // membership. A field can be listed in the old secretFieldIds while
+        // the vault key itself is missing (e.g. a restore that warned about
+        // an absent credential) — declared-but-absent. Classifying that case
+        // as "existing" (the old `existingSecretFieldIds.has(fieldId)` check)
+        // meant a rollback below neither restored it (nothing was captured,
+        // correctly) NOR deleted it (it was never pushed to
+        // newlyWrittenFieldIds, incorrectly) — the freshly-entered credential
+        // would survive a reported-failed update. previousValue === undefined
+        // now always means "treat as newly-written, delete on rollback";
+        // previousValue !== undefined always means "treat as overwritten,
+        // restore on rollback" — regardless of what secretFieldIds says.
         const newlyWrittenFieldIds: string[] = [];
         const overwrittenPreviousValues = new Map<string, string>();
 
@@ -619,14 +633,13 @@ export function registerInventoryCommands(
 
         try {
           for (const [fieldId, value] of Object.entries(reenteredSecrets)) {
-            if (existingSecretFieldIds.has(fieldId)) {
-              const previousValue = await vault.get(inventorySecretKey(source.id, fieldId));
-              if (previousValue !== undefined) {
-                overwrittenPreviousValues.set(fieldId, previousValue);
-              }
-            }
+            // Classify by actual vault state, not by secretFieldIds
+            // membership — see FINDING 1 comment above the declarations.
+            const previousValue = await vault.get(inventorySecretKey(source.id, fieldId));
             await vault.store(inventorySecretKey(source.id, fieldId), value);
-            if (!existingSecretFieldIds.has(fieldId)) {
+            if (previousValue !== undefined) {
+              overwrittenPreviousValues.set(fieldId, previousValue);
+            } else {
               newlyWrittenFieldIds.push(fieldId);
             }
           }

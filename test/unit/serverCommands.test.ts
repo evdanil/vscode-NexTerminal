@@ -15,6 +15,7 @@ import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { SshPty } from "../../src/services/ssh/sshPty";
+import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
@@ -1781,5 +1782,138 @@ describe("nexus.server.edit — origin preservation (P1)", () => {
 
     const saved = addOrUpdateServer.mock.calls[0][0] as ServerConfig;
     expect(saved.origin).toBeUndefined();
+  });
+});
+
+describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  async function submitEdit(
+    ctx: CommandContext,
+    values: Record<string, unknown>
+  ): Promise<void> {
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+    await options.onSubmit(values);
+  }
+
+  function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  it("queues nexus.server.edit's record+proxy-secret mutation behind an in-flight locked backup capture, so the captured server record and its proxy password are a consistent pre-edit pair (kills the unlocked torn pair: new proxy config paired with the old proxy password, or the reverse)", async () => {
+    const { ctx, addOrUpdateServer, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()],
+      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+    });
+
+    // Same call-ordering spy as test/unit/configMutationLockRace.test.ts —
+    // logs when each acquirer's body actually starts/finishes RUNNING
+    // (not merely when it's called) while still delegating to the real
+    // AsyncMutex, so this exercises the genuine production lock, not a
+    // test double.
+    const events: string[] = [];
+    const labels = ["capture", "edit"];
+    let nextLabel = 0;
+    const realRunExclusive = AsyncMutex.prototype.runExclusive;
+    vi.spyOn(configMutationLock, "runExclusive").mockImplementation(function (
+      this: AsyncMutex,
+      fn: () => Promise<unknown>
+    ) {
+      const label = labels[nextLabel] ?? `call-${nextLabel}`;
+      nextLabel++;
+      return realRunExclusive.call(this, async () => {
+        events.push(`${label}:start`);
+        try {
+          return await fn();
+        } finally {
+          events.push(`${label}:end`);
+        }
+      });
+    } as typeof configMutationLock.runExclusive);
+
+    // Stand-in for captureBackupStateForExport's own locked span (see
+    // configCommands.ts): takes a fresh server snapshot immediately on
+    // acquiring the lock, THEN reads that server's proxy-password secret —
+    // gated here so the test controls exactly when the read happens.
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const capturePromise = configMutationLock.runExclusive(async () => {
+      const server = ctx.core.getServer("srv-1")!;
+      await gate;
+      const proxyPw = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+      return { server, proxyPw };
+    });
+
+    await delay(10);
+    expect(events).toEqual(["capture:start"]);
+
+    // Start a full nexus.server.edit submit — new proxy config AND a
+    // rotated proxy password — while the capture is still mid-flight
+    // (blocked on the gate).
+    const editPromise = submitEdit(ctx, {
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "socks5",
+      proxySocks5Host: "proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: "proxyuser",
+      proxySocks5Password: "new-proxy-pw"
+    });
+
+    // Give the edit's UI-free onSubmit body time to reach its own
+    // configMutationLock.runExclusive call — it must queue there, not run
+    // its record+secret writes ahead of the still-in-flight capture.
+    await delay(10);
+    expect(events).toEqual(["capture:start"]);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+    expect(secretStore).not.toHaveBeenCalled();
+
+    // Release the capture's gated read — its critical section can now
+    // finish and hand the lock to the queued edit.
+    releaseGate();
+    const captured = await capturePromise;
+    await editPromise;
+
+    expect(events).toEqual(["capture:start", "capture:end", "edit:start", "edit:end"]);
+
+    // The captured pair is CONSISTENT: the server record captured is the
+    // PRE-edit one (no proxy config yet), and the secret captured alongside
+    // it is that SAME pre-edit generation's password ("old-proxy-pw") —
+    // never the pre-edit record paired with the rotated password. If
+    // FINDING 2's fix were reverted (addOrUpdateServer + syncProxyPasswordSecret
+    // run unlocked, back-to-back, outside configMutationLock), the edit
+    // would run to completion immediately after being invoked — well
+    // before the capture's gate is ever released — so by the time the
+    // gate opens and the capture finally reads the vault, it would read
+    // back "new-proxy-pw" instead: a torn pair this assertion catches.
+    expect(captured.server.proxy).toBeUndefined();
+    expect(captured.proxyPw).toBe("old-proxy-pw");
+
+    // The edit itself was never blocked forever — once the lock freed up
+    // it proceeded and took effect: record and secret both reflect the
+    // new generation.
+    const saved = addOrUpdateServer.mock.calls[0][0] as ServerConfig;
+    expect(saved.proxy).toEqual({ type: "socks5", host: "proxy.example.com", port: 1080, username: "proxyuser" });
+    expect(secretStore).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"), "new-proxy-pw");
   });
 });
