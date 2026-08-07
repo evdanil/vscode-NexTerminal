@@ -1367,17 +1367,39 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // and the confirmation modal has already settled, so nothing
       // interactive runs inside this span — only disconnect/teardown,
       // tunnel stops, vault deletions, and the final core.removeServer.
+      //
+      // FINDING (P1, remove-lock-picker-fallback review) — `server` was
+      // resolved BEFORE the confirmation modal and before waiting to
+      // acquire this very lock; either wait can be arbitrarily long, and a
+      // concurrent flow (inventory sync, another remove) can delete this
+      // same record in the meantime. The lock body used to call
+      // disconnectServer(ctx, server.id) first thing, whose fallback
+      // resolves the id through toServerFromArg -> core.getServer — if the
+      // record is already gone that resolves to undefined and
+      // disconnectServer falls through to an INTERACTIVE pickServer
+      // quickpick, opened while HOLDING configMutationLock (blocking every
+      // other mutation in the app) and risking disconnecting an unrelated
+      // server the user happens to pick. Re-check presence as the very
+      // first thing inside the lock and bail out with an info message if
+      // the record is already gone — nothing left to remove. Teardown
+      // itself now goes through teardownServerRuntime(ctx, server.id), the
+      // id-only, never-prompting variant (see its own doc comment) that
+      // already disposes this server's terminals, stops ALL of its active
+      // tunnels unconditionally, and disconnects the pooled SSH connection
+      // — the exact same three effects the old disconnectServer() call
+      // plus this span's own duplicate tunnel-stop/sshPool.disconnect lines
+      // produced between them, now performed exactly once.
       await configMutationLock.runExclusive(async () => {
-        await disconnectServer(ctx, server.id);
+        if (!ctx.core.getServer(server.id)) {
+          void vscode.window.showInformationMessage(`Server "${server.name}" was already removed.`);
+          return;
+        }
+        await teardownServerRuntime(ctx, server.id);
         if (ctx.secretVault) {
           await ctx.secretVault.delete(passwordSecretKey(server.id));
           await ctx.secretVault.delete(passphraseSecretKey(server.id));
           await ctx.secretVault.delete(proxyPasswordSecretKey(server.id));
         }
-        // Stop ALL tunnels when server profile is deleted, regardless of autoStop
-        const remaining = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === server.id);
-        await Promise.all(remaining.map((t) => ctx.tunnelManager.stop(t.id)));
-        ctx.sshPool.disconnect(server.id);
         await ctx.core.removeServer(server.id);
       });
     }),

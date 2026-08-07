@@ -493,10 +493,10 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).toHaveBeenCalledWith("srv-1");
   });
 
-  it("remove command stops all remaining tunnels and disconnects pool", async () => {
+  it("remove command stops all remaining tunnels, disconnects pool, and disposes terminals via teardownServerRuntime", async () => {
     const autoStopProfile = makeTunnel({ id: "tp-stop", autoStop: true });
     const keepProfile = makeTunnel({ id: "tp-keep", autoStop: false });
-    const { ctx, stopTunnel, disconnectPool, removeServer, secretDelete } = setupHarness({
+    const { ctx, stopTunnel, disconnectPool, removeServer, secretDelete, terminalDispose } = setupHarness({
       profiles: [autoStopProfile, keepProfile],
       activeTunnels: [
         { id: "at-stop", profileId: "tp-stop", serverId: "srv-1" },
@@ -510,6 +510,10 @@ describe("server disconnect with tunnel autoStop", () => {
 
     await removeCmd!("srv-1");
 
+    // Terminal disposal is now covered by teardownServerRuntime rather than
+    // the old disconnectServer() call — assert it still happens so the
+    // replacement doesn't silently drop terminal cleanup on remove.
+    expect(terminalDispose).toHaveBeenCalled();
     expect(stopTunnel).toHaveBeenCalledTimes(2);
     expect(stopTunnel).toHaveBeenCalledWith("at-stop");
     expect(stopTunnel).toHaveBeenCalledWith("at-keep");
@@ -519,6 +523,48 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
+  });
+
+  it("(P1, remove-lock-picker-fallback fix) remove command re-checks server presence inside the lock and bails out with an info message — never falls through to an interactive picker or performs any teardown/vault/removal work — when the record was deleted while the confirmation modal or the lock wait was pending", async () => {
+    const { ctx, stopTunnel, disconnectPool, removeServer, secretDelete, terminalDispose } = setupHarness({
+      profiles: [],
+      activeTunnels: []
+    });
+
+    registerServerCommands(ctx);
+    const removeCmd = registeredCommands.get("nexus.server.remove");
+    expect(removeCmd).toBeDefined();
+
+    // Simulate the record having been removed (e.g. by a concurrent
+    // inventory sync or another remove) sometime between the initial
+    // arg-resolution / confirmation modal and this call's lock acquisition:
+    // the FIRST core.getServer lookup (arg resolution, before the
+    // confirmation modal) still finds the record, but by the time the
+    // locked span's presence re-check runs (the second lookup), the record
+    // is gone.
+    let getServerCalls = 0;
+    (ctx.core.getServer as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      getServerCalls++;
+      return getServerCalls === 1 && id === "srv-1" ? makeServer() : undefined;
+    });
+
+    await removeCmd!("srv-1");
+
+    // If the fix under test were reverted (the span went straight to
+    // disconnectServer/teardown without re-checking presence), this would
+    // still call ctx.sshPool.disconnect / stopTunnel / secretDelete /
+    // removeServer and — for the real disconnectServer implementation —
+    // fall through to an interactive pickServer prompt while still holding
+    // configMutationLock. None of that may happen here.
+    expect(terminalDispose).not.toHaveBeenCalled();
+    expect(stopTunnel).not.toHaveBeenCalled();
+    expect(disconnectPool).not.toHaveBeenCalled();
+    expect(secretDelete).not.toHaveBeenCalled();
+    expect(removeServer).not.toHaveBeenCalled();
+    expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
+      expect.stringContaining("already removed")
+    );
   });
 
   it("clears File Explorer auto-open on duplicated server profiles", async () => {
