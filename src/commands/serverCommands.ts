@@ -935,6 +935,24 @@ async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<voi
   }
 }
 
+/**
+ * F1 — server runtime teardown extracted from nexus.server.remove's own sequence
+ * (below) so extension.ts can hand the exact same logic to
+ * registerInventoryCommands as its `teardownServerRuntime` dependency: disconnect
+ * terminals/sessions, stop every active tunnel routed through the server
+ * (unconditionally — unlike disconnectServer's auto-stop-only tunnels), then
+ * disconnect the pooled SSH connection. Does NOT touch saved secrets or the
+ * server record itself — those stay the caller's job (nexus.server.remove
+ * deletes both after this; inventory sync/removeSource delete vault secrets
+ * separately and let applyInventorySyncPlan drop the server record).
+ */
+export async function teardownServerRuntime(ctx: CommandContext, serverId: string): Promise<void> {
+  await disconnectServer(ctx, serverId);
+  const remaining = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === serverId);
+  await Promise.all(remaining.map((t) => ctx.tunnelManager.stop(t.id)));
+  ctx.sshPool.disconnect(serverId);
+}
+
 export function registerServerCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.server.add", () => {
@@ -1032,7 +1050,10 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!server) {
         return;
       }
-      const copy = { ...server, id: randomUUID(), name: `${server.name} (copy)`, openFileExplorerOnFirstConnect: undefined };
+      // F6 — a duplicate of a synced server is a manual server: keeping `origin`
+      // would make the copy compete with the original for the SAME deterministic
+      // id on the next sync (both share externalId, but only one id can win it).
+      const copy = { ...server, id: randomUUID(), name: `${server.name} (copy)`, openFileExplorerOnFirstConnect: undefined, origin: undefined };
       await ctx.core.addOrUpdateServer(copy);
     }),
 

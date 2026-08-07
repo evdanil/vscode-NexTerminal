@@ -529,6 +529,28 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(item.description).toContain("Waiting for port");
     expect(item.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Expanded);
   });
+
+  it("B5 — a synced server gets a '· synced' description suffix and tooltip line, but contextValue is UNCHANGED (load-bearing: package.json's context menus match it verbatim)", () => {
+    const synced = makeServer({ id: "s1", origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 } });
+    const manual = makeServer({ id: "s2" });
+
+    const syncedItem = new ServerTreeItem(synced, false);
+    const manualItem = new ServerTreeItem(manual, false);
+    const syncedConnected = new ServerTreeItem(synced, true);
+
+    expect(syncedItem.description).toBe("dev@example.com · synced");
+    expect(manualItem.description).toBe("dev@example.com");
+    expect(syncedItem.tooltip).toContain("Synced from inventory");
+    expect(manualItem.tooltip).not.toContain("Synced from inventory");
+
+    // The load-bearing assertion: a synced server's contextValue must match
+    // exactly what an ordinary server's does (package.json's menus key off
+    // "nexus.server" / "nexus.serverConnected" verbatim) — a distinct value
+    // here would silently drop every context-menu entry for synced servers.
+    expect(syncedItem.contextValue).toBe("nexus.server");
+    expect(syncedItem.contextValue).toBe(manualItem.contextValue);
+    expect(syncedConnected.contextValue).toBe("nexus.serverConnected");
+  });
 });
 
 describe("NexusTreeProvider getParent", () => {

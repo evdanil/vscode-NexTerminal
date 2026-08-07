@@ -135,6 +135,7 @@ import { getAssignedBinding } from "../../src/macroBindingHelpers";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
+import { inventorySecretKey, type InventorySourceConfig } from "../../src/models/inventory";
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
@@ -211,6 +212,20 @@ function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
     name: "Prod Auth",
     username: "deploy",
     authType: "password",
+    ...overrides
+  };
+}
+
+function makeInventorySource(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
+  return {
+    id: "src1",
+    providerId: "netbox",
+    name: "NetBox",
+    targetFolder: "NetBox",
+    prunePolicy: "orphan",
+    defaultUsername: "admin",
+    config: { baseUrl: "https://netbox.example.com" },
+    secretFieldIds: ["apiToken"],
     ...overrides
   };
 }
@@ -295,6 +310,11 @@ describe("isValidExport", () => {
   it("rejects invalid profile array types", () => {
     expect(isValidExport({ version: 1, servers: {} })).toBe(false);
     expect(isValidExport({ version: 1, authProfiles: "bad" })).toBe(false);
+  });
+
+  it("accepts a valid inventorySources array and rejects a non-array inventorySources (B6 guard)", () => {
+    expect(isValidExport(makeExportData({ inventorySources: [makeInventorySource()] }))).toBe(true);
+    expect(isValidExport(makeExportData({ inventorySources: "not-an-array" }))).toBe(false);
   });
 });
 
@@ -4354,6 +4374,36 @@ describe("share export round-trip", () => {
     expect(snapshot.servers[0].authProfileId).toBe(snapshot.authProfiles[0].id);
     expect(snapshot.servers[0].authProfileId).not.toBe("ap1");
   });
+
+  it("B6 — share export carries NO inventorySources key and strips origin from every server (fixture server WITH origin)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const sourceRepo = new InMemoryConfigRepository();
+    const sourceCore = new NexusCore(sourceRepo);
+    await sourceCore.initialize();
+    await sourceCore.addOrUpdateInventorySource(makeInventorySource());
+    await sourceCore.addOrUpdateServer(
+      makeServer({ id: "s1", origin: { sourceId: "src1", externalId: "device:1", syncedAt: 1000 } })
+    );
+
+    registerConfigCommands(sourceCore, vault);
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/share.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+
+    await registeredCommands.get("nexus.config.export")!();
+
+    const exported = JSON.parse(exportedJson);
+    expect(exported.inventorySources).toBeUndefined();
+    expect(exported.servers).toHaveLength(1);
+    expect(exported.servers[0].origin).toBeUndefined();
+  });
 });
 
 describe("backup export round-trip", () => {
@@ -4592,5 +4642,107 @@ describe("backup export round-trip", () => {
     const snapshot = core.getSnapshot();
     expect(snapshot.servers).toHaveLength(1);
     expect(snapshot.servers[0].authProfileId).toBeUndefined();
+  });
+
+  it("B6 — backup export then import round-trips inventory sources AND their vault secrets under exact keys", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const sourceRepo = new InMemoryConfigRepository();
+    const sourceCore = new NexusCore(sourceRepo);
+    await sourceCore.initialize();
+    await sourceCore.addOrUpdateInventorySource(makeInventorySource());
+    await vault.store(inventorySecretKey("src1", "apiToken"), "super-secret-token");
+
+    registerConfigCommands(sourceCore, vault);
+
+    mockShowInputBox
+      .mockResolvedValueOnce("masterpass1")
+      .mockResolvedValueOnce("masterpass1");
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+
+    await registeredCommands.get("nexus.config.export.backup")!();
+
+    const exported = JSON.parse(exportedJson);
+    expect(exported.inventorySources).toHaveLength(1);
+    expect(exported.inventorySources[0].id).toBe("src1");
+    // Secrets must NOT sit in cleartext next to the source record.
+    expect(JSON.stringify(exported)).not.toContain("super-secret-token");
+
+    vault.clear();
+    configStore.clear();
+    registeredCommands.clear();
+
+    const destRepo = new InMemoryConfigRepository();
+    const destCore = new NexusCore(destRepo);
+    await destCore.initialize();
+    registerConfigCommands(destCore, vault);
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(exportedJson, "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowInputBox.mockResolvedValueOnce("masterpass1");
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = destCore.getSnapshot();
+    expect(snapshot.inventorySources).toHaveLength(1);
+    expect(snapshot.inventorySources[0].id).toBe("src1");
+    expect(snapshot.inventorySources[0].name).toBe("NetBox");
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("super-secret-token");
+  });
+
+  it("F12/F14 — merge-mode import does NOT overwrite a locally-existing inventory source with the same id; replace mode does", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeInventorySource({ name: "Local Name (edited locally)" }));
+    registerConfigCommands(core, vault);
+
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ name: "Incoming Name From Backup" })]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    // Merge: the local source (same id) is untouched — a real merge, not a silent overwrite.
+    expect(core.getInventorySource("src1")?.name).toBe("Local Name (edited locally)");
+
+    // Now replace mode: the local source IS gone and the incoming one lands.
+    registeredCommands.clear();
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    registerConfigCommands(core, vault);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")?.name).toBe("Incoming Name From Backup");
   });
 });

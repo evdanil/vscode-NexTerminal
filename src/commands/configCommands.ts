@@ -4,6 +4,8 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
+import type { InventorySourceConfig } from "../models/inventory";
+import { inventorySecretKey } from "../models/inventory";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
@@ -29,7 +31,7 @@ import {
   type SecureCrtFileEntry
 } from "../utils/securecrtParser";
 import { sniffImportFormat, type SniffedFormat } from "../utils/importFormatSniffer";
-import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateLocalShellProfile } from "../utils/validation";
+import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateLocalShellProfile, validateInventorySource } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import {
   VALID_MACRO_TRIGGER_SCOPES,
@@ -78,6 +80,8 @@ interface NexusConfigExport {
   serialProfiles?: SerialProfile[];
   localShellProfiles?: LocalShellProfile[];
   authProfiles?: AuthProfile[];
+  /** Backup-only (§B6) — never present on a share export; secrets live under `encryptedSecrets.inventorySourceSecrets`. */
+  inventorySources?: InventorySourceConfig[];
   groups?: string[];
   macros?: TerminalMacro[]; // Non-secret fields; secret macros carry `text: ""`
   /** Explicit macro folders (`nexus.macros.folders`, §4.1) — carried exactly as `groups` is. */
@@ -471,6 +475,9 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
   if (obj.macroFolders !== undefined && !Array.isArray(obj.macroFolders)) {
     return false;
   }
+  if (obj.inventorySources !== undefined && !Array.isArray(obj.inventorySources)) {
+    return false;
+  }
   if (
     obj.settings !== undefined &&
     (typeof obj.settings !== "object" || obj.settings === null || Array.isArray(obj.settings))
@@ -601,7 +608,10 @@ export function sanitizeForSharing(
   const newServers = servers.map((s) => {
     const newId = idMap.get(s.id)!;
     const newAuthProfileId = s.authProfileId ? idMap.get(s.authProfileId) : undefined;
-    return { ...s, id: newId, username: "user", keyPath: "", proxy: remapProxy(s.proxy, idMap), authProfileId: newAuthProfileId };
+    // §B6 — a share export travels to another person/machine; a synced-server marker
+    // (sourceId/externalId) names an inventory source that only exists locally and
+    // would be meaningless (and misleading) on the receiving end.
+    return { ...s, id: newId, username: "user", keyPath: "", proxy: remapProxy(s.proxy, idMap), authProfileId: newAuthProfileId, origin: undefined };
   });
 
   const newTunnels = tunnels.map((t) => {
@@ -982,6 +992,28 @@ function pluralizeNoun(noun: string, count: number): string {
   return count === 1 ? noun : `${noun}s`;
 }
 
+/**
+ * Most frequently used username among existing servers, or "" if there are none.
+ * F20 — exported (not duplicated) so inventoryCommands.ts's addSource default-username
+ * prefill shares this exact logic with the CSV/host-list importer's own prefill.
+ */
+export function mostCommonUsername(servers: ServerConfig[]): string {
+  const counts = new Map<string, number>();
+  for (const server of servers) {
+    if (!server.username) continue;
+    counts.set(server.username, (counts.get(server.username) ?? 0) + 1);
+  }
+  let best = "";
+  let bestCount = 0;
+  for (const [username, count] of counts) {
+    if (count > bestCount) {
+      best = username;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
 export function registerConfigCommands(core: NexusCore, vault: SecretVault, context?: import("vscode").ExtensionContext): vscode.Disposable[] {
   async function exportBackup(): Promise<void> {
     const masterPassword = await promptMasterPassword();
@@ -1000,6 +1032,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           proxyPasswords: {},
           authProfilePasswords: {},
           authProfilePassphrases: {},
+          inventorySourceSecrets: {},
           secretMacros: [],
           fileBackups: []
         };
@@ -1008,6 +1041,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         const proxyPasswords = secrets.proxyPasswords as Record<string, string>;
         const authProfilePasswords = secrets.authProfilePasswords as Record<string, string>;
         const authProfilePassphrases = secrets.authProfilePassphrases as Record<string, string>;
+        const inventorySourceSecrets = secrets.inventorySourceSecrets as Record<string, Record<string, string>>;
         for (const server of snapshot.servers) {
           const pw = await vault.get(passwordSecretKey(server.id));
           if (pw) passwords[server.id] = pw;
@@ -1021,6 +1055,14 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           if (pw) authProfilePasswords[profile.id] = pw;
           const pp = await vault.get(authProfilePassphraseSecretKey(profile.id));
           if (pp) authProfilePassphrases[profile.id] = pp;
+        }
+        for (const source of snapshot.inventorySources) {
+          const fields: Record<string, string> = {};
+          for (const fieldId of source.secretFieldIds) {
+            const value = await vault.get(inventorySecretKey(source.id, fieldId));
+            if (value) fields[fieldId] = value;
+          }
+          if (Object.keys(fields).length > 0) inventorySourceSecrets[source.id] = fields;
         }
 
         // Collect all macros from the store
@@ -1050,6 +1092,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           serialProfiles: snapshot.serialProfiles,
           localShellProfiles: snapshot.localShellProfiles,
           authProfiles: snapshot.authProfiles,
+          inventorySources: snapshot.inventorySources,
           groups: snapshot.explicitGroups,
           macros: nonSecretForTopLevel,
           macroFolders: getMacroFolders(),
@@ -1425,26 +1468,39 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       for (const group of snapshot.explicitGroups) {
         await core.removeExplicitGroup(group);
       }
+      // F18-adjacent ordering: wipe each source's vault secrets before dropping the
+      // source record itself, same as every other replace-mode secret cleanup above.
+      for (const source of snapshot.inventorySources) {
+        for (const fieldId of source.secretFieldIds) {
+          await vault.delete(inventorySecretKey(source.id, fieldId));
+        }
+        await core.removeInventorySource(source.id);
+      }
     }
 
+    // F14 — merge mode: existing inventory source ids join the existing-id set so
+    // importPreservingIds skips them (a local source is never silently overwritten
+    // by a same-id source from the file); replace mode already cleared them above.
     const existingIds = mode === "merge"
       ? new Set([
           ...snapshot.servers.map((s) => s.id),
           ...snapshot.tunnels.map((t) => t.id),
           ...snapshot.serialProfiles.map((p) => p.id),
           ...snapshot.localShellProfiles.map((p) => p.id),
-          ...snapshot.authProfiles.map((p) => p.id)
+          ...snapshot.authProfiles.map((p) => p.id),
+          ...snapshot.inventorySources.map((s) => s.id)
         ])
       : new Set<string>();
 
     let imported = 0;
     let skipped = 0;
     // id-PRESERVING import (distinct from the share path's fresh-id remap): each entity keeps
-    // its id and is skipped when that id already exists. Same shape across all five buckets.
+    // its id and is skipped when that id already exists. Same shape across all six buckets.
     for (const tally of [
       await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => core.addOrUpdateServer(e)),
       await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e)),
       await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e)),
+      await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) => core.addOrUpdateInventorySource(e)),
       await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e)),
       await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e))
     ]) {
@@ -1593,6 +1649,16 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       await restoreSecrets(decryptedSecrets.proxyPasswords as Record<string, string> | undefined, proxyPasswordSecretKey, vault);
       await restoreSecrets(decryptedSecrets.authProfilePasswords as Record<string, string> | undefined, authProfilePasswordSecretKey, vault);
       await restoreSecrets(decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined, authProfilePassphraseSecretKey, vault);
+      // Nested (sourceId -> fieldId -> secret) shape, unlike the flat id->secret buckets
+      // above, so it gets its own loop rather than restoreSecrets()'s single-level keyFn.
+      const inventorySourceSecrets = decryptedSecrets.inventorySourceSecrets as Record<string, Record<string, string>> | undefined;
+      if (inventorySourceSecrets) {
+        for (const [sourceId, fields] of Object.entries(inventorySourceSecrets)) {
+          for (const [fieldId, value] of Object.entries(fields)) {
+            await vault.store(inventorySecretKey(sourceId, fieldId), value);
+          }
+        }
+      }
       fileRestoreResult = await restoreBackupFolders(decryptedSecrets, mode, context);
     }
 
@@ -1607,7 +1673,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
   async function completeReset(): Promise<void> {
     const confirm = await vscode.window.showWarningMessage(
-      "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, macros, groups, and saved passwords. This cannot be undone.",
+      "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, inventory sources, macros, groups, and saved passwords. This cannot be undone.",
       { modal: true },
       "Delete Everything"
     );
@@ -1662,6 +1728,14 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       await core.removeExplicitGroup(group);
     }
 
+    // Remove all inventory sources and their vault secrets
+    for (const source of snapshot.inventorySources) {
+      for (const fieldId of source.secretFieldIds) {
+        await vault.delete(inventorySecretKey(source.id, fieldId));
+      }
+      await core.removeInventorySource(source.id);
+    }
+
     // Clear macros (globalState + vault entries)
     await getActiveMacroStore().clearAll();
     if (context) {
@@ -1676,24 +1750,6 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     }
 
     void vscode.window.showInformationMessage("All Nexus data has been deleted.");
-  }
-
-  /** Most frequently used username among existing servers, or "" if there are none. */
-  function mostCommonUsername(servers: ServerConfig[]): string {
-    const counts = new Map<string, number>();
-    for (const server of servers) {
-      if (!server.username) continue;
-      counts.set(server.username, (counts.get(server.username) ?? 0) + 1);
-    }
-    let best = "";
-    let bestCount = 0;
-    for (const [username, count] of counts) {
-      if (count > bestCount) {
-        best = username;
-        bestCount = count;
-      }
-    }
-    return best;
   }
 
   // Shared tail for the MobaXterm / SecureCRT importers: no-sessions warning, confirm

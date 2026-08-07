@@ -423,6 +423,23 @@ describe("server disconnect with tunnel autoStop", () => {
     }));
   });
 
+  it("F6 — duplicating a synced server strips origin (a spread-copy would keep it and collide with the original on the next sync)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 } })]
+    });
+
+    registerServerCommands(ctx);
+    const duplicateCmd = registeredCommands.get("nexus.server.duplicate");
+    expect(duplicateCmd).toBeDefined();
+
+    await duplicateCmd!("srv-1");
+
+    const copy = addOrUpdateServer.mock.calls[0][0];
+    expect(copy.origin).toBeUndefined();
+  });
+
   it("group disconnect applies only to direct-folder servers and skips hidden ones", async () => {
     const { ctx, disconnectPool } = setupHarness({
       profiles: [],

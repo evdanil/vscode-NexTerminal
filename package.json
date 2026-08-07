@@ -494,6 +494,30 @@
         "category": "Nexus"
       },
       {
+        "command": "nexus.inventory.addSource",
+        "title": "Add Inventory Source (NetBox…)",
+        "category": "Nexus",
+        "icon": "$(add)"
+      },
+      {
+        "command": "nexus.inventory.editSource",
+        "title": "Edit Inventory Source",
+        "category": "Nexus",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.inventory.removeSource",
+        "title": "Remove Inventory Source",
+        "category": "Nexus",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "nexus.inventory.syncNow",
+        "title": "Sync Inventory Now",
+        "category": "Nexus",
+        "icon": "$(sync)"
+      },
+      {
         "command": "nexus.settings.fixMacroKeybindings",
         "title": "Fix Macro Keybindings",
         "category": "Nexus"
@@ -851,6 +875,11 @@
           "command": "nexus.config.import",
           "when": "view == nexusCommandCenter",
           "group": "1_manage@2"
+        },
+        {
+          "command": "nexus.inventory.syncNow",
+          "when": "view == nexusCommandCenter",
+          "group": "1_manage@3"
         },
         {
           "command": "nexus.tunnel.add",
@@ -1789,6 +1818,22 @@
         },
         {
           "command": "nexus.config.completeReset",
+          "when": "true"
+        },
+        {
+          "command": "nexus.inventory.addSource",
+          "when": "true"
+        },
+        {
+          "command": "nexus.inventory.editSource",
+          "when": "true"
+        },
+        {
+          "command": "nexus.inventory.removeSource",
+          "when": "true"
+        },
+        {
+          "command": "nexus.inventory.syncNow",
           "when": "true"
         },
         {
