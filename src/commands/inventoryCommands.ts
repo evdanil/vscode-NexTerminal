@@ -301,6 +301,40 @@ function planCountsEqual(a: InventorySyncPlan, b: InventorySyncPlan): boolean {
   );
 }
 
+function inventorySourceValuesEqual(a: InventorySourceValues, b: InventorySourceValues): boolean {
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every((key) => Object.prototype.hasOwnProperty.call(b, key) && a[key] === b[key]);
+}
+
+function secretFieldIdsEqual(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((id, i) => id === sortedB[i]);
+}
+
+/**
+ * FINDING 2 — compares exactly the InventorySourceConfig fields that feed
+ * computeSyncPlan/planToApplication (and the earlier fetchInventory call): a
+ * source record that differs on any of these must not have the tree fetched
+ * under the OLD config applied against it, even though its id still exists
+ * and the "source was removed" guard alone would let it through — e.g. a
+ * replace-mode config import can delete and recreate the same source id with
+ * an entirely different provider config while a sync is mid-flight.
+ */
+function sourceConfigUnchanged(a: InventorySourceConfig, b: InventorySourceConfig): boolean {
+  return (
+    a.providerId === b.providerId &&
+    a.targetFolder === b.targetFolder &&
+    a.prunePolicy === b.prunePolicy &&
+    a.defaultUsername === b.defaultUsername &&
+    inventorySourceValuesEqual(a.config, b.config) &&
+    secretFieldIdsEqual(a.secretFieldIds, b.secretFieldIds)
+  );
+}
+
 export function registerInventoryCommands(
   core: NexusCore,
   registry: InventoryProviderRegistry,
@@ -375,7 +409,25 @@ export function registerInventoryCommands(
     }
 
     const source: InventorySourceConfig = { id, providerId: provider.id, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds };
-    await core.addOrUpdateInventorySource(source);
+
+    // FINDING 1 — if persisting the new source record fails, the vault keys
+    // just written above have no source to be enumerated/cleaned up by, so
+    // they'd be orphaned forever. Roll them back (best-effort — a delete
+    // failure here must not mask the original persistence error) and report
+    // that the source was not created.
+    try {
+      await core.addOrUpdateInventorySource(source);
+    } catch {
+      for (const fieldId of secretFieldIds) {
+        try {
+          await vault.delete(inventorySecretKey(id, fieldId));
+        } catch {
+          // best-effort rollback — ignore
+        }
+      }
+      void vscode.window.showErrorMessage(`Could not save inventory source "${name}" — the source was not created.`);
+      return;
+    }
 
     const choice = await vscode.window.showInformationMessage(`Inventory source "${name}" added.`, "Sync Now");
     if (choice === "Sync Now") {
@@ -442,9 +494,18 @@ export function registerInventoryCommands(
 
       // F18 — vault writes first; only re-entered secrets are stored, so a blank field
       // leaves its previously saved value untouched.
+      // FINDING 1 — track which of those writes are for fields NOT already in
+      // the old secretFieldIds (i.e. brand-new secrets for this source, as
+      // opposed to an overwrite of a value that already existed). Only those
+      // are safe to roll back later — a pre-existing key's old value isn't
+      // available to restore.
+      const newlyWrittenFieldIds: string[] = [];
       try {
         for (const [fieldId, value] of Object.entries(reenteredSecrets)) {
           await vault.store(inventorySecretKey(source.id, fieldId), value);
+          if (!existingSecretFieldIds.has(fieldId)) {
+            newlyWrittenFieldIds.push(fieldId);
+          }
         }
       } catch {
         void vscode.window.showErrorMessage("Could not store credentials in the system keychain — the source was not updated.");
@@ -461,20 +522,40 @@ export function registerInventoryCommands(
         .filter((f) => f.type === "password" && (reenteredSecrets[f.id] !== undefined || existingSecretFieldIds.has(f.id)))
         .map((f) => f.id);
 
+      const updated: InventorySourceConfig = { ...source, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds: newSecretFieldIds };
+
+      // FINDING 1 — persist BEFORE any vault cleanup. If persistence rejects,
+      // the pre-existing secretFieldIds keys must be left untouched (they're
+      // still the keys the last-known-good source record points at), and any
+      // brand-new keys written above must be rolled back (best-effort — a
+      // delete failure here must not mask the original persistence error).
+      try {
+        await core.addOrUpdateInventorySource(updated);
+      } catch {
+        for (const fieldId of newlyWrittenFieldIds) {
+          try {
+            await vault.delete(inventorySecretKey(source.id, fieldId));
+          } catch {
+            // best-effort rollback — ignore
+          }
+        }
+        void vscode.window.showErrorMessage(`Could not save inventory source "${name}" — the update was not applied.`);
+        return;
+      }
+
       // FINDING 3 — vault keys for ids that were in the OLD secretFieldIds but
       // fell out of the new set (dropped from the provider schema, or simply
       // never re-stored) are orphaned: remove-source/reset/backup only walk
       // secretFieldIds, so a stale vault entry would live forever otherwise.
-      // Deleted before the updated source is persisted.
+      // Deleted only AFTER the updated source is successfully persisted —
+      // deleting them first would destroy still-referenced credentials if the
+      // persist below then failed (FINDING 1).
       const newSecretFieldIdSet = new Set(newSecretFieldIds);
       for (const staleId of source.secretFieldIds) {
         if (!newSecretFieldIdSet.has(staleId)) {
           await vault.delete(inventorySecretKey(source.id, staleId));
         }
       }
-
-      const updated: InventorySourceConfig = { ...source, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds: newSecretFieldIds };
-      await core.addOrUpdateInventorySource(updated);
 
       const folderNote = targetFolder !== source.targetFolder ? " Servers move to the new folder on the next sync." : "";
       void vscode.window.showInformationMessage(`Inventory source "${name}" updated.${folderNote}`);
@@ -648,6 +729,19 @@ export function registerInventoryCommands(
           void vscode.window.showErrorMessage("The inventory source was removed before the sync could be applied.");
           return;
         }
+
+        // FINDING 2 — `source` (captured when this sync started, and used to
+        // fetch `tree`) must still match the current record on every field
+        // that feeds the plan/apply. A presence check alone lets a
+        // delete-and-recreate race (e.g. replace-mode config import) apply
+        // the OLD fetch's tree against a NEW provider config's servers.
+        if (!sourceConfigUnchanged(source, freshSource)) {
+          void vscode.window.showErrorMessage(
+            `Inventory source "${source.name}" configuration changed while syncing — run Sync Now again.`
+          );
+          return;
+        }
+
         const recomputed = computeSyncPlan({ source: freshSource, tree, currentServers: core.getSnapshot().servers, now: Date.now() });
         if (!planCountsEqual(plan, recomputed)) {
           plan = recomputed;

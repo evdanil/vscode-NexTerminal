@@ -269,6 +269,37 @@ describe("inventoryCommands", () => {
       expect(core.getSnapshot().inventorySources).toHaveLength(0);
       expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("keychain"));
     });
+
+    it("FINDING 1 — core.addOrUpdateInventorySource rejecting after secrets were stored rolls back the vault keys just written (kills orphaned inventory-source-* secrets)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      vi.spyOn(core, "addOrUpdateInventorySource").mockRejectedValueOnce(new Error("disk full"));
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      mockShowInputBox
+        .mockResolvedValueOnce("My NetBox")
+        .mockResolvedValueOnce("Infra")
+        .mockResolvedValueOnce("admin")
+        .mockResolvedValueOnce("netbox.local")
+        .mockResolvedValueOnce("secret-token");
+      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("was not created"));
+
+      // The key stored during this run must have been deleted again — no
+      // inventory-source-* key survives for a source that was never created.
+      expect(vault.store).toHaveBeenCalledTimes(1);
+      const [storedKey] = (vault.store as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(vault.delete).toHaveBeenCalledWith(storedKey);
+      expect(await vault.get(storedKey)).toBeUndefined();
+    });
   });
 
   describe("nexus.inventory.editSource", () => {
@@ -328,6 +359,58 @@ describe("inventoryCommands", () => {
       expect(vault.delete).toHaveBeenCalledWith(inventorySecretKey("src-1", "extra"));
       expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("old-token");
       expect(core.getInventorySource("src-1")?.secretFieldIds).toEqual(["apiToken"]);
+    });
+
+    it("FINDING 1 — core.addOrUpdateInventorySource rejecting leaves pre-existing secrets untouched (no stale-key cleanup before persist) and rolls back only the brand-new key (kills cleanup-before-persist / missing rollback)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      // Current schema: host, apiToken, extraToken. "legacyToken" existed on an
+      // older schema version and is no longer a field at all — it's the stale
+      // key that a (buggy) cleanup-before-persist would wrongly delete even
+      // though the update never actually took effect.
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "apiToken", label: "API Token", type: "password", required: true },
+          { id: "extraToken", label: "Extra Token", type: "password", required: false }
+        ]
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({ targetFolder: "Infra", config: { host: "netbox.local" }, secretFieldIds: ["apiToken", "legacyToken"] })
+      );
+      await vault.store(inventorySecretKey("src-1", "apiToken"), "old-token");
+      await vault.store(inventorySecretKey("src-1", "legacyToken"), "legacy-value");
+
+      vi.spyOn(core, "addOrUpdateInventorySource").mockRejectedValueOnce(new Error("disk full"));
+
+      mockShowInputBox
+        .mockResolvedValueOnce("My Source") // name
+        .mockResolvedValueOnce("Infra") // targetFolder
+        .mockResolvedValueOnce("admin") // defaultUsername
+        .mockResolvedValueOnce("netbox.local") // host
+        .mockResolvedValueOnce("") // apiToken left blank -> keep saved value
+        .mockResolvedValueOnce("new-extra"); // extraToken: brand-new secret this run
+      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
+
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd();
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("was not applied"));
+
+      // Persist failed -> the source record (and its secretFieldIds) must be unchanged.
+      expect(core.getInventorySource("src-1")?.secretFieldIds).toEqual(["apiToken", "legacyToken"]);
+
+      // Pre-existing keys survive: apiToken untouched (never re-stored), and
+      // legacyToken's stale-cleanup must not have run before the failed persist.
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("old-token");
+      expect(await vault.get(inventorySecretKey("src-1", "legacyToken"))).toBe("legacy-value");
+
+      // The brand-new key written this run (not in the old secretFieldIds) is rolled back.
+      expect(await vault.get(inventorySecretKey("src-1", "extraToken"))).toBeUndefined();
     });
   });
 
@@ -586,6 +669,39 @@ describe("inventoryCommands", () => {
 
       expect(core.getServer("owned-1")?.logSession).toBe(true);
       expect(core.getServer("owned-1")?.host).toBe("10.0.0.9");
+    });
+
+    it("FINDING 2 — the source record itself changing (not just servers) while the modal is open aborts the apply (kills a presence-only re-check)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1,
+          devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh", host: "10.0.0.5", port: 22 }] }]
+        }))
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      mockShowInformationMessage.mockImplementationOnce(async () => {
+        // Simulate a replace-mode config import racing the sync: same source id,
+        // but the record itself now has a different targetFolder — the plan/tree
+        // computed under the OLD record must not be applied against this one.
+        await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Different" }));
+        return "Apply";
+      });
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      expect(core.getSnapshot().servers).toHaveLength(0);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("configuration changed"));
+      // The source record itself was still updated by the race (targetFolder
+      // change went through) — only the stale apply was blocked.
+      expect(core.getInventorySource("src-1")?.targetFolder).toBe("Different");
     });
 
     it("nothing-to-do still bumps lastSyncAt without a confirm modal", async () => {
