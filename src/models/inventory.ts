@@ -97,8 +97,26 @@ export interface InventorySourceConfig {
   revision?: string;
 }
 
+/**
+ * SecretStorage key for one (source, field) credential.
+ *
+ * Name is `${sourceId.length}:${sourceId}:${fieldId}` — mirroring
+ * deterministicServerId's scheme — rather than a bare
+ * `sourceId-fieldId` concatenation: sourceId is a user-editable inventory
+ * source id (not guaranteed `-`-free like a randomUUID), so without a length
+ * prefix two different (sourceId, fieldId) splits of the same joined string
+ * could collide (e.g. "a-b" + "c" vs "a" + "b-c").
+ *
+ * fieldId itself does NOT need its own length prefix: the sourceId length
+ * prefix already pins the exact split point (read the digits up to the
+ * first `:`, then take exactly that many characters as sourceId, then the
+ * next `:`), so everything after that second `:` is unambiguously fieldId
+ * — even if fieldId itself contains further `:` or `-` characters. Putting
+ * fieldId last (rather than first) is what makes this work with only one
+ * length prefix.
+ */
 export function inventorySecretKey(sourceId: string, fieldId: string): string {
-  return `inventory-source-${sourceId}-${fieldId}`;
+  return `inventory-source-${sourceId.length}:${sourceId}:${fieldId}`;
 }
 
 /**
