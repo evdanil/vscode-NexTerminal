@@ -2440,4 +2440,197 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(finalA?.openFileExplorerOnFirstConnect).toBe(true);
     expect(finalB?.openFileExplorerOnFirstConnect).toBeUndefined();
   });
+
+  it("(FINDING 1, P2) a rename committed while the pre-write proxy-secret vault.get is still pending survives as the rollback's merge baseline, instead of the rollback restoring the stale pre-rename record (kills baseline-before-vault-read)", async () => {
+    const { ctx, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ host: "example.com" })],
+      initialSecrets: {}
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Gate the pre-write proxy-secret vault.get (the priorSecretValue
+    // capture) so a concurrent rename can commit while it's still pending —
+    // exactly the window FINDING 1 closes by moving liveRecord's capture to
+    // AFTER this await instead of before it.
+    let resolveGet!: (value: string | undefined) => void;
+    ctx.secretVault!.get = vi.fn(
+      () => new Promise<string | undefined>((resolve) => { resolveGet = resolve; })
+    );
+
+    const submitPromise = options.onSubmit({
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "socks5",
+      proxySocks5Host: "new-proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: "proxyuser",
+      proxySocks5Password: "new-proxy-pw"
+    });
+
+    // Let onSubmit's body reach the gated vault.get and block there.
+    await delay(10);
+    expect(ctx.secretVault!.get).toHaveBeenCalled();
+
+    // Simulate nexus.server.rename committing while THIS vault.get is still
+    // pending — it doesn't take configMutationLock (see the FINDING 1
+    // comment at the call site), so it can land here.
+    const renamed = { ...ctx.core.getServer("srv-1")!, name: "Renamed Mid-Vault-Read" };
+    await ctx.core.addOrUpdateServer(renamed);
+
+    // Now let the gated vault.get resolve and arm the secret write to fail,
+    // forcing the rollback to run.
+    secretStore.mockRejectedValueOnce(new Error("keychain unavailable"));
+    resolveGet(undefined);
+
+    await expect(submitPromise).rejects.toThrow(/changes were not saved/i);
+
+    // Kill check: against the pre-fix ordering (liveRecord captured BEFORE
+    // the vault.get await), liveRecord would have snapshotted "Server 1" —
+    // the name still on screen before the rename landed — and the rollback
+    // would restore that stale name here instead. This assertion only
+    // passes when liveRecord was captured AFTER the vault-read settled, so
+    // it already reflects the concurrent rename.
+    const finalRecord = ctx.core.getServer("srv-1");
+    expect(finalRecord?.name).toBe("Renamed Mid-Vault-Read");
+  });
+
+  it("(FINDING 2, P2) renaming the displaced owner while the proxy-secret write is still pending still restores its auto-open flag, merged onto the concurrent rename rather than skipped outright (kills all-or-nothing displaced-owner restore)", async () => {
+    const serverA = makeServer({ id: "srv-1", name: "Server A" });
+    const serverB = makeServer({ id: "srv-2", name: "Server B", host: "b.example.com", openFileExplorerOnFirstConnect: true });
+    const { ctx, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [serverA, serverB],
+      initialSecrets: {}
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Gate the proxy-secret write so a concurrent rename of the displaced
+    // owner (B) can commit while it's still pending.
+    let rejectSecretWrite!: (err: unknown) => void;
+    secretStore.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { rejectSecretWrite = reject; })
+    );
+
+    const submitPromise = options.onSubmit({
+      name: "Server A",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      openFileExplorerOnFirstConnect: true,
+      proxyType: "socks5",
+      proxySocks5Host: "new-proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: "proxyuser",
+      proxySocks5Password: "new-proxy-pw"
+    });
+
+    // Let addOrUpdateServer(A) land — displacing B's flag — and let
+    // syncProxyPasswordSecret reach the gated write.
+    await delay(10);
+
+    // Simulate nexus.server.rename committing against B (the displaced
+    // owner) while the secret write is still pending — it doesn't take
+    // configMutationLock.
+    const renamedB = { ...ctx.core.getServer("srv-2")!, name: "Renamed B" };
+    await ctx.core.addOrUpdateServer(renamedB);
+
+    rejectSecretWrite(new Error("keychain unavailable"));
+
+    await expect(submitPromise).rejects.toThrow(/changes were not saved/i);
+
+    // Kill check: a whole-record-equality (all-or-nothing) implementation
+    // detects the name divergence and skips restoring B's flag entirely —
+    // B's flag would read undefined instead of true. The fix restores ONLY
+    // the flag onto B's CURRENT (renamed) record instead.
+    const finalB = ctx.core.getServer("srv-2");
+    expect(finalB?.name).toBe("Renamed B");
+    expect(finalB?.openFileExplorerOnFirstConnect).toBe(true);
+  });
+
+  it("(FINDING 3, P2) a server removed concurrently while the proxy-secret restore is pending stays removed, and the vault ends up with no proxy-secret key for its id, instead of an unconditional restore recreating an orphaned secret (kills unconditional restore)", async () => {
+    const priorProxy = { type: "socks5" as const, host: "old-proxy.example.com", port: 1080, username: "proxyuser" };
+    const { ctx, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ proxy: priorProxy })],
+      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Gate the proxy-secret write so a concurrent nexus.server.remove can
+    // land against this same server id while it's still pending.
+    let rejectSecretWrite!: (err: unknown) => void;
+    secretStore.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { rejectSecretWrite = reject; })
+    );
+
+    const submitPromise = options.onSubmit({
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "socks5",
+      proxySocks5Host: "new-proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: "proxyuser",
+      proxySocks5Password: "new-proxy-pw"
+    });
+
+    // Let addOrUpdateServer(updated) land and syncProxyPasswordSecret reach
+    // the gated write.
+    await delay(10);
+
+    // Simulate nexus.server.remove committing against this SAME server id
+    // while the secret write is still pending — it doesn't take
+    // configMutationLock either.
+    await ctx.core.removeServer("srv-1");
+
+    rejectSecretWrite(new Error("keychain unavailable"));
+
+    await expect(submitPromise).rejects.toThrow(/changes were not saved/i);
+
+    // The record-rollback path correctly leaves the concurrently-deleted
+    // server deleted (existing, pre-FINDING-3 behavior).
+    expect(ctx.core.getServer("srv-1")).toBeUndefined();
+
+    // Kill check: an unconditional secret restore would still `store` the
+    // prior "old-proxy-pw" here, recreating an orphaned vault key for an id
+    // that no longer has a record (nexus.server.remove already deleted this
+    // key). This assertion fails against that implementation because the
+    // vault would read back "old-proxy-pw" instead of undefined.
+    const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+    expect(finalSecret).toBeUndefined();
+  });
 });

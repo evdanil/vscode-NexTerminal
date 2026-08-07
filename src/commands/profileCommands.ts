@@ -129,18 +129,39 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
             }
             if (displacedOwner) {
               // Same concurrent-change rule as the nexus.server.edit rollback:
-              // only hand the flag back if the displaced owner's live record
-              // is still exactly what addOrUpdateServer(server) left it (the
-              // captured record with the flag cleared) — if something else
-              // has since changed it, leave it alone.
+              // if the displaced owner's live record is still exactly what
+              // addOrUpdateServer(server) left it (the captured record with
+              // the flag cleared), hand the flag straight back.
+              //
+              // FINDING 2 (P2, displaced-owner-merge review, sibling) — if
+              // it's since diverged (e.g. a concurrent rename of the
+              // displaced owner), the old all-or-nothing check skipped the
+              // restore entirely and left the flag cleared for good.
+              // Restore ONLY the flag onto the displaced owner's CURRENT
+              // record, preserving every field the concurrent change
+              // touched, unless:
+              //  - the displaced owner was concurrently deleted
+              //    (currentDisplaced is undefined) — nothing to restore the
+              //    flag onto, or
+              //  - some other server already holds the flag now (checked
+              //    against the live snapshot, taken AFTER this submission's
+              //    own record was removed above) — restoring here would
+              //    violate the single-owner invariant addOrUpdateServer
+              //    otherwise enforces.
               try {
                 const currentDisplaced = ctx.core.getSnapshot().servers.find((s) => s.id === displacedOwner.id);
-                const displacedStillClearedByThisSubmission =
-                  currentDisplaced !== undefined &&
-                  serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined });
-                if (displacedStillClearedByThisSubmission) {
-                  await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
+                if (currentDisplaced !== undefined) {
+                  if (serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined })) {
+                    await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
+                  } else {
+                    const currentFlagOwner = ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect);
+                    if (!currentFlagOwner) {
+                      await ctx.core.addOrUpdateServer({ ...currentDisplaced, openFileExplorerOnFirstConnect: true });
+                    }
+                  }
                 }
+                // else: the displaced owner was concurrently deleted —
+                // nothing to restore the flag onto.
               } catch {
                 void vscode.window.showErrorMessage(
                   `Could not restore the previous auto-open setting on "${displacedOwner.name}" after a failed save — re-check its settings.`

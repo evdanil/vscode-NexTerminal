@@ -511,6 +511,90 @@ describe("openUnifiedForm SSH submit — create rollback on secret-storage failu
     expect(finalB?.openFileExplorerOnFirstConnect).toBe(true);
   });
 
+  it("(FINDING 2, P2) renaming the displaced owner while the proxy-secret write is still pending still restores its auto-open flag, merged onto the concurrent rename rather than skipped outright (kills all-or-nothing displaced-owner restore, create variant)", async () => {
+    // Same hand-rolled single-owner-enforcing stand-in as the sibling test
+    // above.
+    const servers = new Map<string, { id: string; name: string; openFileExplorerOnFirstConnect?: boolean }>([
+      ["srv-b", { id: "srv-b", name: "Server B", openFileExplorerOnFirstConnect: true }]
+    ]);
+    const secrets = new Map<string, string>();
+    const addOrUpdateServer = vi.fn(async (server: { id: string; name: string; openFileExplorerOnFirstConnect?: boolean }) => {
+      if (server.openFileExplorerOnFirstConnect) {
+        for (const [id, existing] of servers.entries()) {
+          if (id !== server.id && existing.openFileExplorerOnFirstConnect) {
+            servers.set(id, { ...existing, openFileExplorerOnFirstConnect: undefined });
+          }
+        }
+      }
+      servers.set(server.id, server);
+    });
+    const removeServer = vi.fn(async (id: string) => {
+      servers.delete(id);
+    });
+    const secretDelete = vi.fn(async (key: string) => {
+      secrets.delete(key);
+    });
+    const ctx = {
+      core: {
+        getSnapshot: vi.fn(() => ({ servers: [...servers.values()], authProfiles: [] })),
+        getAuthProfile: vi.fn(),
+        addOrUpdateServer,
+        removeServer,
+        addOrUpdateSerialProfile: vi.fn(),
+        addOrUpdateLocalShellProfile: vi.fn()
+      },
+      secretVault: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: secretDelete
+      }
+    } as any;
+
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", openFileExplorerOnFirstConnect: true });
+
+    // Gate the proxy-secret write so a concurrent rename of the displaced
+    // owner (B) can commit while it's still pending.
+    let rejectSecretWrite!: (err: unknown) => void;
+    mockSyncProxyPasswordSecret.mockImplementation(
+      () => new Promise((_resolve, reject) => { rejectSecretWrite = reject; })
+    );
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+
+    const submitPromise = onSubmit({
+      profileType: "ssh",
+      name: "New Server",
+      host: "example.com",
+      username: "me",
+      openFileExplorerOnFirstConnect: true
+    });
+
+    // Let addOrUpdateServer("srv-new") land — displacing B's flag — and let
+    // syncProxyPasswordSecret reach the gated write.
+    await delay(10);
+
+    // Simulate nexus.server.rename committing against B (the displaced
+    // owner) while the secret write is still pending.
+    const currentB = servers.get("srv-b")!;
+    servers.set("srv-b", { ...currentB, name: "Renamed B" });
+
+    rejectSecretWrite(new Error("keychain unavailable"));
+
+    await expect(submitPromise).rejects.toThrow(/server was not created/i);
+
+    // The newly created (and now rolled-back) server is gone.
+    expect(servers.has("srv-new")).toBe(false);
+
+    // Kill check: a whole-record-equality (all-or-nothing) implementation
+    // detects the name divergence and skips restoring B's flag entirely —
+    // B's flag would read undefined instead of true. The fix restores ONLY
+    // the flag onto B's CURRENT (renamed) record instead.
+    const finalB = servers.get("srv-b");
+    expect(finalB?.name).toBe("Renamed B");
+    expect(finalB?.openFileExplorerOnFirstConnect).toBe(true);
+  });
+
   it("(FINDINGS 2+3, P2 — sanity) a successful create that enables the flag leaves the previous owner cleared, as intended (unchanged existing behavior)", async () => {
     const servers = new Map<string, { id: string; name: string; openFileExplorerOnFirstConnect?: boolean }>([
       ["srv-b", { id: "srv-b", name: "Server B", openFileExplorerOnFirstConnect: true }]

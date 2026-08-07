@@ -1054,20 +1054,39 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // just after is fire-and-forget (`void`, never awaited) and stays
           // outside the lock regardless.
           await configMutationLock.runExclusive(async () => {
+            const proxySecretKey = proxyPasswordSecretKey(existing.id);
+            // FINDING 1 (P2, baseline-before-vault-read review) — this
+            // secret-capture await MUST run BEFORE the baseline snapshot
+            // (liveRecord) below, and nothing may await between that
+            // baseline capture and the addOrUpdateServer(updated) write
+            // further down. nexus.server.rename and nexus.server.remove
+            // don't take configMutationLock (see the FINDING 1 comment in
+            // the catch block below), so either can commit against this
+            // same server id while THIS await is pending. Previously
+            // liveRecord was captured BEFORE this await: a rename landing
+            // during it produced a stale liveRecord, and a subsequently
+            // failed secret write rolled back onto that stale snapshot,
+            // silently discarding the rename. Capturing liveRecord AFTER
+            // this await settles — and keeping everything from liveRecord
+            // through addOrUpdateServer synchronous, with no further await
+            // in between — closes that gap entirely.
+            const priorSecretValue = ctx.secretVault ? await ctx.secretVault.get(proxySecretKey) : undefined;
             // FINDING 1 (P2, edit-rollback-staleness review) — capture the
             // LIVE record via ctx.core.getServer(existing.id), not the
-            // form-open `existing` snapshot, and do it here — inside the
-            // lock, immediately before this generation's write lands. An
-            // edit or deletion committed between form-open and lock
-            // acquisition (there is no drift guard blocking that window;
-            // see below) means `existing` can already be stale by the time
-            // we get here. Rolling back to it on a failed secret write
-            // would silently erase that intervening edit, or — if the
-            // record was deleted in the meantime — resurrect a server the
-            // user just removed. Capturing the live value under the same
-            // lock acquisition that's about to overwrite it means the
-            // rollback always restores exactly what this submission
-            // clobbered, not whatever was on screen when the form opened.
+            // form-open `existing` snapshot, and do it here — synchronously,
+            // immediately after the vault-read above settles and
+            // immediately before this generation's write lands. An edit or
+            // deletion committed between form-open and this point (there is
+            // no drift guard blocking that window; see below) means
+            // `existing` can already be stale by the time we get here.
+            // Rolling back to it on a failed secret write would silently
+            // erase that intervening edit, or — if the record was deleted in
+            // the meantime — resurrect a server the user just removed.
+            // Capturing the live value immediately before the write it's
+            // rolling back means the rollback always restores exactly what
+            // this submission clobbered, not whatever was on screen when the
+            // form opened (or whatever committed during the vault-read await
+            // above).
             //
             // No drift guard: this deliberately does NOT block the edit
             // from proceeding when the live record differs from (or is
@@ -1077,8 +1096,6 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // the live-snapshot rollback below to undo cleanly on failure
             // is an accepted, intentional scope limit for this fix.
             const liveRecord = ctx.core.getServer(existing.id);
-            const proxySecretKey = proxyPasswordSecretKey(existing.id);
-            const priorSecretValue = ctx.secretVault ? await ctx.secretVault.get(proxySecretKey) : undefined;
             // FINDINGS 2+3 (P2, edit-rollback review) — addOrUpdateServer
             // enforces single ownership of openFileExplorerOnFirstConnect:
             // if `updated` enables the flag, it clears it from whichever
@@ -1195,28 +1212,64 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               }
               if (displacedOwner) {
                 // Same concurrent-change rule as above, applied to the
-                // displaced owner: only hand its flag back if its live
-                // record is still exactly what addOrUpdateServer(updated)
-                // left it (the captured record with the flag cleared) — if
-                // it's since been edited, renamed, or removed by something
-                // else, leave it alone rather than clobbering that change.
+                // displaced owner: if its live record is still exactly what
+                // addOrUpdateServer(updated) left it (the captured record
+                // with the flag cleared), hand the flag straight back.
+                //
+                // FINDING 2 (P2, displaced-owner-merge review) — if it's
+                // since diverged (e.g. a concurrent rename of the displaced
+                // owner), the old all-or-nothing check failed the
+                // whole-record equality test and skipped the restore
+                // entirely, leaving the flag cleared for good even though
+                // nothing about THIS submission's rollback should depend on
+                // fields the concurrent change touched. Restore ONLY the
+                // flag onto whatever the displaced owner's CURRENT record
+                // is, preserving every field the concurrent change touched,
+                // unless:
+                //  - the displaced owner was concurrently deleted
+                //    (currentDisplaced is undefined) — nothing to restore
+                //    the flag onto, or
+                //  - some other server already holds the flag now (checked
+                //    against the live snapshot, taken AFTER this
+                //    submission's own record-rollback above has already
+                //    run) — restoring here would violate the single-owner
+                //    invariant addOrUpdateServer otherwise enforces.
                 try {
                   const currentDisplaced = ctx.core.getServer(displacedOwner.id);
-                  const displacedStillClearedByThisSubmission =
-                    currentDisplaced !== undefined &&
-                    serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined });
-                  if (displacedStillClearedByThisSubmission) {
-                    await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
+                  if (currentDisplaced !== undefined) {
+                    if (serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined })) {
+                      await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
+                    } else {
+                      const currentFlagOwner = ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect);
+                      if (!currentFlagOwner) {
+                        await ctx.core.addOrUpdateServer({ ...currentDisplaced, openFileExplorerOnFirstConnect: true });
+                      }
+                    }
                   }
+                  // else: the displaced owner was concurrently deleted —
+                  // nothing to restore the flag onto.
                 } catch {
                   void vscode.window.showErrorMessage(
                     `Could not restore the previous auto-open setting on "${displacedOwner.name}" after a failed save — re-check its settings.`
                   );
                 }
               }
+              // FINDING 3 (P2, orphaned-secret-on-concurrent-delete review)
+              // — the record-rollback logic above correctly leaves a
+              // concurrently-deleted server deleted (see its own "nothing to
+              // restore or merge onto" branch a few lines up). Restoring the
+              // prior secret value unconditionally here would then recreate
+              // a proxy password for an id that no longer has a record — an
+              // orphaned vault key that nexus.server.remove already cleaned
+              // up when it deleted the server. Gate the restore on whether
+              // the record is actually still present after the rollback
+              // logic above has run: only store the prior value when it is;
+              // otherwise make sure the vault key ends up deleted too
+              // (best-effort, same treatment as the no-prior-value case).
+              const recordStillPresentAfterRollback = ctx.core.getServer(existing.id) !== undefined;
               if (ctx.secretVault) {
                 try {
-                  if (priorSecretValue !== undefined) {
+                  if (recordStillPresentAfterRollback && priorSecretValue !== undefined) {
                     await ctx.secretVault.store(proxySecretKey, priorSecretValue);
                   } else {
                     await ctx.secretVault.delete(proxySecretKey);
