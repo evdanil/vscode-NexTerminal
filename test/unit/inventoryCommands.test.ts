@@ -353,6 +353,83 @@ describe("inventoryCommands", () => {
       expect(vault.delete).toHaveBeenCalledWith(field1Key);
       expect(backingStore.size).toBe(0);
     });
+
+    it("wizard step numbering — a single registered provider auto-skips the picker, so the Name prompt is step 1 of a total that omits the invisible provider step (kills always-count-provider-step)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider()); // exactly one provider -> promptProviderPick auto-selects without showing a QuickPick
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      mockShowInputBox
+        .mockResolvedValueOnce("My NetBox") // name
+        .mockResolvedValueOnce("Infra") // target folder
+        .mockResolvedValueOnce("admin") // default username
+        .mockResolvedValueOnce("netbox.local") // host field
+        .mockResolvedValueOnce("secret-token"); // apiToken field
+      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" }); // prune policy
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+
+      // The provider picker itself must never have been shown.
+      expect(mockShowQuickPick).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ title: "Select Inventory Provider" }));
+
+      // 4 fixed steps (Name/Folder/Username/Prune-Policy) + 2 provider config
+      // fields (host, apiToken) = 6 total. Under the reverted (buggy)
+      // implementation the provider pick is always counted, so this same
+      // sequence would produce "(2/7)" here instead — this assertion fails
+      // against that wrong implementation.
+      const [nameCallArgs] = mockShowInputBox.mock.calls[0];
+      expect((nameCallArgs as { title: string }).title).toContain("(1/6)");
+      expect((nameCallArgs as { title: string }).title).not.toContain("(2/");
+
+      const [hostCallArgs] = mockShowInputBox.mock.calls[3];
+      expect((hostCallArgs as { title: string }).title).toContain("(5/6)");
+
+      const [apiTokenCallArgs] = mockShowInputBox.mock.calls[4];
+      expect((apiTokenCallArgs as { title: string }).title).toContain("(6/6)");
+    });
+
+    it("wizard step numbering — two registered providers show the picker as the invisible step 1, bumping the total by one relative to the single-provider case", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const providerA = makeProvider({ id: "fake-a", label: "Provider A" });
+      const providerB = makeProvider({ id: "fake-b", label: "Provider B" });
+      registry.register(providerA);
+      registry.register(providerB);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      mockShowQuickPick
+        .mockResolvedValueOnce({ label: providerA.label, provider: providerA }) // provider pick (occupies step 1)
+        .mockResolvedValueOnce({ value: "orphan" }); // prune policy
+      mockShowInputBox
+        .mockResolvedValueOnce("My NetBox") // name
+        .mockResolvedValueOnce("Infra") // target folder
+        .mockResolvedValueOnce("admin") // default username
+        .mockResolvedValueOnce("netbox.local") // host field
+        .mockResolvedValueOnce("secret-token"); // apiToken field
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+
+      const providerPickCall = mockShowQuickPick.mock.calls[0];
+      expect(providerPickCall[1]).toEqual(expect.objectContaining({ title: "Select Inventory Provider" }));
+
+      // Provider pick was actually shown -> it counts as step 1, Name is step
+      // 2, and the total (7) is one higher than the single-provider case's
+      // total (6).
+      const [nameCallArgs] = mockShowInputBox.mock.calls[0];
+      expect((nameCallArgs as { title: string }).title).toContain("(2/7)");
+
+      const [apiTokenCallArgs] = mockShowInputBox.mock.calls[4];
+      expect((apiTokenCallArgs as { title: string }).title).toContain("(7/7)");
+    });
   });
 
   describe("nexus.inventory.editSource", () => {

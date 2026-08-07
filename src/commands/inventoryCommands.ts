@@ -170,20 +170,32 @@ async function pickInventorySource(core: NexusCore, registry: InventoryProviderR
   return pick?.source;
 }
 
-async function promptProviderPick(registry: InventoryProviderRegistry): Promise<InventoryProvider | undefined> {
+interface ProviderPickResult {
+  provider: InventoryProvider;
+  /**
+   * Whether a QuickPick was actually displayed to the user. False when
+   * exactly one provider is registered (the auto-select branch below) — the
+   * only case that occurs today, but this also covers any future call site.
+   * addSource's wizard step numbering relies on this to avoid counting a
+   * step the user never saw.
+   */
+  shown: boolean;
+}
+
+async function promptProviderPick(registry: InventoryProviderRegistry): Promise<ProviderPickResult | undefined> {
   const providers = registry.list();
   if (providers.length === 0) {
     void vscode.window.showErrorMessage("No inventory providers are registered.");
     return undefined;
   }
   if (providers.length === 1) {
-    return providers[0];
+    return { provider: providers[0], shown: false };
   }
   const pick = await vscode.window.showQuickPick(
     providers.map((provider) => ({ label: provider.label, provider })),
     { title: "Select Inventory Provider" }
   );
-  return pick?.provider;
+  return pick ? { provider: pick.provider, shown: true } : undefined;
 }
 
 /**
@@ -513,22 +525,26 @@ export function registerInventoryCommands(
   const inFlightSourceIds = new Set<string>();
 
   async function addSource(): Promise<void> {
-    const provider = await promptProviderPick(registry);
-    if (!provider) return;
+    const pickResult = await promptProviderPick(registry);
+    if (!pickResult) return;
+    const { provider, shown: providerStepShown } = pickResult;
 
     // M1-minimum — wizard step numbering. Provider selection occupies step 1
-    // (its own picker can't show a total before the provider — and thus its
-    // field count — is known, so it gets no counter of its own); Name/Folder/
-    // Username/Prune-Policy are 2-5; one step per provider config field after
-    // that.
+    // ONLY when promptProviderPick actually displayed a picker — it
+    // auto-selects without showing UI when exactly one provider is
+    // registered (the default desktop case — only NetBox), and an
+    // invisible step must not be counted in the total or offset the visible
+    // prompts by one. Name/Folder/Username/Prune-Policy occupy the next 4
+    // steps either way; one step per provider config field after that.
     // FOLLOW-UP: this sequential-prompt wizard (here, editSource, and the
     // promptConfigFields/promptTargetFolder/promptPrunePolicy helpers it
     // shares with editSource) is a known candidate for migration to a single
     // webview form — tracked separately.
-    const totalSteps = 5 + provider.configFields.length;
+    const totalSteps = (providerStepShown ? 5 : 4) + provider.configFields.length;
+    let step = providerStepShown ? 2 : 1;
 
     const nameInput = await vscode.window.showInputBox({
-      title: `Inventory Source Name (2/${totalSteps})`,
+      title: `Inventory Source Name (${step++}/${totalSteps})`,
       value: provider.label,
       ignoreFocusOut: true,
       validateInput: (v) => (v.trim() ? undefined : "Name is required")
@@ -536,11 +552,11 @@ export function registerInventoryCommands(
     if (nameInput === undefined) return;
     const name = nameInput.trim();
 
-    const targetFolder = await promptTargetFolder(` (3/${totalSteps})`);
+    const targetFolder = await promptTargetFolder(` (${step++}/${totalSteps})`);
     if (targetFolder === undefined) return;
 
     const defaultUsernameInput = await vscode.window.showInputBox({
-      title: `Default SSH Username (4/${totalSteps})`,
+      title: `Default SSH Username (${step++}/${totalSteps})`,
       prompt: "Used when the inventory source doesn't provide a username.",
       value: mostCommonUsername(core.getSnapshot().servers),
       ignoreFocusOut: true,
@@ -549,10 +565,10 @@ export function registerInventoryCommands(
     if (defaultUsernameInput === undefined) return;
     const defaultUsername = defaultUsernameInput.trim();
 
-    const prunePolicy = await promptPrunePolicy(` (5/${totalSteps})`, targetFolder);
+    const prunePolicy = await promptPrunePolicy(` (${step++}/${totalSteps})`, targetFolder);
     if (!prunePolicy) return;
 
-    const fieldsResult = await promptConfigFields(provider.configFields, {}, new Set(), 6, totalSteps);
+    const fieldsResult = await promptConfigFields(provider.configFields, {}, new Set(), step, totalSteps);
     if (!fieldsResult) return;
     const { config, secrets } = fieldsResult;
 
