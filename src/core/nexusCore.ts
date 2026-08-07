@@ -10,7 +10,7 @@ import type {
   TunnelProfile,
   TunnelRegistryEntry
 } from "../models/config";
-import type { InventorySourceConfig } from "../models/inventory";
+import { sourceConfigUnchanged, type InventorySourceConfig } from "../models/inventory";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
@@ -29,6 +29,14 @@ export interface InventorySyncApplication {
   upsertServers: ServerConfig[]; // adds + update "after" + orphan "after"
   removeServerIds: string[];
   folders: string[]; // ensure these + ancestors exist as explicit groups
+  // FINDINGS D/E — the source record exactly as it stood when this
+  // application's plan was computed (the fetch-time snapshot). Compared
+  // synchronously against the CURRENT map entry, before any mutation, in
+  // applyInventorySyncPlan — closes the gap between "source still exists" and
+  // "source is still the same config" for races that land between plan
+  // computation and apply (e.g. a replace-mode config import recreating the
+  // same source id mid-sync).
+  expectedSource: InventorySourceConfig;
 }
 
 export class NexusCore {
@@ -165,9 +173,30 @@ export class NexusCore {
     return this.inventorySources.get(id);
   }
 
+  /**
+   * FINDING A — the map mutation happens first (repo-wide in-memory-first
+   * pattern), but a rejected persist here must leave NO trace: the command
+   * layer's credential rollback (add/edit) assumes a failed
+   * addOrUpdateInventorySource means the source was never created/updated, and
+   * an in-memory-only leftover could later be persisted by an unrelated
+   * operation (e.g. the next successful saveInventorySources call from a
+   * different command). Capture the previous entry (or its absence) before
+   * mutating, and restore it on rejection.
+   */
   public async addOrUpdateInventorySource(source: InventorySourceConfig): Promise<void> {
+    const hadPrevious = this.inventorySources.has(source.id);
+    const previous = this.inventorySources.get(source.id);
     this.inventorySources.set(source.id, source);
-    await this.repository.saveInventorySources([...this.inventorySources.values()]);
+    try {
+      await this.repository.saveInventorySources([...this.inventorySources.values()]);
+    } catch (error) {
+      if (hadPrevious) {
+        this.inventorySources.set(source.id, previous!);
+      } else {
+        this.inventorySources.delete(source.id);
+      }
+      throw error;
+    }
     this.emitChanged();
   }
 
@@ -175,10 +204,24 @@ export class NexusCore {
    * Removes the source record only. Disposition of servers it created
    * (delete / keep / strip origin) is the command layer's job — call
    * applyInventorySyncPlan (or removeServer) first if servers need to change.
+   *
+   * FINDING A — symmetric with addOrUpdateInventorySource: removeSource's
+   * command flow deletes the source's secrets only after this call succeeds,
+   * so a rejected persist here must restore the entry rather than leave it
+   * deleted in memory while its secrets are still on disk.
    */
   public async removeInventorySource(id: string): Promise<void> {
+    const hadPrevious = this.inventorySources.has(id);
+    const previous = this.inventorySources.get(id);
     this.inventorySources.delete(id);
-    await this.repository.saveInventorySources([...this.inventorySources.values()]);
+    try {
+      await this.repository.saveInventorySources([...this.inventorySources.values()]);
+    } catch (error) {
+      if (hadPrevious) {
+        this.inventorySources.set(id, previous!);
+      }
+      throw error;
+    }
     this.emitChanged();
   }
 
@@ -192,11 +235,24 @@ export class NexusCore {
    * source was removed while a sync was in flight) — refuses to partially
    * apply servers on behalf of a source record that will never receive the
    * lastSyncAt update, rather than silently orphaning the write.
+   *
+   * FINDINGS D/E — also throws if the CURRENT source record no longer
+   * matches `apply.expectedSource` (the fetch-time snapshot the plan was
+   * computed against). This check runs synchronously, before any mutation
+   * below, so it is atomic with the apply itself — no await separates "the
+   * record is still the one the plan was computed for" from "the plan gets
+   * applied", closing the race a caller-side check (however recent) can never
+   * fully close on its own.
    */
   public async applyInventorySyncPlan(apply: InventorySyncApplication): Promise<void> {
     const source = this.inventorySources.get(apply.sourceId);
     if (!source) {
       throw new Error(`Cannot apply inventory sync: unknown inventory source "${apply.sourceId}".`);
+    }
+    if (!sourceConfigUnchanged(source, apply.expectedSource)) {
+      throw new Error(
+        `Cannot apply inventory sync: inventory source "${apply.sourceId}" configuration changed since the sync was computed.`
+      );
     }
     for (const folder of apply.folders) {
       const normalized = normalizeFolderPath(folder);

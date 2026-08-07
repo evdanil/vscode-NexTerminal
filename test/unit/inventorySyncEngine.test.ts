@@ -519,12 +519,14 @@ describe("planToApplication (F19 — no targetFolder parameter)", () => {
       manualDuplicateCount: 0
     };
 
-    const application = planToApplication(plan);
+    const expectedSource = makeSource({ id: "source-1" });
+    const application = planToApplication(plan, expectedSource);
     expect(application.upsertServers.map((s) => s.id).sort()).toEqual(["a", "b", "c"]);
     expect(application.removeServerIds).toEqual(["d"]);
     expect(application.folders).toEqual(["X", "Y"]);
     expect(application.sourceId).toBe("source-1");
     expect(application.syncedAt).toBe(1000);
+    expect(application.expectedSource).toBe(expectedSource);
   });
 });
 

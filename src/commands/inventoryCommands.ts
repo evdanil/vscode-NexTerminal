@@ -5,6 +5,8 @@ import type { ServerConfig } from "../models/config";
 import {
   InventoryProviderError,
   inventorySecretKey,
+  inventorySourceValuesEqual,
+  sourceConfigUnchanged,
   type InventoryConfigField,
   type InventoryPrunePolicy,
   type InventoryProvider,
@@ -301,40 +303,6 @@ function planCountsEqual(a: InventorySyncPlan, b: InventorySyncPlan): boolean {
   );
 }
 
-function inventorySourceValuesEqual(a: InventorySourceValues, b: InventorySourceValues): boolean {
-  const aKeys = Object.keys(a);
-  const bKeys = Object.keys(b);
-  if (aKeys.length !== bKeys.length) return false;
-  return aKeys.every((key) => Object.prototype.hasOwnProperty.call(b, key) && a[key] === b[key]);
-}
-
-function secretFieldIdsEqual(a: readonly string[], b: readonly string[]): boolean {
-  if (a.length !== b.length) return false;
-  const sortedA = [...a].sort();
-  const sortedB = [...b].sort();
-  return sortedA.every((id, i) => id === sortedB[i]);
-}
-
-/**
- * FINDING 2 — compares exactly the InventorySourceConfig fields that feed
- * computeSyncPlan/planToApplication (and the earlier fetchInventory call): a
- * source record that differs on any of these must not have the tree fetched
- * under the OLD config applied against it, even though its id still exists
- * and the "source was removed" guard alone would let it through — e.g. a
- * replace-mode config import can delete and recreate the same source id with
- * an entirely different provider config while a sync is mid-flight.
- */
-function sourceConfigUnchanged(a: InventorySourceConfig, b: InventorySourceConfig): boolean {
-  return (
-    a.providerId === b.providerId &&
-    a.targetFolder === b.targetFolder &&
-    a.prunePolicy === b.prunePolicy &&
-    a.defaultUsername === b.defaultUsername &&
-    inventorySourceValuesEqual(a.config, b.config) &&
-    secretFieldIdsEqual(a.secretFieldIds, b.secretFieldIds)
-  );
-}
-
 export function registerInventoryCommands(
   core: NexusCore,
   registry: InventoryProviderRegistry,
@@ -404,6 +372,17 @@ export function registerInventoryCommands(
         }
       }
     } catch {
+      // FINDING B — a later field's store rejecting after earlier ones
+      // succeeded must not orphan those earlier keys: the source is never
+      // created on this path, so nothing will ever enumerate secretFieldIds
+      // to clean them up. Best-effort delete everything written this run.
+      for (const fieldId of secretFieldIds) {
+        try {
+          await vault.delete(inventorySecretKey(id, fieldId));
+        } catch {
+          // best-effort rollback — ignore
+        }
+      }
       void vscode.window.showErrorMessage("Could not store credentials in the system keychain — the source was not created.");
       return;
     }
@@ -496,12 +475,22 @@ export function registerInventoryCommands(
       // leaves its previously saved value untouched.
       // FINDING 1 — track which of those writes are for fields NOT already in
       // the old secretFieldIds (i.e. brand-new secrets for this source, as
-      // opposed to an overwrite of a value that already existed). Only those
-      // are safe to roll back later — a pre-existing key's old value isn't
-      // available to restore.
+      // opposed to an overwrite of a value that already existed).
+      // FINDING C — a re-entered field that WAS already in the old
+      // secretFieldIds gets its pre-write value captured here, BEFORE the
+      // overwrite, so a failed persist below can put it back — the previous
+      // rollback only deleted newly-added keys, leaving an overwritten token
+      // stuck at its new value even though the source record reverted to old.
       const newlyWrittenFieldIds: string[] = [];
+      const overwrittenPreviousValues = new Map<string, string>();
       try {
         for (const [fieldId, value] of Object.entries(reenteredSecrets)) {
+          if (existingSecretFieldIds.has(fieldId)) {
+            const previousValue = await vault.get(inventorySecretKey(source.id, fieldId));
+            if (previousValue !== undefined) {
+              overwrittenPreviousValues.set(fieldId, previousValue);
+            }
+          }
           await vault.store(inventorySecretKey(source.id, fieldId), value);
           if (!existingSecretFieldIds.has(fieldId)) {
             newlyWrittenFieldIds.push(fieldId);
@@ -529,12 +518,22 @@ export function registerInventoryCommands(
       // still the keys the last-known-good source record points at), and any
       // brand-new keys written above must be rolled back (best-effort — a
       // delete failure here must not mask the original persistence error).
+      // FINDING C — additionally, any re-entered field that OVERWROTE an
+      // existing value gets that captured previous value restored, so the
+      // vault matches the reverted (last-known-good) source record.
       try {
         await core.addOrUpdateInventorySource(updated);
       } catch {
         for (const fieldId of newlyWrittenFieldIds) {
           try {
             await vault.delete(inventorySecretKey(source.id, fieldId));
+          } catch {
+            // best-effort rollback — ignore
+          }
+        }
+        for (const [fieldId, previousValue] of overwrittenPreviousValues) {
+          try {
+            await vault.store(inventorySecretKey(source.id, fieldId), previousValue);
           } catch {
             // best-effort rollback — ignore
           }
@@ -604,7 +603,18 @@ export function registerInventoryCommands(
         for (const server of owned) {
           await teardown.teardownServerRuntime(server.id);
         }
-        await core.applyInventorySyncPlan({ sourceId: source.id, syncedAt: Date.now(), upsertServers: [], removeServerIds: owned.map((s) => s.id), folders: [] });
+        // FINDINGS D/E — `source` is the snapshot taken at the start of this
+        // command, before the confirm modal and teardown awaits; it's the
+        // correct expectedSource here since removeSource never recomputes
+        // against a fresher record the way syncNow does.
+        await core.applyInventorySyncPlan({
+          sourceId: source.id,
+          syncedAt: Date.now(),
+          upsertServers: [],
+          removeServerIds: owned.map((s) => s.id),
+          folders: [],
+          expectedSource: source
+        });
         for (const server of owned) {
           await vault.delete(passwordSecretKey(server.id));
           await vault.delete(passphraseSecretKey(server.id));
@@ -612,7 +622,14 @@ export function registerInventoryCommands(
         }
       } else if (choice === "Keep Servers") {
         const strippedServers = owned.map(({ origin, ...rest }) => rest as ServerConfig);
-        await core.applyInventorySyncPlan({ sourceId: source.id, syncedAt: Date.now(), upsertServers: strippedServers, removeServerIds: [], folders: [] });
+        await core.applyInventorySyncPlan({
+          sourceId: source.id,
+          syncedAt: Date.now(),
+          upsertServers: strippedServers,
+          removeServerIds: [],
+          folders: [],
+          expectedSource: source
+        });
       }
 
       for (const fieldId of source.secretFieldIds) {
@@ -696,7 +713,7 @@ export function registerInventoryCommands(
 
       // Nothing to do: apply an empty application to bump lastSyncAt without a confirm modal.
       if (plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0) {
-        await core.applyInventorySyncPlan(planToApplication(plan));
+        await core.applyInventorySyncPlan(planToApplication(plan, source));
         void vscode.window.showInformationMessage(`Inventory sync from "${source.name}": nothing to do (${plan.unchangedCount} unchanged).`);
         if (plan.warnings.length > 0) {
           void vscode.window
@@ -748,11 +765,49 @@ export function registerInventoryCommands(
           continue;
         }
 
-        const application = planToApplication(recomputed);
+        const application = planToApplication(recomputed, freshSource);
         for (const id of application.removeServerIds) {
           await teardown.teardownServerRuntime(id);
         }
-        await core.applyInventorySyncPlan(application);
+
+        // FINDING D — the config-level check above (sourceConfigUnchanged)
+        // doesn't see secret VALUES: a replace-mode import can recreate an
+        // identical-looking record (same providerId/config/secretFieldIds)
+        // while pointing the same field ids at a different vault entry, so
+        // `tree` — fetched under the OLD token — would otherwise get applied
+        // as if it came from the new one. Re-read the vault for the exact
+        // fields the fetch used and compare against what was actually sent,
+        // right after the teardown awaits and immediately before apply — the
+        // narrowest window this check can occupy without moving inside core
+        // (core has no vault access).
+        const currentSecretsForFetchFields: InventorySourceSecrets = {};
+        for (const fieldId of source.secretFieldIds) {
+          const value = await vault.get(inventorySecretKey(source.id, fieldId));
+          if (value === undefined) continue;
+          currentSecretsForFetchFields[fieldId] = value;
+        }
+        if (!inventorySourceValuesEqual(secrets, currentSecretsForFetchFields)) {
+          void vscode.window.showErrorMessage(
+            `Inventory source "${source.name}" credentials changed while syncing — run Sync Now again.`
+          );
+          return;
+        }
+
+        // FINDING E — even after the checks above, the source record could
+        // still be replaced during the teardown awaits themselves (between
+        // the freshSource check and this call). applyInventorySyncPlan's own
+        // synchronous, pre-mutation comparison against `application.expectedSource`
+        // is the only thing that can still catch that — surface its rejection
+        // the same way as the fast-fail check above rather than letting it
+        // propagate as an unhandled command rejection.
+        try {
+          await core.applyInventorySyncPlan(application);
+        } catch (error) {
+          void vscode.window.showErrorMessage(
+            `Inventory sync failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+          return;
+        }
         for (const id of prunedServerIdsForSecretCleanup(recomputed)) {
           await vault.delete(passwordSecretKey(id));
           await vault.delete(passphraseSecretKey(id));

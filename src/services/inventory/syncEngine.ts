@@ -346,8 +346,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   };
 }
 
-/** F19: derives the application entirely from the plan — no targetFolder parameter. */
-export function planToApplication(plan: InventorySyncPlan): InventorySyncApplication {
+/**
+ * F19: derives the application entirely from the plan — no targetFolder
+ * parameter. FINDINGS D/E — `expectedSource` must be the exact
+ * InventorySourceConfig the plan was computed against (the fetch-time
+ * snapshot); it flows straight through to `NexusCore.applyInventorySyncPlan`,
+ * which throws if the record has since changed.
+ */
+export function planToApplication(plan: InventorySyncPlan, expectedSource: InventorySourceConfig): InventorySyncApplication {
   const upsertServers: ServerConfig[] = [
     ...plan.adds,
     ...plan.updates.map((u) => u.after),
@@ -359,7 +365,8 @@ export function planToApplication(plan: InventorySyncPlan): InventorySyncApplica
     syncedAt: plan.syncedAt,
     upsertServers,
     removeServerIds,
-    folders: [...plan.folders]
+    folders: [...plan.folders],
+    expectedSource
   };
 }
 

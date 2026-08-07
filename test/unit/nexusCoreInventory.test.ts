@@ -62,7 +62,8 @@ describe("NexusCore inventory sources", () => {
       syncedAt: 1000,
       upsertServers: [server],
       removeServerIds: ["does-not-exist"],
-      folders: ["NetBox/RackA"]
+      folders: ["NetBox/RackA"],
+      expectedSource: makeSourceConfig()
     };
     await core.applyInventorySyncPlan(application);
 
@@ -81,7 +82,14 @@ describe("NexusCore inventory sources", () => {
     await core.initialize();
     await core.addOrUpdateInventorySource(makeSourceConfig());
 
-    await core.applyInventorySyncPlan({ sourceId: "source-1", syncedAt: 1000, upsertServers: [], removeServerIds: [], folders: ["A/B/C"] });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["A/B/C"],
+      expectedSource: makeSourceConfig()
+    });
 
     expect(core.getSnapshot().explicitGroups).toEqual(expect.arrayContaining(["A", "A/B", "A/B/C"]));
 
@@ -100,7 +108,14 @@ describe("NexusCore inventory sources", () => {
     core.registerSession({ id: "session-1", serverId: "srv-1", terminalName: "Nexus SSH: s", startedAt: Date.now() });
     core.setFocusedSession("session-1");
 
-    await core.applyInventorySyncPlan({ sourceId: "source-1", syncedAt: 1000, upsertServers: [], removeServerIds: ["srv-1"], folders: [] });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: ["srv-1"],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
 
     const snapshot = core.getSnapshot();
     expect(snapshot.servers).toHaveLength(0);
@@ -115,7 +130,14 @@ describe("NexusCore inventory sources", () => {
     await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", lastSyncAt: 100 }));
     await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-2", lastSyncAt: 200 }));
 
-    await core.applyInventorySyncPlan({ sourceId: "source-1", syncedAt: 5000, upsertServers: [], removeServerIds: [], folders: [] });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 5000,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: [],
+      expectedSource: makeSourceConfig({ id: "source-1" })
+    });
 
     expect(core.getInventorySource("source-1")?.lastSyncAt).toBe(5000);
     expect(core.getInventorySource("source-2")?.lastSyncAt).toBe(200);
@@ -129,7 +151,14 @@ describe("NexusCore inventory sources", () => {
     const listener = vi.fn();
     core.onDidChange(listener);
 
-    await core.applyInventorySyncPlan({ sourceId: "source-1", syncedAt: 4242, upsertServers: [], removeServerIds: [], folders: [] });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 4242,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
 
     expect(core.getInventorySource("source-1")?.lastSyncAt).toBe(4242);
     expect(listener).toHaveBeenCalledTimes(1);
@@ -172,10 +201,99 @@ describe("NexusCore inventory sources", () => {
 
     const server: ServerConfig = { id: "srv-1", name: "s", host: "h", port: 22, username: "u", authType: "agent", isHidden: false };
     await expect(
-      core.applyInventorySyncPlan({ sourceId: "does-not-exist", syncedAt: 1, upsertServers: [server], removeServerIds: [], folders: [] })
+      core.applyInventorySyncPlan({
+        sourceId: "does-not-exist",
+        syncedAt: 1,
+        upsertServers: [server],
+        removeServerIds: [],
+        folders: [],
+        expectedSource: makeSourceConfig({ id: "does-not-exist" })
+      })
     ).rejects.toThrow();
 
     expect(core.getSnapshot().servers).toHaveLength(0);
+    expect(listener).not.toHaveBeenCalled();
+    expect(saveServersSpy).not.toHaveBeenCalled();
+  });
+
+  it("(FINDING A) addOrUpdateInventorySource on a rejected persist rolls back a brand-new source — it does not appear in the snapshot (kills mutate-then-leak)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    vi.spyOn(repository, "saveInventorySources").mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(core.addOrUpdateInventorySource(makeSourceConfig())).rejects.toThrow("disk full");
+
+    // If the fix were reverted (mutate-then-await, no rollback), the map would
+    // still hold the new entry here even though persistence failed.
+    expect(core.getInventorySource("source-1")).toBeUndefined();
+    expect(core.getSnapshot().inventorySources).toHaveLength(0);
+  });
+
+  it("(FINDING A) addOrUpdateInventorySource on a rejected persist restores the PRE-UPDATE source — an edit's old value survives (kills mutate-then-leak on update)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ name: "Original", targetFolder: "Old" }));
+
+    vi.spyOn(repository, "saveInventorySources").mockRejectedValueOnce(new Error("disk full"));
+    await expect(
+      core.addOrUpdateInventorySource(makeSourceConfig({ name: "Updated", targetFolder: "New" }))
+    ).rejects.toThrow("disk full");
+
+    // If the fix were reverted, the in-memory map would keep the rejected
+    // "Updated"/"New" values even though the persist never took effect.
+    const current = core.getInventorySource("source-1");
+    expect(current?.name).toBe("Original");
+    expect(current?.targetFolder).toBe("Old");
+  });
+
+  it("(FINDING A) removeInventorySource on a rejected persist restores the deleted entry (kills delete-then-leak)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    vi.spyOn(repository, "saveInventorySources").mockRejectedValueOnce(new Error("disk full"));
+    await expect(core.removeInventorySource("source-1")).rejects.toThrow("disk full");
+
+    // If the fix were reverted, the entry would stay deleted in memory even
+    // though the command layer's secret-cleanup only runs after a resolved
+    // removeInventorySource — leaving it permanently unrecoverable in-process.
+    expect(core.getInventorySource("source-1")).toBeDefined();
+    expect(core.getSnapshot().inventorySources).toHaveLength(1);
+  });
+
+  it("(FINDING E) applyInventorySyncPlan throws when the current source record no longer matches expectedSource, mutating and persisting nothing (kills an exists-only check)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    const staleSnapshot = makeSourceConfig({ targetFolder: "Original" });
+    await core.addOrUpdateInventorySource(staleSnapshot);
+    // Simulate a replace-mode config import racing the sync: same id, but the
+    // record's targetFolder (and thus the plan computed against it) is stale.
+    await core.addOrUpdateInventorySource(makeSourceConfig({ targetFolder: "Different" }));
+
+    const saveServersSpy = vi.spyOn(repository, "saveServers");
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    const server: ServerConfig = { id: "srv-1", name: "s", host: "h", port: 22, username: "u", authType: "agent", isHidden: false };
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 1,
+        upsertServers: [server],
+        removeServerIds: [],
+        folders: [],
+        expectedSource: staleSnapshot // the fetch-time snapshot, now stale
+      })
+    ).rejects.toThrow(/configuration changed/);
+
+    // If the fix were reverted to an exists-only check, this would have
+    // applied: the server would be added and lastSyncAt bumped.
+    expect(core.getSnapshot().servers).toHaveLength(0);
+    expect(core.getInventorySource("source-1")?.lastSyncAt).toBeUndefined();
     expect(listener).not.toHaveBeenCalled();
     expect(saveServersSpy).not.toHaveBeenCalled();
   });

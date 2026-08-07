@@ -84,3 +84,51 @@ export interface InventorySourceConfig {
 export function inventorySecretKey(sourceId: string, fieldId: string): string {
   return `inventory-source-${sourceId}-${fieldId}`;
 }
+
+/**
+ * Exported (not just used by sourceConfigUnchanged below) because
+ * inventoryCommands.ts's syncNow also uses it directly to compare the vault
+ * secret values captured at fetch time against a re-read taken immediately
+ * before apply (FINDING D) — InventorySourceSecrets is structurally a
+ * Record<string, string>, a subtype of InventorySourceValues, so this
+ * comparator works for both.
+ */
+export function inventorySourceValuesEqual(a: InventorySourceValues, b: InventorySourceValues): boolean {
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every((key) => Object.prototype.hasOwnProperty.call(b, key) && a[key] === b[key]);
+}
+
+function secretFieldIdsEqual(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((id, i) => id === sortedB[i]);
+}
+
+/**
+ * FINDINGS D/E — compares exactly the InventorySourceConfig fields that feed
+ * computeSyncPlan/planToApplication (and the fetchInventory config; secret
+ * VALUES are compared separately against the vault — see
+ * inventoryCommands.ts's post-teardown check, which core cannot perform
+ * itself since it has no vault access). A source record that differs on any
+ * of these must not have a tree fetched under the OLD config applied against
+ * it, even though its id still exists — e.g. a replace-mode config import can
+ * delete and recreate the same source id with an entirely different provider
+ * config while a sync is mid-flight.
+ *
+ * Lives here (not in commands or core) so both `NexusCore.applyInventorySyncPlan`
+ * (the atomic, pre-mutation guard) and `inventoryCommands.ts`'s earlier
+ * fast-fail checks share one comparator — core must not import from commands.
+ */
+export function sourceConfigUnchanged(a: InventorySourceConfig, b: InventorySourceConfig): boolean {
+  return (
+    a.providerId === b.providerId &&
+    a.targetFolder === b.targetFolder &&
+    a.prunePolicy === b.prunePolicy &&
+    a.defaultUsername === b.defaultUsername &&
+    inventorySourceValuesEqual(a.config, b.config) &&
+    secretFieldIdsEqual(a.secretFieldIds, b.secretFieldIds)
+  );
+}
