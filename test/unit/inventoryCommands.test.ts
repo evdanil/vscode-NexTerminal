@@ -659,7 +659,7 @@ describe("inventoryCommands", () => {
       expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBeUndefined();
     });
 
-    it("(REVIEW FINDING 3) a rejected removeInventorySource restores the source record AND the vault credentials that were deleted before the record removal was attempted (kills restore-record-without-credentials)", async () => {
+    it("(REVIEW FINDING 3, updated for the REORDER) a rejected removeInventorySource restores the source record AND the vault credentials that were deleted before the record removal was attempted — and, since disposition now runs AFTER record removal, the owned server is never touched either (kills restore-record-without-credentials; keeps the round-10 spirit that a failed removal leaves a fully-functional source)", async () => {
       const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
       const repo = new InMemoryConfigRepository([owned]);
       const core = new NexusCore(repo);
@@ -673,15 +673,18 @@ describe("inventoryCommands", () => {
 
       mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
 
-      // Only the record-removal persist (the SECOND saveInventorySources call
-      // — the first is the "Keep Servers" applyInventorySyncPlan call, which
-      // must succeed) rejects, so core.removeInventorySource itself rejects
-      // (core rolls the record back in memory; see NexusCore.removeInventorySource).
+      // REORDER — record removal now happens BEFORE server disposition, so
+      // it's the FIRST saveInventorySources call (there is no earlier
+      // applyInventorySyncPlan call to consume call #1 anymore). Rejecting
+      // it makes core.removeInventorySource itself reject (core rolls the
+      // record back in memory; see NexusCore.removeInventorySource) — and
+      // the "Keep Servers" disposition apply that would have been call #2
+      // must never even be attempted.
       const originalSaveInventorySources = repo.saveInventorySources.bind(repo);
       let saveInventorySourcesCallCount = 0;
       vi.spyOn(repo, "saveInventorySources").mockImplementation(async (sources) => {
         saveInventorySourcesCallCount++;
-        if (saveInventorySourcesCallCount === 2) {
+        if (saveInventorySourcesCallCount === 1) {
           throw new Error("disk full");
         }
         return originalSaveInventorySources(sources);
@@ -698,6 +701,126 @@ describe("inventoryCommands", () => {
       expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("tok");
       expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("intact"));
       expect(mockShowInformationMessage).not.toHaveBeenCalled();
+
+      // REORDER (kills disposition-before-removal ordering) — if the old
+      // phase order were still in effect, "Keep Servers" disposition would
+      // have run FIRST and already stripped the server's origin before the
+      // (still-failing) record removal was even attempted. Under the fixed
+      // order, disposition never runs at all here.
+      expect(saveInventorySourcesCallCount).toBe(1);
+      expect(core.getServer("owned-1")?.origin?.sourceId).toBe("src-1");
+      expect(teardown.calls).toEqual([]);
+    });
+
+    it("(FINDING 2) a mid-loop vault.delete rejection for a multi-secret source restores every captured value, leaves the record present, and leaves owned servers untouched (kills a partial-credential exit — the delete loop must be one guarded unit)", async () => {
+      const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          configFields: [
+            { id: "host", label: "Host", type: "string", required: true },
+            { id: "field1", label: "Field 1", type: "password", required: true },
+            { id: "field2", label: "Field 2", type: "password", required: true }
+          ]
+        })
+      );
+      const backingStore = new Map<string, string>([
+        [inventorySecretKey("src-1", "field1"), "tok1"],
+        [inventorySecretKey("src-1", "field2"), "tok2"]
+      ]);
+      let deleteCallCount = 0;
+      const vault = {
+        get: vi.fn(async (key: string) => backingStore.get(key)),
+        store: vi.fn(async (key: string, value: string) => {
+          backingStore.set(key, value);
+        }),
+        delete: vi.fn(async (key: string) => {
+          deleteCallCount++;
+          if (deleteCallCount === 2) {
+            // Second secret's delete rejects — field1's key was already
+            // removed by the first (successful) call in this same loop.
+            throw new Error("keychain unavailable");
+          }
+          backingStore.delete(key);
+        })
+      };
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["field1", "field2"] }));
+
+      mockShowWarningMessage.mockResolvedValueOnce("Delete Servers");
+
+      const cmd = registeredCommands.get("nexus.inventory.removeSource")!;
+      await expect(cmd()).resolves.toBeUndefined();
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Could not remove source credentials"));
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+
+      // If FINDING 2's fix were reverted (the loop runs unguarded, or the
+      // catch doesn't restore ALL captured values), field1's key — deleted
+      // successfully before field2's rejection — would be permanently gone
+      // even though the source and its record are still fully live here.
+      expect(backingStore.get(inventorySecretKey("src-1", "field1"))).toBe("tok1");
+      expect(backingStore.get(inventorySecretKey("src-1", "field2"))).toBe("tok2");
+
+      // The record removal step must never even have been attempted.
+      expect(core.getSnapshot().inventorySources).toHaveLength(1);
+      expect(core.getInventorySource("src-1")?.secretFieldIds).toEqual(["field1", "field2"]);
+
+      // Server disposition (teardown + applyInventorySyncPlan) must never
+      // have been attempted either — the server is untouched.
+      expect(teardown.calls).toEqual([]);
+      expect(core.getSnapshot().servers).toHaveLength(1);
+      expect(core.getServer("owned-1")?.origin?.sourceId).toBe("src-1");
+    });
+
+    it("(FINDING 1 / REORDER) a rejected removeInventorySource leaves owned servers completely untouched — still present, still owning their origin, teardown never invoked (kills disposition-before-removal ordering, where a failed record removal used to leave a live source that could no longer manage anything)", async () => {
+      const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      const vault = makeVault({
+        [inventorySecretKey("src-1", "apiToken")]: "tok",
+        [passwordSecretKey("owned-1")]: "pw",
+        [passphraseSecretKey("owned-1")]: "pp",
+        [proxyPasswordSecretKey("owned-1")]: "proxpw"
+      });
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      mockShowWarningMessage.mockResolvedValueOnce("Delete Servers");
+
+      vi.spyOn(core, "removeInventorySource").mockRejectedValueOnce(new Error("disk full"));
+
+      const cmd = registeredCommands.get("nexus.inventory.removeSource")!;
+      await expect(cmd()).resolves.toBeUndefined();
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("intact"));
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+
+      // Credentials restored (round-10 spirit: a failed removal leaves a
+      // fully-functional source).
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("tok");
+
+      // FINDING 1 — the actual kill assertion: under the OLD phase order,
+      // "Delete Servers" disposition (teardown + applyInventorySyncPlan
+      // removeServerIds) ran BEFORE removeInventorySource, so by the time
+      // removeInventorySource rejected here, "owned-1" and its secrets would
+      // already have been deleted for good — leaving a live, restored source
+      // that owns nothing. Under the fixed order, disposition is never even
+      // attempted once record removal has failed.
+      expect(teardown.calls).toEqual([]);
+      expect(core.getSnapshot().servers).toHaveLength(1);
+      expect(core.getServer("owned-1")?.origin?.sourceId).toBe("src-1");
+      expect(await vault.get(passwordSecretKey("owned-1"))).toBe("pw");
+      expect(await vault.get(passphraseSecretKey("owned-1"))).toBe("pp");
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("proxpw");
     });
 
     it("dismissing the confirm modal removes nothing", async () => {

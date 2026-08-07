@@ -38,7 +38,20 @@ export interface InventorySyncApplication {
   // "source is still the same config" for races that land between plan
   // computation and apply (e.g. a replace-mode config import recreating the
   // same source id mid-sync).
-  expectedSource: InventorySourceConfig;
+  //
+  // REORDER (removeSource Findings 1/2) — "absent" is the removal-disposition
+  // case: the caller (inventoryCommands.ts's removeSource) has ALREADY
+  // removed the source record via removeInventorySource() before calling
+  // this method to dispose of the servers it owned (delete / strip origin),
+  // so apply.sourceId is expected to name NO current source at all. The
+  // semantics differ from the normal case: proceed only if the sources map
+  // truly has no entry for apply.sourceId; if one exists (a replace-mode
+  // import recreated the same id in the gap between the record removal and
+  // this call), throw without mutating anything, protecting the NEW source's
+  // servers from this now-stale disposition. When "absent", lastSyncAt is
+  // never bumped and no source-record entry is written for apply.sourceId
+  // (there is nothing to write it onto).
+  expectedSource: InventorySourceConfig | "absent";
 }
 
 export class NexusCore {
@@ -252,16 +265,28 @@ export class NexusCore {
    * record is still the one the plan was computed for" from "the plan gets
    * applied", closing the race a caller-side check (however recent) can never
    * fully close on its own.
+   *
+   * REORDER — `apply.expectedSource === "absent"` inverts the presence check:
+   * this call must throw if a source record for apply.sourceId DOES exist
+   * (see the field doc on InventorySyncApplication.expectedSource for why).
    */
   public async applyInventorySyncPlan(apply: InventorySyncApplication): Promise<void> {
     const source = this.inventorySources.get(apply.sourceId);
-    if (!source) {
-      throw new Error(`Cannot apply inventory sync: unknown inventory source "${apply.sourceId}".`);
-    }
-    if (!sourceConfigUnchanged(source, apply.expectedSource)) {
-      throw new Error(
-        `Cannot apply inventory sync: inventory source "${apply.sourceId}" configuration changed since the sync was computed.`
-      );
+    if (apply.expectedSource === "absent") {
+      if (source) {
+        throw new Error(
+          `Cannot apply inventory sync: inventory source "${apply.sourceId}" exists (expected it to already be removed).`
+        );
+      }
+    } else {
+      if (!source) {
+        throw new Error(`Cannot apply inventory sync: unknown inventory source "${apply.sourceId}".`);
+      }
+      if (!sourceConfigUnchanged(source, apply.expectedSource)) {
+        throw new Error(
+          `Cannot apply inventory sync: inventory source "${apply.sourceId}" configuration changed since the sync was computed.`
+        );
+      }
     }
     // ITEM 1 — capture everything this call is about to mutate BEFORE
     // touching it, so a rejected persist below can be rolled back completely.
@@ -344,8 +369,16 @@ export class NexusCore {
       this.servers.set(server.id, server);
       batchWrittenServers.set(server.id, cloneServerConfig(server));
     }
-    const writtenSourceRecord = { ...source, lastSyncAt: apply.syncedAt };
-    this.inventorySources.set(source.id, writtenSourceRecord);
+    // REORDER — "absent": there is no source record to bump lastSyncAt on or
+    // write an entry for; writtenSourceRecord stays undefined and the
+    // inventorySources map (and its rollback below) are left completely
+    // alone. The bucket is still included in the persist below (unchanged
+    // content), keeping the existing one-persist-one-emit shape intact
+    // rather than special-casing the "absent" apply into its own save call.
+    const writtenSourceRecord = source ? { ...source, lastSyncAt: apply.syncedAt } : undefined;
+    if (writtenSourceRecord) {
+      this.inventorySources.set(apply.sourceId, writtenSourceRecord);
+    }
 
     // FINDING 1 — keep references to all three save promises and settle ALL
     // of them (Promise.allSettled, not Promise.all) before doing anything
@@ -405,9 +438,11 @@ export class NexusCore {
       // compare here cannot be fooled the way the servers check above could.
       // Restore the source record only if it's still the exact object this
       // batch wrote; a concurrent edit to the same source since must not be
-      // clobbered.
-      if (this.inventorySources.get(source.id) === writtenSourceRecord) {
-        this.inventorySources.set(source.id, source);
+      // clobbered. REORDER — "absent": writtenSourceRecord is undefined, so
+      // this is a no-op, exactly matching "nothing was written, nothing to
+      // roll back".
+      if (writtenSourceRecord && this.inventorySources.get(apply.sourceId) === writtenSourceRecord) {
+        this.inventorySources.set(apply.sourceId, source!);
       }
       // FINDING 1 — all three original saves above have now settled (we
       // awaited allSettled), so it's safe to best-effort re-persist all three

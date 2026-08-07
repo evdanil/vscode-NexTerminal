@@ -298,6 +298,96 @@ describe("NexusCore inventory sources", () => {
     expect(saveServersSpy).not.toHaveBeenCalled();
   });
 
+  it('(REORDER) applyInventorySyncPlan with expectedSource "absent" succeeds when no record exists for sourceId, mutates servers, and does not write a source-record entry (kills an unguarded/incorrectly-blocked absent apply)', async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s",
+        host: "h",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    // Deliberately no addOrUpdateInventorySource("source-1") — the record is
+    // absent, mirroring removeSource calling this AFTER removeInventorySource.
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 9999,
+      upsertServers: [],
+      removeServerIds: ["srv-1"],
+      folders: [],
+      expectedSource: "absent"
+    });
+
+    // Server disposition still applied.
+    expect(core.getSnapshot().servers).toHaveLength(0);
+    expect(listener).toHaveBeenCalledTimes(1);
+    // No source-record entry was created for the absent id (no lastSyncAt to
+    // bump, nothing to enumerate).
+    expect(core.getInventorySource("source-1")).toBeUndefined();
+    expect(core.getSnapshot().inventorySources).toHaveLength(0);
+
+    // If a wrong implementation ignored "absent" and treated it like a normal
+    // apply (or simply skipped the presence semantics entirely), the fetch
+    // above of core.getInventorySource("source-1") could still read
+    // undefined by coincidence — the disposition mutating servers despite
+    // no source ever existing is the assertion that actually exercises the
+    // "absent" branch rather than an early throw.
+  });
+
+  it('(REORDER) applyInventorySyncPlan with expectedSource "absent" THROWS without mutating when a record still exists for sourceId (kills an unguarded absent-apply that would run a stale disposition against a recreated source\'s servers)', async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s",
+        host: "h",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    // A replace-mode import recreated "source-1" between the caller's
+    // removeInventorySource call and this apply.
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", name: "Recreated" }));
+
+    const saveServersSpy = vi.spyOn(repository, "saveServers");
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 9999,
+        upsertServers: [],
+        removeServerIds: ["srv-1"],
+        folders: [],
+        expectedSource: "absent"
+      })
+    ).rejects.toThrow();
+
+    // If the fix were reverted (absent-apply proceeds unconditionally, or
+    // treats "absent" the same as a normal expectedSource comparison that
+    // happens to be skipped), the recreated source's own server would be
+    // wrongly deleted here.
+    expect(core.getSnapshot().servers).toHaveLength(1);
+    expect(core.getServer("srv-1")?.origin?.sourceId).toBe("source-1");
+    expect(core.getInventorySource("source-1")?.name).toBe("Recreated");
+    expect(listener).not.toHaveBeenCalled();
+    expect(saveServersSpy).not.toHaveBeenCalled();
+  });
+
   it("(ITEM 1) applyInventorySyncPlan rolls back servers, explicit groups, active sessions, focus, and the source's lastSyncAt when the persist rejects — and emits nothing (kills mutate-then-leak)", async () => {
     const repository = new InMemoryConfigRepository([
       {

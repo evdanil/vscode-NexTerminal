@@ -676,22 +676,93 @@ export function registerInventoryCommands(
       );
       if (!choice) return;
 
+      // ITEM 6 (carried forward from the pre-reorder flow) — a source config
+      // race landing while the confirm modal was open (e.g. a replace-mode
+      // import) must abort here, before anything is touched. Previously this
+      // fell out incidentally of applyInventorySyncPlan's expectedSource
+      // check, because server disposition ran first and was checked against
+      // the pick-time `source`. Now disposition runs LAST (see the REORDER
+      // comment below) and is checked against "absent" instead — which
+      // guards a different, narrower race — so this same-config guard is now
+      // explicit here, using the same comparator applyInventorySyncPlan used
+      // to use for this purpose.
+      const currentSource = core.getInventorySource(source.id);
+      if (!currentSource || !sourceConfigUnchanged(currentSource, source) || currentSource.name !== source.name) {
+        void vscode.window.showErrorMessage("Inventory source changed while removing — try again.");
+        return;
+      }
+
+      // REORDER (Findings 1 & 2) — new phase order so every failure point
+      // below leaves a coherent, still-fully-functional state:
+      //   1. Capture every secret value this source owns.
+      //   2. Delete the source's own secret keys as ONE guarded unit — a
+      //      mid-loop rejection (a provider with multiple secret fields)
+      //      restores everything captured and stops before the record or any
+      //      owned server is touched (closes FINDING 2 — previously this
+      //      loop sat outside any catch).
+      //   3. Remove the source record itself — a rejection (core restores
+      //      the record in memory; see NexusCore.removeInventorySource)
+      //      restores the credentials too, so the source stays fully usable.
+      //   4. ONLY NOW touch owned servers: runtime teardown + the
+      //      delete/strip-origin disposition. Record removal above can no
+      //      longer fail AFTER servers were already deleted/stripped —
+      //      closes FINDING 1 (previously disposition ran first, so a
+      //      rejected record removal left a live source that could no
+      //      longer manage anything).
+      const capturedSecrets = new Map<string, string>();
+      for (const fieldId of source.secretFieldIds) {
+        const value = await vault.get(inventorySecretKey(source.id, fieldId));
+        if (value !== undefined) {
+          capturedSecrets.set(fieldId, value);
+        }
+      }
+      const restoreCapturedSecrets = async (): Promise<void> => {
+        for (const [fieldId, value] of capturedSecrets) {
+          await vault.store(inventorySecretKey(source.id, fieldId), value).catch(() => undefined);
+        }
+      };
+
+      // FINDING 2 — the entire delete loop is one guarded unit: a rejection
+      // on any key (not just the first) restores every captured value and
+      // stops before the record or any server is touched.
+      try {
+        for (const fieldId of source.secretFieldIds) {
+          await vault.delete(inventorySecretKey(source.id, fieldId));
+        }
+      } catch {
+        await restoreCapturedSecrets();
+        void vscode.window.showErrorMessage("Could not remove source credentials — nothing was changed.");
+        return;
+      }
+
+      try {
+        await core.removeInventorySource(source.id);
+      } catch {
+        // Chosen behavior (documented once, here): fail-closed restore — put
+        // every captured credential back so the source (which core has
+        // already rolled back to still exist) stays fully usable. No server
+        // has been touched yet at this point (FINDING 1), so nothing else
+        // needs restoring.
+        await restoreCapturedSecrets();
+        void vscode.window.showErrorMessage(
+          `Failed to remove inventory source "${source.name}" — the removal did not complete and the source (with its credentials) is intact.`
+        );
+        return;
+      }
+
+      // FINDING 1 — the source record is gone for good now, so record
+      // removal can no longer race server disposition. `expectedSource:
+      // "absent"` still guards a narrower race: a replace-mode import
+      // recreating this exact source id in the gap between the
+      // removeInventorySource call above and this apply. If that happens,
+      // applyInventorySyncPlan throws rather than run this now-stale
+      // disposition against the NEW source's servers.
       if (choice === "Delete Servers") {
         // F1 — teardown running sessions/tunnels/pool connections BEFORE the plan removes
         // the server records, mirroring serverCommands.ts's own remove flow.
         for (const server of owned) {
           await teardown.teardownServerRuntime(server.id);
         }
-        // FINDINGS D/E — `source` is the snapshot taken at the start of this
-        // command, before the confirm modal and teardown awaits; it's the
-        // correct expectedSource here since removeSource never recomputes
-        // against a fresher record the way syncNow does.
-        // ITEM 6 — a source config change racing this call (e.g. import/reset)
-        // makes applyInventorySyncPlan's own atomic expectedSource check
-        // throw; catch it here with a removal-appropriate message instead of
-        // letting it surface as an unhandled command rejection, and stop
-        // before touching any secrets or the source record (no partial
-        // removal).
         try {
           await core.applyInventorySyncPlan({
             sourceId: source.id,
@@ -699,10 +770,18 @@ export function registerInventoryCommands(
             upsertServers: [],
             removeServerIds: owned.map((s) => s.id),
             folders: [],
-            expectedSource: source
+            expectedSource: "absent"
           });
         } catch {
-          void vscode.window.showErrorMessage("Inventory source changed while removing — try again.");
+          // Residue is intentional and harmless: the source record is
+          // already gone, so nothing will ever sync against these servers
+          // again — a dangling origin is inert (the engine only ever acts on
+          // behalf of an existing source), though the tree may keep showing
+          // the synced badge on these servers until they're edited or
+          // removed by hand.
+          void vscode.window.showErrorMessage(
+            `Inventory source "${source.name}" removed, but ${owned.length} linked server${owned.length === 1 ? "" : "s"} could not be cleaned up and may still show the synced badge.`
+          );
           return;
         }
         // ITEM 9 — per-key best-effort: one rejected delete must not strand
@@ -714,7 +793,6 @@ export function registerInventoryCommands(
         }
       } else if (choice === "Keep Servers") {
         const strippedServers = owned.map(({ origin, ...rest }) => rest as ServerConfig);
-        // ITEM 6 — same reasoning as the Delete Servers branch above.
         try {
           await core.applyInventorySyncPlan({
             sourceId: source.id,
@@ -722,51 +800,15 @@ export function registerInventoryCommands(
             upsertServers: strippedServers,
             removeServerIds: [],
             folders: [],
-            expectedSource: source
+            expectedSource: "absent"
           });
         } catch {
-          void vscode.window.showErrorMessage("Inventory source changed while removing — try again.");
+          // Same residue note as the Delete Servers branch above.
+          void vscode.window.showErrorMessage(
+            `Inventory source "${source.name}" removed, but ${owned.length} linked server${owned.length === 1 ? "" : "s"} could not be cleaned up and may still show the synced badge.`
+          );
           return;
         }
-      }
-
-      // FINDING 3 — capture every secret value THIS source owns before
-      // deleting any of them, so a rejected removeInventorySource below (core
-      // itself restores the record in that case — see
-      // NexusCore.removeInventorySource) can be followed by restoring the
-      // credentials too. Without this, a failed record removal left an
-      // in-memory-live source with no way to ever authenticate again.
-      const capturedSecrets = new Map<string, string>();
-      for (const fieldId of source.secretFieldIds) {
-        const value = await vault.get(inventorySecretKey(source.id, fieldId));
-        if (value !== undefined) {
-          capturedSecrets.set(fieldId, value);
-        }
-      }
-      // Delete-keys-before-record order is intentional and load-bearing: if
-      // the process crashes between here and removeInventorySource below, or
-      // if a mid-loop delete itself rejects, the record (never removed yet)
-      // still enumerates every field id via secretFieldIds, so a retry simply
-      // re-attempts the same (now-idempotent) vault deletes. Reversing the
-      // order would let a crash after a committed record removal strand
-      // vault keys that nothing can ever enumerate again.
-      for (const fieldId of source.secretFieldIds) {
-        await vault.delete(inventorySecretKey(source.id, fieldId));
-      }
-      try {
-        await core.removeInventorySource(source.id);
-      } catch {
-        // Chosen behavior (documented once, here): fail-closed restore — put
-        // every captured credential back so the source (which core has
-        // already rolled back to still exist) stays fully usable, rather than
-        // trying to also resurrect only the subset of keys that were deleted.
-        for (const [fieldId, value] of capturedSecrets) {
-          await vault.store(inventorySecretKey(source.id, fieldId), value).catch(() => undefined);
-        }
-        void vscode.window.showErrorMessage(
-          `Failed to remove inventory source "${source.name}" — the removal did not complete and the source (with its credentials) is intact.`
-        );
-        return;
       }
 
       void vscode.window.showInformationMessage(`Inventory source "${source.name}" removed.`);
