@@ -895,7 +895,7 @@ export function registerInventoryCommands(
         // applyInventorySyncPlan) counts entries core refused to touch because
         // current state no longer matched what this disposition expected.
         let skippedCount = 0;
-        let recreatedCount = 0;
+        const recreatedIds = new Set<string>();
         let teardownFailureCount = 0;
         if (choice === "Delete Servers") {
           // FINDING 5 (removal-teardown review, REORDER) — apply the deletion
@@ -954,7 +954,23 @@ export function registerInventoryCommands(
           // even though the servers are already gone for good. Contain each
           // teardown per id, count failures, and keep going regardless; the
           // count is folded into the closing report below.
+          // FINDING (round 22, mirrors syncNow) — nexus.server.edit /
+          // nexus.server.rename deliberately don't take configMutationLock,
+          // so a re-add (upsert) of one of these ids can land in the awaited
+          // window between applyInventorySyncPlan committing above and this
+          // loop's iteration for it running. Re-check the server is actually
+          // still absent immediately before tearing it down — otherwise a
+          // recreated, live server's terminals/tunnels/pool connection would
+          // be killed out from under it. Ids skipped this way are folded into
+          // the same `recreatedIds` set the credential-cleanup loop below
+          // uses, so the final "N re-created server(s)" report counts each id
+          // once even though both loops can independently notice the same
+          // recreation.
           for (const id of removedServerIds) {
+            if (core.getServer(id) !== undefined) {
+              recreatedIds.add(id);
+              continue;
+            }
             try {
               await teardown.teardownServerRuntime(id);
             } catch {
@@ -983,7 +999,7 @@ export function registerInventoryCommands(
           // out of scope.
           for (const id of removedServerIds) {
             if (core.getServer(id) !== undefined) {
-              recreatedCount++;
+              recreatedIds.add(id);
               continue;
             }
             await deleteSecretBestEffort(vault, passwordSecretKey(id));
@@ -1015,7 +1031,7 @@ export function registerInventoryCommands(
           }
         }
 
-        return { ok: true, skippedCount, recreatedCount, teardownFailureCount };
+        return { ok: true, skippedCount, recreatedCount: recreatedIds.size, teardownFailureCount };
       });
       if (!removal.ok) return;
 

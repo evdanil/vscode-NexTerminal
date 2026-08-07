@@ -776,6 +776,64 @@ describe("inventoryCommands", () => {
       );
     });
 
+    it("(round 22 finding) Delete Servers: a server re-added (e.g. by nexus.server.edit, which never takes configMutationLock) right as applyInventorySyncPlan resolves is skipped by the post-apply teardown loop, but teardown still runs for the other removed id (kills an unconditional post-apply teardown sweep that would kill the recreated server's live terminals/tunnels/pool)", async () => {
+      const first = makeServer({
+        id: "owned-1",
+        name: "old-sw-1",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const second = makeServer({
+        id: "owned-2",
+        name: "old-sw-2",
+        host: "10.0.0.2",
+        origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([first, second]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+
+      // Simulate the race the finding describes: nexus.server.edit re-adds
+      // "owned-1" (upsert semantics, no configMutationLock) in the window
+      // right after applyInventorySyncPlan's disposition commits, before the
+      // post-apply teardown loop's iteration for it runs.
+      const originalApply = core.applyInventorySyncPlan.bind(core);
+      vi.spyOn(core, "applyInventorySyncPlan").mockImplementation(async (application) => {
+        const result = await originalApply(application);
+        await core.addOrUpdateServer({ ...first, name: "old-sw-1 (recreated)" });
+        return result;
+      });
+
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      mockShowWarningMessage.mockResolvedValueOnce("Delete Servers");
+
+      const cmd = registeredCommands.get("nexus.inventory.removeSource")!;
+      await cmd();
+
+      // "owned-1" is back (re-created right as the apply resolved) — the
+      // teardown loop must re-check core.getServer("owned-1") and skip it
+      // because it's live again. "owned-2" was never recreated, so teardown
+      // still runs for it. If the fix were reverted to an unconditional
+      // teardown sweep over removedServerIds, "owned-1" would appear here
+      // too, killing the recreated server's live terminals/tunnels/pool.
+      expect(teardown.calls).toEqual(["owned-2"]);
+
+      expect(core.getServer("owned-1")).toBeDefined();
+      expect(core.getServer("owned-2")).toBeUndefined();
+
+      // The recreated id is counted once in the closing report, sharing the
+      // same "re-created server(s)" tally the credential-cleanup loop uses.
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(
+        expect.stringMatching(/1 re-created server.*kept.*credentials/i)
+      );
+    });
+
     it("Keep Servers: origin is stripped and the server survives; the source record and its own secrets are removed (kills keep-still-deleting)", async () => {
       const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
       const repo = new InMemoryConfigRepository([owned]);
