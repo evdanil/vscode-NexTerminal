@@ -2155,6 +2155,83 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(finalRecord?.name).toBe("Renamed By Concurrent Command");
   });
 
+  it("(P2, edit-rollback reference-sharing review) leaves a concurrent IN-PLACE mutation of the live record intact when the submission enabled openFileExplorerOnFirstConnect — comparing against a live shared reference would trivially 'match' any mutation applied to it (kills the shared-reference comparison: reverted to `serverConfigsEqual(currentRecord, updated)`, this test fails)", async () => {
+    const { ctx, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ group: "orig-group" })],
+      initialSecrets: {}
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Gate the proxy-secret write so a concurrent in-place mutation can
+    // land on the live record while it's still pending.
+    let rejectSecretWrite!: (err: unknown) => void;
+    secretStore.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { rejectSecretWrite = reject; })
+    );
+
+    const submitPromise = options.onSubmit({
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      // Enabling this flag is what makes NexusCore.addOrUpdateServer store
+      // the submitted `updated` object BY REFERENCE (its `next = server`
+      // branch, see src/core/nexusCore.ts) — the harness's addOrUpdateServer
+      // mock mirrors that by pushing the exact `server` argument into the
+      // snapshot array. Required to reproduce the shared-reference hazard.
+      openFileExplorerOnFirstConnect: true,
+      proxyType: "socks5",
+      proxySocks5Host: "new-proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: "proxyuser",
+      proxySocks5Password: "new-proxy-pw"
+    });
+
+    // Let onSubmit's own addOrUpdateServer(updated) land — `updated` is now
+    // the exact object sitting in the (mock) servers map — and let
+    // syncProxyPasswordSecret reach the gated write.
+    await delay(10);
+
+    // Simulate a concurrent in-place mutation of the LIVE record — exactly
+    // what NexusCore._renameFolderPath does in production: it rewrites
+    // `.group` on whatever object is already sitting in the servers map,
+    // without replacing the object reference (see
+    // src/core/nexusCore.ts:_renameFolderPath). Because addOrUpdateServer
+    // stored `updated` itself (not a clone) when the flag is enabled, this
+    // mutates the SAME object the onSubmit closure still holds as `updated`.
+    const live = ctx.core.getServer("srv-1")!;
+    live.group = "renamed-group";
+
+    rejectSecretWrite(new Error("keychain unavailable"));
+
+    await expect(submitPromise).rejects.toThrow(/changes were not saved/i);
+
+    // Kill check: against a reverted implementation that compares
+    // `serverConfigsEqual(currentRecord, updated)` — instead of a detached
+    // snapshot captured right after the persist — `currentRecord` and
+    // `updated` are literally the SAME object here, so the in-place
+    // mutation above changed both comparands identically and the equality
+    // check trivially holds no matter what changed. The rollback would then
+    // wrongly conclude "still owned by this submission" and restore the
+    // PRE-edit liveRecord (group: "orig-group"), silently erasing the
+    // concurrent rename. This assertion only passes when the rollback
+    // compared against a DETACHED snapshot instead and correctly left the
+    // concurrently-renamed record alone.
+    const finalRecord = ctx.core.getServer("srv-1");
+    expect(finalRecord?.group).toBe("renamed-group");
+  });
+
   it("(FINDING 1, P2) still restores the prior record when nothing concurrent touched it (no-concurrent-change case stays green)", async () => {
     const { ctx, secretStore } = setupHarness({
       profiles: [],

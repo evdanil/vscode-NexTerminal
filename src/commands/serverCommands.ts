@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { AuthProfile, AuthType, ProxyConfig, ServerConfig } from "../models/config";
-import { serverConfigsEqual } from "../models/config";
+import { cloneServerConfig, serverConfigsEqual } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
@@ -1090,6 +1090,24 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               ? ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect && s.id !== updated.id)
               : undefined;
             await ctx.core.addOrUpdateServer(updated);
+            // FINDING (P2, edit-rollback reference-sharing review) — when
+            // `updated` enables openFileExplorerOnFirstConnect,
+            // addOrUpdateServer stores `updated` itself into the live
+            // servers map (no clone — see its `next = server` branch), so
+            // `updated` and ctx.core.getServer(existing.id) become THE SAME
+            // object reference. An in-place mutator running during the
+            // pending secret write below (e.g. _renameFolderPath rewriting
+            // `.group` on whatever object currently sits in the map) then
+            // mutates both comparands at once: the "stillOwnedByThisSubmission"
+            // check a few lines down would stay true no matter what changed,
+            // because it would literally be comparing the live record to
+            // itself. Capture a DETACHED structural snapshot (cloneServerConfig)
+            // of this generation right here, before any such mutation can
+            // reach it, and compare the live record against THAT below —
+            // mirroring the same fix already applied in
+            // NexusCore.applyInventorySyncPlan (see cloneServerConfig's own
+            // doc comment).
+            const writtenSnapshot = cloneServerConfig(updated);
             try {
               await syncProxyPasswordSecret(ctx, updated.id, values);
             } catch {
@@ -1116,15 +1134,20 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               // it: only restore/remove when the CURRENT live record is
               // still structurally exactly what THIS submission's
               // addOrUpdateServer(updated) call wrote (serverConfigsEqual
-              // against `updated` — the simplest reliable check, since
-              // addOrUpdateServer stores either `updated` itself or a
-              // one-field clone of it verbatim, never a transformed copy).
-              // If it differs (or the record is gone for a reason other than
-              // this generation's own write), something else already
-              // legitimately changed it — leave it untouched.
+              // against `writtenSnapshot`, the DETACHED clone captured
+              // immediately after that write — not the live `updated`
+              // reference itself, which addOrUpdateServer may have stored
+              // verbatim into the servers map when openFileExplorerOnFirstConnect
+              // is enabled; comparing against that shared reference would
+              // trivially "match" any in-place mutation applied to it in the
+              // meantime, e.g. _renameFolderPath rewriting `.group`, and
+              // silently undo a legitimate concurrent change). If it differs
+              // (or the record is gone for a reason other than this
+              // generation's own write), something else already legitimately
+              // changed it — leave it untouched.
               try {
                 const currentRecord = ctx.core.getServer(existing.id);
-                const stillOwnedByThisSubmission = currentRecord !== undefined && serverConfigsEqual(currentRecord, updated);
+                const stillOwnedByThisSubmission = currentRecord !== undefined && serverConfigsEqual(currentRecord, writtenSnapshot);
                 if (stillOwnedByThisSubmission) {
                   if (liveRecord) {
                     await ctx.core.addOrUpdateServer(liveRecord);
