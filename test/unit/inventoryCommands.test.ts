@@ -1375,6 +1375,74 @@ describe("inventoryCommands", () => {
       expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
     });
 
+    it("ROUND 24 FIX (P1, pre-apply-shouldAbort review) — the pre-apply sweep disconnects the pooled SSH connection for a delete candidate, not just its terminals/tunnels (kills the always-true `() => core.getServer(id) !== undefined` predicate: pre-apply, every removal candidate still exists in core by construction, so that predicate is unconditionally true and would silently make teardownServerRuntime skip sshPool.disconnect on every pre-apply call)", async () => {
+      const pruned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([pruned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+
+      const callOrder: string[] = [];
+      const originalApply = core.applyInventorySyncPlan.bind(core);
+      vi.spyOn(core, "applyInventorySyncPlan").mockImplementation(async (application) => {
+        callOrder.push("apply");
+        return originalApply(application);
+      });
+
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) // device gone -> prune "delete"
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+
+      // Realistic stand-in for the real teardownServerRuntime (see
+      // serverCommands.ts): honors the exact `shouldAbort` contract that
+      // function documents — its final step, disconnecting the pooled SSH
+      // connection, is skipped iff `shouldAbort()` returns true. That's the
+      // one piece of the real function's behavior the bug in
+      // inventoryCommands.ts's pre-apply call site actually breaks; the
+      // plain `vi.fn` stand-ins used elsewhere in this file swallow the
+      // `shouldAbort` argument entirely and can't observe it.
+      const disconnectCalls: string[] = [];
+      const teardown = {
+        teardownServerRuntime: vi.fn(async (serverId: string, shouldAbort?: () => boolean) => {
+          callOrder.push(`teardown:${serverId}`);
+          if (shouldAbort?.()) return;
+          disconnectCalls.push(serverId);
+          callOrder.push(`disconnect:${serverId}`);
+        })
+      };
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete" }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      // The pre-apply sweep's teardown call for "owned-1" must disconnect the
+      // pooled connection BEFORE applyInventorySyncPlan ever runs. Against
+      // the reverted (buggy) call site —
+      // `teardown.teardownServerRuntime(id, () => core.getServer(id) !== undefined)`
+      // — "owned-1" is still present in core at the moment the pre-apply
+      // sweep runs (the apply hasn't happened yet), so that predicate is
+      // unconditionally true there and the disconnect never fires from this
+      // sweep — only later, from the post-apply sweep, once the record is
+      // actually gone. That failure mode is exactly what this assertion
+      // catches: the first "disconnect:owned-1" would land AFTER "apply" in
+      // callOrder instead of before it.
+      expect(disconnectCalls).toContain("owned-1");
+      const firstDisconnectIndex = callOrder.indexOf("disconnect:owned-1");
+      const applyIndex = callOrder.indexOf("apply");
+      expect(firstDisconnectIndex).toBeGreaterThanOrEqual(0);
+      expect(firstDisconnectIndex).toBeLessThan(applyIndex);
+    });
+
     it("FINDING 1 (P2, reconnect-during-prune review) — a reconnect landing in the window between the pre-apply teardown and the apply gets caught by a second best-effort teardown pass run AFTER the apply resolves, over the ids the apply actually removed (kills a single-pass teardown that lets such a reconnect survive the delete-prune)", async () => {
       const pruned = makeServer({
         id: "owned-1",

@@ -55,8 +55,16 @@ import { mostCommonUsername } from "./configCommands";
  * straight through to teardownServerRuntime, which rechecks it after its own
  * internal awaits (see that function's doc) — a pre-teardown-only absence
  * check at the call site can't protect against a replacement created DURING
- * teardown's own awaited tunnel stops. All three inventory call sites below
- * pass `() => core.getServer(id) !== undefined`.
+ * teardown's own awaited tunnel stops. The two POST-apply inventory call
+ * sites (syncNow's second sweep, removeSource's Delete Servers loop) pass
+ * `() => core.getServer(id) !== undefined` — existence there genuinely means
+ * a concurrent recreate raced the apply. syncNow's PRE-apply sweep
+ * (ROUND 24 FIX, P1, pre-apply-shouldAbort review) passes no shouldAbort at
+ * all: before applyInventorySyncPlan runs, every id in its removal candidate
+ * list still exists in core by construction, so that same predicate would be
+ * unconditionally true there and silently skip sshPool.disconnect on every
+ * call — there is no "recreated mid-teardown" signal to guard against this
+ * early, so teardown runs unconditionally.
  */
 export interface InventoryRuntimeTeardown {
   teardownServerRuntime(serverId: string, shouldAbort?: () => boolean): Promise<void>;
@@ -1268,11 +1276,18 @@ export function registerInventoryCommands(
           for (const id of application.removeServerIds) {
             if (tornDownIds.has(id)) continue;
             try {
-              // FINDING 2 (P2, mid-teardown-recheck review) — shouldAbort lets
-              // teardownServerRuntime recheck between its own internal awaits,
-              // so a server recreated while its tunnel stops were in flight
-              // doesn't get its fresh pooled SSH connection disconnected.
-              await teardown.teardownServerRuntime(id, () => core.getServer(id) !== undefined);
+              // ROUND 24 FIX (P1, pre-apply-shouldAbort review) — no shouldAbort
+              // here: applyInventorySyncPlan hasn't run yet, so every id in
+              // `application.removeServerIds` still exists in core by
+              // definition — `() => core.getServer(id) !== undefined` would be
+              // unconditionally true and silently skip sshPool.disconnect on
+              // every call through this sweep (masked on the success path only
+              // because the post-apply sweep below disconnects it instead; on
+              // every abort path after this — credential recheck, final
+              // recompute mismatch, persist rejection — the pooled connection
+              // would leak). There is no "recreated mid-teardown" signal to
+              // guard against pre-apply, so teardown runs unconditionally.
+              await teardown.teardownServerRuntime(id);
             } catch {
               teardownFailedIds.add(id);
             }
