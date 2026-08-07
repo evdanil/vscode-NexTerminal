@@ -334,10 +334,20 @@ export class NexusCore {
    * emptiness reflects the POST-sync state, not the pre-sync one). Removes
    * explicit folders STRICTLY under `targetFolder` (never `targetFolder`
    * itself — that stays even if momentarily empty) that are:
+   *   - in `ownedCandidates` (REVIEW FINDING 1, P2 — the source's OWN prior
+   *     `managedFolders`, minus the folders this very sync still names; see
+   *     applyInventorySyncPlan's call site). A folder never named by any of
+   *     this source's own past applies is NEVER a candidate here, however
+   *     empty it is — it might be a manually-created folder the user
+   *     deliberately keeps empty (e.g. a staging area under the same
+   *     targetFolder), or one owned by a completely different source. GC
+   *     only ever reclaims a folder that this source itself created and has
+   *     since stopped naming — never sweeps unowned territory,
    *   - not in `keepFolders` (the application's own `folders` list, with
    *     ancestors included) — a folder this very sync still names must never
    *     be GC'd out from under it just because it happens to be empty this
-   *     run, and
+   *     run (this is implied by `ownedCandidates` already excluding the new
+   *     managed set, kept here too as defense-in-depth), and
    *   - completely empty: no server (ANY origin — manual or synced from a
    *     DIFFERENT source), serial profile, or local-shell profile currently
    *     assigned to it, AND no descendant folder that is itself still
@@ -365,11 +375,15 @@ export class NexusCore {
    * `addedExplicitGroups` conditional-restore machinery to a mirrored
    * `removedEmptyGroups` one for exactly this reason).
    */
-  private pruneEmptyFoldersUnderTarget(targetFolder: string, keepFolders: ReadonlySet<string>): Set<string> {
+  private pruneEmptyFoldersUnderTarget(
+    targetFolder: string,
+    keepFolders: ReadonlySet<string>,
+    ownedCandidates: ReadonlySet<string>
+  ): Set<string> {
     const removed = new Set<string>();
     const prefix = `${targetFolder}/`;
     const candidates = [...this.explicitGroups]
-      .filter((group) => group !== targetFolder && group.startsWith(prefix) && !keepFolders.has(group))
+      .filter((group) => group !== targetFolder && group.startsWith(prefix) && !keepFolders.has(group) && ownedCandidates.has(group))
       .sort((a, b) => b.split("/").length - a.split("/").length);
 
     for (const candidate of candidates) {
@@ -643,6 +657,30 @@ export class NexusCore {
       this.servers.set(server.id, server);
       batchWrittenServers.set(server.id, cloneServerConfig(server));
     }
+    // REVIEW FINDING 1 (P2, folder-GC ownership) — the new `managedFolders`
+    // set this apply stamps onto the source record: exactly the members of
+    // `applicationFolderSet` that fall STRICTLY under `source.targetFolder`
+    // (the ancestors-included set already computed above; a root ("")
+    // targetFolder naturally yields an empty set here, since no folder path
+    // starts with "/", matching GC's own root exemption below). This
+    // REPLACES the source's previous `managedFolders` wholesale — it is a
+    // snapshot of what THIS sync's own `folders` list names, not an
+    // accumulating history, so a folder this sync stops naming (e.g. a
+    // renamed rack) drops out of the managed set on this very apply.
+    //
+    // `gcOwnedCandidates` — the previous managed set (empty for a legacy
+    // record, or a source's first-ever non-"absent" apply — nothing to diff
+    // against yet) MINUS the new one: folders this source itself created on
+    // some prior sync and has now stopped naming. Only these are eligible
+    // for GC below; a folder never in the source's own managed history
+    // (hand-created by the user, or owned by a DIFFERENT source under the
+    // same targetFolder) is never touched, however empty it is.
+    const newManagedFolders: Set<string> =
+      source && source.targetFolder !== ""
+        ? new Set([...applicationFolderSet].filter((f) => f.startsWith(`${source.targetFolder}/`)))
+        : new Set<string>();
+    const previousManagedFolders = new Set(source?.managedFolders ?? []);
+    const gcOwnedCandidates = new Set([...previousManagedFolders].filter((f) => !newManagedFolders.has(f)));
     // ITEM B (empty-folder GC) — runs synchronously here, in the mutation
     // phase, AFTER the upserts/removes above so it sees the POST-sync server
     // set. Scoped to non-"absent" applications only (REMOVAL disposition
@@ -657,7 +695,7 @@ export class NexusCore {
     // workspace, not just this source's own subtree.
     const removedEmptyGroups: Set<string> =
       apply.expectedSource !== "absent" && source && source.targetFolder !== ""
-        ? this.pruneEmptyFoldersUnderTarget(source.targetFolder, applicationFolderSet)
+        ? this.pruneEmptyFoldersUnderTarget(source.targetFolder, applicationFolderSet, gcOwnedCandidates)
         : new Set<string>();
     // FINDING 4 (focus review) — same conditional-restore principle as
     // servers/groups above, applied to focusedSessionId: record what THIS
@@ -675,7 +713,14 @@ export class NexusCore {
     // alone. The bucket is still included in the persist below (unchanged
     // content), keeping the existing one-persist-one-emit shape intact
     // rather than special-casing the "absent" apply into its own save call.
-    const writtenSourceRecord = source ? { ...source, lastSyncAt: apply.syncedAt } : undefined;
+    //
+    // REVIEW FINDING 1 (P2, folder-GC ownership) — `managedFolders` is
+    // stamped here, in the SAME object/write as the `lastSyncAt` bump, so it
+    // shares that field's revision semantics: this is a routine sync stamp,
+    // not a new incarnation of the record, so `revision` is deliberately NOT
+    // touched (addOrUpdateInventorySource remains the only place a live
+    // record's revision is ever reassigned — see that method's doc).
+    const writtenSourceRecord = source ? { ...source, lastSyncAt: apply.syncedAt, managedFolders: [...newManagedFolders] } : undefined;
     if (writtenSourceRecord) {
       this.inventorySources.set(apply.sourceId, writtenSourceRecord);
     }
@@ -828,7 +873,13 @@ export class NexusCore {
       // batch wrote; a concurrent edit to the same source since must not be
       // clobbered. REORDER — "absent": writtenSourceRecord is undefined, so
       // this is a no-op, exactly matching "nothing was written, nothing to
-      // roll back".
+      // roll back". REVIEW FINDING 1 (P2, folder-GC ownership) —
+      // `managedFolders` rides along for free here: `source!` is the whole
+      // pre-apply record (this apply's mutation phase only ever builds a
+      // NEW `writtenSourceRecord` object — see above — it never mutates
+      // `source` in place), so restoring it wholesale also reverts
+      // `managedFolders` to its pre-apply value, exactly as it must on a
+      // rejected persist.
       if (writtenSourceRecord && this.inventorySources.get(apply.sourceId) === writtenSourceRecord) {
         this.inventorySources.set(apply.sourceId, source!);
       }

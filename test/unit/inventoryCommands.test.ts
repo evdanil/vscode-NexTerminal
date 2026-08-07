@@ -685,6 +685,47 @@ describe("inventoryCommands", () => {
       expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("old-token");
     });
 
+    it("REVIEW FINDING 2 (P2) — a rejecting vault.get during the Test button's kept-secret hydration is caught and shown as a keychain failure, never an unhandled rejection (kills the escaping await)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      // Simulate a SecretStorage backend failure (e.g. the OS keychain is
+      // locked/unavailable) for exactly the hydration read handleFormTest
+      // performs for a blank, previously-saved secret field.
+      vault.get.mockRejectedValueOnce(new Error("keychain locked"));
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", config: { host: "netbox.local" }, secretFieldIds: ["apiToken"] }));
+
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd();
+      const { onTest } = latestFormCall();
+
+      const values: FormValues = {
+        name: "My Source",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "" // left blank -> triggers vault hydration
+      };
+
+      // If the rejection escaped handleFormTest unhandled, this await itself
+      // would reject (or the test would fail via an unhandled-rejection
+      // reporter) instead of resolving normally with the failure surfaced
+      // through the UI.
+      await expect(onTest!(values)).resolves.toBeUndefined();
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        expect.stringContaining("Could not read saved credentials from the system keychain")
+      );
+      // The hydration failure must abort before ever calling the provider's
+      // testConnection with a possibly-incomplete secret set.
+      expect(provider.testConnection).not.toHaveBeenCalled();
+    });
+
     it("F3 — a mismatched providerFingerprint shows the same Continue/Cancel gate syncNow uses BEFORE the form opens; Cancel aborts editing with no vault read and no form (kills ungated Test-button secret hydration)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
@@ -2117,7 +2158,13 @@ describe("inventoryCommands", () => {
       registry.register(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
-      await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", prunePolicy: "orphan" }));
+      // REVIEW FINDING 1 (P2, folder-GC ownership) — GC now only reclaims a
+      // folder that appears in THIS source's own `managedFolders` (what its
+      // own prior sync's `folders` list named); seed it here too, mirroring
+      // the explicitGroups seed just above, so "Infra/RackA" is recognized
+      // as this source's own abandoned folder rather than an unowned one
+      // that a no-op/first sync would now correctly leave untouched.
+      await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", prunePolicy: "orphan", managedFolders: ["Infra/RackA"] }));
 
       mockShowInformationMessage.mockResolvedValueOnce("Apply");
 

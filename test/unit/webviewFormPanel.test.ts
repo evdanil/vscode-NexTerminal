@@ -115,6 +115,38 @@ describe("WebviewFormPanel submit handling", () => {
     expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "fillFields" }));
   });
 
+  it("REVIEW FINDING 2 (P2) — a rejecting onTest is caught and shown as 'Test failed: ...' instead of escaping as an unhandled rejection (kills the uncaught onTest await)", async () => {
+    const onSubmit = vi.fn();
+    const onTest = vi.fn().mockRejectedValueOnce(new Error("vault read failed"));
+
+    WebviewFormPanel.open("panel-test-reject", { title: "Test", fields: [] }, { onSubmit, onTest });
+    expect(messageHandler).toBeDefined();
+
+    // Without a try/catch around the onTest await, this same call would
+    // reject instead of resolving — the messageHandler's own returned
+    // promise would carry the rejection straight out to whatever (nothing,
+    // in the real onDidReceiveMessage case) is watching it.
+    await expect(Promise.resolve(messageHandler!({ type: "test", values: {} }))).resolves.toBeUndefined();
+
+    expect(onTest).toHaveBeenCalledWith({});
+    expect(showErrorMessage).toHaveBeenCalledWith("Test failed: vault read failed");
+    // A failed Test must never dispose the still-open form.
+    expect(panelDispose).not.toHaveBeenCalled();
+  });
+
+  it("does not show an error when onTest resolves normally", async () => {
+    const onSubmit = vi.fn();
+    const onTest = vi.fn().mockResolvedValue(undefined);
+
+    WebviewFormPanel.open("panel-test-ok", { title: "Test", fields: [] }, { onSubmit, onTest });
+    expect(messageHandler).toBeDefined();
+
+    await Promise.resolve(messageHandler!({ type: "test", values: {} }));
+
+    expect(onTest).toHaveBeenCalledWith({});
+    expect(showErrorMessage).not.toHaveBeenCalled();
+  });
+
   it("supports disposal listeners for external cleanup", () => {
     const onSubmit = vi.fn();
     const panel = WebviewFormPanel.open("panel-dispose-listener", { title: "Dispose", fields: [] }, { onSubmit });

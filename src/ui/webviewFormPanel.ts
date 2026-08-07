@@ -75,7 +75,21 @@ export class WebviewFormPanel {
         }
       }
       if (message.type === "test" && this.onTest) {
-        await Promise.resolve(this.onTest(message.values));
+        // REVIEW FINDING 2 (P2) — mirrors the `submit` handler's try/catch
+        // above: an onTest implementation that lets a rejection escape (e.g.
+        // a vault/SecretStorage read, or a forwarded command execution) must
+        // never become an unhandled promise rejection inside this
+        // fire-and-forget onDidReceiveMessage callback. Individual onTest
+        // implementations are expected to report their own failures through
+        // a more specific UI (see inventoryCommands.ts's handleFormTest), so
+        // this is a last-resort safety net, not the primary failure path —
+        // it only fires for an onTest that itself forgot to catch something.
+        try {
+          await Promise.resolve(this.onTest(message.values));
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          void vscode.window.showErrorMessage(`Test failed: ${msg}`);
+        }
       }
     });
 

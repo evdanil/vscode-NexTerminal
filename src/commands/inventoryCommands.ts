@@ -913,11 +913,27 @@ export function registerInventoryCommands(
     }
     const secretsForTest: InventorySourceSecrets = { ...parsed.secrets };
     if (hydrateFrom) {
-      for (const fieldId of hydrateFrom.secretFieldIds) {
-        if (secretsForTest[fieldId] === undefined) {
-          const stored = await vault.get(inventorySecretKey(hydrateFrom.id, fieldId));
-          if (stored !== undefined) secretsForTest[fieldId] = stored;
+      // REVIEW FINDING 2 (P2) — a rejecting SecretStorage.get here (vault
+      // hydration of a kept/blank secret field) must not escape this
+      // function: WebviewFormPanel's "test" message handler awaits onTest
+      // with no catch of its own (see that file), so an uncaught rejection
+      // here becomes a genuine unhandled promise rejection with no feedback
+      // ever reaching the still-open form. Surface it through the exact same
+      // failure UI a failed provider.testConnection uses — a plain
+      // showErrorMessage("Connection test failed: ...") — rather than adding
+      // a second, differently-shaped error path.
+      try {
+        for (const fieldId of hydrateFrom.secretFieldIds) {
+          if (secretsForTest[fieldId] === undefined) {
+            const stored = await vault.get(inventorySecretKey(hydrateFrom.id, fieldId));
+            if (stored !== undefined) secretsForTest[fieldId] = stored;
+          }
         }
+      } catch {
+        void vscode.window.showErrorMessage(
+          "Connection test failed: Could not read saved credentials from the system keychain — re-enter them or try again."
+        );
+        return;
       }
     }
     const name = typeof values.name === "string" && values.name.trim() ? values.name.trim() : fallbackName;

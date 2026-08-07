@@ -140,6 +140,16 @@ export function validateInventorySource(item: unknown): item is InventorySourceC
   if (obj.providerFingerprint !== undefined && !isNonEmptyString(obj.providerFingerprint)) {
     return false;
   }
+  // REVIEW FINDING 1 (P2, folder-GC ownership) — optional for backward
+  // compat, same reasoning as `revision`/`providerFingerprint` above: a
+  // record persisted before this field existed (or one that has never
+  // completed a sync) simply has none. When present, every entry must be a
+  // string (folder paths — not otherwise validated here, mirroring
+  // `secretFieldIds` just above; applyInventorySyncPlan only ever writes
+  // paths it itself normalized).
+  if (obj.managedFolders !== undefined && (!Array.isArray(obj.managedFolders) || !obj.managedFolders.every((v) => typeof v === "string"))) {
+    return false;
+  }
   return true;
 }
 

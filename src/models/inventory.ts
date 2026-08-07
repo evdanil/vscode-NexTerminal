@@ -112,6 +112,37 @@ export interface InventorySourceConfig {
   // silently on that source's first successful sync afterward (nothing to
   // compare it against yet, so no warning is shown).
   providerFingerprint?: string;
+  // REVIEW FINDING 1 (P2, folder-GC ownership) — the folder paths (strictly
+  // under `targetFolder`, ancestors included) that THIS source's own syncs
+  // have created/used, as of the most recent `applyInventorySyncPlan` call
+  // (non-"absent" mode only). Recomputed and overwritten wholesale on every
+  // such apply — it is a snapshot of "what this sync's own `folders` list
+  // named", not an accumulating history — so a folder this source stops
+  // naming (e.g. a renamed rack) drops out of the set on the very sync that
+  // stops naming it, making it eligible for GC on that same pass.
+  //
+  // Exists so `pruneEmptyFoldersUnderTarget` can tell "a folder THIS source
+  // created and then abandoned" (safe to GC when empty) apart from "a folder
+  // that happens to be empty right now" (never safe to GC on that basis
+  // alone — it could be a manually-created folder the user deliberately
+  // keeps empty, like a staging area, or a folder owned by a DIFFERENT
+  // source under the same targetFolder). Only paths ever present in a
+  // source's own `managedFolders` are GC candidates for that source; an
+  // explicit folder never named by any of this source's applies is never
+  // touched, however empty it is.
+  //
+  // Optional for backward compatibility: a source record persisted before
+  // this field existed (or one that has simply never completed a
+  // non-"absent" apply) has none. `applyInventorySyncPlan` treats a missing
+  // `managedFolders` as an empty set for the purpose of computing GC
+  // candidates — so a legacy/first sync stamps the set for the first time
+  // but removes NOTHING as a side effect of that stamping (there is no prior
+  // set to diff against yet). removeSource deletes the source record
+  // wholesale, so `managedFolders` dies with it — any folders it names are
+  // left behind, exactly like the rest of the source's bookkeeping (this
+  // mirrors the already-documented behavior of leaving synced servers'
+  // folders alone on source removal).
+  managedFolders?: string[];
 }
 
 /**
