@@ -553,5 +553,90 @@ describe("inventoryCommands", () => {
       expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Edit the source"));
       expect(provider.fetchInventory).not.toHaveBeenCalled();
     });
+
+    it("(FIX 3) the confirm modal aggregates manual-duplicate matches into a single count line (kills omitting the aggregate line from the modal)", async () => {
+      const manual = makeServer({ id: "manual-1", name: "hand-added", host: "10.0.0.5", port: 22 });
+      const repo = new InMemoryConfigRepository([manual]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1,
+          devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh", host: "10.0.0.5", port: 22 }] }]
+        }))
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      // The manual-duplicate match also produces a per-device warning, so the
+      // post-apply "N warnings during sync" toast fires too.
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      const [, options] = mockShowInformationMessage.mock.calls[0] as [string, { detail: string }];
+      expect(options.detail).toContain("1 devices match existing manual servers and will be added as duplicates.");
+    });
+
+    it("(F16) the prune-delete confirm modal surfaces the SSH jump-host dependents count (kills dropping countJumpHostDependents from the modal)", async () => {
+      const pruned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const dependent = makeServer({
+        id: "dependent-1",
+        name: "jump-user",
+        host: "10.0.0.50",
+        proxy: { type: "ssh", jumpHostId: "owned-1" }
+      });
+      const repo = new InMemoryConfigRepository([pruned, dependent]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({ fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete" }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      const [, options] = mockShowInformationMessage.mock.calls[0] as [string, { detail: string }];
+      expect(options.detail).toContain("1 other server");
+      expect(options.detail.toLowerCase()).toContain("jump host");
+    });
+
+    it("(F8) a provider returning a malformed inventory tree surfaces a protocol error and leaves core state unchanged (kills removing validateInventoryTree from syncNow)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async () => ({ devices: null }) as unknown as InventoryTree)
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      const beforeSnapshot = core.getSnapshot();
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Unexpected response"));
+      expect(core.getSnapshot().servers).toEqual(beforeSnapshot.servers);
+      expect(core.getInventorySource("src-1")?.lastSyncAt).toBeUndefined();
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    });
   });
 });

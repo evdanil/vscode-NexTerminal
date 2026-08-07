@@ -174,6 +174,10 @@ function validatePagedShape(json: unknown, url: URL): PagedResult {
 
 interface CapState {
   remaining: number;
+  // FIX 2 — set exactly once, at the moment the hard cap actually stops
+  // collection, so fetchInventoryImpl can mark the returned tree `truncated`
+  // without re-deriving it from warning text.
+  hitCap: boolean;
 }
 
 /**
@@ -233,8 +237,23 @@ async function fetchAllPages(
 
     if (capState.remaining <= 0) {
       warnings.push(`Truncated at ${HARD_CAP} devices — narrow the filter.`);
+      capState.hitCap = true;
       break;
     }
+  }
+
+  // FIX 2 — the loop above can also exit because `iterations` hit
+  // MAX_ITERATIONS while the server still reports more devices than we
+  // collected. That is NOT the (already-warned) hard-cap path — it means
+  // NetBox kept sending short/odd-sized pages and pagination gave up early.
+  // Silently returning a partial list here is indistinguishable, downstream,
+  // from every uncollected device having been deleted at the source, so this
+  // aborts loudly instead — same spirit as the empty-page throw above.
+  if (collected.length < Math.min(count, HARD_CAP) && !capState.hitCap) {
+    throw new InventoryProviderError(
+      "protocol",
+      `NetBox pagination for ${baseUrl}${path} stopped after ${iterations} page(s) having collected ${collected.length} of ${count} reported devices — aborting rather than returning a truncated inventory.`
+    );
   }
 
   return collected;
@@ -290,15 +309,23 @@ function vmVars(raw: Record<string, unknown>): Record<string, string> {
   };
 }
 
+/**
+ * FIX 1 — a device/VM missing a name or a usable primary IP is still emitted
+ * into the tree (with an empty `endpoints` array) rather than dropped
+ * entirely. Dropping it would make the sync engine believe the device no
+ * longer exists at the source, pruning the server it previously created even
+ * though the device is merely unmappable this fetch — data loss for a purely
+ * cosmetic NetBox data-quality issue. Only an entry with no `id` at all (no
+ * way to construct a stable externalId) is genuinely dropped.
+ */
 function mapEntry(raw: unknown, template: string, kind: "device" | "vm"): InventoryDevice | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const obj = raw as Record<string, unknown>;
+  if (obj.id === undefined || obj.id === null) return undefined;
   const name = typeof obj.name === "string" ? obj.name : "";
   const primaryIp = obj.primary_ip as { address?: unknown } | null | undefined;
   const address = primaryIp && typeof primaryIp === "object" ? primaryIp.address : undefined;
-  if (!name || typeof address !== "string" || !address) {
-    return undefined;
-  }
+  const usable = Boolean(name) && typeof address === "string" && address.length > 0;
   const vars = kind === "device" ? deviceVars(obj) : vmVars(obj);
   const folderPath = renderFolderTemplate(template, vars);
   return {
@@ -307,7 +334,7 @@ function mapEntry(raw: unknown, template: string, kind: "device" | "vm"): Invent
     externalId: `${kind}:${String(obj.id)}`,
     name,
     folderPath: folderPath || undefined,
-    endpoints: [{ kind: "ssh", host: stripCidr(address), port: 22 }]
+    endpoints: usable ? [{ kind: "ssh", host: stripCidr(address as string), port: 22 }] : []
   };
 }
 
@@ -348,7 +375,7 @@ async function fetchInventoryImpl(
 
   const warnings: string[] = [];
   const filterParams = parseFilter(typeof config.filter === "string" ? config.filter : "", warnings);
-  const capState: CapState = { remaining: HARD_CAP };
+  const capState: CapState = { remaining: HARD_CAP, hitCap: false };
 
   const rawDevices = await fetchAllPages(
     fetchImpl,
@@ -376,22 +403,27 @@ async function fetchInventoryImpl(
       : [];
 
   const devices: InventoryDevice[] = [];
+  // FIX 1 — "skipped" now means "mapped with no endpoints" (unmappable name or
+  // IP), not "dropped from the tree" — mapEntry only returns undefined when
+  // there's no id at all to key an externalId on.
   let skippedCount = 0;
   for (const raw of rawDevices) {
     const mapped = mapEntry(raw, template, "device");
-    if (mapped) devices.push(mapped);
-    else skippedCount++;
+    if (!mapped) continue;
+    devices.push(mapped);
+    if (mapped.endpoints.length === 0) skippedCount++;
   }
   for (const raw of rawVms) {
     const mapped = mapEntry(raw, template, "vm");
-    if (mapped) devices.push(mapped);
-    else skippedCount++;
+    if (!mapped) continue;
+    devices.push(mapped);
+    if (mapped.endpoints.length === 0) skippedCount++;
   }
   if (skippedCount > 0) {
     warnings.push(`${skippedCount} device${skippedCount === 1 ? "" : "s"} without a primary IP were skipped.`);
   }
 
-  return { contractVersion: 1, devices, warnings };
+  return { contractVersion: 1, devices, warnings, truncated: capState.hitCap || undefined };
 }
 
 export function createNetboxProvider(fetchImpl: typeof fetch = fetch): InventoryProvider {

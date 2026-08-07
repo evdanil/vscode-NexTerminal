@@ -133,16 +133,22 @@ async function promptTargetFolder(initialValue = ""): Promise<string | undefined
   }
 }
 
-async function promptPrunePolicy(targetFolder: string): Promise<InventoryPrunePolicy | undefined> {
+/**
+ * FIX 7 — when editing an existing source, the item matching the currently
+ * saved value gets " (current)" appended to its description and is listed
+ * first, so the picker doesn't read as a blank slate. `current` is omitted
+ * entirely on addSource (nothing saved yet) and the list keeps its default
+ * order.
+ */
+async function promptPrunePolicy(targetFolder: string, current?: InventoryPrunePolicy): Promise<InventoryPrunePolicy | undefined> {
   const orphanTarget = targetFolder ? `${targetFolder}/${ORPHAN_FOLDER_NAME}` : ORPHAN_FOLDER_NAME;
-  const pick = await vscode.window.showQuickPick(
-    [
-      { label: `Move to "${orphanTarget}"`, description: "Recommended — keeps synced settings if the device returns", value: "orphan" as const },
-      { label: "Delete", description: "Removes the server and its saved credentials", value: "delete" as const },
-      { label: "Keep", description: "Leaves the server where it is", value: "keep" as const }
-    ],
-    { title: "When a device disappears from the source…" }
-  );
+  const items = [
+    { label: `Move to "${orphanTarget}"`, description: "Recommended — keeps synced settings if the device returns", value: "orphan" as const },
+    { label: "Delete", description: "Removes the server and its saved credentials", value: "delete" as const },
+    { label: "Keep", description: "Leaves the server where it is", value: "keep" as const }
+  ].map((item) => (item.value === current ? { ...item, description: `${item.description} (current)` } : item));
+  const ordered = current ? [...items.filter((i) => i.value === current), ...items.filter((i) => i.value !== current)] : items;
+  const pick = await vscode.window.showQuickPick(ordered, { title: "When a device disappears from the source…" });
   return pick?.value;
 }
 
@@ -167,13 +173,16 @@ async function promptConfigFields(
 
   for (const field of fields) {
     if (field.type === "boolean") {
-      const pick = await vscode.window.showQuickPick(
-        [
-          { label: "Yes", value: true },
-          { label: "No", value: false }
-        ],
-        { title: field.label, placeHolder: field.description }
-      );
+      // FIX 7 — mark whichever option matches the saved config value (edit
+      // flow) and list it first; addSource has no `existingConfig` entry for
+      // the field, so neither option is marked and the default order holds.
+      const current = existingConfig[field.id];
+      const items = [
+        { label: "Yes", value: true, description: current === true ? "(current)" : undefined },
+        { label: "No", value: false, description: current === false ? "(current)" : undefined }
+      ];
+      const ordered = current === false ? [items[1], items[0]] : items;
+      const pick = await vscode.window.showQuickPick(ordered, { title: field.label, placeHolder: field.description });
       if (pick === undefined) return undefined;
       config[field.id] = pick.value;
       continue;
@@ -254,6 +263,12 @@ function countJumpHostDependents(allServers: ServerConfig[], removedIds: Readonl
 function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[]): string {
   const lines: string[] = [];
   if (plan.adds.length > 0) lines.push(`${plan.adds.length} added`);
+  // FIX 3 — aggregate manual-duplicate count (engine-computed, not
+  // string-parsed from plan.warnings) surfaced once in the modal, rather than
+  // leaving it discoverable only by opening the per-device warnings list.
+  if (plan.manualDuplicateCount > 0) {
+    lines.push(`${plan.manualDuplicateCount} devices match existing manual servers and will be added as duplicates.`);
+  }
   if (plan.updates.length > 0) lines.push(`${plan.updates.length} updated`);
   const orphaned = plan.prunes.filter((p) => p.policy === "orphan").length;
   const deleted = plan.prunes.filter((p) => p.policy === "delete").length;
@@ -392,7 +407,7 @@ export function registerInventoryCommands(
       if (defaultUsernameInput === undefined) return;
       const defaultUsername = defaultUsernameInput.trim();
 
-      const prunePolicy = await promptPrunePolicy(targetFolder);
+      const prunePolicy = await promptPrunePolicy(targetFolder, source.prunePolicy);
       if (!prunePolicy) return;
 
       const existingSecretFieldIds = new Set(source.secretFieldIds);

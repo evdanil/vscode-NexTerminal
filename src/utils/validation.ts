@@ -47,7 +47,7 @@ export function validateProxyConfig(proxy: unknown): proxy is ProxyConfig {
   return false;
 }
 
-function isValidServerOrigin(value: unknown): value is ServerOrigin {
+export function isValidServerOrigin(value: unknown): value is ServerOrigin {
   if (typeof value !== "object" || value === null) {
     return false;
   }
@@ -86,13 +86,13 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   if (obj.authProfileId !== undefined && (typeof obj.authProfileId !== "string" || obj.authProfileId === "")) {
     return false;
   }
-  // A malformed origin does not invalidate the whole server row: strip the
-  // field and keep the server as an ordinary (unsynced) entry rather than
-  // discarding a user's manually-tuned config over a corrupt sync marker.
-  if (obj.origin !== undefined && !isValidServerOrigin(obj.origin)) {
-    console.warn("[Nexus] Server config has a malformed origin; stripping it:", JSON.stringify(obj.origin));
-    delete obj.origin;
-  }
+  // F13/FIX 5 — a malformed `origin` does not invalidate the whole server
+  // row: the row is still accepted here. Stripping the malformed field is
+  // NOT this function's job — a type guard must not mutate the value it is
+  // asked to check (callers may reasonably assume `item` is unchanged after
+  // a `boolean`-returning predicate). The actual strip-and-warn happens one
+  // layer up, in VscodeConfigRepository.getServers(), which owns producing
+  // the final, storage-clean ServerConfig list.
   return true;
 }
 

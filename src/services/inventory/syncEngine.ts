@@ -27,6 +27,7 @@ export interface InventorySyncPlan {
   folders: string[]; // every folder any add/update/orphan lands in, plus targetFolder itself
   warnings: string[]; // duplicate externalIds, invalid folders, id collisions, provider warnings
   hiddenPruneCount: number; // F22: how many entries in `prunes` are hidden servers
+  manualDuplicateCount: number; // FIX 3: how many planned adds collided by host:port with a manual server
 }
 
 function joinTargetAndRel(targetFolder: string, rel: string | undefined): string | undefined {
@@ -96,13 +97,22 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   }
 
   const seenExternalIds = new Set<string>();
-  const matchedExternalIds = new Set<string>();
+  // FIX 1 — every device with a non-empty externalId that appears anywhere in
+  // the fetched tree counts as PRESENT for pruning purposes, even when it is
+  // skipped below (empty name / no usable ssh endpoint / invalid port). Only
+  // externalIds that are genuinely absent from the tree may be pruned —
+  // otherwise a device the provider merely couldn't fully map looks
+  // indistinguishable from one that was deleted at the source.
+  const presentExternalIds = new Set<string>();
+  let manualDuplicateCount = 0;
 
   for (const device of tree.devices) {
     if (!device.externalId) {
       warnings.push(`Device "${device.name || "(unnamed)"}" has an empty externalId and was skipped.`);
       continue;
     }
+    presentExternalIds.add(device.externalId);
+
     if (!device.name) {
       warnings.push(`Device "${device.externalId}" has an empty name and was skipped.`);
       continue;
@@ -148,7 +158,6 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       }
     }
 
-    matchedExternalIds.add(device.externalId);
     const id = deterministicServerId(source.id, device.externalId);
 
     const ownedServer = ownedByExternalId.get(device.externalId);
@@ -199,6 +208,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const manualMatch = manualByHostPort.get(hostPortKey);
     if (manualMatch) {
       warnings.push(`Device "${device.name}" matches existing server "${manualMatch.name}" (${endpoint.host}:${port}) — will be added as a duplicate.`);
+      manualDuplicateCount++;
     }
 
     adds.push({
@@ -217,32 +227,61 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
   }
 
-  // Prunes: owned servers whose device did not reappear in this fetch.
-  for (const [externalId, server] of ownedByExternalId.entries()) {
-    if (matchedExternalIds.has(externalId)) {
-      continue;
-    }
-    if (source.prunePolicy === "delete") {
-      prunes.push({ policy: "delete", server });
-    } else if (source.prunePolicy === "orphan") {
-      // Origin is KEPT on the orphaned copy: a reappearing device matches by
-      // externalId regardless of where the server currently sits, and its
-      // group is source-owned so the next sync moves it back automatically.
+  // FIX 2 — a truncated fetch (provider hit its own hard cap) never reflects
+  // the full source inventory: treating the devices it didn't reach as
+  // "absent" would prune servers whose devices are simply unseen this sync,
+  // not deleted. Skip the whole prune phase and say so.
+  if (tree.truncated) {
+    warnings.push("Inventory was truncated — prune skipped this sync.");
+  } else {
+    // FIX 6 — the orphan target folder is constant for the whole sync (it only
+    // depends on `source`, never on the individual pruned server), so a
+    // normalization failure is computed ONCE up front and reported in a single
+    // warning naming the path and how many servers it affected — not once per
+    // pruned server. Phrasing is deliberately neutral ("could not be
+    // created") since normalizeFolderPath can reject a path for reasons other
+    // than exceeding the maximum depth (e.g. invalid segments).
+    let orphanGroupForPrune: string | undefined;
+    let orphanFallbackCandidate: string | undefined;
+    let orphanFallbackCount = 0;
+    if (source.prunePolicy === "orphan") {
       const candidate = source.targetFolder ? `${source.targetFolder}/${ORPHAN_FOLDER_NAME}` : ORPHAN_FOLDER_NAME;
       const normalizedCandidate = normalizeFolderPath(candidate);
-      let orphanGroup: string | undefined;
       if (normalizedCandidate === undefined) {
-        warnings.push(`The orphan folder for source "${source.name}" exceeds the maximum folder depth; orphaned servers were left at the source's target folder instead.`);
-        orphanGroup = source.targetFolder ? source.targetFolder : undefined;
+        orphanFallbackCandidate = candidate;
+        orphanGroupForPrune = source.targetFolder ? source.targetFolder : undefined;
       } else {
-        orphanGroup = normalizedCandidate;
+        orphanGroupForPrune = normalizedCandidate;
       }
-      prunes.push({ policy: "orphan", server, after: { ...server, group: orphanGroup } });
-      if (orphanGroup !== undefined) {
-        folderSet.add(orphanGroup);
+    }
+
+    // Prunes: owned servers whose device did not reappear in this fetch.
+    for (const [externalId, server] of ownedByExternalId.entries()) {
+      if (presentExternalIds.has(externalId)) {
+        continue;
       }
-    } else {
-      prunes.push({ policy: "keep", server });
+      if (source.prunePolicy === "delete") {
+        prunes.push({ policy: "delete", server });
+      } else if (source.prunePolicy === "orphan") {
+        // Origin is KEPT on the orphaned copy: a reappearing device matches by
+        // externalId regardless of where the server currently sits, and its
+        // group is source-owned so the next sync moves it back automatically.
+        prunes.push({ policy: "orphan", server, after: { ...server, group: orphanGroupForPrune } });
+        if (orphanGroupForPrune !== undefined) {
+          folderSet.add(orphanGroupForPrune);
+        }
+        if (orphanFallbackCandidate !== undefined) {
+          orphanFallbackCount++;
+        }
+      } else {
+        prunes.push({ policy: "keep", server });
+      }
+    }
+
+    if (orphanFallbackCandidate !== undefined && orphanFallbackCount > 0) {
+      warnings.push(
+        `The orphan folder path "${orphanFallbackCandidate}" for source "${source.name}" could not be created; ${orphanFallbackCount} orphaned server${orphanFallbackCount === 1 ? " was" : "s were"} left at the source's target folder instead.`
+      );
     }
   }
 
@@ -261,7 +300,8 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     unchangedCount,
     folders: [...folderSet],
     warnings,
-    hiddenPruneCount
+    hiddenPruneCount,
+    manualDuplicateCount
   };
 }
 
@@ -343,5 +383,8 @@ export function validateInventoryTree(tree: unknown): asserts tree is InventoryT
   });
   if (obj.warnings !== undefined && (!Array.isArray(obj.warnings) || !obj.warnings.every((w: unknown) => typeof w === "string"))) {
     throw new Error("warnings is not a string array");
+  }
+  if (obj.truncated !== undefined && typeof obj.truncated !== "boolean") {
+    throw new Error("truncated is not a boolean");
   }
 }

@@ -8,7 +8,8 @@ import {
   validateSerialProfile,
   validateAuthProfile,
   validateLocalShellProfile,
-  validateInventorySource
+  validateInventorySource,
+  isValidServerOrigin
 } from "../utils/validation";
 
 const SERVERS_KEY = "nexus.servers";
@@ -34,13 +35,26 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async getServers(): Promise<ServerConfig[]> {
     const raw = asArray<ServerConfig>(this.context.globalState.get(SERVERS_KEY, []));
-    return raw.filter((item) => {
-      if (validateServerConfig(item)) {
-        return true;
+    const result: ServerConfig[] = [];
+    for (const item of raw) {
+      if (!validateServerConfig(item)) {
+        console.warn("[Nexus] Skipping invalid server config entry:", JSON.stringify(item));
+        continue;
       }
-      console.warn("[Nexus] Skipping invalid server config entry:", JSON.stringify(item));
-      return false;
-    });
+      // F13/FIX 5 — a malformed `origin` does not reject the whole row
+      // (validateServerConfig deliberately doesn't touch `origin`'s shape),
+      // but the corrupt marker still must not reach NexusCore: copy the
+      // server without it here, at the storage boundary, instead of mutating
+      // the value the type guard was asked to check.
+      if (item.origin !== undefined && !isValidServerOrigin(item.origin)) {
+        console.warn("[Nexus] Server config has a malformed origin; stripping it:", JSON.stringify(item.origin));
+        const { origin: _origin, ...rest } = item;
+        result.push(rest as ServerConfig);
+        continue;
+      }
+      result.push(item);
+    }
+    return result;
   }
 
   public async saveServers(servers: ServerConfig[]): Promise<void> {

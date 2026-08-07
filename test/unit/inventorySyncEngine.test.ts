@@ -306,22 +306,94 @@ describe("computeSyncPlan — prunes", () => {
     const plan = computeSyncPlan({ source, tree: makeTree([]), currentServers: [hidden, visible], now: 1000 });
     expect(plan.hiddenPruneCount).toBe(1);
   });
+
+  it("(FIX 1) an owned server whose device is present in the tree but skipped (no usable ssh endpoint) is NOT pruned (kills pruning skipped-but-present devices)", () => {
+    const source = makeSource({ prunePolicy: "delete" });
+    const before = makeOwnedServer();
+    // Same externalId as `before`'s origin, still present in the fetched tree,
+    // but unmappable (no ssh endpoint) — this must NOT read as "deleted at
+    // the source".
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
+    expect(plan.prunes).toHaveLength(0);
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.warnings.some((w) => w.includes("no usable ssh endpoint"))).toBe(true);
+  });
+
+  it("(FIX 1) an owned server whose device is present but skipped for an empty name is NOT pruned", () => {
+    const source = makeSource({ prunePolicy: "delete" });
+    const before = makeOwnedServer();
+    const tree = makeTree([makeDevice({ name: "" })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
+    expect(plan.prunes).toHaveLength(0);
+  });
+
+  it("(FIX 1) an owned server whose device is present but skipped for an invalid port is NOT pruned", () => {
+    const source = makeSource({ prunePolicy: "delete" });
+    const before = makeOwnedServer();
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 999999 }] })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
+    expect(plan.prunes).toHaveLength(0);
+  });
+
+  it("(FIX 1) a device that is genuinely absent from the tree is still pruned (control — the fix must not disable pruning altogether)", () => {
+    const source = makeSource({ prunePolicy: "delete" });
+    const before = makeOwnedServer();
+    const plan = computeSyncPlan({ source, tree: makeTree([]), currentServers: [before], now: 1000 });
+    expect(plan.prunes).toEqual([{ policy: "delete", server: before }]);
+  });
+
+  it("(FIX 2) a truncated tree skips the prune phase entirely and warns, instead of pruning an absent owned server", () => {
+    const source = makeSource({ prunePolicy: "delete" });
+    const before = makeOwnedServer();
+    const tree: InventoryTree = { contractVersion: 1, devices: [], truncated: true };
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
+    expect(plan.prunes).toEqual([]);
+    expect(plan.warnings.some((w) => w.toLowerCase().includes("truncated") && w.toLowerCase().includes("prune"))).toBe(true);
+  });
+
+  it("(FIX 6) the orphan-fallback warning is emitted ONCE per sync (not once per affected server), and its wording doesn't claim 'maximum folder depth' for a generic normalization failure", () => {
+    const deepTarget = Array.from({ length: MAX_FOLDER_DEPTH }, (_, i) => `L${i}`).join("/");
+    const source = makeSource({ targetFolder: deepTarget, prunePolicy: "orphan" });
+    const first = makeOwnedServer({
+      id: "orphan-a",
+      group: deepTarget,
+      origin: { sourceId: "source-1", externalId: "device:orphan-a", syncedAt: 1 }
+    });
+    const second = makeOwnedServer({
+      id: "orphan-b",
+      group: deepTarget,
+      origin: { sourceId: "source-1", externalId: "device:orphan-b", syncedAt: 1 }
+    });
+    const plan = computeSyncPlan({ source, tree: makeTree([]), currentServers: [first, second], now: 1000 });
+
+    expect(plan.prunes).toHaveLength(2);
+    const orphanFallbackWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("orphan folder path"));
+    // A per-server implementation would push this warning twice (once per
+    // pruned server); the fix computes and warns about it exactly once.
+    expect(orphanFallbackWarnings).toHaveLength(1);
+    expect(orphanFallbackWarnings[0]).not.toMatch(/maximum folder depth/i);
+    expect(orphanFallbackWarnings[0]).toContain("2");
+  });
 });
 
 describe("computeSyncPlan — amendments F5/F6", () => {
-  it("(F5) a planned add matching a manual server's host:port still adds, but warns about the duplicate", () => {
+  it("(F5/FIX 3) a planned add matching a manual server's host:port still adds, warns about the duplicate, and the count is exposed on the plan (not just parseable from warnings text)", () => {
     const source = makeSource();
     const manual = makeManualServer({ host: "10.0.0.1", port: 22 });
     const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [manual], now: 1000 });
     expect(plan.adds).toHaveLength(1);
     expect(plan.warnings.some((w) => w.includes("duplicate"))).toBe(true);
+    expect(plan.manualDuplicateCount).toBe(1);
   });
 
-  it("(F5) no duplicate warning when host:port does not match any manual server", () => {
+  it("(F5) no duplicate warning when host:port does not match any manual server, and manualDuplicateCount is 0", () => {
     const source = makeSource();
     const manual = makeManualServer({ host: "10.0.0.200", port: 22 });
     const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [manual], now: 1000 });
     expect(plan.warnings.some((w) => w.includes("duplicate"))).toBe(false);
+    expect(plan.manualDuplicateCount).toBe(0);
   });
 
   it("(F6) two owned servers sharing an externalId: the first (stable order) is used and pruned, the second is left untouched (kills pruning/updating both)", () => {
@@ -405,7 +477,8 @@ describe("planToApplication (F19 — no targetFolder parameter)", () => {
       unchangedCount: 0,
       folders: ["X", "Y"],
       warnings: [],
-      hiddenPruneCount: 0
+      hiddenPruneCount: 0,
+      manualDuplicateCount: 0
     };
 
     const application = planToApplication(plan);
@@ -433,7 +506,8 @@ describe("prunedServerIdsForSecretCleanup", () => {
       unchangedCount: 0,
       folders: [],
       warnings: [],
-      hiddenPruneCount: 0
+      hiddenPruneCount: 0,
+      manualDuplicateCount: 0
     };
     expect(prunedServerIdsForSecretCleanup(plan)).toEqual(["d1"]);
   });

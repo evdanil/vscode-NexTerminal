@@ -74,4 +74,32 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
     const repo = new VscodeConfigRepository(makeContext({ "nexus.groups": ["a", 1, null, "b"] }));
     await expect(repo.getGroups()).resolves.toEqual(["a", "b"]);
   });
+
+  it("(F13/FIX 5) getServers strips a malformed origin and keeps the rest of the server, warning once — the row is NOT dropped (kills both 'rejects whole server' and 'never strips at all')", async () => {
+    const serverWithBadOrigin: ServerConfig = {
+      ...validServer,
+      id: "s2",
+      origin: { sourceId: "src", externalId: "ext", syncedAt: "not-a-number" } as unknown as import("../../src/models/config").ServerOrigin
+    };
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const repo = new VscodeConfigRepository(makeContext({ "nexus.servers": [serverWithBadOrigin] }));
+
+    const servers = await repo.getServers();
+
+    expect(servers).toHaveLength(1);
+    expect(servers[0].id).toBe("s2");
+    expect((servers[0] as { origin?: unknown }).origin).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("getServers keeps a well-formed origin unchanged", async () => {
+    const origin = { sourceId: "src", externalId: "ext", syncedAt: 1000 };
+    const serverWithOrigin: ServerConfig = { ...validServer, id: "s3", origin };
+    const repo = new VscodeConfigRepository(makeContext({ "nexus.servers": [serverWithOrigin] }));
+
+    const servers = await repo.getServers();
+
+    expect(servers[0].origin).toEqual(origin);
+  });
 });

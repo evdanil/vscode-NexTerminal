@@ -26,6 +26,11 @@ export interface InventoryTree {
   contractVersion: 1;
   devices: InventoryDevice[];
   warnings?: string[]; // provider-side notices surfaced in plan summary
+  // FIX 2 — set by a provider when it stopped collecting early because it hit
+  // its own hard cap (not because the source ran out of devices). When true,
+  // computeSyncPlan skips the prune phase entirely: a capped fetch must never
+  // be mistaken for "these devices no longer exist at the source".
+  truncated?: boolean;
 }
 
 export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean";

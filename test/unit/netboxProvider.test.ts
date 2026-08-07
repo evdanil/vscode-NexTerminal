@@ -96,7 +96,7 @@ describe("createNetboxProvider", () => {
       expect(fetchImpl).toHaveBeenCalledTimes(1);
     });
 
-    it("truncates at the 10,000-device hard cap and warns, instead of collecting every reported item", async () => {
+    it("truncates at the 10,000-device hard cap and warns, instead of collecting every reported item (and marks the tree truncated so the engine skips pruning)", async () => {
       const fetchImpl = vi.fn(async (url: string) => {
         const offset = Number(new URL(url).searchParams.get("offset"));
         const results = Array.from({ length: 250 }, (_, i) => ({
@@ -112,32 +112,31 @@ describe("createNetboxProvider", () => {
 
       expect(tree.devices.length).toBeLessThanOrEqual(10_000);
       expect(tree.warnings.some((w) => w.includes("10000") && w.toLowerCase().includes("truncat"))).toBe(true);
+      expect(tree.truncated).toBe(true);
     });
 
-    it("F2 — bounds iterations even when every page is non-empty but short of the reported count (kills an unbounded pagination loop)", async () => {
-      let calls = 0;
+    it("FIX 2 — a protocol error (not a truncated tree) is thrown when the server ignores our page size and pagination gives up short of the reported count (kills silently truncating the tree)", async () => {
+      // The server "clamps" our requested limit=250 down to 100 items per page,
+      // and reports a count (5000) that MAX_ITERATIONS worth of 100-item pages
+      // can never reach (41 * 100 = 4100 < 5000) — nowhere near the 10,000 hard
+      // cap, so this must NOT be mistaken for the legitimate cap-truncation path.
       const fetchImpl = vi.fn(async (url: string) => {
-        calls++;
-        if (calls > 100) {
-          // An unbounded implementation would get this far; the resulting
-          // empty-page-with-nonzero-remaining response throws fast (F2) instead
-          // of looping forever, so this test still terminates either way.
-          return makeResponse(200, { count: 1_000_000, results: [] });
-        }
         const offset = Number(new URL(url).searchParams.get("offset"));
-        return makeResponse(200, { count: 1_000_000, results: [{ id: offset + 1, name: `d${offset}`, primary_ip: { address: "10.0.0.1/24" } }] });
+        const results = Array.from({ length: 100 }, (_, i) => ({
+          id: offset + i + 1,
+          name: `d${offset + i}`,
+          primary_ip: { address: "10.0.0.1/24" }
+        }));
+        return makeResponse(200, { count: 5_000, results });
       });
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
-      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
-
-      expect(calls).toBeLessThanOrEqual(41);
-      expect(tree.devices.length).toBeLessThanOrEqual(41);
+      await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({ kind: "protocol" });
     });
   });
 
   describe("device/VM mapping", () => {
-    it("skips devices without a name or without a primary IP, aggregating them into one warning (kills host: undefined)", async () => {
+    it("(FIX 1) still emits devices without a name or without a primary IP into the tree — with empty endpoints — instead of dropping them, while still aggregating one warning (kills host: undefined AND kills drop-at-mapper causing the sync engine to prune their owned servers)", async () => {
       const fetchImpl = vi.fn(async () =>
         makeResponse(200, {
           count: 3,
@@ -152,9 +151,30 @@ describe("createNetboxProvider", () => {
 
       const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
 
-      expect(tree.devices).toHaveLength(1);
-      expect(tree.devices[0].externalId).toBe("device:1");
+      // All three are present on the tree — the two unmappable ones just carry
+      // no ssh endpoint, rather than being silently absent (which the sync
+      // engine would read as "deleted at the source").
+      expect(tree.devices).toHaveLength(3);
+      const byExternalId = new Map(tree.devices.map((d) => [d.externalId, d]));
+      expect(byExternalId.get("device:1")?.endpoints).toHaveLength(1);
+      expect(byExternalId.get("device:2")?.endpoints).toEqual([]);
+      expect(byExternalId.get("device:3")?.endpoints).toEqual([]);
       expect(tree.warnings.some((w) => w.includes("2") && w.toLowerCase().includes("primary ip"))).toBe(true);
+    });
+
+    it("(FIX 1) a device with an id and a name but no primary IP appears in tree.devices with an empty endpoints array (kills drop-at-mapper)", async () => {
+      const fetchImpl = vi.fn(async () =>
+        makeResponse(200, {
+          count: 1,
+          results: [{ id: 42, name: "no-primary-ip-device", primary_ip: null }]
+        })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      expect(tree.devices).toHaveLength(1);
+      expect(tree.devices[0]).toMatchObject({ externalId: "device:42", name: "no-primary-ip-device", endpoints: [] });
     });
 
     it("prefixes device/vm externalIds so a shared numeric id coexists instead of colliding (kills unprefixed String(id))", async () => {

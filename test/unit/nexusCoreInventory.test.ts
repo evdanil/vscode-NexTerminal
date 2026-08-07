@@ -242,8 +242,8 @@ describe("validateInventorySource", () => {
   });
 });
 
-describe("validateServerConfig — origin handling (F13)", () => {
-  it("strips a malformed origin and keeps the server (does not reject the whole row)", () => {
+describe("validateServerConfig — origin handling (F13/FIX 5)", () => {
+  it("accepts a server with a malformed origin (does not reject the whole row) WITHOUT mutating the input object (kills both 'rejects whole server' and 'validator mutates input')", () => {
     const item = {
       id: "s1",
       name: "Server",
@@ -254,11 +254,15 @@ describe("validateServerConfig — origin handling (F13)", () => {
       isHidden: false,
       origin: { sourceId: "src", externalId: "ext", syncedAt: "not-a-number" }
     };
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const originalOrigin = item.origin;
     expect(validateServerConfig(item)).toBe(true);
-    expect((item as { origin?: unknown }).origin).toBeUndefined();
-    expect(warnSpy).toHaveBeenCalled();
-    warnSpy.mockRestore();
+    // FIX 5 — a type guard must not mutate the value it inspects. Stripping
+    // the malformed origin is VscodeConfigRepository.getServers()'s job (see
+    // test/unit/vscodeConfigRepository.test.ts), not validateServerConfig's.
+    // A reverted fix that goes back to `delete obj.origin` here would make
+    // this identity check fail.
+    expect((item as { origin?: unknown }).origin).toBe(originalOrigin);
+    expect((item as { origin?: unknown }).origin).toEqual({ sourceId: "src", externalId: "ext", syncedAt: "not-a-number" });
   });
 
   it("keeps a well-formed origin unchanged", () => {
