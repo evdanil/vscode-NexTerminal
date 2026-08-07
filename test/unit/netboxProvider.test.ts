@@ -83,8 +83,7 @@ describe("createNetboxProvider", () => {
       expect(new Set(tree.devices.map((d) => d.externalId)).size).toBe(total);
       expect(requestedOffsets).toEqual([0, 250, 500]);
       for (const call of fetchImpl.mock.calls) {
-        expect(String(call[0]).startsWith("http://evil.internal")).toBe(false);
-        expect(String(call[0]).startsWith("https://netbox.local")).toBe(true);
+        expect(new URL(String(call[0])).origin).toBe("https://netbox.local");
       }
     });
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { deterministicServerId, INVENTORY_ID_NAMESPACE } from "../../src/services/inventory/deterministicId";
 
-const UUID_V5_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID_V8_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 describe("deterministicServerId", () => {
   it("is a fixed, non-empty namespace", () => {
@@ -18,9 +18,9 @@ describe("deterministicServerId", () => {
     // Any change to the namespace, the name-composition scheme (F21), or the
     // hash algorithm silently re-mints every previously-synced server's id
     // on the next sync — this literal is the tripwire for that.
-    expect(deterministicServerId("source-1", "device:1")).toBe("49aafb72-6f4a-556d-b508-a50a93459315");
-    expect(deterministicServerId("source-1", "device:2")).toBe("e61786a6-8bc0-58af-8ac0-d7b7aaabd067");
-    expect(deterministicServerId("source-2", "device:1")).toBe("b537f89c-2759-5ae6-8db6-3441281a2554");
+    expect(deterministicServerId("source-1", "device:1")).toBe("f97e80eb-e1b0-8063-8433-8c138322b978");
+    expect(deterministicServerId("source-1", "device:2")).toBe("2e88fa43-6cf8-8e0a-8d2e-16d7be9d31ed");
+    expect(deterministicServerId("source-2", "device:1")).toBe("4855d788-ac6c-8397-8dfd-4730ca165485");
   });
 
   it("differs when only externalId changes (kills hashing only sourceId)", () => {
@@ -35,9 +35,9 @@ describe("deterministicServerId", () => {
     expect(a).not.toBe(b);
   });
 
-  it("always produces an RFC 4122 UUIDv5-shaped string (kills missing version/variant bits)", () => {
-    expect(deterministicServerId("source-1", "device:1")).toMatch(UUID_V5_RE);
-    expect(deterministicServerId("a-very-different-source-id", "another/external:id")).toMatch(UUID_V5_RE);
+  it("always produces an RFC 9562 UUIDv8-shaped string (kills missing version/variant bits)", () => {
+    expect(deterministicServerId("source-1", "device:1")).toMatch(UUID_V8_RE);
+    expect(deterministicServerId("a-very-different-source-id", "another/external:id")).toMatch(UUID_V8_RE);
   });
 
   it("(F21) the sourceId length prefix disambiguates split points, so two different splits of the same joined string don't collide", () => {
