@@ -708,6 +708,74 @@ describe("inventoryCommands", () => {
       expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringMatching(/1 server.*changed during removal/i));
     });
 
+    it("(FINDING 2, review) Delete Servers: a server re-created (e.g. by nexus.server.edit, which never takes configMutationLock) while the post-apply teardown/cleanup loop is still running keeps its vault credentials — the cleanup loop must recheck server absence per id, not just trust the apply's removedServerIds list (kills unconditional post-apply secret deletion)", async () => {
+      const first = makeServer({
+        id: "owned-1",
+        name: "old-sw-1",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const second = makeServer({
+        id: "owned-2",
+        name: "old-sw-2",
+        host: "10.0.0.2",
+        origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([first, second]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      const vault = makeVault({
+        [inventorySecretKey("src-1", "apiToken")]: "tok",
+        [passwordSecretKey("owned-1")]: "pw1",
+        [passphraseSecretKey("owned-1")]: "pp1",
+        [proxyPasswordSecretKey("owned-1")]: "proxy1",
+        [passwordSecretKey("owned-2")]: "pw2",
+        [passphraseSecretKey("owned-2")]: "pp2",
+        [proxyPasswordSecretKey("owned-2")]: "proxy2"
+      });
+      const teardown = {
+        // Simulate the race the finding describes: an unlocked
+        // nexus.server.edit re-adds "owned-2" (upsert semantics) during the
+        // window applyInventorySyncPlan's disposition is still settling —
+        // teardownServerRuntime runs for every id in removedServerIds AFTER
+        // the apply already resolved, so hooking it here lands the re-add
+        // squarely inside that window, before the secret-cleanup loop below
+        // reaches "owned-2".
+        teardownServerRuntime: vi.fn(async (serverId: string) => {
+          if (serverId === "owned-1") {
+            await core.addOrUpdateServer({ ...second, name: "core-sw-2 (recreated)" });
+          }
+        })
+      };
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      mockShowWarningMessage.mockResolvedValueOnce("Delete Servers");
+
+      const cmd = registeredCommands.get("nexus.inventory.removeSource")!;
+      await cmd();
+
+      // "owned-2" is back (re-created mid-flow) — its credentials must
+      // survive; a reverted fix would delete them here unconditionally
+      // because applyInventorySyncPlan's removedServerIds still lists it.
+      expect(core.getServer("owned-2")).toBeDefined();
+      expect(await vault.get(passwordSecretKey("owned-2"))).toBe("pw2");
+      expect(await vault.get(passphraseSecretKey("owned-2"))).toBe("pp2");
+      expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
+
+      // "owned-1" was never re-created — it's genuinely gone, credentials included.
+      expect(core.getServer("owned-1")).toBeUndefined();
+      expect(await vault.get(passwordSecretKey("owned-1"))).toBeUndefined();
+      expect(await vault.get(passphraseSecretKey("owned-1"))).toBeUndefined();
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(
+        expect.stringMatching(/1 re-created server.*kept.*credentials/i)
+      );
+    });
+
     it("Keep Servers: origin is stripped and the server survives; the source record and its own secrets are removed (kills keep-still-deleting)", async () => {
       const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
       const repo = new InMemoryConfigRepository([owned]);
@@ -1243,6 +1311,62 @@ describe("inventoryCommands", () => {
       expect(await vault.get(passwordSecretKey("owned-2"))).toBe("pw2");
       expect(await vault.get(passphraseSecretKey("owned-2"))).toBe("pp2");
       expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
+    });
+
+    it("(FINDING 2, review) a pruned server re-created (e.g. by nexus.server.edit, which never takes configMutationLock) while applyInventorySyncPlan's saves are still settling keeps its vault credentials — the post-apply cleanup loop must recheck server absence per id (kills unconditional pruned-secret cleanup)", async () => {
+      const pruned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        group: "Infra",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([pruned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+
+      // Simulate the race the finding describes: applyInventorySyncPlan's
+      // own saves are what a concurrent, lock-free nexus.server.edit races
+      // against. Re-add "owned-1" (upsert semantics) right as that call
+      // settles — the cleanup loop below runs immediately afterward and must
+      // not just trust the plan's "this id was pruned" designation.
+      const originalApply = core.applyInventorySyncPlan.bind(core);
+      vi.spyOn(core, "applyInventorySyncPlan").mockImplementation(async (application) => {
+        const result = await originalApply(application);
+        await core.addOrUpdateServer({ ...pruned, name: "old-sw (recreated)" });
+        return result;
+      });
+
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+      });
+      registry.register(provider);
+      const vault = makeVault({
+        [passwordSecretKey("owned-1")]: "pw1",
+        [passphraseSecretKey("owned-1")]: "pp1",
+        [proxyPasswordSecretKey("owned-1")]: "proxy1",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", prunePolicy: "delete" }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      // "owned-1" is back (re-created mid-flow) — its credentials must
+      // survive; a reverted fix would delete them here unconditionally
+      // because the plan still designates it as pruned.
+      expect(core.getServer("owned-1")).toBeDefined();
+      expect(await vault.get(passwordSecretKey("owned-1"))).toBe("pw1");
+      expect(await vault.get(passphraseSecretKey("owned-1"))).toBe("pp1");
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("proxy1");
+
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(
+        expect.stringMatching(/1 re-created server.*kept.*credentials/i)
+      );
     });
 
     it("re-entrancy: a second sync on the same source while the first is fetching warns and never fetches twice (kills a missing guard)", async () => {

@@ -728,7 +728,7 @@ export function registerInventoryCommands(
       // calls stay outside — they're fire-and-forget and don't need to be
       // atomic with the mutation.
       const removal = await configMutationLock.runExclusive(async (): Promise<
-        { ok: true; skippedCount: number } | { ok: false }
+        { ok: true; skippedCount: number; recreatedCount: number } | { ok: false }
       > => {
         // ITEM 6 (carried forward from the pre-reorder flow) — a source config
         // race landing while the confirm modal was open (e.g. a replace-mode
@@ -870,6 +870,7 @@ export function registerInventoryCommands(
         // applyInventorySyncPlan) counts entries core refused to touch because
         // current state no longer matched what this disposition expected.
         let skippedCount = 0;
+        let recreatedCount = 0;
         if (choice === "Delete Servers") {
           // FINDING 5 (removal-teardown review, REORDER) — apply the deletion
           // FIRST, then tear down runtime state + vault secrets only for the
@@ -928,7 +929,24 @@ export function registerInventoryCommands(
           // wrongly wiped out from under its surviving, live record.
           // ITEM 9 — per-key best-effort: one rejected delete must not strand
           // the remaining removed servers' secrets uncleaned.
+          // FINDING 2 (review) — nexus.server.edit / nexus.server.rename
+          // deliberately don't take configMutationLock, so while
+          // applyInventorySyncPlan above was awaiting its saves such a flow
+          // could have re-added one of these ids (upsert semantics) before
+          // this loop's iteration for it runs. Re-check the server is still
+          // absent immediately before deleting its keys — otherwise a
+          // recreated, live server's credentials would be wiped out from
+          // under it. The narrower residual window — a re-add landing during
+          // the awaited vault.delete call itself, inside
+          // deleteSecretBestEffort — is intrinsic to the async vault API and
+          // accepted here; closing it would require generation-specific
+          // secret keys, which touches the whole password subsystem and is
+          // out of scope.
           for (const id of removedServerIds) {
+            if (core.getServer(id) !== undefined) {
+              recreatedCount++;
+              continue;
+            }
             await deleteSecretBestEffort(vault, passwordSecretKey(id));
             await deleteSecretBestEffort(vault, passphraseSecretKey(id));
             await deleteSecretBestEffort(vault, proxyPasswordSecretKey(id));
@@ -958,7 +976,7 @@ export function registerInventoryCommands(
           }
         }
 
-        return { ok: true, skippedCount };
+        return { ok: true, skippedCount, recreatedCount };
       });
       if (!removal.ok) return;
 
@@ -968,7 +986,11 @@ export function registerInventoryCommands(
               removal.skippedCount === 1 ? "it" : "they"
             } changed during removal)`
           : "";
-      void vscode.window.showInformationMessage(`Inventory source "${source.name}" removed.${skippedNote}`);
+      const recreatedNote =
+        removal.recreatedCount > 0
+          ? ` (${removal.recreatedCount} re-created server${removal.recreatedCount === 1 ? "" : "s"} kept ${removal.recreatedCount === 1 ? "its" : "their"} credentials)`
+          : "";
+      void vscode.window.showInformationMessage(`Inventory source "${source.name}" removed.${skippedNote}${recreatedNote}`);
     } finally {
       inFlightSourceIds.delete(source.id);
     }
@@ -1094,7 +1116,7 @@ export function registerInventoryCommands(
       type SyncAttempt =
         | { kind: "abort" }
         | { kind: "retry"; plan: InventorySyncPlan }
-        | { kind: "success"; finalPlan: InventorySyncPlan };
+        | { kind: "success"; finalPlan: InventorySyncPlan; recreatedCount: number };
 
       for (;;) {
         const buttons = plan.warnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
@@ -1233,13 +1255,31 @@ export function registerInventoryCommands(
           }
           // ITEM 9 — per-key best-effort: one rejected delete must not strand
           // the remaining pruned servers' secrets uncleaned.
+          // FINDING 2 (review) — nexus.server.edit / nexus.server.rename
+          // deliberately don't take configMutationLock, so while
+          // applyInventorySyncPlan above was awaiting its saves such a flow
+          // could have re-added one of these pruned ids (upsert semantics)
+          // before this loop's iteration for it runs. Re-check the server is
+          // still absent immediately before deleting its keys — otherwise a
+          // recreated, live server's credentials would be wiped out from
+          // under it. The narrower residual window — a re-add landing during
+          // the awaited vault.delete call itself, inside
+          // deleteSecretBestEffort — is intrinsic to the async vault API and
+          // accepted here; closing it would require generation-specific
+          // secret keys, which touches the whole password subsystem and is
+          // out of scope.
+          let recreatedCount = 0;
           for (const id of prunedServerIdsForSecretCleanup(finalPlan)) {
+            if (core.getServer(id) !== undefined) {
+              recreatedCount++;
+              continue;
+            }
             await deleteSecretBestEffort(vault, passwordSecretKey(id));
             await deleteSecretBestEffort(vault, passphraseSecretKey(id));
             await deleteSecretBestEffort(vault, proxyPasswordSecretKey(id));
           }
 
-          return { kind: "success", finalPlan };
+          return { kind: "success", finalPlan, recreatedCount };
         });
 
         if (attempt.kind === "abort") return;
@@ -1250,8 +1290,12 @@ export function registerInventoryCommands(
 
         const finalPlan = attempt.finalPlan;
         const deletedCount = finalPlan.prunes.filter((p) => p.policy === "delete").length;
+        const recreatedNote =
+          attempt.recreatedCount > 0
+            ? ` ${attempt.recreatedCount} re-created server${attempt.recreatedCount === 1 ? "" : "s"} kept ${attempt.recreatedCount === 1 ? "its" : "their"} credentials.`
+            : "";
         void vscode.window.showInformationMessage(
-          `Inventory sync complete: +${finalPlan.adds.length} ~${finalPlan.updates.length} -${deletedCount} (${finalPlan.unchangedCount} unchanged).`
+          `Inventory sync complete: +${finalPlan.adds.length} ~${finalPlan.updates.length} -${deletedCount} (${finalPlan.unchangedCount} unchanged).${recreatedNote}`
         );
         if (finalPlan.warnings.length > 0) {
           void vscode.window

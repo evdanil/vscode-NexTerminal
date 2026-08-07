@@ -1047,6 +1047,53 @@ export function mostCommonUsername(servers: ServerConfig[]): string {
   return best;
 }
 
+/**
+ * FINDING 1 (backup-export review) — captures inventory sources AND their
+ * secrets as one consistent pair for exportBackup. Previously the export
+ * snapshotted `core.getSnapshot().inventorySources` up front, then did
+ * awaited vault.get calls for each source's secrets with NO lock held —
+ * an overlapping Edit Source / replace-mode import / complete reset could
+ * change or delete a source's config or credentials in that gap, producing
+ * a torn backup (stale config paired with a new token, or a source with no
+ * token at all). Taking the snapshot AND reading every secret inside
+ * configMutationLock.runExclusive closes that: nothing else that mutates
+ * inventory sources/secrets (addSource/editSource/removeSource/syncNow,
+ * replace-mode import, complete reset) can run while this capture is in
+ * flight, so the records and the secrets read here always describe the
+ * same generation. Exported (not nested in registerConfigCommands) so it
+ * can be unit-tested directly for lock acquisition + consistency without
+ * having to drive the full exportBackup command (file dialog, encryption
+ * prompt) through the test harness.
+ *
+ * Deliberately narrow: only the inventory-source bucket is locked. Servers/
+ * tunnels/auth-profile secrets, the save dialog, and the master-password
+ * prompt all stay outside — none of that is UI-free, and the lock's own
+ * contract forbids holding it across interactive UI.
+ */
+export async function captureInventorySourcesForBackup(
+  core: NexusCore,
+  vault: SecretVault
+): Promise<{
+  inventorySources: InventorySourceConfig[];
+  inventorySourceSecrets: Record<string, Record<string, string>>;
+}> {
+  return configMutationLock.runExclusive(async () => {
+    // Fresh read taken INSIDE the lock — the earlier top-of-export snapshot
+    // (taken before the lock, if any) must never be reused for this bucket.
+    const inventorySources = core.getSnapshot().inventorySources;
+    const inventorySourceSecrets: Record<string, Record<string, string>> = {};
+    for (const source of inventorySources) {
+      const fields: Record<string, string> = {};
+      for (const fieldId of source.secretFieldIds) {
+        const value = await vault.get(inventorySecretKey(source.id, fieldId));
+        if (value) fields[fieldId] = value;
+      }
+      if (Object.keys(fields).length > 0) inventorySourceSecrets[source.id] = fields;
+    }
+    return { inventorySources, inventorySourceSecrets };
+  });
+}
+
 export function registerConfigCommands(core: NexusCore, vault: SecretVault, context?: import("vscode").ExtensionContext): vscode.Disposable[] {
   async function exportBackup(): Promise<void> {
     const masterPassword = await promptMasterPassword();
@@ -1074,7 +1121,6 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         const proxyPasswords = secrets.proxyPasswords as Record<string, string>;
         const authProfilePasswords = secrets.authProfilePasswords as Record<string, string>;
         const authProfilePassphrases = secrets.authProfilePassphrases as Record<string, string>;
-        const inventorySourceSecrets = secrets.inventorySourceSecrets as Record<string, Record<string, string>>;
         for (const server of snapshot.servers) {
           const pw = await vault.get(passwordSecretKey(server.id));
           if (pw) passwords[server.id] = pw;
@@ -1089,14 +1135,15 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           const pp = await vault.get(authProfilePassphraseSecretKey(profile.id));
           if (pp) authProfilePassphrases[profile.id] = pp;
         }
-        for (const source of snapshot.inventorySources) {
-          const fields: Record<string, string> = {};
-          for (const fieldId of source.secretFieldIds) {
-            const value = await vault.get(inventorySecretKey(source.id, fieldId));
-            if (value) fields[fieldId] = value;
-          }
-          if (Object.keys(fields).length > 0) inventorySourceSecrets[source.id] = fields;
-        }
+        // FINDING 1 — the source records AND their secrets are captured
+        // together, inside configMutationLock, so an overlapping Edit Source /
+        // replace-mode import / complete reset can't land between "which
+        // sources exist" and "what their secrets are" and produce a torn
+        // pairing. Use the captured records below for exportData.inventorySources
+        // too — NOT `snapshot.inventorySources`, which was taken before this
+        // call and may already be stale by the time the lock is acquired.
+        const capturedInventory = await captureInventorySourcesForBackup(core, vault);
+        secrets.inventorySourceSecrets = capturedInventory.inventorySourceSecrets;
 
         // Collect all macros from the store
         const allMacros = getMacros(); // resolved — secret text included
@@ -1125,7 +1172,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           serialProfiles: snapshot.serialProfiles,
           localShellProfiles: snapshot.localShellProfiles,
           authProfiles: snapshot.authProfiles,
-          inventorySources: snapshot.inventorySources,
+          inventorySources: capturedInventory.inventorySources,
           groups: snapshot.explicitGroups,
           macros: nonSecretForTopLevel,
           macroFolders: getMacroFolders(),

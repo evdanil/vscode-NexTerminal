@@ -14,7 +14,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "../../src/commands/inventoryCommands";
-import { registerConfigCommands } from "../../src/commands/configCommands";
+import { captureInventorySourcesForBackup, registerConfigCommands } from "../../src/commands/configCommands";
 import { NexusCore } from "../../src/core/nexusCore";
 import { inventorySecretKey, type InventoryProvider, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
@@ -290,5 +290,128 @@ describe("configMutationLock — real call-site serialization", () => {
     // Dismiss the still-open modal so the command settles cleanly.
     resolveModal(undefined);
     await syncPromise;
+  });
+
+  describe("captureInventorySourcesForBackup (FINDING 1 — backup-export review)", () => {
+    it("a concurrent editSource mutation queues behind the in-flight locked capture, so the captured source record and its secret are a consistent pre-edit pair (kills the unlocked torn capture: old config paired with a new token)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+
+      const backingStore = new Map<string, string>([[inventorySecretKey("src-1", "apiToken"), "old-token"]]);
+      // Gates the FIRST vault.get for this source's secret — i.e. the read
+      // captureInventorySourcesForBackup itself does inside the lock. A
+      // second read of the same key (editSource's own pre-overwrite
+      // "previousValue" read, once it's finally allowed to run) passes
+      // straight through — it only matters that it happens strictly AFTER
+      // capture's lock section, which the assertions below confirm.
+      let gateArmed = true;
+      let releaseGet!: () => void;
+      const getGate = new Promise<void>((resolve) => {
+        releaseGet = resolve;
+      });
+      const vault = {
+        get: vi.fn(async (key: string) => {
+          if (gateArmed && key === inventorySecretKey("src-1", "apiToken")) {
+            gateArmed = false;
+            await getGate;
+          }
+          return backingStore.get(key);
+        }),
+        store: vi.fn(async (key: string, value: string) => {
+          backingStore.set(key, value);
+        }),
+        delete: vi.fn(async (key: string) => {
+          backingStore.delete(key);
+        })
+      };
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      registerConfigCommands(core, vault);
+      await core.addOrUpdateInventorySource(
+        makeSource({ name: "NetBox", targetFolder: "Infra", config: { host: "netbox.local" }, secretFieldIds: ["apiToken"] })
+      );
+
+      // Same call-ordering spy as the test above — logs when each acquirer's
+      // body actually starts/finishes running against the REAL shared mutex.
+      const events: string[] = [];
+      const labels = ["capture", "edit"];
+      let nextLabel = 0;
+      const realRunExclusive = AsyncMutex.prototype.runExclusive;
+      vi.spyOn(configMutationLock, "runExclusive").mockImplementation(function (
+        this: AsyncMutex,
+        fn: () => Promise<unknown>
+      ) {
+        const label = labels[nextLabel] ?? `call-${nextLabel}`;
+        nextLabel++;
+        return realRunExclusive.call(this, async () => {
+          events.push(`${label}:start`);
+          try {
+            return await fn();
+          } finally {
+            events.push(`${label}:end`);
+          }
+        });
+      } as typeof configMutationLock.runExclusive);
+
+      // Start the locked capture — it acquires the lock immediately, takes
+      // its fresh snapshot, and blocks inside the gated vault.get for the
+      // source's secret.
+      const capturePromise = captureInventorySourcesForBackup(core, vault);
+
+      await delay(10);
+      expect(events).toEqual(["capture:start"]);
+
+      // Now attempt a full editSource mutation that renames the source AND
+      // rotates its token — while the capture is still mid-flight. Mirrors
+      // the exact prompt sequence editSource issues for a single registered
+      // source with this provider's two config fields (host, apiToken).
+      mockShowInputBox
+        .mockResolvedValueOnce("Renamed Source") // name
+        .mockResolvedValueOnce("Infra") // targetFolder
+        .mockResolvedValueOnce("admin") // defaultUsername
+        .mockResolvedValueOnce("netbox.local") // host
+        .mockResolvedValueOnce("new-token"); // apiToken — rotated
+      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" }); // prunePolicy
+
+      const editCmd = registeredCommands.get("nexus.inventory.editSource")!;
+      const editPromise = editCmd();
+
+      // Give editSource's UI-only prefix (prompts + testConnection, none of
+      // which touch configMutationLock) time to run all the way up to its
+      // own runExclusive call — it must queue there, not run its store
+      // ahead of the still-in-flight capture.
+      await delay(10);
+      expect(events).toEqual(["capture:start"]);
+      expect(core.getInventorySource("src-1")?.name).toBe("NetBox");
+      expect(backingStore.get(inventorySecretKey("src-1", "apiToken"))).toBe("old-token");
+
+      // Release the capture's gated read — its critical section can now
+      // finish and hand the lock to the queued edit.
+      releaseGet();
+      const captured = await capturePromise;
+      await editPromise;
+
+      expect(events).toEqual(["capture:start", "capture:end", "edit:start", "edit:end"]);
+
+      // The captured pair is CONSISTENT: the source record captured is the
+      // pre-edit one ("NetBox"/"netbox.local"), and the secret captured
+      // alongside it is that SAME generation's token ("old-token") — never
+      // the pre-edit record paired with the post-edit token. A reverted fix
+      // (capturing the snapshot up front, then reading secrets with no lock
+      // held) would let editSource's mutation complete fully during the
+      // gated read, so releasing the gate would hand back "new-token"
+      // instead — a torn pairing this assertion catches.
+      expect(captured.inventorySources).toHaveLength(1);
+      expect(captured.inventorySources[0].name).toBe("NetBox");
+      expect(captured.inventorySourceSecrets["src-1"]?.apiToken).toBe("old-token");
+
+      // The edit itself was never blocked forever — once the lock freed up
+      // it proceeded and took effect.
+      expect(core.getInventorySource("src-1")?.name).toBe("Renamed Source");
+      expect(backingStore.get(inventorySecretKey("src-1", "apiToken"))).toBe("new-token");
+    });
   });
 });
