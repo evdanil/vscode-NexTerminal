@@ -842,6 +842,66 @@ describe("NexusCore inventory sources", () => {
     expect(after.focusedSessionId).toBe("session-1");
   });
 
+  it("(FINDING 4) a user focusing a different session mid-window (setFocusedSession, independent of the batch) survives rollback — restore is conditional on the batch's own written value, not unconditional (kills unconditional focus restore)", async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s1",
+        host: "h1",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      },
+      { id: "srv-other", name: "other", host: "h2", port: 22, username: "u", authType: "agent", isHidden: false }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+    core.registerSession({ id: "session-1", serverId: "srv-1", terminalName: "Nexus SSH: s1", startedAt: Date.now() });
+    core.registerSession({ id: "other-session", serverId: "srv-other", terminalName: "Nexus SSH: other", startedAt: Date.now() });
+    // Focus starts on session-1 — the batch below removes srv-1, so its own
+    // synchronous mutation phase (removeServerSessions) clears focus to
+    // undefined as part of the batch write itself.
+    core.setFocusedSession("session-1");
+
+    // A controllable, still-pending saveServers so the test can inject the
+    // mid-flight setFocusedSession call before the persist settles.
+    let rejectSave!: (err: unknown) => void;
+    const pendingSave = new Promise<void>((_resolve, reject) => {
+      rejectSave = reject;
+    });
+    vi.spyOn(repository, "saveServers").mockReturnValueOnce(pendingSave);
+
+    const applyPromise = core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: ["srv-1"],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    // The synchronous prefix of applyInventorySyncPlan (capture priors, drop
+    // srv-1's session via removeServerSessions — clearing focus as part of
+    // the batch's own write — kick off the saves) has already run by the
+    // time the call above returns; it only suspends at the
+    // `await Promise.allSettled(...)`. Simulate the user focusing an
+    // unrelated, already-open terminal during that pending window — this is
+    // independent of the batch, not something it wrote.
+    core.setFocusedSession("other-session");
+
+    rejectSave(new Error("disk full"));
+    await expect(applyPromise).rejects.toThrow("disk full");
+
+    // If the rollback unconditionally restored priorFocusedSessionId (the
+    // bug this test guards against), focus would snap back to "session-1"
+    // here, clobbering the user's newer, unrelated focus change.
+    const after = core.getSnapshot();
+    expect(after.focusedSessionId).toBe("other-session");
+  });
+
   it("(ITEM 1) success path is unchanged: applyInventorySyncPlan still performs exactly one saveServers/saveGroups call and one emission when the persist resolves", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

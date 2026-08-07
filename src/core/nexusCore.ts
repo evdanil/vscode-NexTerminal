@@ -527,6 +527,16 @@ export class NexusCore {
       this.servers.set(server.id, server);
       batchWrittenServers.set(server.id, cloneServerConfig(server));
     }
+    // FINDING 4 (focus review) — same conditional-restore principle as
+    // servers/groups above, applied to focusedSessionId: record what THIS
+    // batch's own synchronous mutation phase left focusedSessionId as
+    // (removeServerSessions, called from the loop just above, clears it when
+    // the focused session belonged to a removed server). A user calling
+    // setFocusedSession mid-window — while the persist below is still
+    // pending — changes focusedSessionId to something this batch never
+    // wrote; rollback must recognize that and leave it alone rather than
+    // unconditionally snapping back to priorFocusedSessionId.
+    const batchWrittenFocusedSessionId = this.focusedSessionId;
     // REORDER — "absent": there is no source record to bump lastSyncAt on or
     // write an entry for; writtenSourceRecord stays undefined and the
     // inventorySources map (and its rollback below) are left completely
@@ -650,10 +660,20 @@ export class NexusCore {
           this.activitySessionIds.add(sessionId);
         }
       }
-      this.focusedSessionId =
-        priorFocusedSessionId !== undefined && this.inventorySyncTombstonedSessionIds.has(priorFocusedSessionId)
-          ? undefined
-          : priorFocusedSessionId;
+      // FINDING 4 — restore focusedSessionId only if it's still exactly what
+      // this batch itself wrote (batchWrittenFocusedSessionId, captured right
+      // after the mutation loop above). If a concurrent setFocusedSession
+      // moved focus to something else while the persist was pending, that is
+      // newer than this batch and must not be clobbered by a rollback of a
+      // batch that no longer owns the current value. Tombstone rule still
+      // applies on top: never restore focus onto a session that was
+      // genuinely torn down during the in-flight window.
+      if (this.focusedSessionId === batchWrittenFocusedSessionId) {
+        this.focusedSessionId =
+          priorFocusedSessionId !== undefined && this.inventorySyncTombstonedSessionIds.has(priorFocusedSessionId)
+            ? undefined
+            : priorFocusedSessionId;
+      }
       // FINDING 2 — source record: nothing in NexusCore ever mutates an
       // InventorySourceConfig object in place (addOrUpdateInventorySource,
       // removeInventorySource, and this method itself only ever call
