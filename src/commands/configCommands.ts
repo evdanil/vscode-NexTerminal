@@ -1694,10 +1694,25 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         // source that was never persisted — undiscoverable dead secrets, since export, removal,
         // and reset all enumerate persisted sources, not the backup payload. So the restore is
         // scoped to importedIds in both modes, not merge-only.
+        //
+        // FINDING 2 — the importedIds gate above is source-scoped only: it says nothing
+        // about which fields WITHIN that source's bucket are legitimate. A malformed/stale
+        // backup can carry a secrets bucket wider than the imported source record's own
+        // declared `secretFieldIds` (e.g. a field removed from the provider's config schema
+        // since the backup was taken, or hand-edited backup JSON). Restoring those extra
+        // fields writes a vault key nothing can ever enumerate again — export, removal, and
+        // reset all walk `secretFieldIds`, not the backup payload — so it becomes a
+        // permanent, undiscoverable secret. Intersect with the imported record's own
+        // `secretFieldIds` (looked up from `data.inventorySources`, which importPreservingIds
+        // mutated in place with the final id) so only fields the source actually declares
+        // are restored.
         const importedSourceIds = new Set(inventorySourceTally.importedIds);
+        const importedSourceById = new Map((data.inventorySources ?? []).map((s) => [s.id, s]));
         for (const [sourceId, fields] of Object.entries(inventorySourceSecrets)) {
           if (!importedSourceIds.has(sourceId)) continue;
+          const declaredFieldIds = new Set(importedSourceById.get(sourceId)?.secretFieldIds ?? []);
           for (const [fieldId, value] of Object.entries(fields)) {
+            if (!declaredFieldIds.has(fieldId)) continue;
             await vault.store(inventorySecretKey(sourceId, fieldId), value);
           }
         }

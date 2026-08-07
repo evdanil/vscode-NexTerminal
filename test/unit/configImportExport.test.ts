@@ -4888,4 +4888,52 @@ describe("backup export round-trip", () => {
     // genuinely absent, since export/removal/reset only ever enumerate persisted sources.
     expect(await vault.get(inventorySecretKey("src2", "apiToken"))).toBeUndefined();
   });
+
+  it("FINDING 2 — restore intersects the secrets bucket with the imported source's own secretFieldIds, so a field the record doesn't declare is never written to the vault (kills the round-3 fix's source-only, unfiltered-field restore)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // The imported src1 record declares only "apiToken" as a secret field. The backup's
+    // secrets bucket for src1 also carries "obsoleteToken" — e.g. a field dropped from the
+    // provider's config schema since the backup was taken, or hand-edited backup JSON.
+    // Nothing can ever enumerate/delete "obsoleteToken" post-import (export/removal/reset
+    // all walk secretFieldIds), so it must never be written in the first place.
+    const secrets = {
+      inventorySourceSecrets: {
+        src1: { apiToken: "valid-token", obsoleteToken: "should-never-land" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ id: "src1", name: "NetBox", secretFieldIds: ["apiToken"] })],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")?.name).toBe("NetBox");
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("valid-token");
+    expect(await vault.get(inventorySecretKey("src1", "obsoleteToken"))).toBeUndefined();
+  });
 });

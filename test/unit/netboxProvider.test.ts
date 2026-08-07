@@ -233,6 +233,41 @@ describe("createNetboxProvider", () => {
       expect(tree.truncated).toBeUndefined();
     });
 
+    it("FINDING 1 — aborts with a protocol error when a page's rows would push the collected total past the reported count (kills accept-overrun, e.g. {count: 1, results: [row1, row2]} read as a complete inventory)", async () => {
+      const fetchImpl = vi.fn(async () =>
+        makeResponse(200, {
+          count: 1,
+          results: [
+            { id: 1, name: "d1", primary_ip: { address: "10.0.0.1/24" } },
+            { id: 2, name: "d2", primary_ip: { address: "10.0.0.2/24" } }
+          ]
+        })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({
+        kind: "protocol",
+        message: expect.stringMatching(/count.*1/i)
+      });
+      await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({
+        message: expect.stringMatching(/2/)
+      });
+    });
+
+    it("FINDING 1 — aborts with a protocol error when the first page reports count 0 but carries a row (kills desynchronized presence detection on a bogus zero count)", async () => {
+      const fetchImpl = vi.fn(async () =>
+        makeResponse(200, {
+          count: 0,
+          results: [{ id: 1, name: "d1", primary_ip: { address: "10.0.0.1/24" } }]
+        })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({
+        kind: "protocol"
+      });
+    });
+
     it("F2 — still throws a protocol error for a genuinely stuck server whose page size collapses after a fast start (kills a bound that only ever grows/never re-anchors)", async () => {
       // First page is a full 250-item page (establishing an optimistic bound),
       // then every subsequent page shrinks to 10 items while `count` keeps

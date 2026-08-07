@@ -280,6 +280,22 @@ async function fetchAllPages(
     maxPageSize = Math.max(maxPageSize, page.results.length);
     maxIterations = Math.ceil(Math.min(count, HARD_CAP) / maxPageSize) + 1;
 
+    // FINDING 1 — reject a page that would push this endpoint's collected
+    // total beyond the pinned first-page `count`, e.g. {count: 1, results:
+    // [row1, row2]} silently read as a complete 2-device inventory. Guarded
+    // against the *legitimate* hard-cap path: if the hard cap is what's
+    // actually going to limit how many of this page's rows get collected
+    // (capAllowance <= count), the shortfall is explained by the cap, not by
+    // the server over-reporting, so no error.
+    const capAllowance = collected.length + capState.remaining;
+    const projectedTotal = collected.length + page.results.length;
+    if (capAllowance > count && projectedTotal > count) {
+      throw new InventoryProviderError(
+        "protocol",
+        `NetBox reported count ${count} for ${baseUrl}${path} but the page at offset ${offset} carries ${page.results.length} row(s), which would bring the collected total to ${projectedTotal} — aborting rather than accepting an inventory larger than reported.`
+      );
+    }
+
     for (const item of page.results) {
       if (capState.remaining <= 0) break;
       collected.push(item);
