@@ -504,6 +504,11 @@ function ensureId(item: Record<string, unknown>): void {
 interface ImportTally {
   imported: number;
   skipped: number;
+  /** ids that were actually added this run (i.e. not skipped as already-existing/invalid).
+   *  Callers that need to know which ids were freshly imported — e.g. to scope a secret
+   *  restore so a merge-mode skip of a retained local record isn't undone by an
+   *  unconditional secret write — read this instead of re-deriving it from `existingIds`. */
+  importedIds: string[];
 }
 
 /**
@@ -516,7 +521,7 @@ async function importPreservingIds<T extends { id: string }>(
   validate: (entity: T) => boolean,
   add: (entity: T) => Promise<void>
 ): Promise<ImportTally> {
-  const tally: ImportTally = { imported: 0, skipped: 0 };
+  const tally: ImportTally = { imported: 0, skipped: 0, importedIds: [] };
   for (const item of items ?? []) {
     ensureId(item as unknown as Record<string, unknown>);
     if (existingIds.has(item.id) || !validate(item)) {
@@ -524,6 +529,7 @@ async function importPreservingIds<T extends { id: string }>(
     } else {
       await add(item);
       tally.imported++;
+      tally.importedIds.push(item.id);
     }
   }
   return tally;
@@ -1522,14 +1528,16 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     let skipped = 0;
     // id-PRESERVING import (distinct from the share path's fresh-id remap): each entity keeps
     // its id and is skipped when that id already exists. Same shape across all six buckets.
-    for (const tally of [
-      await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))),
-      await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e)),
-      await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e)),
-      await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) => core.addOrUpdateInventorySource(e)),
-      await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e)),
-      await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e))
-    ]) {
+    const serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s)));
+    const tunnelTally = await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e));
+    const serialTally = await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e));
+    // Kept in its own variable (not folded into the array below) because the inventory-secret
+    // restore loop further down needs to know exactly which source ids this run imported — see
+    // the comment there.
+    const inventorySourceTally = await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) => core.addOrUpdateInventorySource(e));
+    const localShellTally = await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e));
+    const authProfileTally = await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
+    for (const tally of [serverTally, tunnelTally, serialTally, inventorySourceTally, localShellTally, authProfileTally]) {
       imported += tally.imported;
       skipped += tally.skipped;
     }
@@ -1679,7 +1687,17 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       // above, so it gets its own loop rather than restoreSecrets()'s single-level keyFn.
       const inventorySourceSecrets = decryptedSecrets.inventorySourceSecrets as Record<string, Record<string, string>> | undefined;
       if (inventorySourceSecrets) {
+        // Merge mode: importPreservingIds silently SKIPS an incoming source whose id already
+        // exists locally (the local record wins), but this bucket is keyed by sourceId
+        // independently of that skip. Restoring unconditionally would overwrite a retained
+        // local source's working vault secret (e.g. its API token) with the backup's — possibly
+        // stale — one, even though the source's config was correctly left untouched. Scope the
+        // restore to ids this run actually imported. Replace mode wipes and reimports every
+        // source above, so every id in the payload was (re)imported and the restore stays
+        // unconditional, matching prior behavior.
+        const importedSourceIds = mode === "merge" ? new Set(inventorySourceTally.importedIds) : undefined;
         for (const [sourceId, fields] of Object.entries(inventorySourceSecrets)) {
+          if (importedSourceIds && !importedSourceIds.has(sourceId)) continue;
           for (const [fieldId, value] of Object.entries(fields)) {
             await vault.store(inventorySecretKey(sourceId, fieldId), value);
           }

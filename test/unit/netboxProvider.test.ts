@@ -95,6 +95,26 @@ describe("createNetboxProvider", () => {
       expect(fetchImpl).toHaveBeenCalledTimes(1);
     });
 
+    it("rejects a negative `count` instead of reading it as a complete empty inventory (kills accept-as-empty on `{ count: -1, results: [] }`)", async () => {
+      // `0 < -1` is false, so the pagination loop's `collected.length < count` guard never
+      // runs a single iteration — a malformed/negative count must fail loudly here rather
+      // than silently pass through as "there is nothing to sync", which would prune every
+      // server this endpoint owns.
+      const fetchImpl = vi.fn(async () => makeResponse(200, { count: -1, results: [] }));
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({ kind: "protocol" });
+    });
+
+    it("a genuinely empty inventory (`{ count: 0, results: [] }`) still resolves without error (sanity companion — kills over-strict rejection of a legitimate empty result)", async () => {
+      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 0, results: [] }));
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      expect(tree.devices).toHaveLength(0);
+    });
+
     it("count 20,000 capped at 10,000 — truncates at the hard cap and warns, instead of collecting every reported item (and marks the tree truncated so the engine skips pruning)", async () => {
       const fetchImpl = vi.fn(async (url: string) => {
         const offset = Number(new URL(url).searchParams.get("offset"));

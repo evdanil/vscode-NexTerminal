@@ -166,6 +166,18 @@ function validatePagedShape(json: unknown, url: URL): PagedResult {
   ) {
     throw new InventoryProviderError("protocol", `Response from ${url} is not NetBox JSON — is the base URL correct?`);
   }
+  const { count } = json as { count: number };
+  // A negative or non-integer count (e.g. `{ count: -1, results: [] }`) satisfies `typeof
+  // count === "number"` above but makes `fetchAllPages`'s `collected.length < count` loop
+  // condition false on the very first page, so the endpoint reads as a complete, empty
+  // inventory instead of a malformed response — silently pruning every server this endpoint
+  // owns rather than failing loudly.
+  if (!Number.isInteger(count) || count < 0) {
+    throw new InventoryProviderError(
+      "protocol",
+      `Response from ${url} reported an invalid count (${count}) — is the base URL correct?`
+    );
+  }
   return json as unknown as PagedResult;
 }
 

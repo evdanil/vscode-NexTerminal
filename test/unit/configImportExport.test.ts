@@ -4761,4 +4761,75 @@ describe("backup export round-trip", () => {
 
     expect(core.getInventorySource("src1")?.name).toBe("Incoming Name From Backup");
   });
+
+  it("merge-mode import does not overwrite a retained source's vault secret with the backup's; a newly-imported source's secret still restores; replace mode restores everything", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // A local source "src1" already exists, with its own working vault token.
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src1", name: "Local NetBox" }));
+    await vault.store(inventorySecretKey("src1", "apiToken"), "local-token");
+    registerConfigCommands(core, vault);
+
+    // Backup carries the SAME source id (src1, with a different token — simulating a stale
+    // backup) plus a source that doesn't exist locally yet (src2).
+    const secrets = {
+      inventorySourceSecrets: {
+        src1: { apiToken: "backup-token" },
+        src2: { apiToken: "new-token" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [
+        makeInventorySource({ id: "src1", name: "Backup NetBox" }),
+        makeInventorySource({ id: "src2", name: "New Source" })
+      ],
+      encryptedSecrets
+    };
+
+    // --- Merge mode: importPreservingIds skips src1 (id already exists locally) and imports
+    // src2 (new). The secret restore must follow the same split: src1's vault token is left
+    // alone, src2's is restored.
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")?.name).toBe("Local NetBox"); // config retained
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("local-token"); // secret NOT overwritten
+    expect(await vault.get(inventorySecretKey("src2", "apiToken"))).toBe("new-token"); // newly-imported source restored
+
+    // --- Replace mode: every existing source (src1) is removed and every backup source
+    // (re)imported, so the secret restore stays unconditional — src1's token IS overwritten.
+    registeredCommands.clear();
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1");
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    registerConfigCommands(core, vault);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")?.name).toBe("Backup NetBox");
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("backup-token");
+    expect(await vault.get(inventorySecretKey("src2", "apiToken"))).toBe("new-token");
+  });
 });
