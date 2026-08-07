@@ -1298,9 +1298,13 @@ describe("inventoryCommands", () => {
       const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
       await cmd("src-1");
 
-      expect(teardown.teardownServerRuntime).toHaveBeenCalledTimes(1);
+      // FINDING 1 (P2, reconnect-during-prune review) — teardown now runs for
+      // "owned-1" TWICE: once in the pre-apply loop (as before) and once more
+      // in the post-apply second pass (see that finding's dedicated test
+      // below for the reconnect scenario this second pass exists to catch).
+      expect(teardown.teardownServerRuntime).toHaveBeenCalledTimes(2);
       expect(teardown.teardownServerRuntime).toHaveBeenCalledWith("owned-1");
-      expect(callOrder).toEqual(["teardown:owned-1", "apply"]);
+      expect(callOrder).toEqual(["teardown:owned-1", "apply", "teardown:owned-1"]);
 
       const snapshot = core.getSnapshot();
       expect(snapshot.servers.map((s) => s.id)).toEqual(["owned-2"]);
@@ -1311,6 +1315,68 @@ describe("inventoryCommands", () => {
       expect(await vault.get(passwordSecretKey("owned-2"))).toBe("pw2");
       expect(await vault.get(passphraseSecretKey("owned-2"))).toBe("pp2");
       expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
+    });
+
+    it("FINDING 1 (P2, reconnect-during-prune review) — a reconnect landing in the window between the pre-apply teardown and the apply gets caught by a second best-effort teardown pass run AFTER the apply resolves, over the ids the apply actually removed (kills a single-pass teardown that lets such a reconnect survive the delete-prune)", async () => {
+      const pruned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([pruned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+
+      const callOrder: string[] = [];
+      const originalApply = core.applyInventorySyncPlan.bind(core);
+      vi.spyOn(core, "applyInventorySyncPlan").mockImplementation(async (application) => {
+        callOrder.push("apply");
+        return originalApply(application);
+      });
+
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) // device gone -> prune "delete"
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+
+      // Simulate the race the finding describes: nexus.server.connect
+      // deliberately doesn't take configMutationLock, so a reconnect can land
+      // in the awaited window between the pre-apply teardown call for
+      // "owned-1" and applyInventorySyncPlan actually deleting its record —
+      // registering a fresh session as if a new terminal had just been
+      // opened against the about-to-be-deleted server. Hooked on the FIRST
+      // teardown call only, so it fires before "apply", not on the (later)
+      // second pass.
+      let reconnectSimulated = false;
+      const teardown = {
+        teardownServerRuntime: vi.fn(async (serverId: string) => {
+          callOrder.push(`teardown:${serverId}`);
+          if (serverId === "owned-1" && !reconnectSimulated) {
+            reconnectSimulated = true;
+            core.registerSession({ id: "sess-reconnect", serverId: "owned-1", terminalName: "Nexus (SSH): old-sw", startedAt: Date.now() });
+          }
+        })
+      };
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete" }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      // Spy call ordering proves teardown ran for "owned-1" BEFORE apply (the
+      // pre-existing pass) and AGAIN AFTER apply resolved (the new second
+      // pass this finding adds) — catching the reconnect that landed in
+      // between. If the fix were reverted to a single pre-apply pass, this
+      // would be ["teardown:owned-1", "apply"] and the length-2 assertion
+      // below would fail.
+      expect(callOrder).toEqual(["teardown:owned-1", "apply", "teardown:owned-1"]);
+      expect(teardown.teardownServerRuntime).toHaveBeenCalledTimes(2);
+      expect(core.getServer("owned-1")).toBeUndefined();
     });
 
     it("(FINDING 2, review) a pruned server re-created (e.g. by nexus.server.edit, which never takes configMutationLock) while applyInventorySyncPlan's saves are still settling keeps its vault credentials — the post-apply cleanup loop must recheck server absence per id (kills unconditional pruned-secret cleanup)", async () => {
@@ -1704,6 +1770,38 @@ describe("inventoryCommands", () => {
 
       expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Inventory sync failed"));
       expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    });
+
+    it("FINDING 2 (P2, defensive-copy review) — a provider that mutates its config argument in place does not corrupt the stored source record (kills passing the live config object straight through to fetchInventory)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async (config) => {
+          // A misbehaving third-party provider mutating the config object it
+          // was handed, as if it were free to treat it as scratch space.
+          (config as Record<string, unknown>).baseUrl = "mutated";
+          return { contractVersion: 1, devices: [] };
+        })
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      // NexusCore.addOrUpdateInventorySource only shallow-copies the source
+      // record itself — the nested `config` object is stored by the exact
+      // same reference the caller passed in, so this is genuinely the live
+      // object syncNow will later read as `source.config`.
+      await core.addOrUpdateInventorySource(makeSource({ config: { baseUrl: "https://original.example" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      // If the fix were reverted (provider.fetchInventory(source.config,
+      // secrets) passing the live object straight through instead of a
+      // structuredClone), the provider's in-place mutation above would be
+      // visible here too — the stored record and the corrupted copy are the
+      // same object.
+      expect(core.getInventorySource("src-1")?.config.baseUrl).toBe("https://original.example");
     });
 
     it("missing saved credential aborts with an error pointing at editSource", async () => {

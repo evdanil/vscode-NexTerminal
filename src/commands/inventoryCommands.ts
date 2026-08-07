@@ -60,6 +60,28 @@ function providerMissingMessage(providerId: string): string {
 }
 
 /**
+ * FINDING 2 (P2, defensive-copy review) — every provider.testConnection /
+ * provider.fetchInventory call site was passing the live config/secrets
+ * objects straight through. `config` here can be the EXACT object stored on
+ * an InventorySourceConfig in NexusCore (e.g. syncNow passes `source.config`
+ * directly) — a third-party provider that mutates its `config` argument in
+ * place corrupts the stored record silently: since InventorySourceValues is
+ * all primitives, the mutated copy and the "current" record are one and the
+ * same object, so there's nothing to diff against and no revision bump to
+ * notice. Every call boundary must hand the provider its own copy instead:
+ * structuredClone for config (cheap — every value is a string/number/boolean)
+ * and a shallow copy for secrets (also a flat Record<string,string>). A tiny
+ * shared helper so future provider call sites inherit this for free instead
+ * of each having to remember it individually.
+ */
+function cloneForProvider(
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets
+): { config: InventorySourceValues; secrets: InventorySourceSecrets } {
+  return { config: structuredClone(config), secrets: { ...secrets } };
+}
+
+/**
  * ITEM 9 — best-effort secret delete for post-apply/post-removal cleanup
  * steps that must not abort a primary operation that has already succeeded
  * (servers removed / plan applied) just because clearing one now-orphaned
@@ -269,7 +291,10 @@ async function testConnectionWithRetry(
   try {
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: `Testing connection to "${provider.label}"…` },
-      () => provider.testConnection(config, secrets)
+      () => {
+        const cloned = cloneForProvider(config, secrets);
+        return provider.testConnection(cloned.config, cloned.secrets);
+      }
     );
     return true;
   } catch (error) {
@@ -1048,7 +1073,10 @@ export function registerInventoryCommands(
       try {
         const fetched = await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: `Syncing inventory from "${source.name}"…` },
-          () => provider.fetchInventory(source.config, secrets)
+          () => {
+            const cloned = cloneForProvider(source.config, secrets);
+            return provider.fetchInventory(cloned.config, cloned.secrets);
+          }
         );
         try {
           validateInventoryTree(fetched);
@@ -1245,14 +1273,40 @@ export function registerInventoryCommands(
           // is the only thing that can still catch that — surface its rejection
           // the same way as the fast-fail check above rather than letting it
           // propagate as an unhandled command rejection.
+          let applyResult: { skippedCount: number; removedServerIds: string[] };
           try {
-            await core.applyInventorySyncPlan(finalApplication);
+            applyResult = await core.applyInventorySyncPlan(finalApplication);
           } catch (error) {
             void vscode.window.showErrorMessage(
               `Inventory sync failed: ${error instanceof Error ? error.message : String(error)}`
             );
             return { kind: "abort" };
           }
+
+          // FINDING 1 (P2, reconnect-during-prune review) — nexus.server.connect
+          // deliberately doesn't (and shouldn't) take configMutationLock, so a
+          // user can reconnect a server torn down by the pre-apply teardown
+          // loop above in the awaited window between that teardown and this
+          // apply — resurrecting a live terminal/tunnel attached to a record
+          // the apply above just deleted. Run a second best-effort teardown
+          // pass, by id, over `applyResult.removedServerIds` (the ids the
+          // apply actually removed, not our own pre-apply candidate list —
+          // same reasoning as the ITEM 9 cleanup loop below). teardownServerRuntime
+          // is idempotent and doesn't need the server record to still exist
+          // (see its doc in serverCommands.ts), so re-running it for an id
+          // already handled by the pre-apply loop above is harmless.
+          // Residual micro-window (accepted, not closeable without making
+          // connect take the lock): a connect that resolved its server object
+          // BEFORE the apply and only creates its terminal AFTER this second
+          // sweep still leaves a stranded terminal attached to a deleted
+          // record. This is intrinsic without locking connects (out of scope
+          // here — see the finding). The extension's orphan-terminal detection
+          // (services/terminal/orphanDetect.ts, run at next activation) is the
+          // backstop that surfaces any terminal stranded this way.
+          for (const id of applyResult.removedServerIds) {
+            await teardown.teardownServerRuntime(id);
+          }
+
           // ITEM 9 — per-key best-effort: one rejected delete must not strand
           // the remaining pruned servers' secrets uncleaned.
           // FINDING 2 (review) — nexus.server.edit / nexus.server.rename
