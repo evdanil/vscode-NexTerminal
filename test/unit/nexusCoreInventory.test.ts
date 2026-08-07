@@ -297,6 +297,89 @@ describe("NexusCore inventory sources", () => {
     expect(listener).not.toHaveBeenCalled();
     expect(saveServersSpy).not.toHaveBeenCalled();
   });
+
+  it("(ITEM 1) applyInventorySyncPlan rolls back servers, explicit groups, active sessions, focus, and the source's lastSyncAt when the persist rejects — and emits nothing (kills mutate-then-leak)", async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s",
+        host: "h",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        group: "OldGroup",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      },
+      { id: "srv-untouched", name: "u2", host: "h2", port: 22, username: "u", authType: "agent", isHidden: false }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ lastSyncAt: 100 }));
+    core.registerSession({ id: "session-1", serverId: "srv-1", terminalName: "Nexus SSH: s", startedAt: Date.now() });
+    core.setFocusedSession("session-1");
+
+    const beforeSnapshot = core.getSnapshot();
+    const beforeLastSyncAt = core.getInventorySource("source-1")?.lastSyncAt;
+
+    vi.spyOn(repository, "saveServers").mockRejectedValueOnce(new Error("disk full"));
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    const newServer: ServerConfig = { id: "srv-2", name: "new", host: "h2", port: 22, username: "u", authType: "agent", isHidden: false };
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 99999,
+        upsertServers: [newServer],
+        removeServerIds: ["srv-1"],
+        folders: ["A/B"],
+        expectedSource: makeSourceConfig({ lastSyncAt: 100 })
+      })
+    ).rejects.toThrow("disk full");
+
+    // If ITEM 1's rollback were reverted (mutate-then-await, no restore on
+    // rejection), all of the following would still reflect the half-applied
+    // sync even though the caller was told it failed: srv-1 gone, srv-2
+    // present, "A/B" registered as an explicit group, the session dropped,
+    // focus cleared, and lastSyncAt bumped.
+    expect(listener).not.toHaveBeenCalled();
+    const after = core.getSnapshot();
+    const byId = (list: { id: string }[]) => [...list].sort((a, b) => a.id.localeCompare(b.id));
+    expect(byId(after.servers)).toEqual(byId(beforeSnapshot.servers));
+    expect([...after.explicitGroups].sort()).toEqual([...beforeSnapshot.explicitGroups].sort());
+    expect(byId(after.activeSessions)).toEqual(byId(beforeSnapshot.activeSessions));
+    expect(after.focusedSessionId).toBe(beforeSnapshot.focusedSessionId);
+    expect(core.getInventorySource("source-1")?.lastSyncAt).toBe(beforeLastSyncAt);
+  });
+
+  it("(ITEM 1) success path is unchanged: applyInventorySyncPlan still performs exactly one saveServers/saveGroups call and one emission when the persist resolves", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    const saveServersSpy = vi.spyOn(repository, "saveServers");
+    const saveGroupsSpy = vi.spyOn(repository, "saveGroups");
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    const server: ServerConfig = { id: "srv-1", name: "s", host: "h", port: 22, username: "u", authType: "agent", isHidden: false };
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [server],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: makeSourceConfig()
+    });
+
+    expect(saveServersSpy).toHaveBeenCalledTimes(1);
+    expect(saveGroupsSpy).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(core.getSnapshot().servers).toHaveLength(1);
+    expect(core.getInventorySource("source-1")?.lastSyncAt).toBe(1000);
+  });
 });
 
 describe("validateInventorySource", () => {

@@ -206,9 +206,16 @@ export class NexusCore {
    * applyInventorySyncPlan (or removeServer) first if servers need to change.
    *
    * FINDING A — symmetric with addOrUpdateInventorySource: removeSource's
-   * command flow deletes the source's secrets only after this call succeeds,
-   * so a rejected persist here must restore the entry rather than leave it
-   * deleted in memory while its secrets are still on disk.
+   * command flow deletes the source's OWN secrets (its inventory-source-*
+   * vault keys) BEFORE calling this method, not after — delete-first is the
+   * correct order here: if the record delete below rejects, the (restored)
+   * record still enumerates those field ids via secretFieldIds, so the
+   * command is retryable and will simply attempt the same (now-idempotent)
+   * vault deletes again. Restoring the entry on a rejected persist keeps that
+   * retry possible — a delete-then-leak here would strand the record deleted
+   * in memory while removeInventorySource() never got persisted, and the
+   * command layer's own retry logic assumes rejection means "nothing
+   * changed".
    */
   public async removeInventorySource(id: string): Promise<void> {
     const hadPrevious = this.inventorySources.has(id);
@@ -254,6 +261,42 @@ export class NexusCore {
         `Cannot apply inventory sync: inventory source "${apply.sourceId}" configuration changed since the sync was computed.`
       );
     }
+    // ITEM 1 — capture everything this call is about to mutate BEFORE
+    // touching it, so a rejected persist below can be rolled back completely.
+    // Without this, a half-applied sync (servers deleted/upserted, sessions
+    // dropped, lastSyncAt bumped) stayed in memory even though the caller was
+    // told the sync failed — and the next unrelated persist (any other
+    // saveServers/saveGroups/saveInventorySources call) would flush that
+    // half-applied state to disk for real.
+    const priorExplicitGroups = new Set(this.explicitGroups);
+    const priorServers = new Map<string, ServerConfig | undefined>();
+    const captureServerPrior = (id: string): void => {
+      if (!priorServers.has(id)) {
+        priorServers.set(id, this.servers.get(id));
+      }
+    };
+    for (const id of apply.removeServerIds) {
+      captureServerPrior(id);
+    }
+    for (const server of apply.upsertServers) {
+      captureServerPrior(server.id);
+    }
+    // removeServerSessions (below) only ever touches activeSessions,
+    // activitySessionIds, and focusedSessionId — mirror exactly that here.
+    const priorFocusedSessionId = this.focusedSessionId;
+    const priorActiveSessions = new Map<string, ActiveSession>();
+    const priorActivitySessionIds = new Set<string>();
+    for (const id of apply.removeServerIds) {
+      for (const [sessionId, session] of this.activeSessions.entries()) {
+        if (session.serverId === id) {
+          priorActiveSessions.set(sessionId, session);
+          if (this.activitySessionIds.has(sessionId)) {
+            priorActivitySessionIds.add(sessionId);
+          }
+        }
+      }
+    }
+
     for (const folder of apply.folders) {
       const normalized = normalizeFolderPath(folder);
       if (!normalized) {
@@ -271,11 +314,34 @@ export class NexusCore {
       this.servers.set(server.id, server);
     }
     this.inventorySources.set(source.id, { ...source, lastSyncAt: apply.syncedAt });
-    await Promise.all([
-      this.repository.saveServers([...this.servers.values()]),
-      this.repository.saveGroups([...this.explicitGroups]),
-      this.repository.saveInventorySources([...this.inventorySources.values()])
-    ]);
+    try {
+      await Promise.all([
+        this.repository.saveServers([...this.servers.values()]),
+        this.repository.saveGroups([...this.explicitGroups]),
+        this.repository.saveInventorySources([...this.inventorySources.values()])
+      ]);
+    } catch (error) {
+      this.explicitGroups.clear();
+      for (const group of priorExplicitGroups) {
+        this.explicitGroups.add(group);
+      }
+      for (const [id, priorServer] of priorServers) {
+        if (priorServer) {
+          this.servers.set(id, priorServer);
+        } else {
+          this.servers.delete(id);
+        }
+      }
+      for (const [sessionId, session] of priorActiveSessions) {
+        this.activeSessions.set(sessionId, session);
+        if (priorActivitySessionIds.has(sessionId)) {
+          this.activitySessionIds.add(sessionId);
+        }
+      }
+      this.focusedSessionId = priorFocusedSessionId;
+      this.inventorySources.set(source.id, source);
+      throw error;
+    }
     this.emitChanged();
   }
 

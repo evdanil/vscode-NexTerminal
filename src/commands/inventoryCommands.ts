@@ -44,6 +44,21 @@ function providerMissingMessage(providerId: string): string {
   return `Provider "${providerId}" not available (the extension providing it may be disabled).`;
 }
 
+/**
+ * ITEM 9 — best-effort secret delete for post-apply/post-removal cleanup
+ * steps that must not abort a primary operation that has already succeeded
+ * (servers removed / plan applied) just because clearing one now-orphaned
+ * vault key failed. Logs and continues so the remaining keys in the batch
+ * still get their own delete attempt.
+ */
+async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<void> {
+  try {
+    await vault.delete(key);
+  } catch (error) {
+    console.warn(`[Nexus] Failed to delete secret key "${key}":`, error);
+  }
+}
+
 function describeInventoryError(error: unknown): string {
   if (error instanceof InventoryProviderError) {
     const prefix = error.kind === "auth" ? "Authentication failed" : error.kind === "network" ? "Network error" : "Unexpected response";
@@ -483,6 +498,29 @@ export function registerInventoryCommands(
       // stuck at its new value even though the source record reverted to old.
       const newlyWrittenFieldIds: string[] = [];
       const overwrittenPreviousValues = new Map<string, string>();
+
+      // ITEM 3/4 shared rollback — best-effort delete of everything newly
+      // written this run and best-effort restore of everything overwritten
+      // this run. Used both when the store loop itself fails partway through
+      // (ITEM 3) and when a pre-persist drift check aborts after the loop
+      // completed successfully (ITEM 4).
+      const rollbackThisRunsVaultWrites = async (): Promise<void> => {
+        for (const fieldId of newlyWrittenFieldIds) {
+          try {
+            await vault.delete(inventorySecretKey(source.id, fieldId));
+          } catch {
+            // best-effort rollback — ignore
+          }
+        }
+        for (const [fieldId, previousValue] of overwrittenPreviousValues) {
+          try {
+            await vault.store(inventorySecretKey(source.id, fieldId), previousValue);
+          } catch {
+            // best-effort rollback — ignore
+          }
+        }
+      };
+
       try {
         for (const [fieldId, value] of Object.entries(reenteredSecrets)) {
           if (existingSecretFieldIds.has(fieldId)) {
@@ -497,6 +535,13 @@ export function registerInventoryCommands(
           }
         }
       } catch {
+        // ITEM 3 — a later field's store rejecting after earlier ones in
+        // THIS loop succeeded must not leave those earlier writes stuck:
+        // an overwritten field's old value would otherwise be lost even
+        // though the update as a whole never took effect, and a brand-new
+        // field's key would otherwise be orphaned exactly like FINDING B on
+        // the add path.
+        await rollbackThisRunsVaultWrites();
         void vscode.window.showErrorMessage("Could not store credentials in the system keychain — the source was not updated.");
         return;
       }
@@ -513,6 +558,23 @@ export function registerInventoryCommands(
 
       const updated: InventorySourceConfig = { ...source, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds: newSecretFieldIds };
 
+      // ITEM 4 — re-read the record immediately before persisting. configCommands
+      // flows (importMergeReplace, completeReset) mutate inventory sources
+      // directly and bypass inFlightSourceIds entirely, so an import/reset can
+      // complete while the user still sits in these prompts. Persisting `updated`
+      // (built from the pick-time `source`) over that would silently overwrite
+      // the imported record (and FINDING 3's stale-key cleanup below would then
+      // delete the imported source's own vault keys), or resurrect a source the
+      // user just reset away. `source` is the exact pick-time record — compared
+      // on both config (sourceConfigUnchanged) and name, since name isn't part
+      // of that comparator.
+      const currentSourceBeforePersist = core.getInventorySource(source.id);
+      if (!currentSourceBeforePersist || !sourceConfigUnchanged(currentSourceBeforePersist, source) || currentSourceBeforePersist.name !== source.name) {
+        await rollbackThisRunsVaultWrites();
+        void vscode.window.showErrorMessage("Inventory source changed while editing — reopen Edit Source.");
+        return;
+      }
+
       // FINDING 1 — persist BEFORE any vault cleanup. If persistence rejects,
       // the pre-existing secretFieldIds keys must be left untouched (they're
       // still the keys the last-known-good source record points at), and any
@@ -524,20 +586,7 @@ export function registerInventoryCommands(
       try {
         await core.addOrUpdateInventorySource(updated);
       } catch {
-        for (const fieldId of newlyWrittenFieldIds) {
-          try {
-            await vault.delete(inventorySecretKey(source.id, fieldId));
-          } catch {
-            // best-effort rollback — ignore
-          }
-        }
-        for (const [fieldId, previousValue] of overwrittenPreviousValues) {
-          try {
-            await vault.store(inventorySecretKey(source.id, fieldId), previousValue);
-          } catch {
-            // best-effort rollback — ignore
-          }
-        }
+        await rollbackThisRunsVaultWrites();
         void vscode.window.showErrorMessage(`Could not save inventory source "${name}" — the update was not applied.`);
         return;
       }
@@ -549,10 +598,18 @@ export function registerInventoryCommands(
       // Deleted only AFTER the updated source is successfully persisted —
       // deleting them first would destroy still-referenced credentials if the
       // persist below then failed (FINDING 1).
+      // ITEM 8 — each stale-key delete is independent and best-effort: one
+      // rejection must neither throw out of an otherwise-successful edit nor
+      // block the remaining stale keys from being cleaned up.
       const newSecretFieldIdSet = new Set(newSecretFieldIds);
       for (const staleId of source.secretFieldIds) {
         if (!newSecretFieldIdSet.has(staleId)) {
-          await vault.delete(inventorySecretKey(source.id, staleId));
+          const staleKey = inventorySecretKey(source.id, staleId);
+          try {
+            await vault.delete(staleKey);
+          } catch (error) {
+            console.warn(`[Nexus] Failed to delete stale inventory secret key "${staleKey}":`, error);
+          }
         }
       }
 
@@ -607,29 +664,48 @@ export function registerInventoryCommands(
         // command, before the confirm modal and teardown awaits; it's the
         // correct expectedSource here since removeSource never recomputes
         // against a fresher record the way syncNow does.
-        await core.applyInventorySyncPlan({
-          sourceId: source.id,
-          syncedAt: Date.now(),
-          upsertServers: [],
-          removeServerIds: owned.map((s) => s.id),
-          folders: [],
-          expectedSource: source
-        });
+        // ITEM 6 — a source config change racing this call (e.g. import/reset)
+        // makes applyInventorySyncPlan's own atomic expectedSource check
+        // throw; catch it here with a removal-appropriate message instead of
+        // letting it surface as an unhandled command rejection, and stop
+        // before touching any secrets or the source record (no partial
+        // removal).
+        try {
+          await core.applyInventorySyncPlan({
+            sourceId: source.id,
+            syncedAt: Date.now(),
+            upsertServers: [],
+            removeServerIds: owned.map((s) => s.id),
+            folders: [],
+            expectedSource: source
+          });
+        } catch {
+          void vscode.window.showErrorMessage("Inventory source changed while removing — try again.");
+          return;
+        }
+        // ITEM 9 — per-key best-effort: one rejected delete must not strand
+        // the remaining owned servers' secrets uncleaned.
         for (const server of owned) {
-          await vault.delete(passwordSecretKey(server.id));
-          await vault.delete(passphraseSecretKey(server.id));
-          await vault.delete(proxyPasswordSecretKey(server.id));
+          await deleteSecretBestEffort(vault, passwordSecretKey(server.id));
+          await deleteSecretBestEffort(vault, passphraseSecretKey(server.id));
+          await deleteSecretBestEffort(vault, proxyPasswordSecretKey(server.id));
         }
       } else if (choice === "Keep Servers") {
         const strippedServers = owned.map(({ origin, ...rest }) => rest as ServerConfig);
-        await core.applyInventorySyncPlan({
-          sourceId: source.id,
-          syncedAt: Date.now(),
-          upsertServers: strippedServers,
-          removeServerIds: [],
-          folders: [],
-          expectedSource: source
-        });
+        // ITEM 6 — same reasoning as the Delete Servers branch above.
+        try {
+          await core.applyInventorySyncPlan({
+            sourceId: source.id,
+            syncedAt: Date.now(),
+            upsertServers: strippedServers,
+            removeServerIds: [],
+            folders: [],
+            expectedSource: source
+          });
+        } catch {
+          void vscode.window.showErrorMessage("Inventory source changed while removing — try again.");
+          return;
+        }
       }
 
       for (const fieldId of source.secretFieldIds) {
@@ -713,7 +789,17 @@ export function registerInventoryCommands(
 
       // Nothing to do: apply an empty application to bump lastSyncAt without a confirm modal.
       if (plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0) {
-        await core.applyInventorySyncPlan(planToApplication(plan, source));
+        // ITEM 5 — same rejection surface as the main apply path below: a
+        // source config race (or any persist failure) here must produce a
+        // friendly error instead of an unhandled command rejection.
+        try {
+          await core.applyInventorySyncPlan(planToApplication(plan, source));
+        } catch (error) {
+          void vscode.window.showErrorMessage(
+            `Inventory sync failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+          return;
+        }
         void vscode.window.showInformationMessage(`Inventory sync from "${source.name}": nothing to do (${plan.unchangedCount} unchanged).`);
         if (plan.warnings.length > 0) {
           void vscode.window
@@ -793,6 +879,26 @@ export function registerInventoryCommands(
           return;
         }
 
+        // ITEM 2 — recompute the plan/application ONE MORE TIME here, after
+        // the very last await above (the teardown loop and the FINDING D
+        // vault re-read), immediately before applyInventorySyncPlan — no
+        // await separates this recompute from the apply call. Without this,
+        // a server edited during those awaits would be overwritten by the
+        // stale `application` object computed before them (`recomputed`
+        // above only reflects state as of right before the teardown loop
+        // started). The teardown loop already ran against that pre-teardown
+        // `application.removeServerIds` — if this fresh recompute's delete
+        // set differs (e.g. a server edited out of "delete" during teardown),
+        // we do NOT re-run teardown for it: applying the fresh plan is what
+        // matters, and a torn-down connection for a server that's no longer
+        // being deleted is an acceptable, visible cost. `freshSource` (not a
+        // re-read here) stays the basis for both the plan and
+        // applyInventorySyncPlan's expectedSource — FINDING E's synchronous
+        // check inside applyInventorySyncPlan is what still catches the
+        // source record itself being replaced during this window.
+        const finalPlan = computeSyncPlan({ source: freshSource, tree, currentServers: core.getSnapshot().servers, now: Date.now() });
+        const finalApplication = planToApplication(finalPlan, freshSource);
+
         // FINDING E — even after the checks above, the source record could
         // still be replaced during the teardown awaits themselves (between
         // the freshSource check and this call). applyInventorySyncPlan's own
@@ -801,28 +907,30 @@ export function registerInventoryCommands(
         // the same way as the fast-fail check above rather than letting it
         // propagate as an unhandled command rejection.
         try {
-          await core.applyInventorySyncPlan(application);
+          await core.applyInventorySyncPlan(finalApplication);
         } catch (error) {
           void vscode.window.showErrorMessage(
             `Inventory sync failed: ${error instanceof Error ? error.message : String(error)}`
           );
           return;
         }
-        for (const id of prunedServerIdsForSecretCleanup(recomputed)) {
-          await vault.delete(passwordSecretKey(id));
-          await vault.delete(passphraseSecretKey(id));
-          await vault.delete(proxyPasswordSecretKey(id));
+        // ITEM 9 — per-key best-effort: one rejected delete must not strand
+        // the remaining pruned servers' secrets uncleaned.
+        for (const id of prunedServerIdsForSecretCleanup(finalPlan)) {
+          await deleteSecretBestEffort(vault, passwordSecretKey(id));
+          await deleteSecretBestEffort(vault, passphraseSecretKey(id));
+          await deleteSecretBestEffort(vault, proxyPasswordSecretKey(id));
         }
 
-        const deletedCount = recomputed.prunes.filter((p) => p.policy === "delete").length;
+        const deletedCount = finalPlan.prunes.filter((p) => p.policy === "delete").length;
         void vscode.window.showInformationMessage(
-          `Inventory sync complete: +${recomputed.adds.length} ~${recomputed.updates.length} -${deletedCount} (${recomputed.unchangedCount} unchanged).`
+          `Inventory sync complete: +${finalPlan.adds.length} ~${finalPlan.updates.length} -${deletedCount} (${finalPlan.unchangedCount} unchanged).`
         );
-        if (recomputed.warnings.length > 0) {
+        if (finalPlan.warnings.length > 0) {
           void vscode.window
-            .showWarningMessage(`${recomputed.warnings.length} warning${recomputed.warnings.length === 1 ? "" : "s"} during sync.`, "Show Details")
+            .showWarningMessage(`${finalPlan.warnings.length} warning${finalPlan.warnings.length === 1 ? "" : "s"} during sync.`, "Show Details")
             .then((detailChoice) => {
-              if (detailChoice === "Show Details") void openInventoryIssuesText(recomputed.warnings);
+              if (detailChoice === "Show Details") void openInventoryIssuesText(finalPlan.warnings);
             });
         }
         return;
