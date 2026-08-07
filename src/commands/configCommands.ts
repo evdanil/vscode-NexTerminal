@@ -1786,7 +1786,20 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
     // Restore passwords/passphrases from decrypted secrets
     let fileRestoreResult: RestoreBackupFoldersResult = { restoredFiles: 0, skippedExistingFiles: 0 };
+    // Sources whose record + secrets were both successfully rolled back this run.
     const failedInventorySourceNames: string[] = [];
+    // FINDING 1 — sources whose secret store ALSO failed to roll back (removeInventorySource
+    // itself rejected). Kept separate from failedInventorySourceNames: these sources are still
+    // live in core (removeInventorySource's own catch restores the in-memory record when its
+    // persist fails — see NexusCore.removeInventorySource), so lumping them into the "could not
+    // be restored — re-import or add it manually" message would tell the user the source is
+    // gone when it is actually still present with missing/partial credentials.
+    const unremovableInventorySourceNames: string[] = [];
+    // FINDING 2 — total count of servers imported THIS RUN that named a rolled-back source as
+    // their origin and were converted to plain manual servers (origin stripped). Only servers
+    // this run itself created are touched; a pre-existing server that happens to share the
+    // rolled-back source id is never modified.
+    let convertedServerCount = 0;
     if (decryptedSecrets) {
       await restoreSecrets(decryptedSecrets.passwords as Record<string, string> | undefined, passwordSecretKey, vault);
       await restoreSecrets(decryptedSecrets.passphrases as Record<string, string> | undefined, passphraseSecretKey, vault);
@@ -1860,25 +1873,67 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
             try {
               await core.removeInventorySource(sourceId);
             } catch {
-              // Best-effort — the record may already be gone or have changed underneath us;
-              // either way there is nothing further this loop can safely do about it.
+              // FINDING 1 — the removal itself failed. removeInventorySource's own catch
+              // already restored the record in memory (its persist rejected), so the source is
+              // NOT gone — it is still live in core, just missing some or all of the
+              // credentials we just deleted/never stored. Report this distinctly below and do
+              // NOT fall into the "successfully rolled back" bookkeeping: don't decrement
+              // `imported` (the source is still counted as imported) and don't touch its
+              // servers' origin — a source that still exists can still manage them.
+              unremovableInventorySourceNames.push(importedSource?.name ?? sourceId);
+              continue;
             }
             imported--;
             failedInventorySourceNames.push(importedSource?.name ?? sourceId);
+
+            // FINDING 2 — the backup can also carry servers whose origin.sourceId names this
+            // now-removed source. Left alone they'd stay synced-badged forever: a manually
+            // re-added source gets a fresh id, so nothing could ever claim them again. Scope
+            // the sweep to servers THIS RUN imported (serverTally.importedIds) — a pre-existing
+            // server is never touched, even if it happens to share the rolled-back source id.
+            for (const serverId of serverTally.importedIds) {
+              const server = core.getServer(serverId);
+              if (!server || server.origin?.sourceId !== sourceId) continue;
+              const { origin: _origin, ...withoutOrigin } = server;
+              try {
+                await core.addOrUpdateServer(withoutOrigin as ServerConfig);
+                convertedServerCount++;
+              } catch {
+                // Best-effort, same residue class as the vault-delete rollback above: at worst
+                // this server keeps an origin pointing at a source that no longer exists.
+              }
+            }
           }
         }
       }
       fileRestoreResult = await restoreBackupFolders(decryptedSecrets, mode, context);
     }
 
-    // FINDING 2 — surface every source rolled back above (record + secret
-    // restore both undone) so the user knows to re-import or add it by hand,
-    // rather than silently discovering a missing source later.
+    // FINDING 2 (rollback review) — surface every source rolled back above (record + secret
+    // restore both undone) so the user knows to re-import or add it by hand, rather than
+    // silently discovering a missing source later. Appends how many of its servers were
+    // converted to plain manual servers, when any were.
     if (failedInventorySourceNames.length > 0) {
       const isSingle = failedInventorySourceNames.length === 1;
       const names = failedInventorySourceNames.map((n) => `"${n}"`).join(", ");
+      const convertedNote = convertedServerCount > 0
+        ? `; ${convertedServerCount} of ${isSingle ? "its" : "their"} servers were kept as manual servers.`
+        : ".";
       void vscode.window.showWarningMessage(
-        `${isSingle ? "Source" : "Sources"} ${names} could not be restored — ${isSingle ? "its" : "their"} credentials failed to store; re-import or add ${isSingle ? "it" : "them"} manually.`
+        `${isSingle ? "Source" : "Sources"} ${names} could not be restored — ${isSingle ? "its" : "their"} credentials failed to store; re-import or add ${isSingle ? "it" : "them"} manually${convertedNote}`
+      );
+    }
+
+    // FINDING 1 (rollback review) — a distinct message for sources where even the rollback's
+    // own removal failed: unlike the case above, the record is still live in core (partially or
+    // fully missing its credentials), so telling the user to "re-import or add it manually"
+    // would be false — re-importing would skip it as already-existing, and adding it manually
+    // would collide. Point at Edit Source instead, where the existing record can be fixed up.
+    if (unremovableInventorySourceNames.length > 0) {
+      const isSingle = unremovableInventorySourceNames.length === 1;
+      const names = unremovableInventorySourceNames.map((n) => `"${n}"`).join(", ");
+      void vscode.window.showWarningMessage(
+        `${isSingle ? "Source" : "Sources"} ${names} ${isSingle ? "was" : "were"} imported but ${isSingle ? "its" : "their"} credentials failed to store and ${isSingle ? "it" : "they"} could not be removed — re-enter them via Edit Source before syncing.`
       );
     }
 

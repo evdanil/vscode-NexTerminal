@@ -5024,4 +5024,162 @@ describe("backup export round-trip", () => {
       'Source "Source Two" could not be restored — its credentials failed to store; re-import or add it manually.'
     );
   });
+
+  it("FINDING 1 (rollback review) — when the rollback's own core.removeInventorySource call ALSO rejects, the source is still live in core (not decremented from the import count) and the warning tells the user to re-enter credentials via Edit Source, not to re-import or add it manually (kills false-success reporting when the removal itself failed)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    const backingStore = new Map<string, string>();
+    const vault: SecretVault = {
+      get: vi.fn(async (key: string) => backingStore.get(key)),
+      store: vi.fn(async (key: string, value: string) => {
+        if (key === inventorySecretKey("src2", "apiToken")) {
+          throw new Error("secret storage unavailable");
+        }
+        backingStore.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        backingStore.delete(key);
+      })
+    };
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // The vault.store rejection above drives the rollback's attempt to remove the
+    // just-imported record; make THAT call reject too (e.g. its own persist failed).
+    // NexusCore.removeInventorySource restores the record in memory on a persist
+    // failure — so the source is genuinely still live in core after this.
+    vi.spyOn(core, "removeInventorySource").mockRejectedValueOnce(new Error("disk full"));
+
+    const secrets = {
+      inventorySourceSecrets: {
+        src2: { apiToken: "src2-token" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ id: "src2", name: "Source Two", secretFieldIds: ["apiToken"] })],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    // The source record is still present — this is NOT a successful rollback. A
+    // reverted fix (catch swallowed, treated as if removal had succeeded) would
+    // report this source as cleanly removed while it in fact still lives in core
+    // with a missing credential.
+    expect(core.getInventorySource("src2")).toBeDefined();
+    expect(core.getInventorySource("src2")?.name).toBe("Source Two");
+    expect(await vault.get(inventorySecretKey("src2", "apiToken"))).toBeUndefined();
+
+    // The closing count reflects the source as still imported (not decremented) —
+    // a reverted fix decrements it even though the record was never actually removed.
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(
+      expect.stringContaining("Imported 1 profile")
+    );
+
+    // The warning distinguishes this from a clean rollback: it must point at Edit
+    // Source rather than claim the source can be re-imported or added manually.
+    const warningCalls = mockShowWarningMessage.mock.calls.map((c) => String(c[0]));
+    expect(warningCalls.some((m) => /re-enter.*Edit Source/i.test(m))).toBe(true);
+    expect(warningCalls.some((m) => /re-import or add/i.test(m))).toBe(false);
+  });
+
+  it("FINDING 2 (rollback review) — a successfully rolled-back source strips origin from the servers THIS RUN imported that named it, leaving a pre-existing (already-manual) server from the same backup untouched, and reports the conversion in the warning (kills orphaned synced-badged servers no re-added source could ever manage again)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    const backingStore = new Map<string, string>();
+    const vault: SecretVault = {
+      get: vi.fn(async (key: string) => backingStore.get(key)),
+      store: vi.fn(async (key: string, value: string) => {
+        if (key === inventorySecretKey("src1", "apiToken")) {
+          throw new Error("secret storage unavailable");
+        }
+        backingStore.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        backingStore.delete(key);
+      })
+    };
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    const secrets = {
+      inventorySourceSecrets: {
+        src1: { apiToken: "src1-token" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      // Two servers synced from src1, plus a third that was already a plain manual
+      // server when the backup was taken (no origin at all).
+      servers: [
+        makeServer({ id: "srv-a", name: "Owned A", origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1 } }),
+        makeServer({ id: "srv-b", name: "Owned B", origin: { sourceId: "src1", externalId: "dev-b", syncedAt: 1 } }),
+        makeServer({ id: "srv-c", name: "Manual C" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ id: "src1", name: "Source One", secretFieldIds: ["apiToken"] })],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    // The rolled-back source is gone.
+    expect(core.getInventorySource("src1")).toBeUndefined();
+
+    // Both servers this run imported under that source had their origin stripped —
+    // a reverted fix leaves them pointing at a source id nothing can ever manage
+    // again (a manually re-added source always gets a fresh id).
+    expect(core.getServer("srv-a")?.origin).toBeUndefined();
+    expect(core.getServer("srv-a")?.name).toBe("Owned A");
+    expect(core.getServer("srv-b")?.origin).toBeUndefined();
+    expect(core.getServer("srv-b")?.name).toBe("Owned B");
+
+    // The already-manual server from the same backup is untouched.
+    expect(core.getServer("srv-c")?.origin).toBeUndefined();
+    expect(core.getServer("srv-c")?.name).toBe("Manual C");
+
+    // The warning reports the conversion.
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Source "Source One" could not be restored — its credentials failed to store; re-import or add it manually; 2 of its servers were kept as manual servers.'
+    );
+  });
 });
