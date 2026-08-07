@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "../../src/commands/inventoryCommands";
-import { NexusCore } from "../../src/core/nexusCore";
+import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/nexusCore";
 import type { ServerConfig } from "../../src/models/config";
 import { inventorySecretKey, type InventoryProvider, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
@@ -634,6 +634,80 @@ describe("inventoryCommands", () => {
       expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBeUndefined();
     });
 
+    it("(FINDING 3 / FINDING 4 / FINDING 5) Delete Servers: a taken-over server (same id, same origin.sourceId, but its content changed underneath the removal) SURVIVES the disposition, is counted as skipped, keeps its vault secrets, and is never handed to teardown — while a genuinely-owned server is still fully removed (kills stale-list cleanup, sourceId-only delete validation, and teardown-before-validation)", async () => {
+      const removed = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const takenOver = makeServer({
+        id: "owned-2",
+        name: "core-sw",
+        host: "10.0.0.2",
+        origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([removed, takenOver]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      const vault = makeVault({
+        [inventorySecretKey("src-1", "apiToken")]: "tok",
+        [passwordSecretKey("owned-1")]: "pw1",
+        [passphraseSecretKey("owned-1")]: "pp1",
+        [proxyPasswordSecretKey("owned-1")]: "proxy1",
+        [passwordSecretKey("owned-2")]: "pw2",
+        [passphraseSecretKey("owned-2")]: "pp2",
+        [proxyPasswordSecretKey("owned-2")]: "proxy2"
+      });
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      // A concurrent import lands while the confirm modal is open: it
+      // re-maps "owned-2" to a DIFFERENT device (still owned by src-1 — the
+      // ownership-only check a reverted FINDING 4 would rely on stays
+      // satisfied) between the pre-modal `owned` snapshot and the
+      // disposition apply below.
+      mockShowWarningMessage.mockImplementationOnce(async () => {
+        await core.addOrUpdateServer({ ...takenOver, host: "10.0.0.99" });
+        return "Delete Servers";
+      });
+
+      const cmd = registeredCommands.get("nexus.inventory.removeSource")!;
+      await cmd();
+
+      // FINDING 4 — the taken-over server survives with its NEW content;
+      // the stale delete entry for it was skipped, not honored.
+      const survivor = core.getServer("owned-2");
+      expect(survivor).toBeDefined();
+      expect(survivor?.host).toBe("10.0.0.99");
+      expect(survivor?.origin?.sourceId).toBe("src-1");
+
+      // The genuinely-owned server is still fully removed.
+      expect(core.getServer("owned-1")).toBeUndefined();
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+
+      // FINDING 5 — teardown was invoked ONLY for the id actually removed;
+      // if the old teardown-before-apply ordering were still in effect, this
+      // would include "owned-2" even though it survives.
+      expect(teardown.calls).toEqual(["owned-1"]);
+
+      // FINDING 3 — vault cleanup was limited to the id actually removed;
+      // the survivor's own password/passphrase/proxy secrets must still be
+      // exactly what they were.
+      expect(await vault.get(passwordSecretKey("owned-1"))).toBeUndefined();
+      expect(await vault.get(passphraseSecretKey("owned-1"))).toBeUndefined();
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+      expect(await vault.get(passwordSecretKey("owned-2"))).toBe("pw2");
+      expect(await vault.get(passphraseSecretKey("owned-2"))).toBe("pp2");
+      expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
+
+      // The skip is surfaced to the user rather than silently dropped.
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringMatching(/1 server.*changed during removal/i));
+    });
+
     it("Keep Servers: origin is stripped and the server survives; the source record and its own secrets are removed (kills keep-still-deleting)", async () => {
       const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
       const repo = new InMemoryConfigRepository([owned]);
@@ -823,7 +897,7 @@ describe("inventoryCommands", () => {
       expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("proxpw");
     });
 
-    it("(FINDING 1) a replace-mode import recreating the source id DURING the awaited vault deletes aborts removeInventorySource — the replacement record survives, captured secrets are restored, and disposition never runs (kills an unconditional delete of the replacement record)", async () => {
+    it("(FINDING 1 / FINDING 2) a replace-mode import recreating the source id DURING the awaited vault deletes aborts removeInventorySource — the replacement record survives, its (deleted) credential slot is NOT restored to the old value, and disposition never runs (kills an unconditional delete of the replacement record, and kills a stale-secret restore over a replacement)", async () => {
       const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
       const repo = new InMemoryConfigRepository([owned]);
       const core = new NexusCore(repo);
@@ -864,17 +938,64 @@ describe("inventoryCommands", () => {
       expect(core.getSnapshot().inventorySources).toHaveLength(1);
       expect(core.getInventorySource("src-1")?.targetFolder).toBe("Different");
 
-      // Captured secrets (read from the OLD record before its keys were
-      // deleted) are restored.
-      expect(backingStore.get(inventorySecretKey("src-1", "apiToken"))).toBe("tok");
+      // FINDING 2 — captured secrets (read from the OLD, now-dead
+      // incarnation) are NOT restored: inventorySecretKey is keyed by
+      // sourceId+fieldId only, so writing the old "tok" value back into this
+      // same vault key would land on whatever the REPLACEMENT record (which
+      // declares this exact field id in its own secretFieldIds) actually
+      // owns there. The key is left exactly as the delete loop left it —
+      // deleted — rather than resurrecting a dead incarnation's value.
+      expect(backingStore.get(inventorySecretKey("src-1", "apiToken"))).toBeUndefined();
+      expect(vault.store).not.toHaveBeenCalled();
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("changed while removing"));
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/changed while removing.*preserved/i));
       expect(mockShowInformationMessage).not.toHaveBeenCalled();
 
       // Disposition never runs — the owned server (still pointing at the
       // now-stale pick-time source) is completely untouched.
       expect(teardown.calls).toEqual([]);
       expect(core.getServer("owned-1")?.origin?.sourceId).toBe("src-1");
+    });
+
+    it("(FINDING 2) an InventorySourceRemovalMismatchError at record removal never restores the OLD captured secret — a replacement's freshly-imported credential written under the same field id must survive untouched (kills stale-secret restore over a replacement)", async () => {
+      const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      // The OLD (about-to-be-removed) incarnation's credential — this is
+      // what removeSource's capturedSecrets step reads before the delete
+      // loop runs.
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      // Simulate a replace-mode import discovering the mismatch: exactly
+      // when core.removeInventorySource is invoked, the replacement writes
+      // its OWN fresh credential into the SAME vault key (inventorySecretKey
+      // is keyed by sourceId+fieldId only, not by revision — both
+      // incarnations share it) and the identity check then throws.
+      vi.spyOn(core, "removeInventorySource").mockImplementationOnce(async () => {
+        await vault.store(inventorySecretKey("src-1", "apiToken"), "replacements-fresh-token");
+        throw new InventorySourceRemovalMismatchError("src-1");
+      });
+
+      const cmd = registeredCommands.get("nexus.inventory.removeSource")!;
+      await expect(cmd()).resolves.toBeUndefined();
+
+      // If FINDING 2's fix were reverted (restore runs unconditionally on
+      // ANY removeInventorySource rejection, mismatch included), the catch
+      // block would write the OLD captured value ("tok") back into
+      // inventory-source-src-1-apiToken — clobbering the replacement's fresh
+      // token that was just written above.
+      expect(vault.store).not.toHaveBeenCalledWith(inventorySecretKey("src-1", "apiToken"), "tok");
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("replacements-fresh-token");
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/changed while removing.*preserved/i));
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+      expect(teardown.calls).toEqual([]);
     });
 
     it("(FINDING 3) a mid-loop vault.delete rejection whose credential restore ALSO fails reports the credentials as un-restorable, not 'nothing was changed' (kills a false-coherence claim)", async () => {

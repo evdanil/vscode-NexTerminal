@@ -127,6 +127,13 @@ export function validateInventorySource(item: unknown): item is InventorySourceC
   if (obj.lastSyncAt !== undefined && typeof obj.lastSyncAt !== "number") {
     return false;
   }
+  // FINDING 1 (removal-identity review) — optional for backward compat: a
+  // record persisted before this field existed simply has no revision here;
+  // the repository getter backfills one at load time (ensureInventorySourceRevision).
+  // When present, it must be a non-empty string.
+  if (obj.revision !== undefined && !isNonEmptyString(obj.revision)) {
+    return false;
+  }
   return true;
 }
 

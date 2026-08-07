@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   cloneServerConfig,
   serverConfigsEqual,
@@ -60,9 +61,18 @@ export interface InventorySyncApplication {
   // currently in the map is still structurally equal (serverConfigsEqual) to
   // the pre-strip snapshot captured here for its id — otherwise the entry
   // belongs to the new import, not this removal, and applyInventorySyncPlan
-  // skips it rather than clobbering it. Not required for removeServerIds
-  // (those are validated by origin.sourceId === apply.sourceId instead, which
-  // needs no captured snapshot). Absent from a non-"absent" apply.
+  // skips it rather than clobbering it.
+  //
+  // FINDING 4 (removal-teardown review) — extended to cover removeServerIds
+  // too: a delete target is validated the same way (origin.sourceId
+  // ownership PLUS, when an entry exists here for its id, structural
+  // equality against it) rather than by ownership alone, which a
+  // same-id/same-sourceId REPLACEMENT (content changed, identity markers
+  // unchanged) could otherwise slip through. Populating an entry for a given
+  // remove-target id is optional — callers with no meaningful
+  // pre-disposition snapshot to capture (or that never pass this map at all,
+  // e.g. syncNow's normal-mode apply) keep the ownership-only check.
+  // Absent from a non-"absent" apply.
   expectedBeforeByServerId?: Map<string, ServerConfig>;
 }
 
@@ -223,11 +233,22 @@ export class NexusCore {
    * operation (e.g. the next successful saveInventorySources call from a
    * different command). Capture the previous entry (or its absence) before
    * mutating, and restore it on rejection.
+   *
+   * FINDING 1 (removal-identity review) — every write through this method is
+   * a new INCARNATION of the record: a fresh `revision` is assigned here,
+   * unconditionally (even if `source` already carries one — e.g. a backup
+   * restore replaying an old value), so no call site (addSource, editSource,
+   * configCommands' backup import/reset paths, ...) needs to remember to do
+   * it itself. This is deliberately the ONLY place a revision is ever
+   * (re)assigned to a LIVE record — applyInventorySyncPlan's own lastSyncAt
+   * bump below intentionally preserves whatever revision the record already
+   * has, since that is not a new incarnation, just a routine sync stamp.
    */
   public async addOrUpdateInventorySource(source: InventorySourceConfig): Promise<void> {
     const hadPrevious = this.inventorySources.has(source.id);
     const previous = this.inventorySources.get(source.id);
-    this.inventorySources.set(source.id, source);
+    const withRevision: InventorySourceConfig = { ...source, revision: randomUUID() };
+    this.inventorySources.set(source.id, withRevision);
     try {
       await this.repository.saveInventorySources([...this.inventorySources.values()]);
     } catch (error) {
@@ -322,8 +343,17 @@ export class NexusCore {
    * entries were skipped this way (always 0 outside "absent" mode) so it can
    * surface that to the user rather than silently under-reporting the
    * removal's effect.
+   *
+   * FINDING 3 (removal-teardown review) — also returns `removedServerIds`:
+   * the ids actually deleted by THIS call (after the "absent"-mode per-entry
+   * filtering above — equal to `apply.removeServerIds` verbatim outside
+   * "absent" mode, where every entry is honored unconditionally). Callers
+   * that need to clean up state keyed by server id AFTER this call (vault
+   * secrets, runtime teardown) must iterate this list, not their own
+   * pre-apply candidate list — a candidate this call skipped was never
+   * touched and must not have its secrets/sessions torn down either.
    */
-  public async applyInventorySyncPlan(apply: InventorySyncApplication): Promise<{ skippedCount: number }> {
+  public async applyInventorySyncPlan(apply: InventorySyncApplication): Promise<{ skippedCount: number; removedServerIds: string[] }> {
     const source = this.inventorySources.get(apply.sourceId);
     // FINDING 2 (removeSource review) — the actual entries this call mutates.
     // In the normal (non-"absent") case these are exactly apply's own arrays;
@@ -345,14 +375,33 @@ export class NexusCore {
       // CURRENT state before mutating it — a mismatch means the entry
       // belongs to the new import, not this stale removal, and must be
       // skipped rather than deleted/overwritten.
+      //
+      // FINDING 4 (removal-teardown review) — ownership (origin.sourceId
+      // match) alone is not enough: a REPLACEMENT server can retain the
+      // exact same id and origin.sourceId (e.g. re-synced/re-imported under
+      // the same source) while its actual content changed underneath this
+      // now-stale removal. When the caller captured a pre-disposition
+      // snapshot for this id in `expectedBeforeByServerId` (removeSource's
+      // "Delete Servers" flow does, mirroring what it already does for
+      // upserts below), the CURRENT record must still be structurally
+      // identical to it. Callers that never populate an entry for a given id
+      // (e.g. syncNow's normal-mode apply, which doesn't use "absent" mode
+      // at all, or any future "absent" caller that genuinely has no
+      // pre-disposition snapshot) keep the ownership-only check unchanged —
+      // this is a strictly ADDITIONAL check, never a required one.
       const validRemoveIds: string[] = [];
       for (const id of apply.removeServerIds) {
         const current = this.servers.get(id);
-        if (current && current.origin?.sourceId === apply.sourceId) {
-          validRemoveIds.push(id);
-        } else {
+        if (!current || current.origin?.sourceId !== apply.sourceId) {
           skippedCount++;
+          continue;
         }
+        const expectedBefore = apply.expectedBeforeByServerId?.get(id);
+        if (expectedBefore && !serverConfigsEqual(current, expectedBefore)) {
+          skippedCount++;
+          continue;
+        }
+        validRemoveIds.push(id);
       }
       const validUpserts: ServerConfig[] = [];
       for (const server of apply.upsertServers) {
@@ -549,7 +598,7 @@ export class NexusCore {
       throw firstRejection.reason;
     }
     this.emitChanged();
-    return { skippedCount };
+    return { skippedCount, removedServerIds: [...removeServerIds] };
   }
 
   public isServerConnected(serverId: string): boolean {

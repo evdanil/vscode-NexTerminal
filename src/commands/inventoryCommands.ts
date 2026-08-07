@@ -32,9 +32,23 @@ import { mostCommonUsername } from "./configCommands";
 /**
  * F1 — server runtime teardown, injected from extension.ts (mirrors the
  * disconnect/stop-tunnels/sshPool.disconnect sequence in serverCommands.ts's
- * remove flow). Called for every server id about to be deleted, BEFORE
- * applyInventorySyncPlan, by both syncNow (prune "delete") and removeSource
- * ("Delete Servers") — this module never touches ssh/tunnel plumbing directly.
+ * remove flow). This module never touches ssh/tunnel plumbing directly.
+ *
+ * FINDING 5 (removal-teardown review) — the two callers no longer share the
+ * same ordering relative to applyInventorySyncPlan. syncNow (prune "delete")
+ * still tears down BEFORE applying: its final pre-apply recompute already
+ * re-validates the plan against fresh state (see the FINDING 1/E chain in
+ * syncNow), so by the time teardown runs there the ids are trustworthy, and
+ * reordering there would require restructuring that recompute loop for no
+ * real gain. removeSource's "Delete Servers" flow instead applies FIRST and
+ * tears down only the ids `applyInventorySyncPlan` actually reports as
+ * removed (`removedServerIds`) — its absent-mode apply can silently SKIP an
+ * id whose server was taken over by a concurrent import (see
+ * InventorySyncApplication.expectedBeforeByServerId), and tearing down a
+ * server that survives the apply untouched would kill its live
+ * terminals/tunnels/pool connection for nothing. teardownServerRuntime
+ * itself (see serverCommands.ts) does not depend on the server record still
+ * existing in NexusCore, so calling it AFTER the record is gone is safe.
  */
 export interface InventoryRuntimeTeardown {
   teardownServerRuntime(serverId: string): Promise<void>;
@@ -762,21 +776,36 @@ export function registerInventoryCommands(
         // deleted here instead of throwing.
         await core.removeInventorySource(source.id, source);
       } catch (error) {
-        // Chosen behavior (documented once, here): fail-closed restore — put
-        // every captured credential back so the source (which core has
-        // already rolled back to still exist, or which a replace-mode import
-        // recreated) stays fully usable. No server has been touched yet at
-        // this point (FINDING 1), so nothing else needs restoring.
+        // FINDING 2 (removal-teardown review) — a mismatch means the record
+        // was REPLACED (e.g. a replace-mode import recreated this exact id)
+        // during the window above; the current record is a different
+        // incarnation from the one whose secrets we captured. Do NOT restore
+        // here: inventorySecretKey(id, fieldId) is keyed by sourceId+fieldId
+        // only (not by revision), so the replacement may already have its
+        // OWN freshly-imported credential sitting under some of these same
+        // vault keys — writing the captured (dead-incarnation) values back
+        // would silently clobber it, or plant an undeclared key on a source
+        // we no longer own either way. Nothing was removed; whatever the
+        // replacement's current credentials are, they are left exactly as
+        // they stood. This is deliberately the ONE case in this catch that
+        // never calls restoreCapturedSecrets().
+        if (error instanceof InventorySourceRemovalMismatchError) {
+          void vscode.window.showErrorMessage(
+            `Inventory source "${source.name}" changed while removing — nothing was removed; its current credentials were preserved.`
+          );
+          return;
+        }
+        // Chosen behavior for every OTHER failure (documented once, here):
+        // fail-closed restore — put every captured credential back so the
+        // source (which core has already rolled back to still exist) stays
+        // fully usable. No server has been touched yet at this point
+        // (FINDING 1), so nothing else needs restoring.
         const failedRestores = await restoreCapturedSecrets();
         if (failedRestores.length > 0) {
-          // FINDING 3 — a failed restore takes priority over the
-          // mismatch-vs-generic-failure distinction below: whichever caused
-          // the removal to abort, the user must be told credentials are
-          // actually missing, not that the source is "intact" or safe to
-          // just retry.
+          // FINDING 3 — a failed restore takes priority over the "intact"
+          // claim below: the user must be told credentials are actually
+          // missing, not that the source is safe to just retry.
           void vscode.window.showErrorMessage(restoreFailureMessage(failedRestores.length));
-        } else if (error instanceof InventorySourceRemovalMismatchError) {
-          void vscode.window.showErrorMessage(`Inventory source "${source.name}" changed while removing — try again.`);
         } else {
           void vscode.window.showErrorMessage(
             `Failed to remove inventory source "${source.name}" — the removal did not complete and the source (with its credentials) is intact.`
@@ -802,11 +831,26 @@ export function registerInventoryCommands(
       // current state no longer matched what this disposition expected.
       let skippedCount = 0;
       if (choice === "Delete Servers") {
-        // F1 — teardown running sessions/tunnels/pool connections BEFORE the plan removes
-        // the server records, mirroring serverCommands.ts's own remove flow.
-        for (const server of owned) {
-          await teardown.teardownServerRuntime(server.id);
-        }
+        // FINDING 5 (removal-teardown review, REORDER) — apply the deletion
+        // FIRST, then tear down runtime state + vault secrets only for the
+        // ids applyInventorySyncPlan actually reports as removed. The old
+        // order (teardown for every `owned` id, then apply) killed live
+        // terminals/tunnels/pool connections for a server the apply might go
+        // on to SKIP (FINDING 4 below) — e.g. one a concurrent import took
+        // over in the window since `owned` was captured — even though that
+        // server survives untouched. teardownServerRuntime itself no longer
+        // needs the server record to still exist in NexusCore (see its
+        // updated doc in serverCommands.ts), so it's safe to call after the
+        // record is already gone.
+        //
+        // FINDING 4 — `expectedBeforeByServerId` (previously built only for
+        // the Keep Servers upserts below) now also covers these delete
+        // targets: ownership (origin.sourceId match) alone can't distinguish
+        // a genuinely-stale entry from a REPLACEMENT server that kept the
+        // same id and origin.sourceId but had its content changed
+        // underneath this removal — see NexusCore.applyInventorySyncPlan.
+        const expectedBeforeByServerId = new Map(owned.map((s) => [s.id, s] as const));
+        let removedServerIds: string[];
         try {
           const result = await core.applyInventorySyncPlan({
             sourceId: source.id,
@@ -814,9 +858,11 @@ export function registerInventoryCommands(
             upsertServers: [],
             removeServerIds: owned.map((s) => s.id),
             folders: [],
-            expectedSource: "absent"
+            expectedSource: "absent",
+            expectedBeforeByServerId
           });
           skippedCount = result.skippedCount;
+          removedServerIds = result.removedServerIds;
         } catch {
           // Residue is intentional and harmless: the source record is
           // already gone, so nothing will ever sync against these servers
@@ -829,12 +875,23 @@ export function registerInventoryCommands(
           );
           return;
         }
+        // FINDING 5 — teardown ONLY the ids actually removed above; a
+        // skipped (taken-over) server keeps its live sessions/tunnels/pool
+        // connection exactly as the surviving server record implies.
+        for (const id of removedServerIds) {
+          await teardown.teardownServerRuntime(id);
+        }
+        // FINDING 3 — likewise, vault secret cleanup is limited to ids
+        // actually removed — previously this looped over the whole `owned`
+        // list regardless of what the apply above actually did, so a
+        // skipped (taken-over) server's password/passphrase/proxy keys were
+        // wrongly wiped out from under its surviving, live record.
         // ITEM 9 — per-key best-effort: one rejected delete must not strand
-        // the remaining owned servers' secrets uncleaned.
-        for (const server of owned) {
-          await deleteSecretBestEffort(vault, passwordSecretKey(server.id));
-          await deleteSecretBestEffort(vault, passphraseSecretKey(server.id));
-          await deleteSecretBestEffort(vault, proxyPasswordSecretKey(server.id));
+        // the remaining removed servers' secrets uncleaned.
+        for (const id of removedServerIds) {
+          await deleteSecretBestEffort(vault, passwordSecretKey(id));
+          await deleteSecretBestEffort(vault, passphraseSecretKey(id));
+          await deleteSecretBestEffort(vault, proxyPasswordSecretKey(id));
         }
       } else if (choice === "Keep Servers") {
         const strippedServers = owned.map(({ origin, ...rest }) => rest as ServerConfig);

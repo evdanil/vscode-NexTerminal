@@ -429,6 +429,81 @@ describe("NexusCore inventory sources", () => {
     expect(listener).toHaveBeenCalledTimes(1);
   });
 
+  it('(FINDING 4) absent-mode apply SKIPS a removeServerIds entry whose current record differs from its captured expectedBefore snapshot — SAME id, SAME origin.sourceId, but a REPLACEMENT (different host) — the server survives and the skip is counted (kills a sourceId-ownership-only delete check)', async () => {
+    const capturedBefore: ServerConfig = {
+      id: "srv-1",
+      name: "old-name",
+      host: "10.0.0.1",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const replaced: ServerConfig = {
+      ...capturedBefore,
+      host: "10.0.0.99", // a NEW import re-mapped this SAME id (still owned by source-1) to a different device
+      origin: { sourceId: "source-1", externalId: "device:99", syncedAt: 500 }
+    };
+    const repository = new InMemoryConfigRepository([replaced]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 9999,
+      upsertServers: [],
+      removeServerIds: ["srv-1"],
+      folders: [],
+      expectedSource: "absent",
+      expectedBeforeByServerId: new Map([["srv-1", capturedBefore]])
+    });
+
+    // If FINDING 4's fix were reverted (removeServerIds validated by
+    // origin.sourceId ownership alone, ignoring expectedBeforeByServerId),
+    // this delete target would be honored — same id, same origin.sourceId —
+    // and the REPLACEMENT server (host 10.0.0.99, a different device this
+    // stale removal was never computed against) would be wrongly deleted.
+    expect(core.getServer("srv-1")).toBeDefined();
+    expect(core.getServer("srv-1")?.host).toBe("10.0.0.99");
+    expect(core.getServer("srv-1")?.origin?.externalId).toBe("device:99");
+    expect(result.skippedCount).toBe(1);
+    expect(result.removedServerIds).toEqual([]);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('(FINDING 4) absent-mode apply still deletes a removeServerIds entry whose current record still matches its captured expectedBefore snapshot exactly — skippedCount stays 0, and it is reported in removedServerIds', async () => {
+    const deletedTarget: ServerConfig = {
+      id: "srv-1",
+      name: "d",
+      host: "h1",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const repository = new InMemoryConfigRepository([deletedTarget]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 9999,
+      upsertServers: [],
+      removeServerIds: ["srv-1"],
+      folders: [],
+      expectedSource: "absent",
+      expectedBeforeByServerId: new Map([["srv-1", deletedTarget]])
+    });
+
+    expect(core.getServer("srv-1")).toBeUndefined();
+    expect(result.skippedCount).toBe(0);
+    expect(result.removedServerIds).toEqual(["srv-1"]);
+  });
+
   it('(FINDING 2) absent-mode apply SKIPS an origin-strip upsert whose current server was replaced (different host) — not overwritten, and the skip is counted (kills a stale-snapshot overwrite)', async () => {
     const capturedBefore: ServerConfig = {
       id: "srv-1",
@@ -507,6 +582,7 @@ describe("NexusCore inventory sources", () => {
     expect(core.getServer("srv-delete")).toBeUndefined();
     expect(core.getServer("srv-strip")?.origin).toBeUndefined();
     expect(result.skippedCount).toBe(0);
+    expect(result.removedServerIds).toEqual(["srv-delete"]);
   });
 
   it("(FINDING 1) removeInventorySource(id, expected) throws InventorySourceRemovalMismatchError and mutates nothing when the current record no longer matches `expected` (kills unconditional delete on a replaced record)", async () => {
@@ -532,6 +608,47 @@ describe("NexusCore inventory sources", () => {
     expect(core.getInventorySource("source-1")?.targetFolder).toBe("New");
     expect(listener).not.toHaveBeenCalled();
     expect(saveInventorySourcesSpy).not.toHaveBeenCalled();
+  });
+
+  it("(FINDING 1 — revision) removeInventorySource(id, expected) throws when the current record is STRUCTURALLY IDENTICAL to `expected` but carries a different revision — a replace-mode import recreating the same values under a new credential (kills structural-equality identity)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+    // The exact stored record at pick time — this IS what a caller like
+    // removeSource captures via pickInventorySource/getSnapshot.
+    const pickTimeSnapshot = core.getInventorySource("source-1")!;
+
+    // A replace-mode import recreates the SAME source id with EVERY
+    // structural field identical (name/providerId/targetFolder/prunePolicy/
+    // defaultUsername/config/secretFieldIds all match makeSourceConfig()'s
+    // defaults) but points the same field ids at a brand-new vault
+    // credential underneath — addOrUpdateInventorySource assigns a fresh
+    // revision on this write regardless of the structural equality.
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+    const recreated = core.getInventorySource("source-1")!;
+    expect(recreated.revision).toBeDefined();
+    expect(recreated.revision).not.toBe(pickTimeSnapshot.revision);
+    // Sanity: every OLD structural field this comparator used to check is
+    // still identical between the two incarnations.
+    expect(recreated.name).toBe(pickTimeSnapshot.name);
+    expect(recreated.targetFolder).toBe(pickTimeSnapshot.targetFolder);
+    expect(recreated.providerId).toBe(pickTimeSnapshot.providerId);
+    expect(recreated.prunePolicy).toBe(pickTimeSnapshot.prunePolicy);
+    expect(recreated.defaultUsername).toBe(pickTimeSnapshot.defaultUsername);
+    expect(recreated.config).toEqual(pickTimeSnapshot.config);
+    expect(recreated.secretFieldIds).toEqual(pickTimeSnapshot.secretFieldIds);
+
+    await expect(core.removeInventorySource("source-1", pickTimeSnapshot)).rejects.toThrow(InventorySourceRemovalMismatchError);
+
+    // If FINDING 1's revision fix were reverted (sourceConfigUnchanged falls
+    // straight through to pure structural comparison), every field checked
+    // above matches — the OLD structural comparator would wrongly "prove"
+    // pickTimeSnapshot is still the current record and delete the
+    // REPLACEMENT'S record (and, in the command layer, strand its freshly
+    // imported credential) instead of throwing here.
+    expect(core.getInventorySource("source-1")).toBeDefined();
+    expect(core.getInventorySource("source-1")?.revision).toBe(recreated.revision);
   });
 
   it("(FINDING 1) removeInventorySource(id, expected) succeeds when the current record still matches `expected`", async () => {

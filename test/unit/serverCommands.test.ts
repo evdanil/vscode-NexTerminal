@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
-import { registerServerCommands, formValuesToServer, formValuesToProxy, preserveLinkedServerCredentials, syncProxyPasswordSecret } from "../../src/commands/serverCommands";
+import {
+  registerServerCommands,
+  formValuesToServer,
+  formValuesToProxy,
+  preserveLinkedServerCredentials,
+  syncProxyPasswordSecret,
+  teardownServerRuntime
+} from "../../src/commands/serverCommands";
 import type { AuthProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
 import { readFile } from "node:fs/promises";
@@ -343,6 +350,34 @@ describe("server disconnect with tunnel autoStop", () => {
       addMode: "ssh",
       profileType: "ssh"
     });
+  });
+
+  it("(FINDING 5 — removal-teardown review) teardownServerRuntime tears down a server's runtime state by id alone even after its record no longer exists in NexusCore — it never falls back to an interactive server picker (kills a core.getServer dependency that would otherwise prompt the user)", async () => {
+    const profile = makeTunnel({ id: "tp-1", autoStop: false });
+    const { ctx, stopTunnel, disconnectPool, terminalDispose } = setupHarness({
+      servers: [], // the record is already gone — mirrors removeSource's REORDER (apply first, teardown only the removed ids after)
+      profiles: [profile],
+      activeTunnels: [{ id: "at-1", profileId: "tp-1", serverId: "srv-1" }]
+    });
+
+    await teardownServerRuntime(ctx, "srv-1");
+
+    // Terminal disposed, the tunnel stopped (even with autoStop: false —
+    // unlike disconnectServer's own partial stop, teardown always stops
+    // everything routed through the server), and the pooled SSH connection
+    // disconnected — all purely by serverId, none of it requiring the
+    // server record to still exist.
+    expect(terminalDispose).toHaveBeenCalled();
+    expect(stopTunnel).toHaveBeenCalledWith("at-1");
+    expect(disconnectPool).toHaveBeenCalledWith("srv-1");
+
+    // If FINDING 5's fix were reverted (teardownServerRuntime delegates to
+    // disconnectServer, whose string-arg branch resolves the server via
+    // core.getServer(id) and falls back to an interactive pickServer/
+    // showQuickPick prompt when that's undefined — exactly the state a
+    // record that's already been removed leaves it in), this call would
+    // have popped an interactive picker instead of just tearing down.
+    expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
   });
 
   it("keeps pool connection when autoStop=false tunnel remains active", async () => {

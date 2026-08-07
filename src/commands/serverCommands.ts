@@ -945,9 +945,32 @@ async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<voi
  * server record itself — those stay the caller's job (nexus.server.remove
  * deletes both after this; inventory sync/removeSource delete vault secrets
  * separately and let applyInventorySyncPlan drop the server record).
+ *
+ * FINDING 5 (removal-teardown review) — deliberately does NOT delegate to
+ * disconnectServer(ctx, serverId) the way it used to. disconnectServer's
+ * fallback path resolves its `arg` through toServerFromArg(), whose `string`
+ * branch does `core.getServer(arg)` — i.e. it requires the server record to
+ * STILL EXIST in NexusCore. If it doesn't (missing → toServerFromArg returns
+ * undefined), disconnectServer falls through to `pickServer(ctx.core)`, an
+ * INTERACTIVE quickpick prompt — clearly wrong for a programmatic teardown
+ * call, and exactly the trap a caller reordered to "apply the removal first,
+ * then tear down only the ids actually removed" (removeSource's Delete
+ * Servers flow) would fall into, since by the time teardown runs for a given
+ * id the server record is already gone. None of the actual work below
+ * (disposing this server's terminals, stopping its tunnels, disconnecting
+ * its pooled SSH connection) needs anything from the ServerConfig object
+ * besides the id we already have, so it's inlined directly against
+ * `serverId` instead of re-resolving through core. Safe to call whether or
+ * not `serverId` still names a server in NexusCore.
  */
 export async function teardownServerRuntime(ctx: CommandContext, serverId: string): Promise<void> {
-  await disconnectServer(ctx, serverId);
+  const terminals = ctx.terminalsByServer.get(serverId);
+  if (terminals) {
+    for (const terminal of terminals) {
+      terminal.dispose();
+    }
+    ctx.terminalsByServer.delete(serverId);
+  }
   const remaining = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === serverId);
   await Promise.all(remaining.map((t) => ctx.tunnelManager.stop(t.id)));
   ctx.sshPool.disconnect(serverId);

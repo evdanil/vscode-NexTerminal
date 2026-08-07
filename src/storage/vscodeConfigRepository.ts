@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
-import type { InventorySourceConfig } from "../models/inventory";
+import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
 import type { ConfigRepository } from "../core/contracts";
 import {
   validateServerConfig,
@@ -133,13 +133,24 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async getInventorySources(): Promise<InventorySourceConfig[]> {
     const raw = asArray<InventorySourceConfig>(this.context.globalState.get(INVENTORY_SOURCES_KEY, []));
-    return raw.filter((item) => {
-      if (validateInventorySource(item)) {
-        return true;
-      }
-      console.warn("[Nexus] Skipping invalid inventory source entry:", JSON.stringify(item));
-      return false;
-    });
+    // FINDING 1 (removal-identity review) — a record persisted before the
+    // `revision` field existed (a "legacy" record) is backfilled with one
+    // here, at LOAD time, so every in-memory InventorySourceConfig this
+    // process ever hands out has one. This does NOT rewrite disk (the next
+    // successful saveInventorySources call will, incidentally, since it
+    // always persists the in-memory objects) — a legacy record loaded twice
+    // (e.g. by two separate extension activations) gets two DIFFERENT
+    // backfilled revisions, which is fine: revision only ever needs to be
+    // stable WITHIN one running core's lifetime, never across processes.
+    return raw
+      .filter((item) => {
+        if (validateInventorySource(item)) {
+          return true;
+        }
+        console.warn("[Nexus] Skipping invalid inventory source entry:", JSON.stringify(item));
+        return false;
+      })
+      .map(ensureInventorySourceRevision);
   }
 
   public async saveInventorySources(sources: InventorySourceConfig[]): Promise<void> {
