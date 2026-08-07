@@ -52,6 +52,32 @@ export interface InventorySyncApplication {
   // never bumped and no source-record entry is written for apply.sourceId
   // (there is nothing to write it onto).
   expectedSource: InventorySourceConfig | "absent";
+  // FINDING 2 (removeSource review) — only consulted when expectedSource is
+  // "absent". importMergeReplace imports servers BEFORE sources, so a
+  // recreated owned server (or one that took over the same id under a NEW
+  // source) can land in the window between removeInventorySource and this
+  // apply. Each entry in upsertServers is honored only if the server
+  // currently in the map is still structurally equal (serverConfigsEqual) to
+  // the pre-strip snapshot captured here for its id — otherwise the entry
+  // belongs to the new import, not this removal, and applyInventorySyncPlan
+  // skips it rather than clobbering it. Not required for removeServerIds
+  // (those are validated by origin.sourceId === apply.sourceId instead, which
+  // needs no captured snapshot). Absent from a non-"absent" apply.
+  expectedBeforeByServerId?: Map<string, ServerConfig>;
+}
+
+/**
+ * FINDING 1 (removeSource review) — thrown by removeInventorySource(id, expected)
+ * when the current record no longer matches `expected` (or is gone). Distinct
+ * from a generic persistence failure so the command layer can surface a
+ * different, more accurate message ("source changed while removing" vs.
+ * "removal did not complete").
+ */
+export class InventorySourceRemovalMismatchError extends Error {
+  public constructor(id: string) {
+    super(`Cannot remove inventory source "${id}": the record changed before the removal could complete.`);
+    this.name = "InventorySourceRemovalMismatchError";
+  }
 }
 
 export class NexusCore {
@@ -231,8 +257,26 @@ export class NexusCore {
    * in memory while removeInventorySource() never got persisted, and the
    * command layer's own retry logic assumes rejection means "nothing
    * changed".
+   *
+   * FINDING 1 (removeSource review) — `expected`, when provided, is compared
+   * against the CURRENT record SYNCHRONOUSLY (no await between the check and
+   * the delete below) via sourceConfigUnchanged plus a name comparison
+   * (sourceConfigUnchanged doesn't cover name). This closes a narrower race
+   * than the id-recreation case InventorySyncApplication's "absent" semantics
+   * guard: a replace-mode import can delete-and-recreate the SAME source id
+   * during removeSource's own awaited vault reads/deletes (which run before
+   * this call), so an unconditional delete here would silently remove the
+   * REPLACEMENT record instead of the one the caller picked. Mismatch or
+   * missing record -> throw InventorySourceRemovalMismatchError without
+   * mutating anything.
    */
-  public async removeInventorySource(id: string): Promise<void> {
+  public async removeInventorySource(id: string, expected?: InventorySourceConfig): Promise<void> {
+    if (expected) {
+      const current = this.inventorySources.get(id);
+      if (!current || !sourceConfigUnchanged(current, expected) || current.name !== expected.name) {
+        throw new InventorySourceRemovalMismatchError(id);
+      }
+    }
     const hadPrevious = this.inventorySources.has(id);
     const previous = this.inventorySources.get(id);
     this.inventorySources.delete(id);
@@ -269,15 +313,59 @@ export class NexusCore {
    * REORDER — `apply.expectedSource === "absent"` inverts the presence check:
    * this call must throw if a source record for apply.sourceId DOES exist
    * (see the field doc on InventorySyncApplication.expectedSource for why).
+   *
+   * FINDING 2 (removeSource review) — in "absent" mode, each removeServerIds/
+   * upsertServers entry is ALSO validated individually against current state
+   * (see the field doc on InventorySyncApplication.expectedBeforeByServerId)
+   * before it is allowed to mutate anything; entries that fail are skipped,
+   * not thrown on. The returned `skippedCount` tells the caller how many
+   * entries were skipped this way (always 0 outside "absent" mode) so it can
+   * surface that to the user rather than silently under-reporting the
+   * removal's effect.
    */
-  public async applyInventorySyncPlan(apply: InventorySyncApplication): Promise<void> {
+  public async applyInventorySyncPlan(apply: InventorySyncApplication): Promise<{ skippedCount: number }> {
     const source = this.inventorySources.get(apply.sourceId);
+    // FINDING 2 (removeSource review) — the actual entries this call mutates.
+    // In the normal (non-"absent") case these are exactly apply's own arrays;
+    // in "absent" mode they're filtered below to exclude entries that no
+    // longer reflect a server this removal actually owns.
+    let removeServerIds = apply.removeServerIds;
+    let upsertServers = apply.upsertServers;
+    let skippedCount = 0;
     if (apply.expectedSource === "absent") {
       if (source) {
         throw new Error(
           `Cannot apply inventory sync: inventory source "${apply.sourceId}" exists (expected it to already be removed).`
         );
       }
+      // FINDING 2 — importMergeReplace imports servers BEFORE sources, so a
+      // recreated owned server (or one that simply took over the same id
+      // under a NEW source) can land in the window between
+      // removeInventorySource and this apply. Validate EACH entry against
+      // CURRENT state before mutating it — a mismatch means the entry
+      // belongs to the new import, not this stale removal, and must be
+      // skipped rather than deleted/overwritten.
+      const validRemoveIds: string[] = [];
+      for (const id of apply.removeServerIds) {
+        const current = this.servers.get(id);
+        if (current && current.origin?.sourceId === apply.sourceId) {
+          validRemoveIds.push(id);
+        } else {
+          skippedCount++;
+        }
+      }
+      const validUpserts: ServerConfig[] = [];
+      for (const server of apply.upsertServers) {
+        const expectedBefore = apply.expectedBeforeByServerId?.get(server.id);
+        const current = this.servers.get(server.id);
+        if (current && expectedBefore && serverConfigsEqual(current, expectedBefore)) {
+          validUpserts.push(server);
+        } else {
+          skippedCount++;
+        }
+      }
+      removeServerIds = validRemoveIds;
+      upsertServers = validUpserts;
     } else {
       if (!source) {
         throw new Error(`Cannot apply inventory sync: unknown inventory source "${apply.sourceId}".`);
@@ -301,10 +389,10 @@ export class NexusCore {
         priorServers.set(id, this.servers.get(id));
       }
     };
-    for (const id of apply.removeServerIds) {
+    for (const id of removeServerIds) {
       captureServerPrior(id);
     }
-    for (const server of apply.upsertServers) {
+    for (const server of upsertServers) {
       captureServerPrior(server.id);
     }
     // removeServerSessions (below) only ever touches activeSessions,
@@ -319,7 +407,7 @@ export class NexusCore {
     const priorFocusedSessionId = this.focusedSessionId;
     const priorActiveSessions = new Map<string, ActiveSession>();
     const priorActivitySessionIds = new Set<string>();
-    for (const id of apply.removeServerIds) {
+    for (const id of removeServerIds) {
       for (const [sessionId, session] of this.activeSessions.entries()) {
         if (session.serverId === id) {
           priorActiveSessions.set(sessionId, session);
@@ -360,12 +448,12 @@ export class NexusCore {
         }
       }
     }
-    for (const id of apply.removeServerIds) {
+    for (const id of removeServerIds) {
       this.servers.delete(id);
       this.removeServerSessions(id);
       batchWrittenServers.set(id, undefined);
     }
-    for (const server of apply.upsertServers) {
+    for (const server of upsertServers) {
       this.servers.set(server.id, server);
       batchWrittenServers.set(server.id, cloneServerConfig(server));
     }
@@ -461,6 +549,7 @@ export class NexusCore {
       throw firstRejection.reason;
     }
     this.emitChanged();
+    return { skippedCount };
   }
 
   public isServerConnected(serverId: string): boolean {

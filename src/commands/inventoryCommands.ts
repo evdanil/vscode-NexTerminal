@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import type { NexusCore } from "../core/nexusCore";
+import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
 import type { ServerConfig } from "../models/config";
 import {
   InventoryProviderError,
@@ -716,11 +716,27 @@ export function registerInventoryCommands(
           capturedSecrets.set(fieldId, value);
         }
       }
-      const restoreCapturedSecrets = async (): Promise<void> => {
+      // FINDING 3 — returns the field ids whose restore itself rejected,
+      // instead of silently swallowing that rejection. A caller that ignores
+      // this can no longer claim "nothing was changed" / "the source is
+      // intact" when a credential restore actually failed — that claim would
+      // be false, and the user needs to know to re-enter it rather than trust
+      // a synced badge or a next sync that authenticates with nothing.
+      const restoreCapturedSecrets = async (): Promise<string[]> => {
+        const failedFieldIds: string[] = [];
         for (const [fieldId, value] of capturedSecrets) {
-          await vault.store(inventorySecretKey(source.id, fieldId), value).catch(() => undefined);
+          try {
+            await vault.store(inventorySecretKey(source.id, fieldId), value);
+          } catch {
+            failedFieldIds.push(fieldId);
+          }
         }
+        return failedFieldIds;
       };
+      const restoreFailureMessage = (failedCount: number): string =>
+        `Removal failed and ${failedCount} credential${failedCount === 1 ? "" : "s"} could not be restored — re-enter ${
+          failedCount === 1 ? "it" : "them"
+        } via Edit Source before syncing.`;
 
       // FINDING 2 — the entire delete loop is one guarded unit: a rejection
       // on any key (not just the first) restores every captured value and
@@ -730,23 +746,42 @@ export function registerInventoryCommands(
           await vault.delete(inventorySecretKey(source.id, fieldId));
         }
       } catch {
-        await restoreCapturedSecrets();
-        void vscode.window.showErrorMessage("Could not remove source credentials — nothing was changed.");
+        const failedRestores = await restoreCapturedSecrets();
+        void vscode.window.showErrorMessage(
+          failedRestores.length > 0 ? restoreFailureMessage(failedRestores.length) : "Could not remove source credentials — nothing was changed."
+        );
         return;
       }
 
       try {
-        await core.removeInventorySource(source.id);
-      } catch {
+        // FINDING 1 — pass the pick-time `source` as `expected`: core
+        // compares it SYNCHRONOUSLY against the current record before
+        // deleting. Without this, a replace-mode import that deletes and
+        // recreates this exact source id during the awaited vault reads/
+        // deletes above would have its REPLACEMENT record unconditionally
+        // deleted here instead of throwing.
+        await core.removeInventorySource(source.id, source);
+      } catch (error) {
         // Chosen behavior (documented once, here): fail-closed restore — put
         // every captured credential back so the source (which core has
-        // already rolled back to still exist) stays fully usable. No server
-        // has been touched yet at this point (FINDING 1), so nothing else
-        // needs restoring.
-        await restoreCapturedSecrets();
-        void vscode.window.showErrorMessage(
-          `Failed to remove inventory source "${source.name}" — the removal did not complete and the source (with its credentials) is intact.`
-        );
+        // already rolled back to still exist, or which a replace-mode import
+        // recreated) stays fully usable. No server has been touched yet at
+        // this point (FINDING 1), so nothing else needs restoring.
+        const failedRestores = await restoreCapturedSecrets();
+        if (failedRestores.length > 0) {
+          // FINDING 3 — a failed restore takes priority over the
+          // mismatch-vs-generic-failure distinction below: whichever caused
+          // the removal to abort, the user must be told credentials are
+          // actually missing, not that the source is "intact" or safe to
+          // just retry.
+          void vscode.window.showErrorMessage(restoreFailureMessage(failedRestores.length));
+        } else if (error instanceof InventorySourceRemovalMismatchError) {
+          void vscode.window.showErrorMessage(`Inventory source "${source.name}" changed while removing — try again.`);
+        } else {
+          void vscode.window.showErrorMessage(
+            `Failed to remove inventory source "${source.name}" — the removal did not complete and the source (with its credentials) is intact.`
+          );
+        }
         return;
       }
 
@@ -757,6 +792,15 @@ export function registerInventoryCommands(
       // removeInventorySource call above and this apply. If that happens,
       // applyInventorySyncPlan throws rather than run this now-stale
       // disposition against the NEW source's servers.
+      //
+      // FINDING 2 — even within a single "absent" apply, importMergeReplace
+      // imports servers BEFORE sources, so an owned server can be recreated
+      // (or have its id taken over by a NEW source) between the record
+      // removal above and this call — a window narrower than "the whole
+      // source id came back", but real. `skippedCount` (returned by
+      // applyInventorySyncPlan) counts entries core refused to touch because
+      // current state no longer matched what this disposition expected.
+      let skippedCount = 0;
       if (choice === "Delete Servers") {
         // F1 — teardown running sessions/tunnels/pool connections BEFORE the plan removes
         // the server records, mirroring serverCommands.ts's own remove flow.
@@ -764,7 +808,7 @@ export function registerInventoryCommands(
           await teardown.teardownServerRuntime(server.id);
         }
         try {
-          await core.applyInventorySyncPlan({
+          const result = await core.applyInventorySyncPlan({
             sourceId: source.id,
             syncedAt: Date.now(),
             upsertServers: [],
@@ -772,6 +816,7 @@ export function registerInventoryCommands(
             folders: [],
             expectedSource: "absent"
           });
+          skippedCount = result.skippedCount;
         } catch {
           // Residue is intentional and harmless: the source record is
           // already gone, so nothing will ever sync against these servers
@@ -793,15 +838,20 @@ export function registerInventoryCommands(
         }
       } else if (choice === "Keep Servers") {
         const strippedServers = owned.map(({ origin, ...rest }) => rest as ServerConfig);
+        // FINDING 2 — the pre-strip snapshot for each server, so core can
+        // refuse to overwrite one that was replaced in the window above.
+        const expectedBeforeByServerId = new Map(owned.map((s) => [s.id, s] as const));
         try {
-          await core.applyInventorySyncPlan({
+          const result = await core.applyInventorySyncPlan({
             sourceId: source.id,
             syncedAt: Date.now(),
             upsertServers: strippedServers,
             removeServerIds: [],
             folders: [],
-            expectedSource: "absent"
+            expectedSource: "absent",
+            expectedBeforeByServerId
           });
+          skippedCount = result.skippedCount;
         } catch {
           // Same residue note as the Delete Servers branch above.
           void vscode.window.showErrorMessage(
@@ -811,7 +861,13 @@ export function registerInventoryCommands(
         }
       }
 
-      void vscode.window.showInformationMessage(`Inventory source "${source.name}" removed.`);
+      const skippedNote =
+        skippedCount > 0
+          ? ` (${skippedCount} server${skippedCount === 1 ? "" : "s"} ${skippedCount === 1 ? "was" : "were"} left untouched because ${
+              skippedCount === 1 ? "it" : "they"
+            } changed during removal)`
+          : "";
+      void vscode.window.showInformationMessage(`Inventory source "${source.name}" removed.${skippedNote}`);
     } finally {
       inFlightSourceIds.delete(source.id);
     }

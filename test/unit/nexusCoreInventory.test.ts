@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { NexusCore, type InventorySyncApplication } from "../../src/core/nexusCore";
+import { InventorySourceRemovalMismatchError, NexusCore, type InventorySyncApplication } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { validateInventorySource, validateServerConfig } from "../../src/utils/validation";
 import type { ServerConfig } from "../../src/models/config";
@@ -386,6 +386,163 @@ describe("NexusCore inventory sources", () => {
     expect(core.getInventorySource("source-1")?.name).toBe("Recreated");
     expect(listener).not.toHaveBeenCalled();
     expect(saveServersSpy).not.toHaveBeenCalled();
+  });
+
+  it('(FINDING 2) absent-mode apply SKIPS a removeServerIds entry whose current owner is a DIFFERENT source — the server survives, and the skip is counted (kills a stale-owned delete)', async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s",
+        host: "h",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        // Recreated by a NEW import under a DIFFERENT source id, landing in
+        // the window between removeInventorySource and this stale
+        // "absent"-mode disposition apply for the OLD source.
+        origin: { sourceId: "source-2", externalId: "device:1", syncedAt: 999 }
+      }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 9999,
+      upsertServers: [],
+      removeServerIds: ["srv-1"],
+      folders: [],
+      expectedSource: "absent"
+    });
+
+    // If FINDING 2's fix were reverted (removeServerIds honored
+    // unconditionally in "absent" mode), srv-1 — now owned by source-2 —
+    // would be wrongly deleted here.
+    expect(core.getServer("srv-1")).toBeDefined();
+    expect(core.getServer("srv-1")?.origin?.sourceId).toBe("source-2");
+    expect(result.skippedCount).toBe(1);
+    // The apply itself still "succeeds" (bucket saves happen, one emission) —
+    // it just did nothing for this stale entry.
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('(FINDING 2) absent-mode apply SKIPS an origin-strip upsert whose current server was replaced (different host) — not overwritten, and the skip is counted (kills a stale-snapshot overwrite)', async () => {
+    const capturedBefore: ServerConfig = {
+      id: "srv-1",
+      name: "old-name",
+      host: "10.0.0.1",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const replaced: ServerConfig = {
+      ...capturedBefore,
+      host: "10.0.0.99", // a NEW import re-mapped this same id to a different device
+      origin: { sourceId: "source-1", externalId: "device:99", syncedAt: 500 }
+    };
+    const repository = new InMemoryConfigRepository([replaced]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    const strippedUpsert: ServerConfig = { ...capturedBefore, origin: undefined };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 9999,
+      upsertServers: [strippedUpsert],
+      removeServerIds: [],
+      folders: [],
+      expectedSource: "absent",
+      expectedBeforeByServerId: new Map([["srv-1", capturedBefore]])
+    });
+
+    // If FINDING 2's fix were reverted (upsertServers applied unconditionally
+    // in "absent" mode), the replaced server's host/origin would be
+    // overwritten by this stale origin-strip.
+    expect(core.getServer("srv-1")?.host).toBe("10.0.0.99");
+    expect(core.getServer("srv-1")?.origin?.externalId).toBe("device:99");
+    expect(result.skippedCount).toBe(1);
+  });
+
+  it('(FINDING 2) absent-mode apply still processes matching entries: a removeServerIds entry still owned by apply.sourceId is deleted, and an origin-strip upsert whose current server still matches its captured snapshot is applied — skippedCount stays 0', async () => {
+    const deletedTarget: ServerConfig = {
+      id: "srv-delete",
+      name: "d",
+      host: "h1",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const stripTarget: ServerConfig = {
+      id: "srv-strip",
+      name: "s",
+      host: "h2",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 1 }
+    };
+    const repository = new InMemoryConfigRepository([deletedTarget, stripTarget]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    const strippedUpsert: ServerConfig = { ...stripTarget, origin: undefined };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 9999,
+      upsertServers: [strippedUpsert],
+      removeServerIds: ["srv-delete"],
+      folders: [],
+      expectedSource: "absent",
+      expectedBeforeByServerId: new Map([["srv-strip", stripTarget]])
+    });
+
+    expect(core.getServer("srv-delete")).toBeUndefined();
+    expect(core.getServer("srv-strip")?.origin).toBeUndefined();
+    expect(result.skippedCount).toBe(0);
+  });
+
+  it("(FINDING 1) removeInventorySource(id, expected) throws InventorySourceRemovalMismatchError and mutates nothing when the current record no longer matches `expected` (kills unconditional delete on a replaced record)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    const pickTimeSnapshot = makeSourceConfig({ targetFolder: "Old" });
+    await core.addOrUpdateInventorySource(pickTimeSnapshot);
+    // A replace-mode import recreated the SAME source id (same providerId/
+    // name) with a different targetFolder — e.g. during a caller's own
+    // awaited vault reads/deletes before calling removeInventorySource.
+    await core.addOrUpdateInventorySource(makeSourceConfig({ targetFolder: "New" }));
+
+    const saveInventorySourcesSpy = vi.spyOn(repository, "saveInventorySources");
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    await expect(core.removeInventorySource("source-1", pickTimeSnapshot)).rejects.toThrow(InventorySourceRemovalMismatchError);
+
+    // If the fix were reverted (removeInventorySource ignores `expected` and
+    // deletes unconditionally), the REPLACEMENT record ("New") would be gone
+    // here even though it belongs to a different, newer import.
+    expect(core.getInventorySource("source-1")?.targetFolder).toBe("New");
+    expect(listener).not.toHaveBeenCalled();
+    expect(saveInventorySourcesSpy).not.toHaveBeenCalled();
+  });
+
+  it("(FINDING 1) removeInventorySource(id, expected) succeeds when the current record still matches `expected`", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    const snapshot = makeSourceConfig();
+    await core.addOrUpdateInventorySource(snapshot);
+
+    await expect(core.removeInventorySource("source-1", snapshot)).resolves.toBeUndefined();
+    expect(core.getInventorySource("source-1")).toBeUndefined();
   });
 
   it("(ITEM 1) applyInventorySyncPlan rolls back servers, explicit groups, active sessions, focus, and the source's lastSyncAt when the persist rejects — and emits nothing (kills mutate-then-leak)", async () => {

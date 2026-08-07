@@ -823,6 +823,147 @@ describe("inventoryCommands", () => {
       expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("proxpw");
     });
 
+    it("(FINDING 1) a replace-mode import recreating the source id DURING the awaited vault deletes aborts removeInventorySource — the replacement record survives, captured secrets are restored, and disposition never runs (kills an unconditional delete of the replacement record)", async () => {
+      const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+
+      const backingStore = new Map<string, string>([[inventorySecretKey("src-1", "apiToken"), "tok"]]);
+      const vault = {
+        get: vi.fn(async (key: string) => backingStore.get(key)),
+        store: vi.fn(async (key: string, value: string) => {
+          backingStore.set(key, value);
+        }),
+        delete: vi.fn(async (key: string) => {
+          backingStore.delete(key);
+          if (key === inventorySecretKey("src-1", "apiToken")) {
+            // A replace-mode import recreates the SAME source id — with a
+            // different targetFolder — while this delete is still in flight,
+            // i.e. exactly the window between removeSource's own vault
+            // deletes and its later removeInventorySource call.
+            await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Different", secretFieldIds: ["apiToken"] }));
+          }
+        })
+      };
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+
+      const cmd = registeredCommands.get("nexus.inventory.removeSource")!;
+      await expect(cmd()).resolves.toBeUndefined();
+
+      // If FINDING 1's fix were reverted (removeInventorySource deletes
+      // unconditionally, ignoring the pick-time `expected`), the
+      // REPLACEMENT record ("Different") would be gone here instead of
+      // surviving — the bug this test exists to kill.
+      expect(core.getSnapshot().inventorySources).toHaveLength(1);
+      expect(core.getInventorySource("src-1")?.targetFolder).toBe("Different");
+
+      // Captured secrets (read from the OLD record before its keys were
+      // deleted) are restored.
+      expect(backingStore.get(inventorySecretKey("src-1", "apiToken"))).toBe("tok");
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("changed while removing"));
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+
+      // Disposition never runs — the owned server (still pointing at the
+      // now-stale pick-time source) is completely untouched.
+      expect(teardown.calls).toEqual([]);
+      expect(core.getServer("owned-1")?.origin?.sourceId).toBe("src-1");
+    });
+
+    it("(FINDING 3) a mid-loop vault.delete rejection whose credential restore ALSO fails reports the credentials as un-restorable, not 'nothing was changed' (kills a false-coherence claim)", async () => {
+      const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          configFields: [
+            { id: "host", label: "Host", type: "string", required: true },
+            { id: "field1", label: "Field 1", type: "password", required: true },
+            { id: "field2", label: "Field 2", type: "password", required: true }
+          ]
+        })
+      );
+      const backingStore = new Map<string, string>([
+        [inventorySecretKey("src-1", "field1"), "tok1"],
+        [inventorySecretKey("src-1", "field2"), "tok2"]
+      ]);
+      let deleteCallCount = 0;
+      const vault = {
+        get: vi.fn(async (key: string) => backingStore.get(key)),
+        store: vi.fn(async () => {
+          throw new Error("keychain locked");
+        }),
+        delete: vi.fn(async (key: string) => {
+          deleteCallCount++;
+          if (deleteCallCount === 2) {
+            throw new Error("keychain unavailable");
+          }
+          backingStore.delete(key);
+        })
+      };
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["field1", "field2"] }));
+
+      mockShowWarningMessage.mockResolvedValueOnce("Delete Servers");
+
+      const cmd = registeredCommands.get("nexus.inventory.removeSource")!;
+      await expect(cmd()).resolves.toBeUndefined();
+
+      // If FINDING 3's fix were reverted (restore rejections swallowed by
+      // `.catch(() => undefined)`), this would still claim "nothing was
+      // changed" even though field1's restore (vault.store) also failed —
+      // its credential is actually gone.
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/could not be restored.*re-enter.*Edit Source/i));
+      expect(mockShowErrorMessage).not.toHaveBeenCalledWith(expect.stringContaining("nothing was changed"));
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    });
+
+    it("(FINDING 3) a failed record removal whose credential restore ALSO fails reports the credentials as un-restorable, not that the source is 'intact' (kills a false-coherence claim on the record-removal path)", async () => {
+      const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      const backingStore = new Map<string, string>([[inventorySecretKey("src-1", "apiToken"), "tok"]]);
+      const vault = {
+        get: vi.fn(async (key: string) => backingStore.get(key)),
+        store: vi.fn(async () => {
+          throw new Error("keychain locked");
+        }),
+        delete: vi.fn(async (key: string) => {
+          backingStore.delete(key);
+        })
+      };
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      mockShowWarningMessage.mockResolvedValueOnce("Delete Servers");
+      vi.spyOn(core, "removeInventorySource").mockRejectedValueOnce(new Error("disk full"));
+
+      const cmd = registeredCommands.get("nexus.inventory.removeSource")!;
+      await expect(cmd()).resolves.toBeUndefined();
+
+      // If FINDING 3's fix were reverted, this would still claim the source
+      // "is intact" even though the credential restore above also failed —
+      // the vault key is actually gone, not "with its credentials" as claimed.
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/could not be restored.*re-enter.*Edit Source/i));
+      expect(mockShowErrorMessage).not.toHaveBeenCalledWith(expect.stringContaining("intact"));
+      expect(backingStore.get(inventorySecretKey("src-1", "apiToken"))).toBeUndefined();
+      expect(teardown.calls).toEqual([]);
+    });
+
     it("dismissing the confirm modal removes nothing", async () => {
       const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
       const repo = new InMemoryConfigRepository([owned]);
