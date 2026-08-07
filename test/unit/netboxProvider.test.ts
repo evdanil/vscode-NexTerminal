@@ -95,7 +95,7 @@ describe("createNetboxProvider", () => {
       expect(fetchImpl).toHaveBeenCalledTimes(1);
     });
 
-    it("truncates at the 10,000-device hard cap and warns, instead of collecting every reported item (and marks the tree truncated so the engine skips pruning)", async () => {
+    it("count 20,000 capped at 10,000 — truncates at the hard cap and warns, instead of collecting every reported item (and marks the tree truncated so the engine skips pruning)", async () => {
       const fetchImpl = vi.fn(async (url: string) => {
         const offset = Number(new URL(url).searchParams.get("offset"));
         const results = Array.from({ length: 250 }, (_, i) => ({
@@ -114,23 +114,80 @@ describe("createNetboxProvider", () => {
       expect(tree.truncated).toBe(true);
     });
 
-    it("FIX 2 — a protocol error (not a truncated tree) is thrown when the server ignores our page size and pagination gives up short of the reported count (kills silently truncating the tree)", async () => {
-      // The server "clamps" our requested limit=250 down to 100 items per page,
-      // and reports a count (5000) that MAX_ITERATIONS worth of 100-item pages
-      // can never reach (41 * 100 = 4100 < 5000) — nowhere near the 10,000 hard
-      // cap, so this must NOT be mistaken for the legitimate cap-truncation path.
+    it("FIX 3 — an inventory of exactly 10,000 devices (the hard cap) is NOT marked truncated and gets no truncation warning (kills always-mark-at-cap)", async () => {
+      const total = 10_000;
       const fetchImpl = vi.fn(async (url: string) => {
         const offset = Number(new URL(url).searchParams.get("offset"));
+        const remaining = total - offset;
+        const pageSize = Math.min(250, remaining);
+        const results = Array.from({ length: pageSize }, (_, i) => ({
+          id: offset + i + 1,
+          name: `d${offset + i}`,
+          primary_ip: { address: "10.0.0.1/24" }
+        }));
+        return makeResponse(200, { count: total, results });
+      });
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      expect(tree.devices).toHaveLength(total);
+      expect(tree.truncated).toBeUndefined();
+      expect(tree.warnings.some((w) => w.toLowerCase().includes("truncat"))).toBe(false);
+    });
+
+    it("F2 — a server that clamps our requested limit=250 down to 100 items per page still completes the fetch (kills a fixed-iteration bound sized for 250-item pages)", async () => {
+      // The server "clamps" our requested limit=250 down to 100 items per page.
+      // A fixed bound tuned to 250-item pages (41 iterations = 4100 items) could
+      // never reach the reported count of 5000 — this must now succeed by
+      // deriving the iteration bound from the page size NetBox actually used.
+      const total = 5_000;
+      const requestedOffsets: number[] = [];
+      const fetchImpl = vi.fn(async (url: string) => {
+        const offset = Number(new URL(url).searchParams.get("offset"));
+        requestedOffsets.push(offset);
         const results = Array.from({ length: 100 }, (_, i) => ({
           id: offset + i + 1,
           name: `d${offset + i}`,
           primary_ip: { address: "10.0.0.1/24" }
         }));
-        return makeResponse(200, { count: 5_000, results });
+        return makeResponse(200, { count: total, results });
+      });
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      expect(tree.devices).toHaveLength(total);
+      expect(new Set(tree.devices.map((d) => d.externalId)).size).toBe(total);
+      expect(requestedOffsets).toEqual(Array.from({ length: 50 }, (_, i) => i * 100));
+      expect(tree.truncated).toBeUndefined();
+    });
+
+    it("F2 — still throws a protocol error for a genuinely stuck server whose page size collapses after a fast start (kills a bound that only ever grows/never re-anchors)", async () => {
+      // First page is a full 250-item page (establishing an optimistic bound),
+      // then every subsequent page shrinks to 10 items while `count` keeps
+      // reporting far more remain. The bound stays anchored to the largest
+      // page size actually demonstrated (250), so it runs out long before
+      // reaching the reported count — this must still fail loudly rather than
+      // silently returning a partial inventory.
+      let calls = 0;
+      const fetchImpl = vi.fn(async (url: string) => {
+        calls++;
+        const offset = Number(new URL(url).searchParams.get("offset"));
+        const pageSize = calls === 1 ? 250 : 10;
+        const results = Array.from({ length: pageSize }, (_, i) => ({
+          id: offset + i + 1,
+          name: `d${offset + i}`,
+          primary_ip: { address: "10.0.0.1/24" }
+        }));
+        return makeResponse(200, { count: 20_000, results });
       });
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({ kind: "protocol" });
+      // Bound = ceil(min(20000,10000)/250)+1 = 41 — well short of what 10-item
+      // pages would need, and cheap enough to assert the loop actually terminates.
+      expect(calls).toBeLessThanOrEqual(41);
     });
   });
 

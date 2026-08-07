@@ -41,6 +41,14 @@ vi.mock("../../src/services/scripts/scriptPicker", () => ({
   pickScriptFromWorkspace: vi.fn(async () => ({ fsPath: "/workspace/.nexus/scripts/task.js" }))
 }));
 
+const mockWebviewFormPanelOpen = vi.fn();
+
+vi.mock("../../src/ui/webviewFormPanel", () => ({
+  WebviewFormPanel: {
+    open: (...args: unknown[]) => mockWebviewFormPanelOpen(...args)
+  }
+}));
+
 vi.mock("vscode", () => ({
   commands: {
     registerCommand: vi.fn((id: string, handler: (...args: unknown[]) => unknown) => {
@@ -170,6 +178,7 @@ function setupHarness(options: {
     })),
     remoteTunnels: [],
     explicitGroups: [],
+    localShellProfiles: [] as Array<{ group?: string }>,
     authProfiles: options.authProfiles ?? [],
     activitySessionIds: new Set(),
     focusedSessionId: undefined
@@ -1614,5 +1623,75 @@ describe("directory sync (issue #35) — OSC 7 observer + lifecycle holes", () =
       observer.onOutput("\x1b]7;file://host/var/log\x07");
       callbacks.onDisconnected?.("session-1");
     }).not.toThrow();
+  });
+});
+
+describe("nexus.server.edit — origin preservation (P1)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  async function submitEdit(
+    ctx: CommandContext,
+    values: Record<string, unknown>
+  ): Promise<void> {
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+    await options.onSubmit(values);
+  }
+
+  it("keeps the existing server's origin verbatim when editing a synced server, even though other fields change", async () => {
+    const origin = { sourceId: "netbox-1", externalId: "device:42", syncedAt: 1000 };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ origin })]
+    });
+
+    await submitEdit(ctx, {
+      name: "Renamed Server", // edited field, different from "Server 1"
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password"
+    });
+
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    const saved = addOrUpdateServer.mock.calls[0][0] as ServerConfig;
+    expect(saved.name).toBe("Renamed Server");
+    // This is the assertion that kills the reconstruction-drops-origin bug:
+    // formValuesToServer's rebuilt object has no `origin` field at all, so a
+    // wrong implementation that saves it verbatim would produce `undefined`
+    // here rather than the exact original origin object.
+    expect(saved.origin).toEqual(origin);
+  });
+
+  it("leaves origin undefined when editing a manually-added (never synced) server", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()] // no origin
+    });
+
+    await submitEdit(ctx, {
+      name: "Renamed Server",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password"
+    });
+
+    const saved = addOrUpdateServer.mock.calls[0][0] as ServerConfig;
+    expect(saved.origin).toBeUndefined();
   });
 });

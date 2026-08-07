@@ -978,7 +978,14 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (!candidate) {
             return;
           }
-          const updated = preserveLinkedServerCredentials(existing, candidate);
+          const linked = preserveLinkedServerCredentials(existing, candidate);
+          // P1 — the edit form has no field for `origin` (it's an inventory-sync
+          // ownership marker, not a user-editable setting), so formValuesToServer's
+          // reconstruction never carries it. Without restoring it here, saving any
+          // edit to a synced server silently detaches it from inventory sync: the
+          // next sync sees an unowned server squatting on the deterministic id and
+          // skips the device forever (id-collision guard in syncEngine.ts).
+          const updated = existing.origin !== undefined ? { ...linked, origin: existing.origin } : linked;
           await ctx.core.addOrUpdateServer(updated);
           await syncProxyPasswordSecret(ctx, updated.id, values);
           if (ctx.core.isServerConnected(existing.id)) {

@@ -13,9 +13,6 @@ export const DEFAULT_FOLDER_TEMPLATE = "{site}/{rack}";
 
 const PAGE_LIMIT = 250;
 const HARD_CAP = 10_000;
-// F2 — bounds the pagination loop independent of anything the server reports, so a
-// provider that never satisfies `collected >= count` cannot hang the sync forever.
-const MAX_ITERATIONS = Math.ceil(HARD_CAP / PAGE_LIMIT) + 1;
 const FETCH_TIMEOUT_MS = 20_000;
 const TEST_CONNECTION_TIMEOUT_MS = 10_000;
 // F11 — Nexus owns pagination; a user-supplied filter that also sets these would
@@ -174,10 +171,18 @@ function validatePagedShape(json: unknown, url: URL): PagedResult {
 
 interface CapState {
   remaining: number;
-  // FIX 2 — set exactly once, at the moment the hard cap actually stops
-  // collection, so fetchInventoryImpl can mark the returned tree `truncated`
-  // without re-deriving it from warning text.
-  hitCap: boolean;
+  // FIX 3 — set exactly once, at the moment the hard cap physically stops a
+  // fetch (`remaining` reaches 0). This is NOT the same as "truncated": an
+  // inventory that has precisely HARD_CAP records also drives `remaining` to
+  // 0, but nothing was left uncollected. fetchInventoryImpl combines this
+  // with `reportedTotal` to tell the two apart before marking the tree
+  // truncated.
+  capped: boolean;
+  // Sum of the NetBox-reported `count` for every endpoint actually fetched
+  // this run (devices, plus VMs when included and not skipped by an
+  // already-exhausted cap) — compared against HARD_CAP to detect a genuine
+  // truncation.
+  reportedTotal: number;
 }
 
 /**
@@ -190,6 +195,16 @@ interface CapState {
  * remain is refused rather than silently treated as "done": that shape means the
  * server disagrees with itself, and looping on it forever (offset never
  * advancing) is the alternative this guards against.
+ *
+ * F2 — the iteration bound is derived from actual observed page size rather
+ * than a fixed constant tuned to PAGE_LIMIT=250: a server that clamps the
+ * page size down (e.g. to 100, as some NetBox deployments do) needs
+ * proportionally more iterations to reach the same target, and a fixed bound
+ * sized for 250-item pages would falsely fail it. The bound is anchored to
+ * the LARGEST page size seen so far — if a later page shrinks (a genuinely
+ * misbehaving/stalling server), the bound stays pinned to the best progress
+ * rate actually demonstrated instead of drifting to excuse the new, slower
+ * rate, so a truly stuck server still trips the post-loop guard below.
  */
 async function fetchAllPages(
   fetchImpl: typeof fetch,
@@ -198,15 +213,16 @@ async function fetchAllPages(
   token: string,
   timeoutMs: number,
   filterParams: URLSearchParams,
-  capState: CapState,
-  warnings: string[]
+  capState: CapState
 ): Promise<unknown[]> {
   const collected: unknown[] = [];
   let offset = 0;
   let count = Number.POSITIVE_INFINITY;
   let iterations = 0;
+  let maxPageSize = 0;
+  let maxIterations = Number.POSITIVE_INFINITY; // unbounded until the first page tells us a real page size
 
-  while (collected.length < count && iterations < MAX_ITERATIONS) {
+  while (collected.length < count && iterations < maxIterations) {
     iterations++;
     const url = new URL(`${baseUrl}${path}`);
     url.searchParams.set("limit", String(PAGE_LIMIT));
@@ -228,6 +244,9 @@ async function fetchAllPages(
       break;
     }
 
+    maxPageSize = Math.max(maxPageSize, page.results.length);
+    maxIterations = Math.ceil(Math.min(count, HARD_CAP) / maxPageSize) + 1;
+
     for (const item of page.results) {
       if (capState.remaining <= 0) break;
       collected.push(item);
@@ -236,25 +255,30 @@ async function fetchAllPages(
     offset += page.results.length;
 
     if (capState.remaining <= 0) {
-      warnings.push(`Truncated at ${HARD_CAP} devices — narrow the filter.`);
-      capState.hitCap = true;
+      capState.capped = true;
       break;
     }
   }
 
   // FIX 2 — the loop above can also exit because `iterations` hit
-  // MAX_ITERATIONS while the server still reports more devices than we
-  // collected. That is NOT the (already-warned) hard-cap path — it means
-  // NetBox kept sending short/odd-sized pages and pagination gave up early.
-  // Silently returning a partial list here is indistinguishable, downstream,
-  // from every uncollected device having been deleted at the source, so this
-  // aborts loudly instead — same spirit as the empty-page throw above.
-  if (collected.length < Math.min(count, HARD_CAP) && !capState.hitCap) {
+  // maxIterations while the server still reports more devices than we
+  // collected. That is NOT the hard-cap path — it means NetBox kept sending
+  // short/odd-sized pages (relative to the best page size it demonstrated)
+  // and pagination gave up early. Silently returning a partial list here is
+  // indistinguishable, downstream, from every uncollected device having been
+  // deleted at the source, so this aborts loudly instead — same spirit as
+  // the empty-page throw above.
+  if (collected.length < Math.min(count, HARD_CAP) && !capState.capped) {
     throw new InventoryProviderError(
       "protocol",
       `NetBox pagination for ${baseUrl}${path} stopped after ${iterations} page(s) having collected ${collected.length} of ${count} reported devices — aborting rather than returning a truncated inventory.`
     );
   }
+
+  // FIX 3 — accumulate this endpoint's reported total so fetchInventoryImpl
+  // can tell a genuine truncation (more records exist than were collected)
+  // from an exact fit at HARD_CAP after combining devices + VMs.
+  capState.reportedTotal += count;
 
   return collected;
 }
@@ -375,7 +399,7 @@ async function fetchInventoryImpl(
 
   const warnings: string[] = [];
   const filterParams = parseFilter(typeof config.filter === "string" ? config.filter : "", warnings);
-  const capState: CapState = { remaining: HARD_CAP, hitCap: false };
+  const capState: CapState = { remaining: HARD_CAP, capped: false, reportedTotal: 0 };
 
   const rawDevices = await fetchAllPages(
     fetchImpl,
@@ -384,12 +408,15 @@ async function fetchInventoryImpl(
     token,
     FETCH_TIMEOUT_MS,
     filterParams,
-    capState,
-    warnings
+    capState
   );
   // F11 — filter applies to devices only; VMs get Nexus's own pagination params and nothing else.
+  // F3 — devices alone can exhaust the cap before VMs are ever queried; that
+  // skip is itself evidence of truncation (see `vmsSkippedByCap` below), since
+  // we have no way to know whether VMs exist beyond what we never asked for.
+  const vmsSkippedByCap = includeVms && capState.remaining <= 0;
   const rawVms =
-    includeVms && capState.remaining > 0
+    includeVms && !vmsSkippedByCap
       ? await fetchAllPages(
           fetchImpl,
           baseUrl,
@@ -397,8 +424,7 @@ async function fetchInventoryImpl(
           token,
           FETCH_TIMEOUT_MS,
           new URLSearchParams(),
-          capState,
-          warnings
+          capState
         )
       : [];
 
@@ -423,7 +449,20 @@ async function fetchInventoryImpl(
     warnings.push(`${skippedCount} device${skippedCount === 1 ? "" : "s"} without a primary IP were skipped.`);
   }
 
-  return { contractVersion: 1, devices, warnings, truncated: capState.hitCap || undefined };
+  // FIX 3 — an exact-cap fetch (the source has precisely HARD_CAP records) must
+  // NOT be marked truncated: the sync engine treats `truncated` as "fail closed,
+  // never prune" and would skip pruning on this source forever. Only mark it
+  // when the fetch actually stopped short of what NetBox reports exists —
+  // comparing the combined reported total across devices (+ VMs, when
+  // included and not skipped by an already-exhausted cap) against HARD_CAP.
+  // Whenever `capped` is true, exactly HARD_CAP records were collected, so
+  // "reportedTotal > collected" reduces to "reportedTotal > HARD_CAP".
+  const truncated = capState.capped && (vmsSkippedByCap || capState.reportedTotal > HARD_CAP);
+  if (truncated) {
+    warnings.push(`Truncated at ${HARD_CAP} devices — narrow the filter.`);
+  }
+
+  return { contractVersion: 1, devices, warnings, truncated: truncated || undefined };
 }
 
 export function createNetboxProvider(fetchImpl: typeof fetch = fetch): InventoryProvider {
