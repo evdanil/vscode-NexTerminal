@@ -10,10 +10,26 @@ import type {
   TunnelProfile,
   TunnelRegistryEntry
 } from "../models/config";
+import type { InventorySourceConfig } from "../models/inventory";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
 type NexusListener = (snapshot: SessionSnapshot) => void;
+
+/**
+ * Result of a sync engine run (see services/inventory/syncEngine.ts), reduced
+ * to exactly what NexusCore needs to mutate in one atomic batch: which
+ * servers to upsert/remove and which folders must exist. Defined here (not
+ * in syncEngine.ts) because NexusCore is the sole writer that consumes it;
+ * syncEngine imports the type back for planToApplication()'s return type.
+ */
+export interface InventorySyncApplication {
+  sourceId: string;
+  syncedAt: number; // -> source.lastSyncAt
+  upsertServers: ServerConfig[]; // adds + update "after" + orphan "after"
+  removeServerIds: string[];
+  folders: string[]; // ensure these + ancestors exist as explicit groups
+}
 
 export class NexusCore {
   private readonly listeners = new Set<NexusListener>();
@@ -30,17 +46,19 @@ export class NexusCore {
   private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
   private readonly authProfiles = new Map<string, AuthProfile>();
+  private readonly inventorySources = new Map<string, InventorySourceConfig>();
 
   public constructor(private readonly repository: ConfigRepository) {}
 
   public async initialize(): Promise<void> {
-    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles] = await Promise.all([
+    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles, inventorySources] = await Promise.all([
       this.repository.getServers(),
       this.repository.getTunnels(),
       this.repository.getSerialProfiles(),
       this.repository.getLocalShellProfiles(),
       this.repository.getGroups(),
-      this.repository.getAuthProfiles()
+      this.repository.getAuthProfiles(),
+      this.repository.getInventorySources()
     ]);
     this.servers.clear();
     this.tunnels.clear();
@@ -48,6 +66,7 @@ export class NexusCore {
     this.localShellProfiles.clear();
     this.explicitGroups.clear();
     this.authProfiles.clear();
+    this.inventorySources.clear();
     const normalizedServers = normalizeFileExplorerAutoOpenOwner(servers);
     for (const server of normalizedServers.servers) {
       this.servers.set(server.id, server);
@@ -66,6 +85,9 @@ export class NexusCore {
     }
     for (const profile of authProfiles) {
       this.authProfiles.set(profile.id, profile);
+    }
+    for (const source of inventorySources) {
+      this.inventorySources.set(source.id, source);
     }
     if (normalizedServers.changed) {
       await this.repository.saveServers(normalizedServers.servers);
@@ -87,7 +109,8 @@ export class NexusCore {
       explicitGroups: [...this.explicitGroups],
       authProfiles: [...this.authProfiles.values()],
       activitySessionIds: new Set(this.activitySessionIds),
-      focusedSessionId: this.focusedSessionId
+      focusedSessionId: this.focusedSessionId,
+      inventorySources: [...this.inventorySources.values()]
     };
   }
 
@@ -135,6 +158,68 @@ export class NexusCore {
     if (serversChanged) {
       await this.repository.saveServers([...this.servers.values()]);
     }
+    this.emitChanged();
+  }
+
+  public getInventorySource(id: string): InventorySourceConfig | undefined {
+    return this.inventorySources.get(id);
+  }
+
+  public async addOrUpdateInventorySource(source: InventorySourceConfig): Promise<void> {
+    this.inventorySources.set(source.id, source);
+    await this.repository.saveInventorySources([...this.inventorySources.values()]);
+    this.emitChanged();
+  }
+
+  /**
+   * Removes the source record only. Disposition of servers it created
+   * (delete / keep / strip origin) is the command layer's job — call
+   * applyInventorySyncPlan (or removeServer) first if servers need to change.
+   */
+  public async removeInventorySource(id: string): Promise<void> {
+    this.inventorySources.delete(id);
+    await this.repository.saveInventorySources([...this.inventorySources.values()]);
+    this.emitChanged();
+  }
+
+  /**
+   * Applies one computed inventory sync as a single atomic batch: one
+   * `saveServers`/`saveGroups`/`saveInventorySources` round-trip, one
+   * `emitChanged()` — mirrors `addServersBatch`'s reasoning for why a
+   * multi-hundred-device sync must not become N sequential memento flushes.
+   *
+   * Throws if `apply.sourceId` no longer names a known source (e.g. the
+   * source was removed while a sync was in flight) — refuses to partially
+   * apply servers on behalf of a source record that will never receive the
+   * lastSyncAt update, rather than silently orphaning the write.
+   */
+  public async applyInventorySyncPlan(apply: InventorySyncApplication): Promise<void> {
+    const source = this.inventorySources.get(apply.sourceId);
+    if (!source) {
+      throw new Error(`Cannot apply inventory sync: unknown inventory source "${apply.sourceId}".`);
+    }
+    for (const folder of apply.folders) {
+      const normalized = normalizeFolderPath(folder);
+      if (!normalized) {
+        continue;
+      }
+      for (const ancestor of getAncestorPaths(normalized)) {
+        this.explicitGroups.add(ancestor);
+      }
+    }
+    for (const id of apply.removeServerIds) {
+      this.servers.delete(id);
+      this.removeServerSessions(id);
+    }
+    for (const server of apply.upsertServers) {
+      this.servers.set(server.id, server);
+    }
+    this.inventorySources.set(source.id, { ...source, lastSyncAt: apply.syncedAt });
+    await Promise.all([
+      this.repository.saveServers([...this.servers.values()]),
+      this.repository.saveGroups([...this.explicitGroups]),
+      this.repository.saveInventorySources([...this.inventorySources.values()])
+    ]);
     this.emitChanged();
   }
 

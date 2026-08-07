@@ -10,6 +10,7 @@ import type {
   TunnelProfile,
   TunnelRegistryEntry
 } from "../models/config";
+import type { InventorySourceConfig } from "../models/inventory";
 
 export interface ConfigRepository {
   getServers(): Promise<ServerConfig[]>;
@@ -24,6 +25,8 @@ export interface ConfigRepository {
   saveGroups(groups: string[]): Promise<void>;
   getAuthProfiles(): Promise<AuthProfile[]>;
   saveAuthProfiles(profiles: AuthProfile[]): Promise<void>;
+  getInventorySources(): Promise<InventorySourceConfig[]>;
+  saveInventorySources(sources: InventorySourceConfig[]): Promise<void>;
 }
 
 export interface SessionSnapshot {
@@ -40,6 +43,7 @@ export interface SessionSnapshot {
   authProfiles: AuthProfile[];
   activitySessionIds: ReadonlySet<string>;
   focusedSessionId: string | undefined;
+  inventorySources: InventorySourceConfig[];
 }
 
 export interface TunnelRegistryStore {

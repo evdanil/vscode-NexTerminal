@@ -1,4 +1,6 @@
-import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile, ProxyConfig, LocalShellProfile } from "../models/config";
+import type { AuthProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile, ProxyConfig, LocalShellProfile } from "../models/config";
+import type { InventorySourceConfig } from "../models/inventory";
+import { normalizeFolderPath } from "./folderPaths";
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
@@ -45,6 +47,14 @@ export function validateProxyConfig(proxy: unknown): proxy is ProxyConfig {
   return false;
 }
 
+function isValidServerOrigin(value: unknown): value is ServerOrigin {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  return isNonEmptyString(obj.sourceId) && isNonEmptyString(obj.externalId) && typeof obj.syncedAt === "number";
+}
+
 export function validateServerConfig(item: unknown): item is ServerConfig {
   if (typeof item !== "object" || item === null) {
     return false;
@@ -74,6 +84,47 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
     return false;
   }
   if (obj.authProfileId !== undefined && (typeof obj.authProfileId !== "string" || obj.authProfileId === "")) {
+    return false;
+  }
+  // A malformed origin does not invalidate the whole server row: strip the
+  // field and keep the server as an ordinary (unsynced) entry rather than
+  // discarding a user's manually-tuned config over a corrupt sync marker.
+  if (obj.origin !== undefined && !isValidServerOrigin(obj.origin)) {
+    console.warn("[Nexus] Server config has a malformed origin; stripping it:", JSON.stringify(obj.origin));
+    delete obj.origin;
+  }
+  return true;
+}
+
+export function validateInventorySource(item: unknown): item is InventorySourceConfig {
+  if (typeof item !== "object" || item === null) {
+    return false;
+  }
+  const obj = item as Record<string, unknown>;
+  if (
+    !(
+      isNonEmptyString(obj.id) &&
+      isNonEmptyString(obj.providerId) &&
+      isNonEmptyString(obj.name) &&
+      isNonEmptyString(obj.defaultUsername) &&
+      (obj.prunePolicy === "delete" || obj.prunePolicy === "orphan" || obj.prunePolicy === "keep")
+    )
+  ) {
+    return false;
+  }
+  if (typeof obj.targetFolder !== "string" || (obj.targetFolder !== "" && normalizeFolderPath(obj.targetFolder) === undefined)) {
+    return false;
+  }
+  if (typeof obj.config !== "object" || obj.config === null || Array.isArray(obj.config)) {
+    return false;
+  }
+  if (!Object.values(obj.config as Record<string, unknown>).every((v) => typeof v === "string" || typeof v === "number" || typeof v === "boolean")) {
+    return false;
+  }
+  if (!Array.isArray(obj.secretFieldIds) || !obj.secretFieldIds.every((v) => typeof v === "string")) {
+    return false;
+  }
+  if (obj.lastSyncAt !== undefined && typeof obj.lastSyncAt !== "number") {
     return false;
   }
   return true;

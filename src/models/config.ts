@@ -35,6 +35,13 @@ export interface HttpConnectProxy {
 
 export type ProxyConfig = SshJumpProxy | Socks5Proxy | HttpConnectProxy;
 
+/** Marks a server as materialized by an inventory sync rather than added by hand. */
+export interface ServerOrigin {
+  sourceId: string; // InventorySourceConfig.id
+  externalId: string; // InventoryDevice.externalId within that source
+  syncedAt: number;
+}
+
 export interface ServerConfig {
   id: string;
   name: string;
@@ -51,6 +58,7 @@ export interface ServerConfig {
   openFileExplorerOnFirstConnect?: boolean;
   proxy?: ProxyConfig;
   authProfileId?: string;  // references AuthProfile.id; credentials resolved at connection time
+  origin?: ServerOrigin;
 }
 
 export interface TunnelProfile {

@@ -1,7 +1,15 @@
 import * as vscode from "vscode";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
+import type { InventorySourceConfig } from "../models/inventory";
 import type { ConfigRepository } from "../core/contracts";
-import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateAuthProfile, validateLocalShellProfile } from "../utils/validation";
+import {
+  validateServerConfig,
+  validateTunnelProfile,
+  validateSerialProfile,
+  validateAuthProfile,
+  validateLocalShellProfile,
+  validateInventorySource
+} from "../utils/validation";
 
 const SERVERS_KEY = "nexus.servers";
 const TUNNELS_KEY = "nexus.tunnels";
@@ -9,6 +17,7 @@ const SERIAL_PROFILES_KEY = "nexus.serialProfiles";
 const LOCAL_SHELL_PROFILES_KEY = "nexus.localShellProfiles";
 const GROUPS_KEY = "nexus.groups";
 const AUTH_PROFILES_KEY = "nexus.authProfiles";
+const INVENTORY_SOURCES_KEY = "nexus.inventorySources";
 
 /**
  * `globalState.get(key, [])` only substitutes the default when the key is ABSENT.
@@ -106,5 +115,20 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async saveAuthProfiles(profiles: AuthProfile[]): Promise<void> {
     await this.context.globalState.update(AUTH_PROFILES_KEY, profiles);
+  }
+
+  public async getInventorySources(): Promise<InventorySourceConfig[]> {
+    const raw = asArray<InventorySourceConfig>(this.context.globalState.get(INVENTORY_SOURCES_KEY, []));
+    return raw.filter((item) => {
+      if (validateInventorySource(item)) {
+        return true;
+      }
+      console.warn("[Nexus] Skipping invalid inventory source entry:", JSON.stringify(item));
+      return false;
+    });
+  }
+
+  public async saveInventorySources(sources: InventorySourceConfig[]): Promise<void> {
+    await this.context.globalState.update(INVENTORY_SOURCES_KEY, sources);
   }
 }

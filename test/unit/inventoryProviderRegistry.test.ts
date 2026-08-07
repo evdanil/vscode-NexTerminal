@@ -1,0 +1,112 @@
+import { describe, expect, it } from "vitest";
+import { InventoryProviderRegistry, validateProviderShape } from "../../src/services/inventory/providerRegistry";
+import type { InventoryProvider } from "../../src/models/inventory";
+
+function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProvider {
+  return {
+    id: "netbox",
+    label: "NetBox",
+    configFields: [{ id: "baseUrl", label: "Base URL", type: "string" }],
+    testConnection: async () => {},
+    fetchInventory: async () => ({ contractVersion: 1, devices: [] }),
+    ...overrides
+  };
+}
+
+describe("InventoryProviderRegistry", () => {
+  it("throws on duplicate id, and the first registration is still resolvable (kills last-write-wins)", () => {
+    const registry = new InventoryProviderRegistry();
+    const first = makeProvider({ label: "First" });
+    const second = makeProvider({ label: "Second" });
+    registry.register(first);
+    expect(() => registry.register(second)).toThrow(/already registered/i);
+    expect(registry.get("netbox")?.label).toBe("First");
+  });
+
+  it("dispose removes the registration; a fresh register with the same id then succeeds; double-dispose is a no-op (kills delete-by-reference / tombstone)", () => {
+    const registry = new InventoryProviderRegistry();
+    const provider = makeProvider();
+    const registration = registry.register(provider);
+    expect(registry.get("netbox")).toBe(provider);
+
+    registration.dispose();
+    expect(registry.get("netbox")).toBeUndefined();
+
+    const replacement = makeProvider({ label: "Replacement" });
+    expect(() => registry.register(replacement)).not.toThrow();
+    expect(registry.get("netbox")).toBe(replacement);
+
+    // A stale dispose() on the first registration must not evict the
+    // replacement that now legitimately owns the id.
+    expect(() => registration.dispose()).not.toThrow();
+    expect(registry.get("netbox")).toBe(replacement);
+  });
+
+  it("disposing provider A does not remove provider B that happens to share A's label (kills keying on label)", () => {
+    const registry = new InventoryProviderRegistry();
+    const a = makeProvider({ id: "provider-a", label: "Shared Label" });
+    const b = makeProvider({ id: "provider-b", label: "Shared Label" });
+    const regA = registry.register(a);
+    registry.register(b);
+
+    regA.dispose();
+
+    expect(registry.get("provider-a")).toBeUndefined();
+    expect(registry.get("provider-b")).toBe(b);
+  });
+
+  it("list() returns providers in stable registration order", () => {
+    const registry = new InventoryProviderRegistry();
+    const a = makeProvider({ id: "provider-a" });
+    const b = makeProvider({ id: "provider-b" });
+    const c = makeProvider({ id: "provider-c" });
+    registry.register(a);
+    registry.register(b);
+    registry.register(c);
+    expect(registry.list().map((p) => p.id)).toEqual(["provider-a", "provider-b", "provider-c"]);
+  });
+});
+
+describe("validateProviderShape", () => {
+  it("accepts a well-formed provider", () => {
+    expect(() => validateProviderShape(makeProvider())).not.toThrow();
+  });
+
+  it("rejects a missing fetchInventory with a distinct message (kills vacuous validation)", () => {
+    const bad = makeProvider();
+    // @ts-expect-error deliberately malformed for the test
+    delete bad.fetchInventory;
+    expect(() => validateProviderShape(bad)).toThrow(/fetchInventory/);
+  });
+
+  it("rejects a missing testConnection with a distinct message", () => {
+    const bad = makeProvider();
+    // @ts-expect-error deliberately malformed for the test
+    delete bad.testConnection;
+    expect(() => validateProviderShape(bad)).toThrow(/testConnection/);
+  });
+
+  it("rejects a configFields entry with a bad type value, with a distinct message", () => {
+    const bad = makeProvider({ configFields: [{ id: "x", label: "X", type: "not-a-real-type" as never }] });
+    expect(() => validateProviderShape(bad)).toThrow(/invalid type/);
+  });
+
+  it("rejects duplicate field ids within configFields, with a distinct message", () => {
+    const bad = makeProvider({
+      configFields: [
+        { id: "dup", label: "One", type: "string" },
+        { id: "dup", label: "Two", type: "string" }
+      ]
+    });
+    expect(() => validateProviderShape(bad)).toThrow(/duplicate field id/i);
+  });
+
+  it("rejects an empty or malformed provider id", () => {
+    expect(() => validateProviderShape(makeProvider({ id: "" }))).toThrow(/id/i);
+    expect(() => validateProviderShape(makeProvider({ id: "not valid!" }))).toThrow(/id/i);
+  });
+
+  it("rejects a missing label", () => {
+    expect(() => validateProviderShape(makeProvider({ label: "" }))).toThrow(/label/i);
+  });
+});

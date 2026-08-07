@@ -1,5 +1,6 @@
 import type { ConfigRepository } from "../core/contracts";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
+import type { InventorySourceConfig } from "../models/inventory";
 
 export class InMemoryConfigRepository implements ConfigRepository {
   public constructor(
@@ -8,7 +9,8 @@ export class InMemoryConfigRepository implements ConfigRepository {
     private serialProfiles: SerialProfile[] = [],
     private groups: string[] = [],
     private authProfiles: AuthProfile[] = [],
-    private localShellProfiles: LocalShellProfile[] = []
+    private localShellProfiles: LocalShellProfile[] = [],
+    private inventorySources: InventorySourceConfig[] = []
   ) {}
 
   public async getServers(): Promise<ServerConfig[]> {
@@ -57,5 +59,13 @@ export class InMemoryConfigRepository implements ConfigRepository {
 
   public async saveAuthProfiles(profiles: AuthProfile[]): Promise<void> {
     this.authProfiles = [...profiles];
+  }
+
+  public async getInventorySources(): Promise<InventorySourceConfig[]> {
+    return [...this.inventorySources];
+  }
+
+  public async saveInventorySources(sources: InventorySourceConfig[]): Promise<void> {
+    this.inventorySources = [...sources];
   }
 }
