@@ -4,9 +4,11 @@ import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/n
 import type { ServerConfig } from "../../src/models/config";
 import { inventorySecretKey, type InventoryProvider, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import { ORPHAN_FOLDER_NAME } from "../../src/services/inventory/syncEngine";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
@@ -352,6 +354,138 @@ describe("inventoryCommands", () => {
       const [field1Key] = (vault.store as ReturnType<typeof vi.fn>).mock.calls[0];
       expect(vault.delete).toHaveBeenCalledWith(field1Key);
       expect(backingStore.size).toBe(0);
+    });
+
+    it("wizard step numbering — a single registered provider auto-skips the picker, so the Name prompt is step 1 of a total that omits the invisible provider step (kills always-count-provider-step)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider()); // exactly one provider -> promptProviderPick auto-selects without showing a QuickPick
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      mockShowInputBox
+        .mockResolvedValueOnce("My NetBox") // name
+        .mockResolvedValueOnce("Infra") // target folder
+        .mockResolvedValueOnce("admin") // default username
+        .mockResolvedValueOnce("netbox.local") // host field
+        .mockResolvedValueOnce("secret-token"); // apiToken field
+      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" }); // prune policy
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+
+      // The provider picker itself must never have been shown.
+      expect(mockShowQuickPick).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ title: "Select Inventory Provider" }));
+
+      // 4 fixed steps (Name/Folder/Username/Prune-Policy) + 2 provider config
+      // fields (host, apiToken) = 6 total. Under the reverted (buggy)
+      // implementation the provider pick is always counted, so this same
+      // sequence would produce "(2/7)" here instead — this assertion fails
+      // against that wrong implementation.
+      const [nameCallArgs] = mockShowInputBox.mock.calls[0];
+      expect((nameCallArgs as { title: string }).title).toContain("(1/6)");
+      expect((nameCallArgs as { title: string }).title).not.toContain("(2/");
+
+      const [hostCallArgs] = mockShowInputBox.mock.calls[3];
+      expect((hostCallArgs as { title: string }).title).toContain("(5/6)");
+
+      const [apiTokenCallArgs] = mockShowInputBox.mock.calls[4];
+      expect((apiTokenCallArgs as { title: string }).title).toContain("(6/6)");
+    });
+
+    it("wizard step numbering — two registered providers show the picker as the invisible step 1, bumping the total by one relative to the single-provider case", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const providerA = makeProvider({ id: "fake-a", label: "Provider A" });
+      const providerB = makeProvider({ id: "fake-b", label: "Provider B" });
+      registry.register(providerA);
+      registry.register(providerB);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      mockShowQuickPick
+        .mockResolvedValueOnce({ label: providerA.label, provider: providerA }) // provider pick (occupies step 1)
+        .mockResolvedValueOnce({ value: "orphan" }); // prune policy
+      mockShowInputBox
+        .mockResolvedValueOnce("My NetBox") // name
+        .mockResolvedValueOnce("Infra") // target folder
+        .mockResolvedValueOnce("admin") // default username
+        .mockResolvedValueOnce("netbox.local") // host field
+        .mockResolvedValueOnce("secret-token"); // apiToken field
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+
+      // providerA and providerB both use makeProvider's default 2-field
+      // schema, so the total (7) is unambiguous before the pick happens and
+      // the picker itself is honestly labeled step 1 of that same total —
+      // not left as a bare, unnumbered title while the very next prompt says
+      // "(2/7)". Under the reverted (buggy) implementation the picker's
+      // title stays exactly "Select Inventory Provider" with no step label,
+      // so this assertion fails against that wrong implementation.
+      const providerPickCall = mockShowQuickPick.mock.calls[0];
+      expect(providerPickCall[1]).toEqual(expect.objectContaining({ title: "Select Inventory Provider (1/7)" }));
+
+      // Provider pick was actually shown -> it counts as step 1, Name is step
+      // 2, and the total (7) is one higher than the single-provider case's
+      // total (6).
+      const [nameCallArgs] = mockShowInputBox.mock.calls[0];
+      expect((nameCallArgs as { title: string }).title).toContain("(2/7)");
+
+      const [apiTokenCallArgs] = mockShowInputBox.mock.calls[4];
+      expect((apiTokenCallArgs as { title: string }).title).toContain("(7/7)");
+    });
+
+    it("wizard step numbering — providers with different config field counts leave the total ambiguous before the pick, so the picker is labeled a bare step 1 instead of a bogus total (kills a wrong-but-confident total)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const providerA = makeProvider({ id: "fake-a", label: "Provider A" }); // 2 config fields
+      const providerB = makeProvider({
+        id: "fake-b",
+        label: "Provider B",
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "apiToken", label: "API Token", type: "password", required: true },
+          { id: "extra", label: "Extra", type: "string", required: false }
+        ]
+      }); // 3 config fields
+      registry.register(providerA);
+      registry.register(providerB);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      mockShowQuickPick
+        .mockResolvedValueOnce({ label: providerA.label, provider: providerA }) // provider pick
+        .mockResolvedValueOnce({ value: "orphan" }); // prune policy
+      mockShowInputBox
+        .mockResolvedValueOnce("My NetBox") // name
+        .mockResolvedValueOnce("Infra") // target folder
+        .mockResolvedValueOnce("admin") // default username
+        .mockResolvedValueOnce("netbox.local") // host field
+        .mockResolvedValueOnce("secret-token"); // apiToken field
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+
+      // providerA (2 fields) and providerB (3 fields) disagree on total step
+      // count, and which one the user picks isn't known when the picker's
+      // title is built — so it must not print a total that could be wrong
+      // for whichever provider actually gets chosen (here providerA -> 7,
+      // but providerB would have been 8).
+      const providerPickCall = mockShowQuickPick.mock.calls[0];
+      expect(providerPickCall[1]).toEqual(expect.objectContaining({ title: "Select Inventory Provider (Step 1)" }));
+      expect((providerPickCall[1] as { title: string }).title).not.toMatch(/\(1\/\d+\)/);
+
+      // The rest of the wizard is unaffected — Name still starts at step 2
+      // of the total for the provider actually chosen (providerA -> 7).
+      const [nameCallArgs] = mockShowInputBox.mock.calls[0];
+      expect((nameCallArgs as { title: string }).title).toContain("(2/7)");
     });
   });
 
@@ -1615,7 +1749,7 @@ describe("inventoryCommands", () => {
       // count the credential-cleanup loop already reports — counted once,
       // not twice, even though both loops independently notice it's live.
       expect(mockShowInformationMessage).toHaveBeenCalledWith(
-        expect.stringMatching(/^Inventory sync complete:.*1 re-created server.*kept its credentials\.$/)
+        expect.stringMatching(/^Inventory sync from ".*" complete:.*1 re-created server.*kept its credentials\.$/)
       );
     });
 
@@ -1687,7 +1821,7 @@ describe("inventoryCommands", () => {
       // The closing report still fires (not swallowed by an unhandled
       // rejection) and calls out the incomplete runtime cleanup by name.
       expect(mockShowInformationMessage).toHaveBeenCalledWith(
-        expect.stringMatching(/^Inventory sync complete:.*Runtime cleanup incomplete for 1 server — close its terminal manually\.$/)
+        expect.stringMatching(/^Inventory sync from ".*" complete:.*Runtime cleanup incomplete for 1 server — close its terminal manually\.$/)
       );
     });
 
@@ -2039,7 +2173,7 @@ describe("inventoryCommands", () => {
       // The modal was shown a SECOND time, with the updated (2-delete) plan.
       expect(mockShowInformationMessage).toHaveBeenCalledTimes(2);
       const secondCallDetail = (mockShowInformationMessage.mock.calls[1]?.[1] as { detail?: string } | undefined)?.detail;
-      expect(secondCallDetail).toContain("2 deleted");
+      expect(secondCallDetail).toContain("2 servers will be deleted");
 
       // If the fix were reverted (the post-teardown final recompute applied
       // unseen instead of looping back to reconfirm), applyInventorySyncPlan
@@ -2106,8 +2240,8 @@ describe("inventoryCommands", () => {
       const firstCallDetail = (mockShowInformationMessage.mock.calls[0]?.[1] as { detail?: string } | undefined)?.detail;
       const secondCallDetail = (mockShowInformationMessage.mock.calls[1]?.[1] as { detail?: string } | undefined)?.detail;
       expect(firstCallDetail).not.toContain("will be added as duplicates");
-      expect(secondCallDetail).toContain("1 added");
-      expect(secondCallDetail).toContain("1 deleted");
+      expect(secondCallDetail).toContain("1 server will be added.");
+      expect(secondCallDetail).toContain("1 server will be deleted");
       expect(secondCallDetail).toContain("will be added as duplicates");
 
       // If FINDING 3's fix were reverted (planCountsEqual comparing only raw
@@ -2173,10 +2307,10 @@ describe("inventoryCommands", () => {
       const firstCallDetail = (mockShowInformationMessage.mock.calls[0]?.[1] as { detail?: string } | undefined)?.detail;
       const secondCallDetail = (mockShowInformationMessage.mock.calls[1]?.[1] as { detail?: string } | undefined)?.detail;
       expect(firstCallDetail).not.toContain("jump host");
-      expect(firstCallDetail).toContain("1 deleted");
-      expect(secondCallDetail).toContain("1 deleted");
+      expect(firstCallDetail).toContain("1 server will be deleted");
+      expect(secondCallDetail).toContain("1 server will be deleted");
       expect(secondCallDetail?.toLowerCase()).toContain("jump host");
-      expect(secondCallDetail).toContain("1 other server uses these as SSH jump hosts.");
+      expect(secondCallDetail).toContain("1 other server uses this server as an SSH jump host.");
 
       // If FINDING 1's fix were reverted (a comparator built only from
       // adds/updates/prunes counts, unchangedCount, manualDuplicateCount,
@@ -2256,7 +2390,7 @@ describe("inventoryCommands", () => {
       );
       expect(modalCall).toBeDefined();
       const detail = (modalCall?.[1] as { detail?: string } | undefined)?.detail;
-      expect(detail).toContain("1 added");
+      expect(detail).toContain("1 server will be added.");
 
       // The recomputed (non-empty) plan was actually applied after the user
       // confirmed it — the device is re-created as a fresh add, proving this
@@ -2278,6 +2412,125 @@ describe("inventoryCommands", () => {
 
       expect(core.getInventorySource("src-1")?.lastSyncAt).toBeDefined();
       expect(mockShowInformationMessage).toHaveBeenCalled(); // toast, not a modal confirm
+    });
+
+    describe("describePlanDetail orphan-line destination (targetFolder at MAX_FOLDER_DEPTH)", () => {
+      function modalDetail(): string | undefined {
+        const modalCall = mockShowInformationMessage.mock.calls.find(
+          ([msg]) => typeof msg === "string" && msg.includes("Apply inventory sync")
+        );
+        return (modalCall?.[1] as { detail?: string } | undefined)?.detail;
+      }
+
+      it("FIX (orphan-line mis-rendered fallback depth) — a targetFolder already at MAX_FOLDER_DEPTH shows the ACTUAL destination computeSyncPlan's fallback used (the target folder itself), not the recomputed target/_orphaned path it could not create (kills the modal misstating where servers actually land)", async () => {
+        // MAX_FOLDER_DEPTH segments — one more level ("<deepFolder>/_orphaned")
+        // exceeds the limit, so normalizeFolderPath rejects it and syncEngine's
+        // fallback (FIX 6) leaves the orphan's `after.group` at deepFolder itself.
+        const deepFolder = Array.from({ length: MAX_FOLDER_DEPTH }, (_, i) => `L${i + 1}`).join("/");
+        const pruned = makeServer({
+          id: "owned-1",
+          name: "old-sw",
+          host: "10.0.0.1",
+          group: deepFolder,
+          origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+        });
+        const repo = new InMemoryConfigRepository([pruned]);
+        const core = new NexusCore(repo);
+        await core.initialize();
+        const registry = new InventoryProviderRegistry();
+        const provider = makeProvider({
+          // device:1 absent from the fetched tree -> prune "orphan".
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        });
+        registry.register(provider);
+        const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+        registerInventoryCommands(core, registry, vault, makeTeardown());
+        await core.addOrUpdateInventorySource(makeSource({ targetFolder: deepFolder, prunePolicy: "orphan" }));
+
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+        // The engine's own orphan-fallback warning fires a separate toast —
+        // unrelated to the fix under test, just needs a resolved promise.
+        mockShowWarningMessage.mockResolvedValueOnce(undefined);
+
+        const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+        await cmd("src-1");
+
+        const detail = modalDetail();
+        // The engine's own fallback destination — this is where the server is
+        // ACTUALLY moved.
+        expect(detail).toContain(`will be moved to "${deepFolder}"`);
+        // If this fix were reverted (recomputing `${targetFolder}/${ORPHAN_FOLDER_NAME}`
+        // regardless of what computeSyncPlan actually did), the modal would
+        // instead claim this path — which the engine explicitly could not
+        // create and never used.
+        expect(detail).not.toContain(`${deepFolder}/${ORPHAN_FOLDER_NAME}`);
+        expect(core.getServer("owned-1")?.group).toBe(deepFolder);
+      });
+
+      it("normal-depth targetFolder still names the real target/_orphaned destination", async () => {
+        const pruned = makeServer({
+          id: "owned-1",
+          name: "old-sw",
+          host: "10.0.0.1",
+          group: "Infra",
+          origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+        });
+        const repo = new InMemoryConfigRepository([pruned]);
+        const core = new NexusCore(repo);
+        await core.initialize();
+        const registry = new InventoryProviderRegistry();
+        const provider = makeProvider({
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        });
+        registry.register(provider);
+        const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+        registerInventoryCommands(core, registry, vault, makeTeardown());
+        await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", prunePolicy: "orphan" }));
+
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+        const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+        await cmd("src-1");
+
+        const detail = modalDetail();
+        expect(detail).toContain(`will be moved to "Infra/${ORPHAN_FOLDER_NAME}"`);
+        expect(core.getServer("owned-1")?.group).toBe(`Infra/${ORPHAN_FOLDER_NAME}`);
+      });
+
+      it("a root targetFolder (\"\") orphans to the top-level _orphaned folder — quoted, not rendered as the top level", async () => {
+        const pruned = makeServer({
+          id: "owned-1",
+          name: "old-sw",
+          host: "10.0.0.1",
+          origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+        });
+        const repo = new InMemoryConfigRepository([pruned]);
+        const core = new NexusCore(repo);
+        await core.initialize();
+        const registry = new InventoryProviderRegistry();
+        const provider = makeProvider({
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        });
+        registry.register(provider);
+        const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+        registerInventoryCommands(core, registry, vault, makeTeardown());
+        await core.addOrUpdateInventorySource(makeSource({ targetFolder: "", prunePolicy: "orphan" }));
+
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+        const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+        await cmd("src-1");
+
+        const detail = modalDetail();
+        // computeSyncPlan normalizes the root-target candidate ("_orphaned"
+        // alone) successfully, so `after.group` is the literal folder name —
+        // never undefined — and the line renders the quoted path, not the
+        // "moved to the top level" wording reserved for a genuinely undefined
+        // destination.
+        expect(detail).toContain(`will be moved to "${ORPHAN_FOLDER_NAME}"`);
+        expect(detail).not.toContain("the top level");
+        expect(core.getServer("owned-1")?.group).toBe(ORPHAN_FOLDER_NAME);
+      });
     });
 
     it("ITEM 5 — a rejected applyInventorySyncPlan on the nothing-to-do fast path surfaces a friendly error instead of an unhandled rejection", async () => {
@@ -2345,7 +2598,7 @@ describe("inventoryCommands", () => {
       const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
       await cmd("src-1");
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Edit the source"));
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("edit the source"));
       expect(provider.fetchInventory).not.toHaveBeenCalled();
     });
 
@@ -2369,7 +2622,7 @@ describe("inventoryCommands", () => {
       const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
       await cmd("src-1");
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("apiToken"));
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("API Token"));
       expect(provider.fetchInventory).not.toHaveBeenCalled();
     });
 
@@ -2463,7 +2716,7 @@ describe("inventoryCommands", () => {
       expect(options.detail).toContain("1 other server");
       expect(options.detail.toLowerCase()).toContain("jump host");
       // Singular subject-verb agreement (kills "1 other server use..." — should be "uses").
-      expect(options.detail).toContain("1 other server uses these as SSH jump hosts.");
+      expect(options.detail).toContain("1 other server uses this server as an SSH jump host.");
     });
 
     it("(F8) a provider returning a malformed inventory tree surfaces a protocol error and leaves core state unchanged (kills removing validateInventoryTree from syncNow)", async () => {

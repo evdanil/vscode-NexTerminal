@@ -530,18 +530,21 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(item.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Expanded);
   });
 
-  it("B5 — a synced server gets a '· synced' description suffix and tooltip line, but contextValue is UNCHANGED (load-bearing: package.json's context menus match it verbatim)", () => {
+  it("B5/m7 — a synced server gets a ' (synced)' description suffix and tooltip line, but contextValue is UNCHANGED (load-bearing: package.json's context menus match it verbatim)", () => {
     const synced = makeServer({ id: "s1", origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 } });
     const manual = makeServer({ id: "s2" });
 
-    const syncedItem = new ServerTreeItem(synced, false);
+    const syncedItem = new ServerTreeItem(synced, false, undefined, true, undefined, undefined, "My NetBox");
     const manualItem = new ServerTreeItem(manual, false);
-    const syncedConnected = new ServerTreeItem(synced, true);
+    const syncedConnected = new ServerTreeItem(synced, true, undefined, true, undefined, undefined, "My NetBox");
 
-    expect(syncedItem.description).toBe("dev@example.com · synced");
+    // Kills reverting the idiom back to "· synced" (a description suffix
+    // wired to the old separator would still read as "synced" but fail this
+    // exact-string check).
+    expect(syncedItem.description).toBe("dev@example.com (synced)");
     expect(manualItem.description).toBe("dev@example.com");
-    expect(syncedItem.tooltip).toContain("Synced from inventory");
-    expect(manualItem.tooltip).not.toContain("Synced from inventory");
+    expect(syncedItem.tooltip).toContain('Synced from "My NetBox"');
+    expect(manualItem.tooltip).not.toContain("Synced from");
 
     // The load-bearing assertion: a synced server's contextValue must match
     // exactly what an ordinary server's does (package.json's menus key off
@@ -550,6 +553,17 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(syncedItem.contextValue).toBe("nexus.server");
     expect(syncedItem.contextValue).toBe(manualItem.contextValue);
     expect(syncedConnected.contextValue).toBe("nexus.serverConnected");
+  });
+
+  it("m7 — the tooltip falls back to the generic 'Synced from inventory' line when the source name can't be resolved (source removed, origin left dangling)", () => {
+    const synced = makeServer({ id: "s1", origin: { sourceId: "source-gone", externalId: "device:1", syncedAt: 1000 } });
+
+    // No sourceName argument passed — mirrors what NexusTreeProvider.toServerItem
+    // computes when snapshot.inventorySources has no entry for origin.sourceId.
+    const item = new ServerTreeItem(synced, false);
+
+    expect(item.tooltip).toContain("Synced from inventory");
+    expect(item.tooltip).not.toContain('Synced from ""');
   });
 });
 
@@ -789,6 +803,35 @@ describe("NexusTreeProvider description visibility", () => {
     const server = children.find((c) => c instanceof ServerTreeItem);
     expect(server!.description).toBe("deploy@example.com (Production Auth)");
     expect(server!.tooltip).toContain("[auth: Production Auth]");
+  });
+
+  it("m7 — resolves the synced tooltip's source name from snapshot.inventorySources by origin.sourceId, and falls back to the generic line when the source is gone (kills a hardcoded 'Synced from inventory' that never looks at the source record)", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: (key: string) => (key === "showTreeDescriptions" ? true : undefined)
+    } as any);
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [
+        makeServer({ id: "s1", name: "synced-live", origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 } }),
+        makeServer({ id: "s2", name: "synced-orphaned", origin: { sourceId: "source-gone", externalId: "device:2", syncedAt: 1 } })
+      ],
+      inventorySources: [
+        { id: "source-1", providerId: "netbox", name: "My NetBox", targetFolder: "", prunePolicy: "orphan", defaultUsername: "admin", config: {}, secretFieldIds: [] }
+      ]
+    } as any);
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    const live = children.find((c) => c instanceof ServerTreeItem && c.server.id === "s1") as ServerTreeItem;
+    const orphaned = children.find((c) => c instanceof ServerTreeItem && c.server.id === "s2") as ServerTreeItem;
+
+    // If the fix were reverted (tooltip always says "Synced from inventory"
+    // regardless of the live source record), this would read identically to
+    // the fallback case below and fail to distinguish a real source name.
+    expect(live.tooltip).toContain('Synced from "My NetBox"');
+    // The source record for "source-gone" doesn't exist — fallback, not a
+    // blank/undefined name rendered literally.
+    expect(orphaned.tooltip).toContain("Synced from inventory");
+    expect(orphaned.tooltip).not.toContain('Synced from "');
   });
 
   it("hides serial profile description when showTreeDescriptions is false", () => {

@@ -51,7 +51,12 @@ export class ServerTreeItem extends vscode.TreeItem {
     serverLookup?: (id: string) => ServerConfig | undefined,
     showDescription = true,
     authProfileName?: string,
-    authProfileUsername?: string
+    authProfileUsername?: string,
+    // m7 — the inventory source's name (looked up by the caller via
+    // snapshot.inventorySources against server.origin.sourceId), or undefined
+    // when the source no longer exists (removed, but this server's origin
+    // wasn't stripped) — the tooltip falls back to a generic line in that case.
+    syncedSourceName?: string
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
@@ -61,10 +66,11 @@ export class ServerTreeItem extends vscode.TreeItem {
     // matched verbatim (and via /^nexus\.server(Connected)?$/) by every context-menu
     // entry in package.json, so introducing a distinct value here would silently
     // drop every one of those menu entries for synced servers.
-    const syncedSuffix = server.origin ? "\nSynced from inventory" : "";
+    const syncedSuffix = server.origin ? (syncedSourceName ? `\nSynced from "${syncedSourceName}"` : "\nSynced from inventory") : "";
     this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${syncedSuffix}`;
     const authDesc = authProfileName ? ` (${authProfileName})` : "";
-    const syncedDesc = server.origin ? " · synced" : "";
+    // m7 — "(synced)" suffix idiom (was "· synced").
+    const syncedDesc = server.origin ? " (synced)" : "";
     this.description = showDescription ? `${displayUsername}@${server.host}${authDesc}${syncedDesc}` : undefined;
     this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
     this.iconPath = new vscode.ThemeIcon(
@@ -574,7 +580,14 @@ export class NexusTreeProvider
     const lookup = (id: string): ServerConfig | undefined => this.snapshot.servers.find((s) => s.id === id);
     const showDesc = vscode.workspace.getConfiguration("nexus.ui").get<boolean>("showTreeDescriptions", true);
     const authProfile = server.authProfileId ? this.authProfileById.get(server.authProfileId) : undefined;
-    return new ServerTreeItem(server, connected, lookup, showDesc, authProfile?.name, authProfile?.username);
+    // m7 — resolved by origin.sourceId against the live snapshot rather than
+    // stored on the server itself, so a source rename is reflected immediately
+    // and a removed source (origin left dangling — see B5's tree tooltip doc)
+    // falls back to the generic "Synced from inventory" line in ServerTreeItem.
+    const syncedSourceName = server.origin
+      ? this.snapshot.inventorySources.find((source) => source.id === server.origin!.sourceId)?.name
+      : undefined;
+    return new ServerTreeItem(server, connected, lookup, showDesc, authProfile?.name, authProfile?.username, syncedSourceName);
   }
 
   private toSerialProfileItem(profile: SerialProfile): SerialProfileTreeItem {

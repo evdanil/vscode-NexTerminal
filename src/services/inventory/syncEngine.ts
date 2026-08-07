@@ -109,7 +109,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     manualByHostPort.set(`${server.host.toLowerCase()}:${server.port}`, server);
   }
 
-  const seenExternalIds = new Set<string>();
+  // m10 — maps externalId -> the first-seen device's name, so a later
+  // duplicate's warning can name which device was kept, not just its id.
+  const seenExternalIds = new Map<string, string>();
   // FIX 1 — every device with a non-empty externalId that appears anywhere in
   // the fetched tree counts as PRESENT for pruning purposes, even when it is
   // skipped below (empty name / no usable ssh endpoint / invalid port). Only
@@ -132,7 +134,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
 
   for (const device of tree.devices) {
     if (!device.externalId) {
-      warnings.push(`Device "${device.name || "(unnamed)"}" has an empty externalId and was skipped.`);
+      warnings.push(`Device "${device.name || "(unnamed)"}" has no device ID and was skipped.`);
       continue;
     }
     presentExternalIds.add(device.externalId);
@@ -146,16 +148,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       }
       continue;
     }
-    if (seenExternalIds.has(device.externalId)) {
-      warnings.push(`Duplicate externalId "${device.externalId}" — keeping the first device seen, skipping the rest.`);
+    const firstSeenName = seenExternalIds.get(device.externalId);
+    if (firstSeenName !== undefined) {
+      warnings.push(`Duplicate device ID "${device.externalId}" — kept first ("${firstSeenName}").`);
       continue;
     }
-    seenExternalIds.add(device.externalId);
+    seenExternalIds.set(device.externalId, device.name);
 
     const endpoint = selectSshEndpoint(device);
     if (!endpoint) {
       if (isOwned) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) has no usable ssh endpoint and was skipped.`);
+        warnings.push(`Device "${device.name}" (${device.externalId}) has no usable SSH endpoint and was skipped.`);
       } else {
         noEndpointSkipped.push(device.name);
       }
@@ -176,7 +179,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     if (device.folderPath) {
       const normalizedRel = normalizeFolderPath(device.folderPath);
       if (normalizedRel === undefined) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid folderPath "${device.folderPath}"; placed at the source's target folder.`);
+        warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid folder path "${device.folderPath}"; placed at the source's target folder.`);
       } else {
         rel = normalizedRel;
       }

@@ -28,6 +28,7 @@ const mockConfigUpdate = vi.fn();
 const mockClipboardReadText = vi.fn();
 const mockOpenTextDocument = vi.fn();
 const mockShowTextDocument = vi.fn();
+const mockExecuteCommand = vi.fn();
 const configStore = new Map<string, unknown>();
 const configDefaults = new Map<string, unknown>();
 
@@ -36,7 +37,8 @@ vi.mock("vscode", () => ({
     registerCommand: vi.fn((id: string, handler: (...args: unknown[]) => unknown) => {
       registeredCommands.set(id, handler);
       return { dispose: vi.fn() };
-    })
+    }),
+    executeCommand: (...args: unknown[]) => mockExecuteCommand(...args)
   },
   window: {
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
@@ -844,6 +846,7 @@ describe("import chooser (nexus.config.import)", () => {
       "add servers in bulk",
       "$(clippy) Paste Host List from Clipboard",
       "$(list-flat) Host List File…",
+      "$(sync) Inventory Source (NetBox)…",
       "migrate from another client",
       "$(file-code) MobaXterm INI File…",
       "$(file-code) SecureCRT XML Export…",
@@ -855,10 +858,22 @@ describe("import chooser (nexus.config.import)", () => {
     const byLabel = (fragment: string) => items.find((i) => i.label.includes(fragment));
     expect(byLabel("Paste Host List")?.description).toBe("Hostnames or CSV rows copied from a spreadsheet");
     expect(byLabel("Host List File")?.description).toBe(".csv, .tsv, or .txt — one device per line");
+    expect(byLabel("Inventory Source")?.description).toBe("Live sync — devices stay linked to the source");
     expect(byLabel("MobaXterm INI")?.description).toBe("Sessions from a MobaXterm .ini bookmarks export");
     expect(byLabel("SecureCRT XML")?.description).toBe("Created in SecureCRT via Tools → Export Settings");
     expect(byLabel("SecureCRT Sessions Folder")?.description).toBe("SecureCRT's Config/Sessions directory");
     expect(byLabel("Nexus Export File")?.description).toBe("An encrypted backup or a shared config (.json)");
+  });
+
+  it("Inventory Source (NetBox)… routes straight to nexus.inventory.addSource (no host-list dialog)", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "inventorySource" });
+
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.addSource");
+    expect(mockShowOpenDialog).not.toHaveBeenCalled();
+    expect(mockClipboardReadText).not.toHaveBeenCalled();
   });
 
   it("does nothing when the chooser is canceled", async () => {
