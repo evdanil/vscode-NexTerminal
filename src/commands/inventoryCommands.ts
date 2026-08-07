@@ -945,6 +945,22 @@ export function registerInventoryCommands(
     if (!pickResult) return;
     const { provider } = pickResult;
 
+    // VERIFIED (post-#52 review) — addSource has no editSource-style
+    // dispose-vs-in-flight-submit race to guard against: there is no id to
+    // register in inFlightSourceIds until AFTER persistNewInventorySource's
+    // core.addOrUpdateInventorySource call actually succeeds (persistNewInventorySource
+    // mints its own randomUUID() and only core-registers it at the very end
+    // of its configMutationLock section). Closing this panel — Cancel, or a
+    // native tab-close — while onSubmit is still mid keychain/repository I/O
+    // does NOT free any busy marker prematurely, because none is ever
+    // claimed for a source that doesn't exist yet: pickInventorySource (used
+    // by editSource/removeSource/syncNow) can't select a not-yet-persisted
+    // id, so no concurrent command can read/send credentials against it
+    // mid-persist. If onSubmit's promise settles after the panel is already
+    // gone, persistNewInventorySource's own FINDING B / FINDING 1 rollback
+    // (vault-first, delete-on-persist-failure) still runs to completion
+    // exactly as if the panel were still open — the panel's lifecycle plays
+    // no part in that sequencing. No closure-local tracking is needed here.
     const definition = inventorySourceFormDefinition(provider, undefined, mostCommonUsername(core.getSnapshot().servers));
     WebviewFormPanel.open(`inventory-source-add-${provider.id}`, definition, {
       onSubmit: async (values) => {
@@ -1012,11 +1028,55 @@ export function registerInventoryCommands(
     // called at each of those points as well as from onDidDispose.
     inFlightSourceIds.add(source.id);
     let releasedInFlight = false;
-    const releaseInFlight = (): void => {
-      if (!releasedInFlight) {
-        releasedInFlight = true;
-        inFlightSourceIds.delete(source.id);
-      }
+
+    // BUG FIX (post-#52 review) — onDidDispose used to release the marker
+    // the instant the panel closed, synchronously, with no regard for
+    // whether onSubmit (persistUpdatedInventorySource, below) was still
+    // mid-flight. WebviewFormPanel's own submitInFlight guard only blocks a
+    // SECOND submit message while one is pending; it does nothing to stop
+    // the "cancel" message or a native tab-close from disposing the panel
+    // (and firing every onDidDispose listener, including this one)
+    // WHILE that first submit is still awaiting vault/repository I/O. That
+    // left a window where the busy marker was gone — so a concurrent Sync
+    // Now would sail past the has()-check above and read/send credentials
+    // against a source that persistUpdatedInventorySource had already
+    // partially mutated (vault overwritten, config record not yet
+    // persisted; see its FINDING 1/FINDING C comments for that exact
+    // sequencing).
+    //
+    // WebviewFormPanel exposes no submit-in-flight signal to dispose
+    // listeners (its `submitInFlight` field is private and only gates its
+    // own message handler), so the current onSubmit invocation's promise is
+    // tracked here, closure-local, instead. `onSubmit` below assigns it
+    // synchronously (before any `await` inside it can run — see its own
+    // comment), so by the time WebviewFormPanel gets around to reacting to
+    // the dispose, `currentSubmit` already reflects whatever is in flight,
+    // no matter which of the two races (dispose winning vs. submit settling
+    // first) actually happened.
+    let currentSubmit: Promise<void> | undefined;
+    let releasing: Promise<void> | undefined;
+    const releaseInFlight = (): Promise<void> => {
+      if (releasing) return releasing;
+      releasing = (async (): Promise<void> => {
+        if (currentSubmit) {
+          try {
+            await currentSubmit;
+          } catch {
+            // A rejected submit is already surfaced to the user by
+            // WebviewFormPanel's own "Save failed: ..." toast (or, for the
+            // early-exit callers of releaseInFlight below, never started at
+            // all). This handler's only job is to wait for persistence to
+            // SETTLE before freeing the marker — never to throw out of a
+            // dispose listener (see WebviewFormPanel's onDidDispose, which
+            // swallows listener errors but must never depend on that here).
+          }
+        }
+        if (!releasedInFlight) {
+          releasedInFlight = true;
+          inFlightSourceIds.delete(source.id);
+        }
+      })();
+      return releasing;
     };
 
     const provider = registry.get(source.providerId);
@@ -1055,20 +1115,51 @@ export function registerInventoryCommands(
       // then be refused with "currently syncing" until the extension host
       // restarts.
       panel = WebviewFormPanel.open(`inventory-source-edit-${source.id}`, definition, {
-        onSubmit: async (values) => {
-          const parsed = await parseSourceFormValues(values, provider, existingSecretFieldIds);
-          const updated = await persistUpdatedInventorySource(core, vault, source, {
-            name: parsed.name,
-            targetFolder: parsed.targetFolder,
-            defaultUsername: parsed.defaultUsername,
-            prunePolicy: parsed.prunePolicy,
-            provider,
-            config: parsed.config,
-            reenteredSecrets: parsed.secrets
-          });
+        // Deliberately NOT an `async` arrow function: an async function's
+        // body only starts executing when it's CALLED, but the promise it
+        // returns isn't available to assign into `currentSubmit` until
+        // AFTER that call returns — by which point the body may already be
+        // past its first `await`, i.e. already mid keychain/repository I/O,
+        // with nothing yet recording that fact for releaseInFlight to see.
+        // Wrapping the async work in its own IIFE here means the IIFE call
+        // happens first (started, not awaited) and its returned promise is
+        // captured into `currentSubmit` before this outer function returns
+        // control to WebviewFormPanel — closing that gap.
+        onSubmit: (values) => {
+          const submitPromise = (async (): Promise<void> => {
+            const parsed = await parseSourceFormValues(values, provider, existingSecretFieldIds);
+            const updated = await persistUpdatedInventorySource(core, vault, source, {
+              name: parsed.name,
+              targetFolder: parsed.targetFolder,
+              defaultUsername: parsed.defaultUsername,
+              prunePolicy: parsed.prunePolicy,
+              provider,
+              config: parsed.config,
+              reenteredSecrets: parsed.secrets
+            });
 
-          const folderNote = updated.targetFolder !== source.targetFolder ? " Servers move to the new folder on the next sync." : "";
-          void vscode.window.showInformationMessage(`Inventory source "${updated.name}" updated.${folderNote}`);
+            const folderNote = updated.targetFolder !== source.targetFolder ? " Servers move to the new folder on the next sync." : "";
+            void vscode.window.showInformationMessage(`Inventory source "${updated.name}" updated.${folderNote}`);
+          })();
+          currentSubmit = submitPromise;
+          // This `.finally()`/`.catch()` pair is a SECOND, closure-local
+          // observer of `submitPromise` — separate from whatever the real
+          // consumer (WebviewFormPanel's own `await
+          // Promise.resolve(this.onSubmit(...))`, which owns showing "Save
+          // failed: ...") does with the promise this function returns. A
+          // `.finally()` callback forwards the original settlement (reject
+          // included) to the promise it returns; without the trailing
+          // `.catch(() => {})` here, a rejected Save would produce a SECOND,
+          // unhandled rejection purely from this bookkeeping chain, on top
+          // of whatever the real consumer already reports.
+          void submitPromise
+            .finally(() => {
+              if (currentSubmit === submitPromise) currentSubmit = undefined;
+            })
+            .catch(() => {
+              // Deliberately swallowed — see comment above.
+            });
+          return submitPromise;
         },
         onTest: (values) => handleFormTest(values, provider, source.name, source)
       });

@@ -884,6 +884,125 @@ describe("inventoryCommands", () => {
       expect(mockWebviewOpen).toHaveBeenCalledTimes(2);
     });
 
+    it("in-flight guard — a Cancel/dispose that arrives WHILE Save's own persist is still in flight must not release the marker until persistence settles (kills onDidDispose releasing inFlightSourceIds instantly instead of waiting on the pending onSubmit — a concurrent Sync Now must be refused for the whole window, not just released the moment the panel closes)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", config: { host: "netbox.local" } }));
+
+      // Gate persistUpdatedInventorySource's own persist call
+      // (core.addOrUpdateInventorySource) on a controllable promise, so the
+      // test can pause a Save exactly at the half-updated window the review
+      // finding describes: this run's re-entered vault secret already
+      // written (persistUpdatedInventorySource stores secrets BEFORE
+      // persisting the record — see its own FINDING 1 comment), the config
+      // record not yet persisted.
+      let releaseGate!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      const originalAddOrUpdate = core.addOrUpdateInventorySource.bind(core);
+      const addOrUpdateSpy = vi.spyOn(core, "addOrUpdateInventorySource").mockImplementation(async (source: InventorySourceConfig) => {
+        await gate;
+        return originalAddOrUpdate(source);
+      });
+
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd();
+      const { panel, onSubmit } = latestFormCall();
+
+      // Save — deliberately not awaited here: it's gated mid-persist.
+      const submitPromise = onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "new-secret"
+      });
+      let submitSettled = false;
+      void submitPromise
+        .finally(() => {
+          submitSettled = true;
+        })
+        .catch(() => {
+          // This is a second, test-local observer of submitPromise, purely
+          // for the `submitSettled` flag below — the real assertion on
+          // success/failure happens via `await submitPromise` further down.
+          // Without this, a rejection would also surface as an unhandled
+          // rejection from THIS chain.
+        });
+
+      // Let Save run up to (and into) the gated persist call.
+      await vi.waitFor(() => {
+        expect(addOrUpdateSpy).toHaveBeenCalled();
+      });
+      expect(submitSettled).toBe(false);
+      // Confirms the half-updated window is real: the vault write for the
+      // re-entered secret already landed even though the config record has
+      // not — this is exactly the state a concurrent Sync Now must not be
+      // able to observe.
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("new-secret");
+
+      // The user cancels/closes the panel WHILE Save is still pending on the
+      // gate — this is the onDidDispose firing the review finding is about.
+      panel.fireDispose();
+
+      // Give a wrong (instant-release) implementation every chance to have
+      // already deleted the marker: several microtask turns pass, still with
+      // the persist gate held closed the whole time.
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      expect(submitSettled).toBe(false);
+
+      // THE KILL — a bounded microtask flush, not an unbounded `await`: with
+      // the CORRECT fix, the marker is still held, so this Sync Now is
+      // refused synchronously at the busy check (zero internal awaits on
+      // that path — see syncNow's own "Marked busy synchronously" comment)
+      // and settles within a handful of microtasks, never reaching
+      // fetchInventory. Reverting the fix (instant release on dispose) lets
+      // this Sync Now sail past the busy check instead: it reads the
+      // mid-persist vault secret and calls fetchInventory with it, then
+      // stalls on configMutationLock — still held by the gated
+      // persistUpdatedInventorySource — so it would NOT settle within this
+      // same bounded window (an unbounded `await` here would instead hang
+      // the whole test out to the runner's timeout).
+      const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      const syncPromise = syncCmd("src-1");
+      let syncSettled = false;
+      void syncPromise
+        .finally(() => {
+          syncSettled = true;
+        })
+        .catch(() => {
+          // Second, test-local observer — see the submitPromise comment above.
+        });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+
+      expect(syncSettled).toBe(true);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+
+      // Let the gated persist complete, and drain both promises so nothing
+      // dangles past this test (relevant if this test were ever run against
+      // a reverted fix, where syncPromise is still queued on
+      // configMutationLock at this point).
+      releaseGate();
+      await submitPromise;
+      await syncPromise;
+      expect(submitSettled).toBe(true);
+
+      // Once persistence has actually settled, the marker IS released — a
+      // subsequent Sync Now proceeds normally.
+      mockShowWarningMessage.mockClear();
+      await syncCmd("src-1");
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+    });
+
     it("F6 — WebviewFormPanel.open throwing surfaces the error but does not leave the source stuck busy (kills a busy-flag leak on open() failure)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
