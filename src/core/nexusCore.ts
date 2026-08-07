@@ -1,19 +1,95 @@
-import type {
-  ActiveLocalShellSession,
-  ActiveSerialSession,
-  ActiveSession,
-  ActiveTunnel,
-  AuthProfile,
-  LocalShellProfile,
-  SerialProfile,
-  ServerConfig,
-  TunnelProfile,
-  TunnelRegistryEntry
+import { randomUUID } from "node:crypto";
+import {
+  cloneServerConfig,
+  mergeServerConfigFields,
+  serverConfigsEqual,
+  type ActiveLocalShellSession,
+  type ActiveSerialSession,
+  type ActiveSession,
+  type ActiveTunnel,
+  type AuthProfile,
+  type LocalShellProfile,
+  type SerialProfile,
+  type ServerConfig,
+  type TunnelProfile,
+  type TunnelRegistryEntry
 } from "../models/config";
+import { sourceConfigUnchanged, type InventorySourceConfig } from "../models/inventory";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
 type NexusListener = (snapshot: SessionSnapshot) => void;
+
+/**
+ * Result of a sync engine run (see services/inventory/syncEngine.ts), reduced
+ * to exactly what NexusCore needs to mutate in one atomic batch: which
+ * servers to upsert/remove and which folders must exist. Defined here (not
+ * in syncEngine.ts) because NexusCore is the sole writer that consumes it;
+ * syncEngine imports the type back for planToApplication()'s return type.
+ */
+export interface InventorySyncApplication {
+  sourceId: string;
+  syncedAt: number; // -> source.lastSyncAt
+  upsertServers: ServerConfig[]; // adds + update "after" + orphan "after"
+  removeServerIds: string[];
+  folders: string[]; // ensure these + ancestors exist as explicit groups
+  // FINDINGS D/E — the source record exactly as it stood when this
+  // application's plan was computed (the fetch-time snapshot). Compared
+  // synchronously against the CURRENT map entry, before any mutation, in
+  // applyInventorySyncPlan — closes the gap between "source still exists" and
+  // "source is still the same config" for races that land between plan
+  // computation and apply (e.g. a replace-mode config import recreating the
+  // same source id mid-sync).
+  //
+  // REORDER (removeSource Findings 1/2) — "absent" is the removal-disposition
+  // case: the caller (inventoryCommands.ts's removeSource) has ALREADY
+  // removed the source record via removeInventorySource() before calling
+  // this method to dispose of the servers it owned (delete / strip origin),
+  // so apply.sourceId is expected to name NO current source at all. The
+  // semantics differ from the normal case: proceed only if the sources map
+  // truly has no entry for apply.sourceId; if one exists (a replace-mode
+  // import recreated the same id in the gap between the record removal and
+  // this call), throw without mutating anything, protecting the NEW source's
+  // servers from this now-stale disposition. When "absent", lastSyncAt is
+  // never bumped and no source-record entry is written for apply.sourceId
+  // (there is nothing to write it onto).
+  expectedSource: InventorySourceConfig | "absent";
+  // FINDING 2 (removeSource review) — only consulted when expectedSource is
+  // "absent". importMergeReplace imports servers BEFORE sources, so a
+  // recreated owned server (or one that took over the same id under a NEW
+  // source) can land in the window between removeInventorySource and this
+  // apply. Each entry in upsertServers is honored only if the server
+  // currently in the map is still structurally equal (serverConfigsEqual) to
+  // the pre-strip snapshot captured here for its id — otherwise the entry
+  // belongs to the new import, not this removal, and applyInventorySyncPlan
+  // skips it rather than clobbering it.
+  //
+  // FINDING 4 (removal-teardown review) — extended to cover removeServerIds
+  // too: a delete target is validated the same way (origin.sourceId
+  // ownership PLUS, when an entry exists here for its id, structural
+  // equality against it) rather than by ownership alone, which a
+  // same-id/same-sourceId REPLACEMENT (content changed, identity markers
+  // unchanged) could otherwise slip through. Populating an entry for a given
+  // remove-target id is optional — callers with no meaningful
+  // pre-disposition snapshot to capture (or that never pass this map at all,
+  // e.g. syncNow's normal-mode apply) keep the ownership-only check.
+  // Absent from a non-"absent" apply.
+  expectedBeforeByServerId?: Map<string, ServerConfig>;
+}
+
+/**
+ * FINDING 1 (removeSource review) — thrown by removeInventorySource(id, expected)
+ * when the current record no longer matches `expected` (or is gone). Distinct
+ * from a generic persistence failure so the command layer can surface a
+ * different, more accurate message ("source changed while removing" vs.
+ * "removal did not complete").
+ */
+export class InventorySourceRemovalMismatchError extends Error {
+  public constructor(id: string) {
+    super(`Cannot remove inventory source "${id}": the record changed before the removal could complete.`);
+    this.name = "InventorySourceRemovalMismatchError";
+  }
+}
 
 export class NexusCore {
   private readonly listeners = new Set<NexusListener>();
@@ -30,17 +106,33 @@ export class NexusCore {
   private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
   private readonly authProfiles = new Map<string, AuthProfile>();
+  private readonly inventorySources = new Map<string, InventorySourceConfig>();
+  // TOMBSTONE (rollback-vs-live-close race) — set while applyInventorySyncPlan
+  // has captured pre-batch session state and is awaiting its persist. Session
+  // lifecycle callbacks (onSessionClosed -> unregisterSession) are NOT
+  // serialized against this window by configMutationLock, so a terminal the
+  // user closes while the batch's save is in flight legitimately removes its
+  // session bookkeeping concurrently with the batch. If that save then fails
+  // and applyInventorySyncPlan rolls back, it must NOT resurrect a session
+  // that was tombstoned during the window: unregisterSession records here any
+  // session id it removes while inventorySyncApplyInFlight is true, and
+  // applyInventorySyncPlan consults this set before re-inserting a captured
+  // session or restoring focusedSessionId to one. Scoped to
+  // applyInventorySyncPlan only — no other mutator sets or reads this.
+  private inventorySyncApplyInFlight = false;
+  private readonly inventorySyncTombstonedSessionIds = new Set<string>();
 
   public constructor(private readonly repository: ConfigRepository) {}
 
   public async initialize(): Promise<void> {
-    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles] = await Promise.all([
+    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles, inventorySources] = await Promise.all([
       this.repository.getServers(),
       this.repository.getTunnels(),
       this.repository.getSerialProfiles(),
       this.repository.getLocalShellProfiles(),
       this.repository.getGroups(),
-      this.repository.getAuthProfiles()
+      this.repository.getAuthProfiles(),
+      this.repository.getInventorySources()
     ]);
     this.servers.clear();
     this.tunnels.clear();
@@ -48,6 +140,7 @@ export class NexusCore {
     this.localShellProfiles.clear();
     this.explicitGroups.clear();
     this.authProfiles.clear();
+    this.inventorySources.clear();
     const normalizedServers = normalizeFileExplorerAutoOpenOwner(servers);
     for (const server of normalizedServers.servers) {
       this.servers.set(server.id, server);
@@ -66,6 +159,9 @@ export class NexusCore {
     }
     for (const profile of authProfiles) {
       this.authProfiles.set(profile.id, profile);
+    }
+    for (const source of inventorySources) {
+      this.inventorySources.set(source.id, source);
     }
     if (normalizedServers.changed) {
       await this.repository.saveServers(normalizedServers.servers);
@@ -87,7 +183,8 @@ export class NexusCore {
       explicitGroups: [...this.explicitGroups],
       authProfiles: [...this.authProfiles.values()],
       activitySessionIds: new Set(this.activitySessionIds),
-      focusedSessionId: this.focusedSessionId
+      focusedSessionId: this.focusedSessionId,
+      inventorySources: [...this.inventorySources.values()]
     };
   }
 
@@ -136,6 +233,487 @@ export class NexusCore {
       await this.repository.saveServers([...this.servers.values()]);
     }
     this.emitChanged();
+  }
+
+  public getInventorySource(id: string): InventorySourceConfig | undefined {
+    return this.inventorySources.get(id);
+  }
+
+  /**
+   * FINDING A — the map mutation happens first (repo-wide in-memory-first
+   * pattern), but a rejected persist here must leave NO trace: the command
+   * layer's credential rollback (add/edit) assumes a failed
+   * addOrUpdateInventorySource means the source was never created/updated, and
+   * an in-memory-only leftover could later be persisted by an unrelated
+   * operation (e.g. the next successful saveInventorySources call from a
+   * different command). Capture the previous entry (or its absence) before
+   * mutating, and restore it on rejection.
+   *
+   * FINDING 1 (removal-identity review) — every write through this method is
+   * a new INCARNATION of the record: a fresh `revision` is assigned here,
+   * unconditionally (even if `source` already carries one — e.g. a backup
+   * restore replaying an old value), so no call site (addSource, editSource,
+   * configCommands' backup import/reset paths, ...) needs to remember to do
+   * it itself. This is deliberately the ONLY place a revision is ever
+   * (re)assigned to a LIVE record — applyInventorySyncPlan's own lastSyncAt
+   * bump below intentionally preserves whatever revision the record already
+   * has, since that is not a new incarnation, just a routine sync stamp.
+   */
+  public async addOrUpdateInventorySource(source: InventorySourceConfig): Promise<void> {
+    const hadPrevious = this.inventorySources.has(source.id);
+    const previous = this.inventorySources.get(source.id);
+    const withRevision: InventorySourceConfig = { ...source, revision: randomUUID() };
+    this.inventorySources.set(source.id, withRevision);
+    try {
+      await this.repository.saveInventorySources([...this.inventorySources.values()]);
+    } catch (error) {
+      if (hadPrevious) {
+        this.inventorySources.set(source.id, previous!);
+      } else {
+        this.inventorySources.delete(source.id);
+      }
+      throw error;
+    }
+    this.emitChanged();
+  }
+
+  /**
+   * Removes the source record only. Disposition of servers it created
+   * (delete / keep / strip origin) is the command layer's job — call
+   * applyInventorySyncPlan (or removeServer) first if servers need to change.
+   *
+   * FINDING A — symmetric with addOrUpdateInventorySource: removeSource's
+   * command flow deletes the source's OWN secrets (its inventory-source-*
+   * vault keys) BEFORE calling this method, not after — delete-first is the
+   * correct order here: if the record delete below rejects, the (restored)
+   * record still enumerates those field ids via secretFieldIds, so the
+   * command is retryable and will simply attempt the same (now-idempotent)
+   * vault deletes again. Restoring the entry on a rejected persist keeps that
+   * retry possible — a delete-then-leak here would strand the record deleted
+   * in memory while removeInventorySource() never got persisted, and the
+   * command layer's own retry logic assumes rejection means "nothing
+   * changed".
+   *
+   * FINDING 1 (removeSource review) — `expected`, when provided, is compared
+   * against the CURRENT record SYNCHRONOUSLY (no await between the check and
+   * the delete below) via sourceConfigUnchanged plus a name comparison
+   * (sourceConfigUnchanged doesn't cover name). This closes a narrower race
+   * than the id-recreation case InventorySyncApplication's "absent" semantics
+   * guard: a replace-mode import can delete-and-recreate the SAME source id
+   * during removeSource's own awaited vault reads/deletes (which run before
+   * this call), so an unconditional delete here would silently remove the
+   * REPLACEMENT record instead of the one the caller picked. Mismatch or
+   * missing record -> throw InventorySourceRemovalMismatchError without
+   * mutating anything.
+   */
+  public async removeInventorySource(id: string, expected?: InventorySourceConfig): Promise<void> {
+    if (expected) {
+      const current = this.inventorySources.get(id);
+      if (!current || !sourceConfigUnchanged(current, expected) || current.name !== expected.name) {
+        throw new InventorySourceRemovalMismatchError(id);
+      }
+    }
+    const hadPrevious = this.inventorySources.has(id);
+    const previous = this.inventorySources.get(id);
+    this.inventorySources.delete(id);
+    try {
+      await this.repository.saveInventorySources([...this.inventorySources.values()]);
+    } catch (error) {
+      if (hadPrevious) {
+        this.inventorySources.set(id, previous!);
+      }
+      throw error;
+    }
+    this.emitChanged();
+  }
+
+  /**
+   * Applies one computed inventory sync as a single atomic batch: one
+   * `saveServers`/`saveGroups`/`saveInventorySources` round-trip, one
+   * `emitChanged()` — mirrors `addServersBatch`'s reasoning for why a
+   * multi-hundred-device sync must not become N sequential memento flushes.
+   *
+   * Throws if `apply.sourceId` no longer names a known source (e.g. the
+   * source was removed while a sync was in flight) — refuses to partially
+   * apply servers on behalf of a source record that will never receive the
+   * lastSyncAt update, rather than silently orphaning the write.
+   *
+   * FINDINGS D/E — also throws if the CURRENT source record no longer
+   * matches `apply.expectedSource` (the fetch-time snapshot the plan was
+   * computed against). This check runs synchronously, before any mutation
+   * below, so it is atomic with the apply itself — no await separates "the
+   * record is still the one the plan was computed for" from "the plan gets
+   * applied", closing the race a caller-side check (however recent) can never
+   * fully close on its own.
+   *
+   * REORDER — `apply.expectedSource === "absent"` inverts the presence check:
+   * this call must throw if a source record for apply.sourceId DOES exist
+   * (see the field doc on InventorySyncApplication.expectedSource for why).
+   *
+   * FINDING 2 (removeSource review) — in "absent" mode, each removeServerIds/
+   * upsertServers entry is ALSO validated individually against current state
+   * (see the field doc on InventorySyncApplication.expectedBeforeByServerId)
+   * before it is allowed to mutate anything; entries that fail are skipped,
+   * not thrown on. The returned `skippedCount` tells the caller how many
+   * entries were skipped this way (always 0 outside "absent" mode) so it can
+   * surface that to the user rather than silently under-reporting the
+   * removal's effect.
+   *
+   * FINDING 3 (removal-teardown review) — also returns `removedServerIds`:
+   * the ids actually deleted by THIS call (after the "absent"-mode per-entry
+   * filtering above — equal to `apply.removeServerIds` verbatim outside
+   * "absent" mode, where every entry is honored unconditionally). Callers
+   * that need to clean up state keyed by server id AFTER this call (vault
+   * secrets, runtime teardown) must iterate this list, not their own
+   * pre-apply candidate list — a candidate this call skipped was never
+   * touched and must not have its secrets/sessions torn down either.
+   */
+  public async applyInventorySyncPlan(apply: InventorySyncApplication): Promise<{ skippedCount: number; removedServerIds: string[] }> {
+    const source = this.inventorySources.get(apply.sourceId);
+    // FINDING 2 (removeSource review) — the actual entries this call mutates.
+    // In the normal (non-"absent") case these are exactly apply's own arrays;
+    // in "absent" mode they're filtered below to exclude entries that no
+    // longer reflect a server this removal actually owns.
+    let removeServerIds = apply.removeServerIds;
+    let upsertServers = apply.upsertServers;
+    let skippedCount = 0;
+    if (apply.expectedSource === "absent") {
+      if (source) {
+        throw new Error(
+          `Cannot apply inventory sync: inventory source "${apply.sourceId}" exists (expected it to already be removed).`
+        );
+      }
+      // FINDING 2 — importMergeReplace imports servers BEFORE sources, so a
+      // recreated owned server (or one that simply took over the same id
+      // under a NEW source) can land in the window between
+      // removeInventorySource and this apply. Validate EACH entry against
+      // CURRENT state before mutating it — a mismatch means the entry
+      // belongs to the new import, not this stale removal, and must be
+      // skipped rather than deleted/overwritten.
+      //
+      // FINDING 4 (removal-teardown review) — ownership (origin.sourceId
+      // match) alone is not enough: a REPLACEMENT server can retain the
+      // exact same id and origin.sourceId (e.g. re-synced/re-imported under
+      // the same source) while its actual content changed underneath this
+      // now-stale removal. When the caller captured a pre-disposition
+      // snapshot for this id in `expectedBeforeByServerId` (removeSource's
+      // "Delete Servers" flow does, mirroring what it already does for
+      // upserts below), the CURRENT record must still be structurally
+      // identical to it. Callers that never populate an entry for a given id
+      // (e.g. syncNow's normal-mode apply, which doesn't use "absent" mode
+      // at all, or any future "absent" caller that genuinely has no
+      // pre-disposition snapshot) keep the ownership-only check unchanged —
+      // this is a strictly ADDITIONAL check, never a required one.
+      const validRemoveIds: string[] = [];
+      for (const id of apply.removeServerIds) {
+        const current = this.servers.get(id);
+        if (!current || current.origin?.sourceId !== apply.sourceId) {
+          skippedCount++;
+          continue;
+        }
+        const expectedBefore = apply.expectedBeforeByServerId?.get(id);
+        if (expectedBefore && !serverConfigsEqual(current, expectedBefore)) {
+          skippedCount++;
+          continue;
+        }
+        validRemoveIds.push(id);
+      }
+      const validUpserts: ServerConfig[] = [];
+      for (const server of apply.upsertServers) {
+        const expectedBefore = apply.expectedBeforeByServerId?.get(server.id);
+        const current = this.servers.get(server.id);
+        if (current && expectedBefore && serverConfigsEqual(current, expectedBefore)) {
+          validUpserts.push(server);
+        } else {
+          skippedCount++;
+        }
+      }
+      removeServerIds = validRemoveIds;
+      upsertServers = validUpserts;
+    } else {
+      if (!source) {
+        throw new Error(`Cannot apply inventory sync: unknown inventory source "${apply.sourceId}".`);
+      }
+      if (!sourceConfigUnchanged(source, apply.expectedSource)) {
+        throw new Error(
+          `Cannot apply inventory sync: inventory source "${apply.sourceId}" configuration changed since the sync was computed.`
+        );
+      }
+    }
+    // ITEM 1 — capture everything this call is about to mutate BEFORE
+    // touching it, so a rejected persist below can be rolled back completely.
+    // Without this, a half-applied sync (servers deleted/upserted, sessions
+    // dropped, lastSyncAt bumped) stayed in memory even though the caller was
+    // told the sync failed — and the next unrelated persist (any other
+    // saveServers/saveGroups/saveInventorySources call) would flush that
+    // half-applied state to disk for real.
+    const priorServers = new Map<string, ServerConfig | undefined>();
+    const captureServerPrior = (id: string): void => {
+      if (!priorServers.has(id)) {
+        priorServers.set(id, this.servers.get(id));
+      }
+    };
+    for (const id of removeServerIds) {
+      captureServerPrior(id);
+    }
+    for (const server of upsertServers) {
+      captureServerPrior(server.id);
+    }
+    // removeServerSessions (below) only ever touches activeSessions,
+    // activitySessionIds, and focusedSessionId — mirror exactly that here.
+    // FINDING 3 — sessions are restored on rollback with no reference/
+    // presence check like servers/groups get below (a concurrent addGroup or
+    // addOrUpdateServer can't touch these session maps). But unlike servers
+    // or groups, session removal here CAN be raced by something outside this
+    // serialized command path: NexusCore.unregisterSession (the public API
+    // fired by the terminal-close -> onSessionClosed handler) is NOT gated
+    // by configMutationLock, so a terminal the user closes for real while
+    // this batch's persist is in flight can legitimately remove one of these
+    // very sessions in between the capture below and the rollback further
+    // down. See the TOMBSTONE mechanism (inventorySyncApplyInFlight /
+    // inventorySyncTombstonedSessionIds) guarding the rollback below — a
+    // session torn down that way is excluded from restoration rather than
+    // resurrected.
+    const priorFocusedSessionId = this.focusedSessionId;
+    const priorActiveSessions = new Map<string, ActiveSession>();
+    const priorActivitySessionIds = new Set<string>();
+    for (const id of removeServerIds) {
+      for (const [sessionId, session] of this.activeSessions.entries()) {
+        if (session.serverId === id) {
+          priorActiveSessions.set(sessionId, session);
+          if (this.activitySessionIds.has(sessionId)) {
+            priorActivitySessionIds.add(sessionId);
+          }
+        }
+      }
+    }
+
+    // FINDING 3 — track exactly what THIS batch writes, so a rejected persist
+    // can roll back conditionally instead of wholesale: another command
+    // (addGroup, addOrUpdateServer, ...) can run concurrently while the
+    // saves below are pending, and an unconditional restore would erase its
+    // newer state along with this batch's own mutations.
+    //
+    // FINDING 2 — the map holds a structural CLONE of each upserted server
+    // (cloneServerConfig), captured at write time, not the live reference.
+    // _renameFolderPath and removeFolderCascade both mutate `server.group` IN
+    // PLACE on the object already sitting in `this.servers`, so a reference
+    // compare (`current === batchValue`) would stay true across that
+    // mutation and rollback would wrongly clobber the rename. Comparing the
+    // CURRENT entry structurally (serverConfigsEqual) against this frozen
+    // snapshot instead correctly treats an in-place-mutated entry as
+    // "changed since" and leaves it alone.
+    const batchWrittenServers = new Map<string, ServerConfig | undefined>(); // undefined = this batch deleted it
+    const addedExplicitGroups = new Set<string>(); // paths this batch added that were NOT already present
+
+    for (const folder of apply.folders) {
+      const normalized = normalizeFolderPath(folder);
+      if (!normalized) {
+        continue;
+      }
+      for (const ancestor of getAncestorPaths(normalized)) {
+        if (!this.explicitGroups.has(ancestor)) {
+          this.explicitGroups.add(ancestor);
+          addedExplicitGroups.add(ancestor);
+        }
+      }
+    }
+    for (const id of removeServerIds) {
+      this.servers.delete(id);
+      this.removeServerSessions(id);
+      batchWrittenServers.set(id, undefined);
+    }
+    for (const server of upsertServers) {
+      this.servers.set(server.id, server);
+      batchWrittenServers.set(server.id, cloneServerConfig(server));
+    }
+    // FINDING 4 (focus review) — same conditional-restore principle as
+    // servers/groups above, applied to focusedSessionId: record what THIS
+    // batch's own synchronous mutation phase left focusedSessionId as
+    // (removeServerSessions, called from the loop just above, clears it when
+    // the focused session belonged to a removed server). A user calling
+    // setFocusedSession mid-window — while the persist below is still
+    // pending — changes focusedSessionId to something this batch never
+    // wrote; rollback must recognize that and leave it alone rather than
+    // unconditionally snapping back to priorFocusedSessionId.
+    const batchWrittenFocusedSessionId = this.focusedSessionId;
+    // REORDER — "absent": there is no source record to bump lastSyncAt on or
+    // write an entry for; writtenSourceRecord stays undefined and the
+    // inventorySources map (and its rollback below) are left completely
+    // alone. The bucket is still included in the persist below (unchanged
+    // content), keeping the existing one-persist-one-emit shape intact
+    // rather than special-casing the "absent" apply into its own save call.
+    const writtenSourceRecord = source ? { ...source, lastSyncAt: apply.syncedAt } : undefined;
+    if (writtenSourceRecord) {
+      this.inventorySources.set(apply.sourceId, writtenSourceRecord);
+    }
+
+    // FINDING 1 — keep references to all three save promises and settle ALL
+    // of them (Promise.allSettled, not Promise.all) before doing anything
+    // else. Promise.all's catch fires the instant the FIRST one rejects,
+    // while its siblings (e.g. a slow saveServers carrying this batch's
+    // payload) can still be in flight; running the conditional rollback and
+    // the compensating re-persist at that point races that slow original —
+    // if it resolves and commits AFTER the compensating write lands, disk
+    // ends up holding the rejected batch's data instead of the rolled-back
+    // state. Awaiting allSettled first guarantees every original has already
+    // committed (or definitively failed) before rollback/compensation touch
+    // anything, so the compensating write is always the last one to land.
+    //
+    // TOMBSTONE — from here until this call resolves/rejects, session
+    // lifecycle callbacks are NOT serialized against this batch: a terminal
+    // the user closes while these saves are pending fires
+    // onSessionClosed -> unregisterSession concurrently with this await.
+    // Mark the window "in flight" so unregisterSession records any id it
+    // genuinely removes during it; the rollback below must not resurrect
+    // those ids from priorActiveSessions/priorFocusedSessionId.
+    this.inventorySyncApplyInFlight = true;
+    this.inventorySyncTombstonedSessionIds.clear();
+    const results = await Promise.allSettled([
+      this.repository.saveServers([...this.servers.values()]),
+      this.repository.saveGroups([...this.explicitGroups]),
+      this.repository.saveInventorySources([...this.inventorySources.values()])
+    ]);
+    const firstRejection = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (firstRejection) {
+      // FINDING 3 (original) — servers: restore the prior entry only if the
+      // current entry is still structurally identical to what this batch
+      // wrote (or still absent where this batch deleted it). If a concurrent
+      // command changed or mutated it since, a wholesale restore/skip would
+      // either erase the concurrent edit or keep the rejected batch write —
+      // see REVIEW FINDING 1 below for the merge that replaces the old
+      // skip-whole-record behavior in the UPDATE case.
+      for (const [id, priorServer] of priorServers) {
+        const batchSnapshot = batchWrittenServers.get(id);
+        const current = this.servers.get(id);
+        if (batchSnapshot === undefined) {
+          // This batch deleted the record. Restore it only if nothing has
+          // recreated it since (current still absent) — a concurrent
+          // recreation is left alone entirely.
+          if (current === undefined && priorServer) {
+            this.servers.set(id, priorServer);
+          }
+          continue;
+        }
+        if (current === undefined) {
+          // This batch created/updated the record, but something concurrent
+          // deleted it since. Nothing to merge onto — leave it deleted.
+          continue;
+        }
+        if (serverConfigsEqual(current, batchSnapshot)) {
+          // Untouched since this batch wrote it: full rollback (restore
+          // prior, or delete outright if this batch had created it).
+          if (priorServer) {
+            this.servers.set(id, priorServer);
+          } else {
+            this.servers.delete(id);
+          }
+          continue;
+        }
+        // REVIEW FINDING 1 (P2) — current differs from what this batch wrote:
+        // a concurrent in-place mutation (_renameFolderPath /
+        // removeFolderCascade rewriting `.group` on the very same object) or
+        // a concurrent replace landed while this batch's persist was still
+        // in flight. The old behavior treated this as "not ours anymore" and
+        // skipped the WHOLE record — which for an UPDATE left the rejected
+        // batch write's untouched fields (host/name/port/origin, ...) in
+        // place, and the compensating save below would then persist them
+        // even though the command reports failure.
+        if (!priorServer) {
+          // This batch CREATED the record — there is no pre-batch state to
+          // merge the concurrent edit onto. Restoring "prior" here would mean
+          // deleting the record outright, destroying the concurrent edit
+          // along with the rejected create. Keep the current
+          // (concurrently-mutated) entry as-is; this is a deliberate,
+          // documented exception to "the rejected batch's fields must not
+          // survive" — for a created record there is nothing else for the
+          // concurrent edit to attach to.
+          continue;
+        }
+        // This batch UPDATED an existing record: merge field-wise. A field
+        // the concurrent edit actually touched (current differs from what
+        // this batch wrote) keeps its current value; every other field falls
+        // back to the pre-batch value, discarding this batch's rejected
+        // write for that field.
+        this.servers.set(id, mergeServerConfigFields(priorServer, batchSnapshot, current));
+      }
+      // FINDING 3 — explicitGroups: this batch only ever ADDS paths, so
+      // rollback only removes paths THIS batch added that are still present.
+      // A concurrently-added identical path can't be distinguished from ours
+      // and is acceptably removed too — but we never do a wholesale set
+      // replacement here, which would erase unrelated concurrent addGroup
+      // calls entirely.
+      for (const group of addedExplicitGroups) {
+        this.explicitGroups.delete(group);
+      }
+      // TOMBSTONE — a captured session that was genuinely torn down by
+      // unregisterSession during the awaited persist (window opened just
+      // above) must NOT be resurrected here: the terminal is actually gone,
+      // and re-inserting it would leave isServerConnected/focus pointing at
+      // a dead session.
+      for (const [sessionId, session] of priorActiveSessions) {
+        if (this.inventorySyncTombstonedSessionIds.has(sessionId)) {
+          continue;
+        }
+        this.activeSessions.set(sessionId, session);
+        if (priorActivitySessionIds.has(sessionId)) {
+          this.activitySessionIds.add(sessionId);
+        }
+      }
+      // FINDING 4 — restore focusedSessionId only if it's still exactly what
+      // this batch itself wrote (batchWrittenFocusedSessionId, captured right
+      // after the mutation loop above). If a concurrent setFocusedSession
+      // moved focus to something else while the persist was pending, that is
+      // newer than this batch and must not be clobbered by a rollback of a
+      // batch that no longer owns the current value. Tombstone rule still
+      // applies on top: never restore focus onto a session that was
+      // genuinely torn down during the in-flight window.
+      if (this.focusedSessionId === batchWrittenFocusedSessionId) {
+        this.focusedSessionId =
+          priorFocusedSessionId !== undefined && this.inventorySyncTombstonedSessionIds.has(priorFocusedSessionId)
+            ? undefined
+            : priorFocusedSessionId;
+      }
+      // FINDING 2 — source record: nothing in NexusCore ever mutates an
+      // InventorySourceConfig object in place (addOrUpdateInventorySource,
+      // removeInventorySource, and this method itself only ever call
+      // `this.inventorySources.set(id, <new object>)`), so a reference
+      // compare here cannot be fooled the way the servers check above could.
+      // Restore the source record only if it's still the exact object this
+      // batch wrote; a concurrent edit to the same source since must not be
+      // clobbered. REORDER — "absent": writtenSourceRecord is undefined, so
+      // this is a no-op, exactly matching "nothing was written, nothing to
+      // roll back".
+      if (writtenSourceRecord && this.inventorySources.get(apply.sourceId) === writtenSourceRecord) {
+        this.inventorySources.set(apply.sourceId, source!);
+      }
+      // FINDING 1 — all three original saves above have now settled (we
+      // awaited allSettled), so it's safe to best-effort re-persist all three
+      // buckets with the (post-rollback) state: one of the originals may
+      // still have committed to disk (e.g. saveServers resolved before
+      // saveGroups rejected), leaving disk half-applied even though memory
+      // was just rolled back (conditionally) to converge with what the
+      // caller is about to be told happened. Ignore individual failures — if
+      // the store is still down, memory stays authoritative and the next
+      // successful persist heals disk.
+      await Promise.allSettled([
+        this.repository.saveServers([...this.servers.values()]),
+        this.repository.saveGroups([...this.explicitGroups]),
+        this.repository.saveInventorySources([...this.inventorySources.values()])
+      ]);
+      // TOMBSTONE — apply has now definitively failed and rolled back; close
+      // the window and drop any recorded ids (they've been consulted above
+      // and must not leak into a later, unrelated apply).
+      this.inventorySyncApplyInFlight = false;
+      this.inventorySyncTombstonedSessionIds.clear();
+      throw firstRejection.reason;
+    }
+    // TOMBSTONE — apply succeeded; close the window (nothing to roll back,
+    // so any recorded ids are moot).
+    this.inventorySyncApplyInFlight = false;
+    this.inventorySyncTombstonedSessionIds.clear();
+    this.emitChanged();
+    return { skippedCount, removedServerIds: [...removeServerIds] };
   }
 
   public isServerConnected(serverId: string): boolean {
@@ -316,6 +894,13 @@ export class NexusCore {
     }
     this.activeSessions.delete(sessionId);
     this.activitySessionIds.delete(sessionId);
+    // TOMBSTONE — an applyInventorySyncPlan batch is mid-flight (see field
+    // doc above): record that this session was genuinely torn down during
+    // the window, so a subsequent rollback in that batch does not resurrect
+    // it from its pre-batch capture.
+    if (this.inventorySyncApplyInFlight) {
+      this.inventorySyncTombstonedSessionIds.add(sessionId);
+    }
     this.emitChanged();
   }
 

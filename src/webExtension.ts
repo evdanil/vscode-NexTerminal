@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { repositoryBlobUrl } from "./utils/repositoryLinks";
+import type { NexusExtensionApi } from "./services/inventory/publicApi";
 
 class StaticTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   public constructor(private readonly label: string) {}
@@ -80,6 +81,10 @@ const unsupportedCommands = [
   "nexus.config.import.securecrt",
   "nexus.config.import.inventory",
   "nexus.config.completeReset",
+  "nexus.inventory.addSource",
+  "nexus.inventory.editSource",
+  "nexus.inventory.removeSource",
+  "nexus.inventory.syncNow",
   "nexus.macro.editor",
   "nexus.macro.add",
   "nexus.macro.addFromTemplate",
@@ -148,7 +153,7 @@ const unsupportedCommands = [
   "nexus.files.editAsRoot"
 ];
 
-export function activate(context: vscode.ExtensionContext): void {
+export function activate(context: vscode.ExtensionContext): NexusExtensionApi {
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
     treeDataProvider: new StaticTreeProvider("Nexus SSH requires desktop VS Code"),
     showCollapseAll: false
@@ -173,6 +178,15 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   context.subscriptions.push(commandCenterView, tunnelsView, fileExplorerView, ...commandRegistrations, macroDocsCommand);
+
+  // F17 — web build parity: same API shape as the desktop activate(), but every
+  // call throws rather than silently no-opping a third party's provider registration.
+  return Object.freeze({
+    contractVersion: 1,
+    registerInventoryProvider(): { dispose(): void } {
+      throw new Error("Nexus inventory providers are not available in the browser build.");
+    }
+  });
 }
 
 export function deactivate(): void {}

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { AuthProfile, AuthType, ProxyConfig, ServerConfig } from "../models/config";
+import { cloneServerConfig, mergeServerConfigFields, serverConfigsEqual } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
@@ -30,6 +31,7 @@ import { formatAuthProfileLabel, formatKeyPathDisplayName, normalizeKeyPathForCo
 import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
+import { configMutationLock } from "../services/configMutationLock";
 
 async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -935,6 +937,72 @@ async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<voi
   }
 }
 
+/**
+ * F1 — server runtime teardown extracted from nexus.server.remove's own sequence
+ * (below) so extension.ts can hand the exact same logic to
+ * registerInventoryCommands as its `teardownServerRuntime` dependency: disconnect
+ * terminals/sessions, stop every active tunnel routed through the server
+ * (unconditionally — unlike disconnectServer's auto-stop-only tunnels), then
+ * disconnect the pooled SSH connection. Does NOT touch saved secrets or the
+ * server record itself — those stay the caller's job (nexus.server.remove
+ * deletes both after this; inventory sync/removeSource delete vault secrets
+ * separately and let applyInventorySyncPlan drop the server record).
+ *
+ * FINDING 5 (removal-teardown review) — deliberately does NOT delegate to
+ * disconnectServer(ctx, serverId) the way it used to. disconnectServer's
+ * fallback path resolves its `arg` through toServerFromArg(), whose `string`
+ * branch does `core.getServer(arg)` — i.e. it requires the server record to
+ * STILL EXIST in NexusCore. If it doesn't (missing → toServerFromArg returns
+ * undefined), disconnectServer falls through to `pickServer(ctx.core)`, an
+ * INTERACTIVE quickpick prompt — clearly wrong for a programmatic teardown
+ * call, and exactly the trap a caller reordered to "apply the removal first,
+ * then tear down only the ids actually removed" (removeSource's Delete
+ * Servers flow) would fall into, since by the time teardown runs for a given
+ * id the server record is already gone. None of the actual work below
+ * (disposing this server's terminals, stopping its tunnels, disconnecting
+ * its pooled SSH connection) needs anything from the ServerConfig object
+ * besides the id we already have, so it's inlined directly against
+ * `serverId` instead of re-resolving through core. Safe to call whether or
+ * not `serverId` still names a server in NexusCore.
+ *
+ * FINDING 2 (P2, mid-teardown-recheck review) — a caller's pre-teardown
+ * "still absent" check only guards against a replacement that existed
+ * BEFORE this call started; it says nothing about a replacement created
+ * DURING the awaits inside this function itself (the tunnel-stop
+ * `Promise.all` below can take arbitrarily long). A replacement created in
+ * that window gets its own new pooled SSH connection under the same
+ * `serverId`, and an unconditional `sshPool.disconnect(serverId)` at the
+ * end would then tear that brand-new connection down instead of the stale
+ * one this call actually set out to clean up.
+ *
+ * `shouldAbort`, when provided, is rechecked after every await in this
+ * function (currently the one after the tunnel-stop `Promise.all`) —
+ * immediately before the next disposal step. A `true` result stops the
+ * rest of teardown right there: already-completed steps (terminals
+ * disposed, tunnels already stopped) are NOT undone or retried — an
+ * acceptable, documented limitation, since those steps only ever acted on
+ * the STALE server's own terminals/tunnels regardless of what shows up
+ * afterward. Only the final `sshPool.disconnect` — the one step that could
+ * otherwise hit a replacement's fresh connection — is guarded this way.
+ * Callers that omit `shouldAbort` (the plain nexus.server.remove flow) get
+ * the original, unconditional behavior.
+ */
+export async function teardownServerRuntime(ctx: CommandContext, serverId: string, shouldAbort?: () => boolean): Promise<void> {
+  const terminals = ctx.terminalsByServer.get(serverId);
+  if (terminals) {
+    for (const terminal of terminals) {
+      terminal.dispose();
+    }
+    ctx.terminalsByServer.delete(serverId);
+  }
+  const remaining = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === serverId);
+  await Promise.all(remaining.map((t) => ctx.tunnelManager.stop(t.id)));
+  if (shouldAbort?.()) {
+    return;
+  }
+  ctx.sshPool.disconnect(serverId);
+}
+
 export function registerServerCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.server.add", () => {
@@ -960,9 +1028,310 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (!candidate) {
             return;
           }
-          const updated = preserveLinkedServerCredentials(existing, candidate);
-          await ctx.core.addOrUpdateServer(updated);
-          await syncProxyPasswordSecret(ctx, updated.id, values);
+          const linked = preserveLinkedServerCredentials(existing, candidate);
+          // P1 — the edit form has no field for `origin` (it's an inventory-sync
+          // ownership marker, not a user-editable setting), so formValuesToServer's
+          // reconstruction never carries it. Without restoring it here, saving any
+          // edit to a synced server silently detaches it from inventory sync: the
+          // next sync sees an unowned server squatting on the deterministic id and
+          // skips the device forever (id-collision guard in syncEngine.ts).
+          //
+          // The restore is deferred to inside the mutation lock, below — it
+          // must source `origin` from the LIVE record (`liveRecord`), not
+          // from this form-open `existing` snapshot. If Remove Source → Keep
+          // Servers stripped the live server's origin while this form was
+          // open, `existing.origin` is a stale ownership marker; reattaching
+          // it here would resurrect the dead source's ownership (an inert
+          // synced badge, and a later same-id source import could then
+          // manage a server it no longer owns). `liveRecord` reflects
+          // whatever ownership state actually holds at write time: present →
+          // keep it, stripped/absent → leave it absent.
+          // FINDING 2 (P2, edit-race review) — the record persist and the
+          // proxy-secret sync must commit as ONE generation with respect to
+          // captureBackupStateForExport (configCommands.ts), which reads a
+          // fresh server snapshot AND every server's proxy-password secret
+          // together inside this SAME configMutationLock. Previously these
+          // two awaits ran unlocked back-to-back: a backup capture landing
+          // between them could pair this edit's NEW server record (new
+          // proxy host/port/type) with the OLD proxy password still sitting
+          // in the vault (capture runs first, reads pre-edit vault value,
+          // edit's addOrUpdateServer already committed) — or the reverse,
+          // pairing the OLD record with a NEW password if the capture's
+          // server-snapshot read lands before this addOrUpdateServer but its
+          // vault.get for this server's proxy password lands after
+          // syncProxyPasswordSecret. Both are torn pairs. Nothing below this
+          // point shows UI — see the lock's own contract — the info message
+          // just after is fire-and-forget (`void`, never awaited) and stays
+          // outside the lock regardless.
+          await configMutationLock.runExclusive(async () => {
+            const proxySecretKey = proxyPasswordSecretKey(existing.id);
+            // FINDING 1 (P2, baseline-before-vault-read review) — this
+            // secret-capture await MUST run BEFORE the baseline snapshot
+            // (liveRecord) below, and nothing may await between that
+            // baseline capture and the addOrUpdateServer(updated) write
+            // further down. nexus.server.rename and nexus.server.remove
+            // don't take configMutationLock (see the FINDING 1 comment in
+            // the catch block below), so either can commit against this
+            // same server id while THIS await is pending. Previously
+            // liveRecord was captured BEFORE this await: a rename landing
+            // during it produced a stale liveRecord, and a subsequently
+            // failed secret write rolled back onto that stale snapshot,
+            // silently discarding the rename. Capturing liveRecord AFTER
+            // this await settles — and keeping everything from liveRecord
+            // through addOrUpdateServer synchronous, with no further await
+            // in between — closes that gap entirely.
+            const priorSecretValue = ctx.secretVault ? await ctx.secretVault.get(proxySecretKey) : undefined;
+            // FINDING 1 (P2, edit-rollback-staleness review) — capture the
+            // LIVE record via ctx.core.getServer(existing.id), not the
+            // form-open `existing` snapshot, and do it here — synchronously,
+            // immediately after the vault-read above settles and
+            // immediately before this generation's write lands. An edit or
+            // deletion committed between form-open and this point (there is
+            // no drift guard blocking that window; see below) means
+            // `existing` can already be stale by the time we get here.
+            // Rolling back to it on a failed secret write would silently
+            // erase that intervening edit, or — if the record was deleted in
+            // the meantime — resurrect a server the user just removed.
+            // Capturing the live value immediately before the write it's
+            // rolling back means the rollback always restores exactly what
+            // this submission clobbered, not whatever was on screen when the
+            // form opened (or whatever committed during the vault-read await
+            // above).
+            //
+            // No drift guard: this deliberately does NOT block the edit
+            // from proceeding when the live record differs from (or is
+            // absent from) the form-open snapshot — last-writer-wins is
+            // the existing behavior for the happy path too (addOrUpdateServer
+            // unconditionally overwrites by id). Proceeding and relying on
+            // the live-snapshot rollback below to undo cleanly on failure
+            // is an accepted, intentional scope limit for this fix.
+            const liveRecord = ctx.core.getServer(existing.id);
+            // P1 — origin preservation (see the comment on `linked` above)
+            // sources from `liveRecord`, captured immediately above, NOT
+            // from the form-open `existing` snapshot: present → keep it,
+            // stripped/absent (e.g. a Remove Source → Keep Servers that
+            // landed while the form was open) → leave it absent.
+            const updated = liveRecord?.origin !== undefined ? { ...linked, origin: liveRecord.origin } : linked;
+            // FINDINGS 2+3 (P2, edit-rollback review) — addOrUpdateServer
+            // enforces single ownership of openFileExplorerOnFirstConnect:
+            // if `updated` enables the flag, it clears it from whichever
+            // OTHER server currently holds it. Capture that displaced owner
+            // (if any) BEFORE the write below lands, so a failed secret sync
+            // can hand its flag back — otherwise a rolled-back edit still
+            // leaves the displaced owner cleared.
+            const displacedOwner = updated.openFileExplorerOnFirstConnect
+              ? ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect && s.id !== updated.id)
+              : undefined;
+            // FINDING (P2, edit-rollback reference-sharing review) — when
+            // `updated` enables openFileExplorerOnFirstConnect,
+            // addOrUpdateServer stores `updated` itself into the live
+            // servers map (no clone — see its `next = server` branch), so
+            // `updated` and ctx.core.getServer(existing.id) become THE SAME
+            // object reference from the moment addOrUpdateServer's own
+            // synchronous map-set runs — which is BEFORE it awaits the
+            // repository write, i.e. before this call below even returns.
+            // An in-place mutator (e.g. _renameFolderPath rewriting `.group`
+            // on whatever object currently sits in the map) landing during
+            // EITHER that pending persist or the pending secret write further
+            // below would then mutate `updated` itself. Capturing the
+            // DETACHED structural snapshot (cloneServerConfig) AFTER
+            // addOrUpdateServer's await settles is too late — a mutation
+            // that lands during addOrUpdateServer's own pending save is
+            // already baked into the clone, so the "still owned by this
+            // submission" check further below would trivially match no
+            // matter what changed, comparing the live record to a copy of
+            // itself. Capture the snapshot HERE, before the write is even
+            // issued, so it reflects exactly what THIS submission set out to
+            // write and nothing an intervening mutation could have touched —
+            // mirroring the same fix already applied in
+            // NexusCore.applyInventorySyncPlan (see cloneServerConfig's own
+            // doc comment).
+            const writtenSnapshot = cloneServerConfig(updated);
+            await ctx.core.addOrUpdateServer(updated);
+            try {
+              await syncProxyPasswordSecret(ctx, updated.id, values);
+            } catch {
+              // The record above just committed to the NEW generation, but
+              // its proxy secret never did — left alone, the new record
+              // would pair with the OLD password while the form reports
+              // failure. Restore the LIVE pre-submit value captured above:
+              // if a record existed live, put it back; if the record was
+              // already gone (deleted mid-flight), remove the one this
+              // submission just created rather than reviving anything. Both
+              // are best-effort. A restore failure is reported honestly
+              // (rather than retried or silently swallowed) since it means
+              // the vault or the record no longer matches either
+              // generation.
+              //
+              // FINDING 1 (P2, edit-rollback-race review) — nexus.server.rename
+              // and nexus.server.remove don't take configMutationLock, so
+              // either can commit against this SAME server id while this
+              // catch is only reached after awaiting syncProxyPasswordSecret
+              // above — i.e. after the lock body has already resumed from an
+              // await, no longer exclusive in practice against unlocked
+              // callers. An unconditional restore here would then erase a
+              // concurrent rename, or resurrect a concurrent delete. Guard
+              // it: only restore/remove when the CURRENT live record is
+              // still structurally exactly what THIS submission's
+              // addOrUpdateServer(updated) call wrote (serverConfigsEqual
+              // against `writtenSnapshot`, the DETACHED clone captured
+              // BEFORE that write was even issued — not the live `updated`
+              // reference itself, which addOrUpdateServer may have stored
+              // verbatim into the servers map when openFileExplorerOnFirstConnect
+              // is enabled; comparing against that shared reference would
+              // trivially "match" any in-place mutation applied to it in the
+              // meantime, e.g. _renameFolderPath rewriting `.group`, and
+              // silently undo a legitimate concurrent change).
+              //
+              // FINDING 2 (P2, edit-rollback-merge review) — if it differs,
+              // something else already legitimately changed it since this
+              // submission's own write — but that does NOT mean the whole
+              // record should be left untouched. Skipping it wholesale used
+              // to leave every field this now-rejected submission wrote
+              // (e.g. a new proxy host/port) live, paired against whatever
+              // the rollback below restores in the vault — a mismatched
+              // pair. Instead, merge field-wise (mirrors
+              // NexusCore.applyInventorySyncPlan's own rollback merge, see
+              // mergeServerConfigFields' doc comment): a field the
+              // concurrent change actually touched (current differs from
+              // what THIS submission wrote) keeps its current value; every
+              // other field falls back to `liveRecord` (the pre-submission
+              // value), discarding this rejected submission's write for
+              // that field. `liveRecord` undefined means this submission's
+              // own write CREATED the record (no pre-submission state was
+              // captured) — there is nothing to merge the concurrent change
+              // onto, so the concurrently-mutated current record is kept
+              // as-is, matching the same created-record exception in
+              // NexusCore.applyInventorySyncPlan.
+              try {
+                const currentRecord = ctx.core.getServer(existing.id);
+                if (currentRecord !== undefined) {
+                  if (serverConfigsEqual(currentRecord, writtenSnapshot)) {
+                    if (liveRecord) {
+                      await ctx.core.addOrUpdateServer(liveRecord);
+                    } else {
+                      await ctx.core.removeServer(existing.id);
+                    }
+                  } else if (liveRecord) {
+                    await ctx.core.addOrUpdateServer(mergeServerConfigFields(liveRecord, writtenSnapshot, currentRecord));
+                  }
+                  // else: created by this submission, then concurrently
+                  // mutated — leave the concurrent mutation as-is.
+                }
+                // else: the record is gone for a reason other than this
+                // generation's own rollback-eligible write (a concurrent
+                // delete) — nothing to restore or merge onto.
+              } catch {
+                void vscode.window.showErrorMessage(
+                  `Could not restore server "${existing.name}" to its previous settings after a failed save — re-check its record.`
+                );
+              }
+              if (displacedOwner) {
+                // Same concurrent-change rule as above, applied to the
+                // displaced owner: if its live record is still exactly what
+                // addOrUpdateServer(updated) left it (the captured record
+                // with the flag cleared), hand the flag straight back.
+                //
+                // FINDING 2 (P2, displaced-owner-merge review) — if it's
+                // since diverged (e.g. a concurrent rename of the displaced
+                // owner), the old all-or-nothing check failed the
+                // whole-record equality test and skipped the restore
+                // entirely, leaving the flag cleared for good even though
+                // nothing about THIS submission's rollback should depend on
+                // fields the concurrent change touched. Restore ONLY the
+                // flag onto whatever the displaced owner's CURRENT record
+                // is, preserving every field the concurrent change touched,
+                // unless:
+                //  - the displaced owner was concurrently deleted
+                //    (currentDisplaced is undefined) — nothing to restore
+                //    the flag onto, or
+                //  - some other server already holds the flag now (checked
+                //    against the live snapshot, taken AFTER this
+                //    submission's own record-rollback above has already
+                //    run) — restoring here would violate the single-owner
+                //    invariant addOrUpdateServer otherwise enforces.
+                //
+                // FINDING 1 (P2, current-flag-owner review) — the
+                // currentFlagOwner check used to guard ONLY the divergent
+                // (else) branch below, not the exact-match branch above it.
+                // On the exact-match path, a concurrent command could have
+                // enabled the flag on some OTHER server C while this
+                // rollback was still pending — restoring it onto the
+                // unchanged displaced owner B here would then silently clear
+                // C's flag via addOrUpdateServer's single-owner enforcement,
+                // even though B's restore has nothing to do with C's
+                // legitimate, more recent change. Hoist the check so it
+                // guards BOTH branches: skip the restore entirely whenever
+                // another server currently holds the flag.
+                try {
+                  const currentDisplaced = ctx.core.getServer(displacedOwner.id);
+                  if (currentDisplaced !== undefined) {
+                    const currentFlagOwner = ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect);
+                    if (!currentFlagOwner) {
+                      if (serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined })) {
+                        await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
+                      } else {
+                        await ctx.core.addOrUpdateServer({ ...currentDisplaced, openFileExplorerOnFirstConnect: true });
+                      }
+                    }
+                  }
+                  // else: the displaced owner was concurrently deleted —
+                  // nothing to restore the flag onto.
+                } catch {
+                  void vscode.window.showErrorMessage(
+                    `Could not restore the previous auto-open setting on "${displacedOwner.name}" after a failed save — re-check its settings.`
+                  );
+                }
+              }
+              // FINDING 3 (P2, orphaned-secret-on-concurrent-delete review)
+              // — the record-rollback logic above correctly leaves a
+              // concurrently-deleted server deleted (see its own "nothing to
+              // restore or merge onto" branch a few lines up). Restoring the
+              // prior secret value unconditionally here would then recreate
+              // a proxy password for an id that no longer has a record — an
+              // orphaned vault key that nexus.server.remove already cleaned
+              // up when it deleted the server. Gate the restore on whether
+              // the record is actually still present after the rollback
+              // logic above has run: only store the prior value when it is;
+              // otherwise make sure the vault key ends up deleted too
+              // (best-effort, same treatment as the no-prior-value case).
+              const recordStillPresentAfterRollback = ctx.core.getServer(existing.id) !== undefined;
+              if (ctx.secretVault) {
+                try {
+                  if (recordStillPresentAfterRollback && priorSecretValue !== undefined) {
+                    await ctx.secretVault.store(proxySecretKey, priorSecretValue);
+                    // FINDING 2 (P2, post-store-presence review) — belt-and-
+                    // braces on top of nexus.server.remove now serializing
+                    // its own mutation phase under this SAME
+                    // configMutationLock (see that command's own comment):
+                    // re-check the record's presence AFTER this store's
+                    // await has settled, and best-effort delete the key it
+                    // just wrote if the record has vanished in the meantime.
+                    // Covers any FUTURE lock-free deleter that might still
+                    // slip a removal in between the presence check above and
+                    // this store landing — without this, that race would
+                    // leave exactly the orphaned vault key (a secret with no
+                    // record to pair it with) this whole rollback exists to
+                    // avoid.
+                    if (ctx.core.getServer(existing.id) === undefined) {
+                      try {
+                        await ctx.secretVault.delete(proxySecretKey);
+                      } catch {
+                        // best-effort — ignore
+                      }
+                    }
+                  } else {
+                    await ctx.secretVault.delete(proxySecretKey);
+                  }
+                } catch {
+                  void vscode.window.showErrorMessage(
+                    `Could not restore the previous proxy password for "${existing.name}" after a failed save — re-check its proxy credentials.`
+                  );
+                }
+              }
+              throw new Error(`Could not store proxy credentials for "${existing.name}" — changes were not saved.`);
+            }
+          });
           if (ctx.core.isServerConnected(existing.id)) {
             void vscode.window.showInformationMessage(
               "Server profile updated. Existing sessions keep current connection settings until reconnect."
@@ -991,25 +1360,94 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!server) {
         return;
       }
+      // `server` is the LIVE record (getServer/toServerFromArg/pickServer all
+      // return the map's own object, not a copy) — e.g. nexus.group.rename
+      // mutates `server.group` on that same object in place. Snapshot it
+      // structurally, BEFORE the first await (the confirmation modal below),
+      // so an in-place mutation that lands while the modal or the lock wait
+      // is pending can't silently drag the comparand along with it and make
+      // the in-lock revalidation below compare a mutated record against
+      // itself. Use this detached clone for the confirmation text too, so
+      // what the user sees matches what gets compared.
+      const confirmedSnapshot = cloneServerConfig(server);
       const confirm = await vscode.window.showWarningMessage(
-        `Remove server "${server.name}" and disconnect all sessions?`,
+        `Remove server "${confirmedSnapshot.name}" and disconnect all sessions?`,
         { modal: true },
         "Remove"
       );
       if (confirm !== "Remove") {
         return;
       }
-      await disconnectServer(ctx, server.id);
-      if (ctx.secretVault) {
-        await ctx.secretVault.delete(passwordSecretKey(server.id));
-        await ctx.secretVault.delete(passphraseSecretKey(server.id));
-        await ctx.secretVault.delete(proxyPasswordSecretKey(server.id));
-      }
-      // Stop ALL tunnels when server profile is deleted, regardless of autoStop
-      const remaining = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === server.id);
-      await Promise.all(remaining.map((t) => ctx.tunnelManager.stop(t.id)));
-      ctx.sshPool.disconnect(server.id);
-      await ctx.core.removeServer(server.id);
+      // FINDING 2 (P2, remove-mutation-race review) — this flow used to run
+      // its whole teardown+delete sequence lock-free. A concurrent
+      // nexus.server.edit rollback (see the edit-path comments above) can
+      // hold a pending vault.store for THIS SAME server id — if this
+      // remove's key deletion below completed first, then the rollback's
+      // store landed AFTER, the record would already be gone but the vault
+      // key would reappear: an orphaned secret with no record to pair it
+      // with. Serializing this span under configMutationLock (the SAME
+      // singleton the edit rollback and inventory sync/backup flows already
+      // use) makes the two flows strictly ordered instead of interleaved —
+      // this also closes the equivalent remove-vs-inventory-sync and
+      // remove-vs-backup-capture races. `server` is already resolved above
+      // and the confirmation modal has already settled, so nothing
+      // interactive runs inside this span — only disconnect/teardown,
+      // tunnel stops, vault deletions, and the final core.removeServer.
+      //
+      // FINDING (P1, remove-lock-picker-fallback review) — `server` was
+      // resolved BEFORE the confirmation modal and before waiting to
+      // acquire this very lock; either wait can be arbitrarily long, and a
+      // concurrent flow (inventory sync, another remove) can delete this
+      // same record in the meantime. The lock body used to call
+      // disconnectServer(ctx, server.id) first thing, whose fallback
+      // resolves the id through toServerFromArg -> core.getServer — if the
+      // record is already gone that resolves to undefined and
+      // disconnectServer falls through to an INTERACTIVE pickServer
+      // quickpick, opened while HOLDING configMutationLock (blocking every
+      // other mutation in the app) and risking disconnecting an unrelated
+      // server the user happens to pick. Re-check presence as the very
+      // first thing inside the lock and bail out with an info message if
+      // the record is already gone — nothing left to remove. Teardown
+      // itself now goes through teardownServerRuntime(ctx, server.id), the
+      // id-only, never-prompting variant (see its own doc comment) that
+      // already disposes this server's terminals, stops ALL of its active
+      // tunnels unconditionally, and disconnects the pooled SSH connection
+      // — the exact same three effects the old disconnectServer() call
+      // plus this span's own duplicate tunnel-stop/sshPool.disconnect lines
+      // produced between them, now performed exactly once.
+      await configMutationLock.runExclusive(async () => {
+        const currentRecord = ctx.core.getServer(server.id);
+        if (!currentRecord) {
+          void vscode.window.showInformationMessage(`Server "${confirmedSnapshot.name}" was already removed.`);
+          return;
+        }
+        // FINDING (revalidation was presence-only) — a presence check alone
+        // cannot tell "still the record the user confirmed" apart from "a
+        // DIFFERENT record that a replace-mode import (or another writer
+        // ahead of us in the lock queue) recreated under the same id" while
+        // this confirm modal was open or this flow was waiting for the
+        // lock. Compare structurally against the captured, DETACHED
+        // `confirmedSnapshot` and abort — distinct from the already-removed
+        // message — rather than tearing down/deleting credentials for/
+        // removing a record the user never actually confirmed removing.
+        // Comparing against `server` itself would be comparing the live map
+        // object against itself — an in-place mutation (e.g.
+        // nexus.group.rename touching server.group) updates both sides at
+        // once and the check would pass despite the change.
+        if (!serverConfigsEqual(currentRecord, confirmedSnapshot)) {
+          void vscode.window.showWarningMessage(
+            `Server "${confirmedSnapshot.name}" changed since the removal was confirmed — try again.`
+          );
+          return;
+        }
+        await teardownServerRuntime(ctx, server.id);
+        if (ctx.secretVault) {
+          await ctx.secretVault.delete(passwordSecretKey(server.id));
+          await ctx.secretVault.delete(passphraseSecretKey(server.id));
+          await ctx.secretVault.delete(proxyPasswordSecretKey(server.id));
+        }
+        await ctx.core.removeServer(server.id);
+      });
     }),
 
     vscode.commands.registerCommand("nexus.server.connect", (arg?: unknown) => connectServer(ctx, arg)),
@@ -1032,7 +1470,10 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!server) {
         return;
       }
-      const copy = { ...server, id: randomUUID(), name: `${server.name} (copy)`, openFileExplorerOnFirstConnect: undefined };
+      // F6 — a duplicate of a synced server is a manual server: keeping `origin`
+      // would make the copy compete with the original for the SAME deterministic
+      // id on the next sync (both share externalId, but only one id can win it).
+      const copy = { ...server, id: randomUUID(), name: `${server.name} (copy)`, openFileExplorerOnFirstConnect: undefined, origin: undefined };
       await ctx.core.addOrUpdateServer(copy);
     }),
 

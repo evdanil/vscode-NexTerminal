@@ -1,5 +1,6 @@
 import type { ConfigRepository } from "../core/contracts";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
+import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
 
 export class InMemoryConfigRepository implements ConfigRepository {
   public constructor(
@@ -8,7 +9,8 @@ export class InMemoryConfigRepository implements ConfigRepository {
     private serialProfiles: SerialProfile[] = [],
     private groups: string[] = [],
     private authProfiles: AuthProfile[] = [],
-    private localShellProfiles: LocalShellProfile[] = []
+    private localShellProfiles: LocalShellProfile[] = [],
+    private inventorySources: InventorySourceConfig[] = []
   ) {}
 
   public async getServers(): Promise<ServerConfig[]> {
@@ -57,5 +59,15 @@ export class InMemoryConfigRepository implements ConfigRepository {
 
   public async saveAuthProfiles(profiles: AuthProfile[]): Promise<void> {
     this.authProfiles = [...profiles];
+  }
+
+  public async getInventorySources(): Promise<InventorySourceConfig[]> {
+    // FINDING 1 (removal-identity review) — mirrors VscodeConfigRepository's
+    // load-time backfill for legacy (pre-revision) records; see its comment.
+    return this.inventorySources.map(ensureInventorySourceRevision);
+  }
+
+  public async saveInventorySources(sources: InventorySourceConfig[]): Promise<void> {
+    this.inventorySources = [...sources];
   }
 }

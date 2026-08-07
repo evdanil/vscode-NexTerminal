@@ -57,9 +57,15 @@ export class ServerTreeItem extends vscode.TreeItem {
     this.id = `server:${server.id}`;
     const displayUsername = authProfileUsername ?? server.username;
     const authSuffix = authProfileName ? ` [auth: ${authProfileName}]` : "";
-    this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}`;
+    // B5 — badge only; contextValue below is UNCHANGED for a synced server. It is
+    // matched verbatim (and via /^nexus\.server(Connected)?$/) by every context-menu
+    // entry in package.json, so introducing a distinct value here would silently
+    // drop every one of those menu entries for synced servers.
+    const syncedSuffix = server.origin ? "\nSynced from inventory" : "";
+    this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${syncedSuffix}`;
     const authDesc = authProfileName ? ` (${authProfileName})` : "";
-    this.description = showDescription ? `${displayUsername}@${server.host}${authDesc}` : undefined;
+    const syncedDesc = server.origin ? " · synced" : "";
+    this.description = showDescription ? `${displayUsername}@${server.host}${authDesc}${syncedDesc}` : undefined;
     this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
     this.iconPath = new vscode.ThemeIcon(
       connected ? "plug" : "debug-disconnect",
@@ -206,7 +212,8 @@ export class NexusTreeProvider
     explicitGroups: [],
     authProfiles: [],
     activitySessionIds: new Set(),
-    focusedSessionId: undefined
+    focusedSessionId: undefined,
+    inventorySources: []
   };
 
   public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME];

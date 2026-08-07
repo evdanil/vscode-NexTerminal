@@ -4,6 +4,8 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
+import type { InventorySourceConfig } from "../models/inventory";
+import { inventorySecretKey } from "../models/inventory";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
@@ -29,7 +31,14 @@ import {
   type SecureCrtFileEntry
 } from "../utils/securecrtParser";
 import { sniffImportFormat, type SniffedFormat } from "../utils/importFormatSniffer";
-import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateLocalShellProfile } from "../utils/validation";
+import {
+  validateServerConfig,
+  validateTunnelProfile,
+  validateSerialProfile,
+  validateLocalShellProfile,
+  validateInventorySource,
+  isValidServerOrigin
+} from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import {
   VALID_MACRO_TRIGGER_SCOPES,
@@ -56,6 +65,7 @@ import { validateRegexSafety } from "../utils/regexSafety";
 import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
 import { MAX_SCRIPT_WAIT_TIMEOUT_MS, MAX_SCRIPT_WAIT_TIMEOUT_SECONDS } from "../services/scripts/defaultTimeout";
 import { getConfiguredSettingValue } from "../utils/configurationInspection";
+import { configMutationLock } from "../services/configMutationLock";
 
 interface MacroEntry {
   name?: string;
@@ -78,6 +88,8 @@ interface NexusConfigExport {
   serialProfiles?: SerialProfile[];
   localShellProfiles?: LocalShellProfile[];
   authProfiles?: AuthProfile[];
+  /** Backup-only (§B6) — never present on a share export; secrets live under `encryptedSecrets.inventorySourceSecrets`. */
+  inventorySources?: InventorySourceConfig[];
   groups?: string[];
   macros?: TerminalMacro[]; // Non-secret fields; secret macros carry `text: ""`
   /** Explicit macro folders (`nexus.macros.folders`, §4.1) — carried exactly as `groups` is. */
@@ -471,6 +483,9 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
   if (obj.macroFolders !== undefined && !Array.isArray(obj.macroFolders)) {
     return false;
   }
+  if (obj.inventorySources !== undefined && !Array.isArray(obj.inventorySources)) {
+    return false;
+  }
   if (
     obj.settings !== undefined &&
     (typeof obj.settings !== "object" || obj.settings === null || Array.isArray(obj.settings))
@@ -490,6 +505,11 @@ function ensureId(item: Record<string, unknown>): void {
 interface ImportTally {
   imported: number;
   skipped: number;
+  /** ids that were actually added this run (i.e. not skipped as already-existing/invalid).
+   *  Callers that need to know which ids were freshly imported — e.g. to scope a secret
+   *  restore so a merge-mode skip of a retained local record isn't undone by an
+   *  unconditional secret write — read this instead of re-deriving it from `existingIds`. */
+  importedIds: string[];
 }
 
 /**
@@ -502,7 +522,7 @@ async function importPreservingIds<T extends { id: string }>(
   validate: (entity: T) => boolean,
   add: (entity: T) => Promise<void>
 ): Promise<ImportTally> {
-  const tally: ImportTally = { imported: 0, skipped: 0 };
+  const tally: ImportTally = { imported: 0, skipped: 0, importedIds: [] };
   for (const item of items ?? []) {
     ensureId(item as unknown as Record<string, unknown>);
     if (existingIds.has(item.id) || !validate(item)) {
@@ -510,9 +530,29 @@ async function importPreservingIds<T extends { id: string }>(
     } else {
       await add(item);
       tally.imported++;
+      tally.importedIds.push(item.id);
     }
   }
   return tally;
+}
+
+/**
+ * N2 — sanitize a malformed `origin` at the import boundary, shared by both
+ * server-import paths (share-import and backup merge/replace). Neither path
+ * flows through VscodeConfigRepository.getServers() (that strip only applies
+ * on the next read), so a file-supplied server with a malformed origin (e.g.
+ * a numeric externalId from a hand-edited or version-skewed backup) would
+ * otherwise reach core.addOrUpdateServer as-is and can mis-key the sync
+ * engine's owned-index until the next reload.
+ */
+async function addServerSanitizingOrigin(server: ServerConfig, add: (entity: ServerConfig) => Promise<void>): Promise<void> {
+  if (server.origin !== undefined && !isValidServerOrigin(server.origin)) {
+    console.warn("[Nexus] Imported server has a malformed origin; stripping it:", JSON.stringify(server.origin));
+    const { origin: _origin, ...rest } = server;
+    await add(rest as ServerConfig);
+    return;
+  }
+  await add(server);
 }
 
 /** Mechanical validate-then-add tail shared by the share-import remap loops; remap stays inline. */
@@ -601,7 +641,10 @@ export function sanitizeForSharing(
   const newServers = servers.map((s) => {
     const newId = idMap.get(s.id)!;
     const newAuthProfileId = s.authProfileId ? idMap.get(s.authProfileId) : undefined;
-    return { ...s, id: newId, username: "user", keyPath: "", proxy: remapProxy(s.proxy, idMap), authProfileId: newAuthProfileId };
+    // §B6 — a share export travels to another person/machine; a synced-server marker
+    // (sourceId/externalId) names an inventory source that only exists locally and
+    // would be meaningless (and misleading) on the receiving end.
+    return { ...s, id: newId, username: "user", keyPath: "", proxy: remapProxy(s.proxy, idMap), authProfileId: newAuthProfileId, origin: undefined };
   });
 
   const newTunnels = tunnels.map((t) => {
@@ -982,6 +1025,147 @@ function pluralizeNoun(noun: string, count: number): string {
   return count === 1 ? noun : `${noun}s`;
 }
 
+/**
+ * Most frequently used username among existing servers, or "" if there are none.
+ * F20 — exported (not duplicated) so inventoryCommands.ts's addSource default-username
+ * prefill shares this exact logic with the CSV/host-list importer's own prefill.
+ */
+export function mostCommonUsername(servers: ServerConfig[]): string {
+  const counts = new Map<string, number>();
+  for (const server of servers) {
+    if (!server.username) continue;
+    counts.set(server.username, (counts.get(server.username) ?? 0) + 1);
+  }
+  let best = "";
+  let bestCount = 0;
+  for (const [username, count] of counts) {
+    if (count > bestCount) {
+      best = username;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+/**
+ * FINDING 1 (backup-export review, round 16) — captures EVERY vault-backed
+ * bucket exportBackup reads (servers + their password/passphrase/proxy-
+ * password secrets, auth profiles + their password/passphrase secrets,
+ * inventory sources + their secrets) as one consistent generation, under a
+ * SINGLE configMutationLock.runExclusive span. Originally only the
+ * inventory-source bucket was locked here (round 15) while the server and
+ * auth-profile record + secret reads ran directly in exportBackup with NO
+ * lock held at all — an inventory sync with prune "delete" (whose mutation
+ * phase, including its post-apply server-credential vault.delete calls,
+ * holds this same configMutationLock) could commit in the gap between
+ * exportBackup's unlocked `snapshot.servers` read and its unlocked
+ * `vault.get(passwordSecretKey(...))` calls, pairing a pre-sync server
+ * record (one the sync was about to delete) with a post-sync vault read
+ * that already came back empty — a torn backup entry: a server with no
+ * password. Taking ONE fresh snapshot AND reading every secret for every
+ * bucket inside the SAME lock span closes that for all three buckets at
+ * once: nothing else that mutates servers, auth profiles, or inventory
+ * sources/secrets (addSource/editSource/removeSource/syncNow, replace-mode
+ * import, complete reset) can run while this capture is in flight, so the
+ * records and the secrets read here always describe the same generation.
+ * Exported (not nested in registerConfigCommands) so it can be
+ * unit-tested directly for lock acquisition + consistency without having
+ * to drive the full exportBackup command (file dialog, encryption prompt)
+ * through the test harness.
+ *
+ * Deliberately still narrow in one direction: tunnels, serial profiles,
+ * local shell profiles, and explicit groups are NOT captured here — none of
+ * them are vault-backed (exportBackup reads those straight off
+ * `core.getSnapshot()`), so there is nothing for this lock to protect there.
+ * Macro secrets (`getMacros()`) are also outside — they live in the macro
+ * store, not this SecretVault. The save dialog and the master-password
+ * prompt stay outside too — none of that is UI-free, and the lock's own
+ * contract forbids holding it across interactive UI.
+ */
+export async function captureBackupStateForExport(
+  core: NexusCore,
+  vault: SecretVault
+): Promise<{
+  servers: ServerConfig[];
+  serverSecrets: {
+    passwords: Record<string, string>;
+    passphrases: Record<string, string>;
+    proxyPasswords: Record<string, string>;
+  };
+  authProfiles: AuthProfile[];
+  authProfileSecrets: {
+    passwords: Record<string, string>;
+    passphrases: Record<string, string>;
+  };
+  inventorySources: InventorySourceConfig[];
+  inventorySourceSecrets: Record<string, Record<string, string>>;
+  // FINDING 1 (P2, secrets review) — count of sources for which at least one declared
+  // secretFieldId came back empty from vault.get (a locked/unavailable keychain, most
+  // commonly). Previously these secrets were just omitted from the bucket with no signal
+  // anywhere: the record still exported cleanly, so a replace-restore of that backup would
+  // re-import the source, its per-source secret-restore loop would iterate zero fields
+  // (nothing to fail on), and the whole import would report success for a source that in
+  // fact has no credentials to sync with. Surfaced by exportBackup as a warning appended to
+  // its completion message — a stuck keychain shouldn't block backing up everything else, so
+  // this is a count to warn with, not a reason to abort the export.
+  sourcesWithMissingSecrets: number;
+}> {
+  return configMutationLock.runExclusive(async () => {
+    // Fresh read taken INSIDE the lock — an earlier top-of-export snapshot
+    // (taken before the lock, if any) must never be reused for these three
+    // buckets.
+    const snapshot = core.getSnapshot();
+    const servers = snapshot.servers;
+    const authProfiles = snapshot.authProfiles;
+    const inventorySources = snapshot.inventorySources;
+
+    const passwords: Record<string, string> = {};
+    const passphrases: Record<string, string> = {};
+    const proxyPasswords: Record<string, string> = {};
+    for (const server of servers) {
+      const pw = await vault.get(passwordSecretKey(server.id));
+      if (pw) passwords[server.id] = pw;
+      const pp = await vault.get(passphraseSecretKey(server.id));
+      if (pp) passphrases[server.id] = pp;
+      const proxyPw = await vault.get(proxyPasswordSecretKey(server.id));
+      if (proxyPw) proxyPasswords[server.id] = proxyPw;
+    }
+
+    const authProfilePasswords: Record<string, string> = {};
+    const authProfilePassphrases: Record<string, string> = {};
+    for (const profile of authProfiles) {
+      const pw = await vault.get(authProfilePasswordSecretKey(profile.id));
+      if (pw) authProfilePasswords[profile.id] = pw;
+      const pp = await vault.get(authProfilePassphraseSecretKey(profile.id));
+      if (pp) authProfilePassphrases[profile.id] = pp;
+    }
+
+    const inventorySourceSecrets: Record<string, Record<string, string>> = {};
+    let sourcesWithMissingSecrets = 0;
+    for (const source of inventorySources) {
+      const fields: Record<string, string> = {};
+      let missingAny = false;
+      for (const fieldId of source.secretFieldIds) {
+        const value = await vault.get(inventorySecretKey(source.id, fieldId));
+        if (value) fields[fieldId] = value;
+        else missingAny = true;
+      }
+      if (Object.keys(fields).length > 0) inventorySourceSecrets[source.id] = fields;
+      if (missingAny) sourcesWithMissingSecrets++;
+    }
+
+    return {
+      servers,
+      serverSecrets: { passwords, passphrases, proxyPasswords },
+      authProfiles,
+      authProfileSecrets: { passwords: authProfilePasswords, passphrases: authProfilePassphrases },
+      inventorySources,
+      inventorySourceSecrets,
+      sourcesWithMissingSecrets
+    };
+  });
+}
+
 export function registerConfigCommands(core: NexusCore, vault: SecretVault, context?: import("vscode").ExtensionContext): vscode.Disposable[] {
   async function exportBackup(): Promise<void> {
     const masterPassword = await promptMasterPassword();
@@ -990,38 +1174,31 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "Creating encrypted backup\u2026" },
       async () => {
+        // FINDING 1 (round 16) — servers, auth profiles, and inventory
+        // sources, PLUS every one of their vault secrets, are captured
+        // together in ONE configMutationLock span (see
+        // captureBackupStateForExport's doc comment for the race this
+        // closes). Everything below consumes `captured.*` for those three
+        // buckets — never `snapshot.servers` / `snapshot.authProfiles` /
+        // `snapshot.inventorySources`, which would be a second,
+        // independently stale read. `snapshot` below is used only for the
+        // buckets the lock does not cover (tunnels, serial profiles, local
+        // shell profiles, explicit groups) — none of which are vault-backed.
+        const captured = await captureBackupStateForExport(core, vault);
         const snapshot = core.getSnapshot();
         const settings = readSettings();
 
         // Collect secrets
         const secrets: Record<string, unknown> = {
-          passwords: {},
-          passphrases: {},
-          proxyPasswords: {},
-          authProfilePasswords: {},
-          authProfilePassphrases: {},
+          passwords: captured.serverSecrets.passwords,
+          passphrases: captured.serverSecrets.passphrases,
+          proxyPasswords: captured.serverSecrets.proxyPasswords,
+          authProfilePasswords: captured.authProfileSecrets.passwords,
+          authProfilePassphrases: captured.authProfileSecrets.passphrases,
+          inventorySourceSecrets: captured.inventorySourceSecrets,
           secretMacros: [],
           fileBackups: []
         };
-        const passwords = secrets.passwords as Record<string, string>;
-        const passphrases = secrets.passphrases as Record<string, string>;
-        const proxyPasswords = secrets.proxyPasswords as Record<string, string>;
-        const authProfilePasswords = secrets.authProfilePasswords as Record<string, string>;
-        const authProfilePassphrases = secrets.authProfilePassphrases as Record<string, string>;
-        for (const server of snapshot.servers) {
-          const pw = await vault.get(passwordSecretKey(server.id));
-          if (pw) passwords[server.id] = pw;
-          const pp = await vault.get(passphraseSecretKey(server.id));
-          if (pp) passphrases[server.id] = pp;
-          const proxyPw = await vault.get(proxyPasswordSecretKey(server.id));
-          if (proxyPw) proxyPasswords[server.id] = proxyPw;
-        }
-        for (const profile of snapshot.authProfiles) {
-          const pw = await vault.get(authProfilePasswordSecretKey(profile.id));
-          if (pw) authProfilePasswords[profile.id] = pw;
-          const pp = await vault.get(authProfilePassphraseSecretKey(profile.id));
-          if (pp) authProfilePassphrases[profile.id] = pp;
-        }
 
         // Collect all macros from the store
         const allMacros = getMacros(); // resolved — secret text included
@@ -1045,11 +1222,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           version: 2,
           exportType: "backup",
           exportedAt: new Date().toISOString(),
-          servers: snapshot.servers,
+          servers: captured.servers,
           tunnels: snapshot.tunnels,
           serialProfiles: snapshot.serialProfiles,
           localShellProfiles: snapshot.localShellProfiles,
-          authProfiles: snapshot.authProfiles,
+          authProfiles: captured.authProfiles,
+          inventorySources: captured.inventorySources,
           groups: snapshot.explicitGroups,
           macros: nonSecretForTopLevel,
           macroFolders: getMacroFolders(),
@@ -1067,12 +1245,19 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         const json = JSON.stringify(exportData, null, 2);
         await vscode.workspace.fs.writeFile(uri, Buffer.from(json, "utf8"));
 
-        const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + snapshot.localShellProfiles.length + snapshot.authProfiles.length;
+        const count = captured.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + snapshot.localShellProfiles.length + captured.authProfiles.length;
         const fileCount = fileBackups.reduce((sum, folder) => sum + folder.files.length, 0);
         const fileNote = fileCount > 0
           ? ` and ${plural(fileCount, "encrypted .ssh/script file")}`
           : "";
-        void vscode.window.showInformationMessage(`Backup saved with ${plural(count, "profile")}${fileNote} to ${uri.fsPath}`);
+        // FINDING 1 (P2, secrets review) — warn, don't abort: a locked/unavailable keychain
+        // shouldn't block backing up everything else. Appended to the SAME completion message
+        // (not a separate dialog) so it can't be missed/dismissed independently of the success
+        // notification.
+        const missingSecretsNote = captured.sourcesWithMissingSecrets > 0
+          ? ` ${captured.sourcesWithMissingSecrets} inventory source${captured.sourcesWithMissingSecrets === 1 ? "" : "s"} had unreadable credentials — the backup does not include them.`
+          : "";
+        void vscode.window.showInformationMessage(`Backup saved with ${plural(count, "profile")}${fileNote} to ${uri.fsPath}${missingSecretsNote}`);
       }
     );
   }
@@ -1309,7 +1494,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         proxy: remappedProxy,
         authProfileId: server.authProfileId ? idMap.get(server.authProfileId) : undefined
       };
-      tally(await addIfValid(remappedServer, validateServerConfig, (e) => core.addOrUpdateServer(e)));
+      tally(await addIfValid(remappedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
     }
     for (const tunnel of tunnels) {
       ensureId(tunnel as unknown as Record<string, unknown>);
@@ -1395,7 +1580,28 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     void vscode.window.showInformationMessage(`Imported ${imported} profiles${skipNote}.`);
   }
 
+  /**
+   * CONFIG MUTATION LOCK — everything below (id-preserving import, replace-mode
+   * wipe, macro/settings/secret restore) is the post-confirmation mutation
+   * phase: the mode picker and the master-password prompt have already
+   * resolved by the time a caller reaches this function (see
+   * applyNexusExportText / the "backup or legacy" branch above), so there is
+   * no interactive UI left to hold the lock across. Serializing this against
+   * inventoryCommands' critical sections closes the round-14 race class: a
+   * replace-mode import here can otherwise delete/recreate an inventory
+   * source's vault key, tear down a recreated server's runtime, or delete a
+   * recreated server's credentials WHILE removeSource/syncNow's own awaited
+   * post-apply phase is still touching the same source/server.
+   */
   async function importMergeReplace(
+    data: NexusConfigExport,
+    mode: "merge" | "replace",
+    decryptedSecrets?: Record<string, unknown>
+  ): Promise<void> {
+    await configMutationLock.runExclusive(() => importMergeReplaceLocked(data, mode, decryptedSecrets));
+  }
+
+  async function importMergeReplaceLocked(
     data: NexusConfigExport,
     mode: "merge" | "replace",
     decryptedSecrets?: Record<string, unknown>
@@ -1425,29 +1631,44 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       for (const group of snapshot.explicitGroups) {
         await core.removeExplicitGroup(group);
       }
+      // F18-adjacent ordering: wipe each source's vault secrets before dropping the
+      // source record itself, same as every other replace-mode secret cleanup above.
+      for (const source of snapshot.inventorySources) {
+        for (const fieldId of source.secretFieldIds) {
+          await vault.delete(inventorySecretKey(source.id, fieldId));
+        }
+        await core.removeInventorySource(source.id);
+      }
     }
 
+    // F14 — merge mode: existing inventory source ids join the existing-id set so
+    // importPreservingIds skips them (a local source is never silently overwritten
+    // by a same-id source from the file); replace mode already cleared them above.
     const existingIds = mode === "merge"
       ? new Set([
           ...snapshot.servers.map((s) => s.id),
           ...snapshot.tunnels.map((t) => t.id),
           ...snapshot.serialProfiles.map((p) => p.id),
           ...snapshot.localShellProfiles.map((p) => p.id),
-          ...snapshot.authProfiles.map((p) => p.id)
+          ...snapshot.authProfiles.map((p) => p.id),
+          ...snapshot.inventorySources.map((s) => s.id)
         ])
       : new Set<string>();
 
     let imported = 0;
     let skipped = 0;
     // id-PRESERVING import (distinct from the share path's fresh-id remap): each entity keeps
-    // its id and is skipped when that id already exists. Same shape across all five buckets.
-    for (const tally of [
-      await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => core.addOrUpdateServer(e)),
-      await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e)),
-      await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e)),
-      await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e)),
-      await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e))
-    ]) {
+    // its id and is skipped when that id already exists. Same shape across all six buckets.
+    const serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s)));
+    const tunnelTally = await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e));
+    const serialTally = await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e));
+    // Kept in its own variable (not folded into the array below) because the inventory-secret
+    // restore loop further down needs to know exactly which source ids this run imported — see
+    // the comment there.
+    const inventorySourceTally = await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) => core.addOrUpdateInventorySource(e));
+    const localShellTally = await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e));
+    const authProfileTally = await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
+    for (const tally of [serverTally, tunnelTally, serialTally, inventorySourceTally, localShellTally, authProfileTally]) {
       imported += tally.imported;
       skipped += tally.skipped;
     }
@@ -1587,13 +1808,227 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
     // Restore passwords/passphrases from decrypted secrets
     let fileRestoreResult: RestoreBackupFoldersResult = { restoredFiles: 0, skippedExistingFiles: 0 };
+    // Sources whose record + secrets were both successfully rolled back this run.
+    const failedInventorySourceNames: string[] = [];
+    // FINDING 1 — sources whose secret store ALSO failed to roll back (removeInventorySource
+    // itself rejected). Kept separate from failedInventorySourceNames: these sources are still
+    // live in core (removeInventorySource's own catch restores the in-memory record when its
+    // persist fails — see NexusCore.removeInventorySource), so lumping them into the "could not
+    // be restored — re-import or add it manually" message would tell the user the source is
+    // gone when it is actually still present with missing/partial credentials.
+    const unremovableInventorySourceNames: string[] = [];
+    // FINDING 2 — total count of servers imported THIS RUN that named a rolled-back source as
+    // their origin and were converted to plain manual servers (origin stripped). Only servers
+    // this run itself created are touched; a pre-existing server that happens to share the
+    // rolled-back source id is never modified.
+    let convertedServerCount = 0;
+    // FINDING 2 (P2, origin-strip review) — count of the same servers whose conversion attempt
+    // (addOrUpdateServer) itself rejected. Previously this catch was silent: the warning below
+    // under-counted (a failed conversion just vanished from the tally) and, because in-memory
+    // core state can diverge from what actually made it to disk while the write is in flight,
+    // the server's origin can still point at the now-removed source after a reload — a stale
+    // "synced" badge with nothing left to manage it. That in-memory-ahead-of-disk gap is the
+    // repo-wide last-writer-wins pattern already accepted everywhere else in this file (e.g. the
+    // best-effort vault-delete/removeInventorySource rollbacks above) — no new compensation
+    // machinery belongs here. The fix is only to stop swallowing the count and say so.
+    let failedConversionCount = 0;
+    // Declared here (not inside the `inventorySourceSecrets` branch below) because the
+    // FINDING 1 (P2, secrets review) missing-credentials sweep after the restore phase needs
+    // them too, and that sweep must run whether or not this backup carried an
+    // `inventorySourceSecrets` bucket at all — a backup with none is exactly the case where
+    // every declared secretFieldId comes back empty.
+    const importedSourceIds = new Set(inventorySourceTally.importedIds);
+    const importedSourceById = new Map((data.inventorySources ?? []).map((s) => [s.id, s]));
+    // Sources handled by one of the two rollback warnings above (removed entirely, or left
+    // live-but-unremovable) — both already tell the user what to do about their credentials,
+    // so the missing-credentials sweep below skips them to avoid a redundant second warning.
+    const rolledBackSourceIds = new Set<string>();
     if (decryptedSecrets) {
       await restoreSecrets(decryptedSecrets.passwords as Record<string, string> | undefined, passwordSecretKey, vault);
       await restoreSecrets(decryptedSecrets.passphrases as Record<string, string> | undefined, passphraseSecretKey, vault);
       await restoreSecrets(decryptedSecrets.proxyPasswords as Record<string, string> | undefined, proxyPasswordSecretKey, vault);
       await restoreSecrets(decryptedSecrets.authProfilePasswords as Record<string, string> | undefined, authProfilePasswordSecretKey, vault);
       await restoreSecrets(decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined, authProfilePassphraseSecretKey, vault);
+      // Nested (sourceId -> fieldId -> secret) shape, unlike the flat id->secret buckets
+      // above, so it gets its own loop rather than restoreSecrets()'s single-level keyFn.
+      const inventorySourceSecrets = decryptedSecrets.inventorySourceSecrets as Record<string, Record<string, string>> | undefined;
+      if (inventorySourceSecrets) {
+        // FINDING 3 — importPreservingIds's `importedIds` only names sources that actually
+        // landed: merge mode skips an id that already exists locally (the local record wins),
+        // and BOTH modes skip a source that fails validateInventorySource (e.g. a corrupt
+        // prunePolicy). Restoring unconditionally in either case would write a vault key for a
+        // source that was never persisted — undiscoverable dead secrets, since export, removal,
+        // and reset all enumerate persisted sources, not the backup payload. So the restore is
+        // scoped to importedIds in both modes, not merge-only.
+        //
+        // FINDING 2 — the importedIds gate above is source-scoped only: it says nothing
+        // about which fields WITHIN that source's bucket are legitimate. A malformed/stale
+        // backup can carry a secrets bucket wider than the imported source record's own
+        // declared `secretFieldIds` (e.g. a field removed from the provider's config schema
+        // since the backup was taken, or hand-edited backup JSON). Restoring those extra
+        // fields writes a vault key nothing can ever enumerate again — export, removal, and
+        // reset all walk `secretFieldIds`, not the backup payload — so it becomes a
+        // permanent, undiscoverable secret. Intersect with the imported record's own
+        // `secretFieldIds` (looked up from `data.inventorySources`, which importPreservingIds
+        // mutated in place with the final id) so only fields the source actually declares
+        // are restored.
+        //
+        // ROUND 16 FINDING (import review) — importPreservingIds above already PERSISTED
+        // each imported source's record before this loop runs; a vault.store rejection here
+        // used to leave that record stranded live with no credential (worst in replace mode,
+        // where the prior local record is already gone — there is nothing to fall back to).
+        // Per source, track exactly which keys THIS RUN stored; on any store failure for that
+        // source, best-effort delete those keys back out, remove the just-imported record via
+        // core.removeInventorySource, and record its name for the closing warning below. Other
+        // sources' restores are unaffected — the try/catch is scoped per source, not around the
+        // whole loop, so one failure never aborts the rest.
+        //
+        // A vault-first reordering (store secrets, THEN persist the record) would close this
+        // more cleanly, but importPreservingIds is the generic shared path all six imported
+        // buckets go through — special-casing the ordering there for inventory sources alone
+        // would complicate every other bucket's call site. This per-source rollback is the
+        // minimal change scoped to the one bucket that reads secrets back out of the vault.
+        for (const [sourceId, fields] of Object.entries(inventorySourceSecrets)) {
+          if (!importedSourceIds.has(sourceId)) continue;
+          const importedSource = importedSourceById.get(sourceId);
+          const declaredFieldIds = new Set(importedSource?.secretFieldIds ?? []);
+          const storedKeysThisRun: string[] = [];
+          try {
+            for (const [fieldId, value] of Object.entries(fields)) {
+              if (!declaredFieldIds.has(fieldId)) continue;
+              const key = inventorySecretKey(sourceId, fieldId);
+              await vault.store(key, value);
+              storedKeysThisRun.push(key);
+            }
+          } catch {
+            for (const key of storedKeysThisRun) {
+              try {
+                await vault.delete(key);
+              } catch {
+                // Best-effort — nothing else to do if the rollback delete itself fails; the
+                // source record is removed below regardless, so this is at worst a leftover
+                // vault key for a source that no longer exists (same residue class already
+                // accepted elsewhere in this file, e.g. removeSource's own best-effort cleanup).
+              }
+            }
+            try {
+              await core.removeInventorySource(sourceId);
+            } catch {
+              // FINDING 1 — the removal itself failed. removeInventorySource's own catch
+              // already restored the record in memory (its persist rejected), so the source is
+              // NOT gone — it is still live in core, just missing some or all of the
+              // credentials we just deleted/never stored. Report this distinctly below and do
+              // NOT fall into the "successfully rolled back" bookkeeping: don't decrement
+              // `imported` (the source is still counted as imported) and don't touch its
+              // servers' origin — a source that still exists can still manage them.
+              unremovableInventorySourceNames.push(importedSource?.name ?? sourceId);
+              rolledBackSourceIds.add(sourceId);
+              continue;
+            }
+            imported--;
+            failedInventorySourceNames.push(importedSource?.name ?? sourceId);
+            rolledBackSourceIds.add(sourceId);
+
+            // FINDING 2 — the backup can also carry servers whose origin.sourceId names this
+            // now-removed source. Left alone they'd stay synced-badged forever: a manually
+            // re-added source gets a fresh id, so nothing could ever claim them again. Scope
+            // the sweep to servers THIS RUN imported (serverTally.importedIds) — a pre-existing
+            // server is never touched, even if it happens to share the rolled-back source id.
+            for (const serverId of serverTally.importedIds) {
+              const server = core.getServer(serverId);
+              if (!server || server.origin?.sourceId !== sourceId) continue;
+              const { origin: _origin, ...withoutOrigin } = server;
+              try {
+                await core.addOrUpdateServer(withoutOrigin as ServerConfig);
+                convertedServerCount++;
+              } catch {
+                // Best-effort, same residue class as the vault-delete rollback above: at worst
+                // this server keeps an origin pointing at a source that no longer exists. Counted
+                // (not silently dropped) so the closing warning can say so honestly.
+                failedConversionCount++;
+              }
+            }
+          }
+        }
+      }
       fileRestoreResult = await restoreBackupFolders(decryptedSecrets, mode, context);
+    }
+
+    // FINDING 1 (P2, secrets review) — after the secret-restore phase above, catch the case a
+    // rejected vault.store never triggers: a source that imported cleanly, and whose secret
+    // restore raised NO error, but which still ends up MISSING one or more of its declared
+    // secretFieldIds in the vault. Most commonly this is the restore-side mirror of
+    // captureBackupStateForExport's missing-secret counting on the export side — the backup
+    // simply never captured the credential (a locked/unavailable keychain at export time), so
+    // there was nothing for this restore to store no matter how cleanly the rest of the run
+    // went. The source can still be added/edited/synced against, but authentication will fail
+    // silently until the value is re-entered — so this is a warning, not a rollback: unlike the
+    // vault.store-rejection rollback above, the record itself is fine, only (part of) the
+    // secret is absent, which is exactly the state "Edit Source" exists to fix. Checked against
+    // the vault directly (not the backup payload) so it also catches a backup with no
+    // `inventorySourceSecrets` bucket at all. FINDING (P2, round-19 review): a provider can
+    // declare MULTIPLE secretFieldIds — checking only whether ANY of them made it into the
+    // vault let one present field mask another absent (possibly required) one, so a source
+    // that can't actually authenticate was reported as a clean import. Every declared field is
+    // now checked; the warning fires if ANY are missing, not only when ALL are.
+    const sourcesRestoredWithoutCredentials: string[] = [];
+    for (const sourceId of importedSourceIds) {
+      if (rolledBackSourceIds.has(sourceId)) continue;
+      const importedSource = importedSourceById.get(sourceId);
+      const declaredFieldIds = importedSource?.secretFieldIds ?? [];
+      if (declaredFieldIds.length === 0) continue;
+      let hasMissingValue = false;
+      for (const fieldId of declaredFieldIds) {
+        const value = await vault.get(inventorySecretKey(sourceId, fieldId));
+        if (!value) {
+          hasMissingValue = true;
+          break;
+        }
+      }
+      if (hasMissingValue) sourcesRestoredWithoutCredentials.push(importedSource?.name ?? sourceId);
+    }
+    if (sourcesRestoredWithoutCredentials.length > 0) {
+      const isSingle = sourcesRestoredWithoutCredentials.length === 1;
+      const names = sourcesRestoredWithoutCredentials.map((n) => `"${n}"`).join(", ");
+      void vscode.window.showWarningMessage(
+        `${isSingle ? "Source" : "Sources"} ${names} ${isSingle ? "was" : "were"} restored with missing credential(s) — re-enter them via Edit Source before syncing.`
+      );
+    }
+
+    // FINDING 2 (rollback review) — surface every source rolled back above (record + secret
+    // restore both undone) so the user knows to re-import or add it by hand, rather than
+    // silently discovering a missing source later. Appends how many of its servers were
+    // converted to plain manual servers, when any were, PLUS (FINDING 2, P2, origin-strip
+    // review) how many of the SAME servers failed that conversion, when any did — both counts
+    // come from the same sweep above and are reported together rather than the failure count
+    // being silently dropped.
+    if (failedInventorySourceNames.length > 0) {
+      const isSingle = failedInventorySourceNames.length === 1;
+      const names = failedInventorySourceNames.map((n) => `"${n}"`).join(", ");
+      const noteParts: string[] = [];
+      if (convertedServerCount > 0) {
+        noteParts.push(`${convertedServerCount} of ${isSingle ? "its" : "their"} servers were kept as manual servers`);
+      }
+      if (failedConversionCount > 0) {
+        noteParts.push(`${failedConversionCount} servers could not be converted and may still show a synced badge — edit them to clear it`);
+      }
+      const noteTail = noteParts.length > 0 ? `; ${noteParts.join("; ")}.` : ".";
+      void vscode.window.showWarningMessage(
+        `${isSingle ? "Source" : "Sources"} ${names} could not be restored — ${isSingle ? "its" : "their"} credentials failed to store; re-import or add ${isSingle ? "it" : "them"} manually${noteTail}`
+      );
+    }
+
+    // FINDING 1 (rollback review) — a distinct message for sources where even the rollback's
+    // own removal failed: unlike the case above, the record is still live in core (partially or
+    // fully missing its credentials), so telling the user to "re-import or add it manually"
+    // would be false — re-importing would skip it as already-existing, and adding it manually
+    // would collide. Point at Edit Source instead, where the existing record can be fixed up.
+    if (unremovableInventorySourceNames.length > 0) {
+      const isSingle = unremovableInventorySourceNames.length === 1;
+      const names = unremovableInventorySourceNames.map((n) => `"${n}"`).join(", ");
+      void vscode.window.showWarningMessage(
+        `${isSingle ? "Source" : "Sources"} ${names} ${isSingle ? "was" : "were"} imported but ${isSingle ? "its" : "their"} credentials failed to store and ${isSingle ? "it" : "they"} could not be removed — re-enter them via Edit Source before syncing.`
+      );
     }
 
     const skipNote = skipped > 0 ? ` (${skipped} skipped)` : "";
@@ -1607,7 +2042,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
   async function completeReset(): Promise<void> {
     const confirm = await vscode.window.showWarningMessage(
-      "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, macros, groups, and saved passwords. This cannot be undone.",
+      "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, inventory sources, macros, groups, and saved passwords. This cannot be undone.",
       { modal: true },
       "Delete Everything"
     );
@@ -1621,79 +2056,76 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     });
     if (typed !== "DELETE") return;
 
-    const snapshot = core.getSnapshot();
+    // CONFIG MUTATION LOCK — both confirmations have already resolved above;
+    // everything from here down is the mutation phase, with no further
+    // interactive UI, so it's safe to hold the lock across all of it. See
+    // importMergeReplace's doc comment for the race class this closes against
+    // inventoryCommands' critical sections.
+    await configMutationLock.runExclusive(async () => {
+      const snapshot = core.getSnapshot();
 
-    // Delete all passwords/passphrases first (before removing servers)
-    for (const server of snapshot.servers) {
-      await vault.delete(passwordSecretKey(server.id));
-      await vault.delete(passphraseSecretKey(server.id));
-      await vault.delete(proxyPasswordSecretKey(server.id));
-    }
+      // Delete all passwords/passphrases first (before removing servers)
+      for (const server of snapshot.servers) {
+        await vault.delete(passwordSecretKey(server.id));
+        await vault.delete(passphraseSecretKey(server.id));
+        await vault.delete(proxyPasswordSecretKey(server.id));
+      }
 
-    // Remove all servers
-    for (const server of snapshot.servers) {
-      await core.removeServer(server.id);
-    }
+      // Remove all servers
+      for (const server of snapshot.servers) {
+        await core.removeServer(server.id);
+      }
 
-    // Remove all tunnels
-    for (const tunnel of snapshot.tunnels) {
-      await core.removeTunnel(tunnel.id);
-    }
+      // Remove all tunnels
+      for (const tunnel of snapshot.tunnels) {
+        await core.removeTunnel(tunnel.id);
+      }
 
-    // Remove all serial profiles
-    for (const profile of snapshot.serialProfiles) {
-      await core.removeSerialProfile(profile.id);
-    }
+      // Remove all serial profiles
+      for (const profile of snapshot.serialProfiles) {
+        await core.removeSerialProfile(profile.id);
+      }
 
-    // Remove all local shell profiles
-    for (const profile of snapshot.localShellProfiles) {
-      await core.removeLocalShellProfile(profile.id);
-    }
+      // Remove all local shell profiles
+      for (const profile of snapshot.localShellProfiles) {
+        await core.removeLocalShellProfile(profile.id);
+      }
 
-    // Remove all auth profiles
-    for (const profile of snapshot.authProfiles) {
-      await vault.delete(authProfilePasswordSecretKey(profile.id));
-      await vault.delete(authProfilePassphraseSecretKey(profile.id));
-      await core.removeAuthProfile(profile.id);
-    }
+      // Remove all auth profiles
+      for (const profile of snapshot.authProfiles) {
+        await vault.delete(authProfilePasswordSecretKey(profile.id));
+        await vault.delete(authProfilePassphraseSecretKey(profile.id));
+        await core.removeAuthProfile(profile.id);
+      }
 
-    // Remove all groups
-    for (const group of snapshot.explicitGroups) {
-      await core.removeExplicitGroup(group);
-    }
+      // Remove all groups
+      for (const group of snapshot.explicitGroups) {
+        await core.removeExplicitGroup(group);
+      }
 
-    // Clear macros (globalState + vault entries)
-    await getActiveMacroStore().clearAll();
-    if (context) {
-      await context.globalState.update("nexus.macros.migrationNoticeShown", undefined);
-    }
+      // Remove all inventory sources and their vault secrets
+      for (const source of snapshot.inventorySources) {
+        for (const fieldId of source.secretFieldIds) {
+          await vault.delete(inventorySecretKey(source.id, fieldId));
+        }
+        await core.removeInventorySource(source.id);
+      }
 
-    // Reset all settings to defaults
-    for (const { section, key } of SETTINGS_KEYS) {
-      const config = vscode.workspace.getConfiguration(section);
-      recordNexusConfigWrite(`${section}.${key}`, undefined, Date.now());
-      await config.update(key, undefined, vscode.ConfigurationTarget.Global);
-    }
+      // Clear macros (globalState + vault entries)
+      await getActiveMacroStore().clearAll();
+      if (context) {
+        await context.globalState.update("nexus.macros.migrationNoticeShown", undefined);
+      }
+
+      // Reset all settings to defaults
+      for (const { section, key } of SETTINGS_KEYS) {
+        const config = vscode.workspace.getConfiguration(section);
+        recordNexusConfigWrite(`${section}.${key}`, undefined, Date.now());
+        await config.update(key, undefined, vscode.ConfigurationTarget.Global);
+      }
+    });
 
     void vscode.window.showInformationMessage("All Nexus data has been deleted.");
-  }
-
-  /** Most frequently used username among existing servers, or "" if there are none. */
-  function mostCommonUsername(servers: ServerConfig[]): string {
-    const counts = new Map<string, number>();
-    for (const server of servers) {
-      if (!server.username) continue;
-      counts.set(server.username, (counts.get(server.username) ?? 0) + 1);
-    }
-    let best = "";
-    let bestCount = 0;
-    for (const [username, count] of counts) {
-      if (count > bestCount) {
-        best = username;
-        bestCount = count;
-      }
-    }
-    return best;
   }
 
   // Shared tail for the MobaXterm / SecureCRT importers: no-sessions warning, confirm

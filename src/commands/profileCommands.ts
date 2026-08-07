@@ -5,6 +5,9 @@ import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, LocalShellProfileTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
+import { serverConfigsEqual } from "../models/config";
+import { configMutationLock } from "../services/configMutationLock";
+import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
 import { formValuesToLocalShell, getConfiguredVscodeTerminalProfileNames } from "./localShellCommands";
 import type { CommandContext } from "./types";
@@ -73,8 +76,121 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         if (!server) {
           return;
         }
-        await ctx.core.addOrUpdateServer(server);
-        await syncProxyPasswordSecret(ctx, server.id, values);
+        // FINDING 2 (P2, edit-race review, sibling) — same record+secret
+        // pairing as nexus.server.edit (serverCommands.ts), for the
+        // add/create path: addOrUpdateServer and syncProxyPasswordSecret
+        // must commit as one generation against captureBackupStateForExport,
+        // which reads server records + proxy-password secrets together
+        // under this SAME configMutationLock — see the edit-path comment in
+        // serverCommands.ts for the full torn-pair scenario. No UI runs
+        // inside this span.
+        await configMutationLock.runExclusive(async () => {
+          // FINDINGS 2+3 (P2, create-rollback review, sibling) — same
+          // single-owner displacement as the nexus.server.edit rollback
+          // (serverCommands.ts): if `server` enables
+          // openFileExplorerOnFirstConnect, addOrUpdateServer below clears
+          // it from whichever OTHER server currently holds it. Capture that
+          // displaced owner (if any) BEFORE the write lands, so a failed
+          // secret sync can hand its flag back on rollback instead of
+          // leaving it cleared for good.
+          const displacedOwner = server.openFileExplorerOnFirstConnect
+            ? ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect && s.id !== server.id)
+            : undefined;
+          await ctx.core.addOrUpdateServer(server);
+          try {
+            await syncProxyPasswordSecret(ctx, server.id, values);
+          } catch {
+            // FINDING 1 (P2, create-rollback review) — the server record above
+            // just committed, but its proxy secret never did. Left alone, the
+            // form still reports failure while the record persists, and a
+            // retry (fresh id per submission — formValuesToServer always
+            // mints one for this add path) creates a duplicate alongside this
+            // orphaned, secret-less leftover. Roll the record back — and
+            // clean up any secret write that DID land before the rejection —
+            // so a retry starts clean. Both are best-effort: a rollback
+            // failure must not mask the original secret-storage error, and
+            // there is nothing further below this span to make it not
+            // best-effort against.
+            //
+            // FINDING 2 (P2, create-rollback-report review) — removeServer's
+            // own persist can itself reject (e.g. the same storage backend
+            // that just rejected the secret write is unavailable). When that
+            // happens the in-memory delete already landed but disk still has
+            // the record — it reappears after a reload — while the generic
+            // "was not created" message would tell the user the opposite of
+            // what actually happened. Track that failure separately and swap
+            // in wording that tells the truth: the record may still be
+            // there and needs manual cleanup.
+            let removeFailed = false;
+            try {
+              await ctx.core.removeServer(server.id);
+            } catch {
+              removeFailed = true;
+            }
+            if (displacedOwner) {
+              // Same concurrent-change rule as the nexus.server.edit rollback:
+              // if the displaced owner's live record is still exactly what
+              // addOrUpdateServer(server) left it (the captured record with
+              // the flag cleared), hand the flag straight back.
+              //
+              // FINDING 2 (P2, displaced-owner-merge review, sibling) — if
+              // it's since diverged (e.g. a concurrent rename of the
+              // displaced owner), the old all-or-nothing check skipped the
+              // restore entirely and left the flag cleared for good.
+              // Restore ONLY the flag onto the displaced owner's CURRENT
+              // record, preserving every field the concurrent change
+              // touched, unless:
+              //  - the displaced owner was concurrently deleted
+              //    (currentDisplaced is undefined) — nothing to restore the
+              //    flag onto, or
+              //  - some other server already holds the flag now (checked
+              //    against the live snapshot, taken AFTER this submission's
+              //    own record was removed above) — restoring here would
+              //    violate the single-owner invariant addOrUpdateServer
+              //    otherwise enforces.
+              //
+              // FINDING 1 (P2, current-flag-owner review, sibling) — same
+              // hoist as the nexus.server.edit rollback (serverCommands.ts):
+              // the currentFlagOwner check used to guard ONLY the divergent
+              // (else) branch, not the exact-match branch above it. Hoist it
+              // so it guards BOTH branches — skip the restore entirely
+              // whenever another server currently holds the flag, even on
+              // the exact-match path.
+              try {
+                const currentDisplaced = ctx.core.getSnapshot().servers.find((s) => s.id === displacedOwner.id);
+                if (currentDisplaced !== undefined) {
+                  const currentFlagOwner = ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect);
+                  if (!currentFlagOwner) {
+                    if (serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined })) {
+                      await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
+                    } else {
+                      await ctx.core.addOrUpdateServer({ ...currentDisplaced, openFileExplorerOnFirstConnect: true });
+                    }
+                  }
+                }
+                // else: the displaced owner was concurrently deleted —
+                // nothing to restore the flag onto.
+              } catch {
+                void vscode.window.showErrorMessage(
+                  `Could not restore the previous auto-open setting on "${displacedOwner.name}" after a failed save — re-check its settings.`
+                );
+              }
+            }
+            if (ctx.secretVault) {
+              try {
+                await ctx.secretVault.delete(proxyPasswordSecretKey(server.id));
+              } catch {
+                // best-effort rollback — ignore
+              }
+            }
+            if (removeFailed) {
+              throw new Error(
+                `Could not store proxy credentials for "${server.name}" and the partially created server could not be removed — delete it manually if it appears.`
+              );
+            }
+            throw new Error(`Could not store proxy credentials for "${server.name}" — the server was not created.`);
+          }
+        });
       }
     },
     onBrowse: browseForKey,

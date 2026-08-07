@@ -5,7 +5,7 @@ import { registerCwdSyncCommands, FOLLOW_TERMINAL_STATE_KEY } from "./commands/c
 import { registerScriptCommands } from "./commands/scriptCommands";
 import { registerSerialCommands } from "./commands/serialCommands";
 import { registerLocalShellCommands } from "./commands/localShellCommands";
-import { registerServerCommands } from "./commands/serverCommands";
+import { registerServerCommands, teardownServerRuntime } from "./commands/serverCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
 import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import { TerminalRegistry } from "./services/terminal/terminalRegistry";
@@ -62,6 +62,10 @@ import { registerConfigCommands } from "./commands/configCommands";
 import { registerMacroCommands, updateMacroContext } from "./commands/macroCommands";
 import { registerProfileCommands } from "./commands/profileCommands";
 import { registerAuthProfileCommands } from "./commands/authProfileCommands";
+import { registerInventoryCommands, type InventoryRuntimeTeardown } from "./commands/inventoryCommands";
+import { InventoryProviderRegistry } from "./services/inventory/providerRegistry";
+import { createNetboxProvider } from "./services/inventory/providers/netboxProvider";
+import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
 import { buildMacroProfileInputsFromSnapshot } from "./ui/macroProfileOptions";
@@ -273,7 +277,7 @@ function readSftpServiceConfig(): SftpServiceConfig {
   };
 }
 
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
+export async function activate(context: vscode.ExtensionContext): Promise<NexusExtensionApi> {
   // Detect tabs left behind by a previous extension host (window reload, update,
   // disable-then-enable). The old host's PTY link to each tab is already dead;
   // `writeEmitter` events from deactivate lose the IPC flush race
@@ -299,6 +303,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     resolveLogRotationOptions
   );
   const secretVault = new VscodeSecretVault(context);
+
+  // B4 — built-in NetBox provider registered up front so it's available to
+  // registerInventoryCommands (below) and to any third party registering
+  // through the public API returned from this function.
+  const inventoryProviderRegistry = new InventoryProviderRegistry();
+  inventoryProviderRegistry.register(createNetboxProvider());
 
   const macroStore = new VscodeMacroStore(context);
   await macroStore.initialize();
@@ -1211,6 +1221,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);
+  // F1 — same objects nexus.server.remove tears down with (ctx carries core/tunnelManager/sshPool).
+  const inventoryTeardown: InventoryRuntimeTeardown = {
+    teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
+  };
+  const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
   const configDisposables = registerConfigCommands(core, secretVault, context);
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());
@@ -1295,6 +1310,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ...profileDisposables,
     ...settingsDisposables,
     ...authProfileDisposables,
+    ...inventoryDisposables,
     ...configDisposables,
     ...macroDisposables,
     disableTriggerCmd,
@@ -1354,6 +1370,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }
   );
+
+  return createNexusExtensionApi(inventoryProviderRegistry);
 }
 
 export async function deactivate(): Promise<void> {

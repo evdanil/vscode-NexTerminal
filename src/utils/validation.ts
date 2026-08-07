@@ -1,4 +1,6 @@
-import type { AuthProfile, ServerConfig, TunnelProfile, SerialProfile, ProxyConfig, LocalShellProfile } from "../models/config";
+import type { AuthProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile, ProxyConfig, LocalShellProfile } from "../models/config";
+import type { InventorySourceConfig } from "../models/inventory";
+import { normalizeFolderPath } from "./folderPaths";
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
@@ -45,6 +47,14 @@ export function validateProxyConfig(proxy: unknown): proxy is ProxyConfig {
   return false;
 }
 
+export function isValidServerOrigin(value: unknown): value is ServerOrigin {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  return isNonEmptyString(obj.sourceId) && isNonEmptyString(obj.externalId) && typeof obj.syncedAt === "number";
+}
+
 export function validateServerConfig(item: unknown): item is ServerConfig {
   if (typeof item !== "object" || item === null) {
     return false;
@@ -74,6 +84,54 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
     return false;
   }
   if (obj.authProfileId !== undefined && (typeof obj.authProfileId !== "string" || obj.authProfileId === "")) {
+    return false;
+  }
+  // F13/FIX 5 — a malformed `origin` does not invalidate the whole server
+  // row: the row is still accepted here. Stripping the malformed field is
+  // NOT this function's job — a type guard must not mutate the value it is
+  // asked to check (callers may reasonably assume `item` is unchanged after
+  // a `boolean`-returning predicate). The actual strip-and-warn happens one
+  // layer up, in VscodeConfigRepository.getServers(), which owns producing
+  // the final, storage-clean ServerConfig list.
+  return true;
+}
+
+export function validateInventorySource(item: unknown): item is InventorySourceConfig {
+  if (typeof item !== "object" || item === null) {
+    return false;
+  }
+  const obj = item as Record<string, unknown>;
+  if (
+    !(
+      isNonEmptyString(obj.id) &&
+      isNonEmptyString(obj.providerId) &&
+      isNonEmptyString(obj.name) &&
+      isNonEmptyString(obj.defaultUsername) &&
+      (obj.prunePolicy === "delete" || obj.prunePolicy === "orphan" || obj.prunePolicy === "keep")
+    )
+  ) {
+    return false;
+  }
+  if (typeof obj.targetFolder !== "string" || (obj.targetFolder !== "" && normalizeFolderPath(obj.targetFolder) === undefined)) {
+    return false;
+  }
+  if (typeof obj.config !== "object" || obj.config === null || Array.isArray(obj.config)) {
+    return false;
+  }
+  if (!Object.values(obj.config as Record<string, unknown>).every((v) => typeof v === "string" || typeof v === "number" || typeof v === "boolean")) {
+    return false;
+  }
+  if (!Array.isArray(obj.secretFieldIds) || !obj.secretFieldIds.every((v) => typeof v === "string")) {
+    return false;
+  }
+  if (obj.lastSyncAt !== undefined && typeof obj.lastSyncAt !== "number") {
+    return false;
+  }
+  // FINDING 1 (removal-identity review) — optional for backward compat: a
+  // record persisted before this field existed simply has no revision here;
+  // the repository getter backfills one at load time (ensureInventorySourceRevision).
+  // When present, it must be a non-empty string.
+  if (obj.revision !== undefined && !isNonEmptyString(obj.revision)) {
     return false;
   }
   return true;
