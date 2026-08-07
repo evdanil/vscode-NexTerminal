@@ -65,6 +65,7 @@ import { validateRegexSafety } from "../utils/regexSafety";
 import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
 import { MAX_SCRIPT_WAIT_TIMEOUT_MS, MAX_SCRIPT_WAIT_TIMEOUT_SECONDS } from "../services/scripts/defaultTimeout";
 import { getConfiguredSettingValue } from "../utils/configurationInspection";
+import { configMutationLock } from "../services/configMutationLock";
 
 interface MacroEntry {
   name?: string;
@@ -1470,7 +1471,28 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     void vscode.window.showInformationMessage(`Imported ${imported} profiles${skipNote}.`);
   }
 
+  /**
+   * CONFIG MUTATION LOCK — everything below (id-preserving import, replace-mode
+   * wipe, macro/settings/secret restore) is the post-confirmation mutation
+   * phase: the mode picker and the master-password prompt have already
+   * resolved by the time a caller reaches this function (see
+   * applyNexusExportText / the "backup or legacy" branch above), so there is
+   * no interactive UI left to hold the lock across. Serializing this against
+   * inventoryCommands' critical sections closes the round-14 race class: a
+   * replace-mode import here can otherwise delete/recreate an inventory
+   * source's vault key, tear down a recreated server's runtime, or delete a
+   * recreated server's credentials WHILE removeSource/syncNow's own awaited
+   * post-apply phase is still touching the same source/server.
+   */
   async function importMergeReplace(
+    data: NexusConfigExport,
+    mode: "merge" | "replace",
+    decryptedSecrets?: Record<string, unknown>
+  ): Promise<void> {
+    await configMutationLock.runExclusive(() => importMergeReplaceLocked(data, mode, decryptedSecrets));
+  }
+
+  async function importMergeReplaceLocked(
     data: NexusConfigExport,
     mode: "merge" | "replace",
     decryptedSecrets?: Record<string, unknown>
@@ -1745,67 +1767,74 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     });
     if (typed !== "DELETE") return;
 
-    const snapshot = core.getSnapshot();
+    // CONFIG MUTATION LOCK — both confirmations have already resolved above;
+    // everything from here down is the mutation phase, with no further
+    // interactive UI, so it's safe to hold the lock across all of it. See
+    // importMergeReplace's doc comment for the race class this closes against
+    // inventoryCommands' critical sections.
+    await configMutationLock.runExclusive(async () => {
+      const snapshot = core.getSnapshot();
 
-    // Delete all passwords/passphrases first (before removing servers)
-    for (const server of snapshot.servers) {
-      await vault.delete(passwordSecretKey(server.id));
-      await vault.delete(passphraseSecretKey(server.id));
-      await vault.delete(proxyPasswordSecretKey(server.id));
-    }
-
-    // Remove all servers
-    for (const server of snapshot.servers) {
-      await core.removeServer(server.id);
-    }
-
-    // Remove all tunnels
-    for (const tunnel of snapshot.tunnels) {
-      await core.removeTunnel(tunnel.id);
-    }
-
-    // Remove all serial profiles
-    for (const profile of snapshot.serialProfiles) {
-      await core.removeSerialProfile(profile.id);
-    }
-
-    // Remove all local shell profiles
-    for (const profile of snapshot.localShellProfiles) {
-      await core.removeLocalShellProfile(profile.id);
-    }
-
-    // Remove all auth profiles
-    for (const profile of snapshot.authProfiles) {
-      await vault.delete(authProfilePasswordSecretKey(profile.id));
-      await vault.delete(authProfilePassphraseSecretKey(profile.id));
-      await core.removeAuthProfile(profile.id);
-    }
-
-    // Remove all groups
-    for (const group of snapshot.explicitGroups) {
-      await core.removeExplicitGroup(group);
-    }
-
-    // Remove all inventory sources and their vault secrets
-    for (const source of snapshot.inventorySources) {
-      for (const fieldId of source.secretFieldIds) {
-        await vault.delete(inventorySecretKey(source.id, fieldId));
+      // Delete all passwords/passphrases first (before removing servers)
+      for (const server of snapshot.servers) {
+        await vault.delete(passwordSecretKey(server.id));
+        await vault.delete(passphraseSecretKey(server.id));
+        await vault.delete(proxyPasswordSecretKey(server.id));
       }
-      await core.removeInventorySource(source.id);
-    }
 
-    // Clear macros (globalState + vault entries)
-    await getActiveMacroStore().clearAll();
-    if (context) {
-      await context.globalState.update("nexus.macros.migrationNoticeShown", undefined);
-    }
+      // Remove all servers
+      for (const server of snapshot.servers) {
+        await core.removeServer(server.id);
+      }
 
-    // Reset all settings to defaults
-    for (const { section, key } of SETTINGS_KEYS) {
-      const config = vscode.workspace.getConfiguration(section);
-      recordNexusConfigWrite(`${section}.${key}`, undefined, Date.now());
-      await config.update(key, undefined, vscode.ConfigurationTarget.Global);
-    }
+      // Remove all tunnels
+      for (const tunnel of snapshot.tunnels) {
+        await core.removeTunnel(tunnel.id);
+      }
+
+      // Remove all serial profiles
+      for (const profile of snapshot.serialProfiles) {
+        await core.removeSerialProfile(profile.id);
+      }
+
+      // Remove all local shell profiles
+      for (const profile of snapshot.localShellProfiles) {
+        await core.removeLocalShellProfile(profile.id);
+      }
+
+      // Remove all auth profiles
+      for (const profile of snapshot.authProfiles) {
+        await vault.delete(authProfilePasswordSecretKey(profile.id));
+        await vault.delete(authProfilePassphraseSecretKey(profile.id));
+        await core.removeAuthProfile(profile.id);
+      }
+
+      // Remove all groups
+      for (const group of snapshot.explicitGroups) {
+        await core.removeExplicitGroup(group);
+      }
+
+      // Remove all inventory sources and their vault secrets
+      for (const source of snapshot.inventorySources) {
+        for (const fieldId of source.secretFieldIds) {
+          await vault.delete(inventorySecretKey(source.id, fieldId));
+        }
+        await core.removeInventorySource(source.id);
+      }
+
+      // Clear macros (globalState + vault entries)
+      await getActiveMacroStore().clearAll();
+      if (context) {
+        await context.globalState.update("nexus.macros.migrationNoticeShown", undefined);
+      }
+
+      // Reset all settings to defaults
+      for (const { section, key } of SETTINGS_KEYS) {
+        const config = vscode.workspace.getConfiguration(section);
+        recordNexusConfigWrite(`${section}.${key}`, undefined, Date.now());
+        await config.update(key, undefined, vscode.ConfigurationTarget.Global);
+      }
+    });
 
     void vscode.window.showInformationMessage("All Nexus data has been deleted.");
   }
