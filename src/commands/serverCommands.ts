@@ -1390,8 +1390,24 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // plus this span's own duplicate tunnel-stop/sshPool.disconnect lines
       // produced between them, now performed exactly once.
       await configMutationLock.runExclusive(async () => {
-        if (!ctx.core.getServer(server.id)) {
+        const currentRecord = ctx.core.getServer(server.id);
+        if (!currentRecord) {
           void vscode.window.showInformationMessage(`Server "${server.name}" was already removed.`);
+          return;
+        }
+        // FINDING (revalidation was presence-only) — a presence check alone
+        // cannot tell "still the record the user confirmed" apart from "a
+        // DIFFERENT record that a replace-mode import (or another writer
+        // ahead of us in the lock queue) recreated under the same id" while
+        // this confirm modal was open or this flow was waiting for the
+        // lock. Compare structurally against the captured, user-confirmed
+        // `server` and abort — distinct from the already-removed message —
+        // rather than tearing down/deleting credentials for/removing a
+        // record the user never actually confirmed removing.
+        if (!serverConfigsEqual(currentRecord, server)) {
+          void vscode.window.showWarningMessage(
+            `Server "${server.name}" changed since the removal was confirmed — try again.`
+          );
           return;
         }
         await teardownServerRuntime(ctx, server.id);

@@ -10,7 +10,7 @@ import {
   teardownServerRuntime
 } from "../../src/commands/serverCommands";
 import type { AuthProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
-import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
+import { FolderTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
@@ -564,6 +564,95 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
     expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
       expect.stringContaining("already removed")
+    );
+  });
+
+  it("(presence-only revalidation fix) remove command's in-lock re-check compares the CURRENT record structurally against the confirmed one — a replace-mode import that recreated a DIFFERENT server under the same id while the confirm modal/lock wait was pending aborts with a distinct message and performs no teardown/vault-delete/removeServer, instead of tearing down the impostor record", async () => {
+    const { ctx, stopTunnel, disconnectPool, removeServer, secretDelete, terminalDispose } = setupHarness({
+      profiles: [],
+      activeTunnels: []
+    });
+
+    registerServerCommands(ctx);
+    const removeCmd = registeredCommands.get("nexus.server.remove");
+    expect(removeCmd).toBeDefined();
+
+    // First core.getServer lookup (arg resolution, before the confirmation
+    // modal) returns the record the user actually confirmed removing. By
+    // the time the locked span's re-check runs (the second lookup), a
+    // replace-mode import — or any other writer that got ahead of this flow
+    // in the lock queue — has recreated a DIFFERENT server under the SAME
+    // preserved id (same id, different host). A presence-only check (`if
+    // (!ctx.core.getServer(server.id))`) would see this as "still there"
+    // and barrel ahead into tearing down/deleting credentials for/removing
+    // the wrong record.
+    const confirmedRecord = makeServer();
+    const impostorRecord = makeServer({ host: "attacker.example.com" });
+    let getServerCalls = 0;
+    (ctx.core.getServer as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      getServerCalls++;
+      if (id !== "srv-1") {
+        return undefined;
+      }
+      return getServerCalls === 1 ? confirmedRecord : impostorRecord;
+    });
+
+    await removeCmd!("srv-1");
+
+    // If the fix under test were reverted back to the presence-only check,
+    // this would proceed straight through teardownServerRuntime, all three
+    // secretVault.delete calls, and core.removeServer — tearing down and
+    // deleting credentials for a server the user never confirmed removing.
+    // None of that may happen here.
+    expect(terminalDispose).not.toHaveBeenCalled();
+    expect(stopTunnel).not.toHaveBeenCalled();
+    expect(disconnectPool).not.toHaveBeenCalled();
+    expect(secretDelete).not.toHaveBeenCalled();
+    expect(removeServer).not.toHaveBeenCalled();
+    expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+    // Distinct from the already-removed message — the record is present,
+    // just no longer the one the user confirmed.
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("changed since the removal was confirmed")
+    );
+    expect(vscode.window.showInformationMessage).not.toHaveBeenCalledWith(
+      expect.stringContaining("already removed")
+    );
+  });
+
+  it("(presence-only revalidation fix) remove command's in-lock re-check finds the record structurally identical to the confirmed one and proceeds with the normal teardown/vault-delete/removeServer sequence", async () => {
+    const { ctx, stopTunnel, disconnectPool, removeServer, secretDelete, terminalDispose } = setupHarness({
+      profiles: [],
+      activeTunnels: []
+    });
+
+    registerServerCommands(ctx);
+    const removeCmd = registeredCommands.get("nexus.server.remove");
+    expect(removeCmd).toBeDefined();
+
+    // Both lookups return structurally-equal (but distinct object) records —
+    // e.g. a snapshot rebuild that didn't actually change this server. The
+    // structural revalidation must treat this as "still the confirmed
+    // record" and let the removal proceed, exactly like before the fix.
+    let getServerCalls = 0;
+    (ctx.core.getServer as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      getServerCalls++;
+      if (id !== "srv-1") {
+        return undefined;
+      }
+      return getServerCalls === 1 ? makeServer() : makeServer();
+    });
+
+    await removeCmd!("srv-1");
+
+    expect(terminalDispose).toHaveBeenCalled();
+    expect(disconnectPool).toHaveBeenCalledWith("srv-1");
+    expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(removeServer).toHaveBeenCalledWith("srv-1");
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      expect.stringContaining("changed since the removal was confirmed")
     );
   });
 
@@ -2823,7 +2912,20 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // confirmation modal (stubbed to resolve "Remove" by setupHarness) both
     // resolve OUTSIDE the locked span, but its mutation phase must queue on
     // the SAME configMutationLock the edit rollback is still holding.
-    const removePromise = removeCmd!("srv-1");
+    //
+    // Pass a ServerTreeItem carrying the PRE-edit record (what the user's
+    // context-menu click actually captured, matching toServerFromArg's
+    // ServerTreeItem branch which uses arg.server verbatim instead of a
+    // live core.getServer lookup) rather than the bare id string. A bare id
+    // string would re-resolve via core.getServer AT THIS CALL, which by now
+    // already reflects the edit's in-flight (soon to be rolled back) proxy
+    // write — an artifact of this test's own orchestration, not something a
+    // real click could observe, and exactly the kind of divergence the
+    // in-lock structural revalidation (this file's presence-only-revalidation
+    // fix tests) is designed to catch. Anchoring on the tree item's
+    // pre-edit snapshot keeps this test's actual subject — lock ordering —
+    // isolated from that unrelated guard.
+    const removePromise = removeCmd!(new ServerTreeItem(makeServer(), false));
 
     await delay(10);
     expect(events).toEqual(["edit:start"]);
