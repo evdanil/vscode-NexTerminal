@@ -2047,6 +2047,77 @@ describe("inventoryCommands", () => {
       expect(core.getSnapshot().servers.map((s) => s.id).sort()).toEqual(["owned-1", "owned-2"]);
     });
 
+    it("FINDING 3 — a manual server landing on a planned add's host:port during the post-teardown recompute re-shows the confirmation modal with the duplicates line, even though raw add/update/prune/unchanged counts are identical (kills a counts-only plan-drift comparator that misses manualDuplicateCount)", async () => {
+      const pruned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([pruned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        // device:1 is gone from the tree -> prune "delete". device:2 is a
+        // brand-new device -> a planned add at 10.0.0.9:22, with no manual
+        // server colliding yet at the time the first modal is shown.
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1,
+          devices: [{ externalId: "device:2", name: "web1", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }] }]
+        }))
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+
+      const teardown = {
+        teardownServerRuntime: vi.fn(async (serverId: string) => {
+          if (serverId === "owned-1") {
+            // Simulate a manual (non-owned) server hand-added at exactly the
+            // planned add's host:port DURING the teardown await — invisible
+            // to the plan the user just confirmed. The add/update/prune/
+            // unchanged counts are untouched by this (the add still happens,
+            // just flagged as a duplicate); only manualDuplicateCount (and,
+            // as a side effect of the collision warning, warnings.length)
+            // moves.
+            await core.addOrUpdateServer(
+              makeServer({ id: "manual-1", name: "hand-added", host: "10.0.0.9", port: 22 })
+            );
+          }
+        })
+      };
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete" }));
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage
+        .mockResolvedValueOnce("Apply") // first confirm — no duplicate visible yet
+        .mockResolvedValueOnce(undefined); // cancel the reconfirmation modal
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      // The modal was shown a SECOND time, now with the duplicate-add line —
+      // the raw counts (1 added, 1 deleted) are unchanged from the first
+      // modal, so a counts-only comparator would have applied this unseen.
+      expect(mockShowInformationMessage).toHaveBeenCalledTimes(2);
+      const firstCallDetail = (mockShowInformationMessage.mock.calls[0]?.[1] as { detail?: string } | undefined)?.detail;
+      const secondCallDetail = (mockShowInformationMessage.mock.calls[1]?.[1] as { detail?: string } | undefined)?.detail;
+      expect(firstCallDetail).not.toContain("will be added as duplicates");
+      expect(secondCallDetail).toContain("1 added");
+      expect(secondCallDetail).toContain("1 deleted");
+      expect(secondCallDetail).toContain("will be added as duplicates");
+
+      // If FINDING 3's fix were reverted (planCountsEqual comparing only raw
+      // counts), this identical-counts drift would have gone unnoticed and
+      // applyInventorySyncPlan would have been called once here, silently
+      // adding device:2 as a duplicate of manual-1 without ever showing the
+      // duplicates line for THIS plan.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getSnapshot().servers.map((s) => s.id).sort()).toEqual(["manual-1", "owned-1"]);
+    });
+
     it("nothing-to-do still bumps lastSyncAt without a confirm modal", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();

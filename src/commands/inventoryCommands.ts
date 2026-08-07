@@ -373,12 +373,25 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
 // for deletion differs (e.g. a concurrent import added an owned server absent
 // from the fetched tree, and something else's delete count happened to drop
 // by one) — compare the prune-"delete" server-id set too, not just counts.
+//
+// FINDING 3 — raw counts (adds/updates/prunes/unchanged) can stay identical
+// while a modal-visible AGGREGATE changes: a manual server landing on a
+// planned add's host:port between the modal and the recompute leaves
+// adds.length untouched but bumps manualDuplicateCount, and the modal's "will
+// be added as duplicates" line only reflects the plan that was actually
+// shown. Compare every plan-derived value describePlanDetail renders —
+// manualDuplicateCount, hiddenPruneCount, and warnings.length — alongside the
+// raw counts, so a drift in any of them (not just the counts) loops back to
+// reconfirmation instead of applying a plan the user never saw the modal for.
 function planCountsEqual(a: InventorySyncPlan, b: InventorySyncPlan): boolean {
   if (
     a.adds.length !== b.adds.length ||
     a.updates.length !== b.updates.length ||
     a.prunes.length !== b.prunes.length ||
-    a.unchangedCount !== b.unchangedCount
+    a.unchangedCount !== b.unchangedCount ||
+    a.manualDuplicateCount !== b.manualDuplicateCount ||
+    a.hiddenPruneCount !== b.hiddenPruneCount ||
+    a.warnings.length !== b.warnings.length
   ) {
     return false;
   }
