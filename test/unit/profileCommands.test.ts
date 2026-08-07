@@ -434,4 +434,128 @@ describe("openUnifiedForm SSH submit — create rollback on secret-storage failu
     // outcome.
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-new"));
   });
+
+  it("(FINDINGS 2+3, P2) restores the displaced owner's auto-open flag when the newly created server's flag rollback removes it, after a failed secret write (kills owner-left-cleared, create variant)", async () => {
+    // A hand-rolled stand-in for NexusCore's server map that mirrors
+    // addOrUpdateServer's real single-owner enforcement for
+    // openFileExplorerOnFirstConnect (src/core/nexusCore.ts): enabling the
+    // flag on the server being written clears it from whichever other
+    // server currently holds it. Without replicating that here, "Server B"
+    // would never actually get cleared in the first place and this test
+    // would pass even without the fix under review.
+    const servers = new Map<string, { id: string; name: string; openFileExplorerOnFirstConnect?: boolean }>([
+      ["srv-b", { id: "srv-b", name: "Server B", openFileExplorerOnFirstConnect: true }]
+    ]);
+    const secrets = new Map<string, string>();
+    const addOrUpdateServer = vi.fn(async (server: { id: string; name: string; openFileExplorerOnFirstConnect?: boolean }) => {
+      if (server.openFileExplorerOnFirstConnect) {
+        for (const [id, existing] of servers.entries()) {
+          if (id !== server.id && existing.openFileExplorerOnFirstConnect) {
+            servers.set(id, { ...existing, openFileExplorerOnFirstConnect: undefined });
+          }
+        }
+      }
+      servers.set(server.id, server);
+    });
+    const removeServer = vi.fn(async (id: string) => {
+      servers.delete(id);
+    });
+    const secretDelete = vi.fn(async (key: string) => {
+      secrets.delete(key);
+    });
+    const ctx = {
+      core: {
+        getSnapshot: vi.fn(() => ({ servers: [...servers.values()], authProfiles: [] })),
+        getAuthProfile: vi.fn(),
+        addOrUpdateServer,
+        removeServer,
+        addOrUpdateSerialProfile: vi.fn(),
+        addOrUpdateLocalShellProfile: vi.fn()
+      },
+      secretVault: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: secretDelete
+      }
+    } as any;
+
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", openFileExplorerOnFirstConnect: true });
+    mockSyncProxyPasswordSecret.mockImplementation(async () => {
+      throw new Error("keychain unavailable");
+    });
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+
+    await expect(
+      onSubmit({
+        profileType: "ssh",
+        name: "New Server",
+        host: "example.com",
+        username: "me",
+        openFileExplorerOnFirstConnect: true
+      })
+    ).rejects.toThrow(/server was not created/i);
+
+    // The newly created (and now rolled-back) server is gone.
+    expect(servers.has("srv-new")).toBe(false);
+
+    // Kill check: without capturing/restoring the displaced owner, "Server
+    // B" stays cleared here — addOrUpdateServer("srv-new") clears its flag
+    // as a side effect of enforcing single ownership, and the pre-fix
+    // rollback only ever removed the just-created record, never touching
+    // the server it displaced. This assertion fails against that
+    // implementation because Server B's flag would read undefined instead
+    // of true.
+    const finalB = servers.get("srv-b");
+    expect(finalB?.openFileExplorerOnFirstConnect).toBe(true);
+  });
+
+  it("(FINDINGS 2+3, P2 — sanity) a successful create that enables the flag leaves the previous owner cleared, as intended (unchanged existing behavior)", async () => {
+    const servers = new Map<string, { id: string; name: string; openFileExplorerOnFirstConnect?: boolean }>([
+      ["srv-b", { id: "srv-b", name: "Server B", openFileExplorerOnFirstConnect: true }]
+    ]);
+    const addOrUpdateServer = vi.fn(async (server: { id: string; name: string; openFileExplorerOnFirstConnect?: boolean }) => {
+      if (server.openFileExplorerOnFirstConnect) {
+        for (const [id, existing] of servers.entries()) {
+          if (id !== server.id && existing.openFileExplorerOnFirstConnect) {
+            servers.set(id, { ...existing, openFileExplorerOnFirstConnect: undefined });
+          }
+        }
+      }
+      servers.set(server.id, server);
+    });
+    const ctx = {
+      core: {
+        getSnapshot: vi.fn(() => ({ servers: [...servers.values()], authProfiles: [] })),
+        getAuthProfile: vi.fn(),
+        addOrUpdateServer,
+        removeServer: vi.fn(),
+        addOrUpdateSerialProfile: vi.fn(),
+        addOrUpdateLocalShellProfile: vi.fn()
+      },
+      secretVault: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: vi.fn()
+      }
+    } as any;
+
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", openFileExplorerOnFirstConnect: true });
+    mockSyncProxyPasswordSecret.mockImplementation(async () => {});
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+
+    await onSubmit({
+      profileType: "ssh",
+      name: "New Server",
+      host: "example.com",
+      username: "me",
+      openFileExplorerOnFirstConnect: true
+    });
+
+    expect(servers.get("srv-new")?.openFileExplorerOnFirstConnect).toBe(true);
+    expect(servers.get("srv-b")?.openFileExplorerOnFirstConnect).toBeUndefined();
+  });
 });

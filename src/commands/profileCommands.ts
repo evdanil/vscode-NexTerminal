@@ -5,6 +5,7 @@ import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, LocalShellProfileTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
+import { serverConfigsEqual } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
 import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
@@ -84,6 +85,17 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         // serverCommands.ts for the full torn-pair scenario. No UI runs
         // inside this span.
         await configMutationLock.runExclusive(async () => {
+          // FINDINGS 2+3 (P2, create-rollback review, sibling) — same
+          // single-owner displacement as the nexus.server.edit rollback
+          // (serverCommands.ts): if `server` enables
+          // openFileExplorerOnFirstConnect, addOrUpdateServer below clears
+          // it from whichever OTHER server currently holds it. Capture that
+          // displaced owner (if any) BEFORE the write lands, so a failed
+          // secret sync can hand its flag back on rollback instead of
+          // leaving it cleared for good.
+          const displacedOwner = server.openFileExplorerOnFirstConnect
+            ? ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect && s.id !== server.id)
+            : undefined;
           await ctx.core.addOrUpdateServer(server);
           try {
             await syncProxyPasswordSecret(ctx, server.id, values);
@@ -114,6 +126,26 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
               await ctx.core.removeServer(server.id);
             } catch {
               removeFailed = true;
+            }
+            if (displacedOwner) {
+              // Same concurrent-change rule as the nexus.server.edit rollback:
+              // only hand the flag back if the displaced owner's live record
+              // is still exactly what addOrUpdateServer(server) left it (the
+              // captured record with the flag cleared) — if something else
+              // has since changed it, leave it alone.
+              try {
+                const currentDisplaced = ctx.core.getSnapshot().servers.find((s) => s.id === displacedOwner.id);
+                const displacedStillClearedByThisSubmission =
+                  currentDisplaced !== undefined &&
+                  serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined });
+                if (displacedStillClearedByThisSubmission) {
+                  await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
+                }
+              } catch {
+                void vscode.window.showErrorMessage(
+                  `Could not restore the previous auto-open setting on "${displacedOwner.name}" after a failed save — re-check its settings.`
+                );
+              }
             }
             if (ctx.secretVault) {
               try {

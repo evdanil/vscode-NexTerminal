@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { AuthProfile, AuthType, ProxyConfig, ServerConfig } from "../models/config";
+import { serverConfigsEqual } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
@@ -1078,6 +1079,16 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             const liveRecord = ctx.core.getServer(existing.id);
             const proxySecretKey = proxyPasswordSecretKey(existing.id);
             const priorSecretValue = ctx.secretVault ? await ctx.secretVault.get(proxySecretKey) : undefined;
+            // FINDINGS 2+3 (P2, edit-rollback review) — addOrUpdateServer
+            // enforces single ownership of openFileExplorerOnFirstConnect:
+            // if `updated` enables the flag, it clears it from whichever
+            // OTHER server currently holds it. Capture that displaced owner
+            // (if any) BEFORE the write below lands, so a failed secret sync
+            // can hand its flag back — otherwise a rolled-back edit still
+            // leaves the displaced owner cleared.
+            const displacedOwner = updated.openFileExplorerOnFirstConnect
+              ? ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect && s.id !== updated.id)
+              : undefined;
             await ctx.core.addOrUpdateServer(updated);
             try {
               await syncProxyPasswordSecret(ctx, updated.id, values);
@@ -1093,16 +1104,59 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               // (rather than retried or silently swallowed) since it means
               // the vault or the record no longer matches either
               // generation.
+              //
+              // FINDING 1 (P2, edit-rollback-race review) — nexus.server.rename
+              // and nexus.server.remove don't take configMutationLock, so
+              // either can commit against this SAME server id while this
+              // catch is only reached after awaiting syncProxyPasswordSecret
+              // above — i.e. after the lock body has already resumed from an
+              // await, no longer exclusive in practice against unlocked
+              // callers. An unconditional restore here would then erase a
+              // concurrent rename, or resurrect a concurrent delete. Guard
+              // it: only restore/remove when the CURRENT live record is
+              // still structurally exactly what THIS submission's
+              // addOrUpdateServer(updated) call wrote (serverConfigsEqual
+              // against `updated` — the simplest reliable check, since
+              // addOrUpdateServer stores either `updated` itself or a
+              // one-field clone of it verbatim, never a transformed copy).
+              // If it differs (or the record is gone for a reason other than
+              // this generation's own write), something else already
+              // legitimately changed it — leave it untouched.
               try {
-                if (liveRecord) {
-                  await ctx.core.addOrUpdateServer(liveRecord);
-                } else {
-                  await ctx.core.removeServer(existing.id);
+                const currentRecord = ctx.core.getServer(existing.id);
+                const stillOwnedByThisSubmission = currentRecord !== undefined && serverConfigsEqual(currentRecord, updated);
+                if (stillOwnedByThisSubmission) {
+                  if (liveRecord) {
+                    await ctx.core.addOrUpdateServer(liveRecord);
+                  } else {
+                    await ctx.core.removeServer(existing.id);
+                  }
                 }
               } catch {
                 void vscode.window.showErrorMessage(
                   `Could not restore server "${existing.name}" to its previous settings after a failed save — re-check its record.`
                 );
+              }
+              if (displacedOwner) {
+                // Same concurrent-change rule as above, applied to the
+                // displaced owner: only hand its flag back if its live
+                // record is still exactly what addOrUpdateServer(updated)
+                // left it (the captured record with the flag cleared) — if
+                // it's since been edited, renamed, or removed by something
+                // else, leave it alone rather than clobbering that change.
+                try {
+                  const currentDisplaced = ctx.core.getServer(displacedOwner.id);
+                  const displacedStillClearedByThisSubmission =
+                    currentDisplaced !== undefined &&
+                    serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined });
+                  if (displacedStillClearedByThisSubmission) {
+                    await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
+                  }
+                } catch {
+                  void vscode.window.showErrorMessage(
+                    `Could not restore the previous auto-open setting on "${displacedOwner.name}" after a failed save — re-check its settings.`
+                  );
+                }
               }
               if (ctx.secretVault) {
                 try {

@@ -206,9 +206,23 @@ function setupHarness(options: {
     };
   });
   const addOrUpdateServer = vi.fn(async (server: ServerConfig) => {
+    // Mirrors NexusCore.addOrUpdateServer's single-owner enforcement for
+    // openFileExplorerOnFirstConnect (see src/core/nexusCore.ts): enabling
+    // the flag on this server clears it from whichever other server
+    // currently holds it. Kept in sync with production so displaced-owner
+    // rollback tests actually exercise a real displacement instead of a
+    // mock that never clears anyone.
+    let servers = snapshot.servers;
+    if (server.openFileExplorerOnFirstConnect) {
+      servers = servers.map((existing) =>
+        existing.id !== server.id && existing.openFileExplorerOnFirstConnect
+          ? { ...existing, openFileExplorerOnFirstConnect: undefined }
+          : existing
+      );
+    }
     snapshot = {
       ...snapshot,
-      servers: [...snapshot.servers.filter((item) => item.id !== server.id), server]
+      servers: [...servers.filter((item) => item.id !== server.id), server]
     };
   });
   const addOrUpdateAuthProfile = vi.fn(async (profile: AuthProfile) => {
@@ -2075,5 +2089,166 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(removeServer).toHaveBeenCalledWith("srv-1");
     const finalRecord = ctx.core.getServer("srv-1");
     expect(finalRecord).toBeUndefined();
+  });
+
+  it("(FINDING 1, P2) leaves a concurrent rename in place instead of unconditionally restoring the pre-submit record, when that rename commits while the proxy-secret write is still pending", async () => {
+    const { ctx, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()],
+      initialSecrets: {}
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Gate the secret write so a concurrent, unlocked command (simulating
+    // nexus.server.rename, which does not take configMutationLock) can
+    // commit its own addOrUpdateServer call for this SAME server id
+    // between this submission's addOrUpdateServer(updated) and the
+    // rejection reaching the rollback's catch block.
+    let rejectSecretWrite!: (err: unknown) => void;
+    secretStore.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { rejectSecretWrite = reject; })
+    );
+
+    const submitPromise = options.onSubmit({
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "socks5",
+      proxySocks5Host: "new-proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: "proxyuser",
+      proxySocks5Password: "new-proxy-pw"
+    });
+
+    // Let onSubmit's own addOrUpdateServer(updated) land and its
+    // syncProxyPasswordSecret call reach the gated secret write.
+    await delay(10);
+
+    // Simulate nexus.server.rename committing while the secret write is
+    // still pending — an unlocked addOrUpdateServer call for the same id.
+    const renamed = { ...ctx.core.getServer("srv-1")!, name: "Renamed By Concurrent Command" };
+    await ctx.core.addOrUpdateServer(renamed);
+
+    rejectSecretWrite(new Error("keychain unavailable"));
+
+    await expect(submitPromise).rejects.toThrow(/changes were not saved/i);
+
+    // Kill check: the pre-fix (unconditional restore) implementation would
+    // call addOrUpdateServer(liveRecord) here regardless of what's
+    // currently live, where liveRecord is the PRE-edit "Server 1" captured
+    // before this submission's own write — erasing the concurrent rename.
+    // This assertion only passes when the rollback recognized the live
+    // record had moved on since this submission's own write and left it
+    // alone.
+    const finalRecord = ctx.core.getServer("srv-1");
+    expect(finalRecord?.name).toBe("Renamed By Concurrent Command");
+  });
+
+  it("(FINDING 1, P2) still restores the prior record when nothing concurrent touched it (no-concurrent-change case stays green)", async () => {
+    const { ctx, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()],
+      initialSecrets: {}
+    });
+
+    secretStore.mockRejectedValueOnce(new Error("keychain unavailable"));
+
+    await expect(
+      submitEdit(ctx, {
+        name: "Server 1",
+        host: "example.com",
+        port: 22,
+        username: "dev",
+        authType: "password",
+        proxyType: "socks5",
+        proxySocks5Host: "new-proxy.example.com",
+        proxySocks5Port: 1080,
+        proxySocks5Username: "proxyuser",
+        proxySocks5Password: "new-proxy-pw"
+      })
+    ).rejects.toThrow(/changes were not saved/i);
+
+    const finalRecord = ctx.core.getServer("srv-1");
+    expect(finalRecord?.host).toBe("example.com");
+    expect(finalRecord?.proxy).toBeUndefined();
+  });
+
+  it("(FINDINGS 2+3, P2) restores the displaced owner's auto-open flag when enabling it elsewhere is rolled back after a failed secret write (kills owner-left-cleared)", async () => {
+    const serverA = makeServer({ id: "srv-1", name: "Server A" });
+    const serverB = makeServer({ id: "srv-2", name: "Server B", openFileExplorerOnFirstConnect: true });
+    const { ctx, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [serverA, serverB],
+      initialSecrets: {}
+    });
+
+    secretStore.mockRejectedValueOnce(new Error("keychain unavailable"));
+
+    await expect(
+      submitEdit(ctx, {
+        name: "Server A",
+        host: "example.com",
+        port: 22,
+        username: "dev",
+        authType: "password",
+        openFileExplorerOnFirstConnect: true,
+        proxyType: "socks5",
+        proxySocks5Host: "new-proxy.example.com",
+        proxySocks5Port: 1080,
+        proxySocks5Username: "proxyuser",
+        proxySocks5Password: "new-proxy-pw"
+      })
+    ).rejects.toThrow(/changes were not saved/i);
+
+    // Kill check: without capturing/restoring the displaced owner, B stays
+    // cleared here — addOrUpdateServer(updated for A) clears B's flag as a
+    // side effect of enforcing single ownership, and the rollback (before
+    // this fix) only ever restored A's own prior record, never touching B.
+    // This assertion fails against that implementation because B's flag
+    // would read undefined instead of true.
+    const finalA = ctx.core.getServer("srv-1");
+    const finalB = ctx.core.getServer("srv-2");
+    expect(finalB?.openFileExplorerOnFirstConnect).toBe(true);
+    // A is back to its own prior (pre-submission) state: it never owned
+    // the flag before this failed submission tried to claim it.
+    expect(finalA?.openFileExplorerOnFirstConnect).toBeUndefined();
+  });
+
+  it("(FINDINGS 2+3, P2 — sanity) a successful edit that enables the flag leaves the previous owner cleared, as intended (unchanged existing behavior)", async () => {
+    const serverA = makeServer({ id: "srv-1", name: "Server A" });
+    const serverB = makeServer({ id: "srv-2", name: "Server B", openFileExplorerOnFirstConnect: true });
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [serverA, serverB],
+      initialSecrets: {}
+    });
+
+    await submitEdit(ctx, {
+      name: "Server A",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      openFileExplorerOnFirstConnect: true
+    });
+
+    const finalA = ctx.core.getServer("srv-1");
+    const finalB = ctx.core.getServer("srv-2");
+    expect(finalA?.openFileExplorerOnFirstConnect).toBe(true);
+    expect(finalB?.openFileExplorerOnFirstConnect).toBeUndefined();
   });
 });
