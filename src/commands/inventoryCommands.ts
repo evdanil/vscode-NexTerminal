@@ -71,7 +71,7 @@ export interface InventoryRuntimeTeardown {
 }
 
 function providerMissingMessage(providerId: string): string {
-  return `Provider "${providerId}" not available (the extension providing it may be disabled).`;
+  return `Inventory provider "${providerId}" is not available (the extension providing it may be disabled).`;
 }
 
 /**
@@ -119,6 +119,21 @@ function describeInventoryError(error: unknown): string {
   return String(error);
 }
 
+/**
+ * m4 — core.applyInventorySyncPlan throws a plain Error (never a dedicated
+ * type — see nexusCore.ts ~437-441) whose message names the raw sourceId and
+ * says nothing a user would recognize. Detected here by a narrow substring
+ * check on that exact wording rather than an exported error class (none
+ * exists for this one) so the two call sites below can swap in the friendly,
+ * source-name-bearing wording already used at the pre-apply fast-fail check
+ * (~1330) instead of surfacing the raw "Inventory sync failed: ...uuid..."
+ * text. Core's own message is NEVER changed by this — it's also asserted
+ * verbatim by nexusCoreInventory.test.ts.
+ */
+function isSourceConfigMismatchError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("configuration changed since the sync was computed");
+}
+
 function formatLastSync(source: InventorySourceConfig): string {
   if (!source.lastSyncAt) return "never synced";
   const minutes = Math.floor((Date.now() - source.lastSyncAt) / 60_000);
@@ -138,7 +153,11 @@ function sourceDescription(source: InventorySourceConfig, registry: InventoryPro
 async function pickInventorySource(core: NexusCore, registry: InventoryProviderRegistry): Promise<InventorySourceConfig | undefined> {
   const sources = core.getSnapshot().inventorySources;
   if (sources.length === 0) {
-    void vscode.window.showWarningMessage("No inventory sources configured. Add one first.");
+    // M2d — an action button straight to the add-source wizard, rather than
+    // leaving "add one first" as an instruction with no affordance attached.
+    void vscode.window.showWarningMessage("No inventory sources configured. Add one first.", "Add Inventory Source").then((choice) => {
+      if (choice === "Add Inventory Source") void vscode.commands.executeCommand("nexus.inventory.addSource");
+    });
     return undefined;
   }
   if (sources.length === 1) {
@@ -170,14 +189,17 @@ async function promptProviderPick(registry: InventoryProviderRegistry): Promise<
 /**
  * Loops on an empty target folder: warns (top level is unusual, not forbidden)
  * and offers "Choose Folder" to re-prompt instead of silently proceeding.
- * Returns undefined on outright cancellation (Escape / dismiss).
+ * Returns undefined on outright cancellation (Escape / dismiss). `stepSuffix`
+ * is the M1-minimum wizard step indicator (e.g. " (3/8)"), appended verbatim
+ * to the InputBox title by the caller.
  */
-async function promptTargetFolder(initialValue = ""): Promise<string | undefined> {
+async function promptTargetFolder(stepSuffix: string, initialValue = ""): Promise<string | undefined> {
   let seed = initialValue;
   for (;;) {
     const input = await vscode.window.showInputBox({
-      title: "Target Folder",
-      prompt: 'Servers synced from this source are placed under this folder. Leave empty for the top level.',
+      title: `Target Folder${stepSuffix}`,
+      prompt: "Servers synced from this source are placed under this folder. Leave empty for the top level.",
+      placeHolder: "e.g. Datacenter/NetBox — press Enter for top level",
       value: seed,
       ignoreFocusOut: true,
       validateInput: (value) => (normalizeOptionalFolderPath(value) === null ? INVALID_FOLDER_PATH_MESSAGE : undefined)
@@ -187,8 +209,15 @@ async function promptTargetFolder(initialValue = ""): Promise<string | undefined
     if (normalized !== "") {
       return normalized;
     }
+    // m9 — modal convention used elsewhere in this file (and across the
+    // codebase — see removeSource's own confirm below, or serverCommands.ts's
+    // remove-server confirm): a short leading question, not a trailing one.
+    // The top-level placement is genuinely riskier for a LIVE sync (every
+    // future run re-lands everything here with nothing to distinguish it from
+    // hand-added servers), so this confirmation stays — only its wording moves
+    // to match the rest of the file.
     const choice = await vscode.window.showWarningMessage(
-      "No target folder selected — synced servers will be placed at the top level. Continue?",
+      "Place synced servers at the top level? No target folder was entered.",
       { modal: true },
       "Continue",
       "Choose Folder"
@@ -209,7 +238,7 @@ async function promptTargetFolder(initialValue = ""): Promise<string | undefined
  * entirely on addSource (nothing saved yet) and the list keeps its default
  * order.
  */
-async function promptPrunePolicy(targetFolder: string, current?: InventoryPrunePolicy): Promise<InventoryPrunePolicy | undefined> {
+async function promptPrunePolicy(stepSuffix: string, targetFolder: string, current?: InventoryPrunePolicy): Promise<InventoryPrunePolicy | undefined> {
   const orphanTarget = targetFolder ? `${targetFolder}/${ORPHAN_FOLDER_NAME}` : ORPHAN_FOLDER_NAME;
   const items = [
     { label: `Move to "${orphanTarget}"`, description: "Recommended — keeps synced settings if the device returns", value: "orphan" as const },
@@ -217,7 +246,13 @@ async function promptPrunePolicy(targetFolder: string, current?: InventoryPruneP
     { label: "Keep", description: "Leaves the server where it is", value: "keep" as const }
   ].map((item) => (item.value === current ? { ...item, description: `${item.description} (current)` } : item));
   const ordered = current ? [...items.filter((i) => i.value === current), ...items.filter((i) => i.value !== current)] : items;
-  const pick = await vscode.window.showQuickPick(ordered, { title: "When a device disappears from the source…" });
+  // m8 — the question moves from the title into placeHolder; the title
+  // itself now just names what's being configured (mirrors "Target Folder",
+  // "Inventory Source Name" elsewhere in this wizard).
+  const pick = await vscode.window.showQuickPick(ordered, {
+    title: `Removed-Device Policy${stepSuffix}`,
+    placeHolder: "What should happen when a device disappears from the source?"
+  });
   return pick?.value;
 }
 
@@ -231,16 +266,30 @@ interface ConfigFieldsResult {
  * marks which password fields already have a saved vault value (edit flow) —
  * those may be left blank to keep the saved value; everything else required
  * must be non-empty. Returns undefined on cancellation at any step.
+ *
+ * `baseStepIndex`/`totalSteps` are the M1-minimum wizard step indicator —
+ * this field's 1-based position is `baseStepIndex + <index in fields>`, so
+ * caller and callee agree on numbering without this function knowing about
+ * any of the FIXED (non-field) steps that come before it.
+ *
+ * FOLLOW-UP: this whole sequential-prompt chain (here and in addSource/
+ * editSource) is a known candidate for migration to a single webview form —
+ * tracked separately; the step counters below are a stopgap for the current
+ * one-InputBox-at-a-time flow, not a redesign of it.
  */
 async function promptConfigFields(
   fields: InventoryConfigField[],
   existingConfig: InventorySourceValues,
-  existingSecretFieldIds: ReadonlySet<string>
+  existingSecretFieldIds: ReadonlySet<string>,
+  baseStepIndex: number,
+  totalSteps: number
 ): Promise<ConfigFieldsResult | undefined> {
   const config: InventorySourceValues = {};
   const secrets: InventorySourceSecrets = {};
 
-  for (const field of fields) {
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i];
+    const stepSuffix = ` (${baseStepIndex + i}/${totalSteps})`;
     if (field.type === "boolean") {
       // FIX 7 — mark whichever option matches the saved config value (edit
       // flow) and list it first; addSource has no `existingConfig` entry for
@@ -251,7 +300,7 @@ async function promptConfigFields(
         { label: "No", value: false, description: current === false ? "(current)" : undefined }
       ];
       const ordered = current === false ? [items[1], items[0]] : items;
-      const pick = await vscode.window.showQuickPick(ordered, { title: field.label, placeHolder: field.description });
+      const pick = await vscode.window.showQuickPick(ordered, { title: `${field.label}${stepSuffix}`, placeHolder: field.description });
       if (pick === undefined) return undefined;
       config[field.id] = pick.value;
       continue;
@@ -260,7 +309,7 @@ async function promptConfigFields(
     if (field.type === "password") {
       const hasSaved = existingSecretFieldIds.has(field.id);
       const value = await vscode.window.showInputBox({
-        title: field.label,
+        title: `${field.label}${stepSuffix}`,
         prompt: field.description,
         placeHolder: hasSaved ? "Leave empty to keep the saved value" : field.placeholder,
         password: true,
@@ -276,7 +325,7 @@ async function promptConfigFields(
 
     const existingValue = existingConfig[field.id];
     const value = await vscode.window.showInputBox({
-      title: field.label,
+      title: `${field.label}${stepSuffix}`,
       prompt: field.description,
       placeHolder: field.placeholder,
       value: existingValue !== undefined ? String(existingValue) : "",
@@ -299,13 +348,14 @@ async function promptConfigFields(
 }
 
 async function testConnectionWithRetry(
+  name: string,
   provider: InventoryProvider,
   config: InventorySourceValues,
   secrets: InventorySourceSecrets
 ): Promise<boolean> {
   try {
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `Testing connection to "${provider.label}"…` },
+      { location: vscode.ProgressLocation.Notification, title: `Testing connection to "${name}"…` },
       () => {
         const cloned = cloneForProvider(config, secrets);
         return provider.testConnection(cloned.config, cloned.secrets);
@@ -332,9 +382,13 @@ function countJumpHostDependents(allServers: ServerConfig[], removedIds: Readonl
   return allServers.filter((s) => !removedIds.has(s.id) && s.proxy?.type === "ssh" && removedIds.has(s.proxy.jumpHostId)).length;
 }
 
-function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[]): string {
+/** m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync plan for the confirm modal's `detail`. */
+function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[], targetFolder: string): string {
   const lines: string[] = [];
-  if (plan.adds.length > 0) lines.push(`${plan.adds.length} added`);
+  if (plan.adds.length > 0) {
+    const n = plan.adds.length;
+    lines.push(`${n} server${n === 1 ? "" : "s"} will be added.`);
+  }
   // FIX 3 — aggregate manual-duplicate count (engine-computed, not
   // string-parsed from plan.warnings) surfaced once in the modal, rather than
   // leaving it discoverable only by opening the per-device warnings list.
@@ -343,22 +397,49 @@ function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[])
     const verb = n === 1 ? "matches" : "match";
     lines.push(`${n} device${n === 1 ? "" : "s"} ${verb} existing manual servers and will be added as duplicates.`);
   }
-  if (plan.updates.length > 0) lines.push(`${plan.updates.length} updated`);
+  if (plan.updates.length > 0) {
+    const n = plan.updates.length;
+    lines.push(`${n} server${n === 1 ? "" : "s"} will be updated.`);
+  }
   const orphaned = plan.prunes.filter((p) => p.policy === "orphan").length;
   const deleted = plan.prunes.filter((p) => p.policy === "delete").length;
   const kept = plan.prunes.filter((p) => p.policy === "keep").length;
-  if (orphaned > 0) lines.push(`${orphaned} moved to _orphaned`);
-  if (deleted > 0) lines.push(`${deleted} deleted (including saved passwords)`);
-  if (kept > 0) lines.push(`${kept} kept`);
-  lines.push(`${plan.unchangedCount} unchanged`);
-  if (plan.hiddenPruneCount > 0) lines.push(`(includes ${plan.hiddenPruneCount} hidden)`);
-  if (plan.warnings.length > 0) lines.push(`${plan.warnings.length} warning${plan.warnings.length === 1 ? "" : "s"}`);
+  // NIT 2 — hiddenPruneCount is folded into whichever of the three prune
+  // lines below actually renders, rather than sitting on its own line. A
+  // single sync always applies exactly ONE prune policy (source.prunePolicy),
+  // so at most one of orphaned/deleted/kept is ever non-zero and there is
+  // never an ambiguity about which line it qualifies.
+  const hiddenSuffix = plan.hiddenPruneCount > 0 ? ` (${plan.hiddenPruneCount} hidden)` : "";
+  if (orphaned > 0) {
+    // m2 — the REAL destination path, computed the same way the prune-policy
+    // picker (promptPrunePolicy) shows it, not the literal folder name.
+    const orphanTarget = targetFolder ? `${targetFolder}/${ORPHAN_FOLDER_NAME}` : ORPHAN_FOLDER_NAME;
+    lines.push(`${orphaned} server${orphaned === 1 ? "" : "s"} will be moved to "${orphanTarget}"${hiddenSuffix}.`);
+  }
+  if (deleted > 0) {
+    const pronoun = deleted === 1 ? "its" : "their";
+    const passwordWord = deleted === 1 ? "password" : "passwords";
+    lines.push(`${deleted} server${deleted === 1 ? "" : "s"} will be deleted, including ${pronoun} saved ${passwordWord}${hiddenSuffix}.`);
+  }
+  if (kept > 0) {
+    lines.push(`${kept} server${kept === 1 ? "" : "s"} will be kept in place${hiddenSuffix}.`);
+  }
+  lines.push(`${plan.unchangedCount} server${plan.unchangedCount === 1 ? " is" : "s are"} unchanged.`);
+  if (plan.warnings.length > 0) {
+    const n = plan.warnings.length;
+    lines.push(`${n} warning${n === 1 ? "" : "s"} — choose Show Warnings to review.`);
+  }
   if (deleted > 0) {
     const deletedIds = new Set(plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id));
     const dependents = countJumpHostDependents(allServers, deletedIds);
     if (dependents > 0) {
+      // m5 — verb keyed on the dependent count, "this server"/"these servers"
+      // (and the singular/plural jump-host noun) keyed on how many servers
+      // are actually being deleted; mirrored in removeSource below.
       const verb = dependents === 1 ? "uses" : "use";
-      lines.push(`${dependents} other server${dependents === 1 ? "" : "s"} ${verb} these as SSH jump hosts.`);
+      const noun = deleted === 1 ? "this server" : "these servers";
+      const hostNoun = deleted === 1 ? "an SSH jump host" : "SSH jump hosts";
+      lines.push(`${dependents} other server${dependents === 1 ? "" : "s"} ${verb} ${noun} as ${hostNoun}.`);
     }
   }
   return lines.join("\n");
@@ -400,9 +481,10 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
 function planDetailDrift(
   previous: { detail: string; deleteIds: ReadonlySet<string> },
   nextPlan: InventorySyncPlan,
-  nextServers: ServerConfig[]
+  nextServers: ServerConfig[],
+  targetFolder: string
 ): { drift: boolean; detail: string } {
-  const nextDetail = describePlanDetail(nextPlan, nextServers);
+  const nextDetail = describePlanDetail(nextPlan, nextServers, targetFolder);
   if (nextDetail !== previous.detail) {
     return { drift: true, detail: nextDetail };
   }
@@ -434,8 +516,19 @@ export function registerInventoryCommands(
     const provider = await promptProviderPick(registry);
     if (!provider) return;
 
+    // M1-minimum — wizard step numbering. Provider selection occupies step 1
+    // (its own picker can't show a total before the provider — and thus its
+    // field count — is known, so it gets no counter of its own); Name/Folder/
+    // Username/Prune-Policy are 2-5; one step per provider config field after
+    // that.
+    // FOLLOW-UP: this sequential-prompt wizard (here, editSource, and the
+    // promptConfigFields/promptTargetFolder/promptPrunePolicy helpers it
+    // shares with editSource) is a known candidate for migration to a single
+    // webview form — tracked separately.
+    const totalSteps = 5 + provider.configFields.length;
+
     const nameInput = await vscode.window.showInputBox({
-      title: "Inventory Source Name",
+      title: `Inventory Source Name (2/${totalSteps})`,
       value: provider.label,
       ignoreFocusOut: true,
       validateInput: (v) => (v.trim() ? undefined : "Name is required")
@@ -443,11 +536,11 @@ export function registerInventoryCommands(
     if (nameInput === undefined) return;
     const name = nameInput.trim();
 
-    const targetFolder = await promptTargetFolder();
+    const targetFolder = await promptTargetFolder(` (3/${totalSteps})`);
     if (targetFolder === undefined) return;
 
     const defaultUsernameInput = await vscode.window.showInputBox({
-      title: "Default SSH Username",
+      title: `Default SSH Username (4/${totalSteps})`,
       prompt: "Used when the inventory source doesn't provide a username.",
       value: mostCommonUsername(core.getSnapshot().servers),
       ignoreFocusOut: true,
@@ -456,14 +549,14 @@ export function registerInventoryCommands(
     if (defaultUsernameInput === undefined) return;
     const defaultUsername = defaultUsernameInput.trim();
 
-    const prunePolicy = await promptPrunePolicy(targetFolder);
+    const prunePolicy = await promptPrunePolicy(` (5/${totalSteps})`, targetFolder);
     if (!prunePolicy) return;
 
-    const fieldsResult = await promptConfigFields(provider.configFields, {}, new Set());
+    const fieldsResult = await promptConfigFields(provider.configFields, {}, new Set(), 6, totalSteps);
     if (!fieldsResult) return;
     const { config, secrets } = fieldsResult;
 
-    const ok = await testConnectionWithRetry(provider, config, secrets);
+    const ok = await testConnectionWithRetry(name, provider, config, secrets);
     if (!ok) return;
 
     const id = randomUUID();
@@ -553,10 +646,18 @@ export function registerInventoryCommands(
       return;
     }
 
+    // M1-minimum — wizard step numbering. Unlike addSource, the provider is
+    // already fixed (source.providerId), so there is no provider-pick step
+    // here: Name/Folder/Username/Prune-Policy are 1-4, then one step per
+    // provider config field.
+    // FOLLOW-UP: same known candidate for a webview-form migration as
+    // addSource — see its comment.
+    const totalSteps = 4 + provider.configFields.length;
+
     inFlightSourceIds.add(source.id);
     try {
       const nameInput = await vscode.window.showInputBox({
-        title: "Inventory Source Name",
+        title: `Inventory Source Name (1/${totalSteps})`,
         value: source.name,
         ignoreFocusOut: true,
         validateInput: (v) => (v.trim() ? undefined : "Name is required")
@@ -564,11 +665,11 @@ export function registerInventoryCommands(
       if (nameInput === undefined) return;
       const name = nameInput.trim();
 
-      const targetFolder = await promptTargetFolder(source.targetFolder);
+      const targetFolder = await promptTargetFolder(` (2/${totalSteps})`, source.targetFolder);
       if (targetFolder === undefined) return;
 
       const defaultUsernameInput = await vscode.window.showInputBox({
-        title: "Default SSH Username",
+        title: `Default SSH Username (3/${totalSteps})`,
         value: source.defaultUsername,
         ignoreFocusOut: true,
         validateInput: (v) => (v.trim() ? undefined : "Username is required")
@@ -576,11 +677,11 @@ export function registerInventoryCommands(
       if (defaultUsernameInput === undefined) return;
       const defaultUsername = defaultUsernameInput.trim();
 
-      const prunePolicy = await promptPrunePolicy(targetFolder, source.prunePolicy);
+      const prunePolicy = await promptPrunePolicy(` (4/${totalSteps})`, targetFolder, source.prunePolicy);
       if (!prunePolicy) return;
 
       const existingSecretFieldIds = new Set(source.secretFieldIds);
-      const fieldsResult = await promptConfigFields(provider.configFields, source.config, existingSecretFieldIds);
+      const fieldsResult = await promptConfigFields(provider.configFields, source.config, existingSecretFieldIds, 5, totalSteps);
       if (!fieldsResult) return;
       const { config, secrets: reenteredSecrets } = fieldsResult;
 
@@ -594,7 +695,10 @@ export function registerInventoryCommands(
         }
       }
 
-      const ok = await testConnectionWithRetry(provider, config, secretsForTest);
+      // m11 — the connection test keeps its existing gating (unchanged, out
+      // of scope); only the progress title changes, naming the edited
+      // source's (possibly just-renamed) name rather than the provider label.
+      const ok = await testConnectionWithRetry(name, provider, config, secretsForTest);
       if (!ok) return;
 
       // CONFIG MUTATION LOCK — every prompt (name/folder/username/prune-policy/
@@ -778,11 +882,20 @@ export function registerInventoryCommands(
       const detailLines: string[] = [];
       if (owned.length > 0) {
         const verb = owned.length === 1 ? "is" : "are";
+        // NIT 3 — the hidden-count parenthetical moves before the period.
         const hiddenNote = hiddenOwnedCount > 0 ? ` (includes ${hiddenOwnedCount} hidden)` : "";
-        detailLines.push(`${owned.length} synced server${owned.length === 1 ? "" : "s"} ${verb} linked to this source.${hiddenNote}`);
+        detailLines.push(`${owned.length} synced server${owned.length === 1 ? "" : "s"} ${verb} linked to this source${hiddenNote}.`);
       }
       if (dependentCount > 0) {
-        detailLines.push(`${dependentCount} other server${dependentCount === 1 ? "" : "s"} use these as SSH jump hosts.`);
+        // m5 — mirrors describePlanDetail's own jump-host-dependents line
+        // (~ line 428): verb keyed on the dependent count (was hardcoded
+        // "use", wrong for a single dependent), "this server"/"these servers"
+        // (and the singular/plural jump-host noun) keyed on how many linked
+        // servers are actually being removed.
+        const verb = dependentCount === 1 ? "uses" : "use";
+        const noun = owned.length === 1 ? "this server" : "these servers";
+        const hostNoun = owned.length === 1 ? "an SSH jump host" : "SSH jump hosts";
+        detailLines.push(`${dependentCount} other server${dependentCount === 1 ? "" : "s"} ${verb} ${noun} as ${hostNoun}.`);
       }
 
       const buttons = owned.length > 0 ? ["Delete Servers", "Keep Servers"] : ["Remove"];
@@ -1092,25 +1205,27 @@ export function registerInventoryCommands(
       });
       if (!removal.ok) return;
 
+      // m6 — follow-on sentences (each ending with its own period), joined by
+      // spaces, rather than the old chained post-period parentheticals.
       const skippedNote =
         removal.skippedCount > 0
-          ? ` (${removal.skippedCount} server${removal.skippedCount === 1 ? "" : "s"} ${removal.skippedCount === 1 ? "was" : "were"} left untouched because ${
-              removal.skippedCount === 1 ? "it" : "they"
-            } changed during removal)`
+          ? ` ${removal.skippedCount} server${removal.skippedCount === 1 ? "" : "s"} changed during removal and ${
+              removal.skippedCount === 1 ? "was" : "were"
+            } left untouched.`
           : "";
       const recreatedNote =
         removal.recreatedCount > 0
-          ? ` (${removal.recreatedCount} re-created server${removal.recreatedCount === 1 ? "" : "s"} kept ${removal.recreatedCount === 1 ? "its" : "their"} credentials)`
+          ? ` ${removal.recreatedCount} re-created server${removal.recreatedCount === 1 ? "" : "s"} kept ${removal.recreatedCount === 1 ? "its" : "their"} credentials.`
           : "";
       // FINDING 2 (P2, second-sweep-abort review) — surface any teardown that
       // was contained (not swallowed silently) above.
       const teardownFailureNote =
         removal.teardownFailureCount > 0
-          ? ` (runtime cleanup incomplete for ${removal.teardownFailureCount} server${
+          ? ` Runtime cleanup incomplete for ${removal.teardownFailureCount} server${
               removal.teardownFailureCount === 1 ? "" : "s"
             } — close ${removal.teardownFailureCount === 1 ? "its" : "their"} terminal${
               removal.teardownFailureCount === 1 ? "" : "s"
-            } manually)`
+            } manually.`
           : "";
       void vscode.window.showInformationMessage(
         `Inventory source "${source.name}" removed.${skippedNote}${recreatedNote}${teardownFailureNote}`
@@ -1152,7 +1267,12 @@ export function registerInventoryCommands(
         if (field.type !== "password" || !field.required) continue;
         const value = await vault.get(inventorySecretKey(source.id, field.id));
         if (!value) {
-          void vscode.window.showErrorMessage(`Missing saved credential "${field.id}" for "${source.name}". Edit the source to re-enter it.`);
+          // m3 — the user-facing label ("API Token"), not the provider's
+          // internal field id ("apiToken"); falls back to the id only if a
+          // provider ever leaves label unset (the type requires it, but this
+          // stays defensive since providers are third-party-authored).
+          const fieldName = field.label || field.id;
+          void vscode.window.showErrorMessage(`Missing saved credential "${fieldName}" for "${source.name}" — edit the source to re-enter it.`);
           return;
         }
       }
@@ -1237,8 +1357,13 @@ export function registerInventoryCommands(
             await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
             return { kind: "done", plan: recomputed };
           } catch (error) {
+            // m4 — a source-record replacement race surfaces the same
+            // friendly, name-bearing wording as the pre-apply fast-fail check
+            // just above, never core's raw "...uuid..." message.
             void vscode.window.showErrorMessage(
-              `Inventory sync failed: ${error instanceof Error ? error.message : String(error)}`
+              isSourceConfigMismatchError(error)
+                ? `Inventory source "${source.name}" configuration changed while syncing — run Sync Now again.`
+                : `Inventory sync failed: ${error instanceof Error ? error.message : String(error)}`
             );
             return { kind: "abort" };
           }
@@ -1246,7 +1371,9 @@ export function registerInventoryCommands(
         if (fastPathResult.kind === "abort") return;
         if (fastPathResult.kind === "done") {
           const donePlan = fastPathResult.plan;
-          void vscode.window.showInformationMessage(`Inventory sync from "${source.name}": nothing to do (${donePlan.unchangedCount} unchanged).`);
+          void vscode.window.showInformationMessage(
+            `Inventory sync from "${source.name}" complete — nothing to change (${donePlan.unchangedCount} unchanged).`
+          );
           if (donePlan.warnings.length > 0) {
             void vscode.window
               .showWarningMessage(`${donePlan.warnings.length} warning${donePlan.warnings.length === 1 ? "" : "s"} during sync.`, "Show Details")
@@ -1288,7 +1415,7 @@ export function registerInventoryCommands(
         // plan and the same server snapshot describePlanDetail was called
         // with here, not a re-derived approximation of either.
         const shownServers = core.getSnapshot().servers;
-        const shownDetail = describePlanDetail(plan, shownServers);
+        const shownDetail = describePlanDetail(plan, shownServers, source.targetFolder);
         const shownDeleteIds = deletePruneIds(plan);
         const buttons = plan.warnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
         const choice = await vscode.window.showInformationMessage(
@@ -1334,7 +1461,12 @@ export function registerInventoryCommands(
 
           const freshServersForRecompute = core.getSnapshot().servers;
           const recomputed = computeSyncPlan({ source: freshSource, tree, currentServers: freshServersForRecompute, now: Date.now() });
-          const recomputedDrift = planDetailDrift({ detail: shownDetail, deleteIds: shownDeleteIds }, recomputed, freshServersForRecompute);
+          const recomputedDrift = planDetailDrift(
+            { detail: shownDetail, deleteIds: shownDeleteIds },
+            recomputed,
+            freshServersForRecompute,
+            freshSource.targetFolder
+          );
           if (recomputedDrift.drift) {
             return { kind: "retry", plan: recomputed };
           }
@@ -1431,7 +1563,8 @@ export function registerInventoryCommands(
           const finalDrift = planDetailDrift(
             { detail: recomputedDrift.detail, deleteIds: deletePruneIds(recomputed) },
             finalPlan,
-            finalServersForRecompute
+            finalServersForRecompute,
+            freshSource.targetFolder
           );
           if (finalDrift.drift) {
             finalRecomputeMismatchCount++;
@@ -1455,8 +1588,11 @@ export function registerInventoryCommands(
           try {
             applyResult = await core.applyInventorySyncPlan(finalApplication);
           } catch (error) {
+            // m4 — same friendly rewording as the fast-path apply above.
             void vscode.window.showErrorMessage(
-              `Inventory sync failed: ${error instanceof Error ? error.message : String(error)}`
+              isSourceConfigMismatchError(error)
+                ? `Inventory source "${source.name}" configuration changed while syncing — run Sync Now again.`
+                : `Inventory sync failed: ${error instanceof Error ? error.message : String(error)}`
             );
             return { kind: "abort" };
           }
@@ -1571,8 +1707,12 @@ export function registerInventoryCommands(
                 attempt.teardownFailureCount === 1 ? "" : "s"
               } manually.`
             : "";
+        // M3 — named-source, plain-English toast; the previous
+        // "+A ~U -D (K unchanged)" shorthand never printed a zero-line
+        // omission (all four counts always rendered regardless of value), so
+        // this keeps that same always-print-all-four behavior.
         void vscode.window.showInformationMessage(
-          `Inventory sync complete: +${finalPlan.adds.length} ~${finalPlan.updates.length} -${deletedCount} (${finalPlan.unchangedCount} unchanged).${recreatedNote}${teardownFailureNote}`
+          `Inventory sync from "${source.name}" complete: ${finalPlan.adds.length} added, ${finalPlan.updates.length} updated, ${deletedCount} deleted (${finalPlan.unchangedCount} unchanged).${recreatedNote}${teardownFailureNote}`
         );
         if (finalPlan.warnings.length > 0) {
           void vscode.window

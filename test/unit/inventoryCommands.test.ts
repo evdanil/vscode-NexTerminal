@@ -1615,7 +1615,7 @@ describe("inventoryCommands", () => {
       // count the credential-cleanup loop already reports — counted once,
       // not twice, even though both loops independently notice it's live.
       expect(mockShowInformationMessage).toHaveBeenCalledWith(
-        expect.stringMatching(/^Inventory sync complete:.*1 re-created server.*kept its credentials\.$/)
+        expect.stringMatching(/^Inventory sync from ".*" complete:.*1 re-created server.*kept its credentials\.$/)
       );
     });
 
@@ -1687,7 +1687,7 @@ describe("inventoryCommands", () => {
       // The closing report still fires (not swallowed by an unhandled
       // rejection) and calls out the incomplete runtime cleanup by name.
       expect(mockShowInformationMessage).toHaveBeenCalledWith(
-        expect.stringMatching(/^Inventory sync complete:.*Runtime cleanup incomplete for 1 server — close its terminal manually\.$/)
+        expect.stringMatching(/^Inventory sync from ".*" complete:.*Runtime cleanup incomplete for 1 server — close its terminal manually\.$/)
       );
     });
 
@@ -2039,7 +2039,7 @@ describe("inventoryCommands", () => {
       // The modal was shown a SECOND time, with the updated (2-delete) plan.
       expect(mockShowInformationMessage).toHaveBeenCalledTimes(2);
       const secondCallDetail = (mockShowInformationMessage.mock.calls[1]?.[1] as { detail?: string } | undefined)?.detail;
-      expect(secondCallDetail).toContain("2 deleted");
+      expect(secondCallDetail).toContain("2 servers will be deleted");
 
       // If the fix were reverted (the post-teardown final recompute applied
       // unseen instead of looping back to reconfirm), applyInventorySyncPlan
@@ -2106,8 +2106,8 @@ describe("inventoryCommands", () => {
       const firstCallDetail = (mockShowInformationMessage.mock.calls[0]?.[1] as { detail?: string } | undefined)?.detail;
       const secondCallDetail = (mockShowInformationMessage.mock.calls[1]?.[1] as { detail?: string } | undefined)?.detail;
       expect(firstCallDetail).not.toContain("will be added as duplicates");
-      expect(secondCallDetail).toContain("1 added");
-      expect(secondCallDetail).toContain("1 deleted");
+      expect(secondCallDetail).toContain("1 server will be added.");
+      expect(secondCallDetail).toContain("1 server will be deleted");
       expect(secondCallDetail).toContain("will be added as duplicates");
 
       // If FINDING 3's fix were reverted (planCountsEqual comparing only raw
@@ -2173,10 +2173,10 @@ describe("inventoryCommands", () => {
       const firstCallDetail = (mockShowInformationMessage.mock.calls[0]?.[1] as { detail?: string } | undefined)?.detail;
       const secondCallDetail = (mockShowInformationMessage.mock.calls[1]?.[1] as { detail?: string } | undefined)?.detail;
       expect(firstCallDetail).not.toContain("jump host");
-      expect(firstCallDetail).toContain("1 deleted");
-      expect(secondCallDetail).toContain("1 deleted");
+      expect(firstCallDetail).toContain("1 server will be deleted");
+      expect(secondCallDetail).toContain("1 server will be deleted");
       expect(secondCallDetail?.toLowerCase()).toContain("jump host");
-      expect(secondCallDetail).toContain("1 other server uses these as SSH jump hosts.");
+      expect(secondCallDetail).toContain("1 other server uses this server as an SSH jump host.");
 
       // If FINDING 1's fix were reverted (a comparator built only from
       // adds/updates/prunes counts, unchangedCount, manualDuplicateCount,
@@ -2256,7 +2256,7 @@ describe("inventoryCommands", () => {
       );
       expect(modalCall).toBeDefined();
       const detail = (modalCall?.[1] as { detail?: string } | undefined)?.detail;
-      expect(detail).toContain("1 added");
+      expect(detail).toContain("1 server will be added.");
 
       // The recomputed (non-empty) plan was actually applied after the user
       // confirmed it — the device is re-created as a fresh add, proving this
@@ -2345,7 +2345,7 @@ describe("inventoryCommands", () => {
       const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
       await cmd("src-1");
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Edit the source"));
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("edit the source"));
       expect(provider.fetchInventory).not.toHaveBeenCalled();
     });
 
@@ -2369,7 +2369,7 @@ describe("inventoryCommands", () => {
       const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
       await cmd("src-1");
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("apiToken"));
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("API Token"));
       expect(provider.fetchInventory).not.toHaveBeenCalled();
     });
 
@@ -2463,7 +2463,7 @@ describe("inventoryCommands", () => {
       expect(options.detail).toContain("1 other server");
       expect(options.detail.toLowerCase()).toContain("jump host");
       // Singular subject-verb agreement (kills "1 other server use..." — should be "uses").
-      expect(options.detail).toContain("1 other server uses these as SSH jump hosts.");
+      expect(options.detail).toContain("1 other server uses this server as an SSH jump host.");
     });
 
     it("(F8) a provider returning a malformed inventory tree surfaces a protocol error and leaves core state unchanged (kills removing validateInventoryTree from syncNow)", async () => {

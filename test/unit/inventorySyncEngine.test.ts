@@ -131,7 +131,7 @@ describe("computeSyncPlan — adds", () => {
     const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
     expect(plan.adds).toHaveLength(1);
     expect(plan.adds[0].group).toBe("NetBox");
-    expect(plan.warnings.some((w) => w.includes("invalid folderPath"))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes("invalid folder path"))).toBe(true);
   });
 
   it("duplicate externalId in the tree: the first device wins, later ones are skipped with a warning (kills last-wins)", () => {
@@ -140,7 +140,7 @@ describe("computeSyncPlan — adds", () => {
     const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
     expect(plan.adds).toHaveLength(1);
     expect(plan.adds[0].name).toBe("first-device");
-    expect(plan.warnings.some((w) => w.includes("Duplicate externalId"))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes("Duplicate device ID"))).toBe(true);
   });
 
   it("(N1) many endpoint-less devices with no owned server produce ONE aggregate warning, not one per device (kills per-device spam)", () => {
@@ -168,11 +168,11 @@ describe("computeSyncPlan — adds", () => {
     ]);
     const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
     // Owned device: dedicated per-device warning, naming it explicitly.
-    expect(plan.warnings.some((w) => w.includes(`Device "core-sw-1" (device:1) has no usable ssh endpoint and was skipped.`))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes(`Device "core-sw-1" (device:1) has no usable SSH endpoint and was skipped.`))).toBe(true);
     // Unowned device: no dedicated per-device warning of that form — it's folded
     // into the aggregate instead (its name may still appear as an aggregate example).
     expect(
-      plan.warnings.some((w) => w.includes(`Device "unowned-noendpoint" (device:2) has no usable ssh endpoint and was skipped.`))
+      plan.warnings.some((w) => w.includes(`Device "unowned-noendpoint" (device:2) has no usable SSH endpoint and was skipped.`))
     ).toBe(false);
     // Aggregate warning covers exactly the one unowned skip, and names it.
     const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("had no usable ssh endpoint"));
@@ -356,7 +356,7 @@ describe("computeSyncPlan — prunes", () => {
     expect(plan.prunes).toHaveLength(0);
     expect(plan.adds).toHaveLength(0);
     expect(plan.updates).toHaveLength(0);
-    expect(plan.warnings.some((w) => w.includes("no usable ssh endpoint"))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes("no usable SSH endpoint"))).toBe(true);
   });
 
   it("(FIX 1) an owned server whose device is present but skipped for an empty name is NOT pruned", () => {

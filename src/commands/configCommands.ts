@@ -2664,7 +2664,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
   }
 
   interface ImportChooserItem extends vscode.QuickPickItem {
-    value?: "clipboard" | "hostListFile" | "mobaxterm" | "securecrtXml" | "securecrtFolder" | "nexusExport";
+    value?: "clipboard" | "hostListFile" | "inventorySource" | "mobaxterm" | "securecrtXml" | "securecrtFolder" | "nexusExport";
   }
 
   // Row order is deliberate, not alphabetical: bulk host-list add is the lead
@@ -2684,6 +2684,11 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       label: "$(list-flat) Host List File…",
       description: ".csv, .tsv, or .txt — one device per line",
       value: "hostListFile"
+    },
+    {
+      label: "$(sync) Inventory Source (NetBox)…",
+      description: "Live sync — devices stay linked to the source",
+      value: "inventorySource"
     },
     { label: "migrate from another client", kind: vscode.QuickPickItemKind.Separator },
     {
@@ -2723,6 +2728,9 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         break;
       case "hostListFile":
         await importHostListFile();
+        break;
+      case "inventorySource":
+        await vscode.commands.executeCommand("nexus.inventory.addSource");
         break;
       case "mobaxterm":
         await importMobaxterm();
