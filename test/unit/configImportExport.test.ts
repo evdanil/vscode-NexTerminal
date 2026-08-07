@@ -4936,4 +4936,92 @@ describe("backup export round-trip", () => {
     expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("valid-token");
     expect(await vault.get(inventorySecretKey("src1", "obsoleteToken"))).toBeUndefined();
   });
+
+  it("ROUND 16 FINDING (import review) — a vault.store rejection while restoring one imported source's secrets rolls back only that source (record + any keys already stored this run) and reports it, while another imported source in the same run is left fully intact with its own secret restored (kills persisted-without-secrets — a source record surviving with no credential after a failed restore)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    // A custom vault (not MockVault) so `store` can be made to reject for one
+    // specific key. Backing map is separate from MockVault's private one so
+    // this test can assert on it directly.
+    const backingStore = new Map<string, string>();
+    const vault: SecretVault = {
+      get: vi.fn(async (key: string) => backingStore.get(key)),
+      store: vi.fn(async (key: string, value: string) => {
+        if (key === inventorySecretKey("src2", "apiSecret")) {
+          throw new Error("secret storage unavailable");
+        }
+        backingStore.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        backingStore.delete(key);
+      })
+    };
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // src1 restores cleanly (one secret field). src2 declares TWO secret
+    // fields — its first field (apiToken) stores successfully, its second
+    // (apiSecret) rejects — so the rollback must delete the already-stored
+    // apiToken key back out too, not just skip the field that failed.
+    const secrets = {
+      inventorySourceSecrets: {
+        src1: { apiToken: "src1-token" },
+        src2: { apiToken: "src2-token", apiSecret: "src2-secret" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [
+        makeInventorySource({ id: "src1", name: "Source One", secretFieldIds: ["apiToken"] }),
+        makeInventorySource({ id: "src2", name: "Source Two", secretFieldIds: ["apiToken", "apiSecret"] })
+      ],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode — the
+    // mode where a stranded, credential-less source is worst: any prior local
+    // record with the same id has already been wiped by the time the restore
+    // loop runs, so there is nothing to fall back to.
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    // src1 is fully present, with its secret restored — the other source's
+    // failure did not abort or otherwise affect it.
+    expect(core.getInventorySource("src1")?.name).toBe("Source One");
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("src1-token");
+
+    // src2 is rolled back entirely: the record importPreservingIds persisted
+    // is gone, and NEITHER of its keys survive in the vault — not the one
+    // that failed to store, and not the one that stored successfully just
+    // before the failure (a reverted fix that only skips the failed field,
+    // or only removes the record without cleaning up the vault, would leave
+    // "src2"'s apiToken key stranded here).
+    expect(core.getInventorySource("src2")).toBeUndefined();
+    expect(await vault.get(inventorySecretKey("src2", "apiToken"))).toBeUndefined();
+    expect(await vault.get(inventorySecretKey("src2", "apiSecret"))).toBeUndefined();
+
+    // The import completes (no thrown/rejected command) with a warning
+    // naming the source that could not be restored.
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Source "Source Two" could not be restored — its credentials failed to store; re-import or add it manually.'
+    );
+  });
 });

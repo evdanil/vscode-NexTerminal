@@ -14,14 +14,16 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "../../src/commands/inventoryCommands";
-import { captureInventorySourcesForBackup, registerConfigCommands } from "../../src/commands/configCommands";
+import { captureBackupStateForExport, registerConfigCommands } from "../../src/commands/configCommands";
 import { NexusCore } from "../../src/core/nexusCore";
 import { inventorySecretKey, type InventoryProvider, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
+import type { ServerConfig } from "../../src/models/config";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { setActiveMacroStore } from "../../src/macroSettings";
+import { passwordSecretKey, passphraseSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
@@ -108,6 +110,19 @@ function makeSource(overrides: Partial<InventorySourceConfig> = {}): InventorySo
 
 function makeTeardown(): InventoryRuntimeTeardown {
   return { teardownServerRuntime: vi.fn(async () => {}) };
+}
+
+function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
+  return {
+    id: "owned-1",
+    name: "old-sw",
+    host: "10.0.0.1",
+    port: 22,
+    username: "netops",
+    authType: "agent",
+    isHidden: false,
+    ...overrides
+  };
 }
 
 function delay(ms: number): Promise<void> {
@@ -292,7 +307,7 @@ describe("configMutationLock — real call-site serialization", () => {
     await syncPromise;
   });
 
-  describe("captureInventorySourcesForBackup (FINDING 1 — backup-export review)", () => {
+  describe("captureBackupStateForExport (FINDING 1 — backup-export review)", () => {
     it("a concurrent editSource mutation queues behind the in-flight locked capture, so the captured source record and its secret are a consistent pre-edit pair (kills the unlocked torn capture: old config paired with a new token)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
@@ -359,7 +374,7 @@ describe("configMutationLock — real call-site serialization", () => {
       // Start the locked capture — it acquires the lock immediately, takes
       // its fresh snapshot, and blocks inside the gated vault.get for the
       // source's secret.
-      const capturePromise = captureInventorySourcesForBackup(core, vault);
+      const capturePromise = captureBackupStateForExport(core, vault);
 
       await delay(10);
       expect(events).toEqual(["capture:start"]);
@@ -412,6 +427,139 @@ describe("configMutationLock — real call-site serialization", () => {
       // it proceeded and took effect.
       expect(core.getInventorySource("src-1")?.name).toBe("Renamed Source");
       expect(backingStore.get(inventorySecretKey("src-1", "apiToken"))).toBe("new-token");
+    });
+
+    it("a syncNow prune-'delete' mutation (which deletes a server record AND its vault password) queues behind an in-flight locked capture, so the captured server record and its password are a consistent pre-sync pair (kills the round-15 fix's narrow scope, which left server records + secrets reading outside the lock)", async () => {
+      // "owned-1" is owned by inventory source "src-1" and will be pruned
+      // ("delete" policy) once the source's next fetch comes back without it.
+      const owned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      // Empty fetch — the previously-synced "owned-1" is no longer reported,
+      // so the plan prunes it under the source's "delete" policy.
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async (): Promise<InventoryTree> => ({ contractVersion: 1, devices: [] }))
+      });
+      registry.register(provider);
+
+      const backingStore = new Map<string, string>([
+        [passwordSecretKey("owned-1"), "pw1"],
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      // Gates the FIRST vault.get for "owned-1"'s password — i.e. the read
+      // captureBackupStateForExport's own server-secret loop does inside the
+      // lock. Every other vault.get (the source-secret pre-check reads
+      // syncNow does before ever touching the lock, the passphrase/proxy
+      // reads for the same server, syncNow's own credential-drift re-read
+      // inside ITS OWN later lock span) passes straight through.
+      let gateArmed = true;
+      let releaseGet!: () => void;
+      const getGate = new Promise<void>((resolve) => {
+        releaseGet = resolve;
+      });
+      const vault = {
+        get: vi.fn(async (key: string) => {
+          if (gateArmed && key === passwordSecretKey("owned-1")) {
+            gateArmed = false;
+            await getGate;
+          }
+          return backingStore.get(key);
+        }),
+        store: vi.fn(async (key: string, value: string) => {
+          backingStore.set(key, value);
+        }),
+        delete: vi.fn(async (key: string) => {
+          backingStore.delete(key);
+        })
+      };
+
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, vault, teardown);
+      registerConfigCommands(core, vault);
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete", secretFieldIds: ["apiToken"] }));
+
+      // Same call-ordering spy as the tests above.
+      const events: string[] = [];
+      const labels = ["capture", "syncNow"];
+      let nextLabel = 0;
+      const realRunExclusive = AsyncMutex.prototype.runExclusive;
+      vi.spyOn(configMutationLock, "runExclusive").mockImplementation(function (
+        this: AsyncMutex,
+        fn: () => Promise<unknown>
+      ) {
+        const label = labels[nextLabel] ?? `call-${nextLabel}`;
+        nextLabel++;
+        return realRunExclusive.call(this, async () => {
+          events.push(`${label}:start`);
+          try {
+            return await fn();
+          } finally {
+            events.push(`${label}:end`);
+          }
+        });
+      } as typeof configMutationLock.runExclusive);
+
+      // Start the locked capture — it acquires the lock immediately, takes
+      // its fresh snapshot (including "owned-1"), and blocks inside the
+      // gated vault.get for "owned-1"'s password.
+      const capturePromise = captureBackupStateForExport(core, vault);
+
+      await delay(10);
+      expect(events).toEqual(["capture:start"]);
+
+      // Now start a full syncNow run — its own vault reads (the source's
+      // apiToken, for the required-secret check and for fetchInventory) and
+      // its confirm modal all happen BEFORE it ever touches
+      // configMutationLock, so none of that is blocked by the capture's
+      // gate. Only its post-confirmation mutation phase (teardown + apply +
+      // pruned-secret vault.delete, all inside its own runExclusive span)
+      // must queue behind the still-in-flight capture.
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      const syncPromise = syncCmd("src-1");
+
+      await delay(10);
+      expect(events).toEqual(["capture:start"]);
+      expect(core.getServer("owned-1")).toBeDefined();
+      expect(backingStore.get(passwordSecretKey("owned-1"))).toBe("pw1");
+
+      // Release the capture's gated read — its critical section can now
+      // finish and hand the lock to the queued syncNow mutation.
+      releaseGet();
+      const captured = await capturePromise;
+      await syncPromise;
+
+      expect(events).toEqual(["capture:start", "capture:end", "syncNow:start", "syncNow:end"]);
+
+      // The captured pair is CONSISTENT: the server record captured is the
+      // pre-sync one (still owning its origin), and the password captured
+      // alongside it is that SAME pre-sync generation's credential ("pw1")
+      // — never a pre-sync record paired with an already-wiped credential.
+      // A reverted fix (server records/secrets read directly in
+      // exportBackup with no lock, or captured in a SEPARATE, narrower lock
+      // span than the one protecting the snapshot) would let syncNow's
+      // prune-delete mutation — including its own vault.delete of this
+      // exact key — complete fully during the gated read, so releasing the
+      // gate would hand back `undefined` instead of "pw1": a server record
+      // with no password, the torn pairing this assertion catches.
+      expect(captured.servers).toHaveLength(1);
+      expect(captured.servers[0].id).toBe("owned-1");
+      expect(captured.servers[0].origin?.sourceId).toBe("src-1");
+      expect(captured.serverSecrets.passwords["owned-1"]).toBe("pw1");
+
+      // syncNow itself was never blocked forever — once the lock freed up it
+      // proceeded and took effect: the server is pruned and its password
+      // gone from the live vault, even though the capture above still holds
+      // the earlier, consistent generation.
+      expect(teardown.teardownServerRuntime).toHaveBeenCalledWith("owned-1");
+      expect(core.getServer("owned-1")).toBeUndefined();
+      expect(backingStore.get(passwordSecretKey("owned-1"))).toBeUndefined();
     });
   });
 });
