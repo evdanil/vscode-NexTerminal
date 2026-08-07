@@ -129,6 +129,58 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
   );
 }
 
+/**
+ * Field-wise rollback merge for applyInventorySyncPlan's conditional restore
+ * (REVIEW FINDING 1 / P2). Used only for a batch-UPDATED record (one that
+ * existed before the batch touched it) whose current live entry has diverged
+ * from `batchSnapshot` — the structural snapshot captured at write time —
+ * because of a concurrent in-place mutation (e.g. _renameFolderPath /
+ * removeFolderCascade rewriting `.group`) or a concurrent replace while this
+ * batch's persist was still in flight.
+ *
+ * Without this, the caller's only options were "restore `prior` wholesale"
+ * (which would also revert the concurrent edit — wrong) or "leave `current`
+ * alone" (which keeps the REJECTED batch write's fields, e.g. a bogus host
+ * from a sync that just failed to persist — also wrong). This merges the two:
+ * for each of ServerConfig's own fields, a field that the concurrent mutation
+ * actually touched (current differs from what THIS batch wrote) keeps its
+ * CURRENT value; every other field falls back to `prior` (the pre-batch
+ * value), discarding the batch's now-rejected write for that field.
+ *
+ * Only meaningful when `prior` is defined — a batch-CREATED record has no
+ * pre-batch state to fall back to (see the call site in
+ * NexusCore.applyInventorySyncPlan, which keeps `current` as-is instead of
+ * calling this for that case).
+ */
+export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: ServerConfig, current: ServerConfig): ServerConfig {
+  const merged: ServerConfig = { ...prior };
+  if (current.name !== batchSnapshot.name) merged.name = current.name;
+  if (current.group !== batchSnapshot.group) merged.group = current.group;
+  if (current.host !== batchSnapshot.host) merged.host = current.host;
+  if (current.port !== batchSnapshot.port) merged.port = current.port;
+  if (current.username !== batchSnapshot.username) merged.username = current.username;
+  if (current.authType !== batchSnapshot.authType) merged.authType = current.authType;
+  if (current.keyPath !== batchSnapshot.keyPath) merged.keyPath = current.keyPath;
+  if (current.isHidden !== batchSnapshot.isHidden) merged.isHidden = current.isHidden;
+  if (current.logSession !== batchSnapshot.logSession) merged.logSession = current.logSession;
+  if (current.multiplexing !== batchSnapshot.multiplexing) merged.multiplexing = current.multiplexing;
+  if (current.legacyAlgorithms !== batchSnapshot.legacyAlgorithms) merged.legacyAlgorithms = current.legacyAlgorithms;
+  if (current.openFileExplorerOnFirstConnect !== batchSnapshot.openFileExplorerOnFirstConnect) {
+    merged.openFileExplorerOnFirstConnect = current.openFileExplorerOnFirstConnect;
+  }
+  if (current.authProfileId !== batchSnapshot.authProfileId) merged.authProfileId = current.authProfileId;
+  if (!proxyConfigsEqual(current.proxy, batchSnapshot.proxy)) {
+    merged.proxy = current.proxy ? { ...current.proxy } : current.proxy;
+  }
+  if (!serverOriginsEqual(current.origin, batchSnapshot.origin)) {
+    merged.origin = current.origin ? { ...current.origin } : current.origin;
+  }
+  // id never changes across a rollback merge — always prior's (== current's,
+  // == batchSnapshot's; the map key this is stored under is invariant).
+  merged.id = prior.id;
+  return merged;
+}
+
 export interface TunnelProfile {
   id: string;
   name: string;

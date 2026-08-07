@@ -50,9 +50,16 @@ import { mostCommonUsername } from "./configCommands";
  * terminals/tunnels/pool connection for nothing. teardownServerRuntime
  * itself (see serverCommands.ts) does not depend on the server record still
  * existing in NexusCore, so calling it AFTER the record is gone is safe.
+ *
+ * FINDING 2 (P2, mid-teardown-recheck review) — `shouldAbort` is threaded
+ * straight through to teardownServerRuntime, which rechecks it after its own
+ * internal awaits (see that function's doc) — a pre-teardown-only absence
+ * check at the call site can't protect against a replacement created DURING
+ * teardown's own awaited tunnel stops. All three inventory call sites below
+ * pass `() => core.getServer(id) !== undefined`.
  */
 export interface InventoryRuntimeTeardown {
-  teardownServerRuntime(serverId: string): Promise<void>;
+  teardownServerRuntime(serverId: string, shouldAbort?: () => boolean): Promise<void>;
 }
 
 function providerMissingMessage(providerId: string): string {
@@ -972,7 +979,13 @@ export function registerInventoryCommands(
               continue;
             }
             try {
-              await teardown.teardownServerRuntime(id);
+              // FINDING 2 (P2, mid-teardown-recheck review) — the presence
+              // check just above only catches a recreation that landed BEFORE
+              // this iteration; shouldAbort lets teardownServerRuntime itself
+              // recheck between its own internal awaits, so a recreation
+              // racing teardown's awaited tunnel stops doesn't get its fresh
+              // pooled SSH connection disconnected out from under it.
+              await teardown.teardownServerRuntime(id, () => core.getServer(id) !== undefined);
             } catch {
               teardownFailureCount++;
             }
@@ -1255,7 +1268,11 @@ export function registerInventoryCommands(
           for (const id of application.removeServerIds) {
             if (tornDownIds.has(id)) continue;
             try {
-              await teardown.teardownServerRuntime(id);
+              // FINDING 2 (P2, mid-teardown-recheck review) — shouldAbort lets
+              // teardownServerRuntime recheck between its own internal awaits,
+              // so a server recreated while its tunnel stops were in flight
+              // doesn't get its fresh pooled SSH connection disconnected.
+              await teardown.teardownServerRuntime(id, () => core.getServer(id) !== undefined);
             } catch {
               teardownFailedIds.add(id);
             }
@@ -1389,7 +1406,13 @@ export function registerInventoryCommands(
               continue;
             }
             try {
-              await teardown.teardownServerRuntime(id);
+              // FINDING 2 (P2, mid-teardown-recheck review) — the presence
+              // check just above only catches a recreation that landed BEFORE
+              // this iteration; shouldAbort lets teardownServerRuntime itself
+              // recheck between its own internal awaits, so a recreation
+              // racing teardown's awaited tunnel stops doesn't get its fresh
+              // pooled SSH connection disconnected out from under it.
+              await teardown.teardownServerRuntime(id, () => core.getServer(id) !== undefined);
             } catch {
               teardownFailedIds.add(id);
             }

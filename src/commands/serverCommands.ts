@@ -962,8 +962,30 @@ async function disconnectServer(ctx: CommandContext, arg?: unknown): Promise<voi
  * besides the id we already have, so it's inlined directly against
  * `serverId` instead of re-resolving through core. Safe to call whether or
  * not `serverId` still names a server in NexusCore.
+ *
+ * FINDING 2 (P2, mid-teardown-recheck review) — a caller's pre-teardown
+ * "still absent" check only guards against a replacement that existed
+ * BEFORE this call started; it says nothing about a replacement created
+ * DURING the awaits inside this function itself (the tunnel-stop
+ * `Promise.all` below can take arbitrarily long). A replacement created in
+ * that window gets its own new pooled SSH connection under the same
+ * `serverId`, and an unconditional `sshPool.disconnect(serverId)` at the
+ * end would then tear that brand-new connection down instead of the stale
+ * one this call actually set out to clean up.
+ *
+ * `shouldAbort`, when provided, is rechecked after every await in this
+ * function (currently the one after the tunnel-stop `Promise.all`) —
+ * immediately before the next disposal step. A `true` result stops the
+ * rest of teardown right there: already-completed steps (terminals
+ * disposed, tunnels already stopped) are NOT undone or retried — an
+ * acceptable, documented limitation, since those steps only ever acted on
+ * the STALE server's own terminals/tunnels regardless of what shows up
+ * afterward. Only the final `sshPool.disconnect` — the one step that could
+ * otherwise hit a replacement's fresh connection — is guarded this way.
+ * Callers that omit `shouldAbort` (the plain nexus.server.remove flow) get
+ * the original, unconditional behavior.
  */
-export async function teardownServerRuntime(ctx: CommandContext, serverId: string): Promise<void> {
+export async function teardownServerRuntime(ctx: CommandContext, serverId: string, shouldAbort?: () => boolean): Promise<void> {
   const terminals = ctx.terminalsByServer.get(serverId);
   if (terminals) {
     for (const terminal of terminals) {
@@ -973,6 +995,9 @@ export async function teardownServerRuntime(ctx: CommandContext, serverId: strin
   }
   const remaining = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === serverId);
   await Promise.all(remaining.map((t) => ctx.tunnelManager.stop(t.id)));
+  if (shouldAbort?.()) {
+    return;
+  }
   ctx.sshPool.disconnect(serverId);
 }
 

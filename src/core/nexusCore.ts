@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   cloneServerConfig,
+  mergeServerConfigFields,
   serverConfigsEqual,
   type ActiveLocalShellSession,
   type ActiveSerialSession,
@@ -538,19 +539,63 @@ export class NexusCore {
       // FINDING 3 (original) — servers: restore the prior entry only if the
       // current entry is still structurally identical to what this batch
       // wrote (or still absent where this batch deleted it). If a concurrent
-      // command changed or mutated it since, leave the newer value alone.
+      // command changed or mutated it since, a wholesale restore/skip would
+      // either erase the concurrent edit or keep the rejected batch write —
+      // see REVIEW FINDING 1 below for the merge that replaces the old
+      // skip-whole-record behavior in the UPDATE case.
       for (const [id, priorServer] of priorServers) {
         const batchSnapshot = batchWrittenServers.get(id);
         const current = this.servers.get(id);
-        const stillOurs = batchSnapshot === undefined ? current === undefined : current !== undefined && serverConfigsEqual(current, batchSnapshot);
-        if (!stillOurs) {
+        if (batchSnapshot === undefined) {
+          // This batch deleted the record. Restore it only if nothing has
+          // recreated it since (current still absent) — a concurrent
+          // recreation is left alone entirely.
+          if (current === undefined && priorServer) {
+            this.servers.set(id, priorServer);
+          }
           continue;
         }
-        if (priorServer) {
-          this.servers.set(id, priorServer);
-        } else {
-          this.servers.delete(id);
+        if (current === undefined) {
+          // This batch created/updated the record, but something concurrent
+          // deleted it since. Nothing to merge onto — leave it deleted.
+          continue;
         }
+        if (serverConfigsEqual(current, batchSnapshot)) {
+          // Untouched since this batch wrote it: full rollback (restore
+          // prior, or delete outright if this batch had created it).
+          if (priorServer) {
+            this.servers.set(id, priorServer);
+          } else {
+            this.servers.delete(id);
+          }
+          continue;
+        }
+        // REVIEW FINDING 1 (P2) — current differs from what this batch wrote:
+        // a concurrent in-place mutation (_renameFolderPath /
+        // removeFolderCascade rewriting `.group` on the very same object) or
+        // a concurrent replace landed while this batch's persist was still
+        // in flight. The old behavior treated this as "not ours anymore" and
+        // skipped the WHOLE record — which for an UPDATE left the rejected
+        // batch write's untouched fields (host/name/port/origin, ...) in
+        // place, and the compensating save below would then persist them
+        // even though the command reports failure.
+        if (!priorServer) {
+          // This batch CREATED the record — there is no pre-batch state to
+          // merge the concurrent edit onto. Restoring "prior" here would mean
+          // deleting the record outright, destroying the concurrent edit
+          // along with the rejected create. Keep the current
+          // (concurrently-mutated) entry as-is; this is a deliberate,
+          // documented exception to "the rejected batch's fields must not
+          // survive" — for a created record there is nothing else for the
+          // concurrent edit to attach to.
+          continue;
+        }
+        // This batch UPDATED an existing record: merge field-wise. A field
+        // the concurrent edit actually touched (current differs from what
+        // this batch wrote) keeps its current value; every other field falls
+        // back to the pre-batch value, discarding this batch's rejected
+        // write for that field.
+        this.servers.set(id, mergeServerConfigFields(priorServer, batchSnapshot, current));
       }
       // FINDING 3 — explicitGroups: this batch only ever ADDS paths, so
       // rollback only removes paths THIS batch added that are still present.

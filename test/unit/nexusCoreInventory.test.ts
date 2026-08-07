@@ -1026,6 +1026,198 @@ describe("NexusCore inventory sources", () => {
     // captured at write time and leaves the rename alone.
     expect(core.getServer("srv-1")?.group).toBe("NetBox/RenamedRack");
   });
+
+  it("(REVIEW FINDING 1) a concurrent in-place mutation of ONE field (group) during rollback merges field-wise instead of retaining the whole rejected upsert — the rolled-back entry gets the PRIOR host (batch's own change discarded) AND the concurrently-mutated group (kills skip-whole-record)", async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s",
+        host: "h-old",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        group: "OldGroup",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    // Hold the batch's own saveServers call pending so a concurrent in-place
+    // mutation (as performed by _renameFolderPath / removeFolderCascade,
+    // which reassign `server.group` on the SAME object already sitting in
+    // NexusCore's servers map) can land while the persist is still in
+    // flight. The batch's OWN catch-block compensating re-persist (after
+    // rollback) must go through to the real implementation, not hang too.
+    const originalSaveServers = repository.saveServers.bind(repository);
+    let rejectBatchSave!: (err: Error) => void;
+    let batchCallSeen = false;
+    vi.spyOn(repository, "saveServers").mockImplementation(async (servers) => {
+      if (!batchCallSeen) {
+        batchCallSeen = true;
+        return new Promise<void>((_resolve, reject) => {
+          rejectBatchSave = reject;
+        });
+      }
+      return originalSaveServers(servers);
+    });
+
+    // This batch intends to change BOTH host and group.
+    const upsertedServer: ServerConfig = {
+      id: "srv-1",
+      name: "s",
+      host: "h-new-batch",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 999 }
+    };
+    const applyPromise = core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 999,
+      upsertServers: [upsertedServer],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: makeSourceConfig()
+    });
+
+    // The batch's synchronous mutations + save invocation have already run by
+    // the time control returns here. Mutate ONLY `.group` in place on the
+    // live entry, precisely like _renameFolderPath does for a folder rename
+    // racing this pending persist — `.host` is left exactly as the batch set
+    // it.
+    const liveServer = core.getServer("srv-1")!;
+    expect(liveServer).toBe(upsertedServer); // sanity: same reference
+    liveServer.group = "ConcurrentGroup";
+
+    rejectBatchSave(new Error("disk full"));
+    await expect(applyPromise).rejects.toThrow("disk full");
+
+    const rolledBack = core.getServer("srv-1");
+    // The concurrently-mutated field survives rollback...
+    expect(rolledBack?.group).toBe("ConcurrentGroup");
+    // ...but the field the concurrent mutation never touched falls back to
+    // the PRE-BATCH value — the batch's own (now-rejected) host change is
+    // discarded. A skip-whole-record implementation would instead leave
+    // `host` at the batch's rejected "h-new-batch", because it treats any
+    // divergence from the batch snapshot (here, just the group mutation) as
+    // reason to abandon the whole record and keep `current` untouched.
+    expect(rolledBack?.host).toBe("h-old");
+    // Unrelated, untouched-since-batch-wrote fields are restored from prior too.
+    expect(rolledBack?.name).toBe("s");
+    expect(rolledBack?.origin?.syncedAt).toBe(1);
+  });
+
+  it("(REVIEW FINDING 1) unchanged-fields rollback still fully restores prior when nothing concurrent touched the record (no divergence from the batch snapshot)", async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s",
+        host: "h-old",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        group: "OldGroup",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    vi.spyOn(repository, "saveServers").mockRejectedValueOnce(new Error("disk full"));
+
+    const upsertedServer: ServerConfig = {
+      id: "srv-1",
+      name: "s",
+      host: "h-new-batch",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 999 }
+    };
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 999,
+        upsertServers: [upsertedServer],
+        removeServerIds: [],
+        folders: ["NetBox/RackA"],
+        expectedSource: makeSourceConfig()
+      })
+    ).rejects.toThrow("disk full");
+
+    // Nothing concurrent touched srv-1 — the whole prior record is restored,
+    // exactly as before this finding's fix (the merge path is only reached
+    // when current diverges from the batch snapshot).
+    const rolledBack = core.getServer("srv-1");
+    expect(rolledBack?.host).toBe("h-old");
+    expect(rolledBack?.group).toBe("OldGroup");
+    expect(rolledBack?.origin?.syncedAt).toBe(1);
+  });
+
+  it("(REVIEW FINDING 1) a batch-CREATED record with a concurrent in-place mutation keeps the current (concurrently-mutated) entry as-is — there is no prior state to merge onto", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    const originalSaveServers = repository.saveServers.bind(repository);
+    let rejectBatchSave!: (err: Error) => void;
+    let batchCallSeen = false;
+    vi.spyOn(repository, "saveServers").mockImplementation(async (servers) => {
+      if (!batchCallSeen) {
+        batchCallSeen = true;
+        return new Promise<void>((_resolve, reject) => {
+          rejectBatchSave = reject;
+        });
+      }
+      return originalSaveServers(servers);
+    });
+
+    const newServer: ServerConfig = {
+      id: "srv-new",
+      name: "new",
+      host: "h",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 999 }
+    };
+    const applyPromise = core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 999,
+      upsertServers: [newServer],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: makeSourceConfig()
+    });
+
+    const liveServer = core.getServer("srv-new")!;
+    expect(liveServer).toBe(newServer);
+    liveServer.group = "ConcurrentGroup";
+
+    rejectBatchSave(new Error("disk full"));
+    await expect(applyPromise).rejects.toThrow("disk full");
+
+    // There was no pre-batch record for srv-new to merge concurrent changes
+    // onto; deleting it would destroy the concurrent edit along with the
+    // rejected create, so the current (concurrently-mutated) entry survives
+    // as-is instead.
+    const rolledBack = core.getServer("srv-new");
+    expect(rolledBack).toBeDefined();
+    expect(rolledBack?.group).toBe("ConcurrentGroup");
+    expect(rolledBack?.host).toBe("h");
+  });
 });
 
 describe("validateInventorySource", () => {

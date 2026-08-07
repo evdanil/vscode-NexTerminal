@@ -1361,7 +1361,7 @@ describe("inventoryCommands", () => {
       // in the post-apply second pass (see that finding's dedicated test
       // below for the reconnect scenario this second pass exists to catch).
       expect(teardown.teardownServerRuntime).toHaveBeenCalledTimes(2);
-      expect(teardown.teardownServerRuntime).toHaveBeenCalledWith("owned-1");
+      expect(teardown.teardownServerRuntime).toHaveBeenCalledWith("owned-1", expect.any(Function));
       expect(callOrder).toEqual(["teardown:owned-1", "apply", "teardown:owned-1"]);
 
       const snapshot = core.getSnapshot();
@@ -1761,7 +1761,7 @@ describe("inventoryCommands", () => {
       const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
       await cmd("src-1");
 
-      expect(teardown.teardownServerRuntime).toHaveBeenCalledWith("owned-1");
+      expect(teardown.teardownServerRuntime).toHaveBeenCalledWith("owned-1", expect.any(Function));
       // The pruned server is still gone.
       expect(core.getServer("owned-1")).toBeUndefined();
       // The survivor picked up BOTH the inventory-driven update (new host)

@@ -380,6 +380,59 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
   });
 
+  it("(P2 — mid-teardown-recheck review) shouldAbort flipped true WHILE the tunnel-stop await is still pending stops teardown before sshPool.disconnect (kills an unguarded post-await disconnect)", async () => {
+    const profile = makeTunnel({ id: "tp-1", autoStop: false });
+    const { ctx, stopTunnel, disconnectPool, terminalDispose } = setupHarness({
+      servers: [makeServer()],
+      profiles: [profile],
+      activeTunnels: [{ id: "at-1", profileId: "tp-1", serverId: "srv-1" }]
+    });
+
+    // Controllable tunnel-stop promise: teardownServerRuntime's internal
+    // Promise.all(tunnelManager.stop(...)) stays pending until resolveStop()
+    // is called, giving us a window to flip `aborted` to true WHILE that
+    // await is in flight — simulating a replacement server materializing
+    // (with its own fresh pooled connection) during exactly that window.
+    let resolveStop!: () => void;
+    stopTunnel.mockImplementation(() => new Promise<void>((resolve) => { resolveStop = resolve; }));
+
+    let aborted = false;
+    const teardownPromise = teardownServerRuntime(ctx, "srv-1", () => aborted);
+
+    // Let the synchronous prefix of teardownServerRuntime run: terminal
+    // disposal already happened, and stop() has been invoked (kicking off
+    // the pending Promise.all) but not yet resolved.
+    await Promise.resolve();
+    expect(terminalDispose).toHaveBeenCalled();
+    expect(stopTunnel).toHaveBeenCalledWith("at-1");
+    expect(disconnectPool).not.toHaveBeenCalled();
+
+    aborted = true;
+    resolveStop();
+    await teardownPromise;
+
+    // If shouldAbort were only checked before the first await (or not at
+    // all), disconnectPool would still fire here once the tunnel-stop
+    // promise resolves. The recheck immediately after that await must catch
+    // the flip and skip the final disposal step.
+    expect(disconnectPool).not.toHaveBeenCalled();
+  });
+
+  it("(P2 — mid-teardown-recheck review) shouldAbort false throughout still runs the full teardown, including sshPool.disconnect (unchanged behavior)", async () => {
+    const profile = makeTunnel({ id: "tp-1", autoStop: false });
+    const { ctx, stopTunnel, disconnectPool, terminalDispose } = setupHarness({
+      servers: [makeServer()],
+      profiles: [profile],
+      activeTunnels: [{ id: "at-1", profileId: "tp-1", serverId: "srv-1" }]
+    });
+
+    await teardownServerRuntime(ctx, "srv-1", () => false);
+
+    expect(terminalDispose).toHaveBeenCalled();
+    expect(stopTunnel).toHaveBeenCalledWith("at-1");
+    expect(disconnectPool).toHaveBeenCalledWith("srv-1");
+  });
+
   it("keeps pool connection when autoStop=false tunnel remains active", async () => {
     const autoStopProfile = makeTunnel({ id: "tp-stop", autoStop: true });
     const keepProfile = makeTunnel({ id: "tp-keep", autoStop: false });

@@ -557,7 +557,7 @@ describe("configMutationLock — real call-site serialization", () => {
       // proceeded and took effect: the server is pruned and its password
       // gone from the live vault, even though the capture above still holds
       // the earlier, consistent generation.
-      expect(teardown.teardownServerRuntime).toHaveBeenCalledWith("owned-1");
+      expect(teardown.teardownServerRuntime).toHaveBeenCalledWith("owned-1", expect.any(Function));
       expect(core.getServer("owned-1")).toBeUndefined();
       expect(backingStore.get(passwordSecretKey("owned-1"))).toBeUndefined();
     });
