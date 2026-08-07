@@ -1035,7 +1035,17 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // edit to a synced server silently detaches it from inventory sync: the
           // next sync sees an unowned server squatting on the deterministic id and
           // skips the device forever (id-collision guard in syncEngine.ts).
-          const updated = existing.origin !== undefined ? { ...linked, origin: existing.origin } : linked;
+          //
+          // The restore is deferred to inside the mutation lock, below — it
+          // must source `origin` from the LIVE record (`liveRecord`), not
+          // from this form-open `existing` snapshot. If Remove Source → Keep
+          // Servers stripped the live server's origin while this form was
+          // open, `existing.origin` is a stale ownership marker; reattaching
+          // it here would resurrect the dead source's ownership (an inert
+          // synced badge, and a later same-id source import could then
+          // manage a server it no longer owns). `liveRecord` reflects
+          // whatever ownership state actually holds at write time: present →
+          // keep it, stripped/absent → leave it absent.
           // FINDING 2 (P2, edit-race review) — the record persist and the
           // proxy-secret sync must commit as ONE generation with respect to
           // captureBackupStateForExport (configCommands.ts), which reads a
@@ -1096,6 +1106,12 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // the live-snapshot rollback below to undo cleanly on failure
             // is an accepted, intentional scope limit for this fix.
             const liveRecord = ctx.core.getServer(existing.id);
+            // P1 — origin preservation (see the comment on `linked` above)
+            // sources from `liveRecord`, captured immediately above, NOT
+            // from the form-open `existing` snapshot: present → keep it,
+            // stripped/absent (e.g. a Remove Source → Keep Servers that
+            // landed while the form was open) → leave it absent.
+            const updated = liveRecord?.origin !== undefined ? { ...linked, origin: liveRecord.origin } : linked;
             // FINDINGS 2+3 (P2, edit-rollback review) — addOrUpdateServer
             // enforces single ownership of openFileExplorerOnFirstConnect:
             // if `updated` enables the flag, it clears it from whichever

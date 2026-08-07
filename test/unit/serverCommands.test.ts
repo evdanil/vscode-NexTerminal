@@ -1979,6 +1979,52 @@ describe("nexus.server.edit — origin preservation (P1)", () => {
     const saved = addOrUpdateServer.mock.calls[0][0] as ServerConfig;
     expect(saved.origin).toBeUndefined();
   });
+
+  it("does NOT resurrect origin from the form-open snapshot when Remove Source → Keep Servers stripped the live record's origin while the form was open (kills reattaching existing.origin instead of sourcing from the live record)", async () => {
+    const origin = { sourceId: "netbox-1", externalId: "device:42", syncedAt: 1000 };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ origin })]
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    // Open the edit form. `existing` is captured here, WITH origin — this
+    // is the form-open snapshot a wrong implementation would reattach from.
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Simulate Remove Source → Keep Servers landing on the LIVE record
+    // while the form is still open: the source is gone, so the live server
+    // loses its ownership marker, but the record itself survives.
+    const liveWithoutOrigin: ServerConfig = { ...makeServer({ origin }), origin: undefined };
+    await ctx.core.addOrUpdateServer(liveWithoutOrigin);
+    addOrUpdateServer.mockClear(); // only count the edit's own write below
+
+    // Submit the still-open edit form.
+    await options.onSubmit({
+      name: "Renamed Server",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password"
+    });
+
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    const saved = addOrUpdateServer.mock.calls[0][0] as ServerConfig;
+    expect(saved.name).toBe("Renamed Server");
+    // Kill check: sourcing origin from `existing` (the form-open snapshot,
+    // which still has `origin` set) instead of the live record would leave
+    // this equal to `origin` — resurrecting the dead source's ownership
+    // marker onto a record it no longer owns. The fix sources from the LIVE
+    // record captured inside the mutation lock, which has no origin.
+    expect(saved.origin).toBeUndefined();
+  });
 });
 
 describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)", () => {
