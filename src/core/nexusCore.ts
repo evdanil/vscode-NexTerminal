@@ -335,14 +335,18 @@ export class NexusCore {
    * explicit folders STRICTLY under `targetFolder` (never `targetFolder`
    * itself — that stays even if momentarily empty) that are:
    *   - in `ownedCandidates` (REVIEW FINDING 1, P2 — the source's OWN prior
-   *     `managedFolders`, minus the folders this very sync still names; see
-   *     applyInventorySyncPlan's call site). A folder never named by any of
-   *     this source's own past applies is NEVER a candidate here, however
-   *     empty it is — it might be a manually-created folder the user
-   *     deliberately keeps empty (e.g. a staging area under the same
-   *     targetFolder), or one owned by a completely different source. GC
-   *     only ever reclaims a folder that this source itself created and has
-   *     since stopped naming — never sweeps unowned territory,
+   *     `managedFolders`, minus the folders this very sync still names OR
+   *     still occupies with its own devices, and minus any path another
+   *     source currently manages or has as an ancestor of a managed path —
+   *     REVIEW FINDING 2, P2; see applyInventorySyncPlan's call site). A
+   *     folder never named by any of this source's own past applies is NEVER
+   *     a candidate here, however empty it is — it might be a
+   *     manually-created folder the user deliberately keeps empty (e.g. a
+   *     staging area under the same targetFolder), or one owned by a
+   *     completely different source. GC only ever reclaims a folder that
+   *     this source itself created and has since stopped naming/occupying,
+   *     and that no OTHER source still manages — never sweeps unowned or
+   *     cross-owned territory,
    *   - not in `keepFolders` (the application's own `folders` list, with
    *     ancestors included) — a folder this very sync still names must never
    *     be GC'd out from under it just because it happens to be empty this
@@ -657,30 +661,81 @@ export class NexusCore {
       this.servers.set(server.id, server);
       batchWrittenServers.set(server.id, cloneServerConfig(server));
     }
-    // REVIEW FINDING 1 (P2, folder-GC ownership) — the new `managedFolders`
-    // set this apply stamps onto the source record: exactly the members of
-    // `applicationFolderSet` that fall STRICTLY under `source.targetFolder`
-    // (the ancestors-included set already computed above; a root ("")
-    // targetFolder naturally yields an empty set here, since no folder path
-    // starts with "/", matching GC's own root exemption below). This
-    // REPLACES the source's previous `managedFolders` wholesale — it is a
-    // snapshot of what THIS sync's own `folders` list names, not an
-    // accumulating history, so a folder this sync stops naming (e.g. a
-    // renamed rack) drops out of the managed set on this very apply.
+    // REVIEW FINDING 1 (P2, folder-GC ownership — no-op syncs must retain
+    // ownership) — `applicationFolderSet` alone is NOT a faithful picture of
+    // what this source manages: computeSyncPlan only populates `apply.folders`
+    // from adds/updates/orphans (+ the orphan targetFolder), so a STABLE sync
+    // (nothing added/updated/orphaned — every device already matches) yields
+    // an EMPTY `apply.folders`, and a managed set derived from that alone
+    // would empty out on every no-op run. A folder whose device then moves
+    // away on some LATER sync would never have been in `previousManagedFolders`
+    // to begin with, so it could never become GC-eligible — it lingers
+    // forever. Fix: also derive the managed set from the source's ACTUAL
+    // post-apply footprint — walk `this.servers` (already mutated above) for
+    // every record this source currently owns (`origin?.sourceId ===
+    // apply.sourceId`) and collect its group plus all ancestors, intersected
+    // to strictly-under-`targetFolder`. `newManagedFolders` is the UNION of
+    // that footprint with the `applicationFolderSet`-derived set (which is
+    // still needed to cover folders this apply just created but which are
+    // momentarily empty — e.g. a fresh orphan destination with nothing moved
+    // into it yet on THIS apply).
+    const sourceOwnedFootprint = new Set<string>();
+    if (source && source.targetFolder !== "") {
+      const prefix = `${source.targetFolder}/`;
+      for (const server of this.servers.values()) {
+        if (server.origin?.sourceId !== apply.sourceId || !server.group) {
+          continue;
+        }
+        for (const ancestor of getAncestorPaths(server.group)) {
+          if (ancestor.startsWith(prefix)) {
+            sourceOwnedFootprint.add(ancestor);
+          }
+        }
+      }
+    }
+    // This REPLACES the source's previous `managedFolders` wholesale — it is
+    // a snapshot of what THIS sync's own footprint + folder list name, not an
+    // accumulating history, so a folder neither named by this sync nor
+    // occupied by any of this source's own devices anymore (e.g. a renamed
+    // rack) drops out of the managed set on this very apply.
     //
     // `gcOwnedCandidates` — the previous managed set (empty for a legacy
     // record, or a source's first-ever non-"absent" apply — nothing to diff
     // against yet) MINUS the new one: folders this source itself created on
-    // some prior sync and has now stopped naming. Only these are eligible
-    // for GC below; a folder never in the source's own managed history
-    // (hand-created by the user, or owned by a DIFFERENT source under the
-    // same targetFolder) is never touched, however empty it is.
+    // some prior sync and has now stopped naming/occupying. Only these are
+    // eligible for GC below; a folder never in the source's own managed
+    // history (hand-created by the user, or owned by a DIFFERENT source under
+    // the same targetFolder) is never touched, however empty it is.
+    //
+    // REVIEW FINDING 2 (P2, cross-source ownership) — two sources can target
+    // overlapping trees and both legitimately manage the very same folder
+    // (e.g. two NetBox sources pointed at the same "NetBox" targetFolder,
+    // each syncing devices into "NetBox/RackA"). If source X drops the folder
+    // from its own managed set while it's momentarily empty, GC must not
+    // reclaim it out from under source Y, which still names it. Exclude from
+    // `gcOwnedCandidates` any path that is EXACTLY managed by another source,
+    // OR is an ANCESTOR of a path another source manages — deleting an
+    // ancestor would orphan that other source's chain even though the
+    // ancestor itself isn't in the other source's set verbatim.
+    const otherSourcesManagedOrAncestors = new Set<string>();
+    for (const [otherId, otherSource] of this.inventorySources) {
+      if (otherId === apply.sourceId) {
+        continue;
+      }
+      for (const managed of otherSource.managedFolders ?? []) {
+        for (const ancestor of getAncestorPaths(managed)) {
+          otherSourcesManagedOrAncestors.add(ancestor);
+        }
+      }
+    }
     const newManagedFolders: Set<string> =
       source && source.targetFolder !== ""
-        ? new Set([...applicationFolderSet].filter((f) => f.startsWith(`${source.targetFolder}/`)))
+        ? new Set([...sourceOwnedFootprint, ...[...applicationFolderSet].filter((f) => f.startsWith(`${source.targetFolder}/`))])
         : new Set<string>();
     const previousManagedFolders = new Set(source?.managedFolders ?? []);
-    const gcOwnedCandidates = new Set([...previousManagedFolders].filter((f) => !newManagedFolders.has(f)));
+    const gcOwnedCandidates = new Set(
+      [...previousManagedFolders].filter((f) => !newManagedFolders.has(f) && !otherSourcesManagedOrAncestors.has(f))
+    );
     // ITEM B (empty-folder GC) — runs synchronously here, in the mutation
     // phase, AFTER the upserts/removes above so it sees the POST-sync server
     // set. Scoped to non-"absent" applications only (REMOVAL disposition
