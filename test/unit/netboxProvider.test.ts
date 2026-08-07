@@ -87,6 +87,56 @@ describe("createNetboxProvider", () => {
       }
     });
 
+    it("FINDING 1 — aborts with a protocol error when a later page reports a different count than the first page (kills silently continuing with shifted offsets)", async () => {
+      // Page 1 reports count 520 (2 more pages expected at limit=250). Page 2
+      // reports 519 — as if a device was deleted server-side between the two
+      // requests. A naive loop that overwrites `count` on every page would
+      // just keep going with offsets that no longer line up with the
+      // now-smaller collection (skipping or duplicating a still-existing
+      // device); this must fail loudly instead.
+      let call = 0;
+      const fetchImpl = vi.fn(async (url: string) => {
+        call++;
+        const offset = Number(new URL(url).searchParams.get("offset"));
+        const reportedCount = call === 1 ? 520 : 519;
+        const results = Array.from({ length: Math.min(250, reportedCount - offset) }, (_, i) => ({
+          id: offset + i + 1,
+          name: `d${offset + i}`,
+          primary_ip: { address: "10.0.0.1/24" }
+        }));
+        return makeResponse(200, { count: reportedCount, results });
+      });
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      let caught: unknown;
+      try {
+        await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toMatchObject({ kind: "protocol" });
+      expect(String((caught as { message?: string }).message)).toContain("520");
+      expect(String((caught as { message?: string }).message)).toContain("519");
+    });
+
+    it("FINDING 1 — a stable count across every page still succeeds (sanity companion — kills over-strict rejection of a normal multi-page fetch)", async () => {
+      const total = 520;
+      const fetchImpl = vi.fn(async (url: string) => {
+        const offset = Number(new URL(url).searchParams.get("offset"));
+        const results = Array.from({ length: Math.min(250, total - offset) }, (_, i) => ({
+          id: offset + i + 1,
+          name: `d${offset + i}`,
+          primary_ip: { address: "10.0.0.1/24" }
+        }));
+        return makeResponse(200, { count: total, results });
+      });
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      expect(tree.devices).toHaveLength(total);
+    });
+
     it("F2 — throws a protocol error when a page is empty but the reported count says more remain (kills silent truncation / an infinite loop)", async () => {
       const fetchImpl = vi.fn(async () => makeResponse(200, { count: 50, results: [] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);

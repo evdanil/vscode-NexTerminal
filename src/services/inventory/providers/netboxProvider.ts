@@ -217,6 +217,18 @@ interface CapState {
  * misbehaving/stalling server), the bound stays pinned to the best progress
  * rate actually demonstrated instead of drifting to excuse the new, slower
  * rate, so a truly stuck server still trips the post-loop guard below.
+ *
+ * FINDING 1 — `count` is captured from the FIRST page only and held fixed
+ * for the rest of this endpoint's fetch. Overwriting it with every page's
+ * reported count (as a naive offset-pagination loop would) lets a
+ * server-side add/delete between page requests shift the offsets mid-fetch:
+ * a still-existing record can be skipped (and then wrongly pruned by the
+ * sync engine) or duplicated across two pages. Any subsequent page
+ * reporting a different count means the collection changed while we were
+ * paging through it, so this aborts loudly rather than silently continuing
+ * with offsets that no longer line up. The invariant is per-endpoint —
+ * devices and VMs are separate calls to this function, each with their own
+ * first-page count.
  */
 async function fetchAllPages(
   fetchImpl: typeof fetch,
@@ -230,6 +242,7 @@ async function fetchAllPages(
   const collected: unknown[] = [];
   let offset = 0;
   let count = Number.POSITIVE_INFINITY;
+  let firstPageCount: number | undefined;
   let iterations = 0;
   let maxPageSize = 0;
   let maxIterations = Number.POSITIVE_INFINITY; // unbounded until the first page tells us a real page size
@@ -244,6 +257,14 @@ async function fetchAllPages(
     }
 
     const page = validatePagedShape(await netboxGetJson(fetchImpl, url, token, timeoutMs), url);
+    if (firstPageCount === undefined) {
+      firstPageCount = page.count;
+    } else if (page.count !== firstPageCount) {
+      throw new InventoryProviderError(
+        "protocol",
+        `NetBox reported a different count at offset ${offset} (${page.count}) than the first page reported (${firstPageCount}) for ${baseUrl}${path} — records were likely added or removed during the sync; retry the sync.`
+      );
+    }
     count = page.count;
 
     if (page.results.length === 0) {

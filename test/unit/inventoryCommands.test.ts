@@ -207,6 +207,40 @@ describe("inventoryCommands", () => {
       expect(vault.store).not.toHaveBeenCalled();
     });
 
+    it("FINDING 2 — an optional password field left blank is omitted from secretFieldIds and never written to the vault (kills recording every password field regardless of whether it was stored)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "apiToken", label: "API Token", type: "password", required: true },
+          { id: "extraToken", label: "Extra Token", type: "password", required: false }
+        ]
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      mockShowInputBox
+        .mockResolvedValueOnce("My NetBox") // name
+        .mockResolvedValueOnce("Infra") // target folder
+        .mockResolvedValueOnce("admin") // default username
+        .mockResolvedValueOnce("netbox.local") // host field
+        .mockResolvedValueOnce("secret-token") // apiToken field
+        .mockResolvedValueOnce(""); // extraToken left blank (optional)
+      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+
+      const source = core.getSnapshot().inventorySources[0];
+      expect(source.secretFieldIds).toEqual(["apiToken"]);
+      expect(vault.store).not.toHaveBeenCalledWith(inventorySecretKey(source.id, "extraToken"), expect.anything());
+      expect(await vault.get(inventorySecretKey(source.id, "extraToken"))).toBeUndefined();
+    });
+
     it("F18 — a vault that throws on store aborts before the source is created (no partial source)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
@@ -262,6 +296,38 @@ describe("inventoryCommands", () => {
 
       expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("old-token");
       expect(provider.testConnection).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ apiToken: "old-token" }));
+    });
+
+    it("FINDING 3 — a vault key whose password field was dropped from the provider schema is deleted at save time; a still-schema-valid kept secret survives (kills orphaning stale vault entries)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      // Current schema only has apiToken — "extra" no longer exists on this provider.
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({ targetFolder: "Infra", config: { host: "netbox.local" }, secretFieldIds: ["apiToken", "extra"] })
+      );
+      await vault.store(inventorySecretKey("src-1", "apiToken"), "old-token");
+      await vault.store(inventorySecretKey("src-1", "extra"), "leftover-token");
+
+      mockShowInputBox
+        .mockResolvedValueOnce("My Source") // name
+        .mockResolvedValueOnce("Infra") // targetFolder
+        .mockResolvedValueOnce("admin") // defaultUsername
+        .mockResolvedValueOnce("netbox.local") // host
+        .mockResolvedValueOnce(""); // apiToken left blank -> keep saved value
+      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
+
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd();
+
+      expect(await vault.get(inventorySecretKey("src-1", "extra"))).toBeUndefined();
+      expect(vault.delete).toHaveBeenCalledWith(inventorySecretKey("src-1", "extra"));
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("old-token");
+      expect(core.getInventorySource("src-1")?.secretFieldIds).toEqual(["apiToken"]);
     });
   });
 
@@ -552,6 +618,35 @@ describe("inventoryCommands", () => {
 
       expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Edit the source"));
       expect(provider.fetchInventory).not.toHaveBeenCalled();
+    });
+
+    it("FINDING 2 — a missing secret for an optional (non-required) password field does not block the sync; the provider runs and receives secrets without that key (kills the guard erroring on any missing secret)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "apiToken", label: "API Token", type: "password", required: true },
+          { id: "extraToken", label: "Extra Token", type: "password", required: false }
+        ],
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+      });
+      registry.register(provider);
+      // Vault only has apiToken — extraToken was never stored, yet secretFieldIds
+      // still names it (mirrors data saved before FIX 1, or a since-cleared key).
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken", "extraToken"] }));
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      expect(mockShowErrorMessage).not.toHaveBeenCalled();
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      const [, passedSecrets] = (provider.fetchInventory as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(passedSecrets).toEqual({ apiToken: "tok" });
+      expect(Object.prototype.hasOwnProperty.call(passedSecrets, "extraToken")).toBe(false);
     });
 
     it("(FIX 3) the confirm modal aggregates manual-duplicate matches into a single count line (kills omitting the aggregate line from the modal)", async () => {

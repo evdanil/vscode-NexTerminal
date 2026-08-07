@@ -350,14 +350,23 @@ export function registerInventoryCommands(
     if (!ok) return;
 
     const id = randomUUID();
-    const secretFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
+    const passwordFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
+
+    // FINDING 2 — secretFieldIds records only ids ACTUALLY stored to the vault
+    // this run. A password field that is optional and left blank never gets a
+    // vault entry, so it must not appear here either — otherwise syncNow's
+    // missing-secret guard would later error on a vault key that was never
+    // written, making the source unsyncable despite the field being genuinely
+    // optional.
+    const secretFieldIds: string[] = [];
 
     // F18 — secrets to vault FIRST; only on success does the source record get created.
     try {
-      for (const fieldId of secretFieldIds) {
+      for (const fieldId of passwordFieldIds) {
         const value = secrets[fieldId];
         if (value !== undefined) {
           await vault.store(inventorySecretKey(id, fieldId), value);
+          secretFieldIds.push(fieldId);
         }
       }
     } catch {
@@ -431,8 +440,6 @@ export function registerInventoryCommands(
       const ok = await testConnectionWithRetry(provider, config, secretsForTest);
       if (!ok) return;
 
-      const newSecretFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
-
       // F18 — vault writes first; only re-entered secrets are stored, so a blank field
       // leaves its previously saved value untouched.
       try {
@@ -442,6 +449,28 @@ export function registerInventoryCommands(
       } catch {
         void vscode.window.showErrorMessage("Could not store credentials in the system keychain — the source was not updated.");
         return;
+      }
+
+      // FINDING 2 — a password field in the CURRENT schema counts as stored
+      // for this source when it was just re-entered, or when it's a kept
+      // (left-blank) field that already had a saved vault value — never
+      // merely because the schema declares it. A field dropped from the
+      // schema entirely, or an optional field that has never had a value
+      // saved, is excluded.
+      const newSecretFieldIds = provider.configFields
+        .filter((f) => f.type === "password" && (reenteredSecrets[f.id] !== undefined || existingSecretFieldIds.has(f.id)))
+        .map((f) => f.id);
+
+      // FINDING 3 — vault keys for ids that were in the OLD secretFieldIds but
+      // fell out of the new set (dropped from the provider schema, or simply
+      // never re-stored) are orphaned: remove-source/reset/backup only walk
+      // secretFieldIds, so a stale vault entry would live forever otherwise.
+      // Deleted before the updated source is persisted.
+      const newSecretFieldIdSet = new Set(newSecretFieldIds);
+      for (const staleId of source.secretFieldIds) {
+        if (!newSecretFieldIdSet.has(staleId)) {
+          await vault.delete(inventorySecretKey(source.id, staleId));
+        }
       }
 
       const updated: InventorySourceConfig = { ...source, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds: newSecretFieldIds };
@@ -536,12 +565,23 @@ export function registerInventoryCommands(
     // between) so a second invocation arriving on the next microtask sees it.
     inFlightSourceIds.add(source.id);
     try {
+      // FINDING 2 — a missing vault entry only aborts the sync when it belongs
+      // to a field the CURRENT provider schema marks `required: true`. An
+      // optional password field can legitimately have no stored secret (never
+      // entered, or dropped from secretFieldIds by FIX 1/3); the provider
+      // still runs and simply doesn't receive that key. `provider` is
+      // guaranteed registered here (checked above), so "provider unavailable"
+      // never applies within this call.
       const secrets: InventorySourceSecrets = {};
       for (const fieldId of source.secretFieldIds) {
         const value = await vault.get(inventorySecretKey(source.id, fieldId));
         if (value === undefined) {
-          void vscode.window.showErrorMessage(`Missing saved credential "${fieldId}" for "${source.name}". Edit the source to re-enter it.`);
-          return;
+          const providerField = provider.configFields.find((f) => f.id === fieldId && f.type === "password");
+          if (providerField?.required) {
+            void vscode.window.showErrorMessage(`Missing saved credential "${fieldId}" for "${source.name}". Edit the source to re-enter it.`);
+            return;
+          }
+          continue;
         }
         secrets[fieldId] = value;
       }
