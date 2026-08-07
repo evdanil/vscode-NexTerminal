@@ -1234,14 +1234,27 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
                 //    submission's own record-rollback above has already
                 //    run) — restoring here would violate the single-owner
                 //    invariant addOrUpdateServer otherwise enforces.
+                //
+                // FINDING 1 (P2, current-flag-owner review) — the
+                // currentFlagOwner check used to guard ONLY the divergent
+                // (else) branch below, not the exact-match branch above it.
+                // On the exact-match path, a concurrent command could have
+                // enabled the flag on some OTHER server C while this
+                // rollback was still pending — restoring it onto the
+                // unchanged displaced owner B here would then silently clear
+                // C's flag via addOrUpdateServer's single-owner enforcement,
+                // even though B's restore has nothing to do with C's
+                // legitimate, more recent change. Hoist the check so it
+                // guards BOTH branches: skip the restore entirely whenever
+                // another server currently holds the flag.
                 try {
                   const currentDisplaced = ctx.core.getServer(displacedOwner.id);
                   if (currentDisplaced !== undefined) {
-                    if (serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined })) {
-                      await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
-                    } else {
-                      const currentFlagOwner = ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect);
-                      if (!currentFlagOwner) {
+                    const currentFlagOwner = ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect);
+                    if (!currentFlagOwner) {
+                      if (serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined })) {
+                        await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
+                      } else {
                         await ctx.core.addOrUpdateServer({ ...currentDisplaced, openFileExplorerOnFirstConnect: true });
                       }
                     }
@@ -1271,6 +1284,26 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
                 try {
                   if (recordStillPresentAfterRollback && priorSecretValue !== undefined) {
                     await ctx.secretVault.store(proxySecretKey, priorSecretValue);
+                    // FINDING 2 (P2, post-store-presence review) — belt-and-
+                    // braces on top of nexus.server.remove now serializing
+                    // its own mutation phase under this SAME
+                    // configMutationLock (see that command's own comment):
+                    // re-check the record's presence AFTER this store's
+                    // await has settled, and best-effort delete the key it
+                    // just wrote if the record has vanished in the meantime.
+                    // Covers any FUTURE lock-free deleter that might still
+                    // slip a removal in between the presence check above and
+                    // this store landing — without this, that race would
+                    // leave exactly the orphaned vault key (a secret with no
+                    // record to pair it with) this whole rollback exists to
+                    // avoid.
+                    if (ctx.core.getServer(existing.id) === undefined) {
+                      try {
+                        await ctx.secretVault.delete(proxySecretKey);
+                      } catch {
+                        // best-effort — ignore
+                      }
+                    }
                   } else {
                     await ctx.secretVault.delete(proxySecretKey);
                   }
@@ -1319,17 +1352,34 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (confirm !== "Remove") {
         return;
       }
-      await disconnectServer(ctx, server.id);
-      if (ctx.secretVault) {
-        await ctx.secretVault.delete(passwordSecretKey(server.id));
-        await ctx.secretVault.delete(passphraseSecretKey(server.id));
-        await ctx.secretVault.delete(proxyPasswordSecretKey(server.id));
-      }
-      // Stop ALL tunnels when server profile is deleted, regardless of autoStop
-      const remaining = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === server.id);
-      await Promise.all(remaining.map((t) => ctx.tunnelManager.stop(t.id)));
-      ctx.sshPool.disconnect(server.id);
-      await ctx.core.removeServer(server.id);
+      // FINDING 2 (P2, remove-mutation-race review) — this flow used to run
+      // its whole teardown+delete sequence lock-free. A concurrent
+      // nexus.server.edit rollback (see the edit-path comments above) can
+      // hold a pending vault.store for THIS SAME server id — if this
+      // remove's key deletion below completed first, then the rollback's
+      // store landed AFTER, the record would already be gone but the vault
+      // key would reappear: an orphaned secret with no record to pair it
+      // with. Serializing this span under configMutationLock (the SAME
+      // singleton the edit rollback and inventory sync/backup flows already
+      // use) makes the two flows strictly ordered instead of interleaved —
+      // this also closes the equivalent remove-vs-inventory-sync and
+      // remove-vs-backup-capture races. `server` is already resolved above
+      // and the confirmation modal has already settled, so nothing
+      // interactive runs inside this span — only disconnect/teardown,
+      // tunnel stops, vault deletions, and the final core.removeServer.
+      await configMutationLock.runExclusive(async () => {
+        await disconnectServer(ctx, server.id);
+        if (ctx.secretVault) {
+          await ctx.secretVault.delete(passwordSecretKey(server.id));
+          await ctx.secretVault.delete(passphraseSecretKey(server.id));
+          await ctx.secretVault.delete(proxyPasswordSecretKey(server.id));
+        }
+        // Stop ALL tunnels when server profile is deleted, regardless of autoStop
+        const remaining = ctx.core.getSnapshot().activeTunnels.filter((t) => t.serverId === server.id);
+        await Promise.all(remaining.map((t) => ctx.tunnelManager.stop(t.id)));
+        ctx.sshPool.disconnect(server.id);
+        await ctx.core.removeServer(server.id);
+      });
     }),
 
     vscode.commands.registerCommand("nexus.server.connect", (arg?: unknown) => connectServer(ctx, arg)),

@@ -595,6 +595,101 @@ describe("openUnifiedForm SSH submit — create rollback on secret-storage failu
     expect(finalB?.openFileExplorerOnFirstConnect).toBe(true);
   });
 
+  it("(FINDING 1, P2) the displaced owner's EXACT-MATCH (unchanged) restore path also skips when another server concurrently claimed the flag while the secret write was still pending (kills exact-match-path blind restore, create variant)", async () => {
+    // Same hand-rolled single-owner-enforcing stand-in as the sibling tests
+    // above, plus an uninvolved third server (C) that a concurrent command
+    // will claim the flag on.
+    const servers = new Map<string, { id: string; name: string; openFileExplorerOnFirstConnect?: boolean }>([
+      ["srv-b", { id: "srv-b", name: "Server B", openFileExplorerOnFirstConnect: true }],
+      ["srv-c", { id: "srv-c", name: "Server C" }]
+    ]);
+    const secrets = new Map<string, string>();
+    const addOrUpdateServer = vi.fn(async (server: { id: string; name: string; openFileExplorerOnFirstConnect?: boolean }) => {
+      if (server.openFileExplorerOnFirstConnect) {
+        for (const [id, existing] of servers.entries()) {
+          if (id !== server.id && existing.openFileExplorerOnFirstConnect) {
+            servers.set(id, { ...existing, openFileExplorerOnFirstConnect: undefined });
+          }
+        }
+      }
+      servers.set(server.id, server);
+    });
+    const removeServer = vi.fn(async (id: string) => {
+      servers.delete(id);
+    });
+    const secretDelete = vi.fn(async (key: string) => {
+      secrets.delete(key);
+    });
+    const ctx = {
+      core: {
+        getSnapshot: vi.fn(() => ({ servers: [...servers.values()], authProfiles: [] })),
+        getAuthProfile: vi.fn(),
+        addOrUpdateServer,
+        removeServer,
+        addOrUpdateSerialProfile: vi.fn(),
+        addOrUpdateLocalShellProfile: vi.fn()
+      },
+      secretVault: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: secretDelete
+      }
+    } as any;
+
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", openFileExplorerOnFirstConnect: true });
+
+    // Gate the proxy-secret write so a concurrent command can enable the
+    // flag on C while it's still pending. B (the displaced owner) itself is
+    // never touched — its live record stays byte-for-byte what
+    // addOrUpdateServer("srv-new") left it, so the rollback's equality
+    // check takes the EXACT-MATCH branch, not the divergent/merge branch.
+    let rejectSecretWrite!: (err: unknown) => void;
+    mockSyncProxyPasswordSecret.mockImplementation(
+      () => new Promise((_resolve, reject) => { rejectSecretWrite = reject; })
+    );
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+
+    const submitPromise = onSubmit({
+      profileType: "ssh",
+      name: "New Server",
+      host: "example.com",
+      username: "me",
+      openFileExplorerOnFirstConnect: true
+    });
+
+    // Let addOrUpdateServer("srv-new") land — displacing B's flag — and let
+    // syncProxyPasswordSecret reach the gated write.
+    await delay(10);
+
+    // Simulate a concurrent command enabling the flag on C while this
+    // submission's secret write is still pending. Single-owner enforcement
+    // only clears whoever CURRENTLY holds the flag (no one, at this point —
+    // B was already cleared), so this cleanly hands the flag to C without
+    // touching B.
+    await addOrUpdateServer({ ...servers.get("srv-c")!, openFileExplorerOnFirstConnect: true });
+
+    rejectSecretWrite(new Error("keychain unavailable"));
+
+    await expect(submitPromise).rejects.toThrow(/server was not created/i);
+
+    // The newly created (and now rolled-back) server is gone.
+    expect(servers.has("srv-new")).toBe(false);
+
+    // Kill check: the pre-fix exact-match branch restores B's flag
+    // UNCONDITIONALLY (its currentFlagOwner check only ever guarded the
+    // divergent/else branch) — that call would itself clear C's flag via
+    // addOrUpdateServer's single-owner enforcement, leaving C cleared and B
+    // wrongly restored. The fix hoists the currentFlagOwner check so it
+    // guards the exact-match branch too: C, the CURRENT flag owner, keeps
+    // it, and B's restore is skipped entirely.
+    const finalB = servers.get("srv-b");
+    const finalC = servers.get("srv-c");
+    expect(finalC?.openFileExplorerOnFirstConnect).toBe(true);
+    expect(finalB?.openFileExplorerOnFirstConnect).toBeUndefined();
+  });
+
   it("(FINDINGS 2+3, P2 — sanity) a successful create that enables the flag leaves the previous owner cleared, as intended (unchanged existing behavior)", async () => {
     const servers = new Map<string, { id: string; name: string; openFileExplorerOnFirstConnect?: boolean }>([
       ["srv-b", { id: "srv-b", name: "Server B", openFileExplorerOnFirstConnect: true }]

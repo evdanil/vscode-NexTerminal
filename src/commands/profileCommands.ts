@@ -148,14 +148,22 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
               //    own record was removed above) — restoring here would
               //    violate the single-owner invariant addOrUpdateServer
               //    otherwise enforces.
+              //
+              // FINDING 1 (P2, current-flag-owner review, sibling) — same
+              // hoist as the nexus.server.edit rollback (serverCommands.ts):
+              // the currentFlagOwner check used to guard ONLY the divergent
+              // (else) branch, not the exact-match branch above it. Hoist it
+              // so it guards BOTH branches — skip the restore entirely
+              // whenever another server currently holds the flag, even on
+              // the exact-match path.
               try {
                 const currentDisplaced = ctx.core.getSnapshot().servers.find((s) => s.id === displacedOwner.id);
                 if (currentDisplaced !== undefined) {
-                  if (serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined })) {
-                    await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
-                  } else {
-                    const currentFlagOwner = ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect);
-                    if (!currentFlagOwner) {
+                  const currentFlagOwner = ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect);
+                  if (!currentFlagOwner) {
+                    if (serverConfigsEqual(currentDisplaced, { ...displacedOwner, openFileExplorerOnFirstConnect: undefined })) {
+                      await ctx.core.addOrUpdateServer({ ...displacedOwner, openFileExplorerOnFirstConnect: true });
+                    } else {
                       await ctx.core.addOrUpdateServer({ ...currentDisplaced, openFileExplorerOnFirstConnect: true });
                     }
                   }

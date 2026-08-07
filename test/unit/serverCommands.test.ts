@@ -2570,6 +2570,79 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(finalB?.openFileExplorerOnFirstConnect).toBe(true);
   });
 
+  it("(FINDING 1, P2) the displaced owner's EXACT-MATCH (unchanged) restore path also skips when another server concurrently claimed the flag while the secret write was still pending (kills exact-match-path blind restore)", async () => {
+    const serverA = makeServer({ id: "srv-1", name: "Server A" });
+    const serverB = makeServer({ id: "srv-2", name: "Server B", openFileExplorerOnFirstConnect: true });
+    const serverC = makeServer({ id: "srv-3", name: "Server C", host: "c.example.com" });
+    const { ctx, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [serverA, serverB, serverC],
+      initialSecrets: {}
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Gate the proxy-secret write so a concurrent command can enable the
+    // flag on a THIRD server (C) while it's still pending. B (the displaced
+    // owner) itself is never touched — its live record stays byte-for-byte
+    // what addOrUpdateServer(A) left it, so the rollback's equality check
+    // takes the EXACT-MATCH branch, not the divergent/merge branch.
+    let rejectSecretWrite!: (err: unknown) => void;
+    secretStore.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { rejectSecretWrite = reject; })
+    );
+
+    const submitPromise = options.onSubmit({
+      name: "Server A",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      openFileExplorerOnFirstConnect: true,
+      proxyType: "socks5",
+      proxySocks5Host: "new-proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: "proxyuser",
+      proxySocks5Password: "new-proxy-pw"
+    });
+
+    // Let addOrUpdateServer(A) land — displacing B's flag — and let
+    // syncProxyPasswordSecret reach the gated write.
+    await delay(10);
+
+    // Simulate a concurrent command (e.g. another edit) enabling the flag
+    // on C while this submission's secret write is still pending — it
+    // doesn't take configMutationLock either. Single-owner enforcement in
+    // addOrUpdateServer only clears whoever CURRENTLY holds the flag (no
+    // one, at this point — B was already cleared), so this cleanly hands
+    // the flag to C without touching B.
+    await ctx.core.addOrUpdateServer({ ...ctx.core.getServer("srv-3")!, openFileExplorerOnFirstConnect: true });
+
+    rejectSecretWrite(new Error("keychain unavailable"));
+
+    await expect(submitPromise).rejects.toThrow(/changes were not saved/i);
+
+    // Kill check: the pre-fix exact-match branch restores B's flag
+    // UNCONDITIONALLY (its currentFlagOwner check only ever guarded the
+    // divergent/else branch) — that call would itself clear C's flag via
+    // addOrUpdateServer's single-owner enforcement, leaving C cleared and B
+    // wrongly restored. The fix hoists the currentFlagOwner check so it
+    // guards the exact-match branch too: C, the CURRENT flag owner, keeps
+    // it, and B's restore is skipped entirely.
+    const finalB = ctx.core.getServer("srv-2");
+    const finalC = ctx.core.getServer("srv-3");
+    expect(finalC?.openFileExplorerOnFirstConnect).toBe(true);
+    expect(finalB?.openFileExplorerOnFirstConnect).toBeUndefined();
+  });
+
   it("(FINDING 3, P2) a server removed concurrently while the proxy-secret restore is pending stays removed, and the vault ends up with no proxy-secret key for its id, instead of an unconditional restore recreating an orphaned secret (kills unconditional restore)", async () => {
     const priorProxy = { type: "socks5" as const, host: "old-proxy.example.com", port: 1080, username: "proxyuser" };
     const { ctx, secretStore } = setupHarness({
@@ -2630,6 +2703,177 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // that no longer has a record (nexus.server.remove already deleted this
     // key). This assertion fails against that implementation because the
     // vault would read back "old-proxy-pw" instead of undefined.
+    const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+    expect(finalSecret).toBeUndefined();
+  });
+
+  it("(FINDING 2, P2) nexus.server.remove's mutation phase queues behind an in-flight nexus.server.edit rollback holding configMutationLock, so remove's teardown/vault-deletes/removeServer are observed strictly after the rollback completes (kills unserialized remove-vs-edit-rollback interleaving)", async () => {
+    const { ctx, secretStore, secretDelete, removeServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()],
+      initialSecrets: {}
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    const removeCmd = registeredCommands.get("nexus.server.remove");
+    expect(editCmd).toBeDefined();
+    expect(removeCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Same call-ordering spy as the other locking tests in this describe
+    // block — logs when each acquirer's body actually starts/finishes
+    // RUNNING against the REAL shared mutex.
+    const events: string[] = [];
+    const labels = ["edit", "remove"];
+    let nextLabel = 0;
+    const realRunExclusive = AsyncMutex.prototype.runExclusive;
+    vi.spyOn(configMutationLock, "runExclusive").mockImplementation(function (
+      this: AsyncMutex,
+      fn: () => Promise<unknown>
+    ) {
+      const label = labels[nextLabel] ?? `call-${nextLabel}`;
+      nextLabel++;
+      return realRunExclusive.call(this, async () => {
+        events.push(`${label}:start`);
+        try {
+          return await fn();
+        } finally {
+          events.push(`${label}:end`);
+        }
+      });
+    } as typeof configMutationLock.runExclusive);
+
+    // Gate the proxy-secret write so the edit's locked span (record write +
+    // secret sync attempt + rollback, all one runExclusive call) stays open
+    // long enough to start a concurrent remove while it's still mid-flight.
+    let rejectSecretWrite!: (err: unknown) => void;
+    secretStore.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { rejectSecretWrite = reject; })
+    );
+
+    const editPromise = options.onSubmit({
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "socks5",
+      proxySocks5Host: "new-proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: "proxyuser",
+      proxySocks5Password: "new-proxy-pw"
+    });
+
+    await delay(10);
+    expect(events).toEqual(["edit:start"]);
+
+    // Invoke nexus.server.remove now — its own arg-resolution and
+    // confirmation modal (stubbed to resolve "Remove" by setupHarness) both
+    // resolve OUTSIDE the locked span, but its mutation phase must queue on
+    // the SAME configMutationLock the edit rollback is still holding.
+    const removePromise = removeCmd!("srv-1");
+
+    await delay(10);
+    expect(events).toEqual(["edit:start"]);
+    expect(removeServer).not.toHaveBeenCalled();
+    expect(secretDelete).not.toHaveBeenCalled();
+
+    // Release the edit's gated write as a rejection — its rollback runs
+    // (still inside the SAME "edit" runExclusive call) and the whole edit
+    // call then throws.
+    rejectSecretWrite(new Error("keychain unavailable"));
+
+    await expect(editPromise).rejects.toThrow(/changes were not saved/i);
+    await removePromise;
+
+    // Kill check: a lock-free (or independently-locked but unserialized)
+    // remove would let "remove:start" appear before "edit:end" — e.g.
+    // interleaving its own vault.delete calls with the still-in-flight
+    // rollback's vault.store, which is exactly the torn-write race this
+    // fix closes (remove's key deletion landing before the rollback's
+    // store, then the store landing after, leaving an orphaned key). This
+    // assertion only passes when remove's mutation phase waited for the
+    // rollback's ENTIRE locked span to finish first.
+    expect(events).toEqual(["edit:start", "edit:end", "remove:start", "remove:end"]);
+    expect(removeServer).toHaveBeenCalledWith("srv-1");
+    expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+  });
+
+  it("(FINDING 2, P2) the edit rollback's post-store presence re-check deletes the just-restored proxy-secret key when the record vanishes between the store landing and the re-check (kills a missing belt-and-braces post-store check)", async () => {
+    const priorProxy = { type: "socks5" as const, host: "old-proxy.example.com", port: 1080, username: "proxyuser" };
+    const { ctx, secretStore, secretDelete } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ proxy: priorProxy })],
+      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Capture the harness's persistent default `store` implementation
+    // (sets the value into the backing secrets map) BEFORE queuing any
+    // once-implementations below — getMockImplementation() returns the
+    // FRONT of the once-queue when one is pending, not the persistent
+    // default, so this must run first or it would capture the rejection
+    // implementation instead.
+    const defaultStoreImpl = secretStore.getMockImplementation()!;
+    // First store call: the submission's OWN proxy-secret write, which must
+    // fail to drive the rollback.
+    secretStore.mockRejectedValueOnce(new Error("keychain unavailable"));
+    // Second store call: the rollback's restore of the prior proxy
+    // password. Let it actually land (mirrors production), THEN simulate a
+    // future lock-free deleter slipping the record's removal in during
+    // exactly this same write window — belt-and-braces is the only thing
+    // standing between this and an orphaned vault key, since
+    // configMutationLock only serializes callers that actually take it.
+    secretStore.mockImplementationOnce(async (key: string, value: string) => {
+      await defaultStoreImpl(key, value);
+      await ctx.core.removeServer("srv-1");
+    });
+
+    await expect(
+      options.onSubmit({
+        name: "Server 1",
+        host: "example.com",
+        port: 22,
+        username: "dev",
+        authType: "password",
+        proxyType: "socks5",
+        proxySocks5Host: "new-proxy.example.com",
+        proxySocks5Port: 1080,
+        proxySocks5Username: "proxyuser",
+        proxySocks5Password: "new-proxy-pw"
+      })
+    ).rejects.toThrow(/changes were not saved/i);
+
+    // The record-rollback logic ran first and (correctly, per its own
+    // pre-existing behavior) restored the record — recordStillPresentAfterRollback
+    // was true and the store branch ran — but the simulated concurrent
+    // deleter then removed it DURING that store call.
+    expect(ctx.core.getServer("srv-1")).toBeUndefined();
+
+    // Kill check: without the post-store presence re-check, the rollback
+    // would consider its job done the moment `store` resolved, leaving
+    // "old-proxy-pw" sitting in the vault under this id even though the
+    // record it belongs to no longer exists — an orphaned key. The fix
+    // re-checks presence immediately after the store settles and
+    // best-effort deletes the key it just wrote when the record is gone.
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
     expect(finalSecret).toBeUndefined();
   });
