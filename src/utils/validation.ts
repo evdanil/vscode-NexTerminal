@@ -134,6 +134,12 @@ export function validateInventorySource(item: unknown): item is InventorySourceC
   if (obj.revision !== undefined && !isNonEmptyString(obj.revision)) {
     return false;
   }
+  // ITEM A (provider trust fingerprint) — optional for backward compat, same
+  // reasoning as `revision` above: a source saved before this field existed
+  // simply has none. When present it must be a non-empty string.
+  if (obj.providerFingerprint !== undefined && !isNonEmptyString(obj.providerFingerprint)) {
+    return false;
+  }
   return true;
 }
 

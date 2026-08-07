@@ -548,9 +548,14 @@ describe("configMutationLock — real call-site serialization", () => {
       registerConfigCommands(core, vault);
       await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete", secretFieldIds: ["apiToken"] }));
 
-      // Same call-ordering spy as the tests above.
+      // Same call-ordering spy as the tests above. A third label ("restamp")
+      // is included because this source has no `providerFingerprint` yet
+      // (ITEM A) — syncNow stamps one silently after its first successful
+      // sync, via its own SEPARATE, non-nested configMutationLock
+      // acquisition taken after the sync's own "syncNow" span has already
+      // resolved (see restampProviderFingerprintBestEffort's doc).
       const events: string[] = [];
-      const labels = ["capture", "syncNow"];
+      const labels = ["capture", "syncNow", "restamp"];
       let nextLabel = 0;
       const realRunExclusive = AsyncMutex.prototype.runExclusive;
       vi.spyOn(configMutationLock, "runExclusive").mockImplementation(function (
@@ -599,7 +604,12 @@ describe("configMutationLock — real call-site serialization", () => {
       const captured = await capturePromise;
       await syncPromise;
 
-      expect(events).toEqual(["capture:start", "capture:end", "syncNow:start", "syncNow:end"]);
+      // ITEM A — the trailing "restamp" span is a SEPARATE, later lock
+      // acquisition (the sync's own "syncNow" span has already fully
+      // resolved by the time it starts) — it never overlaps or reorders
+      // relative to "syncNow:end", which is what this sequence assertion
+      // actually guards.
+      expect(events).toEqual(["capture:start", "capture:end", "syncNow:start", "syncNow:end", "restamp:start", "restamp:end"]);
 
       // The captured pair is CONSISTENT: the server record captured is the
       // pre-sync one (still owning its origin), and the password captured

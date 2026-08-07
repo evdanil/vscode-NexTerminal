@@ -328,6 +328,98 @@ export class NexusCore {
   }
 
   /**
+   * ITEM B (empty-folder GC) — called synchronously from within
+   * applyInventorySyncPlan's mutation phase, AFTER the batch's own
+   * upserts/removes have already been applied to `this.servers` (so
+   * emptiness reflects the POST-sync state, not the pre-sync one). Removes
+   * explicit folders STRICTLY under `targetFolder` (never `targetFolder`
+   * itself — that stays even if momentarily empty) that are:
+   *   - not in `keepFolders` (the application's own `folders` list, with
+   *     ancestors included) — a folder this very sync still names must never
+   *     be GC'd out from under it just because it happens to be empty this
+   *     run, and
+   *   - completely empty: no server (ANY origin — manual or synced from a
+   *     DIFFERENT source), serial profile, or local-shell profile currently
+   *     assigned to it, AND no descendant folder that is itself still
+   *     present.
+   *
+   * Processes candidates deepest-first (most path segments first) so a
+   * folder that becomes empty only because ALL of its children were removed
+   * earlier in this SAME pass is itself removed too — "no non-empty
+   * descendant" is evaluated against what remains after this pass's own
+   * removals, not against the pre-GC tree.
+   *
+   * Entity coverage: ServerConfig, SerialProfile, and LocalShellProfile are
+   * the only three record types that carry a `group` participating in
+   * `this.explicitGroups` (see removeFolderCascade / _renameFolderPath /
+   * getItemsInFolder above, which enumerate exactly these three). Terminal
+   * macros also have a folder concept, but it is a COMPLETELY SEPARATE
+   * list (`nexus.macros.folders`, owned by `services/macroFolders.ts`) that
+   * NexusCore never reads or writes — nothing of theirs lives in
+   * `this.explicitGroups`, so there is nothing to check here.
+   *
+   * Only ever DELETES from `this.explicitGroups` and returns exactly the set
+   * of paths it removed; persisting the result and restoring any of the
+   * returned ids on a rolled-back persist is the caller's job (see
+   * applyInventorySyncPlan's rollback, which extends its existing
+   * `addedExplicitGroups` conditional-restore machinery to a mirrored
+   * `removedEmptyGroups` one for exactly this reason).
+   */
+  private pruneEmptyFoldersUnderTarget(targetFolder: string, keepFolders: ReadonlySet<string>): Set<string> {
+    const removed = new Set<string>();
+    const prefix = `${targetFolder}/`;
+    const candidates = [...this.explicitGroups]
+      .filter((group) => group !== targetFolder && group.startsWith(prefix) && !keepFolders.has(group))
+      .sort((a, b) => b.split("/").length - a.split("/").length);
+
+    for (const candidate of candidates) {
+      if (!this.explicitGroups.has(candidate)) {
+        continue; // already removed earlier in this same pass (shouldn't happen — candidates are deduped — stays defensive)
+      }
+      let occupied = false;
+      for (const server of this.servers.values()) {
+        if (server.group === candidate) {
+          occupied = true;
+          break;
+        }
+      }
+      if (!occupied) {
+        for (const profile of this.serialProfiles.values()) {
+          if (profile.group === candidate) {
+            occupied = true;
+            break;
+          }
+        }
+      }
+      if (!occupied) {
+        for (const profile of this.localShellProfiles.values()) {
+          if (profile.group === candidate) {
+            occupied = true;
+            break;
+          }
+        }
+      }
+      if (occupied) {
+        continue;
+      }
+      const descendantPrefix = `${candidate}/`;
+      let hasDescendant = false;
+      for (const group of this.explicitGroups) {
+        if (group !== candidate && group.startsWith(descendantPrefix)) {
+          hasDescendant = true;
+          break;
+        }
+      }
+      if (hasDescendant) {
+        continue;
+      }
+      this.explicitGroups.delete(candidate);
+      removed.add(candidate);
+    }
+    return removed;
+  }
+
+  /**
    * Applies one computed inventory sync as a single atomic batch: one
    * `saveServers`/`saveGroups`/`saveInventorySources` round-trip, one
    * `emitChanged()` — mirrors `addServersBatch`'s reasoning for why a
@@ -367,8 +459,16 @@ export class NexusCore {
    * secrets, runtime teardown) must iterate this list, not their own
    * pre-apply candidate list — a candidate this call skipped was never
    * touched and must not have its secrets/sessions torn down either.
+   *
+   * ITEM B (empty-folder GC) — also returns `removedEmptyFolderCount`: how
+   * many explicit folders `pruneEmptyFoldersUnderTarget` removed as part of
+   * this same batch (see that method's doc; always 0 in "absent" mode, and
+   * always 0 when `source.targetFolder` is `""` — GC never runs at the
+   * root). Zero in every case this method predates this feature.
    */
-  public async applyInventorySyncPlan(apply: InventorySyncApplication): Promise<{ skippedCount: number; removedServerIds: string[] }> {
+  public async applyInventorySyncPlan(
+    apply: InventorySyncApplication
+  ): Promise<{ skippedCount: number; removedServerIds: string[]; removedEmptyFolderCount: number }> {
     const source = this.inventorySources.get(apply.sourceId);
     // FINDING 2 (removeSource review) — the actual entries this call mutates.
     // In the normal (non-"absent") case these are exactly apply's own arrays;
@@ -505,6 +605,11 @@ export class NexusCore {
     // "changed since" and leaves it alone.
     const batchWrittenServers = new Map<string, ServerConfig | undefined>(); // undefined = this batch deleted it
     const addedExplicitGroups = new Set<string>(); // paths this batch added that were NOT already present
+    // ITEM B — every folder (with ancestors) this application's own `folders`
+    // list touches, whether newly added above or already present. GC below
+    // must never remove one of these even if it turns out empty this run —
+    // this sync itself still names it.
+    const applicationFolderSet = new Set<string>();
 
     for (const folder of apply.folders) {
       const normalized = normalizeFolderPath(folder);
@@ -512,6 +617,7 @@ export class NexusCore {
         continue;
       }
       for (const ancestor of getAncestorPaths(normalized)) {
+        applicationFolderSet.add(ancestor);
         if (!this.explicitGroups.has(ancestor)) {
           this.explicitGroups.add(ancestor);
           addedExplicitGroups.add(ancestor);
@@ -527,6 +633,22 @@ export class NexusCore {
       this.servers.set(server.id, server);
       batchWrittenServers.set(server.id, cloneServerConfig(server));
     }
+    // ITEM B (empty-folder GC) — runs synchronously here, in the mutation
+    // phase, AFTER the upserts/removes above so it sees the POST-sync server
+    // set. Scoped to non-"absent" applications only (REMOVAL disposition
+    // leaves folders alone — the source is gone, there is nothing to sync
+    // back into them, and leaving them is the documented, conservative
+    // choice) with a live `source` record (guaranteed non-"absent" branch)
+    // whose `targetFolder` is non-empty — "" (root) is deliberately EXEMPT
+    // from GC entirely: at the top level, "empty" is far more likely to mean
+    // "a folder the user manages by hand that simply has nothing in it right
+    // now" than "abandoned by a renamed/removed device", and the blast
+    // radius of a wrong removal there is every root-level folder in the
+    // workspace, not just this source's own subtree.
+    const removedEmptyGroups: Set<string> =
+      apply.expectedSource !== "absent" && source && source.targetFolder !== ""
+        ? this.pruneEmptyFoldersUnderTarget(source.targetFolder, applicationFolderSet)
+        : new Set<string>();
     // FINDING 4 (focus review) — same conditional-restore principle as
     // servers/groups above, applied to focusedSessionId: record what THIS
     // batch's own synchronous mutation phase left focusedSessionId as
@@ -646,6 +768,19 @@ export class NexusCore {
       for (const group of addedExplicitGroups) {
         this.explicitGroups.delete(group);
       }
+      // ITEM B (empty-folder GC rollback) — mirrors the addedExplicitGroups
+      // restore just above, for the OPPOSITE direction: folders THIS batch's
+      // GC pass removed must be put back on a rejected persist, but only if
+      // nothing concurrent has since re-added the exact same path (e.g. a
+      // concurrent addGroup, or a concurrent addOrUpdateServer assigning a
+      // server back into it) while the persist above was in flight — a
+      // wholesale unconditional re-add would clobber that concurrent state
+      // the same way an unconditional restore would for addedExplicitGroups.
+      for (const group of removedEmptyGroups) {
+        if (!this.explicitGroups.has(group)) {
+          this.explicitGroups.add(group);
+        }
+      }
       // TOMBSTONE — a captured session that was genuinely torn down by
       // unregisterSession during the awaited persist (window opened just
       // above) must NOT be resurrected here: the terminal is actually gone,
@@ -713,7 +848,7 @@ export class NexusCore {
     this.inventorySyncApplyInFlight = false;
     this.inventorySyncTombstonedSessionIds.clear();
     this.emitChanged();
-    return { skippedCount, removedServerIds: [...removeServerIds] };
+    return { skippedCount, removedServerIds: [...removeServerIds], removedEmptyFolderCount: removedEmptyGroups.size };
   }
 
   public isServerConnected(serverId: string): boolean {

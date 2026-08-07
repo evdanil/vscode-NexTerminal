@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { InventorySourceRemovalMismatchError, NexusCore, type InventorySyncApplication } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { validateInventorySource, validateServerConfig } from "../../src/utils/validation";
-import type { ServerConfig } from "../../src/models/config";
-import type { InventorySourceConfig } from "../../src/models/inventory";
+import type { ServerConfig, SerialProfile, LocalShellProfile } from "../../src/models/config";
+import { computeProviderFingerprint, type InventoryProvider, type InventorySourceConfig } from "../../src/models/inventory";
 
 function makeSourceConfig(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
   return {
@@ -1405,6 +1405,334 @@ describe("NexusCore inventory sources", () => {
   });
 });
 
+describe("applyInventorySyncPlan — empty-folder GC (ITEM B)", () => {
+  async function makeCoreWithSource(
+    initialServers: ServerConfig[] = [],
+    sourceOverrides: Partial<InventorySourceConfig> = {}
+  ): Promise<{ core: NexusCore; repository: InMemoryConfigRepository }> {
+    const repository = new InMemoryConfigRepository(initialServers);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig(sourceOverrides));
+    return { core, repository };
+  }
+
+  it("(kills no-GC) a site rename leaves the old folder empty and a fresh sync removes it while the new folder survives", async () => {
+    const server: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core } = await makeCoreWithSource([server], { targetFolder: "NetBox" });
+    // Establish the starting folder tree exactly as a real prior sync would have.
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+
+    // The rack was renamed at the source: the device now maps to a new
+    // folder; the old one has no servers left in it after this upsert.
+    const renamed = { ...server, group: "NetBox/RackB" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [renamed],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    const groups = core.getSnapshot().explicitGroups;
+    expect(groups).not.toContain("NetBox/RackA");
+    expect(groups).toContain("NetBox/RackB");
+    expect(groups).toContain("NetBox"); // ancestor, still in use
+    expect(result.removedEmptyFolderCount).toBe(1);
+  });
+
+  it("(kills over-aggressive GC) a folder still holding an unrelated MANUAL server, or a serial profile, survives even though this source's own servers left it", async () => {
+    const manualServer: ServerConfig = {
+      id: "manual-1",
+      name: "hand-added",
+      host: "192.168.1.1",
+      port: 22,
+      username: "root",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA" // no `origin` — added by hand, not by this source
+    };
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core } = await makeCoreWithSource([manualServer, owned], { targetFolder: "NetBox" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // This source's own device moves away; the manual server stays behind.
+    const moved = { ...owned, group: "NetBox/RackB" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // If GC checked only servers this source owns (not "any origin"), RackA
+    // would be wrongly removed even though the manual server still lives
+    // there. It must survive.
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(result.removedEmptyFolderCount).toBe(0);
+  });
+
+  it("(kills over-aggressive GC / entity coverage) a folder holding only a serial profile, or only a local-shell profile, is NOT removed", async () => {
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const serialProfile: SerialProfile = {
+      id: "serial-1",
+      name: "console",
+      group: "NetBox/RackB",
+      path: "/dev/ttyUSB0",
+      baudRate: 9600,
+      dataBits: 8,
+      stopBits: 1,
+      parity: "none",
+      rtscts: false
+    };
+    const localShellProfile: LocalShellProfile = {
+      id: "shell-1",
+      name: "local",
+      group: "NetBox/RackC",
+      launchMode: "custom"
+    };
+    const repository = new InMemoryConfigRepository([owned], [], [serialProfile], [], [], [localShellProfile]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ targetFolder: "NetBox" }));
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA", "NetBox/RackB", "NetBox/RackC"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // Move the owned server away from RackA; RackB/RackC are never touched
+    // by this source's own plan.folders at all on this run, but they must
+    // still survive because the serial/local-shell profiles occupy them.
+    const moved = { ...owned, group: "NetBox/RackD" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["NetBox/RackD"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    const groups = core.getSnapshot().explicitGroups;
+    expect(groups).not.toContain("NetBox/RackA"); // now genuinely empty
+    expect(groups).toContain("NetBox/RackB"); // serial profile still there
+    expect(groups).toContain("NetBox/RackC"); // local-shell profile still there
+    expect(result.removedEmptyFolderCount).toBe(1);
+  });
+
+  it("(kills scope-too-wide GC) a folder OUTSIDE the source's targetFolder is never touched, even if empty and unrelated", async () => {
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core } = await makeCoreWithSource([owned], { targetFolder: "NetBox" });
+    // An unrelated empty folder outside NetBox entirely (e.g. a folder the
+    // user made by hand for something else).
+    await core.addGroup("Elsewhere/Empty");
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    const moved = { ...owned, group: "NetBox/RackB" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    expect(core.getSnapshot().explicitGroups).toContain("Elsewhere/Empty");
+    expect(result.removedEmptyFolderCount).toBe(1); // only NetBox/RackA
+  });
+
+  it('(kills root-target GC) targetFolder "" never GCs anything, however empty a folder becomes', async () => {
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core } = await makeCoreWithSource([owned], { targetFolder: "" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    const moved = { ...owned, group: "RackB" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // RackA is now empty but targetFolder is root ("") — GC must not run at all.
+    expect(core.getSnapshot().explicitGroups).toContain("RackA");
+    expect(result.removedEmptyFolderCount).toBe(0);
+  });
+
+  it('("absent" / removal disposition does NOT GC) an owned server stripped of its origin during source removal leaves its now-empty folder untouched', async () => {
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core } = await makeCoreWithSource([owned], { targetFolder: "NetBox" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    await core.removeInventorySource("source-1");
+
+    // Removal disposition: delete the owned server entirely — its folder is
+    // now empty, but this is an "absent" apply, so GC must not run.
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [],
+      removeServerIds: ["device-1"],
+      folders: [],
+      expectedSource: "absent"
+    });
+
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(result.removedEmptyFolderCount).toBe(0);
+  });
+
+  it("(kills missing rollback tracking) a folder GC removed is RESTORED when the persist rejects, unless something concurrent re-added it", async () => {
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core, repository } = await makeCoreWithSource([owned], { targetFolder: "NetBox" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+
+    vi.spyOn(repository, "saveGroups").mockRejectedValueOnce(new Error("disk full"));
+
+    const moved = { ...owned, group: "NetBox/RackB" };
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 2,
+        upsertServers: [moved],
+        removeServerIds: [],
+        folders: ["NetBox/RackB"],
+        expectedSource: core.getInventorySource("source-1")!
+      })
+    ).rejects.toThrow("disk full");
+
+    // If the rollback never tracked batch-REMOVED groups (only ADDED ones),
+    // "NetBox/RackA" would stay gone even though the whole batch — including
+    // the server move that emptied it — was rolled back. It must come back.
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    // The rejected batch's own upsert was also rolled back, so the server is
+    // still in RackA — consistent with RackA surviving.
+    expect(core.getServer("device-1")?.group).toBe("NetBox/RackA");
+  });
+});
+
 describe("validateInventorySource", () => {
   const valid: InventorySourceConfig = {
     id: "s1",
@@ -1463,6 +1791,102 @@ describe("validateInventorySource", () => {
 
   it("accepts a numeric lastSyncAt", () => {
     expect(validateInventorySource({ ...valid, lastSyncAt: 12345 })).toBe(true);
+  });
+
+  it("(ITEM A) accepts a missing providerFingerprint and a non-empty string providerFingerprint", () => {
+    expect(validateInventorySource(valid)).toBe(true);
+    expect(validateInventorySource({ ...valid, providerFingerprint: "abc123" })).toBe(true);
+  });
+
+  it("(ITEM A) rejects a non-string / empty providerFingerprint (kills a missing type/emptiness check)", () => {
+    expect(validateInventorySource({ ...valid, providerFingerprint: "" })).toBe(false);
+    expect(validateInventorySource({ ...valid, providerFingerprint: 123 })).toBe(false);
+  });
+});
+
+describe("computeProviderFingerprint (ITEM A — provider trust fingerprint)", () => {
+  function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProvider {
+    return {
+      id: "netbox",
+      label: "NetBox",
+      configFields: [
+        { id: "baseUrl", label: "Base URL", type: "string", required: true },
+        { id: "apiToken", label: "API Token", type: "password", required: true }
+      ],
+      testConnection: async () => {},
+      fetchInventory: async () => ({ contractVersion: 1, devices: [] }),
+      ...overrides
+    };
+  }
+
+  it("is deterministic for the same observable shape", () => {
+    expect(computeProviderFingerprint(makeProvider())).toBe(computeProviderFingerprint(makeProvider()));
+  });
+
+  it("is a 16-character lowercase hex string", () => {
+    const fp = computeProviderFingerprint(makeProvider());
+    expect(fp).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it("ignores `id` — hashing the id would make a same-id-different-provider swap invisible, defeating the whole point of the check", () => {
+    const a = computeProviderFingerprint(makeProvider({ id: "netbox" }));
+    const b = computeProviderFingerprint(makeProvider({ id: "totally-different-id" }));
+    expect(a).toBe(b);
+  });
+
+  it("changes when label changes (kills a fingerprint that ignores label)", () => {
+    const a = computeProviderFingerprint(makeProvider({ label: "NetBox" }));
+    const b = computeProviderFingerprint(makeProvider({ label: "NetBox v2" }));
+    expect(a).not.toBe(b);
+  });
+
+  it("changes when a configField is added/removed (kills a fingerprint that ignores configFields)", () => {
+    const a = computeProviderFingerprint(makeProvider());
+    const b = computeProviderFingerprint(
+      makeProvider({ configFields: [{ id: "baseUrl", label: "Base URL", type: "string", required: true }] })
+    );
+    expect(a).not.toBe(b);
+  });
+
+  it("changes when a configField's type or required flag changes, even with the same id/label (kills a fingerprint that only hashes field ids)", () => {
+    const a = computeProviderFingerprint(makeProvider());
+    const bTypeChanged = computeProviderFingerprint(
+      makeProvider({
+        configFields: [
+          { id: "baseUrl", label: "Base URL", type: "string", required: true },
+          { id: "apiToken", label: "API Token", type: "string", required: true } // was "password"
+        ]
+      })
+    );
+    const bRequiredChanged = computeProviderFingerprint(
+      makeProvider({
+        configFields: [
+          { id: "baseUrl", label: "Base URL", type: "string", required: true },
+          { id: "apiToken", label: "API Token", type: "password", required: false }
+        ]
+      })
+    );
+    expect(a).not.toBe(bTypeChanged);
+    expect(a).not.toBe(bRequiredChanged);
+  });
+
+  it("changes when configField ORDER changes (kills a fingerprint that sorts fields before hashing, losing order sensitivity)", () => {
+    const a = computeProviderFingerprint(makeProvider());
+    const reordered = computeProviderFingerprint(
+      makeProvider({
+        configFields: [
+          { id: "apiToken", label: "API Token", type: "password", required: true },
+          { id: "baseUrl", label: "Base URL", type: "string", required: true }
+        ]
+      })
+    );
+    expect(a).not.toBe(reordered);
+  });
+
+  it("ignores testConnection/fetchInventory function identity — two structurally-identical providers with different function references fingerprint the same", () => {
+    const a = computeProviderFingerprint(makeProvider({ testConnection: async () => {}, fetchInventory: async () => ({ contractVersion: 1, devices: [] }) }));
+    const b = computeProviderFingerprint(makeProvider({ testConnection: async () => {}, fetchInventory: async () => ({ contractVersion: 1, devices: [] }) }));
+    expect(a).toBe(b);
   });
 });
 

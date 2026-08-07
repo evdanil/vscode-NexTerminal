@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
 import type { ServerConfig } from "../models/config";
 import {
+  computeProviderFingerprint,
   InventoryProviderError,
   inventorySecretKey,
   inventorySourceValuesEqual,
@@ -111,6 +112,43 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
   } catch (error) {
     console.warn(`[Nexus] Failed to delete secret key "${key}":`, error);
   }
+}
+
+/**
+ * ITEM A (restamp ordering) — restamps the source's providerFingerprint as
+ * its OWN locked write, strictly AFTER a sync has already committed
+ * successfully, rather than mid-flow (before/during the fetch+apply). The
+ * rest of syncNow threads one fetch-time snapshot (`source`) through several
+ * interlocking race guards — most centrally
+ * `sourceConfigUnchanged(source, freshSource)`, which (once both sides carry
+ * a revision, which every loaded record does) is decided ENTIRELY by
+ * revision equality, and `addOrUpdateInventorySource` mints a brand-new
+ * revision on every write with no exception for this one. Restamping before
+ * or during the sync would therefore invalidate `source`'s revision out from
+ * under every later drift check in that same run, unless `source` itself
+ * were reassigned to the freshly restamped record at every downstream use —
+ * a materially larger, riskier change to a function that already carries the
+ * FINDINGS D/E/1/2/4 race-guard chain. Firing this only once the sync has
+ * fully committed sidesteps all of that: nothing later in THIS invocation
+ * reads `source` again, so a fresh read-and-write here needs to agree with
+ * nothing but the CURRENT persisted record. Best-effort and independently
+ * locked (a separate, non-nested configMutationLock acquisition, taken after
+ * the sync's own acquisition has already resolved) — a failed restamp here
+ * costs nothing but showing the confirm modal once more on the NEXT sync;
+ * it must never fail the sync that already succeeded.
+ */
+async function restampProviderFingerprintBestEffort(core: NexusCore, sourceId: string, fingerprint: string): Promise<void> {
+  await configMutationLock.runExclusive(async (): Promise<void> => {
+    const current = core.getInventorySource(sourceId);
+    if (!current || current.providerFingerprint === fingerprint) {
+      return;
+    }
+    try {
+      await core.addOrUpdateInventorySource({ ...current, providerFingerprint: fingerprint });
+    } catch (error) {
+      console.warn(`[Nexus] Failed to restamp provider fingerprint for inventory source "${sourceId}":`, error);
+    }
+  });
 }
 
 function describeInventoryError(error: unknown): string {
@@ -438,7 +476,21 @@ async function persistNewInventorySource(
       throw new Error("Could not store credentials in the system keychain — the source was not created.");
     }
 
-    const source: InventorySourceConfig = { id, providerId: provider.id, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds };
+    // ITEM A — stamp the provider's fingerprint at creation time: the user
+    // is knowingly configuring against WHICHEVER registrant currently holds
+    // `provider.id` right now, so that registrant's observable shape is the
+    // baseline every later sync compares against.
+    const source: InventorySourceConfig = {
+      id,
+      providerId: provider.id,
+      name,
+      targetFolder,
+      prunePolicy,
+      defaultUsername,
+      config,
+      secretFieldIds,
+      providerFingerprint: computeProviderFingerprint(provider)
+    };
 
     // FINDING 1 — if persisting the new source record fails, the vault keys
     // just written above have no source to be enumerated/cleaned up by, so
@@ -541,7 +593,19 @@ async function persistUpdatedInventorySource(
       .filter((f) => f.type === "password" && (reenteredSecrets[f.id] !== undefined || existingSecretFieldIds.has(f.id)))
       .map((f) => f.id);
 
-    const updated: InventorySourceConfig = { ...source, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds: newSecretFieldIds };
+    // ITEM A — restamp on every save: the user has the form open against
+    // `provider` (whichever registrant currently answers `source.providerId`)
+    // and is knowingly interacting with it, exactly like at creation time.
+    const updated: InventorySourceConfig = {
+      ...source,
+      name,
+      targetFolder,
+      prunePolicy,
+      defaultUsername,
+      config,
+      secretFieldIds: newSecretFieldIds,
+      providerFingerprint: computeProviderFingerprint(provider)
+    };
 
     // ITEM 4 — re-read the record immediately before persisting. configCommands
     // flows (importMergeReplace, completeReset) mutate inventory sources
@@ -1265,6 +1329,38 @@ export function registerInventoryCommands(
     // between) so a second invocation arriving on the next microtask sees it.
     inFlightSourceIds.add(source.id);
     try {
+      // ITEM A (provider trust fingerprint) — strictly BEFORE any vault read
+      // for this source (the required-secret presence loop right below this
+      // reads real secret values from the vault). VS Code gives Nexus no way
+      // to verify WHICH extension currently answers `source.providerId` (see
+      // publicApi.ts's trust-model doc) — only whether the current
+      // registrant's declared shape (label + configFields) still matches
+      // what the user configured against last time. A mismatch means the id
+      // was re-registered with a materially different provider since —
+      // silently handing that registrant the source's decrypted secrets is
+      // exactly the silent-secret-handover risk the trust-model doc warns
+      // about, so ask first. A source with NO stamped fingerprint at all
+      // (saved before this field existed) has nothing to compare against —
+      // it is stamped silently after this sync succeeds, no modal shown.
+      let fingerprintToStamp: string | undefined;
+      const currentProviderFingerprint = computeProviderFingerprint(provider);
+      if (source.providerFingerprint === undefined) {
+        fingerprintToStamp = currentProviderFingerprint;
+      } else if (source.providerFingerprint !== currentProviderFingerprint) {
+        const choice = await vscode.window.showWarningMessage(
+          `Provider "${source.providerId}" looks different from when "${source.name}" was configured — its label or fields changed. Pass its saved credentials to the current provider?`,
+          { modal: true },
+          "Continue",
+          "Cancel"
+        );
+        if (choice !== "Continue") {
+          // Cancel (or dismiss) aborts before ANY vault.get for this source —
+          // the required-secret loop and every other vault read below never run.
+          return;
+        }
+        fingerprintToStamp = currentProviderFingerprint;
+      }
+
       // FINDING 2 — the required-secret check is driven by the provider's
       // CURRENT configFields schema, not by the stored source.secretFieldIds.
       // A provider upgrade that adds a new required password field (or flips
@@ -1344,7 +1440,7 @@ export function registerInventoryCommands(
         // source config race (or any persist failure) here must produce a
         // friendly error instead of an unhandled command rejection.
         type FastPathResult =
-          | { kind: "done"; plan: InventorySyncPlan }
+          | { kind: "done"; plan: InventorySyncPlan; removedEmptyFolderCount: number }
           | { kind: "not-empty"; plan: InventorySyncPlan }
           | { kind: "abort" };
         const fastPathResult: FastPathResult = await configMutationLock.runExclusive(async (): Promise<FastPathResult> => {
@@ -1364,8 +1460,8 @@ export function registerInventoryCommands(
             return { kind: "not-empty", plan: recomputed };
           }
           try {
-            await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
-            return { kind: "done", plan: recomputed };
+            const applyResult = await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
+            return { kind: "done", plan: recomputed, removedEmptyFolderCount: applyResult.removedEmptyFolderCount };
           } catch (error) {
             // m4 — a source-record replacement race surfaces the same
             // friendly, name-bearing wording as the pre-apply fast-fail check
@@ -1381,8 +1477,18 @@ export function registerInventoryCommands(
         if (fastPathResult.kind === "abort") return;
         if (fastPathResult.kind === "done") {
           const donePlan = fastPathResult.plan;
+          // ITEM A — the sync (a no-op apply, but still a successful one)
+          // has now committed; restamp outside the lock just released above.
+          if (fingerprintToStamp) {
+            await restampProviderFingerprintBestEffort(core, source.id, fingerprintToStamp);
+          }
+          // ITEM B — surfaced only when nonzero, appended to the same toast.
+          const emptyFolderNote =
+            fastPathResult.removedEmptyFolderCount > 0
+              ? ` ${fastPathResult.removedEmptyFolderCount} empty folder${fastPathResult.removedEmptyFolderCount === 1 ? "" : "s"} removed.`
+              : "";
           void vscode.window.showInformationMessage(
-            `Inventory sync from "${source.name}" complete — nothing to change (${donePlan.unchangedCount} unchanged).`
+            `Inventory sync from "${source.name}" complete — nothing to change (${donePlan.unchangedCount} unchanged).${emptyFolderNote}`
           );
           if (donePlan.warnings.length > 0) {
             void vscode.window
@@ -1417,7 +1523,13 @@ export function registerInventoryCommands(
       type SyncAttempt =
         | { kind: "abort" }
         | { kind: "retry"; plan: InventorySyncPlan }
-        | { kind: "success"; finalPlan: InventorySyncPlan; recreatedCount: number; teardownFailureCount: number };
+        | {
+            kind: "success";
+            finalPlan: InventorySyncPlan;
+            recreatedCount: number;
+            teardownFailureCount: number;
+            removedEmptyFolderCount: number;
+          };
 
       for (;;) {
         // FINDING 1 — captured together so the drift check inside the lock
@@ -1592,7 +1704,7 @@ export function registerInventoryCommands(
           // is the only thing that can still catch that — surface its rejection
           // the same way as the fast-fail check above rather than letting it
           // propagate as an unhandled command rejection.
-          let applyResult: { skippedCount: number; removedServerIds: string[] };
+          let applyResult: { skippedCount: number; removedServerIds: string[]; removedEmptyFolderCount: number };
           try {
             applyResult = await core.applyInventorySyncPlan(finalApplication);
           } catch (error) {
@@ -1690,13 +1802,26 @@ export function registerInventoryCommands(
             await deleteSecretBestEffort(vault, proxyPasswordSecretKey(id));
           }
 
-          return { kind: "success", finalPlan, recreatedCount: recreatedIds.size, teardownFailureCount: teardownFailedIds.size };
+          return {
+            kind: "success",
+            finalPlan,
+            recreatedCount: recreatedIds.size,
+            teardownFailureCount: teardownFailedIds.size,
+            removedEmptyFolderCount: applyResult.removedEmptyFolderCount
+          };
         });
 
         if (attempt.kind === "abort") return;
         if (attempt.kind === "retry") {
           plan = attempt.plan;
           continue;
+        }
+
+        // ITEM A — the sync has now committed successfully; restamp as a
+        // separate, non-nested locked write outside the attempt's own
+        // (already-resolved) lock acquisition.
+        if (fingerprintToStamp) {
+          await restampProviderFingerprintBestEffort(core, source.id, fingerprintToStamp);
         }
 
         const finalPlan = attempt.finalPlan;
@@ -1715,12 +1840,17 @@ export function registerInventoryCommands(
                 attempt.teardownFailureCount === 1 ? "" : "s"
               } manually.`
             : "";
+        // ITEM B — surfaced only when nonzero, appended to the same toast.
+        const emptyFolderNote =
+          attempt.removedEmptyFolderCount > 0
+            ? ` ${attempt.removedEmptyFolderCount} empty folder${attempt.removedEmptyFolderCount === 1 ? "" : "s"} removed.`
+            : "";
         // M3 — named-source, plain-English toast; the previous
         // "+A ~U -D (K unchanged)" shorthand never printed a zero-line
         // omission (all four counts always rendered regardless of value), so
         // this keeps that same always-print-all-four behavior.
         void vscode.window.showInformationMessage(
-          `Inventory sync from "${source.name}" complete: ${finalPlan.adds.length} added, ${finalPlan.updates.length} updated, ${deletedCount} deleted (${finalPlan.unchangedCount} unchanged).${recreatedNote}${teardownFailureNote}`
+          `Inventory sync from "${source.name}" complete: ${finalPlan.adds.length} added, ${finalPlan.updates.length} updated, ${deletedCount} deleted (${finalPlan.unchangedCount} unchanged).${recreatedNote}${teardownFailureNote}${emptyFolderNote}`
         );
         if (finalPlan.warnings.length > 0) {
           void vscode.window

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export const INVENTORY_CONTRACT_VERSION = 1 as const;
 
@@ -95,6 +95,52 @@ export interface InventorySourceConfig {
   // See sourceConfigUnchanged() below for how this decides identity once
   // both sides being compared have one.
   revision?: string;
+  // ITEM A (provider trust fingerprint) — a stable hash of the PROVIDER's
+  // observable shape (label + ordered configFields) at the moment this
+  // source was last saved (addSource) or edited (editSource), computed by
+  // computeProviderFingerprint() below. VS Code exposes no caller identity
+  // for `registerInventoryProvider` (see publicApi.ts's trust-model doc), so
+  // this cannot prove WHICH extension is answering to `providerId` — only
+  // that the currently-registered provider's declared shape still looks like
+  // the one the user last knowingly configured. syncNow compares this
+  // against computeProviderFingerprint(currentRegistrant) before reading any
+  // vault secret for the source; a mismatch means the id was re-registered
+  // (by an update, or by a different extension entirely) with a materially
+  // different provider since, and the user is asked to confirm handing that
+  // registrant the saved credentials. Optional for backward compatibility —
+  // a source saved before this field existed has none; syncNow stamps it
+  // silently on that source's first successful sync afterward (nothing to
+  // compare it against yet, so no warning is shown).
+  providerFingerprint?: string;
+}
+
+/**
+ * ITEM A (provider trust fingerprint) — pure hash over exactly the provider
+ * shape a user can actually SEE and reason about when they configured a
+ * source: its label and its configFields' (id, label, type, required),
+ * in the provider's own declared order. Deliberately excludes
+ * testConnection/fetchInventory (functions — not hashable, and not what the
+ * user "configured against") and `id` itself (the fingerprint's whole
+ * purpose is to detect a DIFFERENT provider answering to the SAME id; hashing
+ * the id would make every mismatch invisible). No `vscode` import — callable
+ * from models/ and safe for both the command layer and tests.
+ *
+ * sha256, hex-encoded, truncated to the first 16 characters — this is a
+ * drift-detection fingerprint, not a security credential, so collision
+ * resistance at full sha256 strength is unnecessary; 16 hex chars (64 bits)
+ * is already far more than this UI-facing comparison needs.
+ */
+export function computeProviderFingerprint(provider: Pick<InventoryProvider, "label" | "configFields">): string {
+  const shape = {
+    label: provider.label,
+    configFields: provider.configFields.map((field) => ({
+      id: field.id,
+      label: field.label,
+      type: field.type,
+      required: field.required === true
+    }))
+  };
+  return createHash("sha256").update(JSON.stringify(shape)).digest("hex").slice(0, 16);
 }
 
 /**

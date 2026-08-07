@@ -2,7 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "../../src/commands/inventoryCommands";
 import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/nexusCore";
 import type { ServerConfig } from "../../src/models/config";
-import { inventorySecretKey, type InventoryProvider, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
+import {
+  computeProviderFingerprint,
+  inventorySecretKey,
+  type InventoryProvider,
+  type InventorySourceConfig,
+  type InventoryTree
+} from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
 import { ORPHAN_FOLDER_NAME } from "../../src/services/inventory/syncEngine";
 import { configMutationLock } from "../../src/services/configMutationLock";
@@ -212,6 +218,13 @@ describe("inventoryCommands", () => {
 
       expect(vault.store).toHaveBeenCalledWith(inventorySecretKey(source.id, "apiToken"), "secret-token");
       expect(await vault.get(inventorySecretKey(source.id, "apiToken"))).toBe("secret-token");
+    });
+
+    it("(ITEM A) stamps providerFingerprint from the chosen provider at creation (kills a source created with no fingerprint at all)", async () => {
+      const { core, provider } = await runAddSourceHappyPath();
+
+      const source = core.getSnapshot().inventorySources[0];
+      expect(source.providerFingerprint).toBe(computeProviderFingerprint(provider));
     });
 
     it("Save persists the source WITHOUT ever calling provider.testConnection — Test is voluntary and no longer gates Save (kills the old forced-test-before-save / Save Anyway prompt)", async () => {
@@ -632,6 +645,37 @@ describe("inventoryCommands", () => {
       expect(byKey("apiToken")).toEqual(
         expect.objectContaining({ type: "password", required: false, placeholder: "Leave empty to keep the saved value" })
       );
+    });
+
+    it("(ITEM A) restamps providerFingerprint on every save, even when it was already stamped differently (kills a save that leaves a stale fingerprint in place)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({ config: { host: "netbox.local" }, secretFieldIds: ["apiToken"], providerFingerprint: "stale-fingerprint" })
+      );
+      await vault.store(inventorySecretKey("src-1", "apiToken"), "old-token");
+
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd();
+      const { onSubmit } = latestFormCall();
+
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        host: "netbox.local",
+        apiToken: ""
+      });
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.providerFingerprint).toBe(computeProviderFingerprint(provider));
+      expect(updated.providerFingerprint).not.toBe("stale-fingerprint");
     });
 
     it("in-flight guard — editSource marks the source busy while the form is open and releases it when the form closes, whether by Save or Cancel (kills leaking the busy flag / never marking it busy at all)", async () => {
@@ -1668,6 +1712,108 @@ describe("inventoryCommands", () => {
     });
   });
 
+  describe("nexus.inventory.syncNow — provider trust fingerprint (ITEM A)", () => {
+    it("a changed fingerprint shows a MODAL warning naming the provider and the source, and Cancel aborts BEFORE any vault.get for this source (kills silent secret handover to a re-registered provider)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({ name: "My Source", secretFieldIds: ["apiToken"], providerFingerprint: "stale-fingerprint" })
+      );
+
+      mockShowWarningMessage.mockResolvedValueOnce(undefined); // dismiss/Cancel
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining('Provider "fake" looks different from when "My Source" was configured'),
+        { modal: true },
+        "Continue",
+        "Cancel"
+      );
+      // The kill test: without the fix, the required-secret check (or the
+      // secrets-loading loop) below would call vault.get regardless of the
+      // modal's outcome — silently handing the mismatched provider the
+      // source's saved credentials. Cancel must prevent every one of them.
+      expect(vault.get).not.toHaveBeenCalled();
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+      // Nothing was restamped either — the source is untouched.
+      expect(core.getInventorySource("src-1")?.providerFingerprint).toBe("stale-fingerprint");
+    });
+
+    it("Continue proceeds with the sync AND restamps the fingerprint — the NEXT sync no longer shows the modal", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({ name: "My Source", secretFieldIds: ["apiToken"], providerFingerprint: "stale-fingerprint" })
+      );
+
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      // The sync actually proceeded — secrets were read and the provider was called.
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "apiToken"));
+      // And the fingerprint is now current.
+      expect(core.getInventorySource("src-1")?.providerFingerprint).toBe(computeProviderFingerprint(provider));
+
+      // Second sync: no modal this time, since the stamped fingerprint now matches.
+      mockShowWarningMessage.mockClear();
+      await cmd("src-1");
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("a fingerprint that already matches the current provider shows no modal", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({ secretFieldIds: ["apiToken"], providerFingerprint: computeProviderFingerprint(provider) })
+      );
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+    });
+
+    it("a legacy source with NO stamped fingerprint shows no modal and is stamped silently after its first successful sync", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      // No providerFingerprint at all — as a source saved before ITEM A existed would be.
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+      expect(core.getInventorySource("src-1")?.providerFingerprint).toBeUndefined();
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(core.getInventorySource("src-1")?.providerFingerprint).toBe(computeProviderFingerprint(provider));
+    });
+  });
+
   describe("nexus.inventory.syncNow", () => {
     it("prune 'delete' tears down and removes only the pruned server, applies the plan, and cleans up only its vault secrets (F1 — teardown runs before apply)", async () => {
       const survivor = makeServer({
@@ -1742,6 +1888,43 @@ describe("inventoryCommands", () => {
       expect(await vault.get(passwordSecretKey("owned-2"))).toBe("pw2");
       expect(await vault.get(passphraseSecretKey("owned-2"))).toBe("pp2");
       expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
+    });
+
+    it("(ITEM B) a rack rename that empties its old folder appends the empty-folder count to the completion toast", async () => {
+      const owned = makeServer({
+        id: "owned-1",
+        name: "sw1",
+        host: "10.0.0.1",
+        group: "Infra/RackA",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      // Seed NexusCore's explicit-groups list directly (the 4th constructor
+      // arg), exactly as a prior real sync would have left it — the server's
+      // own `.group` alone does not register an explicit folder.
+      const repo = new InMemoryConfigRepository([owned], [], [], ["Infra", "Infra/RackA"]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        // Same device, renamed rack -> "RackB" this time.
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1,
+          devices: [{ externalId: "device:1", name: "sw1", folderPath: "RackB", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+        }))
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", prunePolicy: "orphan" }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      expect(core.getServer("owned-1")?.group).toBe("Infra/RackB");
+      expect(core.getSnapshot().explicitGroups).not.toContain("Infra/RackA");
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining("1 empty folder removed."));
     });
 
     it("ROUND 24 FIX (P1, pre-apply-shouldAbort review) — the pre-apply sweep disconnects the pooled SSH connection for a delete candidate, not just its terminals/tunnels (kills the always-true `() => core.getServer(id) !== undefined` predicate: pre-apply, every removal candidate still exists in core by construction, so that predicate is unconditionally true and would silently make teardownServerRuntime skip sshPool.disconnect on every pre-apply call)", async () => {
