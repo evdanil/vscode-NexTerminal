@@ -659,6 +659,47 @@ describe("inventoryCommands", () => {
       expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBeUndefined();
     });
 
+    it("(REVIEW FINDING 3) a rejected removeInventorySource restores the source record AND the vault credentials that were deleted before the record removal was attempted (kills restore-record-without-credentials)", async () => {
+      const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+
+      // Only the record-removal persist (the SECOND saveInventorySources call
+      // — the first is the "Keep Servers" applyInventorySyncPlan call, which
+      // must succeed) rejects, so core.removeInventorySource itself rejects
+      // (core rolls the record back in memory; see NexusCore.removeInventorySource).
+      const originalSaveInventorySources = repo.saveInventorySources.bind(repo);
+      let saveInventorySourcesCallCount = 0;
+      vi.spyOn(repo, "saveInventorySources").mockImplementation(async (sources) => {
+        saveInventorySourcesCallCount++;
+        if (saveInventorySourcesCallCount === 2) {
+          throw new Error("disk full");
+        }
+        return originalSaveInventorySources(sources);
+      });
+
+      const cmd = registeredCommands.get("nexus.inventory.removeSource")!;
+      await expect(cmd()).resolves.toBeUndefined();
+
+      // If FINDING 3's fix were reverted (vault keys deleted and never
+      // restored), the source record would still come back via core's own
+      // rollback here — but its credentials would be gone forever, leaving a
+      // live source that can never sync again.
+      expect(core.getSnapshot().inventorySources).toHaveLength(1);
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("tok");
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("intact"));
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    });
+
     it("dismissing the confirm modal removes nothing", async () => {
       const owned = makeServer({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } });
       const repo = new InMemoryConfigRepository([owned]);

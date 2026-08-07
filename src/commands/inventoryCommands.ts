@@ -730,10 +730,44 @@ export function registerInventoryCommands(
         }
       }
 
+      // FINDING 3 — capture every secret value THIS source owns before
+      // deleting any of them, so a rejected removeInventorySource below (core
+      // itself restores the record in that case — see
+      // NexusCore.removeInventorySource) can be followed by restoring the
+      // credentials too. Without this, a failed record removal left an
+      // in-memory-live source with no way to ever authenticate again.
+      const capturedSecrets = new Map<string, string>();
+      for (const fieldId of source.secretFieldIds) {
+        const value = await vault.get(inventorySecretKey(source.id, fieldId));
+        if (value !== undefined) {
+          capturedSecrets.set(fieldId, value);
+        }
+      }
+      // Delete-keys-before-record order is intentional and load-bearing: if
+      // the process crashes between here and removeInventorySource below, or
+      // if a mid-loop delete itself rejects, the record (never removed yet)
+      // still enumerates every field id via secretFieldIds, so a retry simply
+      // re-attempts the same (now-idempotent) vault deletes. Reversing the
+      // order would let a crash after a committed record removal strand
+      // vault keys that nothing can ever enumerate again.
       for (const fieldId of source.secretFieldIds) {
         await vault.delete(inventorySecretKey(source.id, fieldId));
       }
-      await core.removeInventorySource(source.id);
+      try {
+        await core.removeInventorySource(source.id);
+      } catch {
+        // Chosen behavior (documented once, here): fail-closed restore — put
+        // every captured credential back so the source (which core has
+        // already rolled back to still exist) stays fully usable, rather than
+        // trying to also resurrect only the subset of keys that were deleted.
+        for (const [fieldId, value] of capturedSecrets) {
+          await vault.store(inventorySecretKey(source.id, fieldId), value).catch(() => undefined);
+        }
+        void vscode.window.showErrorMessage(
+          `Failed to remove inventory source "${source.name}" — the removal did not complete and the source (with its credentials) is intact.`
+        );
+        return;
+      }
 
       void vscode.window.showInformationMessage(`Inventory source "${source.name}" removed.`);
     } finally {

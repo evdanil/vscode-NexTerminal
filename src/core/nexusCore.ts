@@ -1,14 +1,16 @@
-import type {
-  ActiveLocalShellSession,
-  ActiveSerialSession,
-  ActiveSession,
-  ActiveTunnel,
-  AuthProfile,
-  LocalShellProfile,
-  SerialProfile,
-  ServerConfig,
-  TunnelProfile,
-  TunnelRegistryEntry
+import {
+  cloneServerConfig,
+  serverConfigsEqual,
+  type ActiveLocalShellSession,
+  type ActiveSerialSession,
+  type ActiveSession,
+  type ActiveTunnel,
+  type AuthProfile,
+  type LocalShellProfile,
+  type SerialProfile,
+  type ServerConfig,
+  type TunnelProfile,
+  type TunnelRegistryEntry
 } from "../models/config";
 import { sourceConfigUnchanged, type InventorySourceConfig } from "../models/inventory";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
@@ -306,8 +308,18 @@ export class NexusCore {
     // FINDING 3 — track exactly what THIS batch writes, so a rejected persist
     // can roll back conditionally instead of wholesale: another command
     // (addGroup, addOrUpdateServer, ...) can run concurrently while the
-    // Promise.all below is pending, and an unconditional restore would erase
-    // its newer state along with this batch's own mutations.
+    // saves below are pending, and an unconditional restore would erase its
+    // newer state along with this batch's own mutations.
+    //
+    // FINDING 2 — the map holds a structural CLONE of each upserted server
+    // (cloneServerConfig), captured at write time, not the live reference.
+    // _renameFolderPath and removeFolderCascade both mutate `server.group` IN
+    // PLACE on the object already sitting in `this.servers`, so a reference
+    // compare (`current === batchValue`) would stay true across that
+    // mutation and rollback would wrongly clobber the rename. Comparing the
+    // CURRENT entry structurally (serverConfigsEqual) against this frozen
+    // snapshot instead correctly treats an in-place-mutated entry as
+    // "changed since" and leaves it alone.
     const batchWrittenServers = new Map<string, ServerConfig | undefined>(); // undefined = this batch deleted it
     const addedExplicitGroups = new Set<string>(); // paths this batch added that were NOT already present
 
@@ -330,25 +342,37 @@ export class NexusCore {
     }
     for (const server of apply.upsertServers) {
       this.servers.set(server.id, server);
-      batchWrittenServers.set(server.id, server);
+      batchWrittenServers.set(server.id, cloneServerConfig(server));
     }
     const writtenSourceRecord = { ...source, lastSyncAt: apply.syncedAt };
     this.inventorySources.set(source.id, writtenSourceRecord);
-    try {
-      await Promise.all([
-        this.repository.saveServers([...this.servers.values()]),
-        this.repository.saveGroups([...this.explicitGroups]),
-        this.repository.saveInventorySources([...this.inventorySources.values()])
-      ]);
-    } catch (error) {
-      // FINDING 3 — servers: restore the prior entry only if the current
-      // entry is still reference-identical to what this batch wrote (or
-      // still absent where this batch deleted it). If a concurrent command
-      // changed it since, leave the newer value alone.
+
+    // FINDING 1 — keep references to all three save promises and settle ALL
+    // of them (Promise.allSettled, not Promise.all) before doing anything
+    // else. Promise.all's catch fires the instant the FIRST one rejects,
+    // while its siblings (e.g. a slow saveServers carrying this batch's
+    // payload) can still be in flight; running the conditional rollback and
+    // the compensating re-persist at that point races that slow original —
+    // if it resolves and commits AFTER the compensating write lands, disk
+    // ends up holding the rejected batch's data instead of the rolled-back
+    // state. Awaiting allSettled first guarantees every original has already
+    // committed (or definitively failed) before rollback/compensation touch
+    // anything, so the compensating write is always the last one to land.
+    const results = await Promise.allSettled([
+      this.repository.saveServers([...this.servers.values()]),
+      this.repository.saveGroups([...this.explicitGroups]),
+      this.repository.saveInventorySources([...this.inventorySources.values()])
+    ]);
+    const firstRejection = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (firstRejection) {
+      // FINDING 3 (original) — servers: restore the prior entry only if the
+      // current entry is still structurally identical to what this batch
+      // wrote (or still absent where this batch deleted it). If a concurrent
+      // command changed or mutated it since, leave the newer value alone.
       for (const [id, priorServer] of priorServers) {
-        const batchValue = batchWrittenServers.get(id);
+        const batchSnapshot = batchWrittenServers.get(id);
         const current = this.servers.get(id);
-        const stillOurs = batchValue === undefined ? current === undefined : current === batchValue;
+        const stillOurs = batchSnapshot === undefined ? current === undefined : current !== undefined && serverConfigsEqual(current, batchSnapshot);
         if (!stillOurs) {
           continue;
         }
@@ -374,27 +398,32 @@ export class NexusCore {
         }
       }
       this.focusedSessionId = priorFocusedSessionId;
-      // FINDING 3 — restore the source record only if it's still the exact
-      // object this batch wrote (reference compare); a concurrent edit to the
-      // same source since must not be clobbered.
+      // FINDING 2 — source record: nothing in NexusCore ever mutates an
+      // InventorySourceConfig object in place (addOrUpdateInventorySource,
+      // removeInventorySource, and this method itself only ever call
+      // `this.inventorySources.set(id, <new object>)`), so a reference
+      // compare here cannot be fooled the way the servers check above could.
+      // Restore the source record only if it's still the exact object this
+      // batch wrote; a concurrent edit to the same source since must not be
+      // clobbered.
       if (this.inventorySources.get(source.id) === writtenSourceRecord) {
         this.inventorySources.set(source.id, source);
       }
-      // FINDING 2 — Promise.all doesn't cancel sibling writes: one of the
-      // three saves above may have already committed to disk (e.g. saveServers
-      // resolved before saveGroups rejected), leaving disk half-applied even
-      // though in-memory state was just rolled back (conditionally) to
-      // converge with what the caller is about to be told happened. Best-effort
-      // re-persist all three buckets with that (post-rollback) state so disk
-      // catches up whenever the store is actually reachable; ignore individual
-      // failures — if the store is still down, memory stays authoritative and
-      // the next successful persist heals disk.
+      // FINDING 1 — all three original saves above have now settled (we
+      // awaited allSettled), so it's safe to best-effort re-persist all three
+      // buckets with the (post-rollback) state: one of the originals may
+      // still have committed to disk (e.g. saveServers resolved before
+      // saveGroups rejected), leaving disk half-applied even though memory
+      // was just rolled back (conditionally) to converge with what the
+      // caller is about to be told happened. Ignore individual failures — if
+      // the store is still down, memory stays authoritative and the next
+      // successful persist heals disk.
       await Promise.allSettled([
         this.repository.saveServers([...this.servers.values()]),
         this.repository.saveGroups([...this.explicitGroups]),
         this.repository.saveInventorySources([...this.inventorySources.values()])
       ]);
-      throw error;
+      throw firstRejection.reason;
     }
     this.emitChanged();
   }

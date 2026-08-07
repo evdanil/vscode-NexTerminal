@@ -61,6 +61,74 @@ export interface ServerConfig {
   origin?: ServerOrigin;
 }
 
+/**
+ * Shallow-plus-one-level clone: ServerConfig's own fields are primitives, but
+ * `proxy` and `origin` are nested objects, so a plain `{...server}` would
+ * still share those two references with the source. Used by
+ * NexusCore.applyInventorySyncPlan to capture a structural snapshot of each
+ * batch-written server AT WRITE TIME, before any later in-place mutation
+ * (e.g. _renameFolderPath rewriting `server.group` on the very same object)
+ * can change what the live map entry looks like out from under it.
+ */
+export function cloneServerConfig(server: ServerConfig): ServerConfig {
+  return {
+    ...server,
+    proxy: server.proxy ? { ...server.proxy } : server.proxy,
+    origin: server.origin ? { ...server.origin } : server.origin
+  };
+}
+
+function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.type !== b.type) return false;
+  switch (a.type) {
+    case "ssh":
+      return a.jumpHostId === (b as SshJumpProxy).jumpHostId;
+    case "socks5":
+    case "http": {
+      const other = b as Socks5Proxy | HttpConnectProxy;
+      return a.host === other.host && a.port === other.port && a.username === other.username;
+    }
+  }
+}
+
+function serverOriginsEqual(a: ServerOrigin | undefined, b: ServerOrigin | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.sourceId === b.sourceId && a.externalId === b.externalId && a.syncedAt === b.syncedAt;
+}
+
+/**
+ * Field-wise structural comparison — the ServerConfig counterpart of
+ * inventory.ts's sourceConfigUnchanged. Used (instead of `===`) wherever a
+ * rollback needs to tell "still exactly what we wrote" apart from "changed
+ * since, even if it's the same object reference" — see FINDING 2 in
+ * NexusCore.applyInventorySyncPlan: _renameFolderPath and
+ * removeFolderCascade both mutate `server.group` IN PLACE on the object
+ * already sitting in the servers map, so a reference check (`a === b`) stays
+ * true across that mutation and would wrongly call the entry "unchanged".
+ */
+export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
+  return (
+    a.id === b.id &&
+    a.name === b.name &&
+    a.group === b.group &&
+    a.host === b.host &&
+    a.port === b.port &&
+    a.username === b.username &&
+    a.authType === b.authType &&
+    a.keyPath === b.keyPath &&
+    a.isHidden === b.isHidden &&
+    a.logSession === b.logSession &&
+    a.multiplexing === b.multiplexing &&
+    a.legacyAlgorithms === b.legacyAlgorithms &&
+    a.openFileExplorerOnFirstConnect === b.openFileExplorerOnFirstConnect &&
+    a.authProfileId === b.authProfileId &&
+    proxyConfigsEqual(a.proxy, b.proxy) &&
+    serverOriginsEqual(a.origin, b.origin)
+  );
+}
+
 export interface TunnelProfile {
   id: string;
   name: string;

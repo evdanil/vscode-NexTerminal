@@ -451,6 +451,70 @@ describe("NexusCore inventory sources", () => {
     expect(core.getInventorySource("source-1")?.lastSyncAt).toBeUndefined();
   });
 
+  it("(REVIEW FINDING 1) originals are settled (allSettled) BEFORE compensating: a fast-rejecting saveGroups can't let a still-pending saveServers land the batch payload AFTER the compensating restore write (kills compensate-before-originals-settle)", async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s",
+        host: "h",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    const originalSaveServers = repository.saveServers.bind(repository);
+    let saveServersCallCount = 0;
+    const saveOrder: string[] = [];
+    vi.spyOn(repository, "saveServers").mockImplementation(async (servers) => {
+      saveServersCallCount++;
+      if (saveServersCallCount === 1) {
+        // The batch's OWN save: settle on a real macrotask (setTimeout),
+        // strictly AFTER any purely microtask-driven work — including a
+        // buggy (Promise.all + immediate catch) implementation's rollback
+        // and compensating writes, which would already be complete by the
+        // time a setTimeout(0) callback fires.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        await originalSaveServers(servers);
+        saveOrder.push(`original:${servers.map((s) => s.id).sort().join(",")}`);
+        return;
+      }
+      await originalSaveServers(servers);
+      saveOrder.push(`compensating:${servers.map((s) => s.id).sort().join(",")}`);
+    });
+    vi.spyOn(repository, "saveGroups").mockRejectedValueOnce(new Error("disk full"));
+
+    const newServer: ServerConfig = { id: "srv-2", name: "new", host: "h2", port: 22, username: "u", authType: "agent", isHidden: false };
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 999,
+        upsertServers: [newServer],
+        removeServerIds: ["srv-1"],
+        folders: [],
+        expectedSource: makeSourceConfig()
+      })
+    ).rejects.toThrow("disk full");
+
+    // If FINDING 1's fix were reverted (Promise.all + immediate catch), the
+    // compensating write would be fired the instant saveGroups rejects —
+    // without waiting for the still-pending saveServers call — resolve on a
+    // microtask, and land FIRST. The slow original save (carrying the
+    // batch's payload: srv-2 present, srv-1 removed) would then land
+    // afterwards and overwrite it, leaving the repo's persisted servers
+    // wrong even though the caller was told the apply failed.
+    const finalServers = await repository.getServers();
+    expect(finalServers.map((s) => s.id).sort()).toEqual(["srv-1"]);
+    // The recorded write order proves the compensating write happened AFTER
+    // the slow original settled, never before it.
+    expect(saveOrder).toEqual(["original:srv-2", "compensating:srv-1"]);
+  });
+
   it("(FINDING 3) a concurrent addGroup/addOrUpdateServer landing while the batch's persist is pending survives rollback — restore is conditional, never a wholesale set replacement (kills restore-by-replacing-the-whole-set)", async () => {
     const untouched: ServerConfig = { id: "srv-untouched", name: "u", host: "h3", port: 22, username: "u", authType: "agent", isHidden: false };
     const repository = new InMemoryConfigRepository([
@@ -520,6 +584,83 @@ describe("NexusCore inventory sources", () => {
     // own mutations. They must survive.
     expect(snapshot.explicitGroups).toContain("Unrelated");
     expect(core.getServer("srv-untouched")?.name).toBe("renamed");
+  });
+
+  it("(REVIEW FINDING 2) a concurrent in-place mutation of an upserted server's group (exactly how _renameFolderPath mutates it) survives rollback — comparison is structural, not by reference (kills a reference-identity rollback check)", async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s",
+        host: "h",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        group: "OldGroup",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    // Hold the batch's own saveServers call pending so a concurrent in-place
+    // mutation (as performed by _renameFolderPath / removeFolderCascade,
+    // which reassign `server.group` on the SAME object already sitting in
+    // NexusCore's servers map) can land while the persist is still in flight.
+    // The batch's OWN catch-block compensating re-persist (after rollback)
+    // must go through to the real implementation, not hang forever too.
+    const originalSaveServers = repository.saveServers.bind(repository);
+    let rejectBatchSave!: (err: Error) => void;
+    let batchCallSeen = false;
+    vi.spyOn(repository, "saveServers").mockImplementation(async (servers) => {
+      if (!batchCallSeen) {
+        batchCallSeen = true;
+        return new Promise<void>((_resolve, reject) => {
+          rejectBatchSave = reject;
+        });
+      }
+      return originalSaveServers(servers);
+    });
+
+    const upsertedServer: ServerConfig = {
+      id: "srv-1",
+      name: "s",
+      host: "h",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 999 }
+    };
+    const applyPromise = core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 999,
+      upsertServers: [upsertedServer],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: makeSourceConfig()
+    });
+
+    // The batch's synchronous mutations + save invocation have already run by
+    // the time control returns here. The live entry in NexusCore's map is
+    // now the exact `upsertedServer` object — mutate its `.group` IN PLACE,
+    // precisely like _renameFolderPath does for a folder rename racing this
+    // pending persist.
+    const liveServer = core.getServer("srv-1")!;
+    expect(liveServer).toBe(upsertedServer); // sanity: same reference, as _renameFolderPath would see it
+    liveServer.group = "NetBox/RenamedRack";
+
+    rejectBatchSave(new Error("disk full"));
+    await expect(applyPromise).rejects.toThrow("disk full");
+
+    // If rollback used a reference check (`current === batchValue`), it would
+    // still consider srv-1 "ours" (same object, merely mutated) and clobber
+    // the concurrent rename back to the pre-batch "OldGroup". A structural
+    // comparison correctly sees the current entry differs from the snapshot
+    // captured at write time and leaves the rename alone.
+    expect(core.getServer("srv-1")?.group).toBe("NetBox/RenamedRack");
   });
 });
 
