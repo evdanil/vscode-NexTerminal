@@ -369,43 +369,53 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
   return new Set(plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id));
 }
 
-// FINDING 1 — counts alone can match while the actual set of servers slated
-// for deletion differs (e.g. a concurrent import added an owned server absent
-// from the fetched tree, and something else's delete count happened to drop
-// by one) — compare the prune-"delete" server-id set too, not just counts.
+// FINDING 1 (P2, jump-host-dependents-drift review) — describePlanDetail IS
+// the modal's rendered text. Comparing its OUTPUT for the plan just shown
+// against a freshly recomputed plan subsumes every field this comparator
+// used to check individually (adds/updates/prunes counts, unchangedCount,
+// manualDuplicateCount, hiddenPruneCount, warnings.length) *and* the
+// jump-host-dependents line, which depended on `allServers` rather than the
+// plan alone and so could drift (a server edited mid-modal to proxy through
+// a planned deletion) without changing anything the old field-list
+// comparator looked at. It also automatically covers any future addition to
+// describePlanDetail's rendering — there is no per-field list to keep in
+// sync by hand anymore. Both renders MUST be produced with the exact
+// arguments describePlanDetail was actually called with for that modal — the
+// server snapshot captured when the modal was shown vs a FRESH snapshot
+// taken at recompute time — passed in by the caller rather than re-read
+// here, so this function can't silently compare a plan against the wrong
+// snapshot.
 //
-// FINDING 3 — raw counts (adds/updates/prunes/unchanged) can stay identical
-// while a modal-visible AGGREGATE changes: a manual server landing on a
-// planned add's host:port between the modal and the recompute leaves
-// adds.length untouched but bumps manualDuplicateCount, and the modal's "will
-// be added as duplicates" line only reflects the plan that was actually
-// shown. Compare every plan-derived value describePlanDetail renders —
-// manualDuplicateCount, hiddenPruneCount, and warnings.length — alongside the
-// raw counts, so a drift in any of them (not just the counts) loops back to
-// reconfirmation instead of applying a plan the user never saw the modal for.
-function planCountsEqual(a: InventorySyncPlan, b: InventorySyncPlan): boolean {
-  if (
-    a.adds.length !== b.adds.length ||
-    a.updates.length !== b.updates.length ||
-    a.prunes.length !== b.prunes.length ||
-    a.unchangedCount !== b.unchangedCount ||
-    a.manualDuplicateCount !== b.manualDuplicateCount ||
-    a.hiddenPruneCount !== b.hiddenPruneCount ||
-    a.warnings.length !== b.warnings.length
-  ) {
-    return false;
+// The prune-"delete" server-id SET is kept as its own, separate comparison
+// (not folded into the rendered text): describePlanDetail only ever renders
+// a COUNT of deletions, so two plans that delete the same NUMBER of servers
+// but a DIFFERENT SET of them render identical text, even though the
+// pre-apply teardown loop below tears down whatever the fresh recompute's
+// delete set actually is — an unseen swap here would silently kill a
+// different server's live terminals/tunnels/pool connection than the one the
+// confirmed detail text implied. Every other individually-compared field
+// from the old comparator is dropped as redundant now that the rendered
+// string covers it; this is the one aggregate that isn't fully captured by
+// the text and so earns its own dedicated check for teardown-safety.
+function planDetailDrift(
+  previous: { detail: string; deleteIds: ReadonlySet<string> },
+  nextPlan: InventorySyncPlan,
+  nextServers: ServerConfig[]
+): { drift: boolean; detail: string } {
+  const nextDetail = describePlanDetail(nextPlan, nextServers);
+  if (nextDetail !== previous.detail) {
+    return { drift: true, detail: nextDetail };
   }
-  const idsA = deletePruneIds(a);
-  const idsB = deletePruneIds(b);
-  if (idsA.size !== idsB.size) {
-    return false;
+  const nextDeleteIds = deletePruneIds(nextPlan);
+  if (nextDeleteIds.size !== previous.deleteIds.size) {
+    return { drift: true, detail: nextDetail };
   }
-  for (const id of idsA) {
-    if (!idsB.has(id)) {
-      return false;
+  for (const id of previous.deleteIds) {
+    if (!nextDeleteIds.has(id)) {
+      return { drift: true, detail: nextDetail };
     }
   }
-  return true;
+  return { drift: false, detail: nextDetail };
 }
 
 export function registerInventoryCommands(
@@ -1183,35 +1193,72 @@ export function registerInventoryCommands(
 
       // Nothing to do: apply an empty application to bump lastSyncAt without a confirm modal.
       if (plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0) {
-        // CONFIG MUTATION LOCK — no modal on this path, so the mutation is
-        // safe to lock immediately. Same serialization guarantee as the
-        // reconfirm loop below, for the same reason: this still calls
-        // applyInventorySyncPlan and must not interleave with a config-level
-        // import/reset's own critical section.
+        // FINDING 2 (P2, fast-path-stale-recompute review) — `plan` above was
+        // computed BEFORE this lock acquisition; a queued mutation elsewhere
+        // (e.g. a locked nexus.server.remove deleting a server this source
+        // owns) can complete in the gap between that computation and actually
+        // acquiring the lock here, turning a genuinely-stale empty plan into
+        // one that would delete/add/update something once state is current.
+        // Recompute from a FRESH snapshot inside the lock and branch on that
+        // result, never on the pre-lock `plan`:
+        //   - still empty -> the original behavior (bump lastSyncAt, "nothing
+        //     to do" toast, no confirm modal — this path exists specifically
+        //     to skip the modal for a no-op sync).
+        //   - NOT empty -> do not apply anything here. Return a signal so the
+        //     lock is released FIRST (never show the confirm modal while
+        //     holding configMutationLock — see the rule documented on the
+        //     lock itself) and the outer code falls through into the normal
+        //     confirmation flow with the recomputed plan, exactly as if the
+        //     very first computeSyncPlan call above had produced it.
         // ITEM 5 — same rejection surface as the main apply path below: a
         // source config race (or any persist failure) here must produce a
         // friendly error instead of an unhandled command rejection.
-        const nothingToDoApplied = await configMutationLock.runExclusive(async (): Promise<boolean> => {
+        type FastPathResult =
+          | { kind: "done"; plan: InventorySyncPlan }
+          | { kind: "not-empty"; plan: InventorySyncPlan }
+          | { kind: "abort" };
+        const fastPathResult: FastPathResult = await configMutationLock.runExclusive(async (): Promise<FastPathResult> => {
+          const freshSource = core.getInventorySource(source.id);
+          if (!freshSource) {
+            void vscode.window.showErrorMessage("The inventory source was removed before the sync could be applied.");
+            return { kind: "abort" };
+          }
+          if (!sourceConfigUnchanged(source, freshSource)) {
+            void vscode.window.showErrorMessage(
+              `Inventory source "${source.name}" configuration changed while syncing — run Sync Now again.`
+            );
+            return { kind: "abort" };
+          }
+          const recomputed = computeSyncPlan({ source: freshSource, tree, currentServers: core.getSnapshot().servers, now: Date.now() });
+          if (recomputed.adds.length > 0 || recomputed.updates.length > 0 || recomputed.prunes.length > 0) {
+            return { kind: "not-empty", plan: recomputed };
+          }
           try {
-            await core.applyInventorySyncPlan(planToApplication(plan, source));
-            return true;
+            await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
+            return { kind: "done", plan: recomputed };
           } catch (error) {
             void vscode.window.showErrorMessage(
               `Inventory sync failed: ${error instanceof Error ? error.message : String(error)}`
             );
-            return false;
+            return { kind: "abort" };
           }
         });
-        if (!nothingToDoApplied) return;
-        void vscode.window.showInformationMessage(`Inventory sync from "${source.name}": nothing to do (${plan.unchangedCount} unchanged).`);
-        if (plan.warnings.length > 0) {
-          void vscode.window
-            .showWarningMessage(`${plan.warnings.length} warning${plan.warnings.length === 1 ? "" : "s"} during sync.`, "Show Details")
-            .then((choice) => {
-              if (choice === "Show Details") void openInventoryIssuesText(plan.warnings);
-            });
+        if (fastPathResult.kind === "abort") return;
+        if (fastPathResult.kind === "done") {
+          const donePlan = fastPathResult.plan;
+          void vscode.window.showInformationMessage(`Inventory sync from "${source.name}": nothing to do (${donePlan.unchangedCount} unchanged).`);
+          if (donePlan.warnings.length > 0) {
+            void vscode.window
+              .showWarningMessage(`${donePlan.warnings.length} warning${donePlan.warnings.length === 1 ? "" : "s"} during sync.`, "Show Details")
+              .then((choice) => {
+                if (choice === "Show Details") void openInventoryIssuesText(donePlan.warnings);
+              });
+          }
+          return;
         }
-        return;
+        // "not-empty" — lock already released above; fall through into the
+        // normal confirmation flow below with the freshly recomputed plan.
+        plan = fastPathResult.plan;
       }
 
       // FINDING 1 — the post-teardown final recompute (below) can turn up a
@@ -1236,10 +1283,17 @@ export function registerInventoryCommands(
         | { kind: "success"; finalPlan: InventorySyncPlan; recreatedCount: number; teardownFailureCount: number };
 
       for (;;) {
+        // FINDING 1 — captured together so the drift check inside the lock
+        // below compares against EXACTLY what this modal rendered: the same
+        // plan and the same server snapshot describePlanDetail was called
+        // with here, not a re-derived approximation of either.
+        const shownServers = core.getSnapshot().servers;
+        const shownDetail = describePlanDetail(plan, shownServers);
+        const shownDeleteIds = deletePruneIds(plan);
         const buttons = plan.warnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
         const choice = await vscode.window.showInformationMessage(
           `Apply inventory sync from "${source.name}"?`,
-          { modal: true, detail: describePlanDetail(plan, core.getSnapshot().servers) },
+          { modal: true, detail: shownDetail },
           ...buttons
         );
         if (choice === "Show Warnings") {
@@ -1278,8 +1332,10 @@ export function registerInventoryCommands(
             return { kind: "abort" };
           }
 
-          const recomputed = computeSyncPlan({ source: freshSource, tree, currentServers: core.getSnapshot().servers, now: Date.now() });
-          if (!planCountsEqual(plan, recomputed)) {
+          const freshServersForRecompute = core.getSnapshot().servers;
+          const recomputed = computeSyncPlan({ source: freshSource, tree, currentServers: freshServersForRecompute, now: Date.now() });
+          const recomputedDrift = planDetailDrift({ detail: shownDetail, deleteIds: shownDeleteIds }, recomputed, freshServersForRecompute);
+          if (recomputedDrift.drift) {
             return { kind: "retry", plan: recomputed };
           }
 
@@ -1360,18 +1416,24 @@ export function registerInventoryCommands(
           // applyInventorySyncPlan's expectedSource — FINDING E's synchronous
           // check inside applyInventorySyncPlan is what still catches the
           // source record itself being replaced during this window.
-          const finalPlan = computeSyncPlan({ source: freshSource, tree, currentServers: core.getSnapshot().servers, now: Date.now() });
+          const finalServersForRecompute = core.getSnapshot().servers;
+          const finalPlan = computeSyncPlan({ source: freshSource, tree, currentServers: finalServersForRecompute, now: Date.now() });
           const finalApplication = planToApplication(finalPlan, freshSource);
 
-          // FINDING 1 — compare the post-teardown final recompute against the
-          // plan the user just reconfirmed (`recomputed`, computed right before
-          // the teardown loop above). If they differ — counts OR the actual
-          // prune-"delete" server-id set — do NOT apply unseen: loop back to
-          // the confirmation modal with the new plan (releasing the lock
-          // first). Nothing has been applied yet (applyInventorySyncPlan
-          // hasn't been called), so re-declining on the next confirmation
-          // leaves state untouched.
-          if (!planCountsEqual(recomputed, finalPlan)) {
+          // FINDING 1 — compare the post-teardown final recompute's rendered
+          // detail (and delete-id set) against the plan the user just
+          // reconfirmed (`recomputed`, rendered right before the teardown
+          // loop above via `recomputedDrift.detail`). If they differ, do NOT
+          // apply unseen: loop back to the confirmation modal with the new
+          // plan (releasing the lock first). Nothing has been applied yet
+          // (applyInventorySyncPlan hasn't been called), so re-declining on
+          // the next confirmation leaves state untouched.
+          const finalDrift = planDetailDrift(
+            { detail: recomputedDrift.detail, deleteIds: deletePruneIds(recomputed) },
+            finalPlan,
+            finalServersForRecompute
+          );
+          if (finalDrift.drift) {
             finalRecomputeMismatchCount++;
             if (finalRecomputeMismatchCount > MAX_FINAL_RECOMPUTE_MISMATCHES) {
               void vscode.window.showErrorMessage(

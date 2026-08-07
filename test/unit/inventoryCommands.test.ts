@@ -4,6 +4,7 @@ import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/n
 import type { ServerConfig } from "../../src/models/config";
 import { inventorySecretKey, type InventoryProvider, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import { configMutationLock } from "../../src/services/configMutationLock";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 
@@ -2116,6 +2117,151 @@ describe("inventoryCommands", () => {
       // duplicates line for THIS plan.
       expect(applySpy).not.toHaveBeenCalled();
       expect(core.getSnapshot().servers.map((s) => s.id).sort()).toEqual(["manual-1", "owned-1"]);
+    });
+
+    it("FINDING 1 (P2, jump-host-dependents-drift review) — a server edited to proxy through a planned deletion during the teardown hook re-shows the confirmation modal with the dependents line, even though every individually-compared count (adds/updates/prunes/unchanged/manualDuplicateCount/hiddenPruneCount/warnings.length) is identical (kills a comparator that never looked at describePlanDetail's jump-host line)", async () => {
+      const pruned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const bystander = makeServer({ id: "bystander-1", name: "bystander", host: "10.0.0.50" });
+      const repo = new InMemoryConfigRepository([pruned, bystander]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        // device:1 is gone from the tree -> prune "delete". No other devices.
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+
+      const teardown = {
+        teardownServerRuntime: vi.fn(async (serverId: string) => {
+          if (serverId === "owned-1") {
+            // Simulate a concurrent edit landing DURING the teardown await —
+            // invisible to the plan the user just confirmed. The bystander
+            // server is reconfigured to proxy through the about-to-be-deleted
+            // "owned-1": this changes nothing computeSyncPlan itself returns
+            // (adds/updates/prunes/unchangedCount/manualDuplicateCount/
+            // hiddenPruneCount/warnings all untouched — the plan doesn't even
+            // look at proxy config), only the jump-host-dependents line
+            // describePlanDetail renders from `allServers` moves.
+            await core.addOrUpdateServer({ ...bystander, proxy: { type: "ssh", jumpHostId: "owned-1" } });
+          }
+        })
+      };
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete" }));
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage
+        .mockResolvedValueOnce("Apply") // first confirm — no dependents visible yet
+        .mockResolvedValueOnce(undefined); // cancel the reconfirmation modal
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      // The modal was shown a SECOND time, now with the jump-host dependents
+      // line — the raw counts (1 deleted, 0 unchanged) are identical between
+      // both modals, so a counts-only comparator would have applied this
+      // unseen.
+      expect(mockShowInformationMessage).toHaveBeenCalledTimes(2);
+      const firstCallDetail = (mockShowInformationMessage.mock.calls[0]?.[1] as { detail?: string } | undefined)?.detail;
+      const secondCallDetail = (mockShowInformationMessage.mock.calls[1]?.[1] as { detail?: string } | undefined)?.detail;
+      expect(firstCallDetail).not.toContain("jump host");
+      expect(firstCallDetail).toContain("1 deleted");
+      expect(secondCallDetail).toContain("1 deleted");
+      expect(secondCallDetail?.toLowerCase()).toContain("jump host");
+      expect(secondCallDetail).toContain("1 other server uses these as SSH jump hosts.");
+
+      // If FINDING 1's fix were reverted (a comparator built only from
+      // adds/updates/prunes counts, unchangedCount, manualDuplicateCount,
+      // hiddenPruneCount, and warnings.length — never the rendered detail
+      // text or anything derived from `allServers`), this identical-counts
+      // drift would have gone unnoticed and applyInventorySyncPlan would
+      // have been called once here, deleting owned-1 without ever showing
+      // the dependents warning for THIS plan.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getSnapshot().servers.map((s) => s.id).sort()).toEqual(["bystander-1", "owned-1"]);
+    });
+
+    it("FINDING 2 (P2, fast-path-stale-recompute review) — a locked server removal deleting an owned server, queued ahead of syncNow's fast-path lock acquisition, is picked up by a fresh in-lock recompute: the sync does NOT report nothing-to-do, and the confirm modal appears with the recomputed (non-empty) plan instead (kills applying a stale pre-lock empty plan without recomputing)", async () => {
+      const owned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        port: 22,
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        // The tree still reports device:1, matching "owned-1" exactly — the
+        // plan computed against the CURRENT (pre-removal) server list is
+        // genuinely empty (unchanged), so syncNow takes the fast path.
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1,
+          devices: [{ externalId: "device:1", name: "old-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+        }))
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      let releaseRemoval!: () => void;
+      const removalGate = new Promise<void>((resolve) => {
+        releaseRemoval = resolve;
+      });
+
+      // Simulates a locked mutation (e.g. nexus.server.remove, which also
+      // serializes through the SAME configMutationLock singleton) queued
+      // AHEAD of syncNow's own fast-path lock acquisition below: this call
+      // is made first, so it sits at the head of the lock's FIFO queue.
+      const removalPromise = configMutationLock.runExclusive(async () => {
+        await removalGate;
+        await core.removeServer("owned-1");
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      const syncPromise = cmd("src-1");
+
+      // Let syncNow run all the way up to (and queue behind, on the shared
+      // lock) its fast-path lock acquisition — everything before that point
+      // (secret checks, the progress-wrapped fetch, the initial pre-lock
+      // computeSyncPlan call) needs no lock and completes on its own.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Release the queued removal — it deletes "owned-1", then frees the
+      // lock for syncNow's fast path to finally acquire it and recompute.
+      releaseRemoval();
+      await removalPromise;
+      await syncPromise;
+
+      // Never the stale "nothing to do" toast: the fresh in-lock recompute
+      // (with "owned-1" gone) finds device:1 unmatched, i.e. a genuine add.
+      expect(
+        mockShowInformationMessage.mock.calls.some(([msg]) => typeof msg === "string" && msg.includes("nothing to do"))
+      ).toBe(false);
+      const modalCall = mockShowInformationMessage.mock.calls.find(
+        ([msg]) => typeof msg === "string" && msg.includes("Apply inventory sync")
+      );
+      expect(modalCall).toBeDefined();
+      const detail = (modalCall?.[1] as { detail?: string } | undefined)?.detail;
+      expect(detail).toContain("1 added");
+
+      // The recomputed (non-empty) plan was actually applied after the user
+      // confirmed it — the device is re-created as a fresh add, proving this
+      // wasn't a no-op.
+      expect(core.getSnapshot().servers.filter((s) => s.origin?.sourceId === "src-1")).toHaveLength(1);
     });
 
     it("nothing-to-do still bumps lastSyncAt without a confirm modal", async () => {
