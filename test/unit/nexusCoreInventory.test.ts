@@ -2200,6 +2200,200 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
     expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
     expect(resultY.removedEmptyFolderCount).toBe(1);
   });
+
+  it("(kills new-target-only filtering) editing targetFolder ('NetBox' -> 'Infra') still reclaims the OLD target's now-empty managed folder, and the old target's own root survives untouched", async () => {
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core } = await makeCoreWithSource([owned], { targetFolder: "NetBox" });
+    // Establish the starting folder tree, and stamp "NetBox/RackA" into
+    // managedFolders, exactly as a real prior sync would have.
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackA"]);
+
+    // The source's targetFolder is edited (e.g. via Edit Source) — mirrors
+    // inventoryCommands.ts's edit flow, which spreads the previous record
+    // and only overwrites the fields the form controls, so `managedFolders`
+    // rides along unchanged even though `targetFolder` now points elsewhere.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("source-1")!, targetFolder: "Infra" });
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackA"]);
+
+    // The very next sync moves the device to the NEW target; the OLD
+    // target's folder is now genuinely empty and named by neither this
+    // sync's `folders` nor this source's own footprint.
+    const moved = { ...owned, group: "Infra/RackA" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["Infra/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // KILLS new-target-only filtering: a GC restricted to folders under the
+    // CURRENT targetFolder ("Infra/...") would never even consider
+    // "NetBox/RackA" a candidate, so it would survive here — and the
+    // `managedFolders` restamp below then permanently drops it from the
+    // set, losing the cleanup opportunity forever.
+    const groups = core.getSnapshot().explicitGroups;
+    expect(groups).not.toContain("NetBox/RackA");
+    expect(groups).toContain("Infra/RackA");
+    // The OLD target's own root is never itself a `managedFolders` member
+    // (see pruneEmptyFoldersUnderTarget's doc), so it is never a GC
+    // candidate at all and survives regardless of occupancy.
+    expect(groups).toContain("NetBox");
+    expect(result.removedEmptyFolderCount).toBe(1);
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["Infra/RackA"]);
+  });
+
+  it("(old-target occupancy) a folder under the OLD target still holding an unrelated manual server survives a targetFolder edit + move", async () => {
+    const manualServer: ServerConfig = {
+      id: "manual-1",
+      name: "hand-added",
+      host: "192.168.1.1",
+      port: 22,
+      username: "root",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA" // no `origin` — added by hand, not by this source
+    };
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core } = await makeCoreWithSource([manualServer, owned], { targetFolder: "NetBox" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackA"]);
+
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("source-1")!, targetFolder: "Infra" });
+
+    // This source's own device moves to the new target; the manual server
+    // stays behind in the OLD target's folder, which is now a GC candidate
+    // (evaluated at its own path, per the fix) but must still survive
+    // because it is not actually empty.
+    const moved = { ...owned, group: "Infra/RackA" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["Infra/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(result.removedEmptyFolderCount).toBe(0);
+  });
+
+  it("(old-target co-ownership) a folder under the OLD target still managed by ANOTHER source survives a targetFolder edit + move, and is only GC'd once that other source also drops it", async () => {
+    const ownedByX: ServerConfig = {
+      id: "device-x",
+      name: "sw-x",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:x", syncedAt: 1 }
+    };
+    const repository = new InMemoryConfigRepository([ownedByX]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", targetFolder: "NetBox" }));
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-2", targetFolder: "NetBox" }));
+
+    // Both sources' plans name "NetBox/RackA" on their first sync.
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [ownedByX],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-2",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-2")!
+    });
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackA"]);
+    expect(core.getInventorySource("source-2")?.managedFolders).toEqual(["NetBox/RackA"]);
+
+    // source-1's targetFolder is edited away from "NetBox" entirely.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("source-1")!, targetFolder: "Infra" });
+
+    // source-1's device moves to the new target — "NetBox/RackA" becomes
+    // genuinely empty of source-1's own devices AND drops out of source-1's
+    // own managed set, but source-2 still names it.
+    const movedX = { ...ownedByX, group: "Infra/RackA" };
+    const resultX = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [movedX],
+      removeServerIds: [],
+      folders: ["Infra/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // KILLS own-set-only / new-target-only checks: "NetBox/RackA" survives
+    // because source-2 still manages it, even though it is genuinely empty
+    // and source-1 both dropped it from its own managed set AND retargeted
+    // away from "NetBox" entirely on this very call.
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(resultX.removedEmptyFolderCount).toBe(0);
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["Infra/RackA"]);
+    expect(core.getInventorySource("source-2")?.managedFolders).toEqual(["NetBox/RackA"]);
+
+    // source-2 now drops it too — nothing manages it anymore, and it is
+    // still genuinely empty. The very next sync of either source may now
+    // reclaim it.
+    const resultY = await core.applyInventorySyncPlan({
+      sourceId: "source-2",
+      syncedAt: 2,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: [],
+      expectedSource: core.getInventorySource("source-2")!
+    });
+
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
+    expect(resultY.removedEmptyFolderCount).toBe(1);
+  });
 });
 
 describe("validateInventorySource", () => {

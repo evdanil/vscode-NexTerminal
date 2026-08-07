@@ -332,8 +332,7 @@ export class NexusCore {
    * applyInventorySyncPlan's mutation phase, AFTER the batch's own
    * upserts/removes have already been applied to `this.servers` (so
    * emptiness reflects the POST-sync state, not the pre-sync one). Removes
-   * explicit folders STRICTLY under `targetFolder` (never `targetFolder`
-   * itself — that stays even if momentarily empty) that are:
+   * explicit folders that are:
    *   - in `ownedCandidates` (REVIEW FINDING 1, P2 — the source's OWN prior
    *     `managedFolders`, minus the folders this very sync still names OR
    *     still occupies with its own devices, and minus any path another
@@ -347,11 +346,49 @@ export class NexusCore {
    *     this source itself created and has since stopped naming/occupying,
    *     and that no OTHER source still manages — never sweeps unowned or
    *     cross-owned territory,
+   *
+   *     TARGET-EDIT FIX — `ownedCandidates` is evaluated at EACH candidate's
+   *     OWN path, not filtered to live under the CURRENT `targetFolder`. A
+   *     candidate drawn from `previousManagedFolders` was stamped relative to
+   *     whatever `targetFolder` was in effect on the sync that created it,
+   *     which can differ from the CURRENT `targetFolder` when the source's
+   *     `targetFolder` was edited between syncs (e.g. "NetBox" -> "Infra") —
+   *     restricting candidates to `startsWith(targetFolder + "/")` would
+   *     silently exclude every folder still sitting under the OLD target
+   *     (e.g. "NetBox/RackA"), so it could never be reclaimed even after it
+   *     goes empty, and the very next restamp of `managedFolders` (see the
+   *     call site) then replaces the set with only new-target paths —
+   *     permanently losing the cleanup opportunity for the old target's tree.
+   *     The `targetFolder` parameter is kept only to protect the CURRENT
+   *     target's own root from ever being reclaimed (see below); it is no
+   *     longer used to restrict WHICH candidates are considered,
    *   - not in `keepFolders` (the application's own `folders` list, with
    *     ancestors included) — a folder this very sync still names must never
    *     be GC'd out from under it just because it happens to be empty this
    *     run (this is implied by `ownedCandidates` already excluding the new
-   *     managed set, kept here too as defense-in-depth), and
+   *     managed set, kept here too as defense-in-depth),
+   *   - not equal to `targetFolder` itself — the CURRENT target's own root
+   *     always survives, even if it happens to appear in `ownedCandidates`.
+   *     Under normal stamping this never happens (`newManagedFolders` and
+   *     `previousManagedFolders` both only ever hold paths STRICTLY under
+   *     their respective target, so a target's own root is never itself a
+   *     member — see the call site), but a source whose `targetFolder` is
+   *     edited to a value that happens to equal a PREVIOUS candidate path
+   *     (e.g. old target "A" with candidate "A/B", then `targetFolder`
+   *     edited to "A/B") could otherwise coincide with it; this check is the
+   *     backstop,
+   *   - structurally well-formed and already in normalized form (own path
+   *     has a "/", `normalizeFolderPath` accepts it unchanged) — defensive
+   *     only. Every candidate a REAL sync ever stamps into `managedFolders`
+   *     is a strict descendant of some non-root `targetFolder` (root-target
+   *     sources never populate `managedFolders` at all — GC is exempt at
+   *     root, see the call site — so a legitimately-stamped candidate always
+   *     has at least one "/"), but `validateInventorySource` accepts ANY
+   *     string array for `managedFolders`, so a legacy/imported source
+   *     record could carry an arbitrary (even single-segment, root-level)
+   *     path here. A single-segment candidate is treated the same as a
+   *     root-level folder and skipped, mirroring the "GC never runs at root"
+   *     rule applied to normal target folders, and
    *   - completely empty: no server (ANY origin — manual or synced from a
    *     DIFFERENT source), serial profile, or local-shell profile currently
    *     assigned to it, AND no descendant folder that is itself still
@@ -385,9 +422,26 @@ export class NexusCore {
     ownedCandidates: ReadonlySet<string>
   ): Set<string> {
     const removed = new Set<string>();
-    const prefix = `${targetFolder}/`;
-    const candidates = [...this.explicitGroups]
-      .filter((group) => group !== targetFolder && group.startsWith(prefix) && !keepFolders.has(group) && ownedCandidates.has(group))
+    const candidates = [...ownedCandidates]
+      .filter((candidate) => {
+        if (candidate === targetFolder || keepFolders.has(candidate)) {
+          return false;
+        }
+        if (!candidate.includes("/")) {
+          // Defensive: a legitimately-stamped candidate is always strictly
+          // under SOME non-root target and therefore always has a "/" — see
+          // the doc above. A single-segment path only reaches here via a
+          // legacy/imported record with a hand-edited `managedFolders`
+          // array; refuse to touch it, same as a root-level folder.
+          return false;
+        }
+        if (normalizeFolderPath(candidate) !== candidate) {
+          // Defensive: same legacy/imported-record concern — only act on
+          // candidates already in normalized form.
+          return false;
+        }
+        return this.explicitGroups.has(candidate);
+      })
       .sort((a, b) => b.split("/").length - a.split("/").length);
 
     for (const candidate of candidates) {
