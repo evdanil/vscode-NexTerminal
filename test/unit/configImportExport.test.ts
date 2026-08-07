@@ -2817,6 +2817,127 @@ describe("backup import", () => {
     expect(configStore.get("nexus.scripts.path")).toBe("/tmp/redirected-scripts");
     expect((mockWriteFile.mock.calls[0][0] as { fsPath: string }).fsPath).toBe("/workspace/.nexus/scripts/hello.js");
   });
+
+  it("merge-mode import does not overwrite a retained server's vault password with the backup's; a newly-imported server's password still restores; replace mode restores everything (kills restoreSecrets()'s pre-fix unconditional write)", async () => {
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    // A local server "s1" already exists, with its own working vault password.
+    await core.addOrUpdateServer(makeServer({ id: "s1", name: "Local Server" }));
+    await vault.store("password-s1", "local-pw");
+
+    // Backup carries the SAME server id (s1, with a different password — simulating a stale
+    // backup) plus a server that doesn't exist locally yet (s2).
+    const secrets = {
+      passwords: { s1: "backup-pw", s2: "new-pw" },
+      passphrases: {}
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [
+        makeServer({ id: "s1", name: "Backup Server" }),
+        makeServer({ id: "s2", name: "New Server" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      encryptedSecrets
+    };
+
+    // --- Merge mode: importPreservingIds skips s1 (id already exists locally) and imports s2
+    // (new). The secret restore must follow the same split: s1's vault password is left alone,
+    // s2's is restored.
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getServer("s1")?.name).toBe("Local Server"); // config retained
+    expect(await vault.get("password-s1")).toBe("local-pw"); // secret NOT overwritten
+    expect(await vault.get("password-s2")).toBe("new-pw"); // newly-imported server restored
+
+    // --- Replace mode: the existing s1 is removed and every backup server (re)imported — both
+    // s1 and s2 land in importedIds and both secrets restore — s1's password IS overwritten.
+    registeredCommands.clear();
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1");
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    registerConfigCommands(core, vault);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getServer("s1")?.name).toBe("Backup Server");
+    expect(await vault.get("password-s1")).toBe("backup-pw");
+    expect(await vault.get("password-s2")).toBe("new-pw");
+  });
+
+  it("merge-mode import does not overwrite a retained auth profile's vault password with the backup's; a newly-imported profile's password still restores; replace mode restores everything (kills restoreSecrets()'s pre-fix unconditional write)", async () => {
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    // A local auth profile "ap1" already exists, with its own working vault password.
+    await core.addOrUpdateAuthProfile(makeAuthProfile({ id: "ap1", name: "Local Profile" }));
+    await vault.store("auth-profile-password-ap1", "local-pw");
+
+    // Backup carries the SAME profile id (ap1, with a different password) plus a profile that
+    // doesn't exist locally yet (ap2).
+    const secrets = {
+      passwords: {},
+      passphrases: {},
+      authProfilePasswords: { ap1: "backup-pw", ap2: "new-pw" }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [
+        makeAuthProfile({ id: "ap1", name: "Backup Profile" }),
+        makeAuthProfile({ id: "ap2", name: "New Profile" })
+      ],
+      encryptedSecrets
+    };
+
+    // --- Merge mode: importPreservingIds skips ap1 (id already exists locally) and imports
+    // ap2 (new). The secret restore must follow the same split: ap1's vault password is left
+    // alone, ap2's is restored.
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getSnapshot().authProfiles.find((p) => p.id === "ap1")?.name).toBe("Local Profile"); // config retained
+    expect(await vault.get("auth-profile-password-ap1")).toBe("local-pw"); // secret NOT overwritten
+    expect(await vault.get("auth-profile-password-ap2")).toBe("new-pw"); // newly-imported profile restored
+
+    // --- Replace mode: the existing ap1 is removed and every backup profile (re)imported —
+    // both ap1 and ap2 land in importedIds and both secrets restore — ap1's password IS
+    // overwritten.
+    registeredCommands.clear();
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1");
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    registerConfigCommands(core, vault);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getSnapshot().authProfiles.find((p) => p.id === "ap1")?.name).toBe("Backup Profile");
+    expect(await vault.get("auth-profile-password-ap1")).toBe("backup-pw");
+    expect(await vault.get("auth-profile-password-ap2")).toBe("new-pw");
+  });
 });
 
 describe("share import", () => {

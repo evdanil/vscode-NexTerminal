@@ -568,14 +568,30 @@ async function addIfValid<T>(
   return false;
 }
 
-/** Restore one secret bucket (id → secret) into the vault under `keyFn(id)`. */
+/**
+ * Restore one secret bucket (id → secret) into the vault under `keyFn(id)`.
+ *
+ * `importedIds` scopes the restore to records this run actually imported — the same
+ * `importPreservingIds().importedIds` mechanism the inventory-source secret restore uses (see
+ * FINDING 3 at the inventorySourceSecrets loop below). Applied in BOTH modes, not merge-only:
+ * merge mode skips an id already present locally (the local record — and its working
+ * credential — wins, so the backup's copy must never overwrite it), and replace mode skips an
+ * id that fails validation (nothing was persisted for it, so a secret written for it would be
+ * an undiscoverable dead vault key — export/removal/reset all enumerate persisted records, not
+ * the backup payload — exactly the residue class FINDING 3 calls out). In replace mode every
+ * *valid* record IS imported (existingIds is empty there), so scoping to importedIds still
+ * restores every secret whose owning record survived import; it only additionally excludes the
+ * secrets of records replace mode itself declined to import.
+ */
 async function restoreSecrets(
   record: Record<string, string> | undefined,
   keyFn: (id: string) => string,
-  vault: SecretVault
+  vault: SecretVault,
+  importedIds: Set<string>
 ): Promise<void> {
   if (!record) return;
   for (const [id, secret] of Object.entries(record)) {
+    if (!importedIds.has(id)) continue;
     await vault.store(keyFn(id), secret);
   }
 }
@@ -1844,11 +1860,16 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // so the missing-credentials sweep below skips them to avoid a redundant second warning.
     const rolledBackSourceIds = new Set<string>();
     if (decryptedSecrets) {
-      await restoreSecrets(decryptedSecrets.passwords as Record<string, string> | undefined, passwordSecretKey, vault);
-      await restoreSecrets(decryptedSecrets.passphrases as Record<string, string> | undefined, passphraseSecretKey, vault);
-      await restoreSecrets(decryptedSecrets.proxyPasswords as Record<string, string> | undefined, proxyPasswordSecretKey, vault);
-      await restoreSecrets(decryptedSecrets.authProfilePasswords as Record<string, string> | undefined, authProfilePasswordSecretKey, vault);
-      await restoreSecrets(decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined, authProfilePassphraseSecretKey, vault);
+      // Scope to ids actually imported this run — server-keyed buckets to serverTally, the
+      // auth-profile-keyed pair to authProfileTally. See restoreSecrets()'s doc comment for why
+      // this applies in both merge and replace mode.
+      const importedServerIds = new Set(serverTally.importedIds);
+      const importedAuthProfileIds = new Set(authProfileTally.importedIds);
+      await restoreSecrets(decryptedSecrets.passwords as Record<string, string> | undefined, passwordSecretKey, vault, importedServerIds);
+      await restoreSecrets(decryptedSecrets.passphrases as Record<string, string> | undefined, passphraseSecretKey, vault, importedServerIds);
+      await restoreSecrets(decryptedSecrets.proxyPasswords as Record<string, string> | undefined, proxyPasswordSecretKey, vault, importedServerIds);
+      await restoreSecrets(decryptedSecrets.authProfilePasswords as Record<string, string> | undefined, authProfilePasswordSecretKey, vault, importedAuthProfileIds);
+      await restoreSecrets(decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined, authProfilePassphraseSecretKey, vault, importedAuthProfileIds);
       // Nested (sourceId -> fieldId -> secret) shape, unlike the flat id->secret buckets
       // above, so it gets its own loop rather than restoreSecrets()'s single-level keyFn.
       const inventorySourceSecrets = decryptedSecrets.inventorySourceSecrets as Record<string, Record<string, string>> | undefined;
