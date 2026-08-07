@@ -814,19 +814,43 @@ export class NexusCore {
     // OR is an ANCESTOR of a path another source manages — deleting an
     // ancestor would orphan that other source's chain even though the
     // ancestor itself isn't in the other source's set verbatim.
-    const otherSourcesManagedOrAncestors = new Set<string>();
+    //
+    // CROSS-SOURCE TARGET-ROOT FIX — `managedFolders` is deliberately never
+    // stamped with a source's own `targetFolder` root (see
+    // `pruneEmptyFoldersUnderTarget`'s doc — a target's own root is never a
+    // member of its own managed set). That is correct for a source's OWN GC,
+    // but it left a gap here: another source's `targetFolder` can be pointed
+    // at a folder THIS source owns (e.g. source A created "NetBox/RackA" via
+    // its own sync; source B is later configured with `targetFolder ===
+    // "NetBox/RackA"` and simply hasn't synced any device into it yet, so
+    // `managedFolders` for B is still empty). Checking only `managedFolders`
+    // means B's own configured root carries no protection at all — A
+    // abandoning its last device leaves "NetBox/RackA" a GC candidate for A,
+    // and it gets deleted out from under B's still-live configuration, even
+    // though B never got a chance to sync anything into it. Fold every OTHER
+    // source's own non-root `targetFolder` (plus its ancestors) into the same
+    // protected set — a configured target root is a live claim on that
+    // folder regardless of whether that source has synced into it yet. A
+    // root-targeted (`targetFolder === ""`) other source contributes nothing
+    // here, exactly like it never accumulates `managedFolders` itself.
+    const otherSourcesProtectedPaths = new Set<string>();
     for (const [otherId, otherSource] of this.inventorySources) {
       if (otherId === apply.sourceId) {
         continue;
       }
       for (const managed of otherSource.managedFolders ?? []) {
         for (const ancestor of getAncestorPaths(managed)) {
-          otherSourcesManagedOrAncestors.add(ancestor);
+          otherSourcesProtectedPaths.add(ancestor);
+        }
+      }
+      if (otherSource.targetFolder !== "") {
+        for (const ancestor of getAncestorPaths(otherSource.targetFolder)) {
+          otherSourcesProtectedPaths.add(ancestor);
         }
       }
     }
     const gcOwnedCandidates = new Set(
-      [...previousManagedFolders].filter((f) => !newManagedFolders.has(f) && !otherSourcesManagedOrAncestors.has(f))
+      [...previousManagedFolders].filter((f) => !newManagedFolders.has(f) && !otherSourcesProtectedPaths.has(f))
     );
     // ITEM B (empty-folder GC) — runs synchronously here, in the mutation
     // phase, AFTER the upserts/removes above so it sees the POST-sync server

@@ -2199,6 +2199,86 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
     expect(resultY.removedEmptyFolderCount).toBe(1);
   });
 
+  it("(cross-source target-root protection) another source's configured targetFolder — even with an EMPTY managedFolders set — protects a folder from GC; the protection lifts once that source's record is removed", async () => {
+    const ownedByA: ServerConfig = {
+      id: "device-a",
+      name: "sw-a",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:a", syncedAt: 1 }
+    };
+    // Seed the steady state directly (explicit groups already in place,
+    // source-1's managedFolders already stamped from an earlier sync),
+    // exactly as the sibling cross-source tests above do.
+    const repository = new InMemoryConfigRepository([ownedByA], [], [], ["NetBox", "NetBox/RackA"]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(
+      makeSourceConfig({ id: "source-1", targetFolder: "NetBox", managedFolders: ["NetBox/RackA"] })
+    );
+    // source-2 is CONFIGURED to sync into "NetBox/RackA" itself but has never
+    // synced a single device into it yet, so its managedFolders is empty. A
+    // check that only ever consults OTHER sources' `managedFolders` sees
+    // NOTHING here protecting "NetBox/RackA", even though source-2's own
+    // `targetFolder` is a live claim on exactly this folder.
+    await core.addOrUpdateInventorySource(
+      makeSourceConfig({ id: "source-2", targetFolder: "NetBox/RackA", managedFolders: [] })
+    );
+    expect(core.getInventorySource("source-2")?.managedFolders).toEqual([]);
+
+    // source-1's device moves away — "NetBox/RackA" becomes genuinely empty
+    // (no server, from any origin, occupies it) and drops out of source-1's
+    // own managed set on this very sync.
+    const movedA = { ...ownedByA, group: "NetBox/RackB" };
+    const resultAbandon = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [movedA],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // KILLS managed-only protection: under a check restricted to other
+    // sources' `managedFolders`, source-2 contributes nothing (its managed
+    // set is empty), so "NetBox/RackA" would be swept as an unprotected GC
+    // candidate right out from under source-2's still-configured target.
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(resultAbandon.removedEmptyFolderCount).toBe(0);
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackB"]);
+
+    // source-2's record is removed entirely — the protection its target root
+    // granted must lift along with it, not linger.
+    await core.removeInventorySource("source-2");
+
+    // Re-seed source-1's managedFolders to once again name "NetBox/RackA",
+    // reproducing the exact same abandon scenario as above (folder empty,
+    // named by neither this apply's footprint nor its `folders` list) with
+    // source-2 gone as the only changed variable.
+    await core.addOrUpdateInventorySource({
+      ...core.getInventorySource("source-1")!,
+      managedFolders: ["NetBox/RackA", "NetBox/RackB"]
+    });
+
+    const resultReclaim = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 3,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // Protection lifted with the record: the identical candidate is now
+    // reclaimed.
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
+    expect(resultReclaim.removedEmptyFolderCount).toBe(1);
+  });
+
   it("(kills new-target-only filtering) editing targetFolder ('NetBox' -> 'Infra') still reclaims the OLD target's now-empty managed folder, and the old target's own root survives untouched", async () => {
     const owned: ServerConfig = {
       id: "device-1",
