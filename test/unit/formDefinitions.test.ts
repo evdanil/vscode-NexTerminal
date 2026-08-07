@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  inventorySourceFormDefinition,
   localShellFormDefinition,
   serialFormDefinition,
   serverFormDefinition,
@@ -7,6 +8,7 @@ import {
   unifiedProfileFormId
 } from "../../src/ui/formDefinitions";
 import type { FormDefinition, FormFieldDescriptor } from "../../src/ui/formTypes";
+import type { InventoryProvider } from "../../src/models/inventory";
 
 function keyedField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { key: string }> {
   const field = definition.fields.find(
@@ -291,5 +293,40 @@ describe("formDefinitions keyPath visibility", () => {
     expect(maybeKeyedField(unifiedProfileFormDefinition({ addMode: "localShell" }), "logSession")).toBeUndefined();
     expect(keyedField(unifiedProfileFormDefinition({ addMode: "ssh" }), "logSession")).toBeDefined();
     expect(keyedField(unifiedProfileFormDefinition({ addMode: "serial" }), "logSession")).toBeDefined();
+  });
+});
+
+describe("inventorySourceFormDefinition", () => {
+  const fakeProvider: InventoryProvider = {
+    id: "fake",
+    label: "Fake Provider",
+    configFields: [
+      { id: "pollInterval", label: "Poll Interval", type: "number", placeholder: "seconds" }
+    ],
+    testConnection: async () => undefined,
+    fetchInventory: async () => ({ nodes: [] }) as never
+  };
+
+  it("marks a provider-declared number field with step \"any\" so fractional values pass native validation (kills the missing-step regression)", () => {
+    const definition = inventorySourceFormDefinition(fakeProvider);
+    const field = keyedField(definition, "cfg_pollInterval");
+    expect(field.type).toBe("number");
+    expect((field as Extract<FormFieldDescriptor, { type: "number" }>).step).toBe("any");
+  });
+
+  it("carries the fractional value through unchanged when reopening a source that already stores one", () => {
+    const definition = inventorySourceFormDefinition(fakeProvider, {
+      id: "src1",
+      providerId: "fake",
+      name: "Fake",
+      targetFolder: "",
+      prunePolicy: "orphan",
+      defaultUsername: "",
+      config: { pollInterval: 0.5 },
+      secretFieldIds: []
+    });
+    const field = keyedField(definition, "cfg_pollInterval") as Extract<FormFieldDescriptor, { type: "number" }>;
+    expect(field.value).toBe(0.5);
+    expect(field.step).toBe("any");
   });
 });

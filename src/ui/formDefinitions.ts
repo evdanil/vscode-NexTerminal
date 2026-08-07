@@ -643,6 +643,13 @@ function inventoryConfigFieldDescriptor(
       key,
       label: field.label,
       required: field.required,
+      // The provider contract (`InventoryConfigField`) has no integer
+      // constraint — providers may store fractional values (e.g. a 0.5-second
+      // poll interval). `step: "any"` disables the browser's default
+      // step="1" native validation, which otherwise silently blocks Save
+      // (including on reopening a source that already has a fractional value
+      // saved) with no visible error.
+      step: "any",
       placeholder: field.placeholder,
       value: typeof existing === "number" ? existing : undefined,
       hint: field.description

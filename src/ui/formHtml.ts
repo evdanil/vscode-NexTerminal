@@ -75,12 +75,14 @@ function renderField(field: FormFieldDescriptor): string {
   <div class="field-error" id="error-${key}"></div>
 </div>`;
 
-    case "number":
+    case "number": {
+      const step = field.step !== undefined ? ` step="${field.step}"` : "";
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
-  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />${renderHint(field)}
+  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}"${step} placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
+    }
 
     case "select": {
       const selectedOpt = field.options.find((opt) => opt.value === field.value) ?? field.options[0];
