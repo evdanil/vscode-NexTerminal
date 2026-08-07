@@ -580,7 +580,7 @@ describe("inventoryCommands", () => {
       await cmd("src-1");
 
       const [, options] = mockShowInformationMessage.mock.calls[0] as [string, { detail: string }];
-      expect(options.detail).toContain("1 devices match existing manual servers and will be added as duplicates.");
+      expect(options.detail).toContain("1 device matches existing manual servers and will be added as duplicates.");
     });
 
     it("(F16) the prune-delete confirm modal surfaces the SSH jump-host dependents count (kills dropping countJumpHostDependents from the modal)", async () => {
@@ -614,6 +614,8 @@ describe("inventoryCommands", () => {
       const [, options] = mockShowInformationMessage.mock.calls[0] as [string, { detail: string }];
       expect(options.detail).toContain("1 other server");
       expect(options.detail.toLowerCase()).toContain("jump host");
+      // Singular subject-verb agreement (kills "1 other server use..." — should be "uses").
+      expect(options.detail).toContain("1 other server uses these as SSH jump hosts.");
     });
 
     it("(F8) a provider returning a malformed inventory tree surfaces a protocol error and leaves core state unchanged (kills removing validateInventoryTree from syncNow)", async () => {

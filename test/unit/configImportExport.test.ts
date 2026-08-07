@@ -763,6 +763,22 @@ describe("config import command (legacy)", () => {
     expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 1 profile.");
   });
 
+  it("(N2) strips a malformed origin (numeric externalId) from a backup-imported server instead of passing it through to core (kills passthrough)", async () => {
+    const exportData = makeExportData({
+      servers: [
+        { ...makeServer(), origin: { sourceId: "src1", externalId: 12345, syncedAt: 1000 } }
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+    await runImport(exportData, "merge");
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0].id).toBe("s1");
+    expect(snapshot.servers[0].origin).toBeUndefined();
+  });
+
   it("imports shared local shell profiles after path sanitization", async () => {
     const sanitized = sanitizeForSharing(
       [],

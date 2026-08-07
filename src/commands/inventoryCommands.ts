@@ -267,7 +267,9 @@ function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[])
   // string-parsed from plan.warnings) surfaced once in the modal, rather than
   // leaving it discoverable only by opening the per-device warnings list.
   if (plan.manualDuplicateCount > 0) {
-    lines.push(`${plan.manualDuplicateCount} devices match existing manual servers and will be added as duplicates.`);
+    const n = plan.manualDuplicateCount;
+    const verb = n === 1 ? "matches" : "match";
+    lines.push(`${n} device${n === 1 ? "" : "s"} ${verb} existing manual servers and will be added as duplicates.`);
   }
   if (plan.updates.length > 0) lines.push(`${plan.updates.length} updated`);
   const orphaned = plan.prunes.filter((p) => p.policy === "orphan").length;
@@ -283,7 +285,8 @@ function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[])
     const deletedIds = new Set(plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id));
     const dependents = countJumpHostDependents(allServers, deletedIds);
     if (dependents > 0) {
-      lines.push(`${dependents} other server${dependents === 1 ? "" : "s"} use these as SSH jump hosts.`);
+      const verb = dependents === 1 ? "uses" : "use";
+      lines.push(`${dependents} other server${dependents === 1 ? "" : "s"} ${verb} these as SSH jump hosts.`);
     }
   }
   return lines.join("\n");

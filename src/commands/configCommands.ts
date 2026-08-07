@@ -31,7 +31,14 @@ import {
   type SecureCrtFileEntry
 } from "../utils/securecrtParser";
 import { sniffImportFormat, type SniffedFormat } from "../utils/importFormatSniffer";
-import { validateServerConfig, validateTunnelProfile, validateSerialProfile, validateLocalShellProfile, validateInventorySource } from "../utils/validation";
+import {
+  validateServerConfig,
+  validateTunnelProfile,
+  validateSerialProfile,
+  validateLocalShellProfile,
+  validateInventorySource,
+  isValidServerOrigin
+} from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import {
   VALID_MACRO_TRIGGER_SCOPES,
@@ -520,6 +527,25 @@ async function importPreservingIds<T extends { id: string }>(
     }
   }
   return tally;
+}
+
+/**
+ * N2 — sanitize a malformed `origin` at the import boundary, shared by both
+ * server-import paths (share-import and backup merge/replace). Neither path
+ * flows through VscodeConfigRepository.getServers() (that strip only applies
+ * on the next read), so a file-supplied server with a malformed origin (e.g.
+ * a numeric externalId from a hand-edited or version-skewed backup) would
+ * otherwise reach core.addOrUpdateServer as-is and can mis-key the sync
+ * engine's owned-index until the next reload.
+ */
+async function addServerSanitizingOrigin(server: ServerConfig, add: (entity: ServerConfig) => Promise<void>): Promise<void> {
+  if (server.origin !== undefined && !isValidServerOrigin(server.origin)) {
+    console.warn("[Nexus] Imported server has a malformed origin; stripping it:", JSON.stringify(server.origin));
+    const { origin: _origin, ...rest } = server;
+    await add(rest as ServerConfig);
+    return;
+  }
+  await add(server);
 }
 
 /** Mechanical validate-then-add tail shared by the share-import remap loops; remap stays inline. */
@@ -1352,7 +1378,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         proxy: remappedProxy,
         authProfileId: server.authProfileId ? idMap.get(server.authProfileId) : undefined
       };
-      tally(await addIfValid(remappedServer, validateServerConfig, (e) => core.addOrUpdateServer(e)));
+      tally(await addIfValid(remappedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
     }
     for (const tunnel of tunnels) {
       ensureId(tunnel as unknown as Record<string, unknown>);
@@ -1497,7 +1523,7 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // id-PRESERVING import (distinct from the share path's fresh-id remap): each entity keeps
     // its id and is skipped when that id already exists. Same shape across all six buckets.
     for (const tally of [
-      await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => core.addOrUpdateServer(e)),
+      await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))),
       await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e)),
       await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e)),
       await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) => core.addOrUpdateInventorySource(e)),

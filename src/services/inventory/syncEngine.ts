@@ -51,6 +51,19 @@ function isValidPort(port: number): boolean {
   return Number.isInteger(port) && port >= 1 && port <= 65535;
 }
 
+/** N1 — appends one summary warning for a category of non-owned device skips, naming up to 3 examples. No-op when the category is empty. */
+function pushSkipSummary(warnings: string[], reason: string, examples: string[]): void {
+  const count = examples.length;
+  if (count === 0) {
+    return;
+  }
+  const shown = examples
+    .slice(0, 3)
+    .map((s) => `"${s}"`)
+    .join(", ");
+  warnings.push(`${count} device${count === 1 ? "" : "s"} ${reason} and ${count === 1 ? "was" : "were"} skipped (e.g. ${shown}).`);
+}
+
 /**
  * Pure: fetch result (InventoryTree) + current server set -> InventorySyncPlan.
  * No vscode import, no I/O — `now` is injected so callers control the sync
@@ -106,15 +119,31 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const presentExternalIds = new Set<string>();
   let manualDuplicateCount = 0;
 
+  // N1 — a device skip is only reported per-device when it could be masking
+  // data loss for a server this source already owns (its externalId matches
+  // an owned server — see ownedByExternalId below). NetBox trees legitimately
+  // contain many endpoint-less devices (PDUs, patch panels, ...), so every
+  // other no-endpoint/empty-name/invalid-port skip is collected here and
+  // reported as a single aggregate warning per category instead of drowning
+  // the warnings list in one line per device.
+  const noEndpointSkipped: string[] = [];
+  const emptyNameSkipped: string[] = [];
+  const invalidPortSkipped: string[] = [];
+
   for (const device of tree.devices) {
     if (!device.externalId) {
       warnings.push(`Device "${device.name || "(unnamed)"}" has an empty externalId and was skipped.`);
       continue;
     }
     presentExternalIds.add(device.externalId);
+    const isOwned = ownedByExternalId.has(device.externalId);
 
     if (!device.name) {
-      warnings.push(`Device "${device.externalId}" has an empty name and was skipped.`);
+      if (isOwned) {
+        warnings.push(`Device "${device.externalId}" has an empty name and was skipped.`);
+      } else {
+        emptyNameSkipped.push(device.externalId);
+      }
       continue;
     }
     if (seenExternalIds.has(device.externalId)) {
@@ -125,12 +154,20 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
 
     const endpoint = selectSshEndpoint(device);
     if (!endpoint) {
-      warnings.push(`Device "${device.name}" (${device.externalId}) has no usable ssh endpoint and was skipped.`);
+      if (isOwned) {
+        warnings.push(`Device "${device.name}" (${device.externalId}) has no usable ssh endpoint and was skipped.`);
+      } else {
+        noEndpointSkipped.push(device.name);
+      }
       continue;
     }
     const port = endpoint.port ?? 22;
     if (!isValidPort(port)) {
-      warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid port ${port} and was skipped.`);
+      if (isOwned) {
+        warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid port ${port} and was skipped.`);
+      } else {
+        invalidPortSkipped.push(device.name);
+      }
       continue;
     }
 
@@ -226,6 +263,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       folderSet.add(group);
     }
   }
+
+  pushSkipSummary(warnings, "had no usable SSH endpoint", noEndpointSkipped);
+  pushSkipSummary(warnings, "had an empty name", emptyNameSkipped);
+  pushSkipSummary(warnings, "had an invalid port", invalidPortSkipped);
 
   // FIX 2 — a truncated fetch (provider hit its own hard cap) never reflects
   // the full source inventory: treating the devices it didn't reach as

@@ -143,6 +143,44 @@ describe("computeSyncPlan — adds", () => {
     expect(plan.warnings.some((w) => w.includes("Duplicate externalId"))).toBe(true);
   });
 
+  it("(N1) many endpoint-less devices with no owned server produce ONE aggregate warning, not one per device (kills per-device spam)", () => {
+    const source = makeSource();
+    const devices = Array.from({ length: 5 }, (_, i) =>
+      makeDevice({
+        externalId: `device:noendpoint-${i}`,
+        name: `noendpoint-${i}`,
+        endpoints: [{ kind: "redfish", host: "10.0.0.9" }]
+      })
+    );
+    const tree = makeTree(devices);
+    const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
+    const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("no usable ssh endpoint"));
+    expect(endpointWarnings).toHaveLength(1);
+    expect(endpointWarnings[0]).toContain("5");
+  });
+
+  it("(N1) an endpoint-less device whose externalId IS owned still gets a per-device warning naming it (kills over-aggregation losing the protective signal)", () => {
+    const source = makeSource();
+    const before = makeOwnedServer(); // origin.externalId === "device:1", matches the first device below
+    const tree = makeTree([
+      makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] }), // externalId "device:1" — owned, no usable ssh endpoint
+      makeDevice({ externalId: "device:2", name: "unowned-noendpoint", endpoints: [{ kind: "redfish", host: "10.0.0.9" }] })
+    ]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
+    // Owned device: dedicated per-device warning, naming it explicitly.
+    expect(plan.warnings.some((w) => w.includes(`Device "core-sw-1" (device:1) has no usable ssh endpoint and was skipped.`))).toBe(true);
+    // Unowned device: no dedicated per-device warning of that form — it's folded
+    // into the aggregate instead (its name may still appear as an aggregate example).
+    expect(
+      plan.warnings.some((w) => w.includes(`Device "unowned-noendpoint" (device:2) has no usable ssh endpoint and was skipped.`))
+    ).toBe(false);
+    // Aggregate warning covers exactly the one unowned skip, and names it.
+    const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("had no usable ssh endpoint"));
+    expect(endpointWarnings).toHaveLength(1);
+    expect(endpointWarnings[0]).toContain("1");
+    expect(endpointWarnings[0]).toContain("unowned-noendpoint");
+  });
+
   it("skips (never adopts/overwrites) a device whose deterministic id collides with an unrelated server", () => {
     const source = makeSource();
     const collidingId = deterministicServerId("source-1", "device:1");
