@@ -454,8 +454,8 @@ describe("configMutationLock — real call-site serialization", () => {
         targetFolder: "Infra",
         defaultUsername: "admin",
         prunePolicy: "orphan",
-        host: "netbox.local",
-        apiToken: "new-token" // rotated
+        cfg_host: "netbox.local",
+        cfg_apiToken: "new-token" // rotated
       });
 
       // Give onSubmit's UI-only prefix (form-value parsing, none of which

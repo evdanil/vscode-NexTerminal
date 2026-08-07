@@ -199,8 +199,8 @@ describe("inventoryCommands", () => {
         targetFolder: "Infra",
         defaultUsername: "admin",
         prunePolicy: "orphan",
-        host: "netbox.local",
-        apiToken: "secret-token"
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
       });
 
       return { core, vault, provider };
@@ -253,8 +253,8 @@ describe("inventoryCommands", () => {
         targetFolder: "",
         defaultUsername: "admin",
         prunePolicy: "orphan",
-        host: "netbox.local",
-        apiToken: "secret-token"
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
       });
 
       expect(provider.testConnection).toHaveBeenCalledWith({ host: "netbox.local" }, { apiToken: "secret-token" });
@@ -284,8 +284,8 @@ describe("inventoryCommands", () => {
         targetFolder: "",
         defaultUsername: "admin",
         prunePolicy: "orphan",
-        host: "netbox.local",
-        apiToken: "secret-token"
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
       });
 
       expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("boom"));
@@ -313,10 +313,10 @@ describe("inventoryCommands", () => {
       const { definition } = latestFormCall();
 
       const byKey = (key: string) => definition.fields.find((f) => "key" in f && f.key === key);
-      expect(byKey("host")).toEqual(expect.objectContaining({ type: "text" }));
-      expect(byKey("apiToken")).toEqual(expect.objectContaining({ type: "password" }));
-      expect(byKey("port")).toEqual(expect.objectContaining({ type: "number" }));
-      expect(byKey("verifyTls")).toEqual(expect.objectContaining({ type: "checkbox" }));
+      expect(byKey("cfg_host")).toEqual(expect.objectContaining({ type: "text" }));
+      expect(byKey("cfg_apiToken")).toEqual(expect.objectContaining({ type: "password" }));
+      expect(byKey("cfg_port")).toEqual(expect.objectContaining({ type: "number" }));
+      expect(byKey("cfg_verifyTls")).toEqual(expect.objectContaining({ type: "checkbox" }));
     });
 
     it("titles the form with the provider label and prefills Default SSH Username with mostCommonUsername", async () => {
@@ -361,8 +361,8 @@ describe("inventoryCommands", () => {
           targetFolder: "Infra",
           defaultUsername: "admin",
           prunePolicy: "orphan",
-          host: "",
-          apiToken: "secret-token"
+          cfg_host: "",
+          cfg_apiToken: "secret-token"
         })
       ).rejects.toThrow(/Host is required/);
 
@@ -388,8 +388,8 @@ describe("inventoryCommands", () => {
         targetFolder: "",
         defaultUsername: "admin",
         prunePolicy: "orphan",
-        host: "netbox.local",
-        apiToken: "secret-token"
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
       };
 
       mockShowWarningMessage.mockResolvedValueOnce(undefined); // declined
@@ -424,9 +424,9 @@ describe("inventoryCommands", () => {
         targetFolder: "Infra",
         defaultUsername: "admin",
         prunePolicy: "orphan",
-        host: "netbox.local",
-        apiToken: "secret-token",
-        extraToken: "" // left blank (optional)
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token",
+        cfg_extraToken: "" // left blank (optional)
       });
 
       const source = core.getSnapshot().inventorySources[0];
@@ -459,8 +459,8 @@ describe("inventoryCommands", () => {
           targetFolder: "Infra",
           defaultUsername: "admin",
           prunePolicy: "orphan",
-          host: "netbox.local",
-          apiToken: "secret-token"
+          cfg_host: "netbox.local",
+          cfg_apiToken: "secret-token"
         })
       ).rejects.toThrow(/keychain/);
 
@@ -486,8 +486,8 @@ describe("inventoryCommands", () => {
           targetFolder: "Infra",
           defaultUsername: "admin",
           prunePolicy: "orphan",
-          host: "netbox.local",
-          apiToken: "secret-token"
+          cfg_host: "netbox.local",
+          cfg_apiToken: "secret-token"
         })
       ).rejects.toThrow(/was not created/);
 
@@ -542,9 +542,9 @@ describe("inventoryCommands", () => {
           targetFolder: "Infra",
           defaultUsername: "admin",
           prunePolicy: "orphan",
-          host: "netbox.local",
-          field1: "value1",
-          field2: "value2"
+          cfg_host: "netbox.local",
+          cfg_field1: "value1",
+          cfg_field2: "value2"
         })
       ).rejects.toThrow(/keychain/);
 
@@ -578,6 +578,79 @@ describe("inventoryCommands", () => {
       const { definition } = latestFormCall();
       expect(definition.title).toBe("Add Inventory Source (Provider A)");
     });
+
+    it("F1 — onSubmit resolves as soon as the source is persisted, even when the follow-up toast's thenable never settles (kills the awaited-toast hang that swallows every later Save)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      // Mirrors a real VS Code information toast auto-hiding without the
+      // user ever clicking a button: its returned thenable never settles.
+      mockShowInformationMessage.mockReturnValueOnce(new Promise(() => {}));
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+      const { onSubmit } = latestFormCall();
+
+      const onSubmitPromise = onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      const TIMEOUT = Symbol("timeout");
+      const winner = await Promise.race([
+        onSubmitPromise.then(() => "resolved" as const),
+        new Promise((resolve) => setTimeout(() => resolve(TIMEOUT), 50))
+      ]);
+
+      // If F1 were reverted (onSubmit awaits the toast directly instead of
+      // running it detached), onSubmitPromise would still be pending here —
+      // the never-resolving toast keeps it stuck forever, so
+      // WebviewFormPanel never disposes the panel and every later Save is
+      // swallowed by submitInFlight.
+      expect(winner).toBe("resolved");
+      expect(core.getSnapshot().inventorySources).toHaveLength(1);
+    });
+
+    it("F2 — a provider config field id that collides with a reserved top-level key (\"name\") keeps BOTH values distinct instead of one clobbering the other (kills last-write-wins key collision)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [{ id: "name", label: "Instance Name", type: "string", required: true }]
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+      const { onSubmit } = latestFormCall();
+
+      await onSubmit({
+        name: "My Source", // the SOURCE's own Name field
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_name: "netbox-instance-1" // the PROVIDER field also id'd "name"
+      });
+
+      const source = core.getSnapshot().inventorySources[0];
+      // If F2 were reverted (both form fields share the raw "name" key), one
+      // of these two assertions fails — whichever value was assigned last
+      // into the single flat FormValues object wins and the other is either
+      // missing or silently overwritten with the wrong value.
+      expect(source.name).toBe("My Source");
+      expect(source.config).toEqual({ name: "netbox-instance-1" });
+    });
   });
 
   describe("nexus.inventory.editSource", () => {
@@ -601,8 +674,8 @@ describe("inventoryCommands", () => {
         targetFolder: "Infra",
         defaultUsername: "admin",
         prunePolicy: "orphan",
-        host: "netbox.local",
-        apiToken: "" // left blank -> keep saved value
+        cfg_host: "netbox.local",
+        cfg_apiToken: "" // left blank -> keep saved value
       };
 
       await onTest!(values);
@@ -610,6 +683,62 @@ describe("inventoryCommands", () => {
 
       await onSubmit(values);
       expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("old-token");
+    });
+
+    it("F3 — a mismatched providerFingerprint shows the same Continue/Cancel gate syncNow uses BEFORE the form opens; Cancel aborts editing with no vault read and no form (kills ungated Test-button secret hydration)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "old-token" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({ config: { host: "netbox.local" }, secretFieldIds: ["apiToken"], providerFingerprint: "stale-fingerprint" })
+      );
+
+      // Default mock resolution (undefined — no button clicked) counts as
+      // Cancel/dismiss, mirroring syncNow's own "choice !== 'Continue'" gate.
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("looks different from when"),
+        expect.objectContaining({ modal: true }),
+        "Continue",
+        "Cancel"
+      );
+      // If F3 were reverted (no gate before WebviewFormPanel.open), the form
+      // would open unconditionally here regardless of the mismatch.
+      expect(mockWebviewOpen).not.toHaveBeenCalled();
+      // The Edit form's Test button hydrates kept secrets straight from the
+      // vault (F7) — with the gate correctly aborting before the form ever
+      // opens, that hydration path never runs and vault.get is never called
+      // for this source's credentials.
+      expect(vault.get).not.toHaveBeenCalled();
+    });
+
+    it("F3 — an unchanged (or never-stamped) providerFingerprint opens the edit form without any confirmation modal", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "old-token" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({
+          config: { host: "netbox.local" },
+          secretFieldIds: ["apiToken"],
+          providerFingerprint: computeProviderFingerprint(provider)
+        })
+      );
+
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd();
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
     });
 
     it("edit form prefill — Name/Target Folder/Default Username/Prune Policy and provider config fields are prefilled from the source; a saved password field is optional with a 'keep' placeholder (kills a blank-slate edit form)", async () => {
@@ -641,8 +770,8 @@ describe("inventoryCommands", () => {
       expect(byKey("targetFolder")).toEqual(expect.objectContaining({ value: "Infra" }));
       expect(byKey("defaultUsername")).toEqual(expect.objectContaining({ value: "opsuser" }));
       expect(byKey("prunePolicy")).toEqual(expect.objectContaining({ value: "delete" }));
-      expect(byKey("host")).toEqual(expect.objectContaining({ type: "text", value: "netbox.local" }));
-      expect(byKey("apiToken")).toEqual(
+      expect(byKey("cfg_host")).toEqual(expect.objectContaining({ type: "text", value: "netbox.local" }));
+      expect(byKey("cfg_apiToken")).toEqual(
         expect.objectContaining({ type: "password", required: false, placeholder: "Leave empty to keep the saved value" })
       );
     });
@@ -660,6 +789,10 @@ describe("inventoryCommands", () => {
       );
       await vault.store(inventorySecretKey("src-1", "apiToken"), "old-token");
 
+      // F3 — a stale fingerprint now gates the form open itself; Continue
+      // through that confirmation to reach the form and exercise Save's own
+      // unconditional restamp (this test's actual subject).
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
       const cmd = registeredCommands.get("nexus.inventory.editSource")!;
       await cmd();
       const { onSubmit } = latestFormCall();
@@ -669,8 +802,8 @@ describe("inventoryCommands", () => {
         targetFolder: "Infra",
         defaultUsername: "admin",
         prunePolicy: "orphan",
-        host: "netbox.local",
-        apiToken: ""
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
       });
 
       const updated = core.getInventorySource("src-1")!;
@@ -710,6 +843,32 @@ describe("inventoryCommands", () => {
       expect(mockWebviewOpen).toHaveBeenCalledTimes(2);
     });
 
+    it("F6 — WebviewFormPanel.open throwing surfaces the error but does not leave the source stuck busy (kills a busy-flag leak on open() failure)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      mockWebviewOpen.mockImplementationOnce(() => {
+        throw new Error("webview init failed");
+      });
+
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await expect(cmd()).rejects.toThrow(/webview init failed/);
+
+      // If F6 were reverted (no try/catch around WebviewFormPanel.open), the
+      // busy flag set just before the throwing call would never be released
+      // — every later editSource for this exact source id would be refused
+      // with "currently syncing" forever.
+      await cmd();
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(2);
+    });
+
     it("required-field validation — a missing required field rejects onSubmit and persists nothing", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
@@ -731,8 +890,8 @@ describe("inventoryCommands", () => {
           targetFolder: "Infra",
           defaultUsername: "", // blank
           prunePolicy: "orphan",
-          host: "netbox.local",
-          apiToken: ""
+          cfg_host: "netbox.local",
+          cfg_apiToken: ""
         })
       ).rejects.toThrow(/Default SSH Username is required/);
 
@@ -762,8 +921,8 @@ describe("inventoryCommands", () => {
         targetFolder: "Infra",
         defaultUsername: "admin",
         prunePolicy: "orphan",
-        host: "netbox.local",
-        apiToken: "" // left blank -> keep saved value
+        cfg_host: "netbox.local",
+        cfg_apiToken: "" // left blank -> keep saved value
       });
 
       expect(await vault.get(inventorySecretKey("src-1", "extra"))).toBeUndefined();
@@ -808,9 +967,9 @@ describe("inventoryCommands", () => {
           targetFolder: "Infra",
           defaultUsername: "admin",
           prunePolicy: "orphan",
-          host: "netbox.local",
-          apiToken: "", // left blank -> keep saved value
-          extraToken: "new-extra" // brand-new secret this run
+          cfg_host: "netbox.local",
+          cfg_apiToken: "", // left blank -> keep saved value
+          cfg_extraToken: "new-extra" // brand-new secret this run
         })
       ).rejects.toThrow(/was not applied/);
 
@@ -851,8 +1010,8 @@ describe("inventoryCommands", () => {
           targetFolder: "Infra",
           defaultUsername: "admin",
           prunePolicy: "orphan",
-          host: "netbox.local",
-          apiToken: "new-tok" // RE-ENTERED — overwrites the old value
+          cfg_host: "netbox.local",
+          cfg_apiToken: "new-tok" // RE-ENTERED — overwrites the old value
         })
       ).rejects.toThrow(/was not applied/);
 
@@ -890,8 +1049,8 @@ describe("inventoryCommands", () => {
           targetFolder: "Infra",
           defaultUsername: "admin",
           prunePolicy: "orphan",
-          host: "netbox.local",
-          apiToken: "new-tok" // re-entered — vault had nothing to overwrite
+          cfg_host: "netbox.local",
+          cfg_apiToken: "new-tok" // re-entered — vault had nothing to overwrite
         })
       ).rejects.toThrow(/was not applied/);
 
@@ -948,9 +1107,9 @@ describe("inventoryCommands", () => {
           targetFolder: "Infra",
           defaultUsername: "admin",
           prunePolicy: "orphan",
-          host: "netbox.local",
-          field1: "new1",
-          field2: "new2"
+          cfg_host: "netbox.local",
+          cfg_field1: "new1",
+          cfg_field2: "new2"
         })
       ).rejects.toThrow(/keychain/);
 
@@ -997,8 +1156,8 @@ describe("inventoryCommands", () => {
           targetFolder: "Infra",
           defaultUsername: "admin",
           prunePolicy: "orphan",
-          host: "netbox.local",
-          apiToken: "new-token" // brand new
+          cfg_host: "netbox.local",
+          cfg_apiToken: "new-token" // brand new
         })
       ).rejects.toThrow(/reopen Edit Source/);
 
@@ -1812,6 +1971,49 @@ describe("inventoryCommands", () => {
       expect(mockShowWarningMessage).not.toHaveBeenCalled();
       expect(core.getInventorySource("src-1")?.providerFingerprint).toBe(computeProviderFingerprint(provider));
     });
+
+    it("F5 — a source replaced (different targetFolder) in the gap between the sync committing and the best-effort restamp's own separate lock is left unstamped (kills stamping whoever currently holds the id)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      // No providerFingerprint stamped yet -> this sync silently attempts to
+      // stamp one afterward, with no confirm modal in the way.
+      await core.addOrUpdateInventorySource(makeSource({ name: "My Source", secretFieldIds: ["apiToken"] }));
+
+      // The empty-plan fast path takes exactly two configMutationLock
+      // acquisitions: (1) the sync's own apply, (2) the restamp's own
+      // separate acquisition. Inject the "concurrent edit" replacement right
+      // as the SECOND acquisition starts — after the sync has fully
+      // committed, before restamp's own read of "current".
+      let runExclusiveCallCount = 0;
+      const originalRunExclusive = configMutationLock.runExclusive.bind(configMutationLock);
+      const runExclusiveSpy = vi.spyOn(configMutationLock, "runExclusive").mockImplementation(async (fn: () => Promise<unknown>) => {
+        runExclusiveCallCount++;
+        if (runExclusiveCallCount === 2) {
+          await core.addOrUpdateInventorySource({ ...core.getInventorySource("src-1")!, targetFolder: "Different" });
+        }
+        return originalRunExclusive(fn as () => Promise<unknown>);
+      });
+
+      try {
+        const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+        await cmd("src-1");
+      } finally {
+        runExclusiveSpy.mockRestore();
+      }
+
+      const current = core.getInventorySource("src-1")!;
+      expect(current.targetFolder).toBe("Different"); // the replacement survived, untouched by the sync
+      // If F5 were reverted (restamp stamps whatever record currently holds
+      // the id, with no drift check against the incarnation the sync
+      // actually ran against), providerFingerprint would be set here despite
+      // the record having been replaced mid-flow.
+      expect(current.providerFingerprint).toBeUndefined();
+    });
   });
 
   describe("nexus.inventory.syncNow", () => {
@@ -2274,6 +2476,13 @@ describe("inventoryCommands", () => {
       const first = cmd("src-1");
       const second = cmd("src-1");
       await second;
+      // F3 — checkProviderFingerprint (shared with editSource's own pre-open
+      // gate) adds one more `await` hop on `first`'s path to fetchInventory
+      // versus `second`'s own (zero-internal-await) busy-check-and-return —
+      // flush one more microtask so `first` has had the same chance to reach
+      // its own first await-on-vault-read that it always had before that hop
+      // existed.
+      await Promise.resolve();
 
       expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("already syncing"));
       expect(provider.fetchInventory).toHaveBeenCalledTimes(1);

@@ -1510,6 +1510,66 @@ describe("applyInventorySyncPlan — empty-folder GC (ITEM B)", () => {
     expect(result.removedEmptyFolderCount).toBe(0);
   });
 
+  it("F4 (kills exact-match-only occupancy) a server at an IMPLICIT descendant path protects its ancestor folder even though nothing sits AT the ancestor path exactly", async () => {
+    const movingServer: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    // Hand-typed group — never itself passed in a plan's `folders` list, so
+    // it never becomes an entry in explicitGroups (mirrors a user typing a
+    // group path directly into a server's Folder field rather than picking
+    // one from the folder tree).
+    const implicitDescendantServer: ServerConfig = {
+      id: "manual-1",
+      name: "special-unit",
+      host: "192.168.1.1",
+      port: 22,
+      username: "root",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA/Special"
+    };
+    const { core } = await makeCoreWithSource([movingServer, implicitDescendantServer], { targetFolder: "NetBox" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    // "NetBox/RackA/Special" was never named in any plan's `folders` list —
+    // confirms it's genuinely implicit, not merely untested-for.
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA/Special");
+
+    // The source's own device moves away; nothing sits AT "NetBox/RackA"
+    // exactly anymore, but implicitDescendantServer still sits underneath it.
+    const moved = { ...movingServer, group: "NetBox/RackB" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // Exact-match-only occupancy would see no server at "NetBox/RackA"
+    // exactly (implicitDescendantServer sits at "NetBox/RackA/Special", not
+    // an exact match) and wrongly GC it out from under the server still
+    // parented there.
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(result.removedEmptyFolderCount).toBe(0);
+  });
+
   it("(kills over-aggressive GC / entity coverage) a folder holding only a serial profile, or only a local-shell profile, is NOT removed", async () => {
     const owned: ServerConfig = {
       id: "device-1",

@@ -376,16 +376,26 @@ export class NexusCore {
       if (!this.explicitGroups.has(candidate)) {
         continue; // already removed earlier in this same pass (shouldn't happen — candidates are deduped — stays defensive)
       }
+      // F4 — an occupant at an IMPLICIT descendant path (a hand-typed group
+      // like "NetBox/RackA/Special" that was never itself added to
+      // explicitGroups) must still protect "NetBox/RackA" from being GC'd:
+      // exact-match alone missed this, since nothing ever creates an
+      // explicit folder entry for "Special" the way the tree UI would for a
+      // folder a user actually browsed to. Every group at or under
+      // `candidate` (candidate itself, or any "candidate/..." descendant,
+      // implicit or explicit) counts as occupying it.
+      const occupiesCandidate = (group: string | undefined): boolean =>
+        group !== undefined && (group === candidate || group.startsWith(`${candidate}/`));
       let occupied = false;
       for (const server of this.servers.values()) {
-        if (server.group === candidate) {
+        if (occupiesCandidate(server.group)) {
           occupied = true;
           break;
         }
       }
       if (!occupied) {
         for (const profile of this.serialProfiles.values()) {
-          if (profile.group === candidate) {
+          if (occupiesCandidate(profile.group)) {
             occupied = true;
             break;
           }
@@ -393,7 +403,7 @@ export class NexusCore {
       }
       if (!occupied) {
         for (const profile of this.localShellProfiles.values()) {
-          if (profile.group === candidate) {
+          if (occupiesCandidate(profile.group)) {
             occupied = true;
             break;
           }

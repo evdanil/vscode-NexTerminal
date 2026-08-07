@@ -584,6 +584,25 @@ export function unifiedProfileFormDefinition(
 }
 
 /**
+ * F2 — every provider-declared field's FORM key (never its `field.id`
+ * itself — that stays the raw key used in InventorySourceValues/Secrets and
+ * the vault) is prefixed so it can never collide with a reserved top-level
+ * source field key ("name", "targetFolder", "defaultUsername",
+ * "prunePolicy"). A provider whose configFields include e.g. `{ id: "name" }`
+ * previously clobbered whichever of the two — the source's own Name field or
+ * the provider's "name" config value — happened to be assigned last into the
+ * single flat FormValues object; there was no way for both to coexist.
+ * inventoryConfigFieldPrefixedKey is the one shared mapping both this
+ * descriptor (writing the form key) and inventoryCommands.ts's
+ * formValuesToProviderConfig (reading it back, then writing the VALUE under
+ * the unprefixed `field.id` into config/secrets) call, so the two stay in
+ * sync by construction rather than by convention.
+ */
+export function inventoryConfigFieldPrefixedKey(fieldId: string): string {
+  return `cfg_${fieldId}`;
+}
+
+/**
  * Maps one provider-declared InventoryConfigField to a form field descriptor.
  * `existingSecretFieldIds` (edit mode only) marks which password fields
  * already have a saved vault value: those become optional in the form (blank
@@ -596,11 +615,12 @@ function inventoryConfigFieldDescriptor(
   existingConfig: InventorySourceValues,
   existingSecretFieldIds: ReadonlySet<string>
 ): FormFieldDescriptor {
+  const key = inventoryConfigFieldPrefixedKey(field.id);
   if (field.type === "password") {
     const hasSaved = existingSecretFieldIds.has(field.id);
     return {
       type: "password",
-      key: field.id,
+      key,
       label: field.label,
       required: field.required && !hasSaved,
       placeholder: hasSaved ? "Leave empty to keep the saved value" : field.placeholder,
@@ -610,7 +630,7 @@ function inventoryConfigFieldDescriptor(
   if (field.type === "boolean") {
     return {
       type: "checkbox",
-      key: field.id,
+      key,
       label: field.label,
       value: existingConfig[field.id] === true,
       hint: field.description
@@ -620,7 +640,7 @@ function inventoryConfigFieldDescriptor(
     const existing = existingConfig[field.id];
     return {
       type: "number",
-      key: field.id,
+      key,
       label: field.label,
       required: field.required,
       placeholder: field.placeholder,
@@ -631,7 +651,7 @@ function inventoryConfigFieldDescriptor(
   const existing = existingConfig[field.id];
   return {
     type: "text",
-    key: field.id,
+    key,
     label: field.label,
     required: field.required,
     placeholder: field.placeholder,
@@ -685,8 +705,24 @@ export function inventorySourceFormDefinition(
         type: "select",
         key: "prunePolicy",
         label: "Removed-Device Policy",
+        // NIT — the old sequential-prompt wizard could show the FULL
+        // destination path (`${targetFolder}/${ORPHAN_FOLDER_NAME}`) because
+        // it prompted for Target Folder and this policy as two separate,
+        // ordered steps and could read the just-entered folder back. Here
+        // both live as sibling fields in one static form descriptor built
+        // once at open time — Target Folder is itself just another field the
+        // user can still edit after this descriptor is built, so recomputing
+        // "${liveTargetFolder}/${ORPHAN_FOLDER_NAME}" here would either go
+        // stale the moment the user retypes Target Folder, or require wiring
+        // a live cross-field recompute into the (currently static) option
+        // list — disproportionate for a label. Chosen instead: wording that
+        // stays true regardless of what Target Folder currently holds.
         options: [
-          { label: `Move to "${ORPHAN_FOLDER_NAME}"`, value: "orphan", description: "Recommended — keeps synced settings if the device returns" },
+          {
+            label: `Move to the source's "${ORPHAN_FOLDER_NAME}" subfolder`,
+            value: "orphan",
+            description: "Recommended — keeps synced settings if the device returns"
+          },
           { label: "Delete", value: "delete", description: "Removes the server and its saved credentials" },
           { label: "Keep", value: "keep", description: "Leaves the server where it is" }
         ],
