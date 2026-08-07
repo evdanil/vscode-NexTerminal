@@ -723,24 +723,26 @@ export class NexusCore {
       this.servers.set(server.id, server);
       batchWrittenServers.set(server.id, cloneServerConfig(server));
     }
-    // REVIEW FINDING 1 (P2, folder-GC ownership — no-op syncs must retain
-    // ownership) — `applicationFolderSet` alone is NOT a faithful picture of
-    // what this source manages: computeSyncPlan only populates `apply.folders`
-    // from adds/updates/orphans (+ the orphan targetFolder), so a STABLE sync
-    // (nothing added/updated/orphaned — every device already matches) yields
-    // an EMPTY `apply.folders`, and a managed set derived from that alone
-    // would empty out on every no-op run. A folder whose device then moves
-    // away on some LATER sync would never have been in `previousManagedFolders`
-    // to begin with, so it could never become GC-eligible — it lingers
-    // forever. Fix: also derive the managed set from the source's ACTUAL
-    // post-apply footprint — walk `this.servers` (already mutated above) for
-    // every record this source currently owns (`origin?.sourceId ===
-    // apply.sourceId`) and collect its group plus all ancestors, intersected
-    // to strictly-under-`targetFolder`. `newManagedFolders` is the UNION of
-    // that footprint with the `applicationFolderSet`-derived set (which is
-    // still needed to cover folders this apply just created but which are
-    // momentarily empty — e.g. a fresh orphan destination with nothing moved
-    // into it yet on THIS apply).
+    // OWNERSHIP FIX (USE is not ownership) — a folder the user pre-created by
+    // hand (e.g. "NetBox/RackA" made via the tree UI before this source ever
+    // synced) that a sync merely PLACES a device into must never enter
+    // `managedFolders` on that basis alone: the sync didn't create it, so it
+    // doesn't own it, and it must never become GC-eligible later just because
+    // the device that happens to sit there moves away. Ownership can only
+    // come from two places: (a) a path this apply itself just ADDED to
+    // `explicitGroups` (it didn't exist before — this apply's own act of
+    // syncing brought it into being), or (b) a path this source already
+    // owned on a PRIOR apply (`previousManagedFolders`) that is still in
+    // actual use by this source (current footprint or this apply's own
+    // `folders` list) — carrying ownership forward, not re-deriving it from
+    // occupancy alone.
+    //
+    // `sourceOwnedFootprint` — walk `this.servers` (already mutated above)
+    // for every record this source currently owns (`origin?.sourceId ===
+    // apply.sourceId`) and collect its group plus all ancestors, restricted
+    // to strictly-under-`targetFolder`. This is USE, not ownership by
+    // itself — see below, it only ever re-affirms a folder already in
+    // `previousManagedFolders`, it never seeds a brand-new one.
     const sourceOwnedFootprint = new Set<string>();
     if (source && source.targetFolder !== "") {
       const prefix = `${source.targetFolder}/`;
@@ -755,19 +757,52 @@ export class NexusCore {
         }
       }
     }
+    // `applicationFolderSetFiltered` — this apply's own `folders` list (with
+    // ancestors), restricted to strictly-under-`targetFolder`. Covers a
+    // folder this apply just created but which is momentarily empty (e.g. a
+    // fresh orphan destination with nothing moved into it yet on THIS apply)
+    // — same role `applicationFolderSet` played before this fix, just scoped
+    // to the target.
+    const applicationFolderSetFiltered =
+      source && source.targetFolder !== ""
+        ? new Set([...applicationFolderSet].filter((f) => f.startsWith(`${source.targetFolder}/`)))
+        : new Set<string>();
+    // `previousManagedFolders` — what this source owned coming INTO this
+    // apply (empty for a legacy record or a source's first-ever non-"absent"
+    // apply — nothing to carry forward yet).
+    const previousManagedFolders = new Set(source?.managedFolders ?? []);
+    // `createdThisApply` — paths THIS apply's own `folders` list caused to be
+    // newly added to `explicitGroups` (see `addedExplicitGroups` above),
+    // restricted to strictly-under-`targetFolder`. This is the ONLY source of
+    // brand-new ownership: a path already present in `explicitGroups` before
+    // this apply ran — pre-created by the user, or owned by a different
+    // source — is never in `addedExplicitGroups`, however this apply's own
+    // footprint or `folders` list happens to use it.
+    const createdThisApply =
+      source && source.targetFolder !== ""
+        ? new Set([...addedExplicitGroups].filter((f) => f.startsWith(`${source.targetFolder}/`)))
+        : new Set<string>();
     // This REPLACES the source's previous `managedFolders` wholesale — it is
-    // a snapshot of what THIS sync's own footprint + folder list name, not an
-    // accumulating history, so a folder neither named by this sync nor
-    // occupied by any of this source's own devices anymore (e.g. a renamed
-    // rack) drops out of the managed set on this very apply.
-    //
-    // `gcOwnedCandidates` — the previous managed set (empty for a legacy
-    // record, or a source's first-ever non-"absent" apply — nothing to diff
-    // against yet) MINUS the new one: folders this source itself created on
-    // some prior sync and has now stopped naming/occupying. Only these are
-    // eligible for GC below; a folder never in the source's own managed
-    // history (hand-created by the user, or owned by a DIFFERENT source under
-    // the same targetFolder) is never touched, however empty it is.
+    // NOT an accumulating history. `newManagedFolders` = (paths this source
+    // already owned that are still in actual use) UNION (paths this apply
+    // just created). A previously-owned path no longer in use (occupied by
+    // none of this source's own devices AND not named by this apply's own
+    // `folders` list — e.g. a renamed rack) drops out here, becoming a GC
+    // candidate below. A path merely USED (footprint) but never OWNED
+    // (neither previously-managed nor newly-created) never enters the set at
+    // all — see the fix comment above; this is what makes a user-pre-created
+    // folder immune to GC forever, exactly as it must be.
+    const currentFootprintOrNamed = new Set([...sourceOwnedFootprint, ...applicationFolderSetFiltered]);
+    const newManagedFolders: Set<string> =
+      source && source.targetFolder !== ""
+        ? new Set([...[...previousManagedFolders].filter((f) => currentFootprintOrNamed.has(f)), ...createdThisApply])
+        : new Set<string>();
+    // `gcOwnedCandidates` — the previous managed set MINUS the new one:
+    // folders this source itself OWNED (not merely used) on some prior sync
+    // and has now stopped naming/occupying. Only these are eligible for GC
+    // below; a folder never in the source's own managed history (hand-created
+    // by the user, or owned by a DIFFERENT source under the same
+    // targetFolder) is never touched, however empty it is.
     //
     // REVIEW FINDING 2 (P2, cross-source ownership) — two sources can target
     // overlapping trees and both legitimately manage the very same folder
@@ -790,11 +825,6 @@ export class NexusCore {
         }
       }
     }
-    const newManagedFolders: Set<string> =
-      source && source.targetFolder !== ""
-        ? new Set([...sourceOwnedFootprint, ...[...applicationFolderSet].filter((f) => f.startsWith(`${source.targetFolder}/`))])
-        : new Set<string>();
-    const previousManagedFolders = new Set(source?.managedFolders ?? []);
     const gcOwnedCandidates = new Set(
       [...previousManagedFolders].filter((f) => !newManagedFolders.has(f) && !otherSourcesManagedOrAncestors.has(f))
     );

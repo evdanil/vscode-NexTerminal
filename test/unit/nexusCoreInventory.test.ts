@@ -2132,32 +2132,30 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
       group: "NetBox/RackA",
       origin: { sourceId: "source-1", externalId: "device:x", syncedAt: 1 }
     };
-    const repository = new InMemoryConfigRepository([ownedByX]);
+    // OWNERSHIP-FIX FIXTURE NOTE — ownership now requires the apply that
+    // claims a path to have ACTUALLY CREATED it in `explicitGroups` (see
+    // `createdThisApply` in applyInventorySyncPlan). Two back-to-back FIRST
+    // syncs against the SAME not-yet-existing path can therefore never both
+    // register as "owners" of it — whichever source syncs second finds the
+    // path already created by the first and gets no ownership credit for
+    // merely naming it again. That is exactly correct for a cold start, but
+    // it means true co-ownership (the scenario this test targets) can only
+    // ever be a STEADY STATE reached after each source's own prior sync —
+    // not something two first-time applies inside this same test can stand
+    // up honestly. Seed that steady state directly (explicit groups already
+    // in place, both sources' `managedFolders` already stamped), exactly as
+    // if each source's own earlier sync had already run, and drive the test
+    // from there — the actual behavior under test (cross-source GC
+    // protection) is unchanged.
+    const repository = new InMemoryConfigRepository([ownedByX], [], [], ["NetBox", "NetBox/RackA"]);
     const core = new NexusCore(repository);
     await core.initialize();
-    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", targetFolder: "NetBox" }));
-    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-2", targetFolder: "NetBox" }));
-
-    // Both sources' plans name "NetBox/RackA" on their first sync — X because
-    // its device lives there, Y because it targets the same shared folder
-    // (e.g. two inventory tools pointed at the same rack) even though it has
-    // no device of its own there yet.
-    await core.applyInventorySyncPlan({
-      sourceId: "source-1",
-      syncedAt: 1,
-      upsertServers: [ownedByX],
-      removeServerIds: [],
-      folders: ["NetBox/RackA"],
-      expectedSource: core.getInventorySource("source-1")!
-    });
-    await core.applyInventorySyncPlan({
-      sourceId: "source-2",
-      syncedAt: 1,
-      upsertServers: [],
-      removeServerIds: [],
-      folders: ["NetBox/RackA"],
-      expectedSource: core.getInventorySource("source-2")!
-    });
+    await core.addOrUpdateInventorySource(
+      makeSourceConfig({ id: "source-1", targetFolder: "NetBox", managedFolders: ["NetBox/RackA"] })
+    );
+    await core.addOrUpdateInventorySource(
+      makeSourceConfig({ id: "source-2", targetFolder: "NetBox", managedFolders: ["NetBox/RackA"] })
+    );
     expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackA"]);
     expect(core.getInventorySource("source-2")?.managedFolders).toEqual(["NetBox/RackA"]);
 
@@ -2328,29 +2326,24 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
       group: "NetBox/RackA",
       origin: { sourceId: "source-1", externalId: "device:x", syncedAt: 1 }
     };
-    const repository = new InMemoryConfigRepository([ownedByX]);
+    // OWNERSHIP-FIX FIXTURE NOTE — see the sibling cross-source test above:
+    // ownership now requires the apply that claims a path to have ACTUALLY
+    // CREATED it, so two back-to-back first syncs against the same
+    // not-yet-existing path can never both register as owners of it. Seed
+    // the co-owned steady state directly (explicit groups already in place,
+    // both sources' `managedFolders` already stamped), exactly as if each
+    // source's own earlier sync had already run, and drive the retarget +
+    // move from there — the actual behavior under test (old-target,
+    // cross-source GC protection) is unchanged.
+    const repository = new InMemoryConfigRepository([ownedByX], [], [], ["NetBox", "NetBox/RackA"]);
     const core = new NexusCore(repository);
     await core.initialize();
-    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", targetFolder: "NetBox" }));
-    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-2", targetFolder: "NetBox" }));
-
-    // Both sources' plans name "NetBox/RackA" on their first sync.
-    await core.applyInventorySyncPlan({
-      sourceId: "source-1",
-      syncedAt: 1,
-      upsertServers: [ownedByX],
-      removeServerIds: [],
-      folders: ["NetBox/RackA"],
-      expectedSource: core.getInventorySource("source-1")!
-    });
-    await core.applyInventorySyncPlan({
-      sourceId: "source-2",
-      syncedAt: 1,
-      upsertServers: [],
-      removeServerIds: [],
-      folders: ["NetBox/RackA"],
-      expectedSource: core.getInventorySource("source-2")!
-    });
+    await core.addOrUpdateInventorySource(
+      makeSourceConfig({ id: "source-1", targetFolder: "NetBox", managedFolders: ["NetBox/RackA"] })
+    );
+    await core.addOrUpdateInventorySource(
+      makeSourceConfig({ id: "source-2", targetFolder: "NetBox", managedFolders: ["NetBox/RackA"] })
+    );
     expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackA"]);
     expect(core.getInventorySource("source-2")?.managedFolders).toEqual(["NetBox/RackA"]);
 
@@ -2494,6 +2487,124 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
     expect(core.getSnapshot().explicitGroups).toContain("RackA");
     expect(result.removedEmptyFolderCount).toBe(0);
     expect(core.getInventorySource("source-1")?.managedFolders).toEqual([]);
+  });
+
+  it("(kills use-as-ownership — THE finding's scenario) a folder the user pre-created and this source's first sync merely USES is never recorded as owned, and survives once the device placed there moves away", async () => {
+    const { core } = await makeCoreWithSource([], { targetFolder: "NetBox" });
+
+    // The user hand-creates "NetBox/RackA" via the tree UI BEFORE this
+    // source has ever synced — it already exists in `explicitGroups` before
+    // this apply's own folder loop runs, so it can never land in
+    // `addedExplicitGroups`, whatever this apply's `folders` list or
+    // footprint later does with it.
+    await core.addGroup("NetBox/RackA");
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+
+    // The first sync PLACES the device into the pre-existing folder — this
+    // is USE, not creation. A derivation keyed on `sourceOwnedFootprint`
+    // alone (the pre-fix behavior) would stamp "NetBox/RackA" straight into
+    // `managedFolders` here, on the strength of occupancy alone.
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [owned],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // KILLS use-as-ownership: the folder pre-existed, so it was never in
+    // this apply's own `addedExplicitGroups` — it must NOT be recorded as
+    // owned by this source, even though the source's own device now sits
+    // there. (Under the reverted/old derivation this would be
+    // ["NetBox/RackA"] instead of [].)
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual([]);
+
+    // The device later moves away. Under the old (use-as-ownership)
+    // derivation this would drop "NetBox/RackA" out of the wrongly-stamped
+    // managed set and turn it into a GC candidate on this very apply,
+    // deleting a folder the user created and still wants to keep, purely
+    // because it is momentarily empty.
+    const moved = { ...owned, group: "NetBox/RackB" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // KILLS use-as-ownership (end state): the user's folder is never a GC
+    // candidate in the first place — it was never in `previousManagedFolders`
+    // (never having been owned) and never in `createdThisApply` on this
+    // apply either. (Under the reverted/old derivation this assertion would
+    // fail: `explicitGroups` would no longer contain "NetBox/RackA" and
+    // `removedEmptyFolderCount` would be 1.)
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(result.removedEmptyFolderCount).toBe(0);
+    // The newly-USED "NetBox/RackB" (named by this apply's own `folders`
+    // list, hence genuinely CREATED by it) IS recorded as owned.
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackB"]);
+  });
+
+  it("(sync-created folder is still reclaimed) a folder this source's own first sync CREATES (never pre-existing) is recorded as owned and IS GC-eligible once abandoned — confirms the ownership fix does not disable ordinary reclamation", async () => {
+    const { core } = await makeCoreWithSource([], { targetFolder: "NetBox" });
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
+
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+
+    // The first sync itself CREATES "NetBox/RackA" — it did not exist
+    // before, so it lands in `addedExplicitGroups` and, restricted to
+    // strictly-under-`targetFolder`, in `createdThisApply` too.
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [owned],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackA"]);
+
+    // The device moves away; the source-CREATED folder is now empty and
+    // named by neither this apply's footprint nor its `folders` list — it
+    // must still be reclaimed, exactly as before this fix.
+    const moved = { ...owned, group: "NetBox/RackB" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
+    expect(result.removedEmptyFolderCount).toBe(1);
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackB"]);
   });
 });
 
