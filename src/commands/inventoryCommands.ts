@@ -395,7 +395,7 @@ function countJumpHostDependents(allServers: ServerConfig[], removedIds: Readonl
 }
 
 /** m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync plan for the confirm modal's `detail`. */
-function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[], targetFolder: string): string {
+function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[]): string {
   const lines: string[] = [];
   if (plan.adds.length > 0) {
     const n = plan.adds.length;
@@ -423,10 +423,26 @@ function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[],
   // never an ambiguity about which line it qualifies.
   const hiddenSuffix = plan.hiddenPruneCount > 0 ? ` (${plan.hiddenPruneCount} hidden)` : "";
   if (orphaned > 0) {
-    // m2 — the REAL destination path, computed the same way the prune-policy
-    // picker (promptPrunePolicy) shows it, not the literal folder name.
-    const orphanTarget = targetFolder ? `${targetFolder}/${ORPHAN_FOLDER_NAME}` : ORPHAN_FOLDER_NAME;
-    lines.push(`${orphaned} server${orphaned === 1 ? "" : "s"} will be moved to "${orphanTarget}"${hiddenSuffix}.`);
+    // m2 (FIX — mis-rendered fallback depth) — the destination is read off the
+    // PLAN's own orphan entries rather than recomputed here. Recomputing
+    // `${targetFolder}/${ORPHAN_FOLDER_NAME}` assumed computeSyncPlan's happy
+    // path; when targetFolder is already at MAX_FOLDER_DEPTH,
+    // normalizeFolderPath rejects the one-level-deeper candidate and
+    // computeSyncPlan's fallback (syncEngine.ts, FIX 6) leaves every orphan's
+    // `after.group` at targetFolder itself instead (plus a warning) — the
+    // recomputed path here would then name a folder no server was actually
+    // moved to. All orphan entries in a single plan share one destination BY
+    // CONSTRUCTION: computeSyncPlan computes a single `orphanGroupForPrune`
+    // once per sync and reuses it for every "orphan" prune it pushes, so
+    // reading it off the first orphan entry is exact, not a best guess.
+    // `after.group === undefined` means the fallback landed at the top level
+    // (source.targetFolder itself was "").
+    const firstOrphan = plan.prunes.find(
+      (p): p is { policy: "orphan"; server: ServerConfig; after: ServerConfig } => p.policy === "orphan"
+    );
+    const orphanDestination = firstOrphan?.after.group;
+    const orphanDestinationText = orphanDestination === undefined ? "the top level" : `"${orphanDestination}"`;
+    lines.push(`${orphaned} server${orphaned === 1 ? "" : "s"} will be moved to ${orphanDestinationText}${hiddenSuffix}.`);
   }
   if (deleted > 0) {
     const pronoun = deleted === 1 ? "its" : "their";
@@ -493,10 +509,9 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
 function planDetailDrift(
   previous: { detail: string; deleteIds: ReadonlySet<string> },
   nextPlan: InventorySyncPlan,
-  nextServers: ServerConfig[],
-  targetFolder: string
+  nextServers: ServerConfig[]
 ): { drift: boolean; detail: string } {
-  const nextDetail = describePlanDetail(nextPlan, nextServers, targetFolder);
+  const nextDetail = describePlanDetail(nextPlan, nextServers);
   if (nextDetail !== previous.detail) {
     return { drift: true, detail: nextDetail };
   }
@@ -1431,7 +1446,7 @@ export function registerInventoryCommands(
         // plan and the same server snapshot describePlanDetail was called
         // with here, not a re-derived approximation of either.
         const shownServers = core.getSnapshot().servers;
-        const shownDetail = describePlanDetail(plan, shownServers, source.targetFolder);
+        const shownDetail = describePlanDetail(plan, shownServers);
         const shownDeleteIds = deletePruneIds(plan);
         const buttons = plan.warnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
         const choice = await vscode.window.showInformationMessage(
@@ -1480,8 +1495,7 @@ export function registerInventoryCommands(
           const recomputedDrift = planDetailDrift(
             { detail: shownDetail, deleteIds: shownDeleteIds },
             recomputed,
-            freshServersForRecompute,
-            freshSource.targetFolder
+            freshServersForRecompute
           );
           if (recomputedDrift.drift) {
             return { kind: "retry", plan: recomputed };
@@ -1579,8 +1593,7 @@ export function registerInventoryCommands(
           const finalDrift = planDetailDrift(
             { detail: recomputedDrift.detail, deleteIds: deletePruneIds(recomputed) },
             finalPlan,
-            finalServersForRecompute,
-            freshSource.targetFolder
+            finalServersForRecompute
           );
           if (finalDrift.drift) {
             finalRecomputeMismatchCount++;

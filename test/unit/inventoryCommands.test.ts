@@ -4,9 +4,11 @@ import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/n
 import type { ServerConfig } from "../../src/models/config";
 import { inventorySecretKey, type InventoryProvider, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import { ORPHAN_FOLDER_NAME } from "../../src/services/inventory/syncEngine";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
@@ -2355,6 +2357,125 @@ describe("inventoryCommands", () => {
 
       expect(core.getInventorySource("src-1")?.lastSyncAt).toBeDefined();
       expect(mockShowInformationMessage).toHaveBeenCalled(); // toast, not a modal confirm
+    });
+
+    describe("describePlanDetail orphan-line destination (targetFolder at MAX_FOLDER_DEPTH)", () => {
+      function modalDetail(): string | undefined {
+        const modalCall = mockShowInformationMessage.mock.calls.find(
+          ([msg]) => typeof msg === "string" && msg.includes("Apply inventory sync")
+        );
+        return (modalCall?.[1] as { detail?: string } | undefined)?.detail;
+      }
+
+      it("FIX (orphan-line mis-rendered fallback depth) — a targetFolder already at MAX_FOLDER_DEPTH shows the ACTUAL destination computeSyncPlan's fallback used (the target folder itself), not the recomputed target/_orphaned path it could not create (kills the modal misstating where servers actually land)", async () => {
+        // MAX_FOLDER_DEPTH segments — one more level ("<deepFolder>/_orphaned")
+        // exceeds the limit, so normalizeFolderPath rejects it and syncEngine's
+        // fallback (FIX 6) leaves the orphan's `after.group` at deepFolder itself.
+        const deepFolder = Array.from({ length: MAX_FOLDER_DEPTH }, (_, i) => `L${i + 1}`).join("/");
+        const pruned = makeServer({
+          id: "owned-1",
+          name: "old-sw",
+          host: "10.0.0.1",
+          group: deepFolder,
+          origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+        });
+        const repo = new InMemoryConfigRepository([pruned]);
+        const core = new NexusCore(repo);
+        await core.initialize();
+        const registry = new InventoryProviderRegistry();
+        const provider = makeProvider({
+          // device:1 absent from the fetched tree -> prune "orphan".
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        });
+        registry.register(provider);
+        const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+        registerInventoryCommands(core, registry, vault, makeTeardown());
+        await core.addOrUpdateInventorySource(makeSource({ targetFolder: deepFolder, prunePolicy: "orphan" }));
+
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+        // The engine's own orphan-fallback warning fires a separate toast —
+        // unrelated to the fix under test, just needs a resolved promise.
+        mockShowWarningMessage.mockResolvedValueOnce(undefined);
+
+        const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+        await cmd("src-1");
+
+        const detail = modalDetail();
+        // The engine's own fallback destination — this is where the server is
+        // ACTUALLY moved.
+        expect(detail).toContain(`will be moved to "${deepFolder}"`);
+        // If this fix were reverted (recomputing `${targetFolder}/${ORPHAN_FOLDER_NAME}`
+        // regardless of what computeSyncPlan actually did), the modal would
+        // instead claim this path — which the engine explicitly could not
+        // create and never used.
+        expect(detail).not.toContain(`${deepFolder}/${ORPHAN_FOLDER_NAME}`);
+        expect(core.getServer("owned-1")?.group).toBe(deepFolder);
+      });
+
+      it("normal-depth targetFolder still names the real target/_orphaned destination", async () => {
+        const pruned = makeServer({
+          id: "owned-1",
+          name: "old-sw",
+          host: "10.0.0.1",
+          group: "Infra",
+          origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+        });
+        const repo = new InMemoryConfigRepository([pruned]);
+        const core = new NexusCore(repo);
+        await core.initialize();
+        const registry = new InventoryProviderRegistry();
+        const provider = makeProvider({
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        });
+        registry.register(provider);
+        const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+        registerInventoryCommands(core, registry, vault, makeTeardown());
+        await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", prunePolicy: "orphan" }));
+
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+        const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+        await cmd("src-1");
+
+        const detail = modalDetail();
+        expect(detail).toContain(`will be moved to "Infra/${ORPHAN_FOLDER_NAME}"`);
+        expect(core.getServer("owned-1")?.group).toBe(`Infra/${ORPHAN_FOLDER_NAME}`);
+      });
+
+      it("a root targetFolder (\"\") orphans to the top-level _orphaned folder — quoted, not rendered as the top level", async () => {
+        const pruned = makeServer({
+          id: "owned-1",
+          name: "old-sw",
+          host: "10.0.0.1",
+          origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+        });
+        const repo = new InMemoryConfigRepository([pruned]);
+        const core = new NexusCore(repo);
+        await core.initialize();
+        const registry = new InventoryProviderRegistry();
+        const provider = makeProvider({
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        });
+        registry.register(provider);
+        const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+        registerInventoryCommands(core, registry, vault, makeTeardown());
+        await core.addOrUpdateInventorySource(makeSource({ targetFolder: "", prunePolicy: "orphan" }));
+
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+        const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+        await cmd("src-1");
+
+        const detail = modalDetail();
+        // computeSyncPlan normalizes the root-target candidate ("_orphaned"
+        // alone) successfully, so `after.group` is the literal folder name —
+        // never undefined — and the line renders the quoted path, not the
+        // "moved to the top level" wording reserved for a genuinely undefined
+        // destination.
+        expect(detail).toContain(`will be moved to "${ORPHAN_FOLDER_NAME}"`);
+        expect(detail).not.toContain("the top level");
+        expect(core.getServer("owned-1")?.group).toBe(ORPHAN_FOLDER_NAME);
+      });
     });
 
     it("ITEM 5 — a rejected applyInventorySyncPlan on the nothing-to-do fast path surfaces a friendly error instead of an unhandled rejection", async () => {
