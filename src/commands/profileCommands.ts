@@ -6,6 +6,7 @@ import { FolderTreeItem, LocalShellProfileTreeItem, SerialProfileTreeItem, Serve
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
 import { configMutationLock } from "../services/configMutationLock";
+import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
 import { formValuesToLocalShell, getConfiguredVscodeTerminalProfileNames } from "./localShellCommands";
 import type { CommandContext } from "./types";
@@ -84,7 +85,34 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         // inside this span.
         await configMutationLock.runExclusive(async () => {
           await ctx.core.addOrUpdateServer(server);
-          await syncProxyPasswordSecret(ctx, server.id, values);
+          try {
+            await syncProxyPasswordSecret(ctx, server.id, values);
+          } catch {
+            // FINDING 1 (P2, create-rollback review) — the server record above
+            // just committed, but its proxy secret never did. Left alone, the
+            // form still reports failure while the record persists, and a
+            // retry (fresh id per submission — formValuesToServer always
+            // mints one for this add path) creates a duplicate alongside this
+            // orphaned, secret-less leftover. Roll the record back — and
+            // clean up any secret write that DID land before the rejection —
+            // so a retry starts clean. Both are best-effort: a rollback
+            // failure must not mask the original secret-storage error, and
+            // there is nothing further below this span to make it not
+            // best-effort against.
+            try {
+              await ctx.core.removeServer(server.id);
+            } catch {
+              // best-effort rollback — ignore
+            }
+            if (ctx.secretVault) {
+              try {
+                await ctx.secretVault.delete(proxyPasswordSecretKey(server.id));
+              } catch {
+                // best-effort rollback — ignore
+              }
+            }
+            throw new Error(`Could not store proxy credentials for "${server.name}" — the server was not created.`);
+          }
         });
       }
     },

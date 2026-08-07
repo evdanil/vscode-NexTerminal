@@ -1916,4 +1916,52 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(saved.proxy).toEqual({ type: "socks5", host: "proxy.example.com", port: 1080, username: "proxyuser" });
     expect(secretStore).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"), "new-proxy-pw");
   });
+
+  it("restores the prior server record and the prior proxy-secret value when syncProxyPasswordSecret rejects after addOrUpdateServer already committed the new record, and surfaces the failure (kills committed-record-with-old-secret leftover)", async () => {
+    const priorProxy = { type: "socks5" as const, host: "old-proxy.example.com", port: 1080, username: "proxyuser" };
+    const { ctx, addOrUpdateServer, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ proxy: priorProxy })],
+      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+    });
+
+    // syncProxyPasswordSecret's store call for the NEW proxy password fails —
+    // e.g. the OS keychain rejected the write. Only the first store call
+    // (the failing one) is intercepted; the rollback's restoring store call
+    // just after uses the harness's normal (succeeding) behavior.
+    secretStore.mockRejectedValueOnce(new Error("keychain unavailable"));
+
+    await expect(
+      submitEdit(ctx, {
+        name: "Server 1",
+        host: "example.com",
+        port: 22,
+        username: "dev",
+        authType: "password",
+        proxyType: "socks5",
+        proxySocks5Host: "new-proxy.example.com", // proxy host CHANGED
+        proxySocks5Port: 1080,
+        proxySocks5Username: "proxyuser",
+        proxySocks5Password: "new-proxy-pw"
+      })
+    ).rejects.toThrow(/changes were not saved/i);
+
+    // Kill check: a wrong implementation that only surfaces the failure
+    // without restoring would leave the NEW record (new-proxy.example.com)
+    // committed in core — this assertion fails against that implementation
+    // because the surviving record's proxy host would read "new-proxy.example.com"
+    // instead of the prior "old-proxy.example.com".
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(2);
+    const finalRecord = ctx.core.getServer("srv-1");
+    expect(finalRecord?.proxy).toEqual(priorProxy);
+
+    // Kill check: a wrong implementation that restores the record but never
+    // restores the vault would leave the rotated "new-proxy-pw" behind (the
+    // failed store call notwithstanding, a partial-write vault could still
+    // have latched it) or leave the key deleted — either way this would not
+    // read back the prior "old-proxy-pw".
+    const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+    expect(finalSecret).toBe("old-proxy-pw");
+  });
 });

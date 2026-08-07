@@ -68,6 +68,7 @@ vi.mock("../../src/commands/inlineAuthProfileCreation", () => ({
 import { openUnifiedForm, registerProfileCommands } from "../../src/commands/profileCommands";
 import { LocalShellProfileTreeItem } from "../../src/ui/nexusTreeProvider";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
+import { proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 
 function makeCtx() {
   return {
@@ -303,5 +304,67 @@ describe("openUnifiedForm SSH submit — record+secret mutation locking (FINDING
       "syncProxyPasswordSecret",
       "submit:end"
     ]);
+  });
+});
+
+describe("openUnifiedForm SSH submit — create rollback on secret-storage failure (FINDING 1, P2)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetConfiguration.mockReturnValue({
+      get: vi.fn((_key: string, fallback: unknown) => fallback)
+    });
+    mockShowQuickPick.mockReset();
+    mockWebviewOpen.mockReturnValue({ dispose: vi.fn() });
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server" });
+  });
+
+  it("removes the just-created server and cleans up any partial proxy secret when syncProxyPasswordSecret rejects, and surfaces the failure (kills persisted-without-secret leftover that would duplicate on retry)", async () => {
+    const servers = new Map<string, { id: string; name: string }>();
+    const secrets = new Map<string, string>();
+    const addOrUpdateServer = vi.fn(async (server: { id: string; name: string }) => {
+      servers.set(server.id, server);
+    });
+    const removeServer = vi.fn(async (id: string) => {
+      servers.delete(id);
+    });
+    const secretDelete = vi.fn(async (key: string) => {
+      secrets.delete(key);
+    });
+    const ctx = {
+      core: {
+        getSnapshot: vi.fn(() => ({ servers: [], authProfiles: [] })),
+        getAuthProfile: vi.fn(),
+        addOrUpdateServer,
+        removeServer,
+        addOrUpdateSerialProfile: vi.fn(),
+        addOrUpdateLocalShellProfile: vi.fn()
+      },
+      secretVault: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: secretDelete
+      }
+    } as any;
+
+    mockSyncProxyPasswordSecret.mockImplementation(async () => {
+      throw new Error("keychain unavailable");
+    });
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+
+    await expect(
+      onSubmit({ profileType: "ssh", name: "New Server", host: "example.com", username: "me" })
+    ).rejects.toThrow(/server was not created/i);
+
+    // Kill check: a wrong implementation that only surfaces the failure
+    // without rolling back would leave "srv-new" sitting in core — this
+    // fails against that implementation because the record would still be
+    // present here.
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    expect(removeServer).toHaveBeenCalledWith("srv-new");
+    expect(servers.has("srv-new")).toBe(false);
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-new"));
+    expect(secrets.has(proxyPasswordSecretKey("srv-new"))).toBe(false);
   });
 });

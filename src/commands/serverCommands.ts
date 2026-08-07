@@ -1053,8 +1053,51 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // just after is fire-and-forget (`void`, never awaited) and stays
           // outside the lock regardless.
           await configMutationLock.runExclusive(async () => {
+            // FINDING 2 (P2, edit-rollback review) — capture the prior
+            // record and the prior proxy-secret value BEFORE this
+            // generation's writes land, inside this same lock acquisition,
+            // so the capture reflects exactly what's about to be
+            // overwritten (not a stale pre-lock read). syncProxyPasswordSecret
+            // only ever touches proxyPasswordSecretKey(existing.id) — see its
+            // definition above — and the server id never changes across an
+            // edit, so there is exactly one secret slot to capture and
+            // restore regardless of what the proxy identity changed to.
+            const priorRecord = existing;
+            const proxySecretKey = proxyPasswordSecretKey(existing.id);
+            const priorSecretValue = ctx.secretVault ? await ctx.secretVault.get(proxySecretKey) : undefined;
             await ctx.core.addOrUpdateServer(updated);
-            await syncProxyPasswordSecret(ctx, updated.id, values);
+            try {
+              await syncProxyPasswordSecret(ctx, updated.id, values);
+            } catch {
+              // The record above just committed to the NEW generation, but
+              // its proxy secret never did — left alone, the new record
+              // would pair with the OLD password while the form reports
+              // failure. Restore both, best-effort. A restore failure is
+              // reported honestly (rather than retried or silently
+              // swallowed) since it means the vault or the record no longer
+              // matches either generation.
+              try {
+                await ctx.core.addOrUpdateServer(priorRecord);
+              } catch {
+                void vscode.window.showErrorMessage(
+                  `Could not restore server "${existing.name}" to its previous settings after a failed save — re-check its record.`
+                );
+              }
+              if (ctx.secretVault) {
+                try {
+                  if (priorSecretValue !== undefined) {
+                    await ctx.secretVault.store(proxySecretKey, priorSecretValue);
+                  } else {
+                    await ctx.secretVault.delete(proxySecretKey);
+                  }
+                } catch {
+                  void vscode.window.showErrorMessage(
+                    `Could not restore the previous proxy password for "${existing.name}" after a failed save — re-check its proxy credentials.`
+                  );
+                }
+              }
+              throw new Error(`Could not store proxy credentials for "${existing.name}" — changes were not saved.`);
+            }
           });
           if (ctx.core.isServerConnected(existing.id)) {
             void vscode.window.showInformationMessage(
