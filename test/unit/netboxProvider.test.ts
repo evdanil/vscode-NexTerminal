@@ -303,6 +303,25 @@ describe("createNetboxProvider", () => {
       expect(tree.devices[0]).toMatchObject({ externalId: "device:42", name: "no-primary-ip-device", endpoints: [] });
     });
 
+    it("FINDING 1 — throws a protocol error (not a silent drop) when a page contains a null row (kills silently dropping the row while pagination still believes the count was fully collected)", async () => {
+      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 1, results: [null] }));
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({
+        kind: "protocol"
+      });
+    });
+
+    it("FINDING 1 — throws a protocol error naming the endpoint and row index when a row has no id (kills silently dropping an id-less row)", async () => {
+      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 1, results: [{ name: "x" }] }));
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({
+        kind: "protocol",
+        message: expect.stringContaining("/api/dcim/devices/")
+      });
+    });
+
     it("prefixes device/vm externalIds so a shared numeric id coexists instead of colliding (kills unprefixed String(id))", async () => {
       const fetchImpl = vi.fn(async (url: string) => {
         if (String(url).includes("virtual-machines")) {

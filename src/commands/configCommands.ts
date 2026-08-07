@@ -1687,17 +1687,16 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       // above, so it gets its own loop rather than restoreSecrets()'s single-level keyFn.
       const inventorySourceSecrets = decryptedSecrets.inventorySourceSecrets as Record<string, Record<string, string>> | undefined;
       if (inventorySourceSecrets) {
-        // Merge mode: importPreservingIds silently SKIPS an incoming source whose id already
-        // exists locally (the local record wins), but this bucket is keyed by sourceId
-        // independently of that skip. Restoring unconditionally would overwrite a retained
-        // local source's working vault secret (e.g. its API token) with the backup's — possibly
-        // stale — one, even though the source's config was correctly left untouched. Scope the
-        // restore to ids this run actually imported. Replace mode wipes and reimports every
-        // source above, so every id in the payload was (re)imported and the restore stays
-        // unconditional, matching prior behavior.
-        const importedSourceIds = mode === "merge" ? new Set(inventorySourceTally.importedIds) : undefined;
+        // FINDING 3 — importPreservingIds's `importedIds` only names sources that actually
+        // landed: merge mode skips an id that already exists locally (the local record wins),
+        // and BOTH modes skip a source that fails validateInventorySource (e.g. a corrupt
+        // prunePolicy). Restoring unconditionally in either case would write a vault key for a
+        // source that was never persisted — undiscoverable dead secrets, since export, removal,
+        // and reset all enumerate persisted sources, not the backup payload. So the restore is
+        // scoped to importedIds in both modes, not merge-only.
+        const importedSourceIds = new Set(inventorySourceTally.importedIds);
         for (const [sourceId, fields] of Object.entries(inventorySourceSecrets)) {
-          if (importedSourceIds && !importedSourceIds.has(sourceId)) continue;
+          if (!importedSourceIds.has(sourceId)) continue;
           for (const [fieldId, value] of Object.entries(fields)) {
             await vault.store(inventorySecretKey(sourceId, fieldId), value);
           }

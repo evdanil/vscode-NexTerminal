@@ -4817,7 +4817,8 @@ describe("backup export round-trip", () => {
     expect(await vault.get(inventorySecretKey("src2", "apiToken"))).toBe("new-token"); // newly-imported source restored
 
     // --- Replace mode: every existing source (src1) is removed and every backup source
-    // (re)imported, so the secret restore stays unconditional — src1's token IS overwritten.
+    // (re)imported — both src1 and src2 pass validateInventorySource, so both land in
+    // importedIds and both secrets restore — src1's token IS overwritten.
     registeredCommands.clear();
     mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
     mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
@@ -4831,5 +4832,60 @@ describe("backup export round-trip", () => {
     expect(core.getInventorySource("src1")?.name).toBe("Backup NetBox");
     expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("backup-token");
     expect(await vault.get(inventorySecretKey("src2", "apiToken"))).toBe("new-token");
+  });
+
+  it("FINDING 3 — replace-mode restore skips secrets for a source validateInventorySource rejected, even though it never existed locally to be filtered out by an id check (kills the round-2 fix's merge-mode-only importedIds filter)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // src1 is a structurally valid source (imports normally). src2 fails
+    // validateInventorySource (bad prunePolicy) and is skipped by importPreservingIds
+    // in EVERY mode — merge or replace — so it never lands in core. Both have a
+    // backed-up secret; only src1's should be discoverable in the vault afterward.
+    const secrets = {
+      inventorySourceSecrets: {
+        src1: { apiToken: "valid-token" },
+        src2: { apiToken: "orphaned-token" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [
+        makeInventorySource({ id: "src1", name: "Valid Source" }),
+        { ...makeInventorySource({ id: "src2", name: "Invalid Source" }), prunePolicy: "bogus" }
+      ],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")?.name).toBe("Valid Source");
+    expect(core.getInventorySource("src2")).toBeUndefined(); // rejected by validateInventorySource
+
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("valid-token");
+    // The invalid source's vault key must not exist at all — not merely "unset", but
+    // genuinely absent, since export/removal/reset only ever enumerate persisted sources.
+    expect(await vault.get(inventorySecretKey("src2", "apiToken"))).toBeUndefined();
   });
 });

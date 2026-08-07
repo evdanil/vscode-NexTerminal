@@ -565,24 +565,31 @@ export function registerInventoryCommands(
     // between) so a second invocation arriving on the next microtask sees it.
     inFlightSourceIds.add(source.id);
     try {
-      // FINDING 2 — a missing vault entry only aborts the sync when it belongs
-      // to a field the CURRENT provider schema marks `required: true`. An
-      // optional password field can legitimately have no stored secret (never
-      // entered, or dropped from secretFieldIds by FIX 1/3); the provider
-      // still runs and simply doesn't receive that key. `provider` is
+      // FINDING 2 — the required-secret check is driven by the provider's
+      // CURRENT configFields schema, not by the stored source.secretFieldIds.
+      // A provider upgrade that adds a new required password field (or flips
+      // a blank optional field to required) must be caught here even though
+      // the stored source predates that schema change and its
+      // secretFieldIds never mention the new field id. `provider` is
       // guaranteed registered here (checked above), so "provider unavailable"
       // never applies within this call.
+      for (const field of provider.configFields) {
+        if (field.type !== "password" || !field.required) continue;
+        const value = await vault.get(inventorySecretKey(source.id, field.id));
+        if (!value) {
+          void vscode.window.showErrorMessage(`Missing saved credential "${field.id}" for "${source.name}". Edit the source to re-enter it.`);
+          return;
+        }
+      }
+
+      // Loading stored secrets into the payload sent to the provider stays
+      // driven by secretFieldIds (unchanged from before FINDING 2) — every id
+      // that was actually stored (optional or stale) is harmless to pass
+      // through, whether or not the current schema still calls it required.
       const secrets: InventorySourceSecrets = {};
       for (const fieldId of source.secretFieldIds) {
         const value = await vault.get(inventorySecretKey(source.id, fieldId));
-        if (value === undefined) {
-          const providerField = provider.configFields.find((f) => f.id === fieldId && f.type === "password");
-          if (providerField?.required) {
-            void vscode.window.showErrorMessage(`Missing saved credential "${fieldId}" for "${source.name}". Edit the source to re-enter it.`);
-            return;
-          }
-          continue;
-        }
+        if (value === undefined) continue;
         secrets[fieldId] = value;
       }
 

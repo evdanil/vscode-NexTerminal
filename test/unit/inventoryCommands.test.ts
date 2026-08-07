@@ -419,7 +419,7 @@ describe("inventoryCommands", () => {
         fetchInventory: vi.fn(() => new Promise<InventoryTree>((resolve) => (resolveFetch = resolve)))
       });
       registry.register(provider);
-      const vault = makeVault();
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
       await core.addOrUpdateInventorySource(makeSource());
 
@@ -479,7 +479,8 @@ describe("inventoryCommands", () => {
         [proxyPasswordSecretKey("owned-1")]: "proxy1",
         [passwordSecretKey("owned-2")]: "pw2",
         [passphraseSecretKey("owned-2")]: "pp2",
-        [proxyPasswordSecretKey("owned-2")]: "proxy2"
+        [proxyPasswordSecretKey("owned-2")]: "proxy2",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
       });
       const teardown = {
         teardownServerRuntime: vi.fn(async (serverId: string) => {
@@ -518,7 +519,7 @@ describe("inventoryCommands", () => {
         fetchInventory: vi.fn(() => new Promise<InventoryTree>((resolve) => (resolveFetch = resolve)))
       });
       registry.register(provider);
-      const vault = makeVault();
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
       await core.addOrUpdateInventorySource(makeSource());
 
@@ -545,7 +546,7 @@ describe("inventoryCommands", () => {
         }))
       });
       registry.register(provider);
-      const vault = makeVault();
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
       await core.addOrUpdateInventorySource(makeSource());
 
@@ -570,7 +571,7 @@ describe("inventoryCommands", () => {
         }))
       });
       registry.register(provider);
-      const vault = makeVault();
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
       await core.addOrUpdateInventorySource(makeSource());
 
@@ -592,7 +593,7 @@ describe("inventoryCommands", () => {
       await core.initialize();
       const registry = new InventoryProviderRegistry();
       registry.register(makeProvider());
-      const vault = makeVault();
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
       await core.addOrUpdateInventorySource(makeSource());
 
@@ -617,6 +618,30 @@ describe("inventoryCommands", () => {
       await cmd("src-1");
 
       expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Edit the source"));
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+    });
+
+    it("FINDING 2 — a provider schema upgrade adding a new required password field aborts the sync even though the stored source's secretFieldIds predates it (kills a check driven by stored secretFieldIds instead of the provider's current schema)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "apiToken", label: "API Token", type: "password", required: true }
+        ]
+      });
+      registry.register(provider);
+      const vault = makeVault(); // apiToken never stored
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      // Simulates a source saved BEFORE the provider required apiToken: its stored
+      // secretFieldIds does not mention it at all (not even as a stale/skipped id).
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: [] }));
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("apiToken"));
       expect(provider.fetchInventory).not.toHaveBeenCalled();
     });
 
@@ -662,7 +687,7 @@ describe("inventoryCommands", () => {
         }))
       });
       registry.register(provider);
-      const vault = makeVault();
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
       await core.addOrUpdateInventorySource(makeSource());
 
@@ -697,7 +722,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({ fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) });
       registry.register(provider);
-      const vault = makeVault();
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
       await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete" }));
 
@@ -721,7 +746,7 @@ describe("inventoryCommands", () => {
         fetchInventory: vi.fn(async () => ({ devices: null }) as unknown as InventoryTree)
       });
       registry.register(provider);
-      const vault = makeVault();
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
       await core.addOrUpdateInventorySource(makeSource());
 

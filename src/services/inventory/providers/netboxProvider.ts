@@ -374,11 +374,33 @@ function vmVars(raw: Record<string, unknown>): Record<string, string> {
  * though the device is merely unmappable this fetch — data loss for a purely
  * cosmetic NetBox data-quality issue. Only an entry with no `id` at all (no
  * way to construct a stable externalId) is genuinely dropped.
+ *
+ * FINDING 1 — "dropped" above must mean "aborts the whole sync", not
+ * "silently skipped and forgotten". A page is a structurally valid paged
+ * response (validatePagedShape already vetted `count`/`results`), so
+ * fetchAllPages considers every row in it faithfully collected; if a row
+ * here is null, not an object, or has no usable id, silently returning
+ * `undefined` would make that row vanish from the `devices` array while the
+ * pagination accounting still believes the reported count was fully
+ * collected. Any server this row corresponds to then falls out of the
+ * engine's present set and gets pruned — the same fail-closed hazard the
+ * count-drift and negative-count guards above exist to prevent. So this
+ * throws a protocol error naming the endpoint and row index instead of
+ * returning `undefined`.
  */
-function mapEntry(raw: unknown, template: string, kind: "device" | "vm"): InventoryDevice | undefined {
-  if (typeof raw !== "object" || raw === null) return undefined;
+function mapEntry(raw: unknown, endpointPath: string, index: number, template: string, kind: "device" | "vm"): InventoryDevice {
+  if (typeof raw !== "object" || raw === null) {
+    throw new InventoryProviderError(
+      "protocol",
+      `row ${index} of ${endpointPath} is not a JSON object — refusing to sync.`
+    );
+  }
   const obj = raw as Record<string, unknown>;
-  if (obj.id === undefined || obj.id === null) return undefined;
+  const hasUsableId =
+    (typeof obj.id === "number" && Number.isFinite(obj.id)) || (typeof obj.id === "string" && obj.id.length > 0);
+  if (!hasUsableId) {
+    throw new InventoryProviderError("protocol", `row ${index} of ${endpointPath} has no id — refusing to sync.`);
+  }
   const name = typeof obj.name === "string" ? obj.name : "";
   const primaryIp = obj.primary_ip as { address?: unknown } | null | undefined;
   const address = primaryIp && typeof primaryIp === "object" ? primaryIp.address : undefined;
@@ -463,21 +485,19 @@ async function fetchInventoryImpl(
 
   const devices: InventoryDevice[] = [];
   // FIX 1 — "skipped" now means "mapped with no endpoints" (unmappable name or
-  // IP), not "dropped from the tree" — mapEntry only returns undefined when
-  // there's no id at all to key an externalId on.
+  // IP), not "dropped from the tree" — mapEntry throws (FINDING 1) rather
+  // than returning undefined for a row with no usable id.
   let skippedCount = 0;
-  for (const raw of rawDevices) {
-    const mapped = mapEntry(raw, template, "device");
-    if (!mapped) continue;
+  rawDevices.forEach((raw, index) => {
+    const mapped = mapEntry(raw, "/api/dcim/devices/", index, template, "device");
     devices.push(mapped);
     if (mapped.endpoints.length === 0) skippedCount++;
-  }
-  for (const raw of rawVms) {
-    const mapped = mapEntry(raw, template, "vm");
-    if (!mapped) continue;
+  });
+  rawVms.forEach((raw, index) => {
+    const mapped = mapEntry(raw, "/api/virtualization/virtual-machines/", index, template, "vm");
     devices.push(mapped);
     if (mapped.endpoints.length === 0) skippedCount++;
-  }
+  });
   if (skippedCount > 0) {
     warnings.push(`${skippedCount} device${skippedCount === 1 ? "" : "s"} without a primary IP were skipped.`);
   }
