@@ -656,6 +656,48 @@ describe("server disconnect with tunnel autoStop", () => {
     );
   });
 
+  it("(shared-live-reference fix) remove command's in-lock structural revalidation catches an IN-PLACE mutation of the live record (e.g. a folder rename rewriting server.group) made while the confirmation modal was pending — comparing against the live `server` reference would trivially 'match' any mutation applied to that same object, so this aborts with the changed-since-confirmed message and performs no teardown/vault-delete/removeServer", async () => {
+    const { ctx, stopTunnel, disconnectPool, removeServer, secretDelete, terminalDispose } = setupHarness({
+      profiles: [],
+      activeTunnels: []
+    });
+
+    registerServerCommands(ctx);
+    const removeCmd = registeredCommands.get("nexus.server.remove");
+    expect(removeCmd).toBeDefined();
+
+    // The harness's default core.getServer does snapshot.servers.find(...) —
+    // both the initial arg-resolution lookup and the in-lock re-check
+    // lookup return the SAME live object reference from snapshot.servers,
+    // exactly like production's NexusCore.getServer (Map#get returns the
+    // map's own object, never a copy). Simulate a concurrent
+    // nexus.group.rename mutating server.group ON THAT OBJECT while the
+    // confirmation modal is pending, by hooking the mock modal's resolution.
+    mockShowWarningMessage.mockImplementationOnce(async () => {
+      const live = (ctx.core.getServer as ReturnType<typeof vi.fn>)("srv-1");
+      live.group = "renamed-folder";
+      return "Remove";
+    });
+
+    await removeCmd!("srv-1");
+
+    // If the fix under test were reverted to comparing against the live
+    // `server` reference instead of a snapshot captured before the mutation,
+    // `currentRecord` and `server` would be the SAME mutated object by the
+    // time the in-lock check runs — serverConfigsEqual would trivially
+    // report "equal" and the removal would proceed despite the change. With
+    // the detached pre-modal snapshot, the mutation is caught and nothing
+    // below may run.
+    expect(terminalDispose).not.toHaveBeenCalled();
+    expect(stopTunnel).not.toHaveBeenCalled();
+    expect(disconnectPool).not.toHaveBeenCalled();
+    expect(secretDelete).not.toHaveBeenCalled();
+    expect(removeServer).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("changed since the removal was confirmed")
+    );
+  });
+
   it("clears File Explorer auto-open on duplicated server profiles", async () => {
     const { ctx, addOrUpdateServer } = setupHarness({
       profiles: [],

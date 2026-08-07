@@ -1344,8 +1344,18 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!server) {
         return;
       }
+      // `server` is the LIVE record (getServer/toServerFromArg/pickServer all
+      // return the map's own object, not a copy) — e.g. nexus.group.rename
+      // mutates `server.group` on that same object in place. Snapshot it
+      // structurally, BEFORE the first await (the confirmation modal below),
+      // so an in-place mutation that lands while the modal or the lock wait
+      // is pending can't silently drag the comparand along with it and make
+      // the in-lock revalidation below compare a mutated record against
+      // itself. Use this detached clone for the confirmation text too, so
+      // what the user sees matches what gets compared.
+      const confirmedSnapshot = cloneServerConfig(server);
       const confirm = await vscode.window.showWarningMessage(
-        `Remove server "${server.name}" and disconnect all sessions?`,
+        `Remove server "${confirmedSnapshot.name}" and disconnect all sessions?`,
         { modal: true },
         "Remove"
       );
@@ -1392,7 +1402,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       await configMutationLock.runExclusive(async () => {
         const currentRecord = ctx.core.getServer(server.id);
         if (!currentRecord) {
-          void vscode.window.showInformationMessage(`Server "${server.name}" was already removed.`);
+          void vscode.window.showInformationMessage(`Server "${confirmedSnapshot.name}" was already removed.`);
           return;
         }
         // FINDING (revalidation was presence-only) — a presence check alone
@@ -1400,13 +1410,17 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         // DIFFERENT record that a replace-mode import (or another writer
         // ahead of us in the lock queue) recreated under the same id" while
         // this confirm modal was open or this flow was waiting for the
-        // lock. Compare structurally against the captured, user-confirmed
-        // `server` and abort — distinct from the already-removed message —
-        // rather than tearing down/deleting credentials for/removing a
-        // record the user never actually confirmed removing.
-        if (!serverConfigsEqual(currentRecord, server)) {
+        // lock. Compare structurally against the captured, DETACHED
+        // `confirmedSnapshot` and abort — distinct from the already-removed
+        // message — rather than tearing down/deleting credentials for/
+        // removing a record the user never actually confirmed removing.
+        // Comparing against `server` itself would be comparing the live map
+        // object against itself — an in-place mutation (e.g.
+        // nexus.group.rename touching server.group) updates both sides at
+        // once and the check would pass despite the change.
+        if (!serverConfigsEqual(currentRecord, confirmedSnapshot)) {
           void vscode.window.showWarningMessage(
-            `Server "${server.name}" changed since the removal was confirmed — try again.`
+            `Server "${confirmedSnapshot.name}" changed since the removal was confirmed — try again.`
           );
           return;
         }
