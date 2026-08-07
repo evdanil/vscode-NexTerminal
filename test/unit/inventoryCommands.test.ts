@@ -1379,6 +1379,150 @@ describe("inventoryCommands", () => {
       expect(core.getServer("owned-1")).toBeUndefined();
     });
 
+    it("FINDING 1 (P2, second-sweep-abort review) — a server re-added (e.g. by nexus.server.edit, which never takes configMutationLock) while applyInventorySyncPlan's saves are still settling is skipped by the post-apply teardown sweep, but teardown still runs for another removed id (kills an unconditional post-apply sweep that would kill the recreated server's live terminals/tunnels/pool)", async () => {
+      const prunedA = makeServer({
+        id: "owned-1",
+        name: "sw-a",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const prunedB = makeServer({
+        id: "owned-2",
+        name: "sw-b",
+        host: "10.0.0.2",
+        origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([prunedA, prunedB]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+
+      // Simulate the race the finding describes: nexus.server.edit re-adds
+      // "owned-1" (upsert semantics, no configMutationLock) right as
+      // applyInventorySyncPlan's own saves settle — after the pre-apply
+      // teardown loop already ran for it, before the post-apply second
+      // sweep's iteration for it runs. "owned-2" is untouched by the race.
+      const originalApply = core.applyInventorySyncPlan.bind(core);
+      vi.spyOn(core, "applyInventorySyncPlan").mockImplementation(async (application) => {
+        const result = await originalApply(application);
+        await core.addOrUpdateServer({ ...prunedA, name: "sw-a (recreated)" });
+        return result;
+      });
+
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) // both devices gone -> prune "delete"
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+
+      const callCounts: Record<string, number> = {};
+      const teardown = {
+        teardownServerRuntime: vi.fn(async (serverId: string) => {
+          callCounts[serverId] = (callCounts[serverId] ?? 0) + 1;
+        })
+      };
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete" }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      // "owned-1" is torn down ONCE (the pre-apply pass) — the post-apply
+      // sweep must re-check core.getServer("owned-1") and skip it because
+      // it's live again. "owned-2" is torn down TWICE (pre-apply pass, then
+      // the post-apply sweep again, same as the dedicated reconnect-race
+      // test above) because it was never recreated. If the fix were reverted
+      // to an unconditional post-apply sweep, "owned-1" would show 2 calls
+      // here too, killing the recreated server's live terminals/tunnels.
+      expect(callCounts["owned-1"]).toBe(1);
+      expect(callCounts["owned-2"]).toBe(2);
+      expect(teardown.teardownServerRuntime).toHaveBeenCalledTimes(3);
+
+      expect(core.getServer("owned-1")).toBeDefined();
+      expect(core.getServer("owned-2")).toBeUndefined();
+
+      // The recreated id is folded into the same "re-created server(s)"
+      // count the credential-cleanup loop already reports — counted once,
+      // not twice, even though both loops independently notice it's live.
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(
+        expect.stringMatching(/^Inventory sync complete:.*1 re-created server.*kept its credentials\.$/)
+      );
+    });
+
+    it("FINDING 2 (P2, second-sweep-abort review) — a teardown rejection (e.g. a tunnel stop failing) for one removed id does not abort the sweep: another removed id still gets torn down, pruned-secret cleanup still runs for both, and the closing report mentions incomplete cleanup (kills abort-on-first-teardown-failure)", async () => {
+      const prunedA = makeServer({
+        id: "owned-1",
+        name: "sw-a",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const prunedB = makeServer({
+        id: "owned-2",
+        name: "sw-b",
+        host: "10.0.0.2",
+        origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([prunedA, prunedB]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) // both devices gone -> prune "delete"
+      });
+      registry.register(provider);
+      const vault = makeVault({
+        [passwordSecretKey("owned-1")]: "pw1",
+        [passwordSecretKey("owned-2")]: "pw2",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+
+      // "owned-1" always rejects teardown (both the pre-apply pass and the
+      // post-apply sweep); "owned-2" always succeeds. A reverted fix (a bare
+      // `await teardown.teardownServerRuntime(id)` with no try/catch) would
+      // let the FIRST rejection propagate out of the post-apply sweep,
+      // skipping "owned-2"'s post-apply teardown, the entire pruned-secret
+      // cleanup loop below it, and the normal success message — surfacing
+      // instead as an unhandled command rejection.
+      const teardownCalls: string[] = [];
+      const teardown = {
+        teardownServerRuntime: vi.fn(async (serverId: string) => {
+          teardownCalls.push(serverId);
+          if (serverId === "owned-1") throw new Error("tunnel stop failed");
+        })
+      };
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete" }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      // Both records are gone regardless of the teardown rejection — the
+      // deletion already committed before the post-apply sweep ran.
+      expect(core.getSnapshot().servers).toHaveLength(0);
+
+      // "owned-2" was torn down in both passes despite "owned-1" rejecting
+      // right before/after it each time — proves the sweep continued.
+      expect(teardownCalls.filter((id) => id === "owned-2")).toHaveLength(2);
+      expect(teardownCalls.filter((id) => id === "owned-1")).toHaveLength(2);
+
+      // Pruned-secret cleanup still ran for BOTH ids — a reverted fix would
+      // have thrown out of the post-apply sweep before ever reaching this
+      // loop, leaving both credentials in place.
+      expect(await vault.get(passwordSecretKey("owned-1"))).toBeUndefined();
+      expect(await vault.get(passwordSecretKey("owned-2"))).toBeUndefined();
+
+      // The closing report still fires (not swallowed by an unhandled
+      // rejection) and calls out the incomplete runtime cleanup by name.
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(
+        expect.stringMatching(/^Inventory sync complete:.*Runtime cleanup incomplete for 1 server — close its terminal manually\.$/)
+      );
+    });
+
     it("(FINDING 2, review) a pruned server re-created (e.g. by nexus.server.edit, which never takes configMutationLock) while applyInventorySyncPlan's saves are still settling keeps its vault credentials — the post-apply cleanup loop must recheck server absence per id (kills unconditional pruned-secret cleanup)", async () => {
       const pruned = makeServer({
         id: "owned-1",

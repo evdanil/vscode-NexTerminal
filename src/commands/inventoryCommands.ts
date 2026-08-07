@@ -753,7 +753,7 @@ export function registerInventoryCommands(
       // calls stay outside — they're fire-and-forget and don't need to be
       // atomic with the mutation.
       const removal = await configMutationLock.runExclusive(async (): Promise<
-        { ok: true; skippedCount: number; recreatedCount: number } | { ok: false }
+        { ok: true; skippedCount: number; recreatedCount: number; teardownFailureCount: number } | { ok: false }
       > => {
         // ITEM 6 (carried forward from the pre-reorder flow) — a source config
         // race landing while the confirm modal was open (e.g. a replace-mode
@@ -896,6 +896,7 @@ export function registerInventoryCommands(
         // current state no longer matched what this disposition expected.
         let skippedCount = 0;
         let recreatedCount = 0;
+        let teardownFailureCount = 0;
         if (choice === "Delete Servers") {
           // FINDING 5 (removal-teardown review, REORDER) — apply the deletion
           // FIRST, then tear down runtime state + vault secrets only for the
@@ -944,8 +945,21 @@ export function registerInventoryCommands(
           // FINDING 5 — teardown ONLY the ids actually removed above; a
           // skipped (taken-over) server keeps its live sessions/tunnels/pool
           // connection exactly as the surviving server record implies.
+          // FINDING 2 (P2, second-sweep-abort review) — this runs AFTER the
+          // record removal above already committed, so a rejected teardown
+          // (e.g. a tunnel stop failing) must not be allowed to throw here:
+          // an uncaught rejection would abort this loop mid-way, skipping
+          // teardown for the remaining ids, skipping the credential-cleanup
+          // loop below entirely, and skipping the normal success message —
+          // even though the servers are already gone for good. Contain each
+          // teardown per id, count failures, and keep going regardless; the
+          // count is folded into the closing report below.
           for (const id of removedServerIds) {
-            await teardown.teardownServerRuntime(id);
+            try {
+              await teardown.teardownServerRuntime(id);
+            } catch {
+              teardownFailureCount++;
+            }
           }
           // FINDING 3 — likewise, vault secret cleanup is limited to ids
           // actually removed — previously this looped over the whole `owned`
@@ -1001,7 +1015,7 @@ export function registerInventoryCommands(
           }
         }
 
-        return { ok: true, skippedCount, recreatedCount };
+        return { ok: true, skippedCount, recreatedCount, teardownFailureCount };
       });
       if (!removal.ok) return;
 
@@ -1015,7 +1029,19 @@ export function registerInventoryCommands(
         removal.recreatedCount > 0
           ? ` (${removal.recreatedCount} re-created server${removal.recreatedCount === 1 ? "" : "s"} kept ${removal.recreatedCount === 1 ? "its" : "their"} credentials)`
           : "";
-      void vscode.window.showInformationMessage(`Inventory source "${source.name}" removed.${skippedNote}${recreatedNote}`);
+      // FINDING 2 (P2, second-sweep-abort review) — surface any teardown that
+      // was contained (not swallowed silently) above.
+      const teardownFailureNote =
+        removal.teardownFailureCount > 0
+          ? ` (runtime cleanup incomplete for ${removal.teardownFailureCount} server${
+              removal.teardownFailureCount === 1 ? "" : "s"
+            } — close ${removal.teardownFailureCount === 1 ? "its" : "their"} terminal${
+              removal.teardownFailureCount === 1 ? "" : "s"
+            } manually)`
+          : "";
+      void vscode.window.showInformationMessage(
+        `Inventory source "${source.name}" removed.${skippedNote}${recreatedNote}${teardownFailureNote}`
+      );
     } finally {
       inFlightSourceIds.delete(source.id);
     }
@@ -1144,7 +1170,7 @@ export function registerInventoryCommands(
       type SyncAttempt =
         | { kind: "abort" }
         | { kind: "retry"; plan: InventorySyncPlan }
-        | { kind: "success"; finalPlan: InventorySyncPlan; recreatedCount: number };
+        | { kind: "success"; finalPlan: InventorySyncPlan; recreatedCount: number; teardownFailureCount: number };
 
       for (;;) {
         const buttons = plan.warnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
@@ -1195,12 +1221,28 @@ export function registerInventoryCommands(
           }
 
           const application = planToApplication(recomputed, freshSource);
+          // FINDING 2 (P2, second-sweep-abort review) — a rejected teardown
+          // (e.g. a tunnel stop failing) must not be allowed to throw out of
+          // this loop: an uncaught rejection here would propagate straight
+          // through applyInventorySyncPlan (never called), the vault
+          // re-checks, and the second teardown sweep below, aborting the
+          // whole attempt with no user-facing report. Contain it per id and
+          // keep going. Failures are collected into `teardownFailedIds` — a
+          // Set, not a raw counter, shared with the post-apply sweep below —
+          // so an id that fails teardown in BOTH sweeps (pre-apply here and
+          // the post-apply reconnect-race sweep) is still reported as one
+          // server needing manual attention, not two.
+          const teardownFailedIds = new Set<string>();
           // FINDING 1 — only tear down ids not already torn down by an earlier
           // iteration of this loop (a prior reconfirmation may have already
           // handled some of these).
           for (const id of application.removeServerIds) {
             if (tornDownIds.has(id)) continue;
-            await teardown.teardownServerRuntime(id);
+            try {
+              await teardown.teardownServerRuntime(id);
+            } catch {
+              teardownFailedIds.add(id);
+            }
             tornDownIds.add(id);
           }
 
@@ -1303,8 +1345,38 @@ export function registerInventoryCommands(
           // here — see the finding). The extension's orphan-terminal detection
           // (services/terminal/orphanDetect.ts, run at next activation) is the
           // backstop that surfaces any terminal stranded this way.
+          //
+          // FINDING 1 (P2, second-sweep-abort review) — nexus.server.edit /
+          // nexus.server.rename deliberately don't take configMutationLock,
+          // so a re-add (upsert) of one of these ids can land in the awaited
+          // window between applyInventorySyncPlan committing above and this
+          // loop's iteration for it running. Re-check the server is actually
+          // still absent immediately before tearing it down — mirrors the
+          // credential-cleanup loop right below — otherwise a recreated,
+          // live server's terminals/tunnels/pool connection would be killed
+          // out from under it. Ids skipped this way are folded into the same
+          // `recreatedIds` set the credential-cleanup loop uses, so the final
+          // "N re-created server(s)" report counts each id once even though
+          // both loops can independently notice the same recreation.
+          //
+          // FINDING 2 (P2, second-sweep-abort review) — a rejected teardown
+          // (e.g. a tunnel stop failing) must not be allowed to throw out of
+          // this loop: the deletion has already committed by this point, so
+          // an uncaught rejection here would abort mid-sweep, skipping
+          // teardown for the remaining ids, the pruned-secret cleanup loop
+          // below entirely, and the normal success report. Contain it per id
+          // and add it to the shared `teardownFailedIds` set, then keep going.
+          const recreatedIds = new Set<string>();
           for (const id of applyResult.removedServerIds) {
-            await teardown.teardownServerRuntime(id);
+            if (core.getServer(id) !== undefined) {
+              recreatedIds.add(id);
+              continue;
+            }
+            try {
+              await teardown.teardownServerRuntime(id);
+            } catch {
+              teardownFailedIds.add(id);
+            }
           }
 
           // ITEM 9 — per-key best-effort: one rejected delete must not strand
@@ -1322,10 +1394,9 @@ export function registerInventoryCommands(
           // accepted here; closing it would require generation-specific
           // secret keys, which touches the whole password subsystem and is
           // out of scope.
-          let recreatedCount = 0;
           for (const id of prunedServerIdsForSecretCleanup(finalPlan)) {
             if (core.getServer(id) !== undefined) {
-              recreatedCount++;
+              recreatedIds.add(id);
               continue;
             }
             await deleteSecretBestEffort(vault, passwordSecretKey(id));
@@ -1333,7 +1404,7 @@ export function registerInventoryCommands(
             await deleteSecretBestEffort(vault, proxyPasswordSecretKey(id));
           }
 
-          return { kind: "success", finalPlan, recreatedCount };
+          return { kind: "success", finalPlan, recreatedCount: recreatedIds.size, teardownFailureCount: teardownFailedIds.size };
         });
 
         if (attempt.kind === "abort") return;
@@ -1348,8 +1419,18 @@ export function registerInventoryCommands(
           attempt.recreatedCount > 0
             ? ` ${attempt.recreatedCount} re-created server${attempt.recreatedCount === 1 ? "" : "s"} kept ${attempt.recreatedCount === 1 ? "its" : "their"} credentials.`
             : "";
+        // FINDING 2 (P2, second-sweep-abort review) — surface any teardown
+        // that was contained (not swallowed silently) above.
+        const teardownFailureNote =
+          attempt.teardownFailureCount > 0
+            ? ` Runtime cleanup incomplete for ${attempt.teardownFailureCount} server${
+                attempt.teardownFailureCount === 1 ? "" : "s"
+              } — close ${attempt.teardownFailureCount === 1 ? "its" : "their"} terminal${
+                attempt.teardownFailureCount === 1 ? "" : "s"
+              } manually.`
+            : "";
         void vscode.window.showInformationMessage(
-          `Inventory sync complete: +${finalPlan.adds.length} ~${finalPlan.updates.length} -${deletedCount} (${finalPlan.unchangedCount} unchanged).${recreatedNote}`
+          `Inventory sync complete: +${finalPlan.adds.length} ~${finalPlan.updates.length} -${deletedCount} (${finalPlan.unchangedCount} unchanged).${recreatedNote}${teardownFailureNote}`
         );
         if (finalPlan.warnings.length > 0) {
           void vscode.window
