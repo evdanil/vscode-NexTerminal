@@ -2091,11 +2091,14 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(finalRecord).toBeUndefined();
   });
 
-  it("(FINDING 1, P2) leaves a concurrent rename in place instead of unconditionally restoring the pre-submit record, when that rename commits while the proxy-secret write is still pending", async () => {
+  it("(FINDING 2, P2) merges a concurrent rename onto the pre-submission record instead of leaving the whole rejected submission live, when that rename commits while the proxy-secret write is still pending (kills skip-whole-record: the failed edit's new proxy endpoint must NOT survive)", async () => {
     const { ctx, secretStore } = setupHarness({
       profiles: [],
       activeTunnels: [],
-      servers: [makeServer()],
+      // No proxy configured pre-edit — this is the value the merge must
+      // fall back to for the (untouched-by-the-concurrent-rename) proxy
+      // field once this submission's own write is rejected.
+      servers: [makeServer({ host: "example.com" })],
       initialSecrets: {}
     });
 
@@ -2120,7 +2123,12 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
 
     const submitPromise = options.onSubmit({
       name: "Server 1",
-      host: "example.com",
+      // A new host, distinct from the pre-edit "example.com", so a
+      // successful merge (falling back to liveRecord for fields the
+      // concurrent rename never touched) is distinguishable from a
+      // skip-whole-record implementation (which would leave this
+      // rejected submission's new host live).
+      host: "rejected-edit-host.example.com",
       port: 22,
       username: "dev",
       authType: "password",
@@ -2136,7 +2144,9 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     await delay(10);
 
     // Simulate nexus.server.rename committing while the secret write is
-    // still pending — an unlocked addOrUpdateServer call for the same id.
+    // still pending — an unlocked addOrUpdateServer call for the same id
+    // that only touches `name`, leaving this (about-to-be-rejected)
+    // submission's host/proxy fields as they were.
     const renamed = { ...ctx.core.getServer("srv-1")!, name: "Renamed By Concurrent Command" };
     await ctx.core.addOrUpdateServer(renamed);
 
@@ -2144,15 +2154,117 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
 
     await expect(submitPromise).rejects.toThrow(/changes were not saved/i);
 
-    // Kill check: the pre-fix (unconditional restore) implementation would
-    // call addOrUpdateServer(liveRecord) here regardless of what's
-    // currently live, where liveRecord is the PRE-edit "Server 1" captured
-    // before this submission's own write — erasing the concurrent rename.
-    // This assertion only passes when the rollback recognized the live
-    // record had moved on since this submission's own write and left it
-    // alone.
+    // Kill check 1 (skip-whole-record): a pre-FINDING-2 implementation
+    // detects the divergence (name changed) and skips the record entirely,
+    // leaving THIS rejected submission's host and proxy live even though
+    // its proxy secret write just failed and was rolled back — a
+    // mismatched pair (new proxy endpoint, old/rolled-back secret). The
+    // merge must instead fall both fields back to the pre-submission
+    // liveRecord, since the concurrent rename never touched them.
     const finalRecord = ctx.core.getServer("srv-1");
+    expect(finalRecord?.host).toBe("example.com");
+    expect(finalRecord?.proxy).toBeUndefined();
+
+    // Kill check 2 (wholesale restore): a pre-FINDING-1/2 implementation
+    // that unconditionally restores `liveRecord` on any secret-write
+    // failure would erase the concurrent rename outright. The merge must
+    // keep the concurrently-changed field (name) live.
     expect(finalRecord?.name).toBe("Renamed By Concurrent Command");
+  });
+
+  it("(FINDING 1, P2) captures the written snapshot BEFORE addOrUpdateServer's own persist is issued, so an in-place mutation landing DURING that pending save is not silently baked into the comparison snapshot (kills the post-await clone: a rename committed mid-persist would otherwise be wiped by a wrongful full restore)", async () => {
+    const { ctx, addOrUpdateServer, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ host: "example.com" })],
+      initialSecrets: {}
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Gate addOrUpdateServer's OWN internal persist — mirrors the real
+    // NexusCore.addOrUpdateServer, which installs `updated` into the live
+    // servers map SYNCHRONOUSLY (this.servers.set(next.id, next)) and only
+    // THEN awaits repository.saveServers(...). While that save is still
+    // pending, a concurrent in-place mutator (e.g. _renameFolderPath
+    // rewriting `.group`, or here a rename touching `.name`) can land on
+    // the very same object reference this submission just installed —
+    // before serverCommands.ts ever regains control from
+    // `await ctx.core.addOrUpdateServer(updated)`.
+    const realInstall = addOrUpdateServer.getMockImplementation()!;
+    let resolveAdd!: () => void;
+    let installedRecord: ServerConfig | undefined;
+    addOrUpdateServer.mockImplementationOnce((server: ServerConfig) => {
+      // Run the harness's real (synchronous) install so ctx.core.getServer
+      // genuinely reflects `server` as live from this point on — mirrors
+      // `this.servers.set(next.id, next)` running synchronously before the
+      // real addOrUpdateServer awaits repository.saveServers(...). Only the
+      // PROMISE this mock returns to serverCommands.ts is deferred, standing
+      // in for that still-pending repository write.
+      void realInstall(server);
+      installedRecord = server;
+      return new Promise<void>((resolve) => {
+        resolveAdd = resolve;
+      });
+    });
+
+    const submitPromise = options.onSubmit({
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "socks5",
+      proxySocks5Host: "new-proxy.example.com",
+      proxySocks5Port: 1080,
+      proxySocks5Username: "proxyuser",
+      proxySocks5Password: "new-proxy-pw"
+    });
+
+    // Let onSubmit reach `await ctx.core.addOrUpdateServer(updated)` — the
+    // gated mock above installs the record and then blocks, standing in
+    // for the still-pending repository.saveServers(...) call.
+    await delay(10);
+    expect(installedRecord).toBeDefined();
+
+    // Simulate a concurrent in-place rename landing on the very object this
+    // submission just installed, WHILE addOrUpdateServer's own persist is
+    // still pending — i.e. before serverCommands.ts has captured anything
+    // at all about this generation.
+    installedRecord!.name = "Renamed Mid-Persist";
+
+    // Arm the proxy-secret write to fail once addOrUpdateServer resumes,
+    // then let addOrUpdateServer's pending persist resolve.
+    secretStore.mockRejectedValueOnce(new Error("keychain unavailable"));
+    resolveAdd();
+
+    await expect(submitPromise).rejects.toThrow(/changes were not saved/i);
+
+    // Kill check: a post-await snapshot (`cloneServerConfig(updated)` taken
+    // AFTER `await ctx.core.addOrUpdateServer(updated)` resolves) would
+    // clone the object AFTER the in-place mutation above already landed on
+    // it — its `.name` already reads "Renamed Mid-Persist" at clone time.
+    // That clone then trivially matches the (identically mutated) live
+    // record, so the rollback wrongly concludes "nothing concurrent
+    // touched it since this submission's write" and fully restores the
+    // PRE-edit liveRecord — silently erasing the rename. Capturing the
+    // snapshot BEFORE addOrUpdateServer is ever called means it reflects
+    // only what this submission itself set out to write, so the mutation
+    // is correctly detected as a divergence and the rename survives
+    // (merged in per FINDING 2, keeping this rejected submission's other
+    // fields off the live record).
+    const finalRecord = ctx.core.getServer("srv-1");
+    expect(finalRecord?.name).toBe("Renamed Mid-Persist");
+    // And FINDING 2's merge correctly discarded this now-rejected
+    // submission's proxy write for the field the mutation never touched.
+    expect(finalRecord?.proxy).toBeUndefined();
   });
 
   it("(P2, edit-rollback reference-sharing review) leaves a concurrent IN-PLACE mutation of the live record intact when the submission enabled openFileExplorerOnFirstConnect — comparing against a live shared reference would trivially 'match' any mutation applied to it (kills the shared-reference comparison: reverted to `serverConfigsEqual(currentRecord, updated)`, this test fails)", async () => {

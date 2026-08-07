@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { AuthProfile, AuthType, ProxyConfig, ServerConfig } from "../models/config";
-import { cloneServerConfig, serverConfigsEqual } from "../models/config";
+import { cloneServerConfig, mergeServerConfigFields, serverConfigsEqual } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
@@ -1089,25 +1089,32 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             const displacedOwner = updated.openFileExplorerOnFirstConnect
               ? ctx.core.getSnapshot().servers.find((s) => s.openFileExplorerOnFirstConnect && s.id !== updated.id)
               : undefined;
-            await ctx.core.addOrUpdateServer(updated);
             // FINDING (P2, edit-rollback reference-sharing review) — when
             // `updated` enables openFileExplorerOnFirstConnect,
             // addOrUpdateServer stores `updated` itself into the live
             // servers map (no clone — see its `next = server` branch), so
             // `updated` and ctx.core.getServer(existing.id) become THE SAME
-            // object reference. An in-place mutator running during the
-            // pending secret write below (e.g. _renameFolderPath rewriting
-            // `.group` on whatever object currently sits in the map) then
-            // mutates both comparands at once: the "stillOwnedByThisSubmission"
-            // check a few lines down would stay true no matter what changed,
-            // because it would literally be comparing the live record to
-            // itself. Capture a DETACHED structural snapshot (cloneServerConfig)
-            // of this generation right here, before any such mutation can
-            // reach it, and compare the live record against THAT below —
+            // object reference from the moment addOrUpdateServer's own
+            // synchronous map-set runs — which is BEFORE it awaits the
+            // repository write, i.e. before this call below even returns.
+            // An in-place mutator (e.g. _renameFolderPath rewriting `.group`
+            // on whatever object currently sits in the map) landing during
+            // EITHER that pending persist or the pending secret write further
+            // below would then mutate `updated` itself. Capturing the
+            // DETACHED structural snapshot (cloneServerConfig) AFTER
+            // addOrUpdateServer's await settles is too late — a mutation
+            // that lands during addOrUpdateServer's own pending save is
+            // already baked into the clone, so the "still owned by this
+            // submission" check further below would trivially match no
+            // matter what changed, comparing the live record to a copy of
+            // itself. Capture the snapshot HERE, before the write is even
+            // issued, so it reflects exactly what THIS submission set out to
+            // write and nothing an intervening mutation could have touched —
             // mirroring the same fix already applied in
             // NexusCore.applyInventorySyncPlan (see cloneServerConfig's own
             // doc comment).
             const writtenSnapshot = cloneServerConfig(updated);
+            await ctx.core.addOrUpdateServer(updated);
             try {
               await syncProxyPasswordSecret(ctx, updated.id, values);
             } catch {
@@ -1135,26 +1142,52 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               // still structurally exactly what THIS submission's
               // addOrUpdateServer(updated) call wrote (serverConfigsEqual
               // against `writtenSnapshot`, the DETACHED clone captured
-              // immediately after that write — not the live `updated`
+              // BEFORE that write was even issued — not the live `updated`
               // reference itself, which addOrUpdateServer may have stored
               // verbatim into the servers map when openFileExplorerOnFirstConnect
               // is enabled; comparing against that shared reference would
               // trivially "match" any in-place mutation applied to it in the
               // meantime, e.g. _renameFolderPath rewriting `.group`, and
-              // silently undo a legitimate concurrent change). If it differs
-              // (or the record is gone for a reason other than this
-              // generation's own write), something else already legitimately
-              // changed it — leave it untouched.
+              // silently undo a legitimate concurrent change).
+              //
+              // FINDING 2 (P2, edit-rollback-merge review) — if it differs,
+              // something else already legitimately changed it since this
+              // submission's own write — but that does NOT mean the whole
+              // record should be left untouched. Skipping it wholesale used
+              // to leave every field this now-rejected submission wrote
+              // (e.g. a new proxy host/port) live, paired against whatever
+              // the rollback below restores in the vault — a mismatched
+              // pair. Instead, merge field-wise (mirrors
+              // NexusCore.applyInventorySyncPlan's own rollback merge, see
+              // mergeServerConfigFields' doc comment): a field the
+              // concurrent change actually touched (current differs from
+              // what THIS submission wrote) keeps its current value; every
+              // other field falls back to `liveRecord` (the pre-submission
+              // value), discarding this rejected submission's write for
+              // that field. `liveRecord` undefined means this submission's
+              // own write CREATED the record (no pre-submission state was
+              // captured) — there is nothing to merge the concurrent change
+              // onto, so the concurrently-mutated current record is kept
+              // as-is, matching the same created-record exception in
+              // NexusCore.applyInventorySyncPlan.
               try {
                 const currentRecord = ctx.core.getServer(existing.id);
-                const stillOwnedByThisSubmission = currentRecord !== undefined && serverConfigsEqual(currentRecord, writtenSnapshot);
-                if (stillOwnedByThisSubmission) {
-                  if (liveRecord) {
-                    await ctx.core.addOrUpdateServer(liveRecord);
-                  } else {
-                    await ctx.core.removeServer(existing.id);
+                if (currentRecord !== undefined) {
+                  if (serverConfigsEqual(currentRecord, writtenSnapshot)) {
+                    if (liveRecord) {
+                      await ctx.core.addOrUpdateServer(liveRecord);
+                    } else {
+                      await ctx.core.removeServer(existing.id);
+                    }
+                  } else if (liveRecord) {
+                    await ctx.core.addOrUpdateServer(mergeServerConfigFields(liveRecord, writtenSnapshot, currentRecord));
                   }
+                  // else: created by this submission, then concurrently
+                  // mutated — leave the concurrent mutation as-is.
                 }
+                // else: the record is gone for a reason other than this
+                // generation's own rollback-eligible write (a concurrent
+                // delete) — nothing to restore or merge onto.
               } catch {
                 void vscode.window.showErrorMessage(
                   `Could not restore server "${existing.name}" to its previous settings after a failed save — re-check its record.`
