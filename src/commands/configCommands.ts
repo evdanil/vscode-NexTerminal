@@ -1956,38 +1956,42 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
 
     // FINDING 1 (P2, secrets review) — after the secret-restore phase above, catch the case a
     // rejected vault.store never triggers: a source that imported cleanly, and whose secret
-    // restore raised NO error, but which still ends up with NONE of its declared secretFieldIds
-    // actually present in the vault. Most commonly this is the restore-side mirror of
+    // restore raised NO error, but which still ends up MISSING one or more of its declared
+    // secretFieldIds in the vault. Most commonly this is the restore-side mirror of
     // captureBackupStateForExport's missing-secret counting on the export side — the backup
     // simply never captured the credential (a locked/unavailable keychain at export time), so
     // there was nothing for this restore to store no matter how cleanly the rest of the run
     // went. The source can still be added/edited/synced against, but authentication will fail
     // silently until the value is re-entered — so this is a warning, not a rollback: unlike the
-    // vault.store-rejection rollback above, the record itself is fine, only the secret is
-    // absent, which is exactly the state "Edit Source" exists to fix. Checked against the
-    // vault directly (not the backup payload) so it also catches a backup with no
-    // `inventorySourceSecrets` bucket at all.
+    // vault.store-rejection rollback above, the record itself is fine, only (part of) the
+    // secret is absent, which is exactly the state "Edit Source" exists to fix. Checked against
+    // the vault directly (not the backup payload) so it also catches a backup with no
+    // `inventorySourceSecrets` bucket at all. FINDING (P2, round-19 review): a provider can
+    // declare MULTIPLE secretFieldIds — checking only whether ANY of them made it into the
+    // vault let one present field mask another absent (possibly required) one, so a source
+    // that can't actually authenticate was reported as a clean import. Every declared field is
+    // now checked; the warning fires if ANY are missing, not only when ALL are.
     const sourcesRestoredWithoutCredentials: string[] = [];
     for (const sourceId of importedSourceIds) {
       if (rolledBackSourceIds.has(sourceId)) continue;
       const importedSource = importedSourceById.get(sourceId);
       const declaredFieldIds = importedSource?.secretFieldIds ?? [];
       if (declaredFieldIds.length === 0) continue;
-      let hasStoredValue = false;
+      let hasMissingValue = false;
       for (const fieldId of declaredFieldIds) {
         const value = await vault.get(inventorySecretKey(sourceId, fieldId));
-        if (value) {
-          hasStoredValue = true;
+        if (!value) {
+          hasMissingValue = true;
           break;
         }
       }
-      if (!hasStoredValue) sourcesRestoredWithoutCredentials.push(importedSource?.name ?? sourceId);
+      if (hasMissingValue) sourcesRestoredWithoutCredentials.push(importedSource?.name ?? sourceId);
     }
     if (sourcesRestoredWithoutCredentials.length > 0) {
       const isSingle = sourcesRestoredWithoutCredentials.length === 1;
       const names = sourcesRestoredWithoutCredentials.map((n) => `"${n}"`).join(", ");
       void vscode.window.showWarningMessage(
-        `${isSingle ? "Source" : "Sources"} ${names} ${isSingle ? "was" : "were"} restored without credentials — re-enter them via Edit Source before syncing.`
+        `${isSingle ? "Source" : "Sources"} ${names} ${isSingle ? "was" : "were"} restored with missing credential(s) — re-enter them via Edit Source before syncing.`
       );
     }
 

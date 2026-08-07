@@ -5346,7 +5346,113 @@ describe("backup export round-trip", () => {
     // post-restore vault check) would leave this source's missing credential completely
     // unsurfaced, reporting only a clean successful import.
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
-      'Source "NetBox" was restored without credentials — re-enter them via Edit Source before syncing.'
+      'Source "NetBox" was restored with missing credential(s) — re-enter them via Edit Source before syncing.'
     );
+  });
+
+  it("FINDING (P2, round-19 review) — a source declaring multiple secretFieldIds warns when only SOME of them made it into the vault (kills the any-present-suppresses-warning bug: one stored field used to mask another missing one)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    const vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // Backup carries a stored value for "apiToken" but nothing for "apiSecret" — the source
+    // declares BOTH as required secret fields.
+    const secrets = {
+      inventorySourceSecrets: {
+        src1: { apiToken: "token-value" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [
+        makeInventorySource({ id: "src1", name: "NetBox", secretFieldIds: ["apiToken", "apiSecret"] })
+      ],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")?.name).toBe("NetBox");
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("token-value");
+    expect(await vault.get(inventorySecretKey("src1", "apiSecret"))).toBeUndefined();
+
+    // A reverted fix (warn only when ALL declared fields are absent) would see apiToken
+    // present and stay silent — this exact call is only made when the partial-miss case is
+    // also caught.
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Source "NetBox" was restored with missing credential(s) — re-enter them via Edit Source before syncing.'
+    );
+  });
+
+  it("FINDING (P2, round-19 review) — a source declaring multiple secretFieldIds does NOT warn when ALL of them are present (guards against over-warning on a clean multi-field restore)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    const vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    const secrets = {
+      inventorySourceSecrets: {
+        src1: { apiToken: "token-value", apiSecret: "secret-value" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [
+        makeInventorySource({ id: "src1", name: "NetBox", secretFieldIds: ["apiToken", "apiSecret"] })
+      ],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")?.name).toBe("NetBox");
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("token-value");
+    expect(await vault.get(inventorySecretKey("src1", "apiSecret"))).toBe("secret-value");
+
+    const missingCredentialWarnings = mockShowWarningMessage.mock.calls.filter(([msg]) =>
+      typeof msg === "string" && msg.includes("missing credential")
+    );
+    expect(missingCredentialWarnings).toHaveLength(0);
   });
 });
