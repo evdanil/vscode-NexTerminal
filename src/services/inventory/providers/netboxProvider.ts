@@ -285,11 +285,22 @@ async function fetchAllPages(
     // [row1, row2]} silently read as a complete 2-device inventory. Guarded
     // against the *legitimate* hard-cap path: if the hard cap is what's
     // actually going to limit how many of this page's rows get collected
-    // (capAllowance <= count), the shortfall is explained by the cap, not by
-    // the server over-reporting, so no error.
+    // (capAllowance < count — strictly less), the shortfall is explained by
+    // the cap, not by the server over-reporting, so no error.
+    //
+    // capAllowance === count is NOT part of that exception: it means the
+    // remaining budget matches the reported count exactly (the server
+    // legitimately has no more than we can take), so any row beyond `count`
+    // on this page is unexplained by the cap — the server is reporting a
+    // count it then contradicts with an overrun page. That must be rejected
+    // the same as the capAllowance > count case, or the extra row is
+    // silently dropped by the inner collection loop below, capState.capped
+    // ends up true, and reportedTotal lands exactly at HARD_CAP — which
+    // fetchInventoryImpl reads as a non-truncated tree, re-enabling pruning
+    // while the dropped row's server is still real.
     const capAllowance = collected.length + capState.remaining;
     const projectedTotal = collected.length + page.results.length;
-    if (capAllowance > count && projectedTotal > count) {
+    if (capAllowance >= count && projectedTotal > count) {
       throw new InventoryProviderError(
         "protocol",
         `NetBox reported count ${count} for ${baseUrl}${path} but the page at offset ${offset} carries ${page.results.length} row(s), which would bring the collected total to ${projectedTotal} — aborting rather than accepting an inventory larger than reported.`

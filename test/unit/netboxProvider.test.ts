@@ -206,6 +206,39 @@ describe("createNetboxProvider", () => {
       expect(tree.warnings.some((w) => w.toLowerCase().includes("truncat"))).toBe(false);
     });
 
+    it("FINDING (P2) — count exactly equal to the hard cap (10,000) but pages carrying 10,001 rows is rejected as a protocol error, not silently clipped as a legitimate cap hit (kills capAllowance > count instead of >=)", async () => {
+      // Reported count is exactly HARD_CAP (10,000), so capAllowance (== 10,000,
+      // since nothing else has consumed the budget yet) equals count exactly.
+      // The old `capAllowance > count` guard treated equality as "the cap
+      // legitimately explains any shortfall" and let the loop silently drop the
+      // 10,001st row instead of raising a protocol error — that row could be a
+      // real, still-owned server. The last page here carries one extra row
+      // (251 instead of 250) so the running total reaches 10,001 while count
+      // says 10,000: an overrun that must fail loudly regardless of proximity
+      // to the cap.
+      const total = 10_000;
+      const fetchImpl = vi.fn(async (url: string) => {
+        const offset = Number(new URL(url).searchParams.get("offset"));
+        const remaining = total - offset;
+        // Every page is a normal 250 except the very last one, which is
+        // oversized by one row — pushing the collected total to 10,001 across
+        // pages while `count` is pinned at 10,000 throughout.
+        const pageSize = remaining <= 250 ? remaining + 1 : 250;
+        const results = Array.from({ length: pageSize }, (_, i) => ({
+          id: offset + i + 1,
+          name: `d${offset + i}`,
+          primary_ip: { address: "10.0.0.1/24" }
+        }));
+        return makeResponse(200, { count: total, results });
+      });
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({
+        kind: "protocol",
+        message: expect.stringMatching(/10000/)
+      });
+    });
+
     it("F2 — a server that clamps our requested limit=250 down to 100 items per page still completes the fetch (kills a fixed-iteration bound sized for 250-item pages)", async () => {
       // The server "clamps" our requested limit=250 down to 100 items per page.
       // A fixed bound tuned to 250-item pages (41 iterations = 4100 items) could
