@@ -9,6 +9,7 @@ import { configMutationLock } from "../../src/services/configMutationLock";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
+import type { FormDefinition, FormValues } from "../../src/ui/formTypes";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
@@ -19,6 +20,7 @@ const mockShowErrorMessage = vi.fn();
 const mockExecuteCommand = vi.fn();
 const mockOpenTextDocument = vi.fn();
 const mockShowTextDocument = vi.fn();
+const mockWebviewOpen = vi.fn();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -42,6 +44,64 @@ vi.mock("vscode", () => ({
   },
   ProgressLocation: { Notification: 15 }
 }));
+
+// Mirrors profileCommands.test.ts's idiom for driving a WebviewFormPanel-based
+// command: capture the (formId, definition, options) triple WebviewFormPanel.open
+// was called with, and invoke onSubmit/onTest directly rather than going through
+// a real webview. The fake panel returned here supports onDidDispose so
+// editSource's in-flight-guard release (fired on both successful submit and
+// Cancel in the real WebviewFormPanel) can be exercised/verified by tests that
+// care about it.
+vi.mock("../../src/ui/webviewFormPanel", () => ({
+  WebviewFormPanel: {
+    open: (...args: unknown[]) => mockWebviewOpen(...args)
+  }
+}));
+
+interface FakePanel {
+  dispose: ReturnType<typeof vi.fn>;
+  onDidDispose: ReturnType<typeof vi.fn>;
+  addSelectOption: ReturnType<typeof vi.fn>;
+  fireDispose: () => void;
+}
+
+function makeFakePanel(): FakePanel {
+  const listeners: Array<() => void> = [];
+  return {
+    dispose: vi.fn(),
+    onDidDispose: vi.fn((listener: () => void) => {
+      listeners.push(listener);
+      return { dispose: vi.fn() };
+    }),
+    addSelectOption: vi.fn(),
+    fireDispose: () => {
+      for (const listener of listeners) listener();
+    }
+  };
+}
+
+function latestFormCall(): {
+  formId: string;
+  definition: FormDefinition;
+  panel: FakePanel;
+  onSubmit: (values: FormValues) => Promise<void>;
+  onTest?: (values: FormValues) => Promise<void>;
+} {
+  const call = mockWebviewOpen.mock.results.at(-1);
+  const callArgs = mockWebviewOpen.mock.calls.at(-1);
+  expect(callArgs).toBeDefined();
+  const handlers = callArgs![2] as {
+    onSubmit: (values: FormValues) => Promise<void>;
+    onTest?: (values: FormValues) => Promise<void>;
+  };
+  return {
+    formId: callArgs![0] as string,
+    definition: callArgs![1] as FormDefinition,
+    panel: call!.value as FakePanel,
+    onSubmit: handlers.onSubmit,
+    onTest: handlers.onTest
+  };
+}
 
 function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProvider {
   return {
@@ -111,6 +171,7 @@ describe("inventoryCommands", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+    mockWebviewOpen.mockImplementation(() => makeFakePanel());
   });
 
   describe("nexus.inventory.addSource", () => {
@@ -123,17 +184,19 @@ describe("inventoryCommands", () => {
       const vault = makeVault();
       registerInventoryCommands(core, registry, vault, makeTeardown());
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My NetBox") // name
-        .mockResolvedValueOnce("Infra") // target folder
-        .mockResolvedValueOnce("admin") // default username
-        .mockResolvedValueOnce("netbox.local") // host field
-        .mockResolvedValueOnce("secret-token"); // apiToken field
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" }); // prune policy
-      mockShowInformationMessage.mockResolvedValueOnce(undefined); // no "Sync Now" click
-
       const cmd = registeredCommands.get("nexus.inventory.addSource")!;
-      await cmd();
+      await cmd(); // single provider -> promptProviderPick auto-skips the picker and opens the form directly
+
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        host: "netbox.local",
+        apiToken: "secret-token"
+      });
+
       return { core, vault, provider };
     }
 
@@ -151,37 +214,42 @@ describe("inventoryCommands", () => {
       expect(await vault.get(inventorySecretKey(source.id, "apiToken"))).toBe("secret-token");
     });
 
-    it("testConnection failure + Save Anyway persists the source and its secrets", async () => {
-      const core = new NexusCore(new InMemoryConfigRepository());
-      await core.initialize();
-      const registry = new InventoryProviderRegistry();
-      const provider = makeProvider({
-        testConnection: vi.fn(async () => {
-          throw new Error("boom");
-        })
-      });
-      registry.register(provider);
-      const vault = makeVault();
-      registerInventoryCommands(core, registry, vault, makeTeardown());
-
-      mockShowInputBox
-        .mockResolvedValueOnce("My NetBox")
-        .mockResolvedValueOnce("Infra")
-        .mockResolvedValueOnce("admin")
-        .mockResolvedValueOnce("netbox.local")
-        .mockResolvedValueOnce("secret-token");
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-      mockShowErrorMessage.mockResolvedValueOnce("Save Anyway");
-      mockShowInformationMessage.mockResolvedValueOnce(undefined);
-
-      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
-      await cmd();
+    it("Save persists the source WITHOUT ever calling provider.testConnection — Test is voluntary and no longer gates Save (kills the old forced-test-before-save / Save Anyway prompt)", async () => {
+      const { core, provider } = await runAddSourceHappyPath();
 
       expect(core.getSnapshot().inventorySources).toHaveLength(1);
-      expect(vault.store).toHaveBeenCalled();
+      expect(provider.testConnection).not.toHaveBeenCalled();
     });
 
-    it("testConnection failure + Cancel persists nothing and leaves the vault empty (kills saving before the gate)", async () => {
+    it("the Test button invokes provider.testConnection with the form's current field values (including secrets), independent of Save (kills wiring the button to nothing / to the wrong values)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+      const { onTest } = latestFormCall();
+      expect(onTest).toBeDefined();
+
+      await onTest!({
+        name: "My NetBox",
+        targetFolder: "",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        host: "netbox.local",
+        apiToken: "secret-token"
+      });
+
+      expect(provider.testConnection).toHaveBeenCalledWith({ host: "netbox.local" }, { apiToken: "secret-token" });
+      // Testing alone must never persist anything.
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+    });
+
+    it("a Test button failure is reported and persists nothing — no Save Anyway gate exists anymore", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
@@ -194,20 +262,130 @@ describe("inventoryCommands", () => {
       const vault = makeVault();
       registerInventoryCommands(core, registry, vault, makeTeardown());
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My NetBox")
-        .mockResolvedValueOnce("Infra")
-        .mockResolvedValueOnce("admin")
-        .mockResolvedValueOnce("netbox.local")
-        .mockResolvedValueOnce("secret-token");
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-      mockShowErrorMessage.mockResolvedValueOnce("Cancel");
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+      const { onTest } = latestFormCall();
+
+      await onTest!({
+        name: "My NetBox",
+        targetFolder: "",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        host: "netbox.local",
+        apiToken: "secret-token"
+      });
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("boom"));
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+    });
+
+    it("field mapping — provider configFields map to the matching form field type: string->text, password->password, number->number, boolean->checkbox", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "apiToken", label: "API Token", type: "password", required: true },
+          { id: "port", label: "Port", type: "number", required: false },
+          { id: "verifyTls", label: "Verify TLS", type: "boolean", required: false }
+        ]
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
 
       const cmd = registeredCommands.get("nexus.inventory.addSource")!;
       await cmd();
+      const { definition } = latestFormCall();
+
+      const byKey = (key: string) => definition.fields.find((f) => "key" in f && f.key === key);
+      expect(byKey("host")).toEqual(expect.objectContaining({ type: "text" }));
+      expect(byKey("apiToken")).toEqual(expect.objectContaining({ type: "password" }));
+      expect(byKey("port")).toEqual(expect.objectContaining({ type: "number" }));
+      expect(byKey("verifyTls")).toEqual(expect.objectContaining({ type: "checkbox" }));
+    });
+
+    it("titles the form with the provider label and prefills Default SSH Username with mostCommonUsername", async () => {
+      const owned = [
+        makeServer({ id: "s1", username: "opsuser" }),
+        makeServer({ id: "s2", username: "opsuser" }),
+        makeServer({ id: "s3", username: "other" })
+      ];
+      const core = new NexusCore(new InMemoryConfigRepository(owned));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({ label: "NetBox" });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+      const { definition } = latestFormCall();
+
+      expect(definition.title).toBe("Add Inventory Source (NetBox)");
+      const usernameField = definition.fields.find((f) => "key" in f && f.key === "defaultUsername");
+      expect(usernameField).toEqual(expect.objectContaining({ value: "opsuser" }));
+    });
+
+    it("required-field validation — a missing required provider field rejects onSubmit and persists nothing (defense-in-depth behind the form's own HTML `required` attribute, kills silently persisting an incomplete source)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+      const { onSubmit } = latestFormCall();
+
+      await expect(
+        onSubmit({
+          name: "My NetBox",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          host: "",
+          apiToken: "secret-token"
+        })
+      ).rejects.toThrow(/Host is required/);
 
       expect(core.getSnapshot().inventorySources).toHaveLength(0);
       expect(vault.store).not.toHaveBeenCalled();
+    });
+
+    it("top-level target folder — declining the confirmation leaves the source unsaved; confirming with Continue saves it at the top level (kills silently skipping the confirmation)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+      const { onSubmit } = latestFormCall();
+
+      const values: FormValues = {
+        name: "My NetBox",
+        targetFolder: "",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        host: "netbox.local",
+        apiToken: "secret-token"
+      };
+
+      mockShowWarningMessage.mockResolvedValueOnce(undefined); // declined
+      await expect(onSubmit(values)).rejects.toThrow(/Enter a target folder/);
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+      await onSubmit(values);
+      expect(core.getSnapshot().inventorySources[0].targetFolder).toBe("");
     });
 
     it("FINDING 2 — an optional password field left blank is omitted from secretFieldIds and never written to the vault (kills recording every password field regardless of whether it was stored)", async () => {
@@ -225,18 +403,18 @@ describe("inventoryCommands", () => {
       const vault = makeVault();
       registerInventoryCommands(core, registry, vault, makeTeardown());
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My NetBox") // name
-        .mockResolvedValueOnce("Infra") // target folder
-        .mockResolvedValueOnce("admin") // default username
-        .mockResolvedValueOnce("netbox.local") // host field
-        .mockResolvedValueOnce("secret-token") // apiToken field
-        .mockResolvedValueOnce(""); // extraToken left blank (optional)
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-      mockShowInformationMessage.mockResolvedValueOnce(undefined);
-
       const cmd = registeredCommands.get("nexus.inventory.addSource")!;
       await cmd();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        host: "netbox.local",
+        apiToken: "secret-token",
+        extraToken: "" // left blank (optional)
+      });
 
       const source = core.getSnapshot().inventorySources[0];
       expect(source.secretFieldIds).toEqual(["apiToken"]);
@@ -258,19 +436,22 @@ describe("inventoryCommands", () => {
       };
       registerInventoryCommands(core, registry, vault, makeTeardown());
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My NetBox")
-        .mockResolvedValueOnce("Infra")
-        .mockResolvedValueOnce("admin")
-        .mockResolvedValueOnce("netbox.local")
-        .mockResolvedValueOnce("secret-token");
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-
       const cmd = registeredCommands.get("nexus.inventory.addSource")!;
       await cmd();
+      const { onSubmit } = latestFormCall();
+
+      await expect(
+        onSubmit({
+          name: "My NetBox",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          host: "netbox.local",
+          apiToken: "secret-token"
+        })
+      ).rejects.toThrow(/keychain/);
 
       expect(core.getSnapshot().inventorySources).toHaveLength(0);
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("keychain"));
     });
 
     it("FINDING 1 — core.addOrUpdateInventorySource rejecting after secrets were stored rolls back the vault keys just written (kills orphaned inventory-source-* secrets)", async () => {
@@ -282,19 +463,22 @@ describe("inventoryCommands", () => {
       const vault = makeVault();
       registerInventoryCommands(core, registry, vault, makeTeardown());
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My NetBox")
-        .mockResolvedValueOnce("Infra")
-        .mockResolvedValueOnce("admin")
-        .mockResolvedValueOnce("netbox.local")
-        .mockResolvedValueOnce("secret-token");
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-
       const cmd = registeredCommands.get("nexus.inventory.addSource")!;
       await cmd();
+      const { onSubmit } = latestFormCall();
+
+      await expect(
+        onSubmit({
+          name: "My NetBox",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          host: "netbox.local",
+          apiToken: "secret-token"
+        })
+      ).rejects.toThrow(/was not created/);
 
       expect(core.getSnapshot().inventorySources).toHaveLength(0);
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("was not created"));
 
       // The key stored during this run must have been deleted again — no
       // inventory-source-* key survives for a source that was never created.
@@ -333,20 +517,25 @@ describe("inventoryCommands", () => {
       };
       registerInventoryCommands(core, registry, vault, makeTeardown());
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My NetBox") // name
-        .mockResolvedValueOnce("Infra") // targetFolder
-        .mockResolvedValueOnce("admin") // defaultUsername
-        .mockResolvedValueOnce("netbox.local") // host
-        .mockResolvedValueOnce("value1") // field1 -> store succeeds (call 1)
-        .mockResolvedValueOnce("value2"); // field2 -> store rejects (call 2)
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-
       const cmd = registeredCommands.get("nexus.inventory.addSource")!;
       await cmd();
+      const { onSubmit } = latestFormCall();
+
+      // field1's store succeeds (call 1), field2's store rejects (call 2) —
+      // provider.configFields order drives the store loop's iteration order.
+      await expect(
+        onSubmit({
+          name: "My NetBox",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          host: "netbox.local",
+          field1: "value1",
+          field2: "value2"
+        })
+      ).rejects.toThrow(/keychain/);
 
       expect(core.getSnapshot().inventorySources).toHaveLength(0);
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("keychain"));
 
       // If the fix were reverted (catch returns without deleting earlier
       // keys), field1's key would still be present here even though the
@@ -356,46 +545,7 @@ describe("inventoryCommands", () => {
       expect(backingStore.size).toBe(0);
     });
 
-    it("wizard step numbering — a single registered provider auto-skips the picker, so the Name prompt is step 1 of a total that omits the invisible provider step (kills always-count-provider-step)", async () => {
-      const core = new NexusCore(new InMemoryConfigRepository());
-      await core.initialize();
-      const registry = new InventoryProviderRegistry();
-      registry.register(makeProvider()); // exactly one provider -> promptProviderPick auto-selects without showing a QuickPick
-      const vault = makeVault();
-      registerInventoryCommands(core, registry, vault, makeTeardown());
-
-      mockShowInputBox
-        .mockResolvedValueOnce("My NetBox") // name
-        .mockResolvedValueOnce("Infra") // target folder
-        .mockResolvedValueOnce("admin") // default username
-        .mockResolvedValueOnce("netbox.local") // host field
-        .mockResolvedValueOnce("secret-token"); // apiToken field
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" }); // prune policy
-      mockShowInformationMessage.mockResolvedValueOnce(undefined);
-
-      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
-      await cmd();
-
-      // The provider picker itself must never have been shown.
-      expect(mockShowQuickPick).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ title: "Select Inventory Provider" }));
-
-      // 4 fixed steps (Name/Folder/Username/Prune-Policy) + 2 provider config
-      // fields (host, apiToken) = 6 total. Under the reverted (buggy)
-      // implementation the provider pick is always counted, so this same
-      // sequence would produce "(2/7)" here instead — this assertion fails
-      // against that wrong implementation.
-      const [nameCallArgs] = mockShowInputBox.mock.calls[0];
-      expect((nameCallArgs as { title: string }).title).toContain("(1/6)");
-      expect((nameCallArgs as { title: string }).title).not.toContain("(2/");
-
-      const [hostCallArgs] = mockShowInputBox.mock.calls[3];
-      expect((hostCallArgs as { title: string }).title).toContain("(5/6)");
-
-      const [apiTokenCallArgs] = mockShowInputBox.mock.calls[4];
-      expect((apiTokenCallArgs as { title: string }).title).toContain("(6/6)");
-    });
-
-    it("wizard step numbering — two registered providers show the picker as the invisible step 1, bumping the total by one relative to the single-provider case", async () => {
+    it("multiple registered providers show the provider picker first; picking one opens that provider's form", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
@@ -406,91 +556,19 @@ describe("inventoryCommands", () => {
       const vault = makeVault();
       registerInventoryCommands(core, registry, vault, makeTeardown());
 
-      mockShowQuickPick
-        .mockResolvedValueOnce({ label: providerA.label, provider: providerA }) // provider pick (occupies step 1)
-        .mockResolvedValueOnce({ value: "orphan" }); // prune policy
-      mockShowInputBox
-        .mockResolvedValueOnce("My NetBox") // name
-        .mockResolvedValueOnce("Infra") // target folder
-        .mockResolvedValueOnce("admin") // default username
-        .mockResolvedValueOnce("netbox.local") // host field
-        .mockResolvedValueOnce("secret-token"); // apiToken field
-      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+      mockShowQuickPick.mockResolvedValueOnce({ label: providerA.label, provider: providerA });
 
       const cmd = registeredCommands.get("nexus.inventory.addSource")!;
       await cmd();
 
-      // providerA and providerB both use makeProvider's default 2-field
-      // schema, so the total (7) is unambiguous before the pick happens and
-      // the picker itself is honestly labeled step 1 of that same total —
-      // not left as a bare, unnumbered title while the very next prompt says
-      // "(2/7)". Under the reverted (buggy) implementation the picker's
-      // title stays exactly "Select Inventory Provider" with no step label,
-      // so this assertion fails against that wrong implementation.
-      const providerPickCall = mockShowQuickPick.mock.calls[0];
-      expect(providerPickCall[1]).toEqual(expect.objectContaining({ title: "Select Inventory Provider (1/7)" }));
-
-      // Provider pick was actually shown -> it counts as step 1, Name is step
-      // 2, and the total (7) is one higher than the single-provider case's
-      // total (6).
-      const [nameCallArgs] = mockShowInputBox.mock.calls[0];
-      expect((nameCallArgs as { title: string }).title).toContain("(2/7)");
-
-      const [apiTokenCallArgs] = mockShowInputBox.mock.calls[4];
-      expect((apiTokenCallArgs as { title: string }).title).toContain("(7/7)");
-    });
-
-    it("wizard step numbering — providers with different config field counts leave the total ambiguous before the pick, so the picker is labeled a bare step 1 instead of a bogus total (kills a wrong-but-confident total)", async () => {
-      const core = new NexusCore(new InMemoryConfigRepository());
-      await core.initialize();
-      const registry = new InventoryProviderRegistry();
-      const providerA = makeProvider({ id: "fake-a", label: "Provider A" }); // 2 config fields
-      const providerB = makeProvider({
-        id: "fake-b",
-        label: "Provider B",
-        configFields: [
-          { id: "host", label: "Host", type: "string", required: true },
-          { id: "apiToken", label: "API Token", type: "password", required: true },
-          { id: "extra", label: "Extra", type: "string", required: false }
-        ]
-      }); // 3 config fields
-      registry.register(providerA);
-      registry.register(providerB);
-      const vault = makeVault();
-      registerInventoryCommands(core, registry, vault, makeTeardown());
-
-      mockShowQuickPick
-        .mockResolvedValueOnce({ label: providerA.label, provider: providerA }) // provider pick
-        .mockResolvedValueOnce({ value: "orphan" }); // prune policy
-      mockShowInputBox
-        .mockResolvedValueOnce("My NetBox") // name
-        .mockResolvedValueOnce("Infra") // target folder
-        .mockResolvedValueOnce("admin") // default username
-        .mockResolvedValueOnce("netbox.local") // host field
-        .mockResolvedValueOnce("secret-token"); // apiToken field
-      mockShowInformationMessage.mockResolvedValueOnce(undefined);
-
-      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
-      await cmd();
-
-      // providerA (2 fields) and providerB (3 fields) disagree on total step
-      // count, and which one the user picks isn't known when the picker's
-      // title is built — so it must not print a total that could be wrong
-      // for whichever provider actually gets chosen (here providerA -> 7,
-      // but providerB would have been 8).
-      const providerPickCall = mockShowQuickPick.mock.calls[0];
-      expect(providerPickCall[1]).toEqual(expect.objectContaining({ title: "Select Inventory Provider (Step 1)" }));
-      expect((providerPickCall[1] as { title: string }).title).not.toMatch(/\(1\/\d+\)/);
-
-      // The rest of the wizard is unaffected — Name still starts at step 2
-      // of the total for the provider actually chosen (providerA -> 7).
-      const [nameCallArgs] = mockShowInputBox.mock.calls[0];
-      expect((nameCallArgs as { title: string }).title).toContain("(2/7)");
+      expect(mockShowQuickPick).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ title: "Select Inventory Provider" }));
+      const { definition } = latestFormCall();
+      expect(definition.title).toBe("Add Inventory Source (Provider A)");
     });
   });
 
   describe("nexus.inventory.editSource", () => {
-    it("F7 — a blank secret field keeps the previously saved vault value AND hydrates it into the testConnection call (kills blank overwriting the token)", async () => {
+    it("F7 — a blank secret field keeps the previously saved vault value on Save, AND the Test button hydrates it from the vault before calling testConnection (kills blank overwriting the token)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
@@ -501,19 +579,120 @@ describe("inventoryCommands", () => {
       await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", config: { host: "netbox.local" }, secretFieldIds: ["apiToken"] }));
       await vault.store(inventorySecretKey("src-1", "apiToken"), "old-token");
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My Source") // name
-        .mockResolvedValueOnce("Infra") // targetFolder
-        .mockResolvedValueOnce("admin") // defaultUsername
-        .mockResolvedValueOnce("netbox.local") // host
-        .mockResolvedValueOnce(""); // apiToken left blank -> keep saved value
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd(); // exactly one source -> pickInventorySource auto-selects it
+      const { onSubmit, onTest } = latestFormCall();
+
+      const values: FormValues = {
+        name: "My Source",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        host: "netbox.local",
+        apiToken: "" // left blank -> keep saved value
+      };
+
+      await onTest!(values);
+      expect(provider.testConnection).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ apiToken: "old-token" }));
+
+      await onSubmit(values);
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("old-token");
+    });
+
+    it("edit form prefill — Name/Target Folder/Default Username/Prune Policy and provider config fields are prefilled from the source; a saved password field is optional with a 'keep' placeholder (kills a blank-slate edit form)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({
+          name: "My NetBox",
+          targetFolder: "Infra",
+          defaultUsername: "opsuser",
+          prunePolicy: "delete",
+          config: { host: "netbox.local" },
+          secretFieldIds: ["apiToken"]
+        })
+      );
 
       const cmd = registeredCommands.get("nexus.inventory.editSource")!;
       await cmd();
+      const { definition } = latestFormCall();
 
-      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("old-token");
-      expect(provider.testConnection).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ apiToken: "old-token" }));
+      expect(definition.title).toBe("Edit Inventory Source (Fake Provider)");
+      const byKey = (key: string) => definition.fields.find((f) => "key" in f && f.key === key);
+      expect(byKey("name")).toEqual(expect.objectContaining({ value: "My NetBox" }));
+      expect(byKey("targetFolder")).toEqual(expect.objectContaining({ value: "Infra" }));
+      expect(byKey("defaultUsername")).toEqual(expect.objectContaining({ value: "opsuser" }));
+      expect(byKey("prunePolicy")).toEqual(expect.objectContaining({ value: "delete" }));
+      expect(byKey("host")).toEqual(expect.objectContaining({ type: "text", value: "netbox.local" }));
+      expect(byKey("apiToken")).toEqual(
+        expect.objectContaining({ type: "password", required: false, placeholder: "Leave empty to keep the saved value" })
+      );
+    });
+
+    it("in-flight guard — editSource marks the source busy while the form is open and releases it when the form closes, whether by Save or Cancel (kills leaking the busy flag / never marking it busy at all)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd();
+      const { panel } = latestFormCall();
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
+
+      // A second edit attempt while the first form is still open must refuse
+      // — the wrong implementation (no busy flag while the form is open)
+      // would open a second form here instead.
+      await cmd();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
+
+      // Closing the form (Cancel, or WebviewFormPanel's own post-submit
+      // dispose) releases the guard — the wrong implementation (no
+      // onDidDispose release wiring) would still refuse here.
+      panel.fireDispose();
+      mockShowWarningMessage.mockClear();
+      await cmd();
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(2);
+    });
+
+    it("required-field validation — a missing required field rejects onSubmit and persists nothing", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", config: { host: "netbox.local" }, secretFieldIds: ["apiToken"] }));
+      await vault.store(inventorySecretKey("src-1", "apiToken"), "old-token");
+
+      const cmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await cmd();
+      const { onSubmit } = latestFormCall();
+
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          defaultUsername: "", // blank
+          prunePolicy: "orphan",
+          host: "netbox.local",
+          apiToken: ""
+        })
+      ).rejects.toThrow(/Default SSH Username is required/);
+
+      expect(core.getInventorySource("src-1")?.defaultUsername).toBe("admin");
     });
 
     it("FINDING 3 — a vault key whose password field was dropped from the provider schema is deleted at save time; a still-schema-valid kept secret survives (kills orphaning stale vault entries)", async () => {
@@ -531,16 +710,17 @@ describe("inventoryCommands", () => {
       await vault.store(inventorySecretKey("src-1", "apiToken"), "old-token");
       await vault.store(inventorySecretKey("src-1", "extra"), "leftover-token");
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My Source") // name
-        .mockResolvedValueOnce("Infra") // targetFolder
-        .mockResolvedValueOnce("admin") // defaultUsername
-        .mockResolvedValueOnce("netbox.local") // host
-        .mockResolvedValueOnce(""); // apiToken left blank -> keep saved value
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-
       const cmd = registeredCommands.get("nexus.inventory.editSource")!;
       await cmd();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        host: "netbox.local",
+        apiToken: "" // left blank -> keep saved value
+      });
 
       expect(await vault.get(inventorySecretKey("src-1", "extra"))).toBeUndefined();
       expect(vault.delete).toHaveBeenCalledWith(inventorySecretKey("src-1", "extra"));
@@ -574,19 +754,21 @@ describe("inventoryCommands", () => {
 
       vi.spyOn(core, "addOrUpdateInventorySource").mockRejectedValueOnce(new Error("disk full"));
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My Source") // name
-        .mockResolvedValueOnce("Infra") // targetFolder
-        .mockResolvedValueOnce("admin") // defaultUsername
-        .mockResolvedValueOnce("netbox.local") // host
-        .mockResolvedValueOnce("") // apiToken left blank -> keep saved value
-        .mockResolvedValueOnce("new-extra"); // extraToken: brand-new secret this run
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-
       const cmd = registeredCommands.get("nexus.inventory.editSource")!;
       await cmd();
+      const { onSubmit } = latestFormCall();
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("was not applied"));
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          host: "netbox.local",
+          apiToken: "", // left blank -> keep saved value
+          extraToken: "new-extra" // brand-new secret this run
+        })
+      ).rejects.toThrow(/was not applied/);
 
       // Persist failed -> the source record (and its secretFieldIds) must be unchanged.
       expect(core.getInventorySource("src-1")?.secretFieldIds).toEqual(["apiToken", "legacyToken"]);
@@ -615,18 +797,20 @@ describe("inventoryCommands", () => {
 
       vi.spyOn(core, "addOrUpdateInventorySource").mockRejectedValueOnce(new Error("disk full"));
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My Source") // name
-        .mockResolvedValueOnce("Infra") // targetFolder
-        .mockResolvedValueOnce("admin") // defaultUsername
-        .mockResolvedValueOnce("netbox.local") // host
-        .mockResolvedValueOnce("new-tok"); // apiToken RE-ENTERED — overwrites the old value
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-
       const cmd = registeredCommands.get("nexus.inventory.editSource")!;
       await cmd();
+      const { onSubmit } = latestFormCall();
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("was not applied"));
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          host: "netbox.local",
+          apiToken: "new-tok" // RE-ENTERED — overwrites the old value
+        })
+      ).rejects.toThrow(/was not applied/);
 
       // If the fix were reverted (rollback only deletes newly-ADDED keys),
       // apiToken — which already existed before this edit — would be left at
@@ -652,18 +836,20 @@ describe("inventoryCommands", () => {
 
       vi.spyOn(core, "addOrUpdateInventorySource").mockRejectedValueOnce(new Error("disk full"));
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My Source") // name
-        .mockResolvedValueOnce("Infra") // targetFolder
-        .mockResolvedValueOnce("admin") // defaultUsername
-        .mockResolvedValueOnce("netbox.local") // host
-        .mockResolvedValueOnce("new-tok"); // apiToken re-entered — vault had nothing to overwrite
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-
       const cmd = registeredCommands.get("nexus.inventory.editSource")!;
       await cmd();
+      const { onSubmit } = latestFormCall();
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("was not applied"));
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          host: "netbox.local",
+          apiToken: "new-tok" // re-entered — vault had nothing to overwrite
+        })
+      ).rejects.toThrow(/was not applied/);
 
       // If the fix were reverted (classification by secretFieldIds
       // membership instead of actual vault.get result), apiToken would be
@@ -707,19 +893,23 @@ describe("inventoryCommands", () => {
         makeSource({ targetFolder: "Infra", config: { host: "netbox.local" }, secretFieldIds: ["field1"] })
       );
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My Source") // name
-        .mockResolvedValueOnce("Infra") // targetFolder
-        .mockResolvedValueOnce("admin") // defaultUsername
-        .mockResolvedValueOnce("netbox.local") // host
-        .mockResolvedValueOnce("new1") // field1 (existing) re-entered -> store call 1, succeeds
-        .mockResolvedValueOnce("new2"); // field2 (new) -> store call 2, rejects
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-
       const cmd = registeredCommands.get("nexus.inventory.editSource")!;
       await cmd();
+      const { onSubmit } = latestFormCall();
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("keychain"));
+      // field1 (existing) re-entered -> store call 1, succeeds; field2 (new) -> store call 2, rejects.
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          host: "netbox.local",
+          field1: "new1",
+          field2: "new2"
+        })
+      ).rejects.toThrow(/keychain/);
+
       // The source record was never persisted (the loop failed before reaching that step).
       expect(core.getInventorySource("src-1")?.secretFieldIds).toEqual(["field1"]);
 
@@ -733,18 +923,11 @@ describe("inventoryCommands", () => {
       expect(await vault.get(inventorySecretKey("src-1", "field2"))).toBeUndefined();
     });
 
-    it("ITEM 4 — the source record changing (e.g. a configCommands import/reset, which bypasses inFlightSourceIds) before the persist aborts the edit and rolls back this run's vault writes (kills last-writer-wins)", async () => {
+    it("ITEM 4 — the source record changing (e.g. a configCommands import/reset, which bypasses inFlightSourceIds) before Save is clicked aborts the edit and rolls back this run's vault writes (kills last-writer-wins)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
-      const provider = makeProvider({
-        testConnection: vi.fn(async () => {
-          // Simulate a configCommands importMergeReplace/completeReset landing
-          // while editSource is still mid-flow — those flows mutate the
-          // source directly and never consult inFlightSourceIds.
-          await core.addOrUpdateInventorySource(makeSource({ name: "Imported", targetFolder: "Different" }));
-        })
-      });
+      const provider = makeProvider();
       registry.register(provider);
       const vault = makeVault();
       registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -752,18 +935,28 @@ describe("inventoryCommands", () => {
         makeSource({ name: "My Source", targetFolder: "Infra", config: { host: "netbox.local" }, secretFieldIds: [] })
       );
 
-      mockShowInputBox
-        .mockResolvedValueOnce("My Source") // name
-        .mockResolvedValueOnce("Infra") // targetFolder
-        .mockResolvedValueOnce("admin") // defaultUsername
-        .mockResolvedValueOnce("netbox.local") // host
-        .mockResolvedValueOnce("new-token"); // apiToken (brand new)
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" });
-
       const cmd = registeredCommands.get("nexus.inventory.editSource")!;
       await cmd();
+      const { onSubmit } = latestFormCall();
 
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("reopen Edit Source"));
+      // Simulate a configCommands importMergeReplace/completeReset landing
+      // while the edit form is still open — those flows mutate the source
+      // directly and never consult inFlightSourceIds. Unlike the old wizard
+      // (where this could only land during testConnection's forced await),
+      // the form can sit open indefinitely, so this window is now the whole
+      // time between opening the form and the user clicking Save.
+      await core.addOrUpdateInventorySource(makeSource({ name: "Imported", targetFolder: "Different" }));
+
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          host: "netbox.local",
+          apiToken: "new-token" // brand new
+        })
+      ).rejects.toThrow(/reopen Edit Source/);
 
       // If ITEM 4 were reverted (persist straight after the store loop, no
       // re-read), this stale `updated` — built from the pick-time record —

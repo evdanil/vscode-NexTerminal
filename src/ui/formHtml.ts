@@ -88,7 +88,10 @@ function renderField(field: FormFieldDescriptor): string {
       const selectedValue = field.value ?? field.options[0]?.value ?? "";
       const autofillAttr = field.autofill ? ' data-autofill="true"' : "";
       const optionsHtml = field.options.map((opt) =>
-        `<div class="custom-select-option${opt.value === selectedValue ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}</div>`
+        `<div class="custom-select-option${opt.value === selectedValue ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">` +
+        `<div class="custom-select-option-label">${escapeHtml(opt.label)}</div>` +
+        (opt.description ? `<div class="custom-select-option-desc">${escapeHtml(opt.description)}</div>` : "") +
+        `</div>`
       ).join("\n      ");
       return `<div class="form-group"${vw}>
   <label>${escapeHtml(field.label)}</label>

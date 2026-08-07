@@ -1,5 +1,7 @@
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
 import { resolveTunnelType } from "../models/config";
+import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues } from "../models/inventory";
+import { ORPHAN_FOLDER_NAME } from "../services/inventory/syncEngine";
 import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
@@ -577,6 +579,121 @@ export function unifiedProfileFormDefinition(
       ...serialFields(undefined, serialVw),
       ...localShellFields(undefined, localShellVw, localShellOptions),
       ...sharedFields
+    ]
+  };
+}
+
+/**
+ * Maps one provider-declared InventoryConfigField to a form field descriptor.
+ * `existingSecretFieldIds` (edit mode only) marks which password fields
+ * already have a saved vault value: those become optional in the form (blank
+ * means "keep the saved value", mirroring the placeholder text) even when the
+ * provider itself declares the field required — required-ness for a NEW
+ * value only applies when there's nothing saved yet to fall back on.
+ */
+function inventoryConfigFieldDescriptor(
+  field: InventoryConfigField,
+  existingConfig: InventorySourceValues,
+  existingSecretFieldIds: ReadonlySet<string>
+): FormFieldDescriptor {
+  if (field.type === "password") {
+    const hasSaved = existingSecretFieldIds.has(field.id);
+    return {
+      type: "password",
+      key: field.id,
+      label: field.label,
+      required: field.required && !hasSaved,
+      placeholder: hasSaved ? "Leave empty to keep the saved value" : field.placeholder,
+      hint: field.description
+    };
+  }
+  if (field.type === "boolean") {
+    return {
+      type: "checkbox",
+      key: field.id,
+      label: field.label,
+      value: existingConfig[field.id] === true,
+      hint: field.description
+    };
+  }
+  if (field.type === "number") {
+    const existing = existingConfig[field.id];
+    return {
+      type: "number",
+      key: field.id,
+      label: field.label,
+      required: field.required,
+      placeholder: field.placeholder,
+      value: typeof existing === "number" ? existing : undefined,
+      hint: field.description
+    };
+  }
+  const existing = existingConfig[field.id];
+  return {
+    type: "text",
+    key: field.id,
+    label: field.label,
+    required: field.required,
+    placeholder: field.placeholder,
+    value: existing !== undefined ? String(existing) : "",
+    hint: field.description
+  };
+}
+
+/**
+ * Add/Edit Inventory Source form. Collection-only — every persistence
+ * decision (vault-first secret storage, drift guards, stale-key cleanup,
+ * secret hydration for kept values, testConnection plumbing) lives in
+ * inventoryCommands.ts's onSubmit/onTest closures, which call the same
+ * shared critical-section functions the old sequential-prompt wizard used to
+ * call after its last prompt resolved.
+ *
+ * `defaultUsernameSeed` is only consulted on Add (mostCommonUsername from the
+ * caller); Edit always prefills from `seed.defaultUsername`.
+ */
+export function inventorySourceFormDefinition(
+  provider: InventoryProvider,
+  seed?: InventorySourceConfig,
+  defaultUsernameSeed?: string
+): FormDefinition {
+  const isEdit = Boolean(seed);
+  const existingSecretFieldIds = new Set(seed?.secretFieldIds ?? []);
+  const existingConfig = seed?.config ?? {};
+
+  return {
+    title: `${isEdit ? "Edit" : "Add"} Inventory Source (${provider.label})`,
+    testable: true,
+    fields: [
+      { type: "text", key: "name", label: "Name", required: true, value: seed?.name ?? provider.label },
+      {
+        type: "text",
+        key: "targetFolder",
+        label: "Target Folder",
+        placeholder: "e.g. Datacenter/NetBox — leave empty for the top level",
+        value: seed?.targetFolder ?? "",
+        hint: "Servers synced from this source are placed under this folder. Leave empty for the top level."
+      },
+      {
+        type: "text",
+        key: "defaultUsername",
+        label: "Default SSH Username",
+        required: true,
+        value: seed?.defaultUsername ?? defaultUsernameSeed ?? "",
+        hint: "Used when the inventory source doesn't provide a username."
+      },
+      {
+        type: "select",
+        key: "prunePolicy",
+        label: "Removed-Device Policy",
+        options: [
+          { label: `Move to "${ORPHAN_FOLDER_NAME}"`, value: "orphan", description: "Recommended — keeps synced settings if the device returns" },
+          { label: "Delete", value: "delete", description: "Removes the server and its saved credentials" },
+          { label: "Keep", value: "keep", description: "Leaves the server where it is" }
+        ],
+        value: seed?.prunePolicy ?? "orphan",
+        hint: "What should happen when a device disappears from the source."
+      },
+      ...provider.configFields.map((field) => inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds))
     ]
   };
 }

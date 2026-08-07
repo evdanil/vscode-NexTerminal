@@ -17,7 +17,6 @@ import {
 } from "../models/inventory";
 import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
 import {
-  ORPHAN_FOLDER_NAME,
   computeSyncPlan,
   planToApplication,
   prunedServerIdsForSecretCleanup,
@@ -27,6 +26,9 @@ import {
 import type { SecretVault } from "../services/ssh/contracts";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { configMutationLock } from "../services/configMutationLock";
+import { inventorySourceFormDefinition } from "../ui/formDefinitions";
+import type { FormValues } from "../ui/formTypes";
+import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { INVALID_FOLDER_PATH_MESSAGE, normalizeOptionalFolderPath } from "../utils/folderPaths";
 import { mostCommonUsername } from "./configCommands";
 
@@ -174,14 +176,15 @@ interface ProviderPickResult {
   provider: InventoryProvider;
   /**
    * Whether a QuickPick was actually displayed to the user. False when
-   * exactly one provider is registered (the auto-select branch below) — the
-   * only case that occurs today, but this also covers any future call site.
-   * addSource's wizard step numbering relies on this to avoid counting a
-   * step the user never saw.
+   * exactly one provider is registered (the auto-select branch below) — kept
+   * for callers that care whether a picker interrupted the flow, though
+   * addSource itself no longer needs it now that the form replaces the
+   * sequential-prompt wizard's step numbering.
    */
   shown: boolean;
 }
 
+/** Auto-skips the picker when exactly one provider is registered. */
 async function promptProviderPick(registry: InventoryProviderRegistry): Promise<ProviderPickResult | undefined> {
   const providers = registry.list();
   if (providers.length === 0) {
@@ -191,192 +194,25 @@ async function promptProviderPick(registry: InventoryProviderRegistry): Promise<
   if (providers.length === 1) {
     return { provider: providers[0], shown: false };
   }
-  // M1-minimum step numbering, continued: when the picker is actually shown
-  // it occupies step 1 of the wizard (addSource numbers the Name prompt right
-  // after it as step 2), but the picker's own title has to be decided BEFORE
-  // the user picks — and the total step count depends on the chosen
-  // provider's configFields.length, which isn't known yet. When every
-  // registered provider agrees on a field count, the total is the same no
-  // matter which one gets picked, so title it plainly as "(1/N)"; when they
-  // disagree, fall back to an untotaled "(Step 1)" rather than print a number
-  // that could turn out wrong once the user's actual choice is known.
-  const fixedSteps = 5; // provider pick + name + folder + username + prune policy
-  const fieldCounts = new Set(providers.map((provider) => provider.configFields.length));
-  const stepLabel = fieldCounts.size === 1 ? `(1/${fixedSteps + providers[0].configFields.length})` : "(Step 1)";
   const pick = await vscode.window.showQuickPick(
     providers.map((provider) => ({ label: provider.label, provider })),
-    { title: `Select Inventory Provider ${stepLabel}` }
+    { title: "Select Inventory Provider" }
   );
   return pick ? { provider: pick.provider, shown: true } : undefined;
 }
 
 /**
- * Loops on an empty target folder: warns (top level is unusual, not forbidden)
- * and offers "Choose Folder" to re-prompt instead of silently proceeding.
- * Returns undefined on outright cancellation (Escape / dismiss). `stepSuffix`
- * is the M1-minimum wizard step indicator (e.g. " (3/8)"), appended verbatim
- * to the InputBox title by the caller.
+ * Voluntary connection test — fired only by the form's Test button, never by
+ * Save. Unlike the old wizard's testConnectionWithRetry, a failure here never
+ * gates persistence (no "Save Anyway" prompt): this just reports success or
+ * failure and lets the user decide what to do next from the still-open form.
  */
-async function promptTargetFolder(stepSuffix: string, initialValue = ""): Promise<string | undefined> {
-  let seed = initialValue;
-  for (;;) {
-    const input = await vscode.window.showInputBox({
-      title: `Target Folder${stepSuffix}`,
-      prompt: "Servers synced from this source are placed under this folder. Leave empty for the top level.",
-      placeHolder: "e.g. Datacenter/NetBox — press Enter for top level",
-      value: seed,
-      ignoreFocusOut: true,
-      validateInput: (value) => (normalizeOptionalFolderPath(value) === null ? INVALID_FOLDER_PATH_MESSAGE : undefined)
-    });
-    if (input === undefined) return undefined;
-    const normalized = normalizeOptionalFolderPath(input) ?? "";
-    if (normalized !== "") {
-      return normalized;
-    }
-    // m9 — modal convention used elsewhere in this file (and across the
-    // codebase — see removeSource's own confirm below, or serverCommands.ts's
-    // remove-server confirm): a short leading question, not a trailing one.
-    // The top-level placement is genuinely riskier for a LIVE sync (every
-    // future run re-lands everything here with nothing to distinguish it from
-    // hand-added servers), so this confirmation stays — only its wording moves
-    // to match the rest of the file.
-    const choice = await vscode.window.showWarningMessage(
-      "Place synced servers at the top level? No target folder was entered.",
-      { modal: true },
-      "Continue",
-      "Choose Folder"
-    );
-    if (choice === "Continue") return "";
-    if (choice === "Choose Folder") {
-      seed = "";
-      continue;
-    }
-    return undefined;
-  }
-}
-
-/**
- * FIX 7 — when editing an existing source, the item matching the currently
- * saved value gets " (current)" appended to its description and is listed
- * first, so the picker doesn't read as a blank slate. `current` is omitted
- * entirely on addSource (nothing saved yet) and the list keeps its default
- * order.
- */
-async function promptPrunePolicy(stepSuffix: string, targetFolder: string, current?: InventoryPrunePolicy): Promise<InventoryPrunePolicy | undefined> {
-  const orphanTarget = targetFolder ? `${targetFolder}/${ORPHAN_FOLDER_NAME}` : ORPHAN_FOLDER_NAME;
-  const items = [
-    { label: `Move to "${orphanTarget}"`, description: "Recommended — keeps synced settings if the device returns", value: "orphan" as const },
-    { label: "Delete", description: "Removes the server and its saved credentials", value: "delete" as const },
-    { label: "Keep", description: "Leaves the server where it is", value: "keep" as const }
-  ].map((item) => (item.value === current ? { ...item, description: `${item.description} (current)` } : item));
-  const ordered = current ? [...items.filter((i) => i.value === current), ...items.filter((i) => i.value !== current)] : items;
-  // m8 — the question moves from the title into placeHolder; the title
-  // itself now just names what's being configured (mirrors "Target Folder",
-  // "Inventory Source Name" elsewhere in this wizard).
-  const pick = await vscode.window.showQuickPick(ordered, {
-    title: `Removed-Device Policy${stepSuffix}`,
-    placeHolder: "What should happen when a device disappears from the source?"
-  });
-  return pick?.value;
-}
-
-interface ConfigFieldsResult {
-  config: InventorySourceValues;
-  secrets: InventorySourceSecrets;
-}
-
-/**
- * Sequential prompts, one per provider config field. `existingSecretFieldIds`
- * marks which password fields already have a saved vault value (edit flow) —
- * those may be left blank to keep the saved value; everything else required
- * must be non-empty. Returns undefined on cancellation at any step.
- *
- * `baseStepIndex`/`totalSteps` are the M1-minimum wizard step indicator —
- * this field's 1-based position is `baseStepIndex + <index in fields>`, so
- * caller and callee agree on numbering without this function knowing about
- * any of the FIXED (non-field) steps that come before it.
- *
- * FOLLOW-UP: this whole sequential-prompt chain (here and in addSource/
- * editSource) is a known candidate for migration to a single webview form —
- * tracked separately; the step counters below are a stopgap for the current
- * one-InputBox-at-a-time flow, not a redesign of it.
- */
-async function promptConfigFields(
-  fields: InventoryConfigField[],
-  existingConfig: InventorySourceValues,
-  existingSecretFieldIds: ReadonlySet<string>,
-  baseStepIndex: number,
-  totalSteps: number
-): Promise<ConfigFieldsResult | undefined> {
-  const config: InventorySourceValues = {};
-  const secrets: InventorySourceSecrets = {};
-
-  for (let i = 0; i < fields.length; i++) {
-    const field = fields[i];
-    const stepSuffix = ` (${baseStepIndex + i}/${totalSteps})`;
-    if (field.type === "boolean") {
-      // FIX 7 — mark whichever option matches the saved config value (edit
-      // flow) and list it first; addSource has no `existingConfig` entry for
-      // the field, so neither option is marked and the default order holds.
-      const current = existingConfig[field.id];
-      const items = [
-        { label: "Yes", value: true, description: current === true ? "(current)" : undefined },
-        { label: "No", value: false, description: current === false ? "(current)" : undefined }
-      ];
-      const ordered = current === false ? [items[1], items[0]] : items;
-      const pick = await vscode.window.showQuickPick(ordered, { title: `${field.label}${stepSuffix}`, placeHolder: field.description });
-      if (pick === undefined) return undefined;
-      config[field.id] = pick.value;
-      continue;
-    }
-
-    if (field.type === "password") {
-      const hasSaved = existingSecretFieldIds.has(field.id);
-      const value = await vscode.window.showInputBox({
-        title: `${field.label}${stepSuffix}`,
-        prompt: field.description,
-        placeHolder: hasSaved ? "Leave empty to keep the saved value" : field.placeholder,
-        password: true,
-        ignoreFocusOut: true,
-        validateInput: (v) => (field.required && !v && !hasSaved ? `${field.label} is required` : undefined)
-      });
-      if (value === undefined) return undefined;
-      if (value !== "") {
-        secrets[field.id] = value;
-      }
-      continue;
-    }
-
-    const existingValue = existingConfig[field.id];
-    const value = await vscode.window.showInputBox({
-      title: `${field.label}${stepSuffix}`,
-      prompt: field.description,
-      placeHolder: field.placeholder,
-      value: existingValue !== undefined ? String(existingValue) : "",
-      ignoreFocusOut: true,
-      validateInput: (v) => {
-        if (field.required && !v.trim()) return `${field.label} is required`;
-        if (field.type === "number" && v.trim() && !Number.isFinite(Number(v))) return "Must be a number";
-        return undefined;
-      }
-    });
-    if (value === undefined) return undefined;
-    const trimmed = value.trim();
-    if (trimmed === "") {
-      continue; // optional empty -> omitted from config
-    }
-    config[field.id] = field.type === "number" ? Number(trimmed) : trimmed;
-  }
-
-  return { config, secrets };
-}
-
-async function testConnectionWithRetry(
+async function testInventoryConnection(
   name: string,
   provider: InventoryProvider,
   config: InventorySourceValues,
   secrets: InventorySourceSecrets
-): Promise<boolean> {
+): Promise<void> {
   try {
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: `Testing connection to "${name}"…` },
@@ -385,15 +221,385 @@ async function testConnectionWithRetry(
         return provider.testConnection(cloned.config, cloned.secrets);
       }
     );
-    return true;
+    void vscode.window.showInformationMessage(`Connection test succeeded for "${name}".`);
   } catch (error) {
-    const choice = await vscode.window.showErrorMessage(
-      `Connection test failed: ${describeInventoryError(error)}`,
-      "Save Anyway",
-      "Cancel"
-    );
-    return choice === "Save Anyway";
+    void vscode.window.showErrorMessage(`Connection test failed: ${describeInventoryError(error)}`);
   }
+}
+
+interface ProviderConfigFormResult {
+  config: InventorySourceValues;
+  secrets: InventorySourceSecrets;
+}
+
+/**
+ * Maps the form's flat FormValues object (keyed by InventoryConfigField.id)
+ * back to the provider's (config, secrets) shape — the collection-side
+ * counterpart of inventoryConfigFieldDescriptor (ui/formDefinitions.ts).
+ * `existingSecretFieldIds` (edit flow) marks which password fields already
+ * have a saved vault value: a blank value for one of those is treated as
+ * "keep the saved value" (omitted from `secrets` entirely, exactly like the
+ * old wizard's blank-password branch) rather than a validation failure.
+ *
+ * Throws a plain Error naming the field on a required-but-missing value —
+ * the form's own HTML `required` attribute already blocks most of these at
+ * the browser layer (see inventoryConfigFieldDescriptor's `required` wiring),
+ * this is the defense-in-depth layer for anything that reaches onSubmit/
+ * onTest anyway (a value programmatically posted, or a required password
+ * field newly required by a provider schema change since the form opened).
+ */
+function formValuesToProviderConfig(
+  fields: InventoryConfigField[],
+  values: FormValues,
+  existingSecretFieldIds: ReadonlySet<string> = new Set()
+): ProviderConfigFormResult {
+  const config: InventorySourceValues = {};
+  const secrets: InventorySourceSecrets = {};
+
+  for (const field of fields) {
+    const raw = values[field.id];
+
+    if (field.type === "password") {
+      const hasSaved = existingSecretFieldIds.has(field.id);
+      if (typeof raw === "string" && raw !== "") {
+        secrets[field.id] = raw;
+      } else if (field.required && !hasSaved) {
+        throw new Error(`${field.label} is required`);
+      }
+      continue;
+    }
+
+    if (field.type === "boolean") {
+      config[field.id] = raw === true;
+      continue;
+    }
+
+    if (field.type === "number") {
+      let numeric: number | undefined;
+      if (typeof raw === "number" && Number.isFinite(raw)) {
+        numeric = raw;
+      } else if (typeof raw === "string" && raw.trim() !== "" && Number.isFinite(Number(raw))) {
+        numeric = Number(raw);
+      }
+      if (numeric !== undefined) {
+        config[field.id] = numeric;
+      } else if (field.required) {
+        throw new Error(`${field.label} is required`);
+      }
+      continue;
+    }
+
+    // string
+    const trimmed = typeof raw === "string" ? raw.trim() : "";
+    if (trimmed !== "") {
+      config[field.id] = trimmed;
+    } else if (field.required) {
+      throw new Error(`${field.label} is required`);
+    }
+  }
+
+  return { config, secrets };
+}
+
+interface ParsedSourceFormValues {
+  name: string;
+  targetFolder: string;
+  defaultUsername: string;
+  prunePolicy: InventoryPrunePolicy;
+  config: InventorySourceValues;
+  secrets: InventorySourceSecrets;
+}
+
+/**
+ * Validates and normalizes the form's top-level (non-provider) fields and
+ * delegates the provider config fields to formValuesToProviderConfig. Thrown
+ * errors surface through WebviewFormPanel's generic "Save failed: ..."
+ * banner and leave the form open for correction — the same recoverable
+ * contract the old wizard's validateInput callbacks had, just surfaced once
+ * at submit time instead of per-keystroke.
+ *
+ * Top-level-folder confirmation: the form itself has no confirm-modal
+ * affordance, so this reproduces the old promptTargetFolder loop's warning
+ * with a plain vscode.window.showWarningMessage (onSubmit runs in the
+ * extension host, same as any other command) — "Continue" proceeds with an
+ * empty (top-level) target folder, anything else throws so the form stays
+ * open for the user to either type a folder or click Save again to confirm.
+ */
+async function parseSourceFormValues(
+  values: FormValues,
+  provider: InventoryProvider,
+  existingSecretFieldIds: ReadonlySet<string> = new Set()
+): Promise<ParsedSourceFormValues> {
+  const name = typeof values.name === "string" ? values.name.trim() : "";
+  if (!name) {
+    throw new Error("Name is required");
+  }
+
+  const rawFolder = typeof values.targetFolder === "string" ? values.targetFolder : "";
+  const normalizedFolder = normalizeOptionalFolderPath(rawFolder);
+  if (normalizedFolder === null) {
+    throw new Error(INVALID_FOLDER_PATH_MESSAGE);
+  }
+  const targetFolder = normalizedFolder ?? "";
+  if (targetFolder === "") {
+    // m9 — same modal wording/convention as the rest of this file (see
+    // removeSource's own confirm).
+    const choice = await vscode.window.showWarningMessage(
+      "Place synced servers at the top level? No target folder was entered.",
+      { modal: true },
+      "Continue"
+    );
+    if (choice !== "Continue") {
+      throw new Error("Enter a target folder, or click Save again to confirm placing synced servers at the top level.");
+    }
+  }
+
+  const defaultUsername = typeof values.defaultUsername === "string" ? values.defaultUsername.trim() : "";
+  if (!defaultUsername) {
+    throw new Error("Default SSH Username is required");
+  }
+
+  const rawPrunePolicy = values.prunePolicy;
+  const prunePolicy: InventoryPrunePolicy =
+    rawPrunePolicy === "delete" || rawPrunePolicy === "keep" ? rawPrunePolicy : "orphan";
+
+  const { config, secrets } = formValuesToProviderConfig(provider.configFields, values, existingSecretFieldIds);
+
+  return { name, targetFolder, defaultUsername, prunePolicy, config, secrets };
+}
+
+export interface NewInventorySourceInput {
+  name: string;
+  targetFolder: string;
+  defaultUsername: string;
+  prunePolicy: InventoryPrunePolicy;
+  provider: InventoryProvider;
+  config: InventorySourceValues;
+  secrets: InventorySourceSecrets;
+}
+
+/**
+ * Create-path critical section, extracted verbatim (behavior-for-behavior)
+ * from the old addSource wizard's post-prompt tail: vault-first secret
+ * storage (only fields actually stored count toward secretFieldIds — an
+ * optional blank password field is never recorded, see FINDING 2 below),
+ * rollback of this run's own vault writes on either a store failure or a
+ * rejected persist (FINDING B / FINDING 1), all held under ONE
+ * configMutationLock acquisition so a replace-mode import/reset can't land
+ * mid-write. Returns the created record on success; throws an Error whose
+ * message is shown verbatim by the caller (the form's onSubmit lets
+ * WebviewFormPanel surface it as "Save failed: ...", the old wizard showed it
+ * directly via vscode.window.showErrorMessage — same wording either way).
+ */
+async function persistNewInventorySource(
+  core: NexusCore,
+  vault: SecretVault,
+  input: NewInventorySourceInput
+): Promise<InventorySourceConfig> {
+  const { name, targetFolder, defaultUsername, prunePolicy, provider, config, secrets } = input;
+  const id = randomUUID();
+  const passwordFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
+
+  // FINDING 2 — secretFieldIds records only ids ACTUALLY stored to the vault
+  // this run. A password field that is optional and left blank never gets a
+  // vault entry, so it must not appear here either — otherwise syncNow's
+  // missing-secret guard would later error on a vault key that was never
+  // written, making the source unsyncable despite the field being genuinely
+  // optional.
+  const secretFieldIds: string[] = [];
+
+  // CONFIG MUTATION LOCK — the form has already resolved (submit fired) and
+  // nothing left in this span shows UI, so it's safe to hold the lock across
+  // the store-secrets + persist sequence. Serializes against configCommands'
+  // replace-mode import / complete reset, which could otherwise delete this
+  // exact source id's vault keys mid-write.
+  return configMutationLock.runExclusive(async (): Promise<InventorySourceConfig> => {
+    // F18 — secrets to vault FIRST; only on success does the source record get created.
+    try {
+      for (const fieldId of passwordFieldIds) {
+        const value = secrets[fieldId];
+        if (value !== undefined) {
+          await vault.store(inventorySecretKey(id, fieldId), value);
+          secretFieldIds.push(fieldId);
+        }
+      }
+    } catch {
+      // FINDING B — a later field's store rejecting after earlier ones
+      // succeeded must not orphan those earlier keys: the source is never
+      // created on this path, so nothing will ever enumerate secretFieldIds
+      // to clean them up. Best-effort delete everything written this run.
+      for (const fieldId of secretFieldIds) {
+        try {
+          await vault.delete(inventorySecretKey(id, fieldId));
+        } catch {
+          // best-effort rollback — ignore
+        }
+      }
+      throw new Error("Could not store credentials in the system keychain — the source was not created.");
+    }
+
+    const source: InventorySourceConfig = { id, providerId: provider.id, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds };
+
+    // FINDING 1 — if persisting the new source record fails, the vault keys
+    // just written above have no source to be enumerated/cleaned up by, so
+    // they'd be orphaned forever. Roll them back (best-effort — a delete
+    // failure here must not mask the original persistence error) and report
+    // that the source was not created.
+    try {
+      await core.addOrUpdateInventorySource(source);
+    } catch {
+      for (const fieldId of secretFieldIds) {
+        try {
+          await vault.delete(inventorySecretKey(id, fieldId));
+        } catch {
+          // best-effort rollback — ignore
+        }
+      }
+      throw new Error(`Could not save inventory source "${name}" — the source was not created.`);
+    }
+
+    return source;
+  });
+}
+
+export interface UpdatedInventorySourceInput {
+  name: string;
+  targetFolder: string;
+  defaultUsername: string;
+  prunePolicy: InventoryPrunePolicy;
+  provider: InventoryProvider;
+  config: InventorySourceValues;
+  /** Only fields the user actually re-typed this run — a blank/kept field is omitted. */
+  reenteredSecrets: InventorySourceSecrets;
+}
+
+/**
+ * Edit-path critical section, extracted verbatim from the old editSource
+ * wizard's post-prompt tail: vault writes for re-entered secrets only
+ * (classified newly-written vs. overwritten by ACTUAL vault state, never by
+ * secretFieldIds membership — FINDING 1 P2), a pre-persist drift guard
+ * comparing the live record against the pick-time `source` (ITEM 4), persist,
+ * then best-effort stale-key cleanup for password fields dropped from the
+ * new secretFieldIds (FINDING 3). All in ONE configMutationLock acquisition.
+ * Returns the updated record on success; throws on any failure, with
+ * rollback of this run's own vault writes (new keys deleted, overwritten
+ * keys restored to their pre-run value — FINDING C) before the throw.
+ */
+async function persistUpdatedInventorySource(
+  core: NexusCore,
+  vault: SecretVault,
+  source: InventorySourceConfig,
+  input: UpdatedInventorySourceInput
+): Promise<InventorySourceConfig> {
+  const { name, targetFolder, defaultUsername, prunePolicy, provider, config, reenteredSecrets } = input;
+  const existingSecretFieldIds = new Set(source.secretFieldIds);
+
+  return configMutationLock.runExclusive(async (): Promise<InventorySourceConfig> => {
+    const newlyWrittenFieldIds: string[] = [];
+    const overwrittenPreviousValues = new Map<string, string>();
+
+    const rollbackThisRunsVaultWrites = async (): Promise<void> => {
+      for (const fieldId of newlyWrittenFieldIds) {
+        try {
+          await vault.delete(inventorySecretKey(source.id, fieldId));
+        } catch {
+          // best-effort rollback — ignore
+        }
+      }
+      for (const [fieldId, previousValue] of overwrittenPreviousValues) {
+        try {
+          await vault.store(inventorySecretKey(source.id, fieldId), previousValue);
+        } catch {
+          // best-effort rollback — ignore
+        }
+      }
+    };
+
+    try {
+      for (const [fieldId, value] of Object.entries(reenteredSecrets)) {
+        // Classify by actual vault state, not by secretFieldIds membership.
+        const previousValue = await vault.get(inventorySecretKey(source.id, fieldId));
+        await vault.store(inventorySecretKey(source.id, fieldId), value);
+        if (previousValue !== undefined) {
+          overwrittenPreviousValues.set(fieldId, previousValue);
+        } else {
+          newlyWrittenFieldIds.push(fieldId);
+        }
+      }
+    } catch {
+      await rollbackThisRunsVaultWrites();
+      throw new Error("Could not store credentials in the system keychain — the source was not updated.");
+    }
+
+    // FINDING 2 — a password field in the CURRENT schema counts as stored
+    // for this source when it was just re-entered, or when it's a kept
+    // (left-blank) field that already had a saved vault value — never
+    // merely because the schema declares it. A field dropped from the
+    // schema entirely, or an optional field that has never had a value
+    // saved, is excluded.
+    const newSecretFieldIds = provider.configFields
+      .filter((f) => f.type === "password" && (reenteredSecrets[f.id] !== undefined || existingSecretFieldIds.has(f.id)))
+      .map((f) => f.id);
+
+    const updated: InventorySourceConfig = { ...source, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds: newSecretFieldIds };
+
+    // ITEM 4 — re-read the record immediately before persisting. configCommands
+    // flows (importMergeReplace, completeReset) mutate inventory sources
+    // directly and bypass inFlightSourceIds entirely, so an import/reset can
+    // complete while the user still has the form open. Persisting `updated`
+    // (built from the pick-time `source`) over that would silently overwrite
+    // the imported record (and the stale-key cleanup below would then delete
+    // the imported source's own vault keys), or resurrect a source the user
+    // just reset away. `source` is the exact pick-time record — compared on
+    // both config (sourceConfigUnchanged) and name, since name isn't part of
+    // that comparator. The store loop above runs inside this same lock
+    // acquisition, so an import/reset can no longer land BETWEEN the stores
+    // and this check either.
+    const currentSourceBeforePersist = core.getInventorySource(source.id);
+    if (!currentSourceBeforePersist || !sourceConfigUnchanged(currentSourceBeforePersist, source) || currentSourceBeforePersist.name !== source.name) {
+      await rollbackThisRunsVaultWrites();
+      throw new Error("Inventory source changed while editing — reopen Edit Source.");
+    }
+
+    // FINDING 1 — persist BEFORE any vault cleanup. If persistence rejects,
+    // the pre-existing secretFieldIds keys must be left untouched (they're
+    // still the keys the last-known-good source record points at), and any
+    // brand-new keys written above must be rolled back (best-effort — a
+    // delete failure here must not mask the original persistence error).
+    // FINDING C — additionally, any re-entered field that OVERWROTE an
+    // existing value gets that captured previous value restored, so the
+    // vault matches the reverted (last-known-good) source record.
+    try {
+      await core.addOrUpdateInventorySource(updated);
+    } catch {
+      await rollbackThisRunsVaultWrites();
+      throw new Error(`Could not save inventory source "${name}" — the update was not applied.`);
+    }
+
+    // FINDING 3 — vault keys for ids that were in the OLD secretFieldIds but
+    // fell out of the new set (dropped from the provider schema, or simply
+    // never re-stored) are orphaned: remove-source/reset/backup only walk
+    // secretFieldIds, so a stale vault entry would live forever otherwise.
+    // Deleted only AFTER the updated source is successfully persisted —
+    // deleting them first would destroy still-referenced credentials if the
+    // persist above then failed (FINDING 1).
+    // ITEM 8 — each stale-key delete is independent and best-effort: one
+    // rejection must neither throw out of an otherwise-successful edit nor
+    // block the remaining stale keys from being cleaned up.
+    const newSecretFieldIdSet = new Set(newSecretFieldIds);
+    for (const staleId of source.secretFieldIds) {
+      if (!newSecretFieldIdSet.has(staleId)) {
+        const staleKey = inventorySecretKey(source.id, staleId);
+        try {
+          await vault.delete(staleKey);
+        } catch (error) {
+          console.warn(`[Nexus] Failed to delete stale inventory secret key "${staleKey}":`, error);
+        }
+      }
+    }
+
+    return updated;
+  });
 }
 
 async function openInventoryIssuesText(lines: string[]): Promise<void> {
@@ -551,129 +757,68 @@ export function registerInventoryCommands(
   // command already marked busy.
   const inFlightSourceIds = new Set<string>();
 
+  /**
+   * Shared Test-button handler for both the Add and Edit forms. Never throws
+   * out to WebviewFormPanel — a bad/incomplete field value is reported as a
+   * warning (mirrors profileCommands' onTest convention) rather than the
+   * generic "Save failed" banner, since testing is voluntary and shouldn't
+   * read like a failed save. `hydrateFrom`, when given, is the edit-mode
+   * source whose vault-stored secrets fill in any field left blank (F7) so
+   * the test exercises the value that will actually be used on Save, not an
+   * empty string.
+   */
+  async function handleFormTest(
+    values: FormValues,
+    provider: InventoryProvider,
+    fallbackName: string,
+    hydrateFrom?: InventorySourceConfig
+  ): Promise<void> {
+    let parsed: ProviderConfigFormResult;
+    try {
+      parsed = formValuesToProviderConfig(provider.configFields, values, new Set(hydrateFrom?.secretFieldIds ?? []));
+    } catch (error) {
+      void vscode.window.showWarningMessage(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    const secretsForTest: InventorySourceSecrets = { ...parsed.secrets };
+    if (hydrateFrom) {
+      for (const fieldId of hydrateFrom.secretFieldIds) {
+        if (secretsForTest[fieldId] === undefined) {
+          const stored = await vault.get(inventorySecretKey(hydrateFrom.id, fieldId));
+          if (stored !== undefined) secretsForTest[fieldId] = stored;
+        }
+      }
+    }
+    const name = typeof values.name === "string" && values.name.trim() ? values.name.trim() : fallbackName;
+    await testInventoryConnection(name, provider, parsed.config, secretsForTest);
+  }
+
   async function addSource(): Promise<void> {
     const pickResult = await promptProviderPick(registry);
     if (!pickResult) return;
-    const { provider, shown: providerStepShown } = pickResult;
+    const { provider } = pickResult;
 
-    // M1-minimum — wizard step numbering. Provider selection occupies step 1
-    // ONLY when promptProviderPick actually displayed a picker — it
-    // auto-selects without showing UI when exactly one provider is
-    // registered (the default desktop case — only NetBox), and an
-    // invisible step must not be counted in the total or offset the visible
-    // prompts by one. Name/Folder/Username/Prune-Policy occupy the next 4
-    // steps either way; one step per provider config field after that.
-    // FOLLOW-UP: this sequential-prompt wizard (here, editSource, and the
-    // promptConfigFields/promptTargetFolder/promptPrunePolicy helpers it
-    // shares with editSource) is a known candidate for migration to a single
-    // webview form — tracked separately.
-    const totalSteps = (providerStepShown ? 5 : 4) + provider.configFields.length;
-    let step = providerStepShown ? 2 : 1;
+    const definition = inventorySourceFormDefinition(provider, undefined, mostCommonUsername(core.getSnapshot().servers));
+    WebviewFormPanel.open(`inventory-source-add-${provider.id}`, definition, {
+      onSubmit: async (values) => {
+        const parsed = await parseSourceFormValues(values, provider);
+        const created = await persistNewInventorySource(core, vault, {
+          name: parsed.name,
+          targetFolder: parsed.targetFolder,
+          defaultUsername: parsed.defaultUsername,
+          prunePolicy: parsed.prunePolicy,
+          provider,
+          config: parsed.config,
+          secrets: parsed.secrets
+        });
 
-    const nameInput = await vscode.window.showInputBox({
-      title: `Inventory Source Name (${step++}/${totalSteps})`,
-      value: provider.label,
-      ignoreFocusOut: true,
-      validateInput: (v) => (v.trim() ? undefined : "Name is required")
-    });
-    if (nameInput === undefined) return;
-    const name = nameInput.trim();
-
-    const targetFolder = await promptTargetFolder(` (${step++}/${totalSteps})`);
-    if (targetFolder === undefined) return;
-
-    const defaultUsernameInput = await vscode.window.showInputBox({
-      title: `Default SSH Username (${step++}/${totalSteps})`,
-      prompt: "Used when the inventory source doesn't provide a username.",
-      value: mostCommonUsername(core.getSnapshot().servers),
-      ignoreFocusOut: true,
-      validateInput: (v) => (v.trim() ? undefined : "Username is required")
-    });
-    if (defaultUsernameInput === undefined) return;
-    const defaultUsername = defaultUsernameInput.trim();
-
-    const prunePolicy = await promptPrunePolicy(` (${step++}/${totalSteps})`, targetFolder);
-    if (!prunePolicy) return;
-
-    const fieldsResult = await promptConfigFields(provider.configFields, {}, new Set(), step, totalSteps);
-    if (!fieldsResult) return;
-    const { config, secrets } = fieldsResult;
-
-    const ok = await testConnectionWithRetry(name, provider, config, secrets);
-    if (!ok) return;
-
-    const id = randomUUID();
-    const passwordFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
-
-    // FINDING 2 — secretFieldIds records only ids ACTUALLY stored to the vault
-    // this run. A password field that is optional and left blank never gets a
-    // vault entry, so it must not appear here either — otherwise syncNow's
-    // missing-secret guard would later error on a vault key that was never
-    // written, making the source unsyncable despite the field being genuinely
-    // optional.
-    const secretFieldIds: string[] = [];
-
-    // CONFIG MUTATION LOCK — every prompt (provider/name/folder/username/
-    // prune-policy/field pickers) and the connection test have already
-    // resolved above; nothing left in this span shows UI, so it's safe to
-    // hold the lock across the store-secrets + persist sequence. Serializes
-    // against configCommands' replace-mode import / complete reset, which
-    // could otherwise delete this exact source id's vault keys mid-write.
-    const created = await configMutationLock.runExclusive(async (): Promise<boolean> => {
-      // F18 — secrets to vault FIRST; only on success does the source record get created.
-      try {
-        for (const fieldId of passwordFieldIds) {
-          const value = secrets[fieldId];
-          if (value !== undefined) {
-            await vault.store(inventorySecretKey(id, fieldId), value);
-            secretFieldIds.push(fieldId);
-          }
+        const choice = await vscode.window.showInformationMessage(`Inventory source "${created.name}" added.`, "Sync Now");
+        if (choice === "Sync Now") {
+          await vscode.commands.executeCommand("nexus.inventory.syncNow", created.id);
         }
-      } catch {
-        // FINDING B — a later field's store rejecting after earlier ones
-        // succeeded must not orphan those earlier keys: the source is never
-        // created on this path, so nothing will ever enumerate secretFieldIds
-        // to clean them up. Best-effort delete everything written this run.
-        for (const fieldId of secretFieldIds) {
-          try {
-            await vault.delete(inventorySecretKey(id, fieldId));
-          } catch {
-            // best-effort rollback — ignore
-          }
-        }
-        void vscode.window.showErrorMessage("Could not store credentials in the system keychain — the source was not created.");
-        return false;
-      }
-
-      const source: InventorySourceConfig = { id, providerId: provider.id, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds };
-
-      // FINDING 1 — if persisting the new source record fails, the vault keys
-      // just written above have no source to be enumerated/cleaned up by, so
-      // they'd be orphaned forever. Roll them back (best-effort — a delete
-      // failure here must not mask the original persistence error) and report
-      // that the source was not created.
-      try {
-        await core.addOrUpdateInventorySource(source);
-      } catch {
-        for (const fieldId of secretFieldIds) {
-          try {
-            await vault.delete(inventorySecretKey(id, fieldId));
-          } catch {
-            // best-effort rollback — ignore
-          }
-        }
-        void vscode.window.showErrorMessage(`Could not save inventory source "${name}" — the source was not created.`);
-        return false;
-      }
-
-      return true;
+      },
+      onTest: (values) => handleFormTest(values, provider, provider.label)
     });
-    if (!created) return;
-
-    const choice = await vscode.window.showInformationMessage(`Inventory source "${name}" added.`, "Sync Now");
-    if (choice === "Sync Now") {
-      await vscode.commands.executeCommand("nexus.inventory.syncNow", id);
-    }
   }
 
   async function editSource(): Promise<void> {
@@ -689,221 +834,43 @@ export function registerInventoryCommands(
       return;
     }
 
-    // M1-minimum — wizard step numbering. Unlike addSource, the provider is
-    // already fixed (source.providerId), so there is no provider-pick step
-    // here: Name/Folder/Username/Prune-Policy are 1-4, then one step per
-    // provider config field.
-    // FOLLOW-UP: same known candidate for a webview-form migration as
-    // addSource — see its comment.
-    const totalSteps = 4 + provider.configFields.length;
-
+    // F4 — marked busy for as long as the form stays open (submit pending,
+    // or simply left open by the user), not just for the sequential prompts
+    // the wizard used to run through — released via onDidDispose below,
+    // which fires whether the form closes because Save succeeded or because
+    // the user hit Cancel. A failed Save leaves the form (and the busy flag)
+    // in place, matching the form's own "stays open for correction" idiom
+    // rather than the wizard's "abort and unlock immediately" one.
     inFlightSourceIds.add(source.id);
-    try {
-      const nameInput = await vscode.window.showInputBox({
-        title: `Inventory Source Name (1/${totalSteps})`,
-        value: source.name,
-        ignoreFocusOut: true,
-        validateInput: (v) => (v.trim() ? undefined : "Name is required")
-      });
-      if (nameInput === undefined) return;
-      const name = nameInput.trim();
-
-      const targetFolder = await promptTargetFolder(` (2/${totalSteps})`, source.targetFolder);
-      if (targetFolder === undefined) return;
-
-      const defaultUsernameInput = await vscode.window.showInputBox({
-        title: `Default SSH Username (3/${totalSteps})`,
-        value: source.defaultUsername,
-        ignoreFocusOut: true,
-        validateInput: (v) => (v.trim() ? undefined : "Username is required")
-      });
-      if (defaultUsernameInput === undefined) return;
-      const defaultUsername = defaultUsernameInput.trim();
-
-      const prunePolicy = await promptPrunePolicy(` (4/${totalSteps})`, targetFolder, source.prunePolicy);
-      if (!prunePolicy) return;
-
-      const existingSecretFieldIds = new Set(source.secretFieldIds);
-      const fieldsResult = await promptConfigFields(provider.configFields, source.config, existingSecretFieldIds, 5, totalSteps);
-      if (!fieldsResult) return;
-      const { config, secrets: reenteredSecrets } = fieldsResult;
-
-      // F7 — hydrate every kept (blank) secret field from the vault BEFORE testConnection,
-      // so the test exercises the value that will actually be used, not an empty string.
-      const secretsForTest: InventorySourceSecrets = { ...reenteredSecrets };
-      for (const fieldId of source.secretFieldIds) {
-        if (secretsForTest[fieldId] === undefined) {
-          const stored = await vault.get(inventorySecretKey(source.id, fieldId));
-          if (stored !== undefined) secretsForTest[fieldId] = stored;
-        }
+    let releasedInFlight = false;
+    const releaseInFlight = (): void => {
+      if (!releasedInFlight) {
+        releasedInFlight = true;
+        inFlightSourceIds.delete(source.id);
       }
+    };
 
-      // m11 — the connection test keeps its existing gating (unchanged, out
-      // of scope); only the progress title changes, naming the edited
-      // source's (possibly just-renamed) name rather than the provider label.
-      const ok = await testConnectionWithRetry(name, provider, config, secretsForTest);
-      if (!ok) return;
+    const existingSecretFieldIds = new Set(source.secretFieldIds);
+    const definition = inventorySourceFormDefinition(provider, source);
+    const panel = WebviewFormPanel.open(`inventory-source-edit-${source.id}`, definition, {
+      onSubmit: async (values) => {
+        const parsed = await parseSourceFormValues(values, provider, existingSecretFieldIds);
+        const updated = await persistUpdatedInventorySource(core, vault, source, {
+          name: parsed.name,
+          targetFolder: parsed.targetFolder,
+          defaultUsername: parsed.defaultUsername,
+          prunePolicy: parsed.prunePolicy,
+          provider,
+          config: parsed.config,
+          reenteredSecrets: parsed.secrets
+        });
 
-      // CONFIG MUTATION LOCK — every prompt (name/folder/username/prune-policy/
-      // field pickers) and the connection test have already resolved above;
-      // nothing left in this span shows UI. Moved the whole store+guard+persist
-      // sequence into ONE lock acquisition (secret stores used to run before the
-      // drift guard, with nothing stopping an import from landing in between)
-      // so a replace-mode import/reset can no longer interleave with any part
-      // of it — see importMergeReplace's doc comment for the race class.
-      const persisted = await configMutationLock.runExclusive(async (): Promise<boolean> => {
-        // F18 — vault writes first; only re-entered secrets are stored, so a blank field
-        // leaves its previously saved value untouched.
-        // FINDING 1 — track which of those writes are for fields NOT already in
-        // the old secretFieldIds (i.e. brand-new secrets for this source, as
-        // opposed to an overwrite of a value that already existed).
-        // FINDING C — a re-entered field that WAS already in the old
-        // secretFieldIds gets its pre-write value captured here, BEFORE the
-        // overwrite, so a failed persist below can put it back — the previous
-        // rollback only deleted newly-added keys, leaving an overwritten token
-        // stuck at its new value even though the source record reverted to old.
-        // FINDING 1 (P2, rollback-classification review) — the split between
-        // "newly-written" and "overwritten" is decided by what vault.get
-        // ACTUALLY returned for this field, never by secretFieldIds
-        // membership. A field can be listed in the old secretFieldIds while
-        // the vault key itself is missing (e.g. a restore that warned about
-        // an absent credential) — declared-but-absent. Classifying that case
-        // as "existing" (the old `existingSecretFieldIds.has(fieldId)` check)
-        // meant a rollback below neither restored it (nothing was captured,
-        // correctly) NOR deleted it (it was never pushed to
-        // newlyWrittenFieldIds, incorrectly) — the freshly-entered credential
-        // would survive a reported-failed update. previousValue === undefined
-        // now always means "treat as newly-written, delete on rollback";
-        // previousValue !== undefined always means "treat as overwritten,
-        // restore on rollback" — regardless of what secretFieldIds says.
-        const newlyWrittenFieldIds: string[] = [];
-        const overwrittenPreviousValues = new Map<string, string>();
-
-        // ITEM 3/4 shared rollback — best-effort delete of everything newly
-        // written this run and best-effort restore of everything overwritten
-        // this run. Used both when the store loop itself fails partway through
-        // (ITEM 3) and when a pre-persist drift check aborts after the loop
-        // completed successfully (ITEM 4).
-        const rollbackThisRunsVaultWrites = async (): Promise<void> => {
-          for (const fieldId of newlyWrittenFieldIds) {
-            try {
-              await vault.delete(inventorySecretKey(source.id, fieldId));
-            } catch {
-              // best-effort rollback — ignore
-            }
-          }
-          for (const [fieldId, previousValue] of overwrittenPreviousValues) {
-            try {
-              await vault.store(inventorySecretKey(source.id, fieldId), previousValue);
-            } catch {
-              // best-effort rollback — ignore
-            }
-          }
-        };
-
-        try {
-          for (const [fieldId, value] of Object.entries(reenteredSecrets)) {
-            // Classify by actual vault state, not by secretFieldIds
-            // membership — see FINDING 1 comment above the declarations.
-            const previousValue = await vault.get(inventorySecretKey(source.id, fieldId));
-            await vault.store(inventorySecretKey(source.id, fieldId), value);
-            if (previousValue !== undefined) {
-              overwrittenPreviousValues.set(fieldId, previousValue);
-            } else {
-              newlyWrittenFieldIds.push(fieldId);
-            }
-          }
-        } catch {
-          // ITEM 3 — a later field's store rejecting after earlier ones in
-          // THIS loop succeeded must not leave those earlier writes stuck:
-          // an overwritten field's old value would otherwise be lost even
-          // though the update as a whole never took effect, and a brand-new
-          // field's key would otherwise be orphaned exactly like FINDING B on
-          // the add path.
-          await rollbackThisRunsVaultWrites();
-          void vscode.window.showErrorMessage("Could not store credentials in the system keychain — the source was not updated.");
-          return false;
-        }
-
-        // FINDING 2 — a password field in the CURRENT schema counts as stored
-        // for this source when it was just re-entered, or when it's a kept
-        // (left-blank) field that already had a saved vault value — never
-        // merely because the schema declares it. A field dropped from the
-        // schema entirely, or an optional field that has never had a value
-        // saved, is excluded.
-        const newSecretFieldIds = provider.configFields
-          .filter((f) => f.type === "password" && (reenteredSecrets[f.id] !== undefined || existingSecretFieldIds.has(f.id)))
-          .map((f) => f.id);
-
-        const updated: InventorySourceConfig = { ...source, name, targetFolder, prunePolicy, defaultUsername, config, secretFieldIds: newSecretFieldIds };
-
-        // ITEM 4 — re-read the record immediately before persisting. configCommands
-        // flows (importMergeReplace, completeReset) mutate inventory sources
-        // directly and bypass inFlightSourceIds entirely, so an import/reset can
-        // complete while the user still sits in these prompts. Persisting `updated`
-        // (built from the pick-time `source`) over that would silently overwrite
-        // the imported record (and FINDING 3's stale-key cleanup below would then
-        // delete the imported source's own vault keys), or resurrect a source the
-        // user just reset away. `source` is the exact pick-time record — compared
-        // on both config (sourceConfigUnchanged) and name, since name isn't part
-        // of that comparator. Now that the store loop above also runs inside this
-        // same lock acquisition, an import/reset can no longer land BETWEEN the
-        // stores and this check either — it either completed entirely before this
-        // acquisition started, or will wait for this one to finish first.
-        const currentSourceBeforePersist = core.getInventorySource(source.id);
-        if (!currentSourceBeforePersist || !sourceConfigUnchanged(currentSourceBeforePersist, source) || currentSourceBeforePersist.name !== source.name) {
-          await rollbackThisRunsVaultWrites();
-          void vscode.window.showErrorMessage("Inventory source changed while editing — reopen Edit Source.");
-          return false;
-        }
-
-        // FINDING 1 — persist BEFORE any vault cleanup. If persistence rejects,
-        // the pre-existing secretFieldIds keys must be left untouched (they're
-        // still the keys the last-known-good source record points at), and any
-        // brand-new keys written above must be rolled back (best-effort — a
-        // delete failure here must not mask the original persistence error).
-        // FINDING C — additionally, any re-entered field that OVERWROTE an
-        // existing value gets that captured previous value restored, so the
-        // vault matches the reverted (last-known-good) source record.
-        try {
-          await core.addOrUpdateInventorySource(updated);
-        } catch {
-          await rollbackThisRunsVaultWrites();
-          void vscode.window.showErrorMessage(`Could not save inventory source "${name}" — the update was not applied.`);
-          return false;
-        }
-
-        // FINDING 3 — vault keys for ids that were in the OLD secretFieldIds but
-        // fell out of the new set (dropped from the provider schema, or simply
-        // never re-stored) are orphaned: remove-source/reset/backup only walk
-        // secretFieldIds, so a stale vault entry would live forever otherwise.
-        // Deleted only AFTER the updated source is successfully persisted —
-        // deleting them first would destroy still-referenced credentials if the
-        // persist below then failed (FINDING 1).
-        // ITEM 8 — each stale-key delete is independent and best-effort: one
-        // rejection must neither throw out of an otherwise-successful edit nor
-        // block the remaining stale keys from being cleaned up.
-        const newSecretFieldIdSet = new Set(newSecretFieldIds);
-        for (const staleId of source.secretFieldIds) {
-          if (!newSecretFieldIdSet.has(staleId)) {
-            const staleKey = inventorySecretKey(source.id, staleId);
-            try {
-              await vault.delete(staleKey);
-            } catch (error) {
-              console.warn(`[Nexus] Failed to delete stale inventory secret key "${staleKey}":`, error);
-            }
-          }
-        }
-
-        return true;
-      });
-      if (!persisted) return;
-
-      const folderNote = targetFolder !== source.targetFolder ? " Servers move to the new folder on the next sync." : "";
-      void vscode.window.showInformationMessage(`Inventory source "${name}" updated.${folderNote}`);
-    } finally {
-      inFlightSourceIds.delete(source.id);
-    }
+        const folderNote = updated.targetFolder !== source.targetFolder ? " Servers move to the new folder on the next sync." : "";
+        void vscode.window.showInformationMessage(`Inventory source "${updated.name}" updated.${folderNote}`);
+      },
+      onTest: (values) => handleFormTest(values, provider, source.name, source)
+    });
+    panel.onDidDispose(releaseInFlight);
   }
 
   async function removeSource(): Promise<void> {
