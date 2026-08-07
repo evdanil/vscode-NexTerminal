@@ -1053,16 +1053,29 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // just after is fire-and-forget (`void`, never awaited) and stays
           // outside the lock regardless.
           await configMutationLock.runExclusive(async () => {
-            // FINDING 2 (P2, edit-rollback review) — capture the prior
-            // record and the prior proxy-secret value BEFORE this
-            // generation's writes land, inside this same lock acquisition,
-            // so the capture reflects exactly what's about to be
-            // overwritten (not a stale pre-lock read). syncProxyPasswordSecret
-            // only ever touches proxyPasswordSecretKey(existing.id) — see its
-            // definition above — and the server id never changes across an
-            // edit, so there is exactly one secret slot to capture and
-            // restore regardless of what the proxy identity changed to.
-            const priorRecord = existing;
+            // FINDING 1 (P2, edit-rollback-staleness review) — capture the
+            // LIVE record via ctx.core.getServer(existing.id), not the
+            // form-open `existing` snapshot, and do it here — inside the
+            // lock, immediately before this generation's write lands. An
+            // edit or deletion committed between form-open and lock
+            // acquisition (there is no drift guard blocking that window;
+            // see below) means `existing` can already be stale by the time
+            // we get here. Rolling back to it on a failed secret write
+            // would silently erase that intervening edit, or — if the
+            // record was deleted in the meantime — resurrect a server the
+            // user just removed. Capturing the live value under the same
+            // lock acquisition that's about to overwrite it means the
+            // rollback always restores exactly what this submission
+            // clobbered, not whatever was on screen when the form opened.
+            //
+            // No drift guard: this deliberately does NOT block the edit
+            // from proceeding when the live record differs from (or is
+            // absent from) the form-open snapshot — last-writer-wins is
+            // the existing behavior for the happy path too (addOrUpdateServer
+            // unconditionally overwrites by id). Proceeding and relying on
+            // the live-snapshot rollback below to undo cleanly on failure
+            // is an accepted, intentional scope limit for this fix.
+            const liveRecord = ctx.core.getServer(existing.id);
             const proxySecretKey = proxyPasswordSecretKey(existing.id);
             const priorSecretValue = ctx.secretVault ? await ctx.secretVault.get(proxySecretKey) : undefined;
             await ctx.core.addOrUpdateServer(updated);
@@ -1072,12 +1085,20 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               // The record above just committed to the NEW generation, but
               // its proxy secret never did — left alone, the new record
               // would pair with the OLD password while the form reports
-              // failure. Restore both, best-effort. A restore failure is
-              // reported honestly (rather than retried or silently
-              // swallowed) since it means the vault or the record no longer
-              // matches either generation.
+              // failure. Restore the LIVE pre-submit value captured above:
+              // if a record existed live, put it back; if the record was
+              // already gone (deleted mid-flight), remove the one this
+              // submission just created rather than reviving anything. Both
+              // are best-effort. A restore failure is reported honestly
+              // (rather than retried or silently swallowed) since it means
+              // the vault or the record no longer matches either
+              // generation.
               try {
-                await ctx.core.addOrUpdateServer(priorRecord);
+                if (liveRecord) {
+                  await ctx.core.addOrUpdateServer(liveRecord);
+                } else {
+                  await ctx.core.removeServer(existing.id);
+                }
               } catch {
                 void vscode.window.showErrorMessage(
                   `Could not restore server "${existing.name}" to its previous settings after a failed save — re-check its record.`

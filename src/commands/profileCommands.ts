@@ -99,10 +99,21 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
             // failure must not mask the original secret-storage error, and
             // there is nothing further below this span to make it not
             // best-effort against.
+            //
+            // FINDING 2 (P2, create-rollback-report review) — removeServer's
+            // own persist can itself reject (e.g. the same storage backend
+            // that just rejected the secret write is unavailable). When that
+            // happens the in-memory delete already landed but disk still has
+            // the record — it reappears after a reload — while the generic
+            // "was not created" message would tell the user the opposite of
+            // what actually happened. Track that failure separately and swap
+            // in wording that tells the truth: the record may still be
+            // there and needs manual cleanup.
+            let removeFailed = false;
             try {
               await ctx.core.removeServer(server.id);
             } catch {
-              // best-effort rollback — ignore
+              removeFailed = true;
             }
             if (ctx.secretVault) {
               try {
@@ -110,6 +121,11 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
               } catch {
                 // best-effort rollback — ignore
               }
+            }
+            if (removeFailed) {
+              throw new Error(
+                `Could not store proxy credentials for "${server.name}" and the partially created server could not be removed — delete it manually if it appears.`
+              );
             }
             throw new Error(`Could not store proxy credentials for "${server.name}" — the server was not created.`);
           }

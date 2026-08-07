@@ -367,4 +367,71 @@ describe("openUnifiedForm SSH submit — create rollback on secret-storage failu
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-new"));
     expect(secrets.has(proxyPasswordSecretKey("srv-new"))).toBe(false);
   });
+
+  it("(FINDING 2, P2) reports that the partially created server could not be removed, instead of claiming it was never created, when removeServer's own rollback persist rejects", async () => {
+    const servers = new Map<string, { id: string; name: string }>();
+    const secrets = new Map<string, string>();
+    const addOrUpdateServer = vi.fn(async (server: { id: string; name: string }) => {
+      servers.set(server.id, server);
+    });
+    // removeServer's in-memory delete would normally happen before its
+    // persist call rejects (mirroring NexusCore.removeServer: delete from
+    // the Map, THEN await repository.saveServers) — but from this call
+    // site's point of view all that matters is that the call rejects, so
+    // the record in `servers` here stands untouched, matching "the record
+    // is still on disk after a reload".
+    const removeServer = vi.fn(async () => {
+      throw new Error("disk unavailable");
+    });
+    const secretDelete = vi.fn(async (key: string) => {
+      secrets.delete(key);
+    });
+    const ctx = {
+      core: {
+        getSnapshot: vi.fn(() => ({ servers: [], authProfiles: [] })),
+        getAuthProfile: vi.fn(),
+        addOrUpdateServer,
+        removeServer,
+        addOrUpdateSerialProfile: vi.fn(),
+        addOrUpdateLocalShellProfile: vi.fn()
+      },
+      secretVault: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: secretDelete
+      }
+    } as any;
+
+    mockSyncProxyPasswordSecret.mockImplementation(async () => {
+      throw new Error("keychain unavailable");
+    });
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+
+    // Kill check: a wrong implementation (the original code, which ignores
+    // the removeServer rejection with a bare best-effort catch and always
+    // throws the generic "was not created" message) would satisfy a
+    // `/was not created/i` assertion — that message lies about the outcome
+    // when removeServer failed. This test instead pins the exact
+    // could-not-be-removed wording, which the reverted implementation never
+    // produces (it has no removeFailed branch at all), so it fails against
+    // that prior behavior.
+    let caught: unknown;
+    try {
+      await onSubmit({ profileType: "ssh", name: "New Server", host: "example.com", username: "me" });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toBe(
+      'Could not store proxy credentials for "New Server" and the partially created server could not be removed — delete it manually if it appears.'
+    );
+    expect((caught as Error).message).not.toMatch(/the server was not created/i);
+
+    expect(removeServer).toHaveBeenCalledWith("srv-new");
+    // The secret delete stays best-effort regardless of the removeServer
+    // outcome.
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-new"));
+  });
 });

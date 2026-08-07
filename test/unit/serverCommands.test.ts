@@ -199,7 +199,12 @@ function setupHarness(options: {
     };
   });
   const disconnectPool = vi.fn();
-  const removeServer = vi.fn(async () => {});
+  const removeServer = vi.fn(async (serverId: string) => {
+    snapshot = {
+      ...snapshot,
+      servers: snapshot.servers.filter((item) => item.id !== serverId)
+    };
+  });
   const addOrUpdateServer = vi.fn(async (server: ServerConfig) => {
     snapshot = {
       ...snapshot,
@@ -1963,5 +1968,112 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // read back the prior "old-proxy-pw".
     const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
     expect(finalSecret).toBe("old-proxy-pw");
+  });
+
+  it("(FINDING 1, P2) restores the LIVE record committed between form-open and lock acquisition, not the stale form-open snapshot, when the secret write then fails", async () => {
+    const { ctx, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()],
+      initialSecrets: {}
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    // Open the edit form — this synchronously captures `existing` as
+    // today's "Server 1" / "example.com" record.
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // Simulate a DIFFERENT edit committing while this form is still open —
+    // e.g. another submission, or an inventory sync — landing between
+    // form-open and this submission reaching the lock.
+    const intervening = makeServer({ name: "Intervening Name", host: "intervening.example.com" });
+    await ctx.core.addOrUpdateServer(intervening);
+
+    // Now the proxy-secret write for THIS (stale) submission fails.
+    secretStore.mockRejectedValueOnce(new Error("keychain unavailable"));
+
+    await expect(
+      options.onSubmit({
+        name: "Server 1",
+        host: "example.com",
+        port: 22,
+        username: "dev",
+        authType: "password",
+        proxyType: "socks5",
+        proxySocks5Host: "new-proxy.example.com",
+        proxySocks5Port: 1080,
+        proxySocks5Username: "proxyuser",
+        proxySocks5Password: "new-proxy-pw"
+      })
+    ).rejects.toThrow(/changes were not saved/i);
+
+    // Kill check: the original implementation captured `priorRecord =
+    // existing` (the form-open snapshot) instead of reading
+    // ctx.core.getServer(existing.id) inside the lock. Against that
+    // implementation, the rollback would restore "Server 1" /
+    // "example.com" here, silently erasing the intervening edit. This
+    // assertion only passes when the rollback restored the INTERVENING
+    // live record instead.
+    const finalRecord = ctx.core.getServer("srv-1");
+    expect(finalRecord?.name).toBe("Intervening Name");
+    expect(finalRecord?.host).toBe("intervening.example.com");
+  });
+
+  it("(FINDING 1, P2) removes the record it just created rather than resurrecting the form-open snapshot, when the live record was deleted between form-open and lock acquisition", async () => {
+    const { ctx, removeServer, secretStore } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()],
+      initialSecrets: {}
+    });
+
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+
+    // `existing` has already been captured (as "Server 1") synchronously
+    // inside editCmd, above. Simulate the record being deleted by
+    // something else before this submission reaches the lock: the very
+    // next ctx.core.getServer call — the live-record read taken inside
+    // the lock, right before this generation's write — returns undefined,
+    // as if a concurrent nexus.server.remove had already run.
+    vi.mocked(ctx.core.getServer).mockReturnValueOnce(undefined);
+
+    secretStore.mockRejectedValueOnce(new Error("keychain unavailable"));
+
+    await expect(
+      options.onSubmit({
+        name: "Server 1",
+        host: "example.com",
+        port: 22,
+        username: "dev",
+        authType: "password",
+        proxyType: "socks5",
+        proxySocks5Host: "new-proxy.example.com",
+        proxySocks5Port: 1080,
+        proxySocks5Username: "proxyuser",
+        proxySocks5Password: "new-proxy-pw"
+      })
+    ).rejects.toThrow(/changes were not saved/i);
+
+    // Kill check: the original implementation would unconditionally call
+    // addOrUpdateServer(priorRecord) where priorRecord is the form-open
+    // `existing` snapshot — resurrecting "Server 1" even though it was
+    // deleted mid-flight, and never calling removeServer at all. This
+    // assertion fails against that implementation.
+    expect(removeServer).toHaveBeenCalledWith("srv-1");
+    const finalRecord = ctx.core.getServer("srv-1");
+    expect(finalRecord).toBeUndefined();
   });
 });
