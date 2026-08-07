@@ -107,6 +107,20 @@ export class NexusCore {
   private readonly explicitGroups = new Set<string>();
   private readonly authProfiles = new Map<string, AuthProfile>();
   private readonly inventorySources = new Map<string, InventorySourceConfig>();
+  // TOMBSTONE (rollback-vs-live-close race) — set while applyInventorySyncPlan
+  // has captured pre-batch session state and is awaiting its persist. Session
+  // lifecycle callbacks (onSessionClosed -> unregisterSession) are NOT
+  // serialized against this window by configMutationLock, so a terminal the
+  // user closes while the batch's save is in flight legitimately removes its
+  // session bookkeeping concurrently with the batch. If that save then fails
+  // and applyInventorySyncPlan rolls back, it must NOT resurrect a session
+  // that was tombstoned during the window: unregisterSession records here any
+  // session id it removes while inventorySyncApplyInFlight is true, and
+  // applyInventorySyncPlan consults this set before re-inserting a captured
+  // session or restoring focusedSessionId to one. Scoped to
+  // applyInventorySyncPlan only — no other mutator sets or reads this.
+  private inventorySyncApplyInFlight = false;
+  private readonly inventorySyncTombstonedSessionIds = new Set<string>();
 
   public constructor(private readonly repository: ConfigRepository) {}
 
@@ -447,13 +461,19 @@ export class NexusCore {
     }
     // removeServerSessions (below) only ever touches activeSessions,
     // activitySessionIds, and focusedSessionId — mirror exactly that here.
-    // FINDING 3 — sessions are restored unconditionally on rollback (no
-    // reference/presence check like servers/groups get below). Unlike
-    // servers or groups, session removal is never raced by another command:
-    // active sessions are only ever unregistered via this same serialized
-    // command path (removeServerSessions, called only from here), so nothing
-    // else can have mutated activeSessions/focusedSessionId for these ids
-    // while this batch's persist was in flight.
+    // FINDING 3 — sessions are restored on rollback with no reference/
+    // presence check like servers/groups get below (a concurrent addGroup or
+    // addOrUpdateServer can't touch these session maps). But unlike servers
+    // or groups, session removal here CAN be raced by something outside this
+    // serialized command path: NexusCore.unregisterSession (the public API
+    // fired by the terminal-close -> onSessionClosed handler) is NOT gated
+    // by configMutationLock, so a terminal the user closes for real while
+    // this batch's persist is in flight can legitimately remove one of these
+    // very sessions in between the capture below and the rollback further
+    // down. See the TOMBSTONE mechanism (inventorySyncApplyInFlight /
+    // inventorySyncTombstonedSessionIds) guarding the rollback below — a
+    // session torn down that way is excluded from restoration rather than
+    // resurrected.
     const priorFocusedSessionId = this.focusedSessionId;
     const priorActiveSessions = new Map<string, ActiveSession>();
     const priorActivitySessionIds = new Set<string>();
@@ -529,6 +549,16 @@ export class NexusCore {
     // state. Awaiting allSettled first guarantees every original has already
     // committed (or definitively failed) before rollback/compensation touch
     // anything, so the compensating write is always the last one to land.
+    //
+    // TOMBSTONE — from here until this call resolves/rejects, session
+    // lifecycle callbacks are NOT serialized against this batch: a terminal
+    // the user closes while these saves are pending fires
+    // onSessionClosed -> unregisterSession concurrently with this await.
+    // Mark the window "in flight" so unregisterSession records any id it
+    // genuinely removes during it; the rollback below must not resurrect
+    // those ids from priorActiveSessions/priorFocusedSessionId.
+    this.inventorySyncApplyInFlight = true;
+    this.inventorySyncTombstonedSessionIds.clear();
     const results = await Promise.allSettled([
       this.repository.saveServers([...this.servers.values()]),
       this.repository.saveGroups([...this.explicitGroups]),
@@ -606,13 +636,24 @@ export class NexusCore {
       for (const group of addedExplicitGroups) {
         this.explicitGroups.delete(group);
       }
+      // TOMBSTONE — a captured session that was genuinely torn down by
+      // unregisterSession during the awaited persist (window opened just
+      // above) must NOT be resurrected here: the terminal is actually gone,
+      // and re-inserting it would leave isServerConnected/focus pointing at
+      // a dead session.
       for (const [sessionId, session] of priorActiveSessions) {
+        if (this.inventorySyncTombstonedSessionIds.has(sessionId)) {
+          continue;
+        }
         this.activeSessions.set(sessionId, session);
         if (priorActivitySessionIds.has(sessionId)) {
           this.activitySessionIds.add(sessionId);
         }
       }
-      this.focusedSessionId = priorFocusedSessionId;
+      this.focusedSessionId =
+        priorFocusedSessionId !== undefined && this.inventorySyncTombstonedSessionIds.has(priorFocusedSessionId)
+          ? undefined
+          : priorFocusedSessionId;
       // FINDING 2 — source record: nothing in NexusCore ever mutates an
       // InventorySourceConfig object in place (addOrUpdateInventorySource,
       // removeInventorySource, and this method itself only ever call
@@ -640,8 +681,17 @@ export class NexusCore {
         this.repository.saveGroups([...this.explicitGroups]),
         this.repository.saveInventorySources([...this.inventorySources.values()])
       ]);
+      // TOMBSTONE — apply has now definitively failed and rolled back; close
+      // the window and drop any recorded ids (they've been consulted above
+      // and must not leak into a later, unrelated apply).
+      this.inventorySyncApplyInFlight = false;
+      this.inventorySyncTombstonedSessionIds.clear();
       throw firstRejection.reason;
     }
+    // TOMBSTONE — apply succeeded; close the window (nothing to roll back,
+    // so any recorded ids are moot).
+    this.inventorySyncApplyInFlight = false;
+    this.inventorySyncTombstonedSessionIds.clear();
     this.emitChanged();
     return { skippedCount, removedServerIds: [...removeServerIds] };
   }
@@ -824,6 +874,13 @@ export class NexusCore {
     }
     this.activeSessions.delete(sessionId);
     this.activitySessionIds.delete(sessionId);
+    // TOMBSTONE — an applyInventorySyncPlan batch is mid-flight (see field
+    // doc above): record that this session was genuinely torn down during
+    // the window, so a subsequent rollback in that batch does not resurrect
+    // it from its pre-batch capture.
+    if (this.inventorySyncApplyInFlight) {
+      this.inventorySyncTombstonedSessionIds.add(sessionId);
+    }
     this.emitChanged();
   }
 

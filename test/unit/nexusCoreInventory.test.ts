@@ -717,6 +717,131 @@ describe("NexusCore inventory sources", () => {
     expect(core.getInventorySource("source-1")?.lastSyncAt).toBe(beforeLastSyncAt);
   });
 
+  it("(TOMBSTONE) a session closed for real while the persist is pending is NOT resurrected by rollback, but a session untouched during the window still is (kills unconditional re-insert of priorActiveSessions/focusedSessionId)", async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s1",
+        host: "h1",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      },
+      {
+        id: "srv-2",
+        name: "s2",
+        host: "h2",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 1 }
+      }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+    core.registerSession({ id: "session-1", serverId: "srv-1", terminalName: "Nexus SSH: s1", startedAt: Date.now() });
+    core.registerSession({ id: "session-2", serverId: "srv-2", terminalName: "Nexus SSH: s2", startedAt: Date.now() });
+    // Focus sits on session-1 — the one whose terminal the user will close
+    // mid-flight below, so the rollback's focusedSessionId restore is
+    // exercised too (a focus id pointing at a tombstoned session must not
+    // survive rollback).
+    core.setFocusedSession("session-1");
+
+    // A controllable, still-pending saveServers so the test can inject the
+    // mid-flight unregisterSession call before the persist settles.
+    let rejectSave!: (err: unknown) => void;
+    const pendingSave = new Promise<void>((_resolve, reject) => {
+      rejectSave = reject;
+    });
+    vi.spyOn(repository, "saveServers").mockReturnValueOnce(pendingSave);
+
+    const applyPromise = core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: ["srv-1", "srv-2"],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    // The synchronous prefix of applyInventorySyncPlan (capture priors, drop
+    // both sessions via removeServerSessions, kick off the saves) has already
+    // run by the time the call above returns — it only suspends at the
+    // `await Promise.allSettled(...)`. Simulate the user closing session-1's
+    // terminal for real during that pending window, exactly like
+    // onSessionClosed -> unregisterSession would.
+    core.unregisterSession("session-1");
+
+    rejectSave(new Error("disk full"));
+    await expect(applyPromise).rejects.toThrow("disk full");
+
+    const after = core.getSnapshot();
+    // session-1 was tombstoned by the mid-flight close: rollback must NOT
+    // resurrect it, and focus (which pointed at it) must NOT be restored to
+    // it either — both would otherwise leave bookkeeping (isServerConnected,
+    // focusedSessionId) pointing at a dead terminal.
+    expect(after.activeSessions.find((s) => s.id === "session-1")).toBeUndefined();
+    expect(core.isServerConnected("srv-1")).toBe(false);
+    expect(after.focusedSessionId).toBeUndefined();
+    // session-2 was never touched during the window: rollback restores it
+    // exactly as before, same as the plain rollback test above.
+    expect(after.activeSessions.find((s) => s.id === "session-2")).toBeDefined();
+    expect(core.isServerConnected("srv-2")).toBe(true);
+  });
+
+  it("(TOMBSTONE sanity) with no mid-window close, both captured sessions and focus are restored on rollback — unchanged from before the tombstone fix", async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s1",
+        host: "h1",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      },
+      {
+        id: "srv-2",
+        name: "s2",
+        host: "h2",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 1 }
+      }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+    core.registerSession({ id: "session-1", serverId: "srv-1", terminalName: "Nexus SSH: s1", startedAt: Date.now() });
+    core.registerSession({ id: "session-2", serverId: "srv-2", terminalName: "Nexus SSH: s2", startedAt: Date.now() });
+    core.setFocusedSession("session-1");
+
+    vi.spyOn(repository, "saveServers").mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 1000,
+        upsertServers: [],
+        removeServerIds: ["srv-1", "srv-2"],
+        folders: [],
+        expectedSource: makeSourceConfig()
+      })
+    ).rejects.toThrow("disk full");
+
+    const after = core.getSnapshot();
+    expect(after.activeSessions.find((s) => s.id === "session-1")).toBeDefined();
+    expect(after.activeSessions.find((s) => s.id === "session-2")).toBeDefined();
+    expect(after.focusedSessionId).toBe("session-1");
+  });
+
   it("(ITEM 1) success path is unchanged: applyInventorySyncPlan still performs exactly one saveServers/saveGroups call and one emission when the persist resolves", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);
