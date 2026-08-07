@@ -380,6 +380,147 @@ describe("NexusCore inventory sources", () => {
     expect(core.getSnapshot().servers).toHaveLength(1);
     expect(core.getInventorySource("source-1")?.lastSyncAt).toBe(1000);
   });
+
+  it("(FINDING 2) a partial persist (saveServers commits, saveGroups rejects) gets compensated after rollback: the repo's LAST persisted servers/groups/sources converge on the restored pre-apply state (kills restore-memory-only, leaving disk half-applied)", async () => {
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s",
+        host: "h",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    const servedServers: ServerConfig[][] = [];
+    const servedGroups: string[][] = [];
+    const servedSources: InventorySourceConfig[][] = [];
+
+    vi.spyOn(repository, "saveServers").mockImplementation(async (servers) => {
+      servedServers.push(servers);
+    });
+    let saveGroupsCallCount = 0;
+    vi.spyOn(repository, "saveGroups").mockImplementation(async (groups) => {
+      saveGroupsCallCount++;
+      if (saveGroupsCallCount === 1) {
+        // The batch's own saveGroups call rejects — nothing committed this call.
+        throw new Error("disk full");
+      }
+      servedGroups.push(groups);
+    });
+    vi.spyOn(repository, "saveInventorySources").mockImplementation(async (sources) => {
+      servedSources.push(sources);
+    });
+
+    const newServer: ServerConfig = { id: "srv-2", name: "new", host: "h2", port: 22, username: "u", authType: "agent", isHidden: false };
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 999,
+        upsertServers: [newServer],
+        removeServerIds: ["srv-1"],
+        folders: ["A/B"],
+        expectedSource: makeSourceConfig()
+      })
+    ).rejects.toThrow("disk full");
+
+    // If FINDING 2's compensating persist were reverted (restore memory only,
+    // never re-persist), servedServers/servedSources would each have exactly
+    // ONE entry — the half-applied one saveServers/saveInventorySources
+    // committed during the batch, which would then be the "last" persisted
+    // value even though memory was rolled back out from under it.
+    expect(servedServers.length).toBeGreaterThanOrEqual(2);
+    expect(servedSources.length).toBeGreaterThanOrEqual(2);
+
+    const lastServers = servedServers[servedServers.length - 1];
+    const lastSources = servedSources[servedSources.length - 1];
+    const lastGroups = servedGroups[servedGroups.length - 1];
+
+    expect(lastServers.map((s) => s.id).sort()).toEqual(["srv-1"]);
+    expect(lastGroups).toEqual([]);
+    expect(lastSources.find((s) => s.id === "source-1")?.lastSyncAt).toBeUndefined();
+
+    // In-memory state matches what was compensated to disk.
+    expect(core.getSnapshot().servers.map((s) => s.id)).toEqual(["srv-1"]);
+    expect(core.getInventorySource("source-1")?.lastSyncAt).toBeUndefined();
+  });
+
+  it("(FINDING 3) a concurrent addGroup/addOrUpdateServer landing while the batch's persist is pending survives rollback — restore is conditional, never a wholesale set replacement (kills restore-by-replacing-the-whole-set)", async () => {
+    const untouched: ServerConfig = { id: "srv-untouched", name: "u", host: "h3", port: 22, username: "u", authType: "agent", isHidden: false };
+    const repository = new InMemoryConfigRepository([
+      {
+        id: "srv-1",
+        name: "s",
+        host: "h",
+        port: 22,
+        username: "u",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+      },
+      untouched
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    // Hold the batch's own saveServers call pending so we can land concurrent
+    // commands while applyInventorySyncPlan's Promise.all is still in flight.
+    // The next call (from the concurrent addOrUpdateServer below) goes
+    // through to the real implementation.
+    const originalSaveServers = repository.saveServers.bind(repository);
+    let rejectBatchSave!: (err: Error) => void;
+    let batchCallSeen = false;
+    vi.spyOn(repository, "saveServers").mockImplementation(async (servers) => {
+      if (!batchCallSeen) {
+        batchCallSeen = true;
+        return new Promise<void>((_resolve, reject) => {
+          rejectBatchSave = reject;
+        });
+      }
+      return originalSaveServers(servers);
+    });
+
+    const newServer: ServerConfig = { id: "srv-2", name: "new", host: "h2", port: 22, username: "u", authType: "agent", isHidden: false };
+    const applyPromise = core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 999,
+      upsertServers: [newServer],
+      removeServerIds: ["srv-1"],
+      folders: ["A/B"],
+      expectedSource: makeSourceConfig()
+    });
+
+    // The batch's synchronous mutations + Promise.all invocation have already
+    // run by the time the call above returns control here (async function
+    // bodies run synchronously up to their first await).
+    await core.addGroup("Unrelated");
+    await core.addOrUpdateServer({ ...untouched, name: "renamed" });
+
+    rejectBatchSave(new Error("disk full"));
+    await expect(applyPromise).rejects.toThrow("disk full");
+
+    const snapshot = core.getSnapshot();
+    // The batch's own mutations were reverted.
+    expect(core.getServer("srv-1")).toBeDefined();
+    expect(core.getServer("srv-2")).toBeUndefined();
+    expect(snapshot.explicitGroups).not.toContain("A");
+    expect(snapshot.explicitGroups).not.toContain("A/B");
+
+    // If the fix were reverted to a wholesale restore (explicitGroups.clear()
+    // + re-add the pre-batch set; servers restored unconditionally from the
+    // pre-batch snapshot), these concurrent mutations — which the batch never
+    // touched — would be erased even though they landed after the batch's
+    // own mutations. They must survive.
+    expect(snapshot.explicitGroups).toContain("Unrelated");
+    expect(core.getServer("srv-untouched")?.name).toBe("renamed");
+  });
 });
 
 describe("validateInventorySource", () => {

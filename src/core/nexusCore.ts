@@ -268,7 +268,6 @@ export class NexusCore {
     // told the sync failed — and the next unrelated persist (any other
     // saveServers/saveGroups/saveInventorySources call) would flush that
     // half-applied state to disk for real.
-    const priorExplicitGroups = new Set(this.explicitGroups);
     const priorServers = new Map<string, ServerConfig | undefined>();
     const captureServerPrior = (id: string): void => {
       if (!priorServers.has(id)) {
@@ -283,6 +282,13 @@ export class NexusCore {
     }
     // removeServerSessions (below) only ever touches activeSessions,
     // activitySessionIds, and focusedSessionId — mirror exactly that here.
+    // FINDING 3 — sessions are restored unconditionally on rollback (no
+    // reference/presence check like servers/groups get below). Unlike
+    // servers or groups, session removal is never raced by another command:
+    // active sessions are only ever unregistered via this same serialized
+    // command path (removeServerSessions, called only from here), so nothing
+    // else can have mutated activeSessions/focusedSessionId for these ids
+    // while this batch's persist was in flight.
     const priorFocusedSessionId = this.focusedSessionId;
     const priorActiveSessions = new Map<string, ActiveSession>();
     const priorActivitySessionIds = new Set<string>();
@@ -297,23 +303,37 @@ export class NexusCore {
       }
     }
 
+    // FINDING 3 — track exactly what THIS batch writes, so a rejected persist
+    // can roll back conditionally instead of wholesale: another command
+    // (addGroup, addOrUpdateServer, ...) can run concurrently while the
+    // Promise.all below is pending, and an unconditional restore would erase
+    // its newer state along with this batch's own mutations.
+    const batchWrittenServers = new Map<string, ServerConfig | undefined>(); // undefined = this batch deleted it
+    const addedExplicitGroups = new Set<string>(); // paths this batch added that were NOT already present
+
     for (const folder of apply.folders) {
       const normalized = normalizeFolderPath(folder);
       if (!normalized) {
         continue;
       }
       for (const ancestor of getAncestorPaths(normalized)) {
-        this.explicitGroups.add(ancestor);
+        if (!this.explicitGroups.has(ancestor)) {
+          this.explicitGroups.add(ancestor);
+          addedExplicitGroups.add(ancestor);
+        }
       }
     }
     for (const id of apply.removeServerIds) {
       this.servers.delete(id);
       this.removeServerSessions(id);
+      batchWrittenServers.set(id, undefined);
     }
     for (const server of apply.upsertServers) {
       this.servers.set(server.id, server);
+      batchWrittenServers.set(server.id, server);
     }
-    this.inventorySources.set(source.id, { ...source, lastSyncAt: apply.syncedAt });
+    const writtenSourceRecord = { ...source, lastSyncAt: apply.syncedAt };
+    this.inventorySources.set(source.id, writtenSourceRecord);
     try {
       await Promise.all([
         this.repository.saveServers([...this.servers.values()]),
@@ -321,16 +341,31 @@ export class NexusCore {
         this.repository.saveInventorySources([...this.inventorySources.values()])
       ]);
     } catch (error) {
-      this.explicitGroups.clear();
-      for (const group of priorExplicitGroups) {
-        this.explicitGroups.add(group);
-      }
+      // FINDING 3 — servers: restore the prior entry only if the current
+      // entry is still reference-identical to what this batch wrote (or
+      // still absent where this batch deleted it). If a concurrent command
+      // changed it since, leave the newer value alone.
       for (const [id, priorServer] of priorServers) {
+        const batchValue = batchWrittenServers.get(id);
+        const current = this.servers.get(id);
+        const stillOurs = batchValue === undefined ? current === undefined : current === batchValue;
+        if (!stillOurs) {
+          continue;
+        }
         if (priorServer) {
           this.servers.set(id, priorServer);
         } else {
           this.servers.delete(id);
         }
+      }
+      // FINDING 3 — explicitGroups: this batch only ever ADDS paths, so
+      // rollback only removes paths THIS batch added that are still present.
+      // A concurrently-added identical path can't be distinguished from ours
+      // and is acceptably removed too — but we never do a wholesale set
+      // replacement here, which would erase unrelated concurrent addGroup
+      // calls entirely.
+      for (const group of addedExplicitGroups) {
+        this.explicitGroups.delete(group);
       }
       for (const [sessionId, session] of priorActiveSessions) {
         this.activeSessions.set(sessionId, session);
@@ -339,7 +374,26 @@ export class NexusCore {
         }
       }
       this.focusedSessionId = priorFocusedSessionId;
-      this.inventorySources.set(source.id, source);
+      // FINDING 3 — restore the source record only if it's still the exact
+      // object this batch wrote (reference compare); a concurrent edit to the
+      // same source since must not be clobbered.
+      if (this.inventorySources.get(source.id) === writtenSourceRecord) {
+        this.inventorySources.set(source.id, source);
+      }
+      // FINDING 2 — Promise.all doesn't cancel sibling writes: one of the
+      // three saves above may have already committed to disk (e.g. saveServers
+      // resolved before saveGroups rejected), leaving disk half-applied even
+      // though in-memory state was just rolled back (conditionally) to
+      // converge with what the caller is about to be told happened. Best-effort
+      // re-persist all three buckets with that (post-rollback) state so disk
+      // catches up whenever the store is actually reachable; ignore individual
+      // failures — if the store is still down, memory stays authoritative and
+      // the next successful persist heals disk.
+      await Promise.allSettled([
+        this.repository.saveServers([...this.servers.values()]),
+        this.repository.saveGroups([...this.explicitGroups]),
+        this.repository.saveInventorySources([...this.inventorySources.values()])
+      ]);
       throw error;
     }
     this.emitChanged();

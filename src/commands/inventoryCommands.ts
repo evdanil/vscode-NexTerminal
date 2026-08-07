@@ -309,13 +309,35 @@ function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[])
   return lines.join("\n");
 }
 
+/** The set of server ids the plan would actually delete (prune policy "delete"). */
+function deletePruneIds(plan: InventorySyncPlan): Set<string> {
+  return new Set(plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id));
+}
+
+// FINDING 1 — counts alone can match while the actual set of servers slated
+// for deletion differs (e.g. a concurrent import added an owned server absent
+// from the fetched tree, and something else's delete count happened to drop
+// by one) — compare the prune-"delete" server-id set too, not just counts.
 function planCountsEqual(a: InventorySyncPlan, b: InventorySyncPlan): boolean {
-  return (
-    a.adds.length === b.adds.length &&
-    a.updates.length === b.updates.length &&
-    a.prunes.length === b.prunes.length &&
-    a.unchangedCount === b.unchangedCount
-  );
+  if (
+    a.adds.length !== b.adds.length ||
+    a.updates.length !== b.updates.length ||
+    a.prunes.length !== b.prunes.length ||
+    a.unchangedCount !== b.unchangedCount
+  ) {
+    return false;
+  }
+  const idsA = deletePruneIds(a);
+  const idsB = deletePruneIds(b);
+  if (idsA.size !== idsB.size) {
+    return false;
+  }
+  for (const id of idsA) {
+    if (!idsB.has(id)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function registerInventoryCommands(
@@ -811,6 +833,18 @@ export function registerInventoryCommands(
         return;
       }
 
+      // FINDING 1 — the post-teardown final recompute (below) can turn up a
+      // different plan than the one just reconfirmed (e.g. a concurrent
+      // import added an owned server absent from the fetched tree — applying
+      // unseen would delete it). `tornDownIds` tracks every server id already
+      // torn down across re-confirmation loops so a later iteration only
+      // tears down NEWLY-deleted ids, never repeats a teardown. The loop is
+      // bounded — if the plan keeps changing out from under the user, abort
+      // rather than reconfirm forever.
+      const tornDownIds = new Set<string>();
+      let finalRecomputeMismatchCount = 0;
+      const MAX_FINAL_RECOMPUTE_MISMATCHES = 5;
+
       for (;;) {
         const buttons = plan.warnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
         const choice = await vscode.window.showInformationMessage(
@@ -852,8 +886,13 @@ export function registerInventoryCommands(
         }
 
         const application = planToApplication(recomputed, freshSource);
+        // FINDING 1 — only tear down ids not already torn down by an earlier
+        // iteration of this loop (a prior reconfirmation may have already
+        // handled some of these).
         for (const id of application.removeServerIds) {
+          if (tornDownIds.has(id)) continue;
           await teardown.teardownServerRuntime(id);
+          tornDownIds.add(id);
         }
 
         // FINDING D — the config-level check above (sourceConfigUnchanged)
@@ -898,6 +937,25 @@ export function registerInventoryCommands(
         // source record itself being replaced during this window.
         const finalPlan = computeSyncPlan({ source: freshSource, tree, currentServers: core.getSnapshot().servers, now: Date.now() });
         const finalApplication = planToApplication(finalPlan, freshSource);
+
+        // FINDING 1 — compare the post-teardown final recompute against the
+        // plan the user just reconfirmed (`recomputed`, computed right before
+        // the teardown loop above). If they differ — counts OR the actual
+        // prune-"delete" server-id set — do NOT apply unseen: loop back to
+        // the confirmation modal with the new plan. Nothing has been applied
+        // yet (applyInventorySyncPlan hasn't been called), so re-declining on
+        // the next confirmation leaves state untouched.
+        if (!planCountsEqual(recomputed, finalPlan)) {
+          finalRecomputeMismatchCount++;
+          if (finalRecomputeMismatchCount > MAX_FINAL_RECOMPUTE_MISMATCHES) {
+            void vscode.window.showErrorMessage(
+              "Inventory state keeps changing — sync aborted, run Sync Now again."
+            );
+            return;
+          }
+          plan = finalPlan;
+          continue;
+        }
 
         // FINDING E — even after the checks above, the source record could
         // still be replaced during the teardown awaits themselves (between

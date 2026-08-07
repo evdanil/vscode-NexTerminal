@@ -1060,6 +1060,66 @@ describe("inventoryCommands", () => {
       expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("configuration changed"));
     });
 
+    it("FINDING 1 — a concurrent mutation that only shows up in the post-teardown final recompute re-shows the confirmation modal instead of applying it unseen; canceling the second modal applies nothing (kills apply-without-reconfirm)", async () => {
+      const pruned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+      const repo = new InMemoryConfigRepository([pruned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        // device:1 is gone from the tree -> prune "delete". No other devices.
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+
+      const teardown = {
+        teardownServerRuntime: vi.fn(async (serverId: string) => {
+          if (serverId === "owned-1") {
+            // Simulate a concurrent import landing an owned server that the
+            // fetched tree never mentions — invisible to the plan the user
+            // just confirmed, but the post-teardown final recompute will see
+            // it as another "delete" prune (device:2 is also absent).
+            await core.addOrUpdateServer(
+              makeServer({
+                id: "owned-2",
+                name: "new-owned",
+                host: "10.0.0.2",
+                origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1 }
+              })
+            );
+          }
+        })
+      };
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete" }));
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage
+        .mockResolvedValueOnce("Apply") // first confirm
+        .mockResolvedValueOnce(undefined); // cancel the reconfirmation modal
+
+      const cmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await cmd("src-1");
+
+      // The modal was shown a SECOND time, with the updated (2-delete) plan.
+      expect(mockShowInformationMessage).toHaveBeenCalledTimes(2);
+      const secondCallDetail = (mockShowInformationMessage.mock.calls[1]?.[1] as { detail?: string } | undefined)?.detail;
+      expect(secondCallDetail).toContain("2 deleted");
+
+      // If the fix were reverted (the post-teardown final recompute applied
+      // unseen instead of looping back to reconfirm), applyInventorySyncPlan
+      // would have been called once here and owned-2 would be gone.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getSnapshot().servers.map((s) => s.id).sort()).toEqual(["owned-1", "owned-2"]);
+    });
+
     it("nothing-to-do still bumps lastSyncAt without a confirm modal", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
