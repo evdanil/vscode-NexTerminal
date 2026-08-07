@@ -420,8 +420,15 @@ describe("inventoryCommands", () => {
       const cmd = registeredCommands.get("nexus.inventory.addSource")!;
       await cmd();
 
+      // providerA and providerB both use makeProvider's default 2-field
+      // schema, so the total (7) is unambiguous before the pick happens and
+      // the picker itself is honestly labeled step 1 of that same total —
+      // not left as a bare, unnumbered title while the very next prompt says
+      // "(2/7)". Under the reverted (buggy) implementation the picker's
+      // title stays exactly "Select Inventory Provider" with no step label,
+      // so this assertion fails against that wrong implementation.
       const providerPickCall = mockShowQuickPick.mock.calls[0];
-      expect(providerPickCall[1]).toEqual(expect.objectContaining({ title: "Select Inventory Provider" }));
+      expect(providerPickCall[1]).toEqual(expect.objectContaining({ title: "Select Inventory Provider (1/7)" }));
 
       // Provider pick was actually shown -> it counts as step 1, Name is step
       // 2, and the total (7) is one higher than the single-provider case's
@@ -431,6 +438,54 @@ describe("inventoryCommands", () => {
 
       const [apiTokenCallArgs] = mockShowInputBox.mock.calls[4];
       expect((apiTokenCallArgs as { title: string }).title).toContain("(7/7)");
+    });
+
+    it("wizard step numbering — providers with different config field counts leave the total ambiguous before the pick, so the picker is labeled a bare step 1 instead of a bogus total (kills a wrong-but-confident total)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const providerA = makeProvider({ id: "fake-a", label: "Provider A" }); // 2 config fields
+      const providerB = makeProvider({
+        id: "fake-b",
+        label: "Provider B",
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "apiToken", label: "API Token", type: "password", required: true },
+          { id: "extra", label: "Extra", type: "string", required: false }
+        ]
+      }); // 3 config fields
+      registry.register(providerA);
+      registry.register(providerB);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      mockShowQuickPick
+        .mockResolvedValueOnce({ label: providerA.label, provider: providerA }) // provider pick
+        .mockResolvedValueOnce({ value: "orphan" }); // prune policy
+      mockShowInputBox
+        .mockResolvedValueOnce("My NetBox") // name
+        .mockResolvedValueOnce("Infra") // target folder
+        .mockResolvedValueOnce("admin") // default username
+        .mockResolvedValueOnce("netbox.local") // host field
+        .mockResolvedValueOnce("secret-token"); // apiToken field
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+
+      // providerA (2 fields) and providerB (3 fields) disagree on total step
+      // count, and which one the user picks isn't known when the picker's
+      // title is built — so it must not print a total that could be wrong
+      // for whichever provider actually gets chosen (here providerA -> 7,
+      // but providerB would have been 8).
+      const providerPickCall = mockShowQuickPick.mock.calls[0];
+      expect(providerPickCall[1]).toEqual(expect.objectContaining({ title: "Select Inventory Provider (Step 1)" }));
+      expect((providerPickCall[1] as { title: string }).title).not.toMatch(/\(1\/\d+\)/);
+
+      // The rest of the wizard is unaffected — Name still starts at step 2
+      // of the total for the provider actually chosen (providerA -> 7).
+      const [nameCallArgs] = mockShowInputBox.mock.calls[0];
+      expect((nameCallArgs as { title: string }).title).toContain("(2/7)");
     });
   });
 

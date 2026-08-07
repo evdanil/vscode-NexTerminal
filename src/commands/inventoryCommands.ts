@@ -191,9 +191,21 @@ async function promptProviderPick(registry: InventoryProviderRegistry): Promise<
   if (providers.length === 1) {
     return { provider: providers[0], shown: false };
   }
+  // M1-minimum step numbering, continued: when the picker is actually shown
+  // it occupies step 1 of the wizard (addSource numbers the Name prompt right
+  // after it as step 2), but the picker's own title has to be decided BEFORE
+  // the user picks — and the total step count depends on the chosen
+  // provider's configFields.length, which isn't known yet. When every
+  // registered provider agrees on a field count, the total is the same no
+  // matter which one gets picked, so title it plainly as "(1/N)"; when they
+  // disagree, fall back to an untotaled "(Step 1)" rather than print a number
+  // that could turn out wrong once the user's actual choice is known.
+  const fixedSteps = 5; // provider pick + name + folder + username + prune policy
+  const fieldCounts = new Set(providers.map((provider) => provider.configFields.length));
+  const stepLabel = fieldCounts.size === 1 ? `(1/${fixedSteps + providers[0].configFields.length})` : "(Step 1)";
   const pick = await vscode.window.showQuickPick(
     providers.map((provider) => ({ label: provider.label, provider })),
-    { title: "Select Inventory Provider" }
+    { title: `Select Inventory Provider ${stepLabel}` }
   );
   return pick ? { provider: pick.provider, shown: true } : undefined;
 }
