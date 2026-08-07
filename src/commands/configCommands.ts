@@ -1099,6 +1099,16 @@ export async function captureBackupStateForExport(
   };
   inventorySources: InventorySourceConfig[];
   inventorySourceSecrets: Record<string, Record<string, string>>;
+  // FINDING 1 (P2, secrets review) — count of sources for which at least one declared
+  // secretFieldId came back empty from vault.get (a locked/unavailable keychain, most
+  // commonly). Previously these secrets were just omitted from the bucket with no signal
+  // anywhere: the record still exported cleanly, so a replace-restore of that backup would
+  // re-import the source, its per-source secret-restore loop would iterate zero fields
+  // (nothing to fail on), and the whole import would report success for a source that in
+  // fact has no credentials to sync with. Surfaced by exportBackup as a warning appended to
+  // its completion message — a stuck keychain shouldn't block backing up everything else, so
+  // this is a count to warn with, not a reason to abort the export.
+  sourcesWithMissingSecrets: number;
 }> {
   return configMutationLock.runExclusive(async () => {
     // Fresh read taken INSIDE the lock — an earlier top-of-export snapshot
@@ -1131,13 +1141,17 @@ export async function captureBackupStateForExport(
     }
 
     const inventorySourceSecrets: Record<string, Record<string, string>> = {};
+    let sourcesWithMissingSecrets = 0;
     for (const source of inventorySources) {
       const fields: Record<string, string> = {};
+      let missingAny = false;
       for (const fieldId of source.secretFieldIds) {
         const value = await vault.get(inventorySecretKey(source.id, fieldId));
         if (value) fields[fieldId] = value;
+        else missingAny = true;
       }
       if (Object.keys(fields).length > 0) inventorySourceSecrets[source.id] = fields;
+      if (missingAny) sourcesWithMissingSecrets++;
     }
 
     return {
@@ -1146,7 +1160,8 @@ export async function captureBackupStateForExport(
       authProfiles,
       authProfileSecrets: { passwords: authProfilePasswords, passphrases: authProfilePassphrases },
       inventorySources,
-      inventorySourceSecrets
+      inventorySourceSecrets,
+      sourcesWithMissingSecrets
     };
   });
 }
@@ -1235,7 +1250,14 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         const fileNote = fileCount > 0
           ? ` and ${plural(fileCount, "encrypted .ssh/script file")}`
           : "";
-        void vscode.window.showInformationMessage(`Backup saved with ${plural(count, "profile")}${fileNote} to ${uri.fsPath}`);
+        // FINDING 1 (P2, secrets review) — warn, don't abort: a locked/unavailable keychain
+        // shouldn't block backing up everything else. Appended to the SAME completion message
+        // (not a separate dialog) so it can't be missed/dismissed independently of the success
+        // notification.
+        const missingSecretsNote = captured.sourcesWithMissingSecrets > 0
+          ? ` ${captured.sourcesWithMissingSecrets} inventory source${captured.sourcesWithMissingSecrets === 1 ? "" : "s"} had unreadable credentials — the backup does not include them.`
+          : "";
+        void vscode.window.showInformationMessage(`Backup saved with ${plural(count, "profile")}${fileNote} to ${uri.fsPath}${missingSecretsNote}`);
       }
     );
   }
@@ -1800,6 +1822,27 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // this run itself created are touched; a pre-existing server that happens to share the
     // rolled-back source id is never modified.
     let convertedServerCount = 0;
+    // FINDING 2 (P2, origin-strip review) — count of the same servers whose conversion attempt
+    // (addOrUpdateServer) itself rejected. Previously this catch was silent: the warning below
+    // under-counted (a failed conversion just vanished from the tally) and, because in-memory
+    // core state can diverge from what actually made it to disk while the write is in flight,
+    // the server's origin can still point at the now-removed source after a reload — a stale
+    // "synced" badge with nothing left to manage it. That in-memory-ahead-of-disk gap is the
+    // repo-wide last-writer-wins pattern already accepted everywhere else in this file (e.g. the
+    // best-effort vault-delete/removeInventorySource rollbacks above) — no new compensation
+    // machinery belongs here. The fix is only to stop swallowing the count and say so.
+    let failedConversionCount = 0;
+    // Declared here (not inside the `inventorySourceSecrets` branch below) because the
+    // FINDING 1 (P2, secrets review) missing-credentials sweep after the restore phase needs
+    // them too, and that sweep must run whether or not this backup carried an
+    // `inventorySourceSecrets` bucket at all — a backup with none is exactly the case where
+    // every declared secretFieldId comes back empty.
+    const importedSourceIds = new Set(inventorySourceTally.importedIds);
+    const importedSourceById = new Map((data.inventorySources ?? []).map((s) => [s.id, s]));
+    // Sources handled by one of the two rollback warnings above (removed entirely, or left
+    // live-but-unremovable) — both already tell the user what to do about their credentials,
+    // so the missing-credentials sweep below skips them to avoid a redundant second warning.
+    const rolledBackSourceIds = new Set<string>();
     if (decryptedSecrets) {
       await restoreSecrets(decryptedSecrets.passwords as Record<string, string> | undefined, passwordSecretKey, vault);
       await restoreSecrets(decryptedSecrets.passphrases as Record<string, string> | undefined, passphraseSecretKey, vault);
@@ -1845,8 +1888,6 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         // buckets go through — special-casing the ordering there for inventory sources alone
         // would complicate every other bucket's call site. This per-source rollback is the
         // minimal change scoped to the one bucket that reads secrets back out of the vault.
-        const importedSourceIds = new Set(inventorySourceTally.importedIds);
-        const importedSourceById = new Map((data.inventorySources ?? []).map((s) => [s.id, s]));
         for (const [sourceId, fields] of Object.entries(inventorySourceSecrets)) {
           if (!importedSourceIds.has(sourceId)) continue;
           const importedSource = importedSourceById.get(sourceId);
@@ -1881,10 +1922,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
               // `imported` (the source is still counted as imported) and don't touch its
               // servers' origin — a source that still exists can still manage them.
               unremovableInventorySourceNames.push(importedSource?.name ?? sourceId);
+              rolledBackSourceIds.add(sourceId);
               continue;
             }
             imported--;
             failedInventorySourceNames.push(importedSource?.name ?? sourceId);
+            rolledBackSourceIds.add(sourceId);
 
             // FINDING 2 — the backup can also carry servers whose origin.sourceId names this
             // now-removed source. Left alone they'd stay synced-badged forever: a manually
@@ -1900,7 +1943,9 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
                 convertedServerCount++;
               } catch {
                 // Best-effort, same residue class as the vault-delete rollback above: at worst
-                // this server keeps an origin pointing at a source that no longer exists.
+                // this server keeps an origin pointing at a source that no longer exists. Counted
+                // (not silently dropped) so the closing warning can say so honestly.
+                failedConversionCount++;
               }
             }
           }
@@ -1909,18 +1954,63 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       fileRestoreResult = await restoreBackupFolders(decryptedSecrets, mode, context);
     }
 
+    // FINDING 1 (P2, secrets review) — after the secret-restore phase above, catch the case a
+    // rejected vault.store never triggers: a source that imported cleanly, and whose secret
+    // restore raised NO error, but which still ends up with NONE of its declared secretFieldIds
+    // actually present in the vault. Most commonly this is the restore-side mirror of
+    // captureBackupStateForExport's missing-secret counting on the export side — the backup
+    // simply never captured the credential (a locked/unavailable keychain at export time), so
+    // there was nothing for this restore to store no matter how cleanly the rest of the run
+    // went. The source can still be added/edited/synced against, but authentication will fail
+    // silently until the value is re-entered — so this is a warning, not a rollback: unlike the
+    // vault.store-rejection rollback above, the record itself is fine, only the secret is
+    // absent, which is exactly the state "Edit Source" exists to fix. Checked against the
+    // vault directly (not the backup payload) so it also catches a backup with no
+    // `inventorySourceSecrets` bucket at all.
+    const sourcesRestoredWithoutCredentials: string[] = [];
+    for (const sourceId of importedSourceIds) {
+      if (rolledBackSourceIds.has(sourceId)) continue;
+      const importedSource = importedSourceById.get(sourceId);
+      const declaredFieldIds = importedSource?.secretFieldIds ?? [];
+      if (declaredFieldIds.length === 0) continue;
+      let hasStoredValue = false;
+      for (const fieldId of declaredFieldIds) {
+        const value = await vault.get(inventorySecretKey(sourceId, fieldId));
+        if (value) {
+          hasStoredValue = true;
+          break;
+        }
+      }
+      if (!hasStoredValue) sourcesRestoredWithoutCredentials.push(importedSource?.name ?? sourceId);
+    }
+    if (sourcesRestoredWithoutCredentials.length > 0) {
+      const isSingle = sourcesRestoredWithoutCredentials.length === 1;
+      const names = sourcesRestoredWithoutCredentials.map((n) => `"${n}"`).join(", ");
+      void vscode.window.showWarningMessage(
+        `${isSingle ? "Source" : "Sources"} ${names} ${isSingle ? "was" : "were"} restored without credentials — re-enter them via Edit Source before syncing.`
+      );
+    }
+
     // FINDING 2 (rollback review) — surface every source rolled back above (record + secret
     // restore both undone) so the user knows to re-import or add it by hand, rather than
     // silently discovering a missing source later. Appends how many of its servers were
-    // converted to plain manual servers, when any were.
+    // converted to plain manual servers, when any were, PLUS (FINDING 2, P2, origin-strip
+    // review) how many of the SAME servers failed that conversion, when any did — both counts
+    // come from the same sweep above and are reported together rather than the failure count
+    // being silently dropped.
     if (failedInventorySourceNames.length > 0) {
       const isSingle = failedInventorySourceNames.length === 1;
       const names = failedInventorySourceNames.map((n) => `"${n}"`).join(", ");
-      const convertedNote = convertedServerCount > 0
-        ? `; ${convertedServerCount} of ${isSingle ? "its" : "their"} servers were kept as manual servers.`
-        : ".";
+      const noteParts: string[] = [];
+      if (convertedServerCount > 0) {
+        noteParts.push(`${convertedServerCount} of ${isSingle ? "its" : "their"} servers were kept as manual servers`);
+      }
+      if (failedConversionCount > 0) {
+        noteParts.push(`${failedConversionCount} servers could not be converted and may still show a synced badge — edit them to clear it`);
+      }
+      const noteTail = noteParts.length > 0 ? `; ${noteParts.join("; ")}.` : ".";
       void vscode.window.showWarningMessage(
-        `${isSingle ? "Source" : "Sources"} ${names} could not be restored — ${isSingle ? "its" : "their"} credentials failed to store; re-import or add ${isSingle ? "it" : "them"} manually${convertedNote}`
+        `${isSingle ? "Source" : "Sources"} ${names} could not be restored — ${isSingle ? "its" : "their"} credentials failed to store; re-import or add ${isSingle ? "it" : "them"} manually${noteTail}`
       );
     }
 

@@ -1540,6 +1540,36 @@ describe("backup export command", () => {
       "nexus.scripts.maxRuntimeMs": 0
     });
   });
+
+  it("FINDING 1 (P2, secrets review) — a source whose declared secret has no vault value at export time still exports its record, but the completion message warns it was left uncredentialed (kills silent omission — a reverted fix drops the secret AND says nothing, so a replace-restore of this backup would later report success for a source that can never authenticate)", async () => {
+    // src1 declares "apiToken" as a secret field but the vault is never populated for it —
+    // e.g. the keychain was locked/unavailable when this backup was taken.
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src1", name: "NetBox", secretFieldIds: ["apiToken"] }));
+
+    mockShowInputBox
+      .mockResolvedValueOnce("testpass123")
+      .mockResolvedValueOnce("testpass123");
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+    mockWriteFile.mockResolvedValue(undefined);
+
+    const backupCmd = registeredCommands.get("nexus.config.export.backup")!;
+    await backupCmd();
+
+    // The record itself still exports cleanly — the fix is a warning, not an abort.
+    const writtenData = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+    expect(writtenData.inventorySources).toHaveLength(1);
+    expect(writtenData.inventorySources[0].id).toBe("src1");
+
+    const { decrypt } = await import("../../src/utils/configCrypto");
+    const decrypted = JSON.parse(decrypt(writtenData.encryptedSecrets, "testpass123"));
+    expect(decrypted.inventorySourceSecrets.src1).toBeUndefined();
+
+    // The completion message names the gap. A reverted fix (missing count never surfaced)
+    // would call showInformationMessage with a message that does NOT contain this line.
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(
+      expect.stringContaining("1 inventory source had unreadable credentials — the backup does not include them.")
+    );
+  });
 });
 
 describe("backup import", () => {
@@ -5180,6 +5210,143 @@ describe("backup export round-trip", () => {
     // The warning reports the conversion.
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
       'Source "Source One" could not be restored — its credentials failed to store; re-import or add it manually; 2 of its servers were kept as manual servers.'
+    );
+  });
+
+  it("FINDING 2 (P2, origin-strip review) — when one of the origin-strip conversions itself rejects, the closing warning reports the successful conversion count AND the failed one separately (kills silent suppression that dropped the failure from the tally entirely)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    const backingStore = new Map<string, string>();
+    const vault: SecretVault = {
+      get: vi.fn(async (key: string) => backingStore.get(key)),
+      store: vi.fn(async (key: string, value: string) => {
+        if (key === inventorySecretKey("src1", "apiToken")) {
+          throw new Error("secret storage unavailable");
+        }
+        backingStore.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        backingStore.delete(key);
+      })
+    };
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // Two servers are imported under src1's origin. The conversion sweep's SECOND call
+    // (srv-b, once its origin has been stripped) rejects — the initial import of the server
+    // records themselves (which also goes through addOrUpdateServer, but WITH origin still
+    // intact) must succeed normally, so the mock only intercepts the origin-stripped shape.
+    const realAddOrUpdateServer = core.addOrUpdateServer.bind(core);
+    vi.spyOn(core, "addOrUpdateServer").mockImplementation(async (server: ServerConfig) => {
+      if (server.id === "srv-b" && !("origin" in server)) {
+        throw new Error("disk full");
+      }
+      return realAddOrUpdateServer(server);
+    });
+
+    const secrets = {
+      inventorySourceSecrets: {
+        src1: { apiToken: "src1-token" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [
+        makeServer({ id: "srv-a", name: "Owned A", origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1 } }),
+        makeServer({ id: "srv-b", name: "Owned B", origin: { sourceId: "src1", externalId: "dev-b", syncedAt: 1 } })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ id: "src1", name: "Source One", secretFieldIds: ["apiToken"] })],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")).toBeUndefined();
+
+    // srv-a converted cleanly.
+    expect(core.getServer("srv-a")?.origin).toBeUndefined();
+
+    // srv-b's conversion attempt rejected, so it never persisted the origin-stripped shape —
+    // the server keeps its old origin, pointing at a source that no longer exists (exactly
+    // the "may still show a synced badge" case the new warning clause names).
+    expect(core.getServer("srv-b")?.origin).toEqual({ sourceId: "src1", externalId: "dev-b", syncedAt: 1 });
+
+    // The warning reports BOTH counts. A reverted fix (catch swallowed with no counting)
+    // would call showWarningMessage with the tail truncated after "manual servers." — this
+    // exact string only matches when the failure is also surfaced.
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Source "Source One" could not be restored — its credentials failed to store; re-import or add it manually; 1 of its servers were kept as manual servers; 1 servers could not be converted and may still show a synced badge — edit them to clear it.'
+    );
+  });
+
+  it("FINDING 1 (P2, secrets review) — replace-restoring a backup whose source has no secret bucket at all still imports the source record, but the import warning names it and points at Edit Source (kills silent success — a reverted fix reports a clean import for a source that can never authenticate)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    const vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // The backup's decrypted secrets carry no bucket for src1 at all — e.g. the export ran
+    // with a locked/unavailable keychain (mirrors the export-side FINDING 1 test above).
+    const secrets = {};
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ id: "src1", name: "NetBox", secretFieldIds: ["apiToken"] })],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    // The source is imported fine — this is NOT a rollback, and the completion message
+    // reports success.
+    expect(core.getInventorySource("src1")?.name).toBe("NetBox");
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBeUndefined();
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining("Imported 1 profile"));
+
+    // The warning names the source and points at Edit Source — distinct wording from the two
+    // rollback warnings above, since the record itself is fine here. A reverted fix (no
+    // post-restore vault check) would leave this source's missing credential completely
+    // unsurfaced, reporting only a clean successful import.
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Source "NetBox" was restored without credentials — re-enter them via Edit Source before syncing.'
     );
   });
 });
