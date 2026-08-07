@@ -910,6 +910,102 @@ describe("inventoryCommands", () => {
       expect(mockWebviewOpen).toHaveBeenCalledTimes(2);
     });
 
+    it("REVIEW FINDING 2 (P2) — the busy marker is claimed BEFORE the fingerprint-mismatch modal, not after: a concurrent Sync Now while the modal is still pending is refused as busy (kills the late-claim race)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({ config: { host: "netbox.local" }, secretFieldIds: ["apiToken"], providerFingerprint: "stale-fingerprint" })
+      );
+
+      // Controllable: the fingerprint-mismatch modal (an `{modal: true}` call)
+      // stays pending until resolveModal is invoked; any OTHER
+      // showWarningMessage call (e.g. the "currently syncing" / "already
+      // syncing" busy notices, both fire-and-forget) resolves immediately —
+      // they're never awaited by their callers anyway.
+      let resolveModal!: (choice: string | undefined) => void;
+      const modalChoice = new Promise<string | undefined>((resolve) => (resolveModal = resolve));
+      mockShowWarningMessage.mockImplementation((...args: unknown[]) => {
+        const isModal = typeof args[1] === "object" && args[1] !== null && (args[1] as { modal?: boolean }).modal === true;
+        return isModal ? modalChoice : Promise.resolve(undefined);
+      });
+
+      const editCmd = registeredCommands.get("nexus.inventory.editSource")!;
+      const editPromise = editCmd();
+      // Flush microtasks: pickInventorySource's own `await` resolves, then
+      // editSource runs synchronously (busy-check, claim, provider lookup)
+      // straight into checkProviderFingerprint's `await showWarningMessage`,
+      // which suspends on our still-pending `modalChoice`.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // The OLD (wrong) implementation claims the marker only AFTER this
+      // await resolves — at this point in time it would still be unclaimed,
+      // and the concurrent Sync Now below would sail straight through the
+      // busy check, past its OWN `await checkProviderFingerprint`, and hang
+      // on the very same still-pending `modalChoice` (since the source's
+      // fingerprint is stale for syncNow too). Detect that without actually
+      // waiting out a timeout: a busy-refused Sync Now takes zero internal
+      // awaits (see its "Marked busy synchronously right after the last
+      // check above" comment) and settles within a couple of microtasks; a
+      // wrongly-admitted one stays pending, still awaiting `modalChoice`,
+      // past that same flush.
+      const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      let syncSettled = false;
+      const syncPromise = syncCmd("src-1").finally(() => {
+        syncSettled = true;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(syncSettled).toBe(true);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+
+      // Clean up: let the still-open edit modal (and, if the assertions
+      // above already failed, the still-pending sync too) resolve so nothing
+      // is left dangling past the end of the test.
+      resolveModal(undefined);
+      await Promise.all([editPromise, syncPromise]);
+    });
+
+    it("REVIEW FINDING 2 (P2) — Cancel at the fingerprint-mismatch modal releases the busy marker; a subsequent Sync Now is not refused as busy", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+      });
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({ config: { host: "netbox.local" }, secretFieldIds: ["apiToken"], providerFingerprint: "stale-fingerprint" })
+      );
+
+      // editSource's own modal: Cancel.
+      mockShowWarningMessage.mockResolvedValueOnce("Cancel");
+      const editCmd = registeredCommands.get("nexus.inventory.editSource")!;
+      await editCmd();
+      expect(mockWebviewOpen).not.toHaveBeenCalled();
+
+      // If Cancel left the marker claimed (e.g. releaseInFlight only wired
+      // for the open()-throw/dispose paths, not this one), the sync below
+      // would be refused with "already syncing" and never reach
+      // fetchInventory.
+      mockShowWarningMessage.mockResolvedValueOnce("Continue"); // syncNow's own fingerprint check (still stale)
+      const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
+      await syncCmd("src-1");
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+    });
+
     it("required-field validation — a missing required field rejects onSubmit and persists nothing", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();

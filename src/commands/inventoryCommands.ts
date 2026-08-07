@@ -985,8 +985,43 @@ export function registerInventoryCommands(
       void vscode.window.showWarningMessage(`"${source.name}" is currently syncing — try again once the sync finishes.`);
       return;
     }
+
+    // REVIEW FINDING 2 (P2) — claimed HERE, synchronously adjacent to the
+    // has()-check above (no await in between — mirrors syncNow's own
+    // "Marked busy synchronously right after the last check above" comment),
+    // NOT after the fingerprint-mismatch modal below. The fingerprint check
+    // awaits on a user decision that can sit open for an arbitrary amount of
+    // time; claiming the marker only after it returns leaves a window where
+    // this source has already passed ITS OWN not-busy check but is not yet
+    // recorded as busy, and a concurrent Sync Now (or another Edit) sails
+    // through the SAME has()-check and claims the id too. Both then run
+    // against the same source concurrently, and whichever's dispose/finally
+    // fires first deletes the shared Set entry out from under the other,
+    // which is then free to race a THIRD command in.
+    //
+    // F4 — marked busy for as long as the form stays open (submit pending,
+    // or simply left open by the user), not just for the sequential prompts
+    // the wizard used to run through — released via onDidDispose below,
+    // which fires whether the form closes because Save succeeded or because
+    // the user hit Cancel. A failed Save leaves the form (and the busy flag)
+    // in place, matching the form's own "stays open for correction" idiom
+    // rather than the wizard's "abort and unlock immediately" one.
+    //
+    // Every OTHER exit from here on (provider-missing abort, fingerprint
+    // Cancel, open() throw) must also release it — see releaseInFlight below,
+    // called at each of those points as well as from onDidDispose.
+    inFlightSourceIds.add(source.id);
+    let releasedInFlight = false;
+    const releaseInFlight = (): void => {
+      if (!releasedInFlight) {
+        releasedInFlight = true;
+        inFlightSourceIds.delete(source.id);
+      }
+    };
+
     const provider = registry.get(source.providerId);
     if (!provider) {
+      releaseInFlight();
       void vscode.window.showErrorMessage(providerMissingMessage(source.providerId));
       return;
     }
@@ -999,27 +1034,13 @@ export function registerInventoryCommands(
     // source. (Save itself already restamps unconditionally on every
     // successful edit — see persistUpdatedInventorySource's ITEM A — so this
     // gate only needs to decide whether editing may proceed at all, never a
-    // fingerprintToStamp to carry forward.)
+    // fingerprintToStamp to carry forward.) The marker was already claimed
+    // above, so a Cancel here must release it before returning.
     const fingerprintCheck = await checkProviderFingerprint(source, provider);
     if (fingerprintCheck.outcome === "cancelled") {
+      releaseInFlight();
       return;
     }
-
-    // F4 — marked busy for as long as the form stays open (submit pending,
-    // or simply left open by the user), not just for the sequential prompts
-    // the wizard used to run through — released via onDidDispose below,
-    // which fires whether the form closes because Save succeeded or because
-    // the user hit Cancel. A failed Save leaves the form (and the busy flag)
-    // in place, matching the form's own "stays open for correction" idiom
-    // rather than the wizard's "abort and unlock immediately" one.
-    inFlightSourceIds.add(source.id);
-    let releasedInFlight = false;
-    const releaseInFlight = (): void => {
-      if (!releasedInFlight) {
-        releasedInFlight = true;
-        inFlightSourceIds.delete(source.id);
-      }
-    };
 
     const existingSecretFieldIds = new Set(source.secretFieldIds);
     const definition = inventorySourceFormDefinition(provider, source);

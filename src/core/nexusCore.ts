@@ -381,14 +381,18 @@ export class NexusCore {
    *     has a "/", `normalizeFolderPath` accepts it unchanged) — defensive
    *     only. Every candidate a REAL sync ever stamps into `managedFolders`
    *     is a strict descendant of some non-root `targetFolder` (root-target
-   *     sources never populate `managedFolders` at all — GC is exempt at
-   *     root, see the call site — so a legitimately-stamped candidate always
-   *     has at least one "/"), but `validateInventorySource` accepts ANY
+   *     sources never ACCUMULATE `managedFolders` themselves — `newManaged
+   *     Folders` is unconditionally empty whenever the CURRENT `targetFolder`
+   *     is "", see the call site — so a legitimately-stamped candidate always
+   *     has at least one "/"; a root-targeted source's `previousManagedFolders`
+   *     can still be non-empty for exactly one apply, right after it was
+   *     retargeted away from a non-root value, and those inherited candidates
+   *     are still multi-segment), but `validateInventorySource` accepts ANY
    *     string array for `managedFolders`, so a legacy/imported source
    *     record could carry an arbitrary (even single-segment, root-level)
    *     path here. A single-segment candidate is treated the same as a
-   *     root-level folder and skipped, mirroring the "GC never runs at root"
-   *     rule applied to normal target folders, and
+   *     root-level folder and skipped, mirroring the "never sweep a
+   *     root-level folder" rule applied to normal target folders, and
    *   - completely empty: no server (ANY origin — manual or synced from a
    *     DIFFERENT source), serial profile, or local-shell profile currently
    *     assigned to it, AND no descendant folder that is itself still
@@ -544,9 +548,13 @@ export class NexusCore {
    *
    * ITEM B (empty-folder GC) — also returns `removedEmptyFolderCount`: how
    * many explicit folders `pruneEmptyFoldersUnderTarget` removed as part of
-   * this same batch (see that method's doc; always 0 in "absent" mode, and
-   * always 0 when `source.targetFolder` is `""` — GC never runs at the
-   * root). Zero in every case this method predates this feature.
+   * this same batch (see that method's doc; always 0 in "absent" mode). A
+   * root-targeted (`targetFolder === ""`) source never GCs anything IT
+   * SEEDED — it never accumulates `managedFolders` in the first place — but
+   * CAN still be nonzero for one that was just retargeted TO root: candidates
+   * inherited from its previous non-root target are still processed (REVIEW
+   * FINDING 1, P2), only ever at their own multi-segment path, never at the
+   * root level. Zero in every case this method predates this feature.
    */
   public async applyInventorySyncPlan(
     apply: InventorySyncApplication
@@ -795,15 +803,29 @@ export class NexusCore {
     // set. Scoped to non-"absent" applications only (REMOVAL disposition
     // leaves folders alone — the source is gone, there is nothing to sync
     // back into them, and leaving them is the documented, conservative
-    // choice) with a live `source` record (guaranteed non-"absent" branch)
-    // whose `targetFolder` is non-empty — "" (root) is deliberately EXEMPT
-    // from GC entirely: at the top level, "empty" is far more likely to mean
-    // "a folder the user manages by hand that simply has nothing in it right
-    // now" than "abandoned by a renamed/removed device", and the blast
-    // radius of a wrong removal there is every root-level folder in the
-    // workspace, not just this source's own subtree.
+    // choice) with a live `source` record (guaranteed non-"absent" branch).
+    //
+    // REVIEW FINDING 1 (P2, root retarget strands old-tree cleanup) — this
+    // call is NOT gated on `source.targetFolder !== ""` anymore. Root ("")
+    // keeps exactly ONE invariant: it never ACCUMULATES new ownership — see
+    // `newManagedFolders` above, which is unconditionally empty for a root
+    // target, so a root source's own footprint/folder-list can never seed a
+    // future GC candidate, and `pruneEmptyFoldersUnderTarget` independently
+    // refuses to ever touch a single-segment (root-level) candidate or one
+    // equal to `targetFolder` itself. What root no longer blocks is
+    // processing `gcOwnedCandidates` INHERITED from a previous non-root
+    // `targetFolder` (e.g. a source retargeted from "NetBox" to "" still
+    // carries ["NetBox/RackA"] in `previousManagedFolders` until this apply
+    // restamps it) — those candidates are multi-segment by construction and
+    // are evaluated at their own path with every existing safety check
+    // (occupancy, descendants, cross-source ownership), so gating the whole
+    // call on the CURRENT targetFolder being non-root did nothing but strand
+    // that one-time cleanup forever the moment `managedFolders` got restamped
+    // to `[]` immediately below. "Empty at the top level might be
+    // deliberate" is still honored — it just now means "never sweep a
+    // root-level folder", not "never run GC for a root-targeted source".
     const removedEmptyGroups: Set<string> =
-      apply.expectedSource !== "absent" && source && source.targetFolder !== ""
+      apply.expectedSource !== "absent" && source
         ? this.pruneEmptyFoldersUnderTarget(source.targetFolder, applicationFolderSet, gcOwnedCandidates)
         : new Set<string>();
     // FINDING 4 (focus review) — same conditional-restore principle as
