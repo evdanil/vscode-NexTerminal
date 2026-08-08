@@ -1606,11 +1606,29 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
      * as a per-server opt-out nobody chose and locks that server out of retro-apply
      * for good. Passed through untouched when there is no stamp, so a server that
      * never carried one does not acquire the field.
+     *
+     * REVIEW FINDING (P2) — the gate is `isValidServerOrigin`, not `!== undefined`.
+     * `ServerOrigin | undefined` is what the payload DECLARES, not what it can
+     * contain: `isValidExport` only checks that `servers` is an array, and
+     * `validateServerConfig` deliberately accepts a row whose `origin` is
+     * malformed (F13/FIX 5 — a bookkeeping field must not cost a server its
+     * record). So `"origin": null` on an otherwise-valid server reaches here, and
+     * `origin.syncedAuthProfileId` threw a TypeError that aborted the whole
+     * import — with everything imported before it already persisted.
+     *
+     * Anything this guard rejects is returned UNTOUCHED rather than dropped or
+     * repaired here: `addServerSanitizingOrigin` below is the one place that
+     * decides what a malformed marker costs (the origin, never the server), and
+     * it already handles null the same way it handles a numeric `externalId`.
+     * Remapping a stamp on an origin that is about to be stripped whole would be
+     * work with no reader anyway.
      */
-    const remapOriginStamp = (origin: ServerOrigin | undefined): ServerOrigin | undefined =>
-      origin === undefined || origin.syncedAuthProfileId === undefined
-        ? origin
-        : { ...origin, syncedAuthProfileId: linkToImportedProfile(origin.syncedAuthProfileId) };
+    const remapOriginStamp = (origin: ServerOrigin | undefined): ServerOrigin | undefined => {
+      if (!isValidServerOrigin(origin) || origin.syncedAuthProfileId === undefined) {
+        return origin;
+      }
+      return { ...origin, syncedAuthProfileId: linkToImportedProfile(origin.syncedAuthProfileId) };
+    };
 
     for (const server of servers) {
       let remappedProxy = server.proxy;

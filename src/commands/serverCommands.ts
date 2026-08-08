@@ -421,18 +421,52 @@ async function pickDeployConversionMode(
   return undefined;
 }
 
+/**
+ * The existing key profiles that are interchangeable with the one this flow
+ * would otherwise create — i.e. that supply the same account and the same key
+ * file as `{ username, authType: "key", keyPath: privateKeyPath }` would.
+ *
+ * REVIEW FINDING (P3) — every candidate field is read through THE ONE RULE
+ * (`authProfileOwnedCredentials`, models/config.ts), the same rule
+ * `resolveEffectiveUsername` above uses to derive `username`. A raw
+ * `profile.username === username` compared a trimmed value against an untrimmed
+ * one, so an imported profile with a padded username (`"deploy-user "` — reachable
+ * because `validateAuthProfile` only checks length) was not offered even though
+ * it is the very profile the user already has for this account and this key: the
+ * flow then prompted them to create a duplicate that behaves identically, because
+ * the connect path trims too.
+ *
+ * WHAT DOES NOT CHANGE — a profile that supplies NO usable username still
+ * matches nothing. `resolveEffectiveUsername`'s `?? server.username` fallback is
+ * NOT part of the rule and has no counterpart here: there it answers "what
+ * account does this already-chosen pairing connect as", and the server is the
+ * other half of that pairing. Here the question is "which profile supplies the
+ * account I need", and a profile that owns no username supplies none — so
+ * `undefined !== username` for every possible target, which is right. Adopting
+ * the fallback instead (`owned.username ?? username`) would make a blank-username
+ * profile match EVERY account, offering the user a known-broken record as the
+ * reusable profile for a key they just deployed.
+ *
+ * `authType` and `keyPath` read off the same rule for consistency, which is
+ * behaviour-preserving: `authType` is always owned, and
+ * `normalizeKeyPathForComparison` already trimmed what the old comparison passed
+ * it.
+ */
 function findMatchingKeyAuthProfiles(
   core: import("../core/nexusCore").NexusCore,
   username: string,
   privateKeyPath: string
 ): AuthProfile[] {
   const normalizedKeyPath = normalizeKeyPathForComparison(privateKeyPath);
-  return core.getSnapshot().authProfiles.filter((profile) =>
-    profile.authType === "key" &&
-    profile.username === username &&
-    typeof profile.keyPath === "string" &&
-    normalizeKeyPathForComparison(profile.keyPath) === normalizedKeyPath
-  );
+  return core.getSnapshot().authProfiles.filter((profile) => {
+    const owned = authProfileOwnedCredentials(profile);
+    return (
+      owned.authType === "key" &&
+      owned.username === username &&
+      owned.keyPath !== undefined &&
+      normalizeKeyPathForComparison(owned.keyPath) === normalizedKeyPath
+    );
+  });
 }
 
 function getDefaultKeyAuthProfileName(username: string, privateKeyPath: string): string {

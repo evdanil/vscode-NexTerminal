@@ -1617,6 +1617,118 @@ describe("deploy key command", () => {
     );
   });
 
+  // REVIEW FINDING (P3) — the candidate side of the same ownership rule
+  // `resolveEffectiveUsername` uses. A raw `profile.username === username`
+  // compared an untrimmed stored value against a trimmed derived one, so the
+  // existing profile for this account and this key was not offered and the flow
+  // asked the user to name a duplicate that connects identically (the connect
+  // path trims too). `showInputBox` is mocked with a name here on purpose: it
+  // lets the broken path complete, so the duplicate it creates is what fails the
+  // assertions rather than an aborted command.
+  it("offers an existing key profile whose stored username is padded, instead of prompting for a duplicate (kills comparing candidate usernames raw)", async () => {
+    const keyProfile = makeAuthProfile({
+      id: "ap-key",
+      name: "Shared Deploy Key",
+      username: "deploy-user ",
+      authType: "key",
+      keyPath: "/home/user/.ssh/id_ed25519"
+    });
+    const { ctx, addOrUpdateServer, addOrUpdateAuthProfile } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "deploy-user", authType: "password" })],
+      authProfiles: [keyProfile]
+    });
+    (ctx.sshFactory as any).connect = vi.fn(async () => ({ dispose: vi.fn() }));
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    ]);
+    vi.mocked(vscode.window.showQuickPick as any)
+      .mockResolvedValueOnce({
+        label: "id_ed25519",
+        keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+      })
+      .mockResolvedValueOnce({ label: "Shared Deploy Key — key — deploy-user  — id_ed25519", profile: keyProfile });
+    // Only the broken path reaches this: the name prompt for a NEW profile.
+    vi.mocked(vscode.window.showInputBox as any).mockResolvedValueOnce("Duplicate Profile");
+    vi.mocked(readFile).mockResolvedValueOnce("ssh-ed25519 AAAA user@example");
+    vi.mocked(deployPublicKeyToRemote).mockResolvedValueOnce({ alreadyDeployed: false });
+    vi.mocked(vscode.window.showInformationMessage as any).mockResolvedValueOnce("Use key auth profile");
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.deployKey")!("srv-1");
+
+    // The existing profile was offered and reused — no second profile for the same
+    // account and the same key, and no name prompt for one.
+    expect(addOrUpdateAuthProfile).not.toHaveBeenCalled();
+    expect(vscode.window.showInputBox).not.toHaveBeenCalled();
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "srv-1",
+        username: "deploy-user",
+        authProfileId: "ap-key",
+        authType: "key",
+        keyPath: "/home/user/.ssh/id_ed25519"
+      })
+    );
+  });
+
+  // The half of the ownership rule that deliberately does NOT carry over:
+  // `resolveEffectiveUsername`'s `?? server.username` fallback. There the server
+  // is the other half of an already-chosen pairing; here there is no such half,
+  // and a profile that owns no username supplies none. The wrong implementation
+  // this kills is `owned.username ?? username`, which matches every account and
+  // would offer this known-broken record as the reusable profile for the key.
+  it("does not offer a key profile whose stored username is whitespace-only (kills falling back to the target username on the candidate side)", async () => {
+    const blankProfile = makeAuthProfile({
+      id: "ap-blank",
+      name: "Blank Username Key",
+      username: "   ",
+      authType: "key",
+      keyPath: "/home/user/.ssh/id_ed25519"
+    });
+    const { ctx, addOrUpdateServer, addOrUpdateAuthProfile } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "deploy-user", authType: "password" })],
+      authProfiles: [blankProfile]
+    });
+    (ctx.sshFactory as any).connect = vi.fn(async () => ({ dispose: vi.fn() }));
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    ]);
+    vi.mocked(vscode.window.showQuickPick as any)
+      .mockResolvedValueOnce({
+        label: "id_ed25519",
+        keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+      })
+      // Only a matching implementation reaches this — and would link the blank profile.
+      .mockResolvedValueOnce({ label: "Blank Username Key —    — id_ed25519", profile: blankProfile });
+    vi.mocked(vscode.window.showInputBox as any).mockResolvedValueOnce("New Deploy Key Profile");
+    vi.mocked(readFile).mockResolvedValueOnce("ssh-ed25519 AAAA user@example");
+    vi.mocked(deployPublicKeyToRemote).mockResolvedValueOnce({ alreadyDeployed: false });
+    vi.mocked(vscode.window.showInformationMessage as any).mockResolvedValueOnce("Use key auth profile");
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.deployKey")!("srv-1");
+
+    expect(addOrUpdateAuthProfile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "New Deploy Key Profile",
+        username: "deploy-user",
+        authType: "key",
+        keyPath: "/home/user/.ssh/id_ed25519"
+      })
+    );
+    const createdProfile = addOrUpdateAuthProfile.mock.calls[0][0];
+    expect(createdProfile.id).not.toBe("ap-blank");
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "srv-1", username: "deploy-user", authProfileId: createdProfile.id })
+    );
+  });
+
   it("creates a new key auth profile, links it, and offers to remove stored standalone password", async () => {
     const { ctx, addOrUpdateServer, addOrUpdateAuthProfile, secretDelete } = setupHarness({
       profiles: [],

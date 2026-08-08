@@ -3132,6 +3132,63 @@ describe("share import", () => {
     expect(none.origin?.syncedUsername).toBe("dev");
   });
 
+  /**
+   * REVIEW FINDING (P2) — the stamp remap above reads a field off `origin`, and
+   * `origin` is payload data: `isValidExport` checks only that `servers` is an
+   * array, and `validateServerConfig` deliberately ACCEPTS a row whose origin is
+   * malformed (a bookkeeping field must not cost the user a server). So
+   * `"origin": null` reaches the remap on an otherwise-valid server, where
+   * `origin.syncedAuthProfileId` threw a TypeError that aborted the entire
+   * import — after the auth-profile loop ahead of it had already persisted.
+   *
+   * The fixture is built so the broken path is VISIBLE rather than merely
+   * equivalent: the null origin sits on the FIRST server, so the throw shows up
+   * as records that never landed at all; and a second server carries a real
+   * stamp, so the guard cannot be satisfied by simply not remapping any more.
+   */
+  it("share import keeps a server whose payload `origin` is null, stripping only the marker (kills reading `origin.syncedAuthProfileId` before the origin is known to be one)", async () => {
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [
+        { ...makeServer({ id: "share-s-null", name: "Null Origin", authProfileId: "ap-ok" }), origin: null },
+        makeServer({
+          id: "share-s-stamped",
+          name: "Stamped",
+          authProfileId: "ap-ok",
+          origin: { sourceId: "src-on-the-other-machine", externalId: "device:9", syncedAt: 1000, syncedAuthProfileId: "ap-ok" }
+        })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [makeAuthProfile({ id: "ap-ok", name: "Kept" })]
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-null-origin.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    // Nothing aborted: both servers landed, next to the profile imported before them.
+    expect(snapshot.servers.map((s) => s.name).sort()).toEqual(["Null Origin", "Stamped"]);
+    expect(snapshot.authProfiles).toHaveLength(1);
+
+    const nullOrigin = snapshot.servers.find((s) => s.name === "Null Origin")!;
+    // Only the marker is lost, and the record — with its remapped link — is kept.
+    // That disposition is addServerSanitizingOrigin's, exactly as it already is for
+    // a numeric `externalId`; this fix's whole content is letting it get there.
+    expect(nullOrigin.origin).toBeUndefined();
+    expect(nullOrigin.authProfileId).toBe(snapshot.authProfiles[0].id);
+    expect(nullOrigin.authProfileId).not.toBe("ap-ok");
+
+    // …and none of that was bought by switching the stamp remap off.
+    const stamped = snapshot.servers.find((s) => s.name === "Stamped")!;
+    expect(stamped.origin?.externalId).toBe("device:9");
+    expect(stamped.origin?.syncedAuthProfileId).toBe(stamped.authProfileId);
+    expect(stamped.origin?.syncedAuthProfileId).not.toBe("ap-ok");
+  });
+
   it("v1 share import reads legacy macros from settings key", async () => {
     const v1ShareData = {
       version: 1,
