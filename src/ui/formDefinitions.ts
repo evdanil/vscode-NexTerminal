@@ -1,4 +1,4 @@
-import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
+import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
 import { authProfileOwnedCredentials, resolveTunnelType } from "../models/config";
 import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues } from "../models/inventory";
 import { ORPHAN_FOLDER_NAME } from "../services/inventory/syncEngine";
@@ -18,6 +18,10 @@ interface AuthProfileSelectOptions {
   advanced?: boolean;
   /** Defaults to `AUTH_PROFILE_HINT`. */
   hint?: string;
+  /** What this render already overwrote with the selected profile's values —
+   *  see `applyLinkedAuthProfileValues`. Absent on forms that render every
+   *  managed field from the record itself. */
+  displacedValues?: Record<string, string>;
 }
 
 /**
@@ -61,6 +65,91 @@ function authProfileFilledKeys(profile: AuthProfile | undefined): string[] {
   return keys;
 }
 
+/**
+ * REVIEW FINDING (P1) — what a form OPENS showing, for the fields a linked
+ * profile owns. The lock seed above says which managed fields the profile
+ * fills; this says what it fills them with, and the two must be one decision.
+ *
+ * THE BUG THIS CLOSES: the seed alone locked `authType` (always owned — a
+ * closed enum) while `sshFields` went on rendering the RECORD's own value. A
+ * server whose stored `authType` is `password`/`agent`, linked to a `key`
+ * profile, therefore opened showing "Password", locked — and the Private Key
+ * File control is `visibleWhen: authType === "key"`, so it was hidden AND
+ * disabled, and `updateVisibility` disables exactly what the submit loop
+ * skips. Saving any unrelated edit submitted no `keyPath` at all;
+ * `preserveLinkedServerCredentials` could not put it back because the profile,
+ * carrying no key path of its own, does not own that field. The server's own
+ * key file was deleted by opening the form and pressing Save, and the next
+ * connection — which resolves `authType: "key"` from the profile — failed with
+ * `Missing keyPath for key auth`. That configuration is not exotic: it is
+ * exactly what the previous Save produces, since the profile owns `authType`
+ * and the record therefore keeps whatever it had underneath.
+ *
+ * So the render now shows what the profile will actually impose
+ * (`authProfileOwnedCredentials` — the same rule the connect path spreads and
+ * the save path restores), which makes the key path field visible, editable
+ * and prefilled, and its value survives Save because it is submitted.
+ *
+ * WHAT IT DISPLACES IS KEPT, NOT DROPPED. Each overwritten key's original —
+ * the value the descriptor would have carried without the profile, defaults
+ * included — is returned for the select to hand to the webview, which seeds
+ * `profileDisplacedValues` (formHtml.ts) from it. Unlinking then restores the
+ * server's own `authType`, `username` and `keyPath` through the mechanism that
+ * already handles every mid-session switch, rather than a second one invented
+ * here. Without that seed the render's substitution would become permanent:
+ * choosing `(None)` would leave the profile's `key` sitting in an unlocked
+ * field with nothing behind it to restore, and Save would write it onto the
+ * server as its own.
+ */
+interface LinkedAuthProfileValues {
+  /** `fields`, with every key the profile owns showing the PROFILE's value. */
+  fields: FormFieldDescriptor[];
+  /** For each key overwritten above, what it would otherwise have shown. */
+  displaced: Record<string, string>;
+}
+
+/** Narrowing lookup into the owned set — `field.key` is a bare string, and
+ *  only these three keys are ever profile-owned (`AuthProfileOwnedCredentials`). */
+function ownedValueForFieldKey(owned: AuthProfileOwnedCredentials, key: string): string | undefined {
+  switch (key) {
+    case "username":
+      return owned.username;
+    case "authType":
+      return owned.authType;
+    case "keyPath":
+      return owned.keyPath;
+    default:
+      return undefined;
+  }
+}
+
+function applyLinkedAuthProfileValues(
+  fields: FormFieldDescriptor[],
+  profile: AuthProfile | undefined
+): LinkedAuthProfileValues {
+  const owned = authProfileOwnedCredentials(profile);
+  const displaced: Record<string, string> = {};
+  const applied = fields.map((field): FormFieldDescriptor => {
+    if (field.type !== "text" && field.type !== "file" && field.type !== "select") {
+      return field;
+    }
+    const value = ownedValueForFieldKey(owned, field.key);
+    if (value === undefined) {
+      return field;
+    }
+    if (field.type === "select") {
+      // A select with no explicit value renders its first option, which is what
+      // the webview would read back out of the control — so that, not "", is
+      // what this key held before the profile took it over.
+      displaced[field.key] = field.value ?? field.options[0]?.value ?? "";
+      return { ...field, value };
+    }
+    displaced[field.key] = field.value ?? "";
+    return { ...field, value };
+  });
+  return { fields: applied, displaced };
+}
+
 function authProfileSelectField(
   authProfiles?: AuthProfile[],
   vw?: VisibleWhen,
@@ -83,6 +172,7 @@ function authProfileSelectField(
     advanced: opts?.advanced ?? true,
     autofill: true,
     autofillFilledKeys: authProfileFilledKeys(selectedProfile),
+    autofillDisplacedValues: opts?.displacedValues,
     visibleWhen: vw
   };
 }
@@ -410,13 +500,22 @@ export function serverFormDefinition(
   authProfiles?: AuthProfile[]
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
+  // Resolved the same way `authProfileSelectField` resolves the selected
+  // option, and the same way the save path re-resolves the submitted id: an id
+  // that names no profile owns nothing, so the record's own values render
+  // unlocked — which is exactly what `preserveLinkedServerCredentials` then
+  // keeps for it.
+  const linkedProfile = seed?.authProfileId
+    ? (authProfiles ?? []).find((profile) => profile.id === seed.authProfileId)
+    : undefined;
+  const ssh = applyLinkedAuthProfileValues(sshFields(seed), linkedProfile);
 
   return {
     title: isEdit ? "Edit SSH Server Profile" : "Add SSH Server Profile",
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
-      authProfileSelectField(authProfiles, undefined, seed?.authProfileId),
-      ...sshFields(seed),
+      authProfileSelectField(authProfiles, undefined, seed?.authProfileId, { displacedValues: ssh.displaced }),
+      ...ssh.fields,
       ...proxyFields(seed, servers),
       openFileExplorerOnFirstConnectField(seed),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)

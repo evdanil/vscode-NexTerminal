@@ -87,7 +87,19 @@ describe("formDefinitions keyPath visibility", () => {
     expect(authProfileField!.options.some((option) => option.label === "Shared Key — key — deploy — id_ed25519")).toBe(true);
   });
 
-  it("preserves stored server credentials in edit form when auth profile is linked", () => {
+  /**
+   * REVIEW FINDING (P1) — the edit form renders what the LINKED PROFILE will
+   * impose, and retains the record's own values beside it rather than in the
+   * fields. Showing the record's values under a lock the profile owns is what
+   * put the two out of step: `authType` rendered `password` while the profile
+   * imposed `key`, which hid (and therefore disabled, and therefore dropped
+   * from the submission) the Private Key File control — see the end-to-end
+   * proof in authProfileSwitchTransition.test.ts, which follows it all the way
+   * to the persisted record. Preservation of the stored values is
+   * `preserveLinkedServerCredentials`' job at save, plus the displaced seed
+   * below for an unlink; it was never this descriptor's.
+   */
+  it("renders the linked profile's credentials, and hands the stored ones to the webview's restore seed instead of into the fields", () => {
     const definition = serverFormDefinition(
       {
         id: "srv-1",
@@ -101,12 +113,70 @@ describe("formDefinitions keyPath visibility", () => {
       [],
       [{ id: "ap-1", name: "Production", username: "live-user", authType: "key", keyPath: "/live/key" }]
     );
-    const usernameField = definition.fields.find(
-      (field): field is Extract<(typeof definition.fields)[number], { key: string; value?: unknown }> =>
-        "key" in field && field.key === "username"
+
+    expect(keyedField(definition, "username").value).toBe("live-user");
+    expect(keyedField(definition, "authType").value).toBe("key");
+    expect(keyedField(definition, "keyPath").value).toBe("/live/key");
+
+    const select = keyedField(definition, "authProfileId");
+    expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({
+      username: "stored-user",
+      authType: "password",
+      keyPath: "/stored/key"
+    });
+  });
+
+  it("displaces only the keys the profile actually supplies, so a field it leaves alone keeps the record's value AND stays out of the restore seed (kills overriding on the mere fact of a link: a keyless key profile would blank the server's own key file at render, which is the field it exists to let you set)", () => {
+    const definition = serverFormDefinition(
+      {
+        id: "srv-1",
+        username: "stored-user",
+        authType: "password",
+        keyPath: "/stored/key",
+        authProfileId: "ap-keyless"
+      },
+      [],
+      true,
+      [],
+      [{ id: "ap-keyless", name: "Shared key", username: "live-user", authType: "key" }]
     );
-    expect(usernameField).toBeDefined();
-    expect(usernameField!.value).toBe("stored-user");
+
+    // Supplied → rendered from the profile, and the record's own is retained.
+    expect(keyedField(definition, "username").value).toBe("live-user");
+    expect(keyedField(definition, "authType").value).toBe("key");
+    // NOT supplied → the record's own file stays in the field, where the
+    // profile-imposed `key` auth type now makes it visible and submittable.
+    expect(keyedField(definition, "keyPath").value).toBe("/stored/key");
+
+    const select = keyedField(definition, "authProfileId");
+    expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({
+      username: "stored-user",
+      authType: "password"
+    });
+  });
+
+  it("displaces nothing when there is no link, or when the linked id resolves to no profile (kills seeding a restore for values no profile replaced — the release would then overwrite the user's own edits with a stale snapshot of the form's opening state)", () => {
+    const seed = {
+      id: "srv-1",
+      username: "stored-user",
+      authType: "password" as const,
+      keyPath: "/stored/key",
+      authProfileId: "ap-gone"
+    };
+    const profiles = [{ id: "ap-1", name: "Production", username: "live-user", authType: "key" as const, keyPath: "/live/key" }];
+
+    for (const definition of [
+      serverFormDefinition({ ...seed, authProfileId: undefined }, [], true, [], profiles),
+      serverFormDefinition(seed, [], true, [], profiles)
+    ]) {
+      expect(keyedField(definition, "username").value).toBe("stored-user");
+      expect(keyedField(definition, "authType").value).toBe("password");
+      const select = keyedField(definition, "authProfileId");
+      // Empty, exactly as `autofillFilledKeys` is `[]` for the same two cases —
+      // and `renderField` omits the attribute entirely for an empty record, so
+      // the webview seeds nothing.
+      expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({});
+    }
   });
 
   it("marks optional SSH setup fields as advanced in the unified profile form", () => {

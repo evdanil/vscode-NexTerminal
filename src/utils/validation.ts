@@ -277,10 +277,53 @@ export function validateAuthProfile(item: unknown): item is AuthProfile {
     return false;
   }
   const obj = item as Record<string, unknown>;
-  return (
-    isNonEmptyString(obj.id) &&
-    isNonEmptyString(obj.name) &&
-    isNonEmptyString(obj.username) &&
-    (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
-  );
+  if (
+    !(
+      isNonEmptyString(obj.id) &&
+      isNonEmptyString(obj.name) &&
+      isNonEmptyString(obj.username) &&
+      (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
+    )
+  ) {
+    return false;
+  }
+  // REVIEW FINDING (P2) — optional `keyPath` was the one declared field this
+  // guard never looked at, so a hand-edited backup or a version-skewed
+  // globalState row could carry a number/object/array here and still be handed
+  // out typed as `AuthProfile`. Everything downstream then treats it as a
+  // string: `authProfileOwnedCredentials` trims it (models/config.ts) and
+  // `formatAuthProfileLabel` hands it to `path.posix.basename` via
+  // `normalizeKeyPathForComparison` (utils/authProfileLabel.ts) for every
+  // option of every Auth Profile select and every server tooltip in the tree.
+  // A TypeError there is not a rejected record, it is a sidebar that fails to
+  // render, so the shape is settled HERE, once, at the two boundaries a
+  // foreign record can arrive through (`VscodeConfigRepository.getAuthProfiles`
+  // and both import paths in configCommands.ts).
+  //
+  // A TYPE check, deliberately not `isOptionalNonEmptyString`:
+  //
+  //   * `""` is harmless and must stay accepted. It reads identically to
+  //     absent everywhere that matters — THE ONE RULE owns no blank key path,
+  //     and `formatAuthProfileLabel` skips a falsy one — so rejecting it would
+  //     buy nothing while newly discarding a record that is merely untidy.
+  //   * No version of Nexus has ever WRITTEN a non-string here
+  //     (`authProfileEditorPanel.ts` stores `string | undefined`), so nothing
+  //     a user legitimately holds can be rejected by this line. That matters
+  //     because rejection is destructive in a way a shape check on a
+  //     bookkeeping field is not: a rejected profile is skipped by the import
+  //     (counted, but not named), its vault password/passphrase are not
+  //     restored — `restoreSecrets` is scoped to the ids actually imported —
+  //     and the post-import dangling-reference sweep then strips the link from
+  //     every server and inventory source that pointed at it. In REPLACE mode
+  //     the local copy is already gone by the time this runs. Rejecting only
+  //     values no writer of ours can produce keeps that blast radius aimed
+  //     exclusively at records that are already broken.
+  //
+  // The rule itself stays defensive too (see `authProfileOwnedCredentials`):
+  // this boundary is what should stop such a value existing, not the only
+  // thing standing between one and a thrown `.trim()`.
+  if (obj.keyPath !== undefined && typeof obj.keyPath !== "string") {
+    return false;
+  }
+  return true;
 }

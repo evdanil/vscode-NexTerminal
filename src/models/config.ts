@@ -448,17 +448,32 @@ export type AuthProfileOwnedCredentials = Partial<Pick<ServerConfig, "username" 
  * and saved — so what a form displays is bit-identical to what a connection
  * uses. An `undefined` profile (no link, or an id that resolves to nothing)
  * owns nothing; the caller's own value stands everywhere.
+ *
+ * REVIEW FINDING (P2) — both string fields are TYPE-CHECKED, not merely
+ * defaulted, before they are trimmed. `AuthProfile.keyPath` is declared
+ * `string | undefined` and `validateAuthProfile` (utils/validation.ts) now
+ * enforces exactly that at both boundaries a foreign record can enter through
+ * (an imported backup and a globalState load), so a non-string reaching here
+ * should be impossible. It is guarded anyway because this rule is called from
+ * RENDERING paths — the tree's server tooltips, every form that carries the
+ * Auth Profile select, the sync plan — where an exception is not a rejected
+ * record but a blank sidebar or a form that never opens. A bare
+ * `(profile.keyPath ?? "").trim()` throws on the one value it exists to
+ * reject; this lands it in the same bucket blank already occupies, "supplies
+ * no usable key path", which is both survivable and semantically right. Cheap
+ * insurance against a profile built in-process, a future writer, or a boundary
+ * someone adds later without this check.
  */
 export function authProfileOwnedCredentials(profile: AuthProfile | undefined): AuthProfileOwnedCredentials {
   if (!profile) {
     return {};
   }
   const owned: AuthProfileOwnedCredentials = { authType: profile.authType };
-  const username = profile.username.trim();
+  const username = typeof profile.username === "string" ? profile.username.trim() : "";
   if (username !== "") {
     owned.username = username;
   }
-  const keyPath = (profile.keyPath ?? "").trim();
+  const keyPath = typeof profile.keyPath === "string" ? profile.keyPath.trim() : "";
   if (keyPath !== "") {
     owned.keyPath = keyPath;
   }

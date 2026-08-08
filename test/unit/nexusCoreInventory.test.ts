@@ -1554,18 +1554,25 @@ describe("removeAuthProfile — dangling references on inventory sources (T2)", 
     expect(saveSourcesSpy).not.toHaveBeenCalled();
   });
 
-  it("(FINDING A) restores the linked source in memory when saveInventorySources rejects, and rethrows (kills mutate-then-leak)", async () => {
+  /**
+   * (FINDING A) The rollback's original case, now scoped by REVIEW FINDING (P2)
+   * to the ONLY save whose rejection means the deletion did not happen: the
+   * profile record's own. Nothing has reached disk, so memory must match disk
+   * and the delete must stay retryable.
+   */
+  it("(FINDING A) restores the linked source in memory when saveAuthProfiles rejects, and rethrows (kills mutate-then-leak)", async () => {
     const { core, repository } = makeCore();
     await core.initialize();
     await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", authProfileId: "p1" }));
     const revisionBefore = core.getInventorySource("source-1")?.revision;
 
-    vi.spyOn(repository, "saveInventorySources").mockRejectedValueOnce(new Error("disk full"));
+    vi.spyOn(repository, "saveAuthProfiles").mockRejectedValueOnce(new Error("disk full"));
     await expect(core.removeAuthProfile("p1")).rejects.toThrow("disk full");
 
     // Without the rollback, the map would hold a half-cleared, re-revisioned
     // record that never reached disk — and the next unrelated
-    // saveInventorySources (from any other command) would silently commit it.
+    // saveInventorySources (from any other command) would silently commit it,
+    // clearing a link for a profile that is still very much alive on disk.
     const current = core.getInventorySource("source-1");
     expect(current?.authProfileId).toBe("p1");
     expect(current?.revision).toBe(revisionBefore);
@@ -1573,9 +1580,14 @@ describe("removeAuthProfile — dangling references on inventory sources (T2)", 
     const persisted = await repository.getInventorySources();
     expect(persisted[0].authProfileId).toBe("p1");
     expect(persisted[0].revision).toBe(revisionBefore);
+    // The profile is still on disk, which is what makes restoring the link the
+    // right answer here and the wrong one in the committed cases below.
+    expect(await repository.getAuthProfiles()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "p1" })])
+    );
   });
 
-  it("emits once even when saveInventorySources rejects, AFTER the rollback (kills observers left rendering a deleted profile and stale links until some unrelated change fires an emission)", async () => {
+  it("emits once even when saveInventorySources rejects, AFTER the state settles (kills observers left rendering a deleted profile and stale links until some unrelated change fires an emission)", async () => {
     const { core, repository } = makeCore();
     await core.initialize();
     await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", authProfileId: "p1" }));
@@ -1604,25 +1616,27 @@ describe("removeAuthProfile — dangling references on inventory sources (T2)", 
     expect(observed).toHaveLength(1);
     expect(observed[0].profile).toBeUndefined();
     expect(observed[0].serverRef).toBeUndefined();
-    // Ordering: the emission happens after the rollback, so observers never
-    // see (or re-persist) the half-cleared, re-revisioned source.
-    expect(observed[0].sourceRef).toBe("p1");
+    // REVIEW FINDING (P2) — and what they read for the SOURCE is the cleared
+    // value, not a restored link to the profile they have just been told is
+    // gone. The tree would otherwise render a source pointing at a deleted
+    // profile.
+    expect(observed[0].sourceRef).toBeUndefined();
   });
 
   /**
-   * (FINDING 2) The two saves that run BEFORE saveInventorySources. The sources
-   * are already cleared and re-revisioned in memory by the time either can
-   * reject, so a rollback that only wraps saveInventorySources is skipped
-   * entirely — and the next unrelated inventory-source save from any other
-   * command persists the whole map, silently committing a deletion that failed.
+   * REVIEW FINDING (P2) — the two saves that run AFTER saveAuthProfiles has
+   * already resolved. The profile record is GONE FROM DISK by then, so
+   * restoring `authProfileId` on the sources points memory (and, through the
+   * next unrelated saveInventorySources from any command, disk) at a profile
+   * that no longer exists — and the deletion cannot be retried to fix it,
+   * because there is no profile left to select.
    *
-   * Each case asserts BOTH halves, because the fix has to keep them together:
-   * the in-memory record is restored (link AND revision), and the emission
-   * still fires — sampled inside the listener, so it also pins the ordering
-   * (rollback first, emit second).
+   * The gate is asserted from BOTH ends: the sources stay cleared, and the
+   * emission still fires exactly once with the cleared value visible to
+   * observers.
    */
-  for (const failing of ["saveAuthProfiles", "saveServers"] as const) {
-    it(`(FINDING 2) restores the linked source in memory when ${failing} rejects, before the emission, and rethrows (kills a rollback that only covers saveInventorySources)`, async () => {
+  for (const failing of ["saveServers", "saveInventorySources"] as const) {
+    it(`(REVIEW FINDING, P2) keeps the source link CLEARED when ${failing} rejects after the profile record has already been persisted away, and rethrows (kills restoring a reference to a profile that is already deleted and can no longer be re-deleted)`, async () => {
       const { core, repository } = makeCore();
       await core.initialize();
       await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", authProfileId: "p1" }));
@@ -1635,7 +1649,6 @@ describe("removeAuthProfile — dangling references on inventory sources (T2)", 
       expect(revisionBefore).toBeDefined();
 
       vi.spyOn(repository, failing).mockRejectedValueOnce(new Error("disk full"));
-      const saveSourcesSpy = vi.spyOn(repository, "saveInventorySources");
       const observedSourceRefs: Array<string | undefined> = [];
       core.onDidChange(() => {
         observedSourceRefs.push(core.getInventorySource("source-1")?.authProfileId);
@@ -1643,22 +1656,22 @@ describe("removeAuthProfile — dangling references on inventory sources (T2)", 
 
       await expect(core.removeAuthProfile("p1")).rejects.toThrow("disk full");
 
-      // The save that would have carried the clear to disk never ran, so the
-      // in-memory clear has no counterpart anywhere and must be undone.
-      expect(saveSourcesSpy).not.toHaveBeenCalled();
+      // The precondition that makes the restore wrong: the deletion committed.
+      expect(await repository.getAuthProfiles()).toEqual([expect.objectContaining({ id: "p2" })]);
+      expect(core.getAuthProfile("p1")).toBeUndefined();
+
+      // Under the blanket rollback this reads "p1" — a live reference to a
+      // deleted profile, which every later sync degrades to agent auth over and
+      // which no retry can clear.
       const current = core.getInventorySource("source-1");
-      expect(current?.authProfileId).toBe("p1");
-      expect(current?.revision).toBe(revisionBefore);
+      expect(current?.authProfileId).toBeUndefined();
+      // The re-revision stays with the clear it belongs to, so an in-flight sync
+      // holding the pre-clear snapshot still aborts rather than re-applying it.
+      expect(current?.revision).not.toBe(revisionBefore);
 
-      // Disk is what a foreign command's next saveInventorySources would have
-      // overwritten with the half-applied state.
-      const persisted = await repository.getInventorySources();
-      expect(persisted[0].authProfileId).toBe("p1");
-      expect(persisted[0].revision).toBe(revisionBefore);
-
-      // Emit-on-every-path (the behaviour the `finally` exists for) survives
-      // the fix, and observers read the ROLLED-BACK source, not the cleared one.
-      expect(observedSourceRefs).toEqual(["p1"]);
+      // Emit-on-every-path (the behaviour the `finally` exists for) survives,
+      // and observers read the cleared source.
+      expect(observedSourceRefs).toEqual([undefined]);
     });
   }
 });

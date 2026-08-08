@@ -4407,6 +4407,76 @@ describe("inventoryCommands", () => {
       );
     });
 
+    /**
+     * REVIEW FINDING (P1) — the engine's AUTH 2b unlink, seen from the command
+     * layer. It is a credential mutation on existing servers, so it travels the
+     * same disclosure route as the adoption it reverses: a counted line in the
+     * modal and every affected server named behind Show Warnings.
+     *
+     * The two `not.toContain` assertions are the point. Before the split, an
+     * unlink satisfied `before.authProfileId !== after.authProfileId` and was
+     * rendered by the SWITCH branch — the modal told the user their servers were
+     * about to start using the very profile the plan was taking away from them.
+     */
+    function previouslyLinkedHarness(): Promise<{ core: NexusCore; provider: InventoryProvider; vault: ReturnType<typeof makeVault> }> {
+      const devices = [1, 2].map((n) => ({
+        externalId: `device:${n}`,
+        name: `sw${n}`,
+        endpoints: [{ kind: "ssh" as const, host: `10.0.0.${n}`, port: 22 }]
+      }));
+      return makeHarness({
+        profiles: [KEYLESS_KEY_PROFILE],
+        source: { targetFolder: "", authProfileId: "pk" },
+        // Exactly what an earlier sync left behind while the profile still had a
+        // key file: the link, plus the stamp recording that the SYNC made it.
+        servers: devices.map((d, i) =>
+          ownedServer({
+            id: `owned-${i + 1}`,
+            externalId: d.externalId,
+            name: d.name,
+            host: d.endpoints[0].host,
+            authProfileId: "pk",
+            origin: { sourceId: "src-1", externalId: d.externalId, syncedAt: 1, syncedAuthProfileId: "pk" }
+          })
+        ),
+        provider: { fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices })) }
+      });
+    }
+
+    it("(REVIEW FINDING, P1) the confirm modal discloses an UNLINK as an unlink, and Apply performs it (kills rendering it through the switch branch, which claims the opposite of what the plan does)", async () => {
+      const { core } = await previouslyLinkedHarness();
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const [, options] = modalCalls()[0];
+      expect(options.detail).toContain(
+        '2 servers will stop using auth profile "Shared Key" and revert to their own stored credentials.'
+      );
+      expect(options.detail).not.toContain("will switch to");
+      // And it is a real change, applied — not a line the modal renders about
+      // nothing. Both halves of the record go: the link and the sync's stamp.
+      expect(core.getServer("owned-1")?.authProfileId).toBeUndefined();
+      expect(core.getServer("owned-2")?.authProfileId).toBeUndefined();
+      expect(core.getServer("owned-1")?.origin?.syncedAuthProfileId).toBeUndefined();
+    });
+
+    it("(REVIEW FINDING, P1) Show Warnings names every server being unlinked, under its own heading (kills a count-only disclosure, and kills reusing the switch heading)", async () => {
+      await previouslyLinkedHarness();
+
+      mockShowInformationMessage.mockResolvedValueOnce("Show Warnings");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const [openArgs] = mockOpenTextDocument.mock.calls as Array<[{ content: string }]>;
+      const lines = openArgs[0].content.split("\n");
+      expect(lines).toContain('2 servers will stop using auth profile "Shared Key" and revert to their own stored credentials:');
+      expect(lines).toContain('  "sw1"');
+      expect(lines).toContain('  "sw2"');
+      expect(openArgs[0].content).not.toContain("will switch to");
+      // The engine's own explanation of WHY sits in the same buffer.
+      expect(openArgs[0].content).toContain("uses private key authentication but has no key file");
+    });
+
     it("describePlanDetail renders a NAMELESS switch line rather than none when the caller loses the profile name (kills the silent drop that would slip the stamps past the modal with no disclosure at all)", () => {
       function planWithSwitches(count: number): InventorySyncPlan {
         const updates = Array.from({ length: count }, (_, i) => {
@@ -4439,6 +4509,29 @@ describe("inventoryCommands", () => {
       expect(describePlanDetail(planWithSwitches(2), [], "Lab credentials")).toContain(
         '2 servers will switch to auth profile "Lab credentials".'
       );
+
+      // REVIEW FINDING (P1) — the unlink line carries the same nameless
+      // fallback, exercised directly for the same reason: it is unreachable
+      // through syncNow (an unlink only happens for a profile that resolves, so
+      // the name is always in hand), and a guard nobody can run is a guard
+      // nobody can prove still works.
+      function planWithClears(count: number): InventorySyncPlan {
+        const plan = planWithSwitches(count);
+        return {
+          ...plan,
+          updates: plan.updates.map((u) => ({ before: { ...u.before, authProfileId: "p1" }, after: { ...u.after, authProfileId: undefined } }))
+        };
+      }
+
+      expect(describePlanDetail(planWithClears(2), [], undefined)).toContain(
+        "2 servers will stop using their auth profile and revert to their own stored credentials."
+      );
+      expect(describePlanDetail(planWithClears(1), [], undefined)).toContain(
+        "1 server will stop using their auth profile and revert to their own stored credentials."
+      );
+      // An unlink must never be rendered by the switch branch — that line claims
+      // the opposite of what the plan does.
+      expect(describePlanDetail(planWithClears(2), [], "Lab credentials")).not.toContain("will switch to");
     });
 
     it("syncNow retro-applies the source's profile to a server still on the bare agent default: the confirm modal appears (not the nothing-to-change fast path) and Apply stamps the link (kills a caller that never resolves/passes authProfile into computeSyncPlan)", async () => {

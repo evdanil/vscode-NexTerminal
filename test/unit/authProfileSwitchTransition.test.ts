@@ -290,6 +290,9 @@ function buildFormDom(definition: FormDefinition): FormDom {
         if (field.autofillFilledKeys && field.autofillFilledKeys.length > 0) {
           wrapper.dataset.autofillFilled = JSON.stringify(field.autofillFilledKeys);
         }
+        if (field.autofillDisplacedValues && Object.keys(field.autofillDisplacedValues).length > 0) {
+          wrapper.dataset.autofillDisplaced = JSON.stringify(field.autofillDisplacedValues);
+        }
         const selectedValue = field.value ?? field.options[0]?.value ?? "";
         const hidden = wrapper.append(new StubElement("INPUT"));
         hidden.type = "hidden";
@@ -760,6 +763,149 @@ describe("an auth-profile switch hands back the values the previous profile disp
       expect(resolved.username).toBe("my-own-account");
       expect(resolved.authType).toBe("password");
       expect(resolved.keyPath).toBeUndefined();
+    });
+  });
+
+  describe("a form OPENED on an already-linked server — the render is a transition too", () => {
+    /**
+     * REVIEW FINDING (P1) — the reported scenario, and it is self-inflicting:
+     * the state it destroys is precisely the state the PREVIOUS save produced.
+     * Link a keyless `key` profile to a password server and browse to a key
+     * file; the profile owns `authType` (closed enum) but not `keyPath`, so
+     * `preserveLinkedServerCredentials` puts the record's own `password` back
+     * underneath the link and stores the key file you just chose. Reopen that
+     * record and the form used to render the RECORD's `authType` — "Password",
+     * locked, because the seed said the profile owns it — which hides the
+     * Private Key File control behind its `authType === "key"` rule.
+     * `updateVisibility` disables exactly what the submit loop skips, so any
+     * unrelated edit saved a record with no `keyPath` at all, and the next
+     * connection resolved `key` from the profile with no file to read.
+     */
+    it("keeps the server's own key file when an unrelated edit is saved (THE REPORTED SCENARIO — kills seeding the lock from the profile while rendering the record's authType: the key path control is hidden, therefore disabled, therefore never submitted, and preserveLinkedServerCredentials cannot restore a field the profile does not own)", async () => {
+      const server = makeServer({
+        // What the previous save left: the profile's `key` is imposed at
+        // connect time, the record keeps its own type underneath the link.
+        authType: "password",
+        keyPath: "/home/me/.ssh/my_own_key",
+        authProfileId: KEYLESS_PROFILE.id
+      });
+      const harness = openServerForm(server);
+
+      // An edit with nothing to do with credentials — a rename.
+      harness.type("name", "Core switch (renamed)");
+      const persisted = saveServerEdit(server, harness.submit(), PROFILES);
+
+      expect(persisted.name).toBe("Core switch (renamed)");
+      expect(persisted.keyPath).toBe("/home/me/.ssh/my_own_key");
+      // The link and the record's own auth type are both untouched by the save.
+      expect(persisted.authProfileId).toBe(KEYLESS_PROFILE.id);
+      expect(persisted.authType).toBe("password");
+
+      // And the connection still has a key to read: the profile imposes `key`,
+      // the server supplies the file, which is the whole point of this pairing.
+      const resolved = await resolveForConnect(persisted, PROFILES);
+      expect(resolved.authType).toBe("key");
+      expect(resolved.keyPath).toBe("/home/me/.ssh/my_own_key");
+      expect(resolved.username).toBe("shared");
+    });
+
+    it("opens showing the auth type the profile will actually impose, with the key path control visible and editable because the profile supplies none (kills a form whose locked value and its lock disagree: the user is shown 'Password' for a server every connection dials with key auth)", () => {
+      const server = makeServer({
+        authType: "password",
+        keyPath: "/home/me/.ssh/my_own_key",
+        authProfileId: KEYLESS_PROFILE.id
+      });
+      const harness = openServerForm(server);
+
+      expect(harness.value("authType")).toBe("key");
+      expect(harness.selectLabel("authType")).toBe("Private Key");
+      expect(harness.locked("authType")).toBe(true);
+      // Supplied by the profile, so locked and showing the profile's value…
+      expect(harness.value("username")).toBe("shared");
+      expect(harness.locked("username")).toBe(true);
+      // …and NOT supplied, so editable and showing the server's own file.
+      expect(harness.value("keyPath")).toBe("/home/me/.ssh/my_own_key");
+      expect(harness.locked("keyPath")).toBe(false);
+      // Editable in the sense that matters: Browse can still replace it, and
+      // what it writes is what a Save stores.
+      harness.browseResult("keyPath", "/home/me/.ssh/rotated_key");
+      expect(saveServerEdit(server, harness.submit(), PROFILES).keyPath).toBe("/home/me/.ssh/rotated_key");
+    });
+
+    it("hands the server's own credentials back when the link is removed, having rendered the profile's (kills seeding the render without seeding the RESTORE: (None) would unlock fields still holding the profile's username and private key with nothing behind them, and the save would then store those onto the server as its own)", async () => {
+      const server = makeServer({
+        // The shape every inventory-synced server has, and the one a keyed
+        // profile visibly overwrites at render.
+        authType: "agent",
+        keyPath: undefined,
+        username: "my-own-account",
+        authProfileId: KEY_PROFILE.id
+      });
+      const harness = openServerForm(server);
+
+      expect(harness.value("authType")).toBe("key");
+      expect(harness.value("username")).toBe("dcuser");
+      expect(harness.value("keyPath")).toBe("/keys/datacenter_ed25519");
+
+      harness.choose("authProfileId", "");
+
+      expect(harness.value("authType")).toBe("agent");
+      expect(harness.selectLabel("authType")).toBe("SSH Agent");
+      expect(harness.value("username")).toBe("my-own-account");
+      expect(harness.value("keyPath")).toBe("");
+
+      const persisted = saveServerEdit(server, harness.submit(), PROFILES);
+      expect(persisted.authProfileId).toBeUndefined();
+      expect(persisted.authType).toBe("agent");
+      expect(persisted.username).toBe("my-own-account");
+      expect(persisted.keyPath).toBeUndefined();
+
+      const resolved = await resolveForConnect(persisted, PROFILES);
+      expect(resolved.authType).toBe("agent");
+      expect(resolved.username).toBe("my-own-account");
+      expect(resolved.keyPath).toBeUndefined();
+    });
+
+    it("hands them back on a SWITCH to another profile too, not only on (None) — the render's seed is consumed once and then the per-fill capture takes over", () => {
+      const server = makeServer({
+        authType: "agent",
+        keyPath: undefined,
+        username: "my-own-account",
+        authProfileId: KEY_PROFILE.id
+      });
+      const harness = openServerForm(server);
+
+      // KEYLESS_PROFILE supplies a username but no key path, so the key path
+      // must come back to the server's own — which is nothing.
+      pickProfile(harness, PROFILES, KEYLESS_PROFILE.id);
+      expect(harness.value("username")).toBe("shared");
+      expect(harness.value("keyPath")).toBe("");
+      expect(harness.locked("keyPath")).toBe(false);
+
+      const persisted = saveServerEdit(server, harness.submit(), PROFILES);
+      expect(persisted.keyPath).toBeUndefined();
+      expect(persisted.authProfileId).toBe(KEYLESS_PROFILE.id);
+      // Still the server's own underneath the new link, as for the old one.
+      expect(persisted.username).toBe("my-own-account");
+      expect(persisted.authType).toBe("agent");
+    });
+
+    it("renders the record's own values for a link whose profile no longer resolves, exactly as the save path treats that id (kills overriding from a dangling id: the fields would lock onto nothing and the record's credentials would be dropped)", () => {
+      const server = makeServer({
+        authType: "password",
+        keyPath: "/home/me/.ssh/my_own_key",
+        username: "my-own-account",
+        authProfileId: "ap-deleted-while-the-form-sat-open"
+      });
+      const harness = openServerForm(server);
+
+      expect(harness.value("authType")).toBe("password");
+      expect(harness.value("username")).toBe("my-own-account");
+      expect(harness.locked("username")).toBe(false);
+
+      const persisted = saveServerEdit(server, harness.submit(), PROFILES);
+      expect(persisted.username).toBe("my-own-account");
+      expect(persisted.authType).toBe("password");
     });
   });
 

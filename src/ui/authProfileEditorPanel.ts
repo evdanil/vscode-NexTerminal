@@ -167,40 +167,101 @@ export class AuthProfileEditorPanel {
           const password = typeof msg.password === "string" ? msg.password : "";
           const keyPath = typeof msg.keyPath === "string" && msg.keyPath.trim() ? msg.keyPath.trim() : undefined;
           const requestedId = typeof msg.id === "string" ? msg.id : null;
-          const previousProfile = requestedId ? this.core.getAuthProfile(requestedId) : undefined;
-          const existingId = previousProfile ? requestedId : null;
 
-          const profile: AuthProfile = {
-            id: existingId ?? randomUUID(),
-            name,
-            username,
-            authType,
-            keyPath: authType === "key" ? keyPath : undefined
-          };
+          // CONFIG MUTATION LOCK (REVIEW FINDING, P2 — save vs. deletion).
+          // The delete handler below pauses inside this lock across two awaited
+          // vault deletes before calling removeAuthProfile. A lock-free save
+          // lands squarely in that pause and breaks it both ways: the record it
+          // writes (a rename, an auth-type change, a new key path) is removed by
+          // a deletion that already revalidated and will not look again, and a
+          // save queued the other way round resurrects — under the very id the
+          // deletion just cleared off every server and inventory source — a
+          // profile built from a form snapshot taken before the delete. Both
+          // operations then report success. Serializing the record write and its
+          // secret writes into the same critical section is what makes one of
+          // them see the other's result.
+          //
+          // NO PROMPT INSIDE: everything below is a core write plus vault I/O.
+          // The re-render and the "saved" post are webview writes, not UI the
+          // user has to answer, and they are kept outside the section anyway.
+          //
+          // DEADLOCK CHECK (AsyncMutex is not re-entrant). The only way into
+          // this branch is `panel.webview.onDidReceiveMessage` -> handleMessage;
+          // handleMessage is private and called from nowhere else, and the two
+          // constructors of this panel (authProfileCommands' two commands and
+          // inlineAuthProfileCreation's openNew) only create/reveal it — neither
+          // holds the lock, and neither awaits a message handler. Nothing that
+          // runs inside a held section can therefore be sitting above this frame.
+          // The core write's synchronous `emitChanged()` reaches tree/panel
+          // observers, none of which acquires this lock. The lock stays OUT of
+          // NexusCore.addOrUpdateAuthProfile for the same reason it stays out of
+          // removeAuthProfile: configCommands' importMergeReplaceLocked and
+          // completeReset both call it from inside a held section.
+          let savedId: string | undefined;
+          let refusal: string | undefined;
+          await configMutationLock.runExclusive(async () => {
+            // Re-read INSIDE the lock. The pre-lock read this replaced could be
+            // taken while a deletion was already inside the section and merely
+            // awaiting its vault deletes.
+            const previousProfile = requestedId !== null ? this.core.getAuthProfile(requestedId) : undefined;
+            if (requestedId !== null && previousProfile === undefined) {
+              // ABORT, NOT RESURRECT — the same call the delete handler makes
+              // when its disclosure goes stale. The pre-lock code fell through to
+              // `existingId = null` here and created a NEW profile under a fresh
+              // id: a duplicate of the record the user thought they were editing,
+              // carrying its password under a key nothing else references, while
+              // every server and source the deletion unlinked stays unlinked.
+              // Saying so and keeping the form's contents is the conservative
+              // answer for a save whose subject no longer exists.
+              refusal = `Auth profile "${name}" was deleted while you were editing it — nothing was saved. Create it again if you still need it.`;
+              return;
+            }
+            const existingId = previousProfile ? requestedId : null;
 
-          await this.core.addOrUpdateAuthProfile(profile);
+            const profile: AuthProfile = {
+              id: existingId ?? randomUUID(),
+              name,
+              username,
+              authType,
+              keyPath: authType === "key" ? keyPath : undefined
+            };
 
-          // Handle password in SecretVault
-          if (this.secretVault) {
-            const passwordKey = authProfilePasswordSecretKey(profile.id);
-            const passphraseKey = authProfilePassphraseSecretKey(profile.id);
-            if (authType !== "password") {
-              // Switching away from password auth — remove stored password
-              await this.secretVault.delete(passwordKey);
-            } else if (password) {
-              // New or updated password
-              await this.secretVault.store(passwordKey, password);
-            } else if (existingId !== null && previousProfile && previousProfile.authType !== "password") {
-              // Switching to password auth with no password should not retain stale secret.
-              await this.secretVault.delete(passwordKey);
+            await this.core.addOrUpdateAuthProfile(profile);
+
+            // Handle password in SecretVault
+            if (this.secretVault) {
+              const passwordKey = authProfilePasswordSecretKey(profile.id);
+              const passphraseKey = authProfilePassphraseSecretKey(profile.id);
+              if (authType !== "password") {
+                // Switching away from password auth — remove stored password
+                await this.secretVault.delete(passwordKey);
+              } else if (password) {
+                // New or updated password
+                await this.secretVault.store(passwordKey, password);
+              } else if (existingId !== null && previousProfile && previousProfile.authType !== "password") {
+                // Switching to password auth with no password should not retain stale secret.
+                await this.secretVault.delete(passwordKey);
+              }
+
+              if (authType !== "key") {
+                await this.secretVault.delete(passphraseKey);
+              }
             }
 
-            if (authType !== "key") {
-              await this.secretVault.delete(passphraseKey);
-            }
+            savedId = profile.id;
+          });
+          if (refusal !== undefined) {
+            // Deferred out of the section for the same reason the delete
+            // handler's refusal is: nothing may show UI while the lock is held.
+            // No "saved" post either — the editor must not report a write it did
+            // not make. The panel has already re-rendered off the deletion's own
+            // emission (the onDidChange signature watcher), so nothing is
+            // re-rendered here.
+            void vscode.window.showErrorMessage(refusal);
+            break;
           }
 
-          this.selectedId = profile.id;
+          this.selectedId = savedId ?? this.selectedId;
           this.render();
           void this.panel.webview.postMessage({ type: "saved" });
           break;

@@ -95,6 +95,13 @@ function renderField(field: FormFieldDescriptor): string {
       const filledAttr = field.autofillFilledKeys && field.autofillFilledKeys.length > 0
         ? ` data-autofill-filled='${escapeHtml(JSON.stringify(field.autofillFilledKeys))}'`
         : "";
+      // The initial restore record: for each key whose descriptor this render
+      // ALREADY overwrote with the selected option's value, what that key held
+      // before. Omitted when the render displaced nothing, which the script
+      // reads as the same empty record.
+      const displacedAttr = field.autofillDisplacedValues && Object.keys(field.autofillDisplacedValues).length > 0
+        ? ` data-autofill-displaced='${escapeHtml(JSON.stringify(field.autofillDisplacedValues))}'`
+        : "";
       const optionsHtml = field.options.map((opt) =>
         `<div class="custom-select-option${opt.value === selectedValue ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">` +
         `<div class="custom-select-option-label">${escapeHtml(opt.label)}</div>` +
@@ -103,7 +110,7 @@ function renderField(field: FormFieldDescriptor): string {
       ).join("\n      ");
       return `<div class="form-group"${vw}>
   <label>${escapeHtml(field.label)}</label>
-  <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}>
+  <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}>
     <input type="hidden" name="${key}" value="${escapeHtml(selectedValue)}" />
     <div class="custom-select-trigger" tabindex="0">
       <span class="custom-select-text">${escapeHtml(selectedLabel)}</span>
@@ -264,11 +271,22 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       // Captured at each fill, never once at form open, so an edit made in an
       // unlocked field BETWEEN two selections is what comes back — the entry
       // is always "what this field held immediately before a profile
-      // overwrote it", not a frozen picture of the form's opening state. Keys
-      // the RENDER seeded ownership for (seededProfileFilledKeys) have no
-      // entry and need none: no profile has written them, every form seeds
-      // them from the record itself, so leaving them alone IS the restore.
-      var profileDisplacedValues = {};
+      // overwrote it", not a frozen picture of the form's opening state.
+      //
+      // REVIEW FINDING (P1) — with ONE exception, seeded from the render:
+      // where a form opens with a profile already selected, that profile's
+      // values are already in its fields (the descriptors carry them — see
+      // applyLinkedAuthProfileValues in formDefinitions.ts), so the very first
+      // overwrite happened before this script ran and no fill can record it.
+      // data-autofill-displaced carries what those fields would otherwise have
+      // shown. Without it the render's substitution becomes permanent:
+      // choosing (None) unlocks fields still holding the profile's
+      // credentials, with nothing behind them to put back, and Save then
+      // stores them on the record as its own.
+      // A key that is LOCKED but rendered from the record itself still has no
+      // entry and needs none — nothing overwrote it, so leaving it alone IS
+      // the restore (the inventory source form's defaultUsername).
+      var profileDisplacedValues = seededProfileDisplacedValues();
 
       /** The render-time seed — the keys the initially selected profile fills. */
       function seededProfileFilledKeys() {
@@ -290,6 +308,34 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           // fields editable rather than taking the whole form script down.
         }
         return filled;
+      }
+
+      /** The other render-time seed — what the initially selected profile's
+       *  values displaced when the descriptors were built. */
+      function seededProfileDisplacedValues() {
+        var wrapper = document.getElementById("field-authProfileId");
+        var raw = wrapper && wrapper.dataset ? wrapper.dataset.autofillDisplaced : "";
+        var displaced = {};
+        if (!raw) {
+          return displaced;
+        }
+        try {
+          var parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            for (var key in parsed) {
+              // Only strings: setFieldValue writes straight into a control's
+              // value, and a restore is worthless if what it puts back is
+              // "[object Object]".
+              if (typeof parsed[key] === "string") {
+                displaced[key] = parsed[key];
+              }
+            }
+          }
+        } catch (_error) {
+          // Same posture as seededProfileFilledKeys — a malformed attribute
+          // costs the restore, not the form.
+        }
+        return displaced;
       }
 
       /**

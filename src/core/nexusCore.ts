@@ -248,15 +248,43 @@ export class NexusCore {
    * saveInventorySources call from some other command. Capture the previous
    * entries before mutating and restore them on rejection.
    *
-   * FINDING 2 (P2) — that restore covers EVERY failure after the in-memory
-   * clearing, not just a rejected saveInventorySources. An earlier rejection
-   * (saveAuthProfiles, or the intervening saveServers) leaves the sources
-   * cleared and re-revisioned in memory while disk still holds the links, and
-   * the next unrelated inventory-source save from any other command persists
-   * the whole map — silently committing a deletion that failed. The restore
-   * therefore lives in a catch around all three saves, INSIDE the try/finally
-   * that owns the emission, so it always runs before observers are told to
-   * re-read (see the emission note below).
+   * FINDING 2 (P2) — that restore covers EVERY failure BEFORE the deletion
+   * commits, not just a rejected saveInventorySources. A rejected
+   * saveAuthProfiles leaves the sources cleared and re-revisioned in memory
+   * while disk still holds both the profile and the links, and the next
+   * unrelated inventory-source save from any other command persists the whole
+   * map — silently committing a deletion that failed. The restore therefore
+   * lives in a catch around all three saves, INSIDE the try/finally that owns
+   * the emission, so it always runs before observers are told to re-read (see
+   * the emission note below).
+   *
+   * REVIEW FINDING (P2) — but it is gated on `deletionCommitted`, because past
+   * the FIRST save the restore stops being a rollback and becomes corruption.
+   * Once saveAuthProfiles resolves the profile record is GONE FROM DISK: putting
+   * `authProfileId` back on a source then points memory (and, via the next
+   * unrelated saveInventorySources, disk) at a profile that no longer exists
+   * anywhere. Every later sync falls back to agent authentication with the
+   * dangling-profile warning, and the deletion cannot be retried to fix it —
+   * there is no profile left to select, so nothing can reach removeAuthProfile
+   * with this id again.
+   *
+   * Rolling the WHOLE deletion back instead is not available: the profile's
+   * vault secrets are deleted by the caller BEFORE this method is entered
+   * (AuthProfileEditorPanel's delete handler), so re-saving the record would
+   * resurrect a profile whose password and passphrase are already gone —
+   * a silently broken credential in place of a missing one.
+   *
+   * So the two halves of the rule are:
+   *   - saveAuthProfiles rejected -> nothing committed; restore the sources so
+   *     the map matches disk and the delete stays retryable.
+   *   - saveAuthProfiles resolved, a later save rejected -> the deletion HAS
+   *     committed; keep the cleared sources. Memory is then correct, and the
+   *     "a foreign command's next saveInventorySources persists this map"
+   *     property that made a leftover dangerous above is what heals disk here.
+   *     The clears not reaching disk in this run is survivable on its own: a
+   *     source reloaded with a link to a profile that is gone resolves to
+   *     nothing and degrades to agent auth with a warning, which is exactly the
+   *     dangling case computeSyncPlan already handles.
    *
    * SERIALIZATION IS THE CALLER'S JOB (FINDING 1, P2). The clears above are
    * persisted as snapshots taken synchronously at each save's call time, so an
@@ -274,13 +302,16 @@ export class NexusCore {
    * instead. Any NEW caller must either already hold `configMutationLock` or
    * acquire it around this call.
    *
-   * KNOWN ASYMMETRY, deliberately left alone: the `authProfiles` and `servers`
-   * in-memory mutations are NOT rolled back when their own saves reject. Those
-   * two are the deletion's primary intent rather than incidental reference
-   * clearing, and the emission contract below is written around them staying
-   * applied — observers are told the profile is gone. Only the source map,
-   * whose stale in-memory state is what a foreign command would silently
-   * persist, is restored here.
+   * KNOWN ASYMMETRY, and how the gate above reconciles with it: the
+   * `authProfiles` and `servers` in-memory mutations are NOT rolled back when
+   * their own saves reject. Those two are the deletion's primary intent rather
+   * than incidental reference clearing, and the emission contract below is
+   * written around them staying applied — observers are told the profile is
+   * gone. The source clears are now held to the SAME standard rather than a
+   * different one: they are undone only while the deletion can still be said not
+   * to have happened, and from the moment it has, they stay applied exactly like
+   * the other two. The asymmetry that remains is only in the one window where
+   * the deletion genuinely did not happen.
    */
   public async removeAuthProfile(profileId: string): Promise<void> {
     this.authProfiles.delete(profileId);
@@ -324,9 +355,14 @@ export class NexusCore {
     // an emission. Whatever the in-memory state ends up being — fully applied,
     // or with the inventory-source clears rolled back below — observers are told
     // about it exactly once.
+    // The single fact the restore below is gated on: has the profile record
+    // itself left disk yet? Set between the save and the next await, so nothing
+    // can observe it out of step with what has been persisted.
+    let deletionCommitted = false;
     try {
       try {
         await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
+        deletionCommitted = true;
         if (serversChanged) {
           await this.repository.saveServers([...this.servers.values()]);
         }
@@ -334,13 +370,21 @@ export class NexusCore {
           await this.repository.saveInventorySources([...this.inventorySources.values()]);
         }
       } catch (error) {
-        // FINDING A / FINDING 2 — restore the sources for ANY rejection above,
-        // then rethrow. A no-op when nothing was cleared (`previousSources`
-        // empty), so it needs no guard of its own. This catch is nested inside
-        // the emitting try/finally rather than wrapping it, so the restore is
-        // complete before the emission fires.
-        for (const [id, source] of previousSources) {
-          this.inventorySources.set(id, source);
+        // FINDING A / FINDING 2 — restore the sources for a rejection that
+        // happened BEFORE the profile record left disk, then rethrow. A no-op
+        // when nothing was cleared (`previousSources` empty), so it needs no
+        // guard of its own. This catch is nested inside the emitting try/finally
+        // rather than wrapping it, so the restore is complete before the
+        // emission fires.
+        //
+        // REVIEW FINDING (P2) — once `deletionCommitted` is true the restore is
+        // SKIPPED: re-linking a source to a profile that no longer exists (and
+        // can no longer be deleted again) is worse than leaving the link
+        // cleared. See the two-halves rule in the doc comment above.
+        if (!deletionCommitted) {
+          for (const [id, source] of previousSources) {
+            this.inventorySources.set(id, source);
+          }
         }
         throw error;
       }

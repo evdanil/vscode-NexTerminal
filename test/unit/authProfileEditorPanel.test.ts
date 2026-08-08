@@ -499,6 +499,133 @@ describe("AuthProfileEditorPanel", () => {
     });
   });
 
+  /**
+   * REVIEW FINDING (P2) — the SAVE path was outside the mutex the delete path
+   * runs in. Deletion pauses inside the lock across two awaited vault deletes,
+   * and a lock-free save lands squarely in that pause.
+   *
+   * Both tests gate the operation that must be inside the window rather than
+   * racing it: the parked one holds its position until the test releases it, so
+   * the interleaving is guaranteed rather than usual. The assertion that kills
+   * the pre-fix code is always the MID-WINDOW one — sampled while the gate is
+   * still closed — because in both orderings the two flows happen to converge on
+   * the same final profile map, and only the intermediate state (and, in the
+   * second test, the vault) tells them apart.
+   */
+  describe("profile saves are serialized against deletion", () => {
+    /** Parks the Nth call to a vault method until released, then runs the real one. */
+    function gateVaultCall(
+      method: { getMockImplementation: () => ((key: string, value?: string) => Promise<void>) | undefined; mockImplementation: (fn: (key: string, value?: string) => Promise<void>) => unknown },
+      gateOnCall: number
+    ): { release: () => void } {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const real = method.getMockImplementation()!;
+      let calls = 0;
+      method.mockImplementation(async (key: string, value?: string) => {
+        if (calls++ === gateOnCall) {
+          await gate;
+        }
+        await real(key, value);
+      });
+      return { release };
+    }
+
+    it("(REVIEW FINDING, P2) a save issued while a deletion is paused in its vault deletes cannot rewrite the record being deleted, and is refused instead of re-creating it afterwards (kills a lock-free save path)", async () => {
+      const profile = makeAuthProfile({ id: "ap1", authType: "password" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+
+      // The deletion's FIRST vault delete parks — the exact pause the finding
+      // names, after its stale-confirmation check has already passed.
+      const passwordDelete = gateVaultCall(vault.delete, 0);
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+      // Precondition: the deletion really is parked mid-flight.
+      expect(core.getAuthProfile("ap1")).toBeDefined();
+      expect(vault.delete).toHaveBeenCalledTimes(1);
+
+      const save = sendMessage({
+        type: "save",
+        id: "ap1",
+        name: "Renamed",
+        username: "root",
+        authType: "password",
+        password: "new-secret",
+        keyPath: ""
+      });
+      await settle();
+
+      // THE KILL. Lock-free, the save has already committed by now and the
+      // record reads "Renamed" — which the paused deletion then removes without
+      // ever looking again, discarding a save it reported as successful.
+      expect(core.getAuthProfile("ap1")?.name).toBe("Prod Auth");
+      expect(vault.store).not.toHaveBeenCalled();
+
+      passwordDelete.release();
+      await deletion;
+      await save;
+
+      // SECOND KILL — for a half-fix that takes the lock but does not re-read
+      // the profile inside it: the queued save's `id` no longer resolves, the
+      // pre-fix code fell through to `existingId = null`, and a brand-new
+      // profile called "Renamed" (fresh uuid, its own stored password) appeared
+      // in place of the one just deleted.
+      expect(core.getSnapshot().authProfiles).toEqual([]);
+      expect(vault.store).not.toHaveBeenCalled();
+      expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        'Auth profile "Renamed" was deleted while you were editing it — nothing was saved. Create it again if you still need it.'
+      );
+    });
+
+    it("(REVIEW FINDING, P2) a deletion issued while a save is paused in its vault write waits for it, so the save's password is never stored after the deletion has wiped it (kills a save that holds no lock while it writes secrets)", async () => {
+      const profile = makeAuthProfile({ id: "ap1", authType: "password" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+
+      // The save's vault write parks — its record is already committed to core,
+      // the secret is not yet written.
+      const passwordStore = gateVaultCall(vault.store, 0);
+
+      const save = sendMessage({
+        type: "save",
+        id: "ap1",
+        name: "Renamed",
+        username: "root",
+        authType: "password",
+        password: "new-secret",
+        keyPath: ""
+      });
+      await settle();
+      expect(core.getAuthProfile("ap1")?.name).toBe("Renamed");
+      expect(vault.store).toHaveBeenCalledTimes(1);
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+
+      // THE KILL. With the save holding no lock, the deletion runs to completion
+      // right here — profile gone, both secret keys deleted — while the save is
+      // still holding an unwritten password for it.
+      expect(core.getAuthProfile("ap1")).toBeDefined();
+      expect(vault.delete).not.toHaveBeenCalled();
+
+      passwordStore.release();
+      await save;
+      await deletion;
+
+      expect(core.getAuthProfile("ap1")).toBeUndefined();
+      // SECOND KILL, on the end state rather than the window: unserialized, the
+      // store lands after the deletion's deletes and leaves a password in the
+      // vault for a profile that no longer exists — unreachable by any UI, and
+      // adopted wholesale by the next profile to be created under that id.
+      expect(await vault.get(authProfilePasswordSecretKey("ap1"))).toBeUndefined();
+    });
+  });
+
   it("delete profile does nothing if user cancels", async () => {
     const profile = makeAuthProfile({ id: "ap1" });
     const { core, vault, sendMessage } = await openPanel([profile]);

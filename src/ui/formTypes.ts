@@ -24,8 +24,16 @@ export type FormFieldDescriptor =
    * these until the next selection replaces them with the keys that
    * selection's `fillFields` answer actually filled. Only meaningful
    * alongside `autofill`.
+   *
+   * `autofillDisplacedValues` is the render-time half of the RESTORE
+   * (`profileDisplacedValues` in formHtml.ts): for each key whose descriptor
+   * this render already overwrote with the selected option's value, the value
+   * the field would otherwise have shown — the record's own. The webview seeds
+   * its restore record from it, so deselecting hands those values straight
+   * back, exactly as a mid-session switch does. A key that is locked but
+   * rendered from the record itself has no entry and needs none.
    */
-  | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string }[]; value?: string; autofill?: boolean; autofillFilledKeys?: string[] } & FormFieldCommon)
+  | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string }[]; value?: string; autofill?: boolean; autofillFilledKeys?: string[]; autofillDisplacedValues?: Record<string, string> } & FormFieldCommon)
   | ({ type: "combobox"; key: string; label: string; suggestions: string[]; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "checkbox"; key: string; label: string; value?: boolean } & FormFieldCommon)
   | ({ type: "file"; key: string; label: string; value?: string } & FormFieldCommon)

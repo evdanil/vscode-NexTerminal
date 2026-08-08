@@ -1072,9 +1072,31 @@ function countJumpHostDependents(allServers: ServerConfig[], removedIds: Readonl
   return allServers.filter((s) => !removedIds.has(s.id) && s.proxy?.type === "ssh" && removedIds.has(s.proxy.jumpHostId)).length;
 }
 
-/** The updates whose auth profile actually changes — the retro-apply subset of `plan.updates`. */
+/**
+ * The updates whose auth profile actually changes — the retro-apply and
+ * retro-UNAPPLY subsets of `plan.updates` together. Both directions are
+ * credential mutations on existing servers, so both are disclosed and both are
+ * covered by the drift comparison; the two renderings below split them, because
+ * "gains a profile" and "loses one" are not the same news.
+ */
 function authProfileSwitches(plan: InventorySyncPlan): Array<{ before: ServerConfig; after: ServerConfig }> {
   return plan.updates.filter((u) => u.before.authProfileId !== u.after.authProfileId);
+}
+
+/** The switches that ADOPT a profile — computeSyncPlan's AUTH 2 retro-apply. */
+function authProfileAdoptions(plan: InventorySyncPlan): Array<{ before: ServerConfig; after: ServerConfig }> {
+  return authProfileSwitches(plan).filter((u) => u.after.authProfileId !== undefined);
+}
+
+/**
+ * REVIEW FINDING (P1) — the switches that REMOVE the source's profile:
+ * computeSyncPlan's AUTH 2b, which undoes a link the source applied once the
+ * profile can no longer honour it (a key profile that lost its key file). Split
+ * out from the adoptions above because rendering it as "will switch to auth
+ * profile X" would tell the user the exact opposite of what the plan does.
+ */
+function authProfileClears(plan: InventorySyncPlan): Array<{ before: ServerConfig; after: ServerConfig }> {
+  return authProfileSwitches(plan).filter((u) => u.after.authProfileId === undefined);
 }
 
 /**
@@ -1128,13 +1150,30 @@ export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerCo
   // case, where one render has the name and another doesn't.) A line naming no
   // profile is less useful than one that does, but it is still consent: the
   // user is told how many servers change auth, and can cancel.
-  const authProfileSwitchCount = authProfileSwitches(plan).length;
+  const authProfileSwitchCount = authProfileAdoptions(plan).length;
   if (authProfileSwitchCount > 0) {
     const n = authProfileSwitchCount;
     lines.push(
       authProfileName !== undefined
         ? `${n} server${n === 1 ? "" : "s"} will switch to auth profile "${authProfileName}".`
         : `${n} server${n === 1 ? "" : "s"} will switch to a different auth profile.`
+    );
+  }
+  // REVIEW FINDING (P1) — the other direction, on its own line and in the same
+  // place: unlinking a server the source had linked is a credential change to an
+  // existing record, so it is disclosed exactly like the adoption it reverses,
+  // never folded into it. Wording matches the auth-profile delete confirmation
+  // ("will revert to their own stored credentials") — the same event from the
+  // server's point of view, and the reason the line does not promise SSH agent
+  // authentication specifically: what a server falls back to is whatever its own
+  // record holds.
+  const authProfileClearCount = authProfileClears(plan).length;
+  if (authProfileClearCount > 0) {
+    const n = authProfileClearCount;
+    lines.push(
+      authProfileName !== undefined
+        ? `${n} server${n === 1 ? "" : "s"} will stop using auth profile "${authProfileName}" and revert to their own stored credentials.`
+        : `${n} server${n === 1 ? "" : "s"} will stop using their auth profile and revert to their own stored credentials.`
     );
   }
   const orphaned = plan.prunes.filter((p) => p.policy === "orphan").length;
@@ -1224,7 +1263,7 @@ export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerCo
  */
 function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: string): string[] {
   const buffer = [...plan.warnings];
-  const switches = authProfileSwitches(plan);
+  const switches = authProfileAdoptions(plan);
   if (switches.length > 0) {
     const n = switches.length;
     const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "a different auth profile";
@@ -1234,6 +1273,21 @@ function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: string): 
     // plan also carries engine warnings above.
     buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
     for (const u of switches) {
+      buffer.push(`  "${u.before.name}"`);
+    }
+  }
+  // REVIEW FINDING (P1) — the unlink list, in the same shape and for the same
+  // reason: every affected server named, so "is MY server in this set" is
+  // answerable one click before Apply. Its own heading rather than a shared one,
+  // because a plan can in principle carry both (the engine's two rules are
+  // mutually exclusive per sync today, but the render must not depend on that to
+  // stay truthful).
+  const clears = authProfileClears(plan);
+  if (clears.length > 0) {
+    const n = clears.length;
+    const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "their auth profile";
+    buffer.push(`${n} server${n === 1 ? "" : "s"} will stop using ${target} and revert to their own stored credentials:`);
+    for (const u of clears) {
       buffer.push(`  "${u.before.name}"`);
     }
   }
@@ -1251,6 +1305,11 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
  * Read off `before.id` for the same reason `planWarningsBuffer` names
  * `before.name`: it is the record as it exists right now, which is what the
  * user is being asked to consent to.
+ *
+ * Deliberately the UNION of both directions (`authProfileSwitches`, not just the
+ * adoptions): an unlink is a credential change to a named, disclosed server too,
+ * so a mid-modal swap of WHICH server gets unlinked has to drift exactly as an
+ * adoption swap does.
  */
 function authProfileSwitchIds(plan: InventorySyncPlan): Set<string> {
   return new Set(authProfileSwitches(plan).map((u) => u.before.id));

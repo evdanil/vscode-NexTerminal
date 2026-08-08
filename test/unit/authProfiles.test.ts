@@ -48,6 +48,34 @@ describe("validateAuthProfile", () => {
   it("rejects non-object", () => {
     expect(validateAuthProfile("string")).toBe(false);
   });
+
+  /**
+   * REVIEW FINDING (P2) — `keyPath` was the one declared field this guard never
+   * looked at, so a hand-edited backup or a version-skewed globalState row could
+   * carry any JSON value there and still be handed downstream typed as
+   * `AuthProfile`. It is settled here, at the boundary, because the consumers
+   * are RENDERERS: `authProfileOwnedCredentials` trims it, and
+   * `formatAuthProfileLabel` runs `path.posix.basename` over it for every option
+   * of every Auth Profile select and every linked server's tree tooltip.
+   */
+  it("rejects a keyPath that is not a string (kills leaving the one optional declared field unchecked: the record loads typed as AuthProfile and the first string operation on it throws mid-render, taking out a form or the sidebar rather than one bad row)", () => {
+    const base = { id: "x", name: "Imported", username: "root", authType: "key" };
+    expect(validateAuthProfile({ ...base, keyPath: 12345 })).toBe(false);
+    expect(validateAuthProfile({ ...base, keyPath: { path: "/keys/id" } })).toBe(false);
+    expect(validateAuthProfile({ ...base, keyPath: ["/keys/id"] })).toBe(false);
+    expect(validateAuthProfile({ ...base, keyPath: null })).toBe(false);
+    expect(validateAuthProfile({ ...base, keyPath: true })).toBe(false);
+  });
+
+  it("still accepts an absent or EMPTY keyPath (kills tightening this with isOptionalNonEmptyString: \"\" reads identically to absent everywhere downstream, so rejecting it would discard a whole credential record — and, on the import path, its vault secrets and every server/source link to it — over a field that changes nothing)", () => {
+    const base = { id: "x", name: "Imported", username: "root", authType: "key" };
+    expect(validateAuthProfile(base)).toBe(true);
+    expect(validateAuthProfile({ ...base, keyPath: "" })).toBe(true);
+    expect(validateAuthProfile({ ...base, keyPath: "   " })).toBe(true);
+    // …and both are "no usable key path" to the rule, so nothing downstream is
+    // relying on this guard to have filtered them out.
+    expect(authProfileOwnedCredentials({ ...base, authType: "key", keyPath: "" } as AuthProfile).keyPath).toBeUndefined();
+  });
 });
 
 /**
@@ -95,6 +123,31 @@ describe("authProfileOwnedCredentials — the shared field-ownership rule", () =
 
   it("owns nothing for no profile — an unlinked server, or an id that resolves to nothing", () => {
     expect(authProfileOwnedCredentials(undefined)).toEqual({});
+  });
+
+  /**
+   * REVIEW FINDING (P2) — the second half of the malformed-`keyPath` fix.
+   * `validateAuthProfile` is what should stop such a record existing; this is
+   * what stops one that got past a boundary (a profile built in-process, a
+   * future writer, a caller that skipped the guard) taking a render down with
+   * it. The unconditional `.trim()` this replaced threw for every consumer of
+   * the rule at once — the tree, both mirrors, the lock seed, the sync plan.
+   */
+  it("owns no key path for a non-string one instead of throwing (kills (profile.keyPath ?? \"\").trim(): this rule runs while the tree and every profile-select form are rendering, where a TypeError is a view that never draws — not a rejected row)", () => {
+    const malformed = {
+      id: "ap-bad",
+      name: "Imported",
+      username: "root",
+      authType: "key",
+      keyPath: 12345
+    } as unknown as AuthProfile;
+
+    expect(() => authProfileOwnedCredentials(malformed)).not.toThrow();
+    expect(authProfileOwnedCredentials(malformed)).toEqual({ username: "root", authType: "key" });
+    // And it lands in the bucket blank already occupies, so the companion
+    // predicate reaches the right conclusion for free: this profile cannot
+    // serve a server that brings no key of its own.
+    expect(authProfileNeedsServerKeyPath(malformed)).toBe(true);
   });
 });
 

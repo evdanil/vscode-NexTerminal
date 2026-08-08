@@ -595,6 +595,14 @@ describe("renderFormHtml", () => {
       return (doc: unknown) => factory(doc)();
     }
 
+    function extractSeededProfileDisplacedValues(html: string): (doc: unknown) => Record<string, string> {
+      const source = extractFunctionSource(html, "function seededProfileDisplacedValues()");
+      const factory = new Function("document", `${source}\nreturn seededProfileDisplacedValues;`) as (
+        doc: unknown
+      ) => () => Record<string, string>;
+      return (doc: unknown) => factory(doc)();
+    }
+
     function extractFilledKeysFromValues(html: string): (values: Record<string, unknown>) => Record<string, boolean> {
       const source = extractFunctionSource(html, "function filledKeysFromValues(values)");
       const factory = new Function(`${source}\nreturn filledKeysFromValues;`) as () => (
@@ -705,6 +713,31 @@ describe("renderFormHtml", () => {
           id === "field-authProfileId" ? { dataset: { autofillFilled } } : null
       };
     }
+
+    /** The same entry point for the restore half. */
+    function makeDisplacedSeedDom(autofillDisplaced: string | undefined) {
+      return {
+        getElementById: (id: string): unknown =>
+          id === "field-authProfileId" ? { dataset: { autofillDisplaced } } : null
+      };
+    }
+
+    it("seeds the restore record from the select's data-autofill-displaced attribute (kills starting a pre-linked form with an empty one: the render's substitution then has nothing behind it and unlinking cannot undo it)", () => {
+      const seed = extractSeededProfileDisplacedValues(run);
+      expect(seed(makeDisplacedSeedDom('{"username":"stored-user","authType":"password","keyPath":"/stored/key"}'))).toEqual({
+        username: "stored-user",
+        authType: "password",
+        keyPath: "/stored/key"
+      });
+    });
+
+    it("seeds nothing when the render displaced nothing (no attribute), and survives a malformed or wrongly-typed one (kills an unguarded JSON.parse taking the form script down, and kills writing a non-string straight into a control's value)", () => {
+      const seed = extractSeededProfileDisplacedValues(run);
+      expect(seed(makeDisplacedSeedDom(undefined))).toEqual({});
+      expect(seed(makeDisplacedSeedDom("{not json"))).toEqual({});
+      expect(seed(makeDisplacedSeedDom('["username"]'))).toEqual({});
+      expect(seed(makeDisplacedSeedDom('{"username":"ok","authType":7,"keyPath":null}'))).toEqual({ username: "ok" });
+    });
 
     it("seeds ownership from the select's data-autofill-filled attribute (kills leaving the initial render with no record at all, which unlocks every mirrored field on Edit until the profile is re-picked)", () => {
       const seed = extractSeededProfileFilledKeys(run);
@@ -910,6 +943,75 @@ describe("renderFormHtml", () => {
     });
     // The attribute itself, not the script comment that names it.
     expect(html).not.toContain("data-autofill-filled='");
+  });
+
+  /**
+   * REVIEW FINDING (P1) — the render's other seed. Where a form opens with a
+   * profile already selected, the descriptors already carry that profile's
+   * values, so the first overwrite happened before the script ran and no fill
+   * can record it. This attribute is the only way the webview learns what to
+   * put back when the link is dropped.
+   */
+  it("renders what the initially selected profile's values displaced (kills seeding the render's values without seeding their originals: unlinking leaves the profile's credentials in unlocked fields with nothing behind them, and the save stores them onto the record as its own)", () => {
+    const html = renderFormHtml({
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "authProfileId",
+          label: "Auth Profile",
+          options: [
+            { label: "(None)", value: "" },
+            { label: "Prod", value: "ap1" }
+          ],
+          value: "ap1",
+          autofill: true,
+          autofillFilledKeys: ["username", "authType"],
+          autofillDisplacedValues: { username: "stored-user", authType: "password" }
+        }
+      ]
+    });
+    expect(html).toContain(
+      "data-autofill-displaced='{&quot;username&quot;:&quot;stored-user&quot;,&quot;authType&quot;:&quot;password&quot;}'"
+    );
+  });
+
+  it("escapes the displaced values it embeds, which are record data and can carry quotes (kills interpolating them raw into a single-quoted attribute: a key path containing an apostrophe would close the attribute and inject markup into the form)", () => {
+    const html = renderFormHtml({
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "authProfileId",
+          label: "Auth Profile",
+          options: [{ label: "Prod", value: "ap1" }],
+          value: "ap1",
+          autofill: true,
+          autofillDisplacedValues: { keyPath: "/home/o'brien/id_rsa" }
+        }
+      ]
+    });
+    expect(html).not.toContain("/home/o'brien/id_rsa");
+    expect(html).toContain("&#39;brien");
+  });
+
+  it("omits the displaced attribute entirely when the render displaced nothing", () => {
+    const html = renderFormHtml({
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "authProfileId",
+          label: "Auth Profile",
+          options: [{ label: "(None)", value: "" }],
+          value: "",
+          autofill: true,
+          autofillFilledKeys: [],
+          autofillDisplacedValues: {}
+        }
+      ]
+    });
+    expect(html).not.toContain("data-autofill-displaced='");
   });
 
   it("renders a dangling seeded auth profile id as an empty hidden value, not just an empty label", () => {
