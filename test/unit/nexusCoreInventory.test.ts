@@ -1798,6 +1798,151 @@ describe("applyInventorySyncPlan — empty-folder GC (ITEM B)", () => {
     // dropped) set this rejected apply attempted to stamp.
     expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackA"]);
   });
+
+  it("(PARENT-CHAIN FIX) a concurrent rename of the removed folder's parent tree while the persist is pending is NOT undone — rollback does not resurrect the stale pre-rename path (kills unconditional re-add)", async () => {
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core, repository } = await makeCoreWithSource([owned], { targetFolder: "NetBox" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox");
+
+    // Hold the batch's own saveGroups call pending so a concurrent
+    // _renameFolderPath (via the public renameFolder API) can land while the
+    // persist is still in flight. The batch's own compensating re-persist
+    // (after rollback) must go through to the real implementation.
+    const originalSaveGroups = repository.saveGroups.bind(repository);
+    let rejectBatchSave!: (err: Error) => void;
+    let batchCallSeen = false;
+    vi.spyOn(repository, "saveGroups").mockImplementation(async (groups) => {
+      if (!batchCallSeen) {
+        batchCallSeen = true;
+        return new Promise<void>((_resolve, reject) => {
+          rejectBatchSave = reject;
+        });
+      }
+      return originalSaveGroups(groups);
+    });
+
+    // The device moves to RackB; RackA becomes empty and is GC'd — this
+    // batch's own mutation phase (synchronous, already run by the time
+    // control returns from applyInventorySyncPlan below) deletes
+    // "NetBox/RackA" from explicitGroups and kicks off the (held) saveGroups.
+    const moved = { ...owned, group: "NetBox/RackB" };
+    const applyPromise = core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // Concurrent command: the user renames the whole "NetBox" tree to "Lab"
+    // while the batch's persist is still pending. Lock-free tree commands are
+    // not serialized against applyInventorySyncPlan's in-flight window.
+    await core.renameFolder("NetBox", "Lab");
+    expect(core.getSnapshot().explicitGroups).toContain("Lab");
+    expect(core.getSnapshot().explicitGroups).toContain("Lab/RackB");
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox");
+
+    rejectBatchSave(new Error("disk full"));
+    await expect(applyPromise).rejects.toThrow("disk full");
+
+    // THE KILL ASSERTION — with the OLD unconditional-restore-if-absent
+    // implementation ("NetBox/RackA" is absent from explicitGroups, so it
+    // gets re-added unconditionally"), this would resurrect the stale,
+    // now-orphaned "NetBox/RackA" path even though its parent "NetBox" no
+    // longer exists (renamed to "Lab"). The fix's parent-chain check must
+    // refuse the restore because "NetBox" is absent from explicitGroups at
+    // rollback time.
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox");
+    // The user's concurrent rename must survive untouched.
+    expect(core.getSnapshot().explicitGroups).toContain("Lab");
+    expect(core.getSnapshot().explicitGroups).toContain("Lab/RackB");
+  });
+
+  it("(PARENT-CHAIN FIX) a concurrent re-creation of the exact removed folder path while the persist is pending is left alone by rollback — no duplicate, no churn", async () => {
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core, repository } = await makeCoreWithSource([owned], { targetFolder: "NetBox" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+
+    const originalSaveGroups = repository.saveGroups.bind(repository);
+    let rejectBatchSave!: (err: Error) => void;
+    let batchCallSeen = false;
+    vi.spyOn(repository, "saveGroups").mockImplementation(async (groups) => {
+      if (!batchCallSeen) {
+        batchCallSeen = true;
+        return new Promise<void>((_resolve, reject) => {
+          rejectBatchSave = reject;
+        });
+      }
+      return originalSaveGroups(groups);
+    });
+
+    const moved = { ...owned, group: "NetBox/RackB" };
+    const applyPromise = core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    // Concurrent command: something (a user's manual "New Folder", or a
+    // different sync) re-creates the exact path this batch's GC just removed
+    // while the persist is still pending.
+    await core.addGroup("NetBox/RackA");
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+
+    rejectBatchSave(new Error("disk full"));
+    await expect(applyPromise).rejects.toThrow("disk full");
+
+    // Still present exactly once (Set semantics) — rollback must not have
+    // deleted-then-readded it (which would be harmless here but would betray
+    // an unconditional-add-without-presence-check implementation), and must
+    // not have skipped it either (the concurrent recreation is real and must
+    // remain).
+    const groups = core.getSnapshot().explicitGroups;
+    expect(groups.filter((g) => g === "NetBox/RackA")).toHaveLength(1);
+    expect(groups).toContain("NetBox/RackA");
+  });
 });
 
 describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1, P2)", () => {

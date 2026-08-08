@@ -1109,10 +1109,52 @@ export class NexusCore {
       // server back into it) while the persist above was in flight — a
       // wholesale unconditional re-add would clobber that concurrent state
       // the same way an unconditional restore would for addedExplicitGroups.
-      for (const group of removedEmptyGroups) {
-        if (!this.explicitGroups.has(group)) {
-          this.explicitGroups.add(group);
+      //
+      // PARENT-CHAIN FIX — presence-of-the-exact-path alone isn't enough.
+      // Lock-free tree commands (`_renameFolderPath` / `removeFolderCascade`)
+      // are NOT serialized against this batch's pending persist (same window
+      // FINDING 3/REVIEW FINDING 2 above already contend with for servers),
+      // so the surrounding tree can be renamed or deleted out from under a
+      // removed candidate while this save is in flight — e.g. the whole
+      // "NetBox" branch renamed to "Lab" while this batch is mid-persist
+      // after GC'ing the now-empty "NetBox/RackA". "NetBox/RackA" is still
+      // ABSENT from `explicitGroups` at rollback time (it was never
+      // recreated at that exact path — it just moved, along with its
+      // parent), so the presence check alone would wrongly resurrect a
+      // stale, now-orphaned path under a parent tree the user just renamed
+      // away, and the compensating re-persist below would then write that
+      // resurrection to disk — undoing the user's concurrent rename/delete.
+      //
+      // A GC candidate is always multi-segment (see
+      // `pruneEmptyFoldersUnderTarget`'s doc — a target's own root and any
+      // single-segment path are never candidates), so `parentPath` always
+      // returns a defined immediate parent here. Restore only if that parent
+      // is CURRENTLY in `explicitGroups` — i.e. this candidate's own chain
+      // still exists to hang it back off. Process shallowest-first (fewest
+      // path segments first) so a parent restored earlier in this SAME loop
+      // (e.g. "NetBox/RackA" before "NetBox/RackA/Sub", both GC'd together)
+      // is visible to its child's parent check via the ordinary
+      // `explicitGroups.has` lookup — no separate "restoring in this pass"
+      // bookkeeping needed, the loop's own insertion order provides it.
+      //
+      // RESIDUAL (documented, acceptable) — a concurrent rename that
+      // happens to leave an IDENTICALLY-NAMED parent behind (coincidence,
+      // not the same folder) is indistinguishable from "the chain still
+      // exists" and this restore proceeds anyway. Bounded and rare; the
+      // realistic, common case this guards is exactly the rename/delete
+      // scenario above, where the parent is verifiably gone.
+      const sortedRemovedEmptyGroups = [...removedEmptyGroups].sort(
+        (a, b) => a.split("/").length - b.split("/").length
+      );
+      for (const group of sortedRemovedEmptyGroups) {
+        if (this.explicitGroups.has(group)) {
+          continue; // (a) someone re-created this exact path since — leave theirs.
         }
+        const parent = parentPath(group);
+        if (parent !== undefined && !this.explicitGroups.has(parent)) {
+          continue; // (b) the chain this path hung off no longer exists — do not resurrect an orphan.
+        }
+        this.explicitGroups.add(group);
       }
       // TOMBSTONE — a captured session that was genuinely torn down by
       // unregisterSession during the awaited persist (window opened just
