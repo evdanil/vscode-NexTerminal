@@ -99,9 +99,18 @@ describe("WebviewFormPanel submit handling", () => {
     // `key` echoes the request: the webview tracks which managed fields the
     // AUTH PROFILE select filled, and must not read another autofill-capable
     // select's answer as the profile's (kills dropping the echo).
+    //
+    // REVIEW FINDING (P2) — and `value` echoes WHICH option was asked about, so
+    // the webview can drop an answer the user has already moved past. Asserted
+    // as an exact object, never toMatchObject: an answer that reaches the
+    // webview without the id it was composed for cannot be correlated against
+    // the current selection at all, and formHtml's
+    // `fillAnswersCurrentSelection` refuses it — so dropping this echo does not
+    // merely weaken the guard, it stops every autofill from applying.
     expect(postMessage).toHaveBeenCalledWith({
       type: "fillFields",
       key: "authProfileId",
+      value: "ap1",
       values: { username: "root", authType: "key" }
     });
   });

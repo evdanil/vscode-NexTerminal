@@ -30,8 +30,8 @@ export type FormFieldDescriptor =
    * this render already overwrote with the selected option's value, the value
    * the field would otherwise have shown — the record's own. The webview seeds
    * its restore record from it, so deselecting hands those values straight
-   * back, exactly as a mid-session switch does. A key that is locked but
-   * rendered from the record itself has no entry and needs none.
+   * back, exactly as a mid-session switch does. A key the option supplies no
+   * usable value for is not overwritten, so it has no entry and needs none.
    */
   | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string }[]; value?: string; autofill?: boolean; autofillFilledKeys?: string[]; autofillDisplacedValues?: Record<string, string> } & FormFieldCommon)
   | ({ type: "combobox"; key: string; label: string; suggestions: string[]; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
@@ -65,6 +65,17 @@ export type ExtensionMessage =
   | { type: "browseResult"; key: string; path: string }
   | { type: "validationError"; errors: Record<string, string> }
   | { type: "addSelectOption"; key: string; value: string; label: string }
-  /** `key` echoes the `autofill` message this answers, so the webview can
-   *  attribute the filled values to the select that asked for them. */
-  | { type: "fillFields"; key: string; values: Record<string, string> };
+  /**
+   * `key` echoes the `autofill` message this answers, so the webview can
+   * attribute the filled values to the select that asked for them.
+   *
+   * REVIEW FINDING (P2) — `value` echoes the OPTION that autofill asked about,
+   * which is what makes the answer discardable. An autofill is a round trip;
+   * the user can move on before it returns, and without the echo a late answer
+   * for a profile that is no longer selected is applied anyway — writing that
+   * profile's credentials into fields the release has just unlocked, where the
+   * save path reads them as the user's own. The webview compares this against
+   * the select's CURRENT value and drops anything that does not match (see
+   * `fillAnswersCurrentSelection` in formHtml.ts).
+   */
+  | { type: "fillFields"; key: string; value: string; values: Record<string, string> };

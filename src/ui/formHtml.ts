@@ -283,9 +283,10 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       // choosing (None) unlocks fields still holding the profile's
       // credentials, with nothing behind them to put back, and Save then
       // stores them on the record as its own.
-      // A key that is LOCKED but rendered from the record itself still has no
-      // entry and needs none — nothing overwrote it, so leaving it alone IS
-      // the restore (the inventory source form's defaultUsername).
+      // Every form that can OPEN pre-linked seeds this, the inventory source
+      // form's defaultUsername included: it renders that field from the
+      // profile too, so the source's own stored fallback lives here and
+      // nowhere else until the link is dropped.
       var profileDisplacedValues = seededProfileDisplacedValues();
 
       /** The render-time seed — the keys the initially selected profile fills. */
@@ -401,6 +402,43 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       }
 
       /**
+       * REVIEW FINDING (P2) — is this answer about the option that is selected
+       * RIGHT NOW? An autofill is a round trip through the extension host, and
+       * the user can outrun it: pick a profile, then pick (None) — or a
+       * different profile — before the answer lands. Nothing else in this
+       * script can tell that answer apart from a timely one, because it is
+       * shaped identically; only the id it was composed for can, so the
+       * fillFields answer echoes it (webviewFormPanel.ts).
+       *
+       * WHAT GOING WITHOUT COSTS, precisely: the selection already ran
+       * releaseProfileOwnedFields, so the managed fields are unlocked and
+       * holding the user's own values again. Applying the late answer writes
+       * the DESELECTED profile's credentials over them and locks them to it,
+       * and every save path downstream reads an unlinked submission as the
+       * user's own input — preserveLinkedServerCredentials keeps all of it
+       * (there is no link to preserve anything under), and
+       * fallbackUsernameForSource stores the submitted username verbatim. A
+       * source or server the user unlinked is then saved carrying the very
+       * credentials they backed out of, from fields that showed them unlocked
+       * as though they had been typed.
+       *
+       * Compared against the CONTROL, not against a variable this script keeps
+       * in step: the control is what the user sees, what the submit loop reads,
+       * and what every other selection path already writes through
+       * selectCustomOption. A key this form does not render cannot be
+       * correlated at all (another form's select — fieldValue's own expected
+       * miss), so it is applied as before; the fills that matter here all name
+       * a control this form has.
+       */
+      function fillAnswersCurrentSelection(msg) {
+        var control = form.elements[msg.key];
+        if (!control) {
+          return true;
+        }
+        return control.value === msg.value;
+      }
+
+      /**
        * Ends the current profile's ownership: every value it displaced goes
        * back to its field, and the ownership record empties so the fields
        * unlock. Runs on EVERY transition — another profile, (None), or an
@@ -424,9 +462,18 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
        * Applies an autofill answer. For the auth profile select the answer IS
        * the ownership record — these keys, and only these, came from the
        * profile just selected. Scoped by the echoed key so another
-       * autofill-capable select's answer can never be read as the profile's.
+       * autofill-capable select's answer can never be read as the profile's,
+       * and by the echoed value so an answer for an option the user has since
+       * moved away from is discarded rather than applied
+       * (fillAnswersCurrentSelection).
        */
       function applyFillFields(msg) {
+        // Stale answers are dropped whole — values, ownership and all. A
+        // partial application would be worse than none: the fields would show
+        // one profile's values under another's lock.
+        if (!fillAnswersCurrentSelection(msg)) {
+          return;
+        }
         var fillValues = msg.values;
         var isProfileFill = msg.key === "authProfileId";
         var nextFilledKeys = isProfileFill ? filledKeysFromValues(fillValues) : null;

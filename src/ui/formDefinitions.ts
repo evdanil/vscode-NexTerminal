@@ -19,8 +19,9 @@ interface AuthProfileSelectOptions {
   /** Defaults to `AUTH_PROFILE_HINT`. */
   hint?: string;
   /** What this render already overwrote with the selected profile's values —
-   *  see `applyLinkedAuthProfileValues`. Absent on forms that render every
-   *  managed field from the record itself. */
+   *  see `applyLinkedAuthProfileValues`. Absent on forms that cannot open with
+   *  a profile already selected (the unified Add Profile form), where there is
+   *  nothing for a render to have displaced. */
   displacedValues?: Record<string, string>;
 }
 
@@ -109,10 +110,17 @@ interface LinkedAuthProfileValues {
 }
 
 /** Narrowing lookup into the owned set — `field.key` is a bare string, and
- *  only these three keys are ever profile-owned (`AuthProfileOwnedCredentials`). */
+ *  only these keys are ever profile-owned (`AuthProfileOwnedCredentials`).
+ *
+ *  `defaultUsername` is the inventory source form's name for the username the
+ *  profile supplies, exactly as it is in `authProfileFilledKeys` above and in
+ *  `updateProfileManagedFields`'s `managedKeys` (formHtml.ts) — one key, three
+ *  form-side readers, so a form that locks the field also renders it from the
+ *  profile and hands the record's own value to the restore. */
 function ownedValueForFieldKey(owned: AuthProfileOwnedCredentials, key: string): string | undefined {
   switch (key) {
     case "username":
+    case "defaultUsername":
       return owned.username;
     case "authType":
       return owned.authType;
@@ -869,6 +877,60 @@ export function inventorySourceFormDefinition(
     seededAuthProfileId !== undefined && (authProfiles ?? []).some((profile) => profile.id === seededAuthProfileId)
       ? seededAuthProfileId
       : undefined;
+  // Resolved from the SAME list the select's options and the sanitizer above
+  // are built from, so what the form renders, what it locks and what it offers
+  // are one lookup — never a second, later one that could disagree.
+  const linkedProfile =
+    sanitizedAuthProfileId !== undefined
+      ? (authProfiles ?? []).find((profile) => profile.id === sanitizedAuthProfileId)
+      : undefined;
+
+  /**
+   * REVIEW FINDING (P2) — the source form's copy of the server form's render
+   * rule (`applyLinkedAuthProfileValues`): a field the linked profile owns
+   * opens showing THE PROFILE's value, not the record's.
+   *
+   * THE BUG THIS CLOSES: reopening a source whose linked profile's username had
+   * been edited since the last save seeded the profile as selected and locked
+   * Default SSH Username — while the field still displayed the STORED
+   * `defaultUsername`. The lock made that stale value un-editable, and Save
+   * derived the stored username from the profile anyway
+   * (`fallbackUsernameForSource`, inventoryCommands.ts), so pressing Save with
+   * no edit at all silently replaced the source's default username with one the
+   * form never displayed. Rendering from the profile makes the field, the lock
+   * and the derived value one statement.
+   *
+   * What it displaces is kept, not dropped: the stored fallback rides back to
+   * the webview as the select's `autofillDisplacedValues`, so choosing `(None)`
+   * hands it straight back through the same release every mid-session switch
+   * uses — see `applyLinkedAuthProfileValues`. Without that seed the render's
+   * substitution would be permanent, and an unlink would save the profile's
+   * username onto the source as its own.
+   *
+   * A profile that supplies NO usable username (an imported one whose username
+   * is whitespace — THE ONE RULE) owns nothing here, so the field keeps the
+   * record's own value, stays unlocked, and seeds no restore: exactly what
+   * `authProfileUsernameMirror` answers for it and what
+   * `fallbackUsernameForSource` then stores.
+   */
+  const managed = applyLinkedAuthProfileValues(
+    [
+      {
+        type: "text",
+        key: "defaultUsername",
+        label: "Default SSH Username",
+        required: true,
+        value: seed?.defaultUsername ?? defaultUsernameSeed ?? "",
+        // Second sentence explains why the field stays VISIBLE but locked once
+        // a profile is selected: it is not disabled decoration, it is the
+        // value the profile supplied, and the one synced servers fall back
+        // to if that profile is ever deleted (silentAuth reads the record's
+        // own username once the profile stops resolving).
+        hint: "Used when the inventory source doesn't provide a username. With an auth profile selected it comes from that profile, and is the fallback if the profile is ever removed."
+      }
+    ],
+    linkedProfile
+  );
 
   return {
     title: `${isEdit ? "Edit" : "Add"} Inventory Source (${provider.label})`,
@@ -884,26 +946,15 @@ export function inventorySourceFormDefinition(
         hint: "Servers synced from this source are placed under this folder. Leave empty for the top level."
       },
       // Directly above Default SSH Username, and NOT advanced: selecting a
-      // profile mirrors its username into that field and locks it
+      // profile puts its username into that field and locks it
       // (updateProfileManagedFields in formHtml.ts), so the two must read as
       // one decision with the cause above the effect.
       authProfileSelectField(authProfiles, undefined, sanitizedAuthProfileId, {
         advanced: false,
-        hint: INVENTORY_SOURCE_AUTH_PROFILE_HINT
+        hint: INVENTORY_SOURCE_AUTH_PROFILE_HINT,
+        displacedValues: managed.displaced
       }),
-      {
-        type: "text",
-        key: "defaultUsername",
-        label: "Default SSH Username",
-        required: true,
-        value: seed?.defaultUsername ?? defaultUsernameSeed ?? "",
-        // Second sentence explains why the field stays VISIBLE but locked once
-        // a profile is selected: it is not disabled decoration, it is the
-        // value the profile mirrored in, and the one synced servers fall back
-        // to if that profile is ever deleted (silentAuth reads the record's
-        // own username once the profile stops resolving).
-        hint: "Used when the inventory source doesn't provide a username. With an auth profile selected it comes from that profile, and is the fallback if the profile is ever removed."
-      },
+      ...managed.fields,
       {
         type: "select",
         key: "prunePolicy",

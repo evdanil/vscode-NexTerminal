@@ -506,6 +506,57 @@ describe("inventorySourceFormDefinition", () => {
   });
 
   /**
+   * REVIEW FINDING (P2) — the OTHER render-time half, and the source form's
+   * copy of what `serverFormDefinition` already does: the lock seed above says
+   * Default SSH Username is the profile's, so the field must SHOW the profile's
+   * value. Rendering the record's underneath that lock is how the form came to
+   * display one username and Save store another — `fallbackUsernameForSource`
+   * (inventoryCommands.ts) derives the stored value from the live profile, so
+   * the two part company the moment the profile is renamed, and the lock means
+   * the user cannot even see it happen. Followed all the way to the persisted
+   * record in inventoryCommands.test.ts.
+   */
+  it("renders Default SSH Username from the LINKED PROFILE, and hands the stored fallback to the webview's restore seed instead of leaving it in the field", () => {
+    const definition = inventorySourceFormDefinition(
+      fakeProvider,
+      sourceSeed({ authProfileId: "p1", defaultUsername: "stored-fallback" }),
+      undefined,
+      authProfiles
+    );
+
+    expect(keyedField(definition, "defaultUsername").value).toBe("labuser");
+    const select = keyedField(definition, "authProfileId");
+    expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({
+      defaultUsername: "stored-fallback"
+    });
+  });
+
+  it("keeps the record's own username, and seeds no restore, for a profile that supplies none (kills displacing on the mere fact of a link: that field is not locked for such a profile, so a restore entry would overwrite an edit the user is free to make)", () => {
+    const blank: AuthProfile[] = [{ id: "p3", name: "Imported", username: "   ", authType: "password" }];
+    const definition = inventorySourceFormDefinition(
+      fakeProvider,
+      sourceSeed({ authProfileId: "p3", defaultUsername: "stored-fallback" }),
+      undefined,
+      blank
+    );
+
+    expect(keyedField(definition, "defaultUsername").value).toBe("stored-fallback");
+    const select = keyedField(definition, "authProfileId");
+    expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({});
+  });
+
+  it("displaces nothing on Add, nor when the seeded id resolves to no profile (kills seeding a restore for a value no profile replaced — the next release would then overwrite what the user typed)", () => {
+    for (const definition of [
+      inventorySourceFormDefinition(fakeProvider, undefined, "most-common-account", authProfiles),
+      inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: "ghost" }), undefined, authProfiles)
+    ]) {
+      expect(keyedField(definition, "defaultUsername").value).not.toBe("labuser");
+      const select = keyedField(definition, "authProfileId");
+      expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({});
+    }
+  });
+
+  /**
    * REVIEW FINDING (P2) — the render-time half of field-ownership tracking. The
    * webview locks exactly the keys it has been told the selected profile fills;
    * before the first autofill round trip, this is the only source of that.

@@ -611,6 +611,19 @@ describe("renderFormHtml", () => {
       return factory();
     }
 
+    function extractFillAnswersCurrentSelection(
+      html: string
+    ): (form: unknown, msg: { key: string; value?: string }) => boolean {
+      const source = extractFunctionSource(html, "function fillAnswersCurrentSelection(msg)");
+      // `form` is the only thing it reads from its closure — deliberately, so
+      // the comparison is against the live control rather than a copy of the
+      // selection this script would have to keep in step.
+      const factory = new Function("form", `${source}\nreturn fillAnswersCurrentSelection;`) as (
+        form: unknown
+      ) => (msg: { key: string; value?: string }) => boolean;
+      return (form, msg) => factory(form)(msg);
+    }
+
     /**
      * One managed field ("defaultUsername") in its own .form-group, plus the
      * Auth Profile select's hidden input that decides `isLinked`. `button`
@@ -770,6 +783,33 @@ describe("renderFormHtml", () => {
     });
 
     /**
+     * REVIEW FINDING (P2) — an autofill is a round trip, so the answer can
+     * describe an option the user has already left. Only the echoed id can tell
+     * the two apart, and the comparison is against the CONTROL: whatever the
+     * user last selected is in there, whether they got to it by clicking an
+     * option, by (None), or through an inline-created one.
+     */
+    it("accepts an answer for the option that is selected right now", () => {
+      const answers = extractFillAnswersCurrentSelection(run);
+      const form = { elements: { authProfileId: { value: "ap1" } } };
+      expect(answers(form, { key: "authProfileId", value: "ap1" })).toBe(true);
+    });
+
+    it("refuses one for a profile the form has moved away from — another profile, or (None) (kills applying a late answer to a selection it does not describe: those fields have just been unlocked and handed the user's own values back, and an unlinked save keeps whatever is submitted)", () => {
+      const answers = extractFillAnswersCurrentSelection(run);
+      expect(answers({ elements: { authProfileId: { value: "ap2" } } }, { key: "authProfileId", value: "ap1" })).toBe(false);
+      expect(answers({ elements: { authProfileId: { value: "" } } }, { key: "authProfileId", value: "ap1" })).toBe(false);
+      // An answer carrying no id at all cannot be correlated, so it is refused
+      // rather than trusted (kills reading a missing echo as "close enough").
+      expect(answers({ elements: { authProfileId: { value: "ap1" } } }, { key: "authProfileId" })).toBe(false);
+    });
+
+    it("accepts an answer for a key this form does not render (kills correlating against a control that is not there: one managed-key list serves every form, and a lookup for another form's select is an expected miss, not a stale answer)", () => {
+      const answers = extractFillAnswersCurrentSelection(run);
+      expect(answers({ elements: {} }, { key: "someOtherSelect", value: "whatever" })).toBe(true);
+    });
+
+    /**
      * REVIEW FINDING (P2) — the webview keeps its OWN copy of the ownership
      * rule, because it cannot import the TypeScript one: `filledKeysFromValues`
      * is a hand-written mirror of `authProfileOwnedCredentials`
@@ -860,6 +900,19 @@ describe("renderFormHtml", () => {
     const listenerEnd = html.indexOf('if (msg.type === "validationError")');
     expect(listenerStart).toBeGreaterThan(-1);
     expect(html.slice(listenerStart, listenerEnd)).toContain("applyFillFields(msg);");
+  });
+
+  it("consults the staleness guard before applying any part of an answer (kills a guard that exists but is never called, and kills writing values or seizing ownership first)", () => {
+    const html = renderFormHtml({ title: "Test", fields: [] });
+    const start = html.indexOf("function applyFillFields(msg)");
+    expect(start).toBeGreaterThan(-1);
+    const block = html.slice(start, html.indexOf("function parseVisibleWhen(raw)"));
+    const guardIndex = block.indexOf("if (!fillAnswersCurrentSelection(msg)) {");
+    expect(guardIndex).toBeGreaterThan(-1);
+    // Values and ownership both follow it — a partially applied stale answer
+    // would leave one profile's values sitting under another's lock.
+    expect(block.indexOf("setFieldValue(fk, fillValues[fk]);")).toBeGreaterThan(guardIndex);
+    expect(block.indexOf("profileFilledKeys = nextFilledKeys;")).toBeGreaterThan(guardIndex);
   });
 
   it("records what a managed field held before the profile's fill overwrites it (kills writing the profile's value first, which records the profile's own value as the thing to hand back)", () => {

@@ -75,7 +75,22 @@ export class WebviewFormPanel {
           // the AUTH PROFILE select filled (formHtml's profileFilledKeys), and
           // must not let another autofill-capable select's answer be mistaken
           // for the profile's.
-          void this.panel.webview.postMessage({ type: "fillFields", key: message.key, values: result });
+          //
+          // REVIEW FINDING (P2) — and `value` travels back with it, so the
+          // webview can tell WHICH option this answer was composed for. This
+          // await is a round trip the user can outrun: selecting a profile and
+          // then `(None)` (or a different profile) before it returns left the
+          // late answer being applied to a selection it does not describe,
+          // putting a deselected profile's credentials into fields the release
+          // had just unlocked — which the save path then stores as the user's
+          // own. Answering with the id makes that answer discardable rather
+          // than merely unlikely.
+          void this.panel.webview.postMessage({
+            type: "fillFields",
+            key: message.key,
+            value: message.value,
+            values: result
+          });
         }
       }
       if (message.type === "test" && this.onTest) {

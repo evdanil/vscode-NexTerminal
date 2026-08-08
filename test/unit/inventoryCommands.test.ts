@@ -17,6 +17,7 @@ import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 import type { FormDefinition, FormValues } from "../../src/ui/formTypes";
+import { openForm } from "../helpers/formScriptHarness";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
@@ -4170,6 +4171,101 @@ describe("inventoryCommands", () => {
       // fallbackUsernameForSource trims too, so an untrimmed mirror would show
       // "  labuser  " over a record holding "labuser".
       expect(created.defaultUsername).toBe("labuser");
+    });
+
+    /* ── the form the user actually sees, running its real script ─────────
+     *
+     * REVIEW FINDING (P2) — both defects below are "the form displayed one
+     * thing and Save stored another", so neither end alone can see them: the
+     * hand-built `onSubmit` payloads above prove what the persist helper does
+     * with a submission, never that the form can produce that submission. These
+     * open the REAL rendered form over the definition the command handed
+     * WebviewFormPanel (`openForm`, test/helpers/formScriptHarness.ts), drive
+     * it, and submit exactly what it posts into the command's own onSubmit —
+     * so the oracle is the persisted record and the comparand is what the field
+     * was showing.
+     */
+    it("Edit Source opens showing the LINKED PROFILE's current username, and an untouched Save stores exactly what it showed (kills seeding the field from the stored record: the profile's username is what fallbackUsernameForSource persists, so a profile renamed since the last save left the form displaying one username, locked, while Save quietly wrote another)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        // What the last save stored — the profile's username AT THAT TIME.
+        source: { authProfileId: "p1", defaultUsername: "labuser" }
+      });
+      // …and the profile's username is changed afterwards, in the profile
+      // editor, while the source record keeps the older fallback.
+      await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, username: "renamed-labuser" });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+
+      // The field is locked, so this is the ONLY value the user could save.
+      expect(harness.locked("defaultUsername")).toBe(true);
+      expect(harness.value("defaultUsername")).toBe("renamed-labuser");
+
+      await onSubmit(harness.submit());
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBe("p1");
+      expect(updated.defaultUsername).toBe("renamed-labuser");
+      // The invariant, stated directly: a locked field and the record behind it
+      // cannot disagree.
+      expect(updated.defaultUsername).toBe(harness.value("defaultUsername"));
+    });
+
+    it("and setting that same form back to (None) hands the SOURCE's stored fallback back, which is what Save then stores (kills rendering the profile's username without seeding the restore: unlinking would leave it in the unlocked field and the source would adopt the username of a profile it is no longer using)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { authProfileId: "p1", defaultUsername: "source-own-account" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+      expect(harness.value("defaultUsername")).toBe("labuser");
+
+      harness.choose("authProfileId", "");
+      expect(harness.value("defaultUsername")).toBe("source-own-account");
+      expect(harness.locked("defaultUsername")).toBe(false);
+
+      await onSubmit(harness.submit());
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBeUndefined();
+      expect(updated.defaultUsername).toBe("source-own-account");
+    });
+
+    it("discards an autofill answer that lands after the profile was deselected (kills applying a fillFields payload without checking which profile it describes: the release has already handed the source's own username back, and an unlinked save stores whatever the form submits)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { defaultUsername: "source-own-account" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onAutofill, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+
+      // The round trip is GATED, not raced: the request is posted…
+      harness.choose("authProfileId", "p1");
+      const requested = [...harness.posted].reverse().find((msg) => msg.type === "autofill");
+      expect(requested?.type).toBe("autofill");
+      const requestedId = requested!.type === "autofill" ? requested.value : "";
+      // …the extension composes its real answer…
+      const answer = await onAutofill!("authProfileId", requestedId);
+      expect(answer).toEqual({ defaultUsername: "labuser" });
+      // …the user reaches (None) before it can be delivered…
+      harness.choose("authProfileId", "");
+      // …and only now does it arrive, exactly as WebviewFormPanel posts it.
+      harness.deliver({ type: "fillFields", key: "authProfileId", value: requestedId, values: answer! });
+
+      expect(harness.value("defaultUsername")).toBe("source-own-account");
+      expect(harness.locked("defaultUsername")).toBe(false);
+
+      await onSubmit(harness.submit());
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBeUndefined();
+      expect(updated.defaultUsername).toBe("source-own-account");
     });
 
     it("addSource wires inline auth-profile creation end to end and an autofill that mirrors ONLY defaultUsername (kills the server form's {username, authType, keyPath} payload, an unwired onAutofill, and a controller that is never attached to the panel)", async () => {
