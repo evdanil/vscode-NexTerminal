@@ -79,6 +79,50 @@ function providerMissingMessage(providerId: string): string {
 }
 
 /**
+ * WHY a source is currently claimed in `inFlightSourceIds` — recorded at every
+ * claim site, read by every refusal message.
+ *
+ * BUG (user-reported) — the marker used to be a bare `Set<string>`, so all
+ * three commands worded their refusal as an in-flight sync. But syncNow is
+ * only ONE of the three claimants: editSource holds the same marker for as
+ * long as its form stays open (F4), and removeSource holds it across its
+ * confirm-and-mutate run. Leaving an Edit Source tab open therefore made Sync
+ * Now announce a sync that was not running, with no clue beyond "closing the
+ * tab makes it work". Each claimant now names itself, so the refusal can say
+ * what is actually true.
+ *
+ * There is deliberately no "other"/default member: the value type is this
+ * union, so a claimed-but-unexplained source is unrepresentable, and
+ * `sourceBusyMessage`'s Record forces any future member to bring its own
+ * wording instead of silently inheriting one of these.
+ */
+type SourceBusyReason = "sync" | "edit" | "remove";
+
+/**
+ * The warning a command shows when the source it was asked to act on is
+ * already claimed by another command.
+ *
+ * `holder` is the reason recorded by whoever claimed it; `asking` is the
+ * reason the CALLER would have claimed. Only the sync case reads `asking`:
+ * a Sync Now refused by a running sync is the user asking for the very thing
+ * already in progress ("already syncing"), while edit/remove are asking for
+ * something else and need to be told what to wait for. The other two cases
+ * read the same from every caller — the source is unavailable, and the
+ * sentence says what is holding it and how to free it.
+ *
+ * The Record is the exhaustiveness gate: adding a SourceBusyReason without
+ * wording for it is a compile error here, not a message that quietly lies.
+ */
+function sourceBusyMessage(name: string, holder: SourceBusyReason, asking: SourceBusyReason): string {
+  const wording: Record<SourceBusyReason, string> = {
+    sync: asking === "sync" ? `"${name}" is already syncing.` : `"${name}" is currently syncing — try again once the sync finishes.`,
+    edit: `"${name}" is open in Edit Source — close that tab, then try again.`,
+    remove: `"${name}" is currently being removed — try again once the removal finishes.`
+  };
+  return wording[holder];
+}
+
+/**
  * FINDING 2 (P2, defensive-copy review) — every provider.testConnection /
  * provider.fetchInventory call site was passing the live config/secrets
  * objects straight through. `config` here can be the EXACT object stored on
@@ -1226,7 +1270,12 @@ export function registerInventoryCommands(
   // run; editSource/removeSource hold it for their whole run too (they mutate
   // servers/secrets); every command refuses to start work on a source another
   // command already marked busy.
-  const inFlightSourceIds = new Set<string>();
+  //
+  // Keyed by source id, valued by WHY it is claimed (see SourceBusyReason):
+  // the three claimants are not interchangeable to the user, so the refusal
+  // each command renders is driven by the holder's reason rather than by the
+  // one-size-fits-all "is currently syncing" this used to be.
+  const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
   /**
    * Shared Test-button handler for both the Add and Edit forms. Never throws
@@ -1360,20 +1409,21 @@ export function registerInventoryCommands(
       if (sourceIdArg) void vscode.window.showErrorMessage("That inventory source no longer exists.");
       return;
     }
-    if (inFlightSourceIds.has(source.id)) {
-      void vscode.window.showWarningMessage(`"${source.name}" is currently syncing — try again once the sync finishes.`);
+    const editBusyReason = inFlightSourceIds.get(source.id);
+    if (editBusyReason !== undefined) {
+      void vscode.window.showWarningMessage(sourceBusyMessage(source.name, editBusyReason, "edit"));
       return;
     }
 
     // REVIEW FINDING 2 (P2) — claimed HERE, synchronously adjacent to the
-    // has()-check above (no await in between — mirrors syncNow's own
+    // busy-check above (no await in between — mirrors syncNow's own
     // "Marked busy synchronously right after the last check above" comment),
     // NOT after the fingerprint-mismatch modal below. The fingerprint check
     // awaits on a user decision that can sit open for an arbitrary amount of
     // time; claiming the marker only after it returns leaves a window where
     // this source has already passed ITS OWN not-busy check but is not yet
     // recorded as busy, and a concurrent Sync Now (or another Edit) sails
-    // through the SAME has()-check and claims the id too. Both then run
+    // through the SAME busy-check and claims the id too. Both then run
     // against the same source concurrently, and whichever's dispose/finally
     // fires first deletes the shared Set entry out from under the other,
     // which is then free to race a THIRD command in.
@@ -1389,7 +1439,12 @@ export function registerInventoryCommands(
     // Every OTHER exit from here on (provider-missing abort, fingerprint
     // Cancel, open() throw) must also release it — see releaseInFlight below,
     // called at each of those points as well as from onDidDispose.
-    inFlightSourceIds.add(source.id);
+    //
+    // Claimed as "edit", not merely claimed: for the whole time that form
+    // stays open, every other command's refusal must name the open tab (which
+    // the user can close) instead of an in-flight sync (which the user can
+    // only wait out, and which is not happening).
+    inFlightSourceIds.set(source.id, "edit");
     let releasedInFlight = false;
 
     // BUG FIX (post-#52 review) — onDidDispose used to release the marker
@@ -1401,7 +1456,7 @@ export function registerInventoryCommands(
     // (and firing every onDidDispose listener, including this one)
     // WHILE that first submit is still awaiting vault/repository I/O. That
     // left a window where the busy marker was gone — so a concurrent Sync
-    // Now would sail past the has()-check above and read/send credentials
+    // Now would sail past the busy-check above and read/send credentials
     // against a source that persistUpdatedInventorySource had already
     // partially mutated (vault overwritten, config record not yet
     // persisted; see its FINDING 1/FINDING C comments for that exact
@@ -1484,8 +1539,9 @@ export function registerInventoryCommands(
       // editSource with the busy flag already set above, and nothing is ever
       // left to call releaseInFlight. That strands the source busy forever —
       // every later editSource/syncNow/removeSource for this exact id would
-      // then be refused with "currently syncing" until the extension host
-      // restarts.
+      // then be refused as still open in Edit Source (a tab that does not
+      // exist, so closing it can never free the source) until the extension
+      // host restarts.
       panel = WebviewFormPanel.open(`inventory-source-edit-${source.id}`, definition, {
         // Deliberately NOT an `async` arrow function: an async function's
         // body only starts executing when it's CALLED, but the promise it
@@ -1585,12 +1641,16 @@ export function registerInventoryCommands(
       if (sourceIdArg) void vscode.window.showErrorMessage("That inventory source no longer exists.");
       return;
     }
-    if (inFlightSourceIds.has(source.id)) {
-      void vscode.window.showWarningMessage(`"${source.name}" is currently syncing — try again once the sync finishes.`);
+    const removeBusyReason = inFlightSourceIds.get(source.id);
+    if (removeBusyReason !== undefined) {
+      void vscode.window.showWarningMessage(sourceBusyMessage(source.name, removeBusyReason, "remove"));
       return;
     }
 
-    inFlightSourceIds.add(source.id);
+    // Claimed as "remove" — the confirm modal below, and the mutation after
+    // it, are neither a sync nor an open form, and reporting this window as
+    // either would be the same lie in a third command.
+    inFlightSourceIds.set(source.id, "remove");
     try {
       const snapshot = core.getSnapshot();
       const owned = snapshot.servers.filter((s) => s.origin?.sourceId === source.id);
@@ -1960,8 +2020,9 @@ export function registerInventoryCommands(
       if (sourceIdArg) void vscode.window.showErrorMessage("That inventory source no longer exists.");
       return;
     }
-    if (inFlightSourceIds.has(source.id)) {
-      void vscode.window.showWarningMessage(`"${source.name}" is already syncing.`);
+    const syncBusyReason = inFlightSourceIds.get(source.id);
+    if (syncBusyReason !== undefined) {
+      void vscode.window.showWarningMessage(sourceBusyMessage(source.name, syncBusyReason, "sync"));
       return;
     }
     const provider = registry.get(source.providerId);
@@ -1972,7 +2033,8 @@ export function registerInventoryCommands(
 
     // Marked busy synchronously right after the last check above (no await in
     // between) so a second invocation arriving on the next microtask sees it.
-    inFlightSourceIds.add(source.id);
+    // This is the one claimant for which "syncing" is the honest word.
+    inFlightSourceIds.set(source.id, "sync");
     try {
       // ITEM A (provider trust fingerprint) / F3 — strictly BEFORE any vault
       // read for this source (the required-secret presence loop right below

@@ -194,6 +194,16 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
   };
 }
 
+// The four busy refusals, verbatim (against makeSource()'s "My Source").
+// Asserted as EXACT strings, never by substring, because the bug these pin is
+// a wording bug: the busy marker used to be a bare Set, so an open Edit Source
+// form and an in-flight removal both reported themselves as a running sync.
+// A "some warning appeared" assertion passes against that exact lie.
+const BUSY_SYNC_FROM_SYNC = '"My Source" is already syncing.';
+const BUSY_SYNC_FROM_OTHER = '"My Source" is currently syncing — try again once the sync finishes.';
+const BUSY_EDIT = '"My Source" is open in Edit Source — close that tab, then try again.';
+const BUSY_REMOVE = '"My Source" is currently being removed — try again once the removal finishes.';
+
 describe("inventoryCommands", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -890,9 +900,11 @@ describe("inventoryCommands", () => {
 
       // A second edit attempt while the first form is still open must refuse
       // — the wrong implementation (no busy flag while the form is open)
-      // would open a second form here instead.
+      // would open a second form here instead. The refusal names the open
+      // tab: no sync is running, so the pre-fix "currently syncing" wording
+      // was a straight falsehood.
       await cmd();
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_EDIT);
       expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
 
       // Closing the form (Cancel, or WebviewFormPanel's own post-submit
@@ -901,7 +913,7 @@ describe("inventoryCommands", () => {
       panel.fireDispose();
       mockShowWarningMessage.mockClear();
       await cmd();
-      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
       expect(mockWebviewOpen).toHaveBeenCalledTimes(2);
     });
 
@@ -1004,7 +1016,10 @@ describe("inventoryCommands", () => {
       for (let i = 0; i < 10; i++) await Promise.resolve();
 
       expect(syncSettled).toBe(true);
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      // The marker is held by the still-open (mid-save) Edit form, so the
+      // refusal names that form — not a sync, which is exactly what is NOT
+      // happening here.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_EDIT);
       expect(provider.fetchInventory).not.toHaveBeenCalled();
 
       // Let the gated persist complete, and drain both promises so nothing
@@ -1020,7 +1035,7 @@ describe("inventoryCommands", () => {
       // subsequent Sync Now proceeds normally.
       mockShowWarningMessage.mockClear();
       await syncCmd("src-1");
-      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
       expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
     });
 
@@ -1043,10 +1058,10 @@ describe("inventoryCommands", () => {
 
       // If F6 were reverted (no try/catch around WebviewFormPanel.open), the
       // busy flag set just before the throwing call would never be released
-      // — every later editSource for this exact source id would be refused
-      // with "currently syncing" forever.
+      // — every later editSource for this exact source id would be refused as
+      // open in an Edit Source tab that does not exist, forever.
       await cmd();
-      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
       expect(mockWebviewOpen).toHaveBeenCalledTimes(2);
     });
 
@@ -1064,9 +1079,8 @@ describe("inventoryCommands", () => {
 
       // Controllable: the fingerprint-mismatch modal (an `{modal: true}` call)
       // stays pending until resolveModal is invoked; any OTHER
-      // showWarningMessage call (e.g. the "currently syncing" / "already
-      // syncing" busy notices, both fire-and-forget) resolves immediately —
-      // they're never awaited by their callers anyway.
+      // showWarningMessage call (e.g. the busy refusals, all fire-and-forget)
+      // resolves immediately — they're never awaited by their callers anyway.
       let resolveModal!: (choice: string | undefined) => void;
       const modalChoice = new Promise<string | undefined>((resolve) => (resolveModal = resolve));
       mockShowWarningMessage.mockImplementation((...args: unknown[]) => {
@@ -1104,7 +1118,9 @@ describe("inventoryCommands", () => {
       await Promise.resolve();
 
       expect(syncSettled).toBe(true);
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      // Held by editSource (which is parked on its fingerprint modal), so the
+      // refusal names the edit, not a sync.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_EDIT);
       expect(provider.fetchInventory).not.toHaveBeenCalled();
 
       // Clean up: let the still-open edit modal (and, if the assertions
@@ -1136,13 +1152,13 @@ describe("inventoryCommands", () => {
 
       // If Cancel left the marker claimed (e.g. releaseInFlight only wired
       // for the open()-throw/dispose paths, not this one), the sync below
-      // would be refused with "already syncing" and never reach
+      // would be refused as still open in Edit Source and never reach
       // fetchInventory.
       mockShowWarningMessage.mockResolvedValueOnce("Continue"); // syncNow's own fingerprint check (still stale)
       const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
       await syncCmd("src-1");
 
-      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
       expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
     });
 
@@ -2139,7 +2155,9 @@ describe("inventoryCommands", () => {
       const removeCmd = registeredCommands.get("nexus.inventory.removeSource")!;
       await removeCmd();
 
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      // A sync really IS in flight here, so the sync wording is the truthful
+      // one — the fix must not have made every refusal name an edit instead.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_SYNC_FROM_OTHER);
       expect(core.getSnapshot().inventorySources).toHaveLength(1);
       expect(core.getSnapshot().servers).toHaveLength(1);
 
@@ -2767,7 +2785,7 @@ describe("inventoryCommands", () => {
       // existed.
       await Promise.resolve();
 
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_SYNC_FROM_SYNC);
       expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
 
       resolveFetch({ contractVersion: 1, devices: [] });
@@ -4401,6 +4419,182 @@ describe("inventoryCommands", () => {
       // Pre-feature fallback, field for field.
       expect(servers[0].authType).toBe("agent");
       expect(servers[0].username).toBe("admin");
+    });
+  });
+
+  // The busy-marker refusal wording. One marker is shared by three claimants
+  // (syncNow, editSource's open form, removeSource's confirm-and-mutate run)
+  // and it used to be a bare Set<string>, so every refusal was worded as an
+  // in-flight sync regardless of who actually held it. Reported by the repo
+  // owner: an Edit Source tab left open made Sync Now insist the source was
+  // "currently syncing", and the only way to discover the truth was to close
+  // the tab and watch the problem vanish.
+  //
+  // Every test below asserts the EXACT sentence at EVERY reporting site, for
+  // each holder in turn: a substring/"some warning appeared" assertion cannot
+  // tell the fixed code from the lie it replaced.
+  describe("busy-marker refusals name the real holder", () => {
+    async function setupBusyFixture(fetchInventory?: InventoryProvider["fetchInventory"]): Promise<{
+      core: NexusCore;
+      provider: InventoryProvider;
+      syncCmd: (...args: unknown[]) => Promise<void>;
+      editCmd: (...args: unknown[]) => Promise<void>;
+      removeCmd: (...args: unknown[]) => Promise<void>;
+    }> {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider(fetchInventory ? { fetchInventory } : {});
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+      return {
+        core,
+        provider,
+        syncCmd: registeredCommands.get("nexus.inventory.syncNow")! as (...args: unknown[]) => Promise<void>,
+        editCmd: registeredCommands.get("nexus.inventory.editSource")! as (...args: unknown[]) => Promise<void>,
+        removeCmd: registeredCommands.get("nexus.inventory.removeSource")! as (...args: unknown[]) => Promise<void>
+      };
+    }
+
+    /** Every message the three commands passed to showWarningMessage as their sole argument. */
+    function singleArgWarnings(): string[] {
+      return mockShowWarningMessage.mock.calls.filter((call) => call.length === 1).map((call) => String(call[0]));
+    }
+
+    it("holder = a running sync: syncNow says already syncing, editSource and removeSource say to wait for it (kills a fix that renders every refusal as the edit/removal wording, and the syncNow/other phrasing swap)", async () => {
+      let resolveFetch!: (tree: InventoryTree) => void;
+      const { core, provider, syncCmd, editCmd, removeCmd } = await setupBusyFixture(
+        vi.fn(() => new Promise<InventoryTree>((resolve) => (resolveFetch = resolve)))
+      );
+
+      // Claimed as "sync" and parked inside fetchInventory (a few awaited
+      // hops in: the fingerprint gate, then the vault reads).
+      const syncPromise = syncCmd("src-1");
+      await vi.waitFor(() => {
+        expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      });
+      mockShowWarningMessage.mockClear();
+
+      await syncCmd("src-1");
+      await editCmd("src-1");
+      await removeCmd("src-1");
+
+      // This is the ONE holder for which "syncing" is true, so all three
+      // sentences must still say so — and syncNow's keeps its own phrasing
+      // (the user asked for the thing already running).
+      expect(singleArgWarnings()).toEqual([BUSY_SYNC_FROM_SYNC, BUSY_SYNC_FROM_OTHER, BUSY_SYNC_FROM_OTHER]);
+      // None of them started work: no second fetch, no form, no removal.
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      expect(mockWebviewOpen).not.toHaveBeenCalled();
+      expect(core.getSnapshot().inventorySources).toHaveLength(1);
+
+      resolveFetch({ contractVersion: 1, devices: [] });
+      await syncPromise;
+    });
+
+    it("holder = an open Edit Source form: all three commands name the open tab and none claims a sync is running (kills the reported bug — the shared Set reported this holder as an in-flight sync)", async () => {
+      const { core, provider, syncCmd, editCmd, removeCmd } = await setupBusyFixture();
+
+      // Claimed as "edit" for as long as the form stays open (F4). Nothing is
+      // syncing: fetchInventory has never been called.
+      await editCmd("src-1");
+      const { panel } = latestFormCall();
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
+      mockShowWarningMessage.mockClear();
+
+      await syncCmd("src-1");
+      await removeCmd("src-1");
+      await editCmd("src-1");
+
+      expect(singleArgWarnings()).toEqual([BUSY_EDIT, BUSY_EDIT, BUSY_EDIT]);
+      // The pre-fix wording, spelled out so a regression to it is unmissable:
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_SYNC_FROM_SYNC);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_SYNC_FROM_OTHER);
+      for (const message of singleArgWarnings()) {
+        expect(message).not.toMatch(/sync/i);
+      }
+      // Refused, not merely mis-worded: no fetch, no second form, no removal.
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
+      expect(core.getSnapshot().inventorySources).toHaveLength(1);
+
+      // The instruction the sentence gives has to be the one that works:
+      // closing that tab frees the source.
+      panel.fireDispose();
+      mockShowWarningMessage.mockClear();
+      await syncCmd("src-1");
+      expect(singleArgWarnings()).toEqual([]);
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+    });
+
+    it("holder = a removal awaiting its confirm modal: all three commands say the source is being removed (kills a two-member reason enum that has to file removeSource under 'sync' or 'edit')", async () => {
+      const { core, provider, syncCmd, editCmd, removeCmd } = await setupBusyFixture();
+
+      // The confirm modal stays open, holding the marker; every other
+      // showWarningMessage (i.e. the busy refusals, all fire-and-forget)
+      // resolves immediately.
+      let resolveConfirm!: (choice: string | undefined) => void;
+      const confirmChoice = new Promise<string | undefined>((resolve) => (resolveConfirm = resolve));
+      mockShowWarningMessage.mockImplementation((...args: unknown[]) => {
+        const isModal = typeof args[1] === "object" && args[1] !== null && (args[1] as { modal?: boolean }).modal === true;
+        return isModal ? confirmChoice : Promise.resolve(undefined);
+      });
+
+      const removePromise = removeCmd("src-1");
+      await Promise.resolve();
+      const modalCalls = (): number =>
+        mockShowWarningMessage.mock.calls.filter(
+          (call) => typeof call[1] === "object" && call[1] !== null && (call[1] as { modal?: boolean }).modal === true
+        ).length;
+      expect(modalCalls()).toBe(1);
+
+      await syncCmd("src-1");
+      await editCmd("src-1");
+      await removeCmd("src-1");
+
+      expect(singleArgWarnings()).toEqual([BUSY_REMOVE, BUSY_REMOVE, BUSY_REMOVE]);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_SYNC_FROM_SYNC);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_SYNC_FROM_OTHER);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+      expect(mockWebviewOpen).not.toHaveBeenCalled();
+      // The second removeSource was refused before it could open a modal of
+      // its own — one confirm dialog, still exactly one.
+      expect(modalCalls()).toBe(1);
+
+      // Dismissing the modal aborts the removal and releases the marker.
+      resolveConfirm(undefined);
+      await removePromise;
+      expect(core.getSnapshot().inventorySources).toHaveLength(1);
+      mockShowWarningMessage.mockClear();
+      await syncCmd("src-1");
+      expect(singleArgWarnings()).toEqual([]);
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+    });
+
+    it("editSource's provider-missing abort still releases the marker — a source whose provider extension was disabled is not left permanently 'open in Edit Source' (kills dropping releaseInFlight from that early return)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      // Deliberately empty: the extension that registered "fake" is disabled.
+      const registry = new InventoryProviderRegistry();
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      const editCmd = registeredCommands.get("nexus.inventory.editSource")! as (...args: unknown[]) => Promise<void>;
+      await editCmd("src-1");
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining('Inventory provider "fake" is not available'));
+      expect(mockWebviewOpen).not.toHaveBeenCalled();
+
+      // The extension comes back. Without the release on that abort the marker
+      // is stranded, and every later command reports a source held open by an
+      // Edit Source tab that never existed — the F6 failure mode, on a second
+      // early-return path.
+      registry.register(makeProvider());
+      await editCmd("src-1");
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
     });
   });
 
