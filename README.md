@@ -11,6 +11,7 @@ A full SSH + serial + port-forwarding client inside VS Code — without Remote-S
 - **Unlike Remote-SSH, nothing is installed on the remote.** It's a pure client: no `vscode-server` unpacked into the target, no node process running on the far end. That matters when the far end is a Cisco switch, a bastion you only get a shell on, or a change-controlled box where you can't drop an agent.
 - **Bring your existing connections** — import session profiles straight from MobaXterm `.ini` and SecureCRT XML exports, folder hierarchy preserved, so switching costs you minutes, not a weekend.
 - **Onboard a whole rack in one paste** — feed it a CSV export or a plain list of hostnames and it creates the connections in bulk, with folders, ports, and usernames picked up from the columns. Duplicates are skipped and unparsable lines are reported with their line numbers instead of failing the batch.
+- **Sync servers straight from NetBox** — point an inventory source at your NetBox instance and devices become connection profiles, foldered by site and rack, linked to an auth profile so they can actually connect the moment they land. Re-syncing follows renames and rack moves at the source, and every sync shows you its plan before anything is applied.
 - **Edit root-owned files without dropping to a shell** — save `/etc/*` over SFTP with `sudo`, writing through the file's existing inode so owner, mode, and ACLs are preserved. Your sudo password goes to the SSH channel's stdin only: never to disk, never to secret storage, never to a log.
 
 ## Reaching a device two hops away
@@ -36,7 +37,7 @@ Jump hosts are set per server, and a jump host can have a jump host of its own �
 - **SSH Terminal Sessions** — Connect to remote servers with password, private key, or SSH agent authentication. Two-factor authentication (keyboard-interactive) is fully supported — passwords auto-fill while verification codes are prompted separately. Credentials are cached securely via VS Code SecretStorage with silent re-auth. Per-server legacy algorithm toggle for older devices (Cisco IOS, embedded systems).
 - **SSH Key Deployment** — Right-click any server and select "Deploy SSH Key" to automate key-based authentication setup. Discovers existing local keys or generates new ed25519 key pairs, deploys the public key to the remote `authorized_keys`, and optionally converts the server profile to key auth. Cross-platform (Windows, macOS, Linux).
 - **SSH Host Key Verification** — Trust-on-first-use (TOFU) model stores host keys on first connection and alerts if a key changes (potential MITM). Configurable via `nexus.ssh.trustNewHosts`.
-- **Auth Profiles** — Define reusable credential sets (password, private key, or SSH agent) and apply them to individual servers or entire folders in bulk. Manage profiles from a dedicated editor panel accessible via the Settings tree or context menu.
+- **Auth Profiles** — Define reusable credential sets (password, private key, or SSH agent) and apply them to individual servers or entire folders in bulk. A NetBox inventory source can carry a profile too, so every server it syncs connects with those credentials from the start. The link is a reference, not a copy — edit the profile once and every server using it picks up the change, no re-sync needed. Manage profiles from a dedicated editor panel accessible via the Settings tree or context menu.
 - **Proxy Support** — Route SSH connections through intermediaries when direct access isn't available. Three proxy types are supported per server:
   - **SSH Jump Host** — Select another configured server as a bastion/jump host (ProxyJump equivalent). Supports multi-hop chaining (A → B → C) with full auth reuse.
   - **SOCKS5 Proxy** — Connect through a SOCKS5 proxy server with optional username/password authentication.
@@ -64,6 +65,7 @@ Jump hosts are set per server, and a jump host can have a jump host of its own �
 - **Settings Panel** — View and edit extension settings in a dedicated webview panel with grouped categories, terminal-adjacent actions, validation, and host-confirmed auto-save.
 - **Configuration Export/Import** — Full encrypted backup with master password protection, or sanitized share export (credentials stripped, IDs remapped). Proxy configurations are preserved across backup and restore.
 - **Import from MobaXterm / SecureCRT** — Migrate SSH session profiles directly from MobaXterm INI files or SecureCRT XML exports and session directories. Folder hierarchy is preserved.
+- **NetBox Inventory Sync** — Add your NetBox instance as an inventory source and Nexus creates and maintains server profiles from its devices: placed under a target folder of your choosing, organized by a folder template (`{site}/{rack}` by default; `{location}`, `{role}`, and `{tenant}` also available), narrowed by any NetBox device filter, with virtual machines included on request. The API token lives in VS Code SecretStorage, never in a settings file. Nothing is applied blind: every sync computes a plan — servers to add, update, move, or remove — and shows it for confirmation first, with warnings and affected-server lists one click away. Devices renamed or re-racked at the source follow on the next sync; a device that disappears is moved to the source's `_orphaned` subfolder by default, keeping its settings in case it returns (deleting or keeping it in place are per-source alternatives). Link an **Auth Profile** to the source and every server it creates connects with those credentials. Servers from earlier syncs adopt the profile on the next sync — but only those still carrying exactly what the sync gave them: anything you've hand-edited keeps its own credentials, and clearing the profile on one synced server is a per-server opt-out that later syncs respect. Manage sources from **Settings → Inventory Sources** (Sync Now / Edit / Remove per source) or the Command Palette.
 - **Scripts** — Author `.js` automation scripts under `.nexus/scripts/` (or the folder of your choice via *Nexus Settings → Scripts → Scripts Folder*, which exposes a native folder picker; works with or without an open workspace — when none is open, scripts live in the extension's global storage) and run them against any active SSH, Serial, or Local Shell session. Scripts use an async expect/send API (`waitFor`, `expect`, `waitAny`, `send`, `sendLine`, `sendKey`, `poll`, `prompt`, `confirm`, `alert`, `sleep`, `log`) with IntelliSense auto-seeded on first run. Each script runs in an isolated `worker_threads` Worker so runaway loops can be stopped in &lt;100 ms. Macros on the script's session are suspended automatically (configurable via `nexus.scripts.macroPolicy` and the per-script `@allow-macros` header); macros on unrelated sessions keep firing normally. Minimal example:
   ```js
   /**
@@ -88,7 +90,7 @@ Nexus Terminal is available from both the VS Code Marketplace and Open VSX regis
 
 ### First Use Flow
 
-1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, `Nexus: Add Serial Profile`, or `Nexus: Add Local Shell Profile`.
+1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, `Nexus: Add Serial Profile`, or `Nexus: Add Local Shell Profile` — or sync your whole device inventory in one go with `Nexus: Add Inventory Source (NetBox)`.
 2. Select **Connect** / **Open Local Shell** on the profile to open an SSH, Serial, or Local Shell terminal.
 3. For SSH profiles, open **File Explorer** and run **Browse Files** to choose the connected profile and browse SFTP files.
 4. Open **Port Forwarding**, add a tunnel with `Nexus: Add Tunnel`, assign an SSH server, then select **Start**.
@@ -132,6 +134,20 @@ If your target server is behind a firewall or bastion host:
 
 1. **SSH Jump Host** — First add the bastion server as a regular server profile, then edit the target server and set its proxy to "SSH Jump Host", selecting the bastion from the dropdown. Multi-hop chains (A → B → C) work automatically.
 2. **SOCKS5 / HTTP CONNECT** — Edit the target server and set its proxy type, entering the proxy host, port, and optional credentials. Proxy passwords are stored securely in VS Code SecretStorage.
+
+### Sync Servers from NetBox
+
+If your device inventory already lives in NetBox, you don't have to re-type it:
+
+1. Run `Nexus: Add Inventory Source (NetBox)` — or open **Settings → Inventory Sources**, which lists every configured source with **Sync Now**, **Edit**, and **Remove**
+2. Enter your NetBox base URL and an API token with read access to DCIM (and Virtualization, if you include VMs). The token is stored in VS Code SecretStorage. **Test Connection** confirms the URL is reachable and the token is accepted — it does not check that the token can read your devices, so a token NetBox accepts but hasn't granted DCIM access will pass here and fail on the first sync
+3. Optionally narrow the sync with a device filter (e.g. `status=active&site=syd`), shape the folder layout with a template (`{site}/{rack}` by default), and set a **Target Folder** to keep synced servers under
+4. Pick an **Auth Profile** so the servers the sync creates can actually connect — choose an existing profile or create one inline without leaving the form. Its username fills the **Default SSH Username** field; with **(None)**, servers use the default username with SSH agent authentication
+5. Save, then choose **Sync Now**. The plan is shown before anything is applied — how many servers will be added, updated, moved, or removed, and, when credentials would change, exactly which servers by name under **Show Warnings**
+
+Run **Sync Now** again whenever devices change at the source: renames and rack moves follow, and a device that disappears from NetBox is handled per the source's **Removed-Device Policy** — moved to an `_orphaned` subfolder (the default, which keeps its settings in case it returns), deleted, or kept in place.
+
+Credentials stay yours. If a source gains an auth profile later, servers from earlier syncs adopt it on the next sync — but only servers still carrying exactly what the sync gave them. A server whose username or authentication you've edited keeps its own credentials (use **Apply Auth Profile** on it or its folder if you do want it on the profile), and setting one synced server's Auth Profile back to **(None)** is a per-server opt-out that later syncs respect. One combination is refused up front: a private-key profile that carries no key file works fine on a server that brings its own key, but a synced server has none to bring, so linking such a profile to a source is rejected with the reason instead of creating servers that could never log in.
 
 ### Add a Serial Device
 
