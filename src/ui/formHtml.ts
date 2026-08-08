@@ -238,6 +238,38 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       // nothing yet), then rebuilt when that choice's fillFields answer lands.
       var profileFilledKeys = seededProfileFilledKeys();
 
+      // ── WHAT THE PREVIOUS PROFILE DISPLACED ────────────────────────────
+      // REVIEW FINDING (P2) — a selection hands over more than the ownership
+      // flags: the profile being left behind also put ITS VALUES in the fields
+      // it filled. Unlocking those fields without putting back what they held
+      // before leaves the old profile's credentials sitting in editable
+      // fields, indistinguishable from something the user typed — and that is
+      // exactly how the save path then treats them. Pick a key profile that
+      // carries a key path, then one that does not: the second owns no
+      // keyPath, so preserveLinkedServerCredentials keeps the SUBMITTED one,
+      // and the first profile's private key is written onto the server as its
+      // own, from a field showing it unlocked as though it had been chosen.
+      //
+      // RESTORE, not clear. The honest value for a field the old profile
+      // filled and the new one does not supply is the one it held before any
+      // profile touched it: that is what the form then shows, what Save
+      // persists (the submitted value equals the stored one, so the record is
+      // unchanged), and what a connection resolves (an unowned key keeps the
+      // server's own value) — three layers agreeing by construction. Clearing
+      // agrees with none of them: it would drop a stored key path for merely
+      // browsing the profile list, and empty a REQUIRED username that was
+      // valid a moment ago, refusing a Save for a field the user never
+      // touched.
+      //
+      // Captured at each fill, never once at form open, so an edit made in an
+      // unlocked field BETWEEN two selections is what comes back — the entry
+      // is always "what this field held immediately before a profile
+      // overwrote it", not a frozen picture of the form's opening state. Keys
+      // the RENDER seeded ownership for (seededProfileFilledKeys) have no
+      // entry and need none: no profile has written them, every form seeds
+      // them from the record itself, so leaving them alone IS the restore.
+      var profileDisplacedValues = {};
+
       /** The render-time seed — the keys the initially selected profile fills. */
       function seededProfileFilledKeys() {
         var wrapper = document.getElementById("field-authProfileId");
@@ -277,6 +309,100 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           filled[key] = true;
         }
         return filled;
+      }
+
+      /** A field's current value, or undefined when this form does not render
+       *  that key — one managed-key list serves every form (see managedKeys),
+       *  so a lookup for a key another form owns is expected to miss. */
+      function fieldValue(key) {
+        var el = form.elements[key];
+        return el ? el.value : undefined;
+      }
+
+      /**
+       * Writes a value into a field. Custom-select wrappers (authType) need
+       * both halves — the hidden input the form submits AND the visible label
+       * the trigger shows — so this is the one place either is written, shared
+       * by the fill and the restore. Writing only the input would leave the
+       * trigger showing the profile that is no longer selected.
+       */
+      function setFieldValue(key, value) {
+        var el = form.elements[key];
+        if (el) {
+          el.value = value;
+        }
+        var wrapper = document.getElementById("field-" + key);
+        if (wrapper && wrapper.classList && wrapper.classList.contains("custom-select")) {
+          selectCustomOption(wrapper, value);
+        }
+      }
+
+      /**
+       * Remembers what this key held immediately before the profile that is
+       * about to own it writes over the field. An entry already taken is never
+       * overwritten: two selections can be in flight at once (each fill is a
+       * webview round trip), and only the FIRST recording was made before any
+       * profile's value had landed in that field.
+       */
+      function rememberDisplacedValue(key) {
+        if (Object.prototype.hasOwnProperty.call(profileDisplacedValues, key)) {
+          return;
+        }
+        var current = fieldValue(key);
+        if (current !== undefined) {
+          profileDisplacedValues[key] = current;
+        }
+      }
+
+      /**
+       * Ends the current profile's ownership: every value it displaced goes
+       * back to its field, and the ownership record empties so the fields
+       * unlock. Runs on EVERY transition — another profile, (None), or an
+       * inline-created one — because each of them equally leaves the previous
+       * profile's values behind in fields the user is now free to save.
+       */
+      function releaseProfileOwnedFields() {
+        for (var key in profileDisplacedValues) {
+          setFieldValue(key, profileDisplacedValues[key]);
+        }
+        profileDisplacedValues = {};
+        profileFilledKeys = {};
+        // Restoring authType can change which fields are visible at all (the
+        // key path field follows it), so visibility is re-settled with the
+        // lock, exactly as applyFillFields does on the way in.
+        updateVisibility();
+        updateProfileManagedFields();
+      }
+
+      /**
+       * Applies an autofill answer. For the auth profile select the answer IS
+       * the ownership record — these keys, and only these, came from the
+       * profile just selected. Scoped by the echoed key so another
+       * autofill-capable select's answer can never be read as the profile's.
+       */
+      function applyFillFields(msg) {
+        var fillValues = msg.values;
+        var isProfileFill = msg.key === "authProfileId";
+        var nextFilledKeys = isProfileFill ? filledKeysFromValues(fillValues) : null;
+        for (var fk in fillValues) {
+          if (isProfileFill) {
+            // A key supplied BLANK owns nothing (filledKeysFromValues), so
+            // writing it would replace the user's own value with one nothing
+            // downstream will keep — and, being unowned, it would not be
+            // handed back by the next release either. Defence in depth: both
+            // mirrors already send only the keys the profile owns.
+            if (nextFilledKeys[fk] !== true) {
+              continue;
+            }
+            rememberDisplacedValue(fk);
+          }
+          setFieldValue(fk, fillValues[fk]);
+        }
+        if (isProfileFill) {
+          profileFilledKeys = nextFilledKeys;
+        }
+        updateVisibility();
+        updateProfileManagedFields();
       }
 
       function parseVisibleWhen(raw) {
@@ -501,10 +627,11 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         if (wrapper.dataset.name === 'authProfileId') {
           // The newly chosen profile has supplied nothing yet — the previous
           // one's ownership dies with the selection, so the fields it filled
-          // unlock until this profile's own fillFields says which of them it
-          // fills. Also covers (None), which posts no autofill at all.
-          profileFilledKeys = {};
-          updateProfileManagedFields();
+          // unlock, holding the values they had before that profile filled
+          // them, until this profile's own fillFields says which of them it
+          // fills. Also covers (None), which posts no autofill at all and so
+          // gets no second chance to put anything back.
+          releaseProfileOwnedFields();
         }
       });
       initCustomComboboxes();
@@ -541,34 +668,15 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
               vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value });
             }
             if (wrapper.dataset.name === 'authProfileId') {
-              // Same ownership reset as the user-click path above — an
-              // inline-created profile starts owning nothing.
-              profileFilledKeys = {};
-              updateProfileManagedFields();
+              // Same release as the user-click path above — an inline-created
+              // profile starts owning nothing, and the profile it replaces
+              // must hand back what it displaced on the way out.
+              releaseProfileOwnedFields();
             }
           }
         }
         if (msg.type === "fillFields") {
-          var fillValues = msg.values;
-          for (var fk in fillValues) {
-            var el = form.elements[fk];
-            if (el) {
-              el.value = fillValues[fk];
-            }
-            var wrapper = document.getElementById("field-" + fk);
-            if (wrapper && wrapper.classList.contains("custom-select")) {
-              selectCustomOption(wrapper, fillValues[fk]);
-            }
-          }
-          // The answer to the auth-profile autofill IS the ownership record:
-          // these keys, and only these, came from the profile just selected.
-          // Scoped by the echoed key so another autofill-capable select's
-          // answer can never be read as the profile's.
-          if (msg.key === "authProfileId") {
-            profileFilledKeys = filledKeysFromValues(fillValues);
-          }
-          updateVisibility();
-          updateProfileManagedFields();
+          applyFillFields(msg);
         }
         if (msg.type === "validationError") {
           var errEls = document.querySelectorAll(".field-error");

@@ -784,29 +784,59 @@ describe("renderFormHtml", () => {
     });
   });
 
-  it("resets tracked ownership when a different auth profile is picked, before re-evaluating the lock (kills carrying the previous profile's keys across a selection: they stay locked through the whole round trip, and forever if the new profile fills nothing)", () => {
+  it("releases the previous profile when a different one is picked (kills carrying the previous profile's keys across a selection: they stay locked through the whole round trip, and forever if the new profile fills nothing — and kills unlocking them while leaving that profile's VALUES behind, which is the transition half, exercised end to end in authProfileSwitchTransition.test.ts)", () => {
     const html = renderFormHtml({ title: "Test", fields: [] });
     // Slice the user-click callback out so the addSelectOption handler's own
-    // reset cannot satisfy these assertions.
+    // release cannot satisfy this assertion.
     const start = html.indexOf("initCustomSelects(function(wrapper, opt) {");
     const end = html.indexOf("initCustomComboboxes();");
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
-    const block = html.slice(start, end);
-    const resetIndex = block.indexOf("profileFilledKeys = {};");
-    expect(resetIndex).toBeGreaterThan(-1);
-    expect(block.indexOf("updateProfileManagedFields();")).toBeGreaterThan(resetIndex);
+    expect(html.slice(start, end)).toContain("releaseProfileOwnedFields();");
+  });
+
+  it("releases in one order: values back first, then ownership dropped, then the lock and visibility re-settled (kills re-evaluating the lock before the values are back, which paints the old profile's value into an unlocked field)", () => {
+    const html = renderFormHtml({ title: "Test", fields: [] });
+    const start = html.indexOf("function releaseProfileOwnedFields()");
+    expect(start).toBeGreaterThan(-1);
+    const block = html.slice(start, html.indexOf("function applyFillFields(msg)"));
+    const restoreIndex = block.indexOf("setFieldValue(key, profileDisplacedValues[key]);");
+    const forgetIndex = block.indexOf("profileDisplacedValues = {};");
+    const disownIndex = block.indexOf("profileFilledKeys = {};");
+    const relockIndex = block.indexOf("updateProfileManagedFields();");
+    expect(restoreIndex).toBeGreaterThan(-1);
+    expect(forgetIndex).toBeGreaterThan(restoreIndex);
+    expect(disownIndex).toBeGreaterThan(restoreIndex);
+    expect(relockIndex).toBeGreaterThan(disownIndex);
+    expect(block.indexOf("updateVisibility();")).toBeGreaterThan(disownIndex);
   });
 
   it("attributes a fillFields answer to the auth profile select by the echoed key (kills recording another autofill-capable select's answer as the profile's, and kills never recording at all)", () => {
     const html = renderFormHtml({ title: "Test", fields: [] });
-    const start = html.indexOf('if (msg.type === "fillFields")');
-    const end = html.indexOf('if (msg.type === "validationError")');
+    const start = html.indexOf("function applyFillFields(msg)");
+    const end = html.indexOf("function parseVisibleWhen(raw)");
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     const block = html.slice(start, end);
-    expect(block).toContain('if (msg.key === "authProfileId") {');
-    expect(block).toContain("profileFilledKeys = filledKeysFromValues(fillValues);");
+    expect(block).toContain('var isProfileFill = msg.key === "authProfileId";');
+    expect(block).toContain("var nextFilledKeys = isProfileFill ? filledKeysFromValues(fillValues) : null;");
+    expect(block).toContain("profileFilledKeys = nextFilledKeys;");
+    // …and the message listener delegates to it rather than keeping a second
+    // copy of the rule inline.
+    const listenerStart = html.indexOf('if (msg.type === "fillFields")');
+    const listenerEnd = html.indexOf('if (msg.type === "validationError")');
+    expect(listenerStart).toBeGreaterThan(-1);
+    expect(html.slice(listenerStart, listenerEnd)).toContain("applyFillFields(msg);");
+  });
+
+  it("records what a managed field held before the profile's fill overwrites it (kills writing the profile's value first, which records the profile's own value as the thing to hand back)", () => {
+    const html = renderFormHtml({ title: "Test", fields: [] });
+    const start = html.indexOf("function applyFillFields(msg)");
+    const block = html.slice(start, html.indexOf("function parseVisibleWhen(raw)"));
+    const rememberIndex = block.indexOf("rememberDisplacedValue(fk);");
+    const writeIndex = block.indexOf("setFieldValue(fk, fillValues[fk]);");
+    expect(rememberIndex).toBeGreaterThan(-1);
+    expect(writeIndex).toBeGreaterThan(rememberIndex);
   });
 
   it("locks Default SSH Username alongside the server form's credential fields while a profile is linked", () => {
@@ -834,12 +864,12 @@ describe("renderFormHtml", () => {
     expect(block).toContain("wrapper.dataset.autofill === 'true'");
     expect(block).toContain("vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value });");
     expect(block).toContain("if (wrapper.dataset.name === 'authProfileId') {");
-    expect(block).toContain("updateProfileManagedFields();");
     expect(block.indexOf("type: 'autofill'")).toBeGreaterThan(selectIndex);
-    expect(block.indexOf("updateProfileManagedFields();")).toBeGreaterThan(selectIndex);
-    // Including the ownership reset: an inline-created profile owns nothing
-    // until its own fill answers, exactly like one picked from the list.
-    expect(block).toContain("profileFilledKeys = {};");
+    // The release is the re-lock (it ends by re-evaluating both the lock and
+    // visibility): an inline-created profile owns nothing until its own fill
+    // answers, and the profile it replaces hands back what it displaced —
+    // exactly like one picked from the list.
+    expect(block.indexOf("releaseProfileOwnedFields();")).toBeGreaterThan(selectIndex);
   });
 
   it("renders the initially selected profile's filled keys onto the Auth Profile select (kills leaving the render-time seed off, which is the only thing the webview can know before the first autofill)", () => {
