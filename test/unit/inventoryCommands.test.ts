@@ -3829,6 +3829,108 @@ describe("inventoryCommands", () => {
       expect(mockShowInformationMessage.mock.calls.map((call) => call[0])).toEqual(['Inventory source "My Source" updated.']);
     });
 
+    /**
+     * REVIEW FINDING (P2) — the mirror that fills Default SSH Username from the
+     * selected profile is an async webview round trip (onAutofill). Save can win
+     * that race, and then the form posts the NEW authProfileId next to the
+     * PREVIOUS defaultUsername. Every payload below reproduces exactly that:
+     * `authProfileId: "p1"` (LAB_PROFILE, username "labuser") alongside the
+     * stale "admin" the field still held.
+     *
+     * Both persist helpers used to write the posted username verbatim — the
+     * existence re-check only proves the id resolves, never that the two agree —
+     * leaving a linked source whose locked fallback username disagreed with its
+     * own profile, invisibly (reopening the form re-renders the mirror, showing
+     * the profile's username over a record holding a different one).
+     */
+    it("addSource stores the RESOLVED PROFILE's username as the fallback, not the stale one posted alongside it (kills persisting the submitted defaultUsername verbatim when Save beats the autofill round trip)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        authProfileId: "p1",
+        defaultUsername: "admin", // stale — the mirror had not landed yet
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      const created = core.getSnapshot().inventorySources[0];
+      expect(created.authProfileId).toBe("p1");
+      expect(created.defaultUsername).toBe("labuser");
+    });
+
+    it("editSource stores the RESOLVED PROFILE's username too (kills fixing only the create path)", async () => {
+      // Starts unlinked on "admin" — the state a user is in when they pick a
+      // profile for the first time and click Save immediately.
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE], source: { defaultUsername: "admin" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        authProfileId: "p1",
+        defaultUsername: "admin", // stale
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      });
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBe("p1");
+      expect(updated.defaultUsername).toBe("labuser");
+    });
+
+    it("an UNLINKED save keeps the username the user typed (kills a derivation that reaches past the `(None)` answer — e.g. to the previously linked profile — or blanks the field)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE], source: { authProfileId: "p1", defaultUsername: "labuser" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        authProfileId: "", // (None) — the field is unlocked and hand-typed again
+        defaultUsername: "hand-typed",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      });
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBeUndefined();
+      expect(updated.defaultUsername).toBe("hand-typed");
+    });
+
+    it("a profile whose username is whitespace-only falls back to the submitted username (kills storing an unusable/empty defaultUsername that validateInventorySource drops the whole record for)", async () => {
+      // Only reachable through an imported backup: the profile editor trims and
+      // refuses a blank username, but validateAuthProfile only checks length.
+      const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
+      const { core } = await makeHarness({ profiles: [blankish] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        authProfileId: "p3",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      const created = core.getSnapshot().inventorySources[0];
+      expect(created.authProfileId).toBe("p3");
+      // Neither the untrimmed "   " nor the "" a bare trim would produce: the
+      // former is a username no SSH login can use, the latter fails
+      // validateInventorySource and takes the whole record down at next load.
+      expect(created.defaultUsername).toBe("admin");
+    });
+
     it("addSource wires inline auth-profile creation end to end and an autofill that mirrors ONLY defaultUsername (kills the server form's {username, authType, keyPath} payload, an unwired onAutofill, and a controller that is never attached to the panel)", async () => {
       const { core } = await makeHarness({ profiles: [LAB_PROFILE] });
 

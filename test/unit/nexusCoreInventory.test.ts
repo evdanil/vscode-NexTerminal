@@ -1576,6 +1576,59 @@ describe("removeAuthProfile — dangling references on inventory sources (T2)", 
     // see (or re-persist) the half-cleared, re-revisioned source.
     expect(observed[0].sourceRef).toBe("p1");
   });
+
+  /**
+   * (FINDING 2) The two saves that run BEFORE saveInventorySources. The sources
+   * are already cleared and re-revisioned in memory by the time either can
+   * reject, so a rollback that only wraps saveInventorySources is skipped
+   * entirely — and the next unrelated inventory-source save from any other
+   * command persists the whole map, silently committing a deletion that failed.
+   *
+   * Each case asserts BOTH halves, because the fix has to keep them together:
+   * the in-memory record is restored (link AND revision), and the emission
+   * still fires — sampled inside the listener, so it also pins the ordering
+   * (rollback first, emit second).
+   */
+  for (const failing of ["saveAuthProfiles", "saveServers"] as const) {
+    it(`(FINDING 2) restores the linked source in memory when ${failing} rejects, before the emission, and rethrows (kills a rollback that only covers saveInventorySources)`, async () => {
+      const { core, repository } = makeCore();
+      await core.initialize();
+      await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", authProfileId: "p1" }));
+      // Linked so `serversChanged` is true and saveServers is actually reached.
+      await core.addOrUpdateServer({
+        id: "srv-1", name: "S1", host: "h", port: 22, username: "u",
+        authType: "password", isHidden: false, authProfileId: "p1"
+      });
+      const revisionBefore = core.getInventorySource("source-1")?.revision;
+      expect(revisionBefore).toBeDefined();
+
+      vi.spyOn(repository, failing).mockRejectedValueOnce(new Error("disk full"));
+      const saveSourcesSpy = vi.spyOn(repository, "saveInventorySources");
+      const observedSourceRefs: Array<string | undefined> = [];
+      core.onDidChange(() => {
+        observedSourceRefs.push(core.getInventorySource("source-1")?.authProfileId);
+      });
+
+      await expect(core.removeAuthProfile("p1")).rejects.toThrow("disk full");
+
+      // The save that would have carried the clear to disk never ran, so the
+      // in-memory clear has no counterpart anywhere and must be undone.
+      expect(saveSourcesSpy).not.toHaveBeenCalled();
+      const current = core.getInventorySource("source-1");
+      expect(current?.authProfileId).toBe("p1");
+      expect(current?.revision).toBe(revisionBefore);
+
+      // Disk is what a foreign command's next saveInventorySources would have
+      // overwritten with the half-applied state.
+      const persisted = await repository.getInventorySources();
+      expect(persisted[0].authProfileId).toBe("p1");
+      expect(persisted[0].revision).toBe(revisionBefore);
+
+      // Emit-on-every-path (the behaviour the `finally` exists for) survives
+      // the fix, and observers read the ROLLED-BACK source, not the cleared one.
+      expect(observedSourceRefs).toEqual(["p1"]);
+    });
+  }
 });
 
 describe("applyInventorySyncPlan — empty-folder GC (ITEM B)", () => {

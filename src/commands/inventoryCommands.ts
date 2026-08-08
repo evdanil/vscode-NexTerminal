@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
-import type { ServerConfig } from "../models/config";
+import type { AuthProfile, ServerConfig } from "../models/config";
 import {
   computeProviderFingerprint,
   InventoryProviderError,
@@ -521,6 +521,46 @@ async function parseSourceFormValues(
  */
 const MISSING_AUTH_PROFILE_MESSAGE = "The selected auth profile no longer exists. Choose another, or clear the Auth Profile field.";
 
+/**
+ * REVIEW FINDING (P2) — the fallback username a source records. Called by both
+ * persist helpers with the profile they just re-resolved (above), i.e. at the
+ * exact moment the record is written.
+ *
+ * INVARIANT: every save through these two helpers — i.e. every save the Add and
+ * Edit Source forms can make — stores the LINKED PROFILE's username as the
+ * source's `defaultUsername`. (Nothing here reaches configCommands' backup
+ * import, which restores whatever pair a file happens to carry; that path
+ * writes records wholesale and is not a form save.) The form's
+ * mirror-and-lock of the field (onAutofill -> `{ defaultUsername }`, plus the
+ * read-only rendering formHtml gives every managed key) is therefore purely
+ * COSMETIC: it shows the user what will be stored, it does not decide it.
+ *
+ * It cannot be what decides it. The mirror is an asynchronous webview round
+ * trip, so a Save clicked before it returns posts the NEW `authProfileId`
+ * alongside the PREVIOUS `defaultUsername`, and both persist paths used to
+ * write that submitted value verbatim — the re-resolve above only proves the id
+ * still names a profile, never that the two agree. The result was a linked
+ * source whose locked fallback username disagreed with its own profile, and
+ * nothing surfaced it: reopening the form re-renders the mirror, showing the
+ * profile's username over a record holding a different one. Deriving here makes
+ * the invariant unconditional and enforceable rather than dependent on webview
+ * timing.
+ *
+ * The trim mirrors parseSourceFormValues' own treatment of the field, so the
+ * derived value is bit-identical to what a completed mirror would have posted.
+ * A profile whose username is whitespace-only (reachable only through an
+ * imported backup — the profile editor trims and rejects blanks) falls back to
+ * the submitted username, which the parser already proved non-empty: a stored
+ * empty `defaultUsername` fails validateInventorySource and would take the
+ * whole source record down with it at the next load.
+ */
+function fallbackUsernameForSource(profile: AuthProfile | undefined, submittedUsername: string): string {
+  if (profile === undefined) {
+    return submittedUsername;
+  }
+  return profile.username.trim() || submittedUsername;
+}
+
 export interface NewInventorySourceInput {
   name: string;
   targetFolder: string;
@@ -592,23 +632,6 @@ async function persistNewInventorySource(
       throw new Error("Could not store credentials in the system keychain — the source was not created.");
     }
 
-    // ITEM A — stamp the provider's fingerprint at creation time: the user
-    // is knowingly configuring against WHICHEVER registrant currently holds
-    // `provider.id` right now, so that registrant's observable shape is the
-    // baseline every later sync compares against.
-    const source: InventorySourceConfig = {
-      id,
-      providerId: provider.id,
-      name,
-      targetFolder,
-      prunePolicy,
-      authProfileId,
-      defaultUsername,
-      config,
-      secretFieldIds,
-      providerFingerprint: computeProviderFingerprint(provider)
-    };
-
     // REVIEW FINDING (P2) — re-resolve the selected profile against live core
     // state (see MISSING_AUTH_PROFILE_MESSAGE for why this exists and why it
     // rejects instead of clearing). This path has no drift guard of its own:
@@ -624,7 +647,8 @@ async function persistNewInventorySource(
     // the map synchronously before its first await, so removeAuthProfile finds
     // this source and clears the reference off it exactly as it would for any
     // other holder.
-    if (authProfileId !== undefined && core.getAuthProfile(authProfileId) === undefined) {
+    const linkedProfile = authProfileId !== undefined ? core.getAuthProfile(authProfileId) : undefined;
+    if (authProfileId !== undefined && linkedProfile === undefined) {
       // Same best-effort rollback as FINDING B / FINDING 1 below: the source
       // is not created on this path either, so nothing would ever enumerate
       // these keys to clean them up.
@@ -637,6 +661,32 @@ async function persistNewInventorySource(
       }
       throw new Error(MISSING_AUTH_PROFILE_MESSAGE);
     }
+
+    // ITEM A — stamp the provider's fingerprint at creation time: the user
+    // is knowingly configuring against WHICHEVER registrant currently holds
+    // `provider.id` right now, so that registrant's observable shape is the
+    // baseline every later sync compares against.
+    //
+    // Built HERE, below the re-resolve rather than above it, because
+    // `defaultUsername` is derived from the profile that resolve produced.
+    // Purely a move of the object literal: it is synchronous, so the TOCTOU
+    // argument above (nothing runs between the resolve and the persist) is
+    // untouched.
+    const source: InventorySourceConfig = {
+      id,
+      providerId: provider.id,
+      name,
+      targetFolder,
+      prunePolicy,
+      authProfileId,
+      // REVIEW FINDING (P2) — the profile's username, not the posted one; see
+      // fallbackUsernameForSource for the invariant and why the form's mirror
+      // cannot be trusted to have landed before Save.
+      defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
+      config,
+      secretFieldIds,
+      providerFingerprint: computeProviderFingerprint(provider)
+    };
 
     // FINDING 1 — if persisting the new source record fails, the vault keys
     // just written above have no source to be enumerated/cleaned up by, so
@@ -741,24 +791,6 @@ async function persistUpdatedInventorySource(
       .filter((f) => f.type === "password" && (reenteredSecrets[f.id] !== undefined || existingSecretFieldIds.has(f.id)))
       .map((f) => f.id);
 
-    // ITEM A — restamp on every save: the user has the form open against
-    // `provider` (whichever registrant currently answers `source.providerId`)
-    // and is knowingly interacting with it, exactly like at creation time.
-    const updated: InventorySourceConfig = {
-      ...source,
-      name,
-      targetFolder,
-      prunePolicy,
-      // Assigned unconditionally (never spread-guarded): `undefined` is the
-      // form's `(None)` answer and MUST overwrite a previously linked id,
-      // which a conditional spread over `...source` would silently preserve.
-      authProfileId,
-      defaultUsername,
-      config,
-      secretFieldIds: newSecretFieldIds,
-      providerFingerprint: computeProviderFingerprint(provider)
-    };
-
     // ITEM 4 — re-read the record immediately before persisting. configCommands
     // flows (importMergeReplace, completeReset) mutate inventory sources
     // directly and bypass inFlightSourceIds entirely, so an import/reset can
@@ -789,10 +821,39 @@ async function persistUpdatedInventorySource(
     // already linked trips ITEM 4 and is told to reopen, while a source being
     // switched ONTO that profile keeps its revision, sails through ITEM 4
     // untouched, and is caught here.
-    if (authProfileId !== undefined && core.getAuthProfile(authProfileId) === undefined) {
+    const linkedProfile = authProfileId !== undefined ? core.getAuthProfile(authProfileId) : undefined;
+    if (authProfileId !== undefined && linkedProfile === undefined) {
       await rollbackThisRunsVaultWrites();
       throw new Error(MISSING_AUTH_PROFILE_MESSAGE);
     }
+
+    // ITEM A — restamp on every save: the user has the form open against
+    // `provider` (whichever registrant currently answers `source.providerId`)
+    // and is knowingly interacting with it, exactly like at creation time.
+    //
+    // Built HERE, below both guards rather than above them, because
+    // `defaultUsername` is derived from the profile the re-resolve above
+    // produced. Nothing between the two guards reads `updated`, and building an
+    // object literal is synchronous, so neither guard's reasoning changes —
+    // ITEM 4 still runs first, and still no `await` separates the auth-profile
+    // resolve from the persist below.
+    const updated: InventorySourceConfig = {
+      ...source,
+      name,
+      targetFolder,
+      prunePolicy,
+      // Assigned unconditionally (never spread-guarded): `undefined` is the
+      // form's `(None)` answer and MUST overwrite a previously linked id,
+      // which a conditional spread over `...source` would silently preserve.
+      authProfileId,
+      // REVIEW FINDING (P2) — the profile's username, not the posted one; see
+      // fallbackUsernameForSource for the invariant and why the form's mirror
+      // cannot be trusted to have landed before Save.
+      defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
+      config,
+      secretFieldIds: newSecretFieldIds,
+      providerFingerprint: computeProviderFingerprint(provider)
+    };
 
     // FINDING 1 — persist BEFORE any vault cleanup. If persistence rejects,
     // the pre-existing secretFieldIds keys must be left untouched (they're

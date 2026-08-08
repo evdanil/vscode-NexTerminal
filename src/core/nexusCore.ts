@@ -247,6 +247,24 @@ export class NexusCore {
    * re-revisioned records would be silently committed by the next unrelated
    * saveInventorySources call from some other command. Capture the previous
    * entries before mutating and restore them on rejection.
+   *
+   * FINDING 2 (P2) — that restore covers EVERY failure after the in-memory
+   * clearing, not just a rejected saveInventorySources. An earlier rejection
+   * (saveAuthProfiles, or the intervening saveServers) leaves the sources
+   * cleared and re-revisioned in memory while disk still holds the links, and
+   * the next unrelated inventory-source save from any other command persists
+   * the whole map — silently committing a deletion that failed. The restore
+   * therefore lives in a catch around all three saves, INSIDE the try/finally
+   * that owns the emission, so it always runs before observers are told to
+   * re-read (see the emission note below).
+   *
+   * KNOWN ASYMMETRY, deliberately left alone: the `authProfiles` and `servers`
+   * in-memory mutations are NOT rolled back when their own saves reject. Those
+   * two are the deletion's primary intent rather than incidental reference
+   * clearing, and the emission contract below is written around them staying
+   * applied — observers are told the profile is gone. Only the source map,
+   * whose stale in-memory state is what a foreign command would silently
+   * persist, is restored here.
    */
   public async removeAuthProfile(profileId: string): Promise<void> {
     this.authProfiles.delete(profileId);
@@ -274,19 +292,24 @@ export class NexusCore {
     // or with the inventory-source clears rolled back below — observers are told
     // about it exactly once.
     try {
-      await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
-      if (serversChanged) {
-        await this.repository.saveServers([...this.servers.values()]);
-      }
-      if (previousSources.size > 0) {
-        try {
-          await this.repository.saveInventorySources([...this.inventorySources.values()]);
-        } catch (error) {
-          for (const [id, source] of previousSources) {
-            this.inventorySources.set(id, source);
-          }
-          throw error;
+      try {
+        await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
+        if (serversChanged) {
+          await this.repository.saveServers([...this.servers.values()]);
         }
+        if (previousSources.size > 0) {
+          await this.repository.saveInventorySources([...this.inventorySources.values()]);
+        }
+      } catch (error) {
+        // FINDING A / FINDING 2 — restore the sources for ANY rejection above,
+        // then rethrow. A no-op when nothing was cleared (`previousSources`
+        // empty), so it needs no guard of its own. This catch is nested inside
+        // the emitting try/finally rather than wrapping it, so the restore is
+        // complete before the emission fires.
+        for (const [id, source] of previousSources) {
+          this.inventorySources.set(id, source);
+        }
+        throw error;
       }
     } finally {
       this.emitChanged();
