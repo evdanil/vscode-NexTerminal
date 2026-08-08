@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
-import type { ServerConfig } from "../models/config";
+import type { AuthProfile, ServerConfig } from "../models/config";
+import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials } from "../models/config";
 import {
   computeProviderFingerprint,
   InventoryProviderError,
@@ -32,6 +33,7 @@ import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { INVALID_FOLDER_PATH_MESSAGE, normalizeOptionalFolderPath } from "../utils/folderPaths";
 import { mostCommonUsername } from "./configCommands";
+import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 
 /**
  * F1 — server runtime teardown, injected from extension.ts (mirrors the
@@ -75,6 +77,50 @@ export interface InventoryRuntimeTeardown {
 
 function providerMissingMessage(providerId: string): string {
   return `Inventory provider "${providerId}" is not available (the extension providing it may be disabled).`;
+}
+
+/**
+ * WHY a source is currently claimed in `inFlightSourceIds` — recorded at every
+ * claim site, read by every refusal message.
+ *
+ * BUG (user-reported) — the marker used to be a bare `Set<string>`, so all
+ * three commands worded their refusal as an in-flight sync. But syncNow is
+ * only ONE of the three claimants: editSource holds the same marker for as
+ * long as its form stays open (F4), and removeSource holds it across its
+ * confirm-and-mutate run. Leaving an Edit Source tab open therefore made Sync
+ * Now announce a sync that was not running, with no clue beyond "closing the
+ * tab makes it work". Each claimant now names itself, so the refusal can say
+ * what is actually true.
+ *
+ * There is deliberately no "other"/default member: the value type is this
+ * union, so a claimed-but-unexplained source is unrepresentable, and
+ * `sourceBusyMessage`'s Record forces any future member to bring its own
+ * wording instead of silently inheriting one of these.
+ */
+type SourceBusyReason = "sync" | "edit" | "remove";
+
+/**
+ * The warning a command shows when the source it was asked to act on is
+ * already claimed by another command.
+ *
+ * `holder` is the reason recorded by whoever claimed it; `asking` is the
+ * reason the CALLER would have claimed. Only the sync case reads `asking`:
+ * a Sync Now refused by a running sync is the user asking for the very thing
+ * already in progress ("already syncing"), while edit/remove are asking for
+ * something else and need to be told what to wait for. The other two cases
+ * read the same from every caller — the source is unavailable, and the
+ * sentence says what is holding it and how to free it.
+ *
+ * The Record is the exhaustiveness gate: adding a SourceBusyReason without
+ * wording for it is a compile error here, not a message that quietly lies.
+ */
+function sourceBusyMessage(name: string, holder: SourceBusyReason, asking: SourceBusyReason): string {
+  const wording: Record<SourceBusyReason, string> = {
+    sync: asking === "sync" ? `"${name}" is already syncing.` : `"${name}" is currently syncing — try again once the sync finishes.`,
+    edit: `"${name}" is open in Edit Source — close that tab, then try again.`,
+    remove: `"${name}" is currently being removed — try again once the removal finishes.`
+  };
+  return wording[holder];
 }
 
 /**
@@ -336,10 +382,11 @@ interface ProviderConfigFormResult {
  * writes it back into `config`/`secrets` under the field's own unprefixed
  * `id`, exactly as InventorySourceValues/Secrets and the vault expect —
  * without this split, a provider field id that collided with a reserved
- * top-level key ("name", "targetFolder", "defaultUsername", "prunePolicy")
- * would silently overwrite that source field's own value in the same flat
- * FormValues object (or be overwritten by it), whichever happened to be
- * assigned last.
+ * top-level key ("name", "targetFolder", "authProfileId", "defaultUsername",
+ * "prunePolicy") would silently overwrite that source field's own value in
+ * the same flat FormValues object (or be overwritten by it), whichever
+ * happened to be assigned last. ("authProfileId" is doubly reserved: it is
+ * also the key createInlineAuthProfileCreation hard-filters on.)
  *
  * `existingSecretFieldIds` (edit flow) marks which password fields already
  * have a saved vault value: a blank value for one of those is treated as
@@ -409,6 +456,8 @@ function formValuesToProviderConfig(
 interface ParsedSourceFormValues {
   name: string;
   targetFolder: string;
+  /** `undefined` for the select's `(None)` option, never the empty string. */
+  authProfileId?: string;
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
   config: InventorySourceValues;
@@ -459,6 +508,21 @@ async function parseSourceFormValues(
     }
   }
 
+  // The Auth Profile select submits "" for its `(None)` option; a source must
+  // never store that as an id — validateInventorySource rejects a non-empty
+  // string, sourceConfigUnchanged would see "" and undefined as different
+  // configurations, and the engine's resolution guard would treat "" as a
+  // dangling reference and warn on every sync. Normalized to `undefined`
+  // here, once, so nothing downstream has to know about the empty option.
+  //
+  // No existence check HERE: parsing has no core access, and a check at this
+  // point would sit an entire keychain round trip away from the write it is
+  // meant to protect. The posted id is re-resolved against live core state
+  // immediately before the record is persisted instead — see
+  // MISSING_AUTH_PROFILE_MESSAGE and the two persist helpers below.
+  const rawAuthProfileId = values.authProfileId;
+  const authProfileId = typeof rawAuthProfileId === "string" && rawAuthProfileId !== "" ? rawAuthProfileId : undefined;
+
   const defaultUsername = typeof values.defaultUsername === "string" ? values.defaultUsername.trim() : "";
   if (!defaultUsername) {
     throw new Error("Default SSH Username is required");
@@ -470,12 +534,347 @@ async function parseSourceFormValues(
 
   const { config, secrets } = formValuesToProviderConfig(provider.configFields, values, existingSecretFieldIds);
 
-  return { name, targetFolder, defaultUsername, prunePolicy, config, secrets };
+  return { name, targetFolder, authProfileId, defaultUsername, prunePolicy, config, secrets };
+}
+
+/**
+ * REVIEW FINDING (P2) — shared by both persist helpers below, which re-resolve
+ * the form's selected auth profile against LIVE core state immediately before
+ * writing the source record.
+ *
+ * WHY A LATE RE-CHECK AT ALL: the select is populated once, when the form
+ * opens, and the form can then sit open indefinitely. Deleting that profile in
+ * the meantime (AuthProfileEditorPanel -> NexusCore.removeAuthProfile) leaves
+ * the still-open form posting an id that no longer names anything.
+ * removeAuthProfile's own reference clearing cannot help: it only touches
+ * sources that ALREADY reference the profile. So the two cases it re-revisions
+ * nothing for — an Add form (no record yet, hence nothing for the edit path's
+ * ITEM 4 drift guard to compare against) and an Edit form switching a source
+ * ONTO a profile it wasn't linked to — would persist a dangling reference,
+ * and every later sync of that source would quietly fall back to the default
+ * username with SSH agent auth: the exact defect this link exists to prevent,
+ * with only a per-sync warning to show for it.
+ *
+ * WHY REJECT RATHER THAN CLEAR TO `(None)`: the user made an explicit
+ * credential choice that can no longer be honoured. Saving without it is how
+ * synced devices land on credentials nobody chose; refusing keeps the form
+ * open (WebviewFormPanel's "Save failed: ..." banner) with the choice intact
+ * so it can be re-pointed or deliberately cleared.
+ *
+ * Named, not id'd: this file's copy never shows a UUID (m3), and the profile
+ * is gone by now, so there is no name left to quote either.
+ */
+const MISSING_AUTH_PROFILE_MESSAGE = "The selected auth profile no longer exists. Choose another, or clear the Auth Profile field.";
+
+/**
+ * REVIEW FINDING (P1) — the second reason a selected profile cannot be
+ * honoured, refused in the same breath and by the same two persist helpers as
+ * the first.
+ *
+ * A `key` profile that carries no key path forces `authType: "key"` onto every
+ * server linked to it while supplying no path, and NO server this source
+ * produces can supply one of its own: the add path writes `authType: "agent"`
+ * with no `keyPath`, and retro-apply adopts only servers still carrying exactly
+ * that. So `buildConnectConfig` throws `Missing keyPath for key auth on
+ * <server>` for every device the source has ever synced or will sync — the same
+ * fleet-wide unusability this feature was written to end, entered through the
+ * Auth Profile select instead of through the missing default. See
+ * `authProfileNeedsServerKeyPath` (models/config.ts) for why this is a property
+ * of the PAIRING rather than something the field-ownership rule should absorb,
+ * and why such a profile stays perfectly valid on a server form.
+ *
+ * WHY HERE AND NOT IN THE SELECT'S OPTION LIST: options are built once, when
+ * the form opens, so filtering them cannot govern a profile whose key path is
+ * removed while the form sits open — the same reason the missing-profile check
+ * above is a persist-time re-resolve rather than a render-time filter. It would
+ * also silently drop the currently-linked profile out of an Edit form's own
+ * select, turning "your source is misconfigured" into "your source is linked to
+ * nothing", which is the state this refusal exists to avoid persisting.
+ * Refusing at Save keeps the choice visible and says what to repair.
+ *
+ * NAMED here, unlike MISSING_AUTH_PROFILE_MESSAGE: the profile still exists, so
+ * there is a name to quote (m3 — a name, never the id), and the repair is to
+ * that profile rather than to this form.
+ */
+function keylessKeyAuthProfileMessage(profile: AuthProfile): string {
+  return `The auth profile "${profile.name}" uses private key authentication but has no key file. Servers synced from this source have no key of their own, so none of them could connect. Add a key file to that profile, or choose another.`;
+}
+
+/**
+ * REVIEW FINDING (P2) — what an Add or Edit Source form committed to when it
+ * last put a profile's username on screen. Compared against LIVE core state at
+ * Save by `inventoryAuthProfileRejection`, the source form's counterpart of the
+ * server form's `RenderedAuthProfile` (commands/serverCommands.ts).
+ */
+export interface RenderedSourceAuthProfile {
+  /** The id whose username the form is currently showing. */
+  id: string;
+  /**
+   * The username that profile SUPPLIED at that moment — THE ONE RULE
+   * (`authProfileOwnedCredentials`), i.e. precisely what
+   * `fallbackUsernameForSource` would have stored had Save been pressed then,
+   * and `undefined` where it supplied none and Default SSH Username kept the
+   * user's own value, unlocked.
+   *
+   * The value itself rather than the hashed shape the server form compares
+   * (`authProfileOwnershipSignature`): there is exactly ONE profile fact a
+   * source save reads, so `===` over `string | undefined` states it exactly,
+   * with nothing to encode and nothing to collide.
+   */
+  username: string | undefined;
+}
+
+/**
+ * The stamp for a profile this form is about to be handed the username of,
+ * built from the SAME lookup the render (or the mirror) is built from, so what
+ * the form shows and what Save checks against are one fact rather than two
+ * lookups that can disagree.
+ *
+ * `undefined` for an id that resolves to no profile — the state in which the
+ * form is showing NO profile's username: the mirror answers nothing (so
+ * WebviewFormPanel suppresses the fillFields round trip entirely) and the Edit
+ * render sanitizes such a seed down to `(None)` (`inventorySourceFormDefinition`,
+ * ui/formDefinitions.ts). A Save that still carries that id is refused as
+ * missing, one check earlier.
+ */
+function renderedSourceAuthProfile(profile: AuthProfile | undefined): RenderedSourceAuthProfile | undefined {
+  return profile ? { id: profile.id, username: authProfileOwnedCredentials(profile).username } : undefined;
+}
+
+/**
+ * REVIEW FINDING (P2) — the third reason a selected profile cannot be honoured,
+ * refused in the same breath as the other two: the profile still exists and is
+ * still linkable, but it no longer supplies the username the form is showing
+ * for it.
+ *
+ * Named, like the keyless-key refusal and unlike the missing one: the profile
+ * is still there to be named (m3 — a name, never the id), and the repair is a
+ * single action in THIS form.
+ */
+function changedAuthProfileUsernameMessage(profile: AuthProfile): string {
+  return `The auth profile "${profile.name}" changed the username it supplies while this form was open, so Default SSH Username on screen is not the one a save would store. Re-select it in the Auth Profile list to pick up its current username, then save again.`;
+}
+
+/**
+ * The single answer to "may this source be saved carrying this auth profile?",
+ * shared by both persist helpers so the Add and Edit paths cannot diverge on
+ * it. Returns the message to reject with, or `undefined` to proceed.
+ *
+ * `profile` is what `authProfileId` resolved to against LIVE core state a
+ * statement earlier — the caller does the lookup because only it knows which
+ * rollback its own critical section owes on the way out. `rendered` is the
+ * form's own stamp (`renderedSourceAuthProfile`), threaded through the persist
+ * input so both paths are answered by this one function.
+ *
+ * REVIEW FINDING (P2) — THE THIRD CHECK, and why its comparand is not the
+ * server form's.
+ *
+ * WHAT GOES WRONG WITHOUT IT: `fallbackUsernameForSource` derives
+ * `defaultUsername` from the LIVE profile, deliberately and unconditionally. So
+ * a username edited in the Auth Profile Editor while this form sat open makes
+ * Save store a username the form never displayed — in a field the profile had
+ * LOCKED, so the user could not have corrected it even had they noticed — and
+ * nothing else surfaces it. Editing a profile does not revise the source, so
+ * the edit path's ITEM 4 drift guard passes; saving any unrelated field
+ * (a rename, a new target folder) is enough to carry it in. What lands is not
+ * cosmetic either: `defaultUsername` is the username every server this source
+ * syncs is stamped with, and the one `SilentAuthSshFactory` falls back to for
+ * all of them if the profile is ever removed.
+ *
+ * THE COMPARAND IS THE USERNAME, AND ONLY THE USERNAME. The server form
+ * compares `authProfileOwnershipSignature`, which deliberately EXCLUDES the
+ * profile's values: a linked server stores neither the profile's username nor
+ * its key path, so a value that moves under an open server form changes nothing
+ * that save writes, and only the ownership SHAPE (plus `authType`, which
+ * decides which credential control is rendered at all) can. Here that reasoning
+ * INVERTS. A source record takes exactly one thing from its profile — the
+ * username's VALUE, via `fallbackUsernameForSource` — and takes nothing else:
+ * no `authType`, no key path, no name. So this compares the value the server
+ * form omits, and omits everything the server form compares. Both halves cost
+ * something to get wrong: including `authType` would refuse saves that are
+ * correct (switching a profile from password to SSH agent changes nothing a
+ * source record holds), and omitting the value would let the finding straight
+ * through.
+ *
+ * "SUPPLIES NONE" IS A DISTINCT STATE, not a blank — which is the one thing
+ * this shares with the server's signature, applied to the single field this
+ * form has. GAINING a username (an imported blank-username profile edited into
+ * a real one) turns the fallback the user typed and can see, in an unlocked
+ * field, into one the save silently replaces. LOSING it leaves Default SSH
+ * Username locked on screen against a profile that no longer fills it; the
+ * string written happens to coincide, but what it MEANS does not — it stops
+ * being the profile's username and becomes the source's own account, and only
+ * a re-select runs the webview's release (`profileDisplacedValues`,
+ * ui/formHtml.ts) that unlocks the field the user would need to change it in.
+ *
+ * ONLY WHEN `rendered` NAMES THE SUBMITTED ID — and this is where the server's
+ * guard deliberately goes further than this one. There, a submission naming a
+ * profile the form never rendered is refused outright, because
+ * `preserveLinkedServerCredentials` reads the live profile to decide which
+ * submitted fields are the user's own input, and that decision would be made
+ * about a form nobody saw. Here the save does not decide anything from the
+ * submission: it DERIVES the username from the live profile, so a Save that
+ * beats the mirror's round trip stores exactly what the completed mirror would
+ * have shown a moment later. That is `fallbackUsernameForSource`'s documented
+ * purpose — making the invariant independent of webview timing — and refusing
+ * it would reintroduce the very timing dependence that helper removed (the
+ * "Save beats the autofill round trip" tests in
+ * test/unit/inventoryCommands.test.ts pin it). What is checked is therefore
+ * what this form actually PUT ON SCREEN for this profile, which is established
+ * by the mirror's answer or by the Edit form's own render, and by nothing else.
+ *
+ * REJECT rather than re-render, for the same reason the server form does: the
+ * values needed to re-render correctly live in the webview's transition
+ * machinery, and pushing a bare `fillFields` from here would apply the new
+ * state WITHOUT the release step, leaving a field the profile no longer fills
+ * unlocked and still holding the profile's value. The message names the one
+ * action that runs the real transition — re-select the profile.
+ *
+ * Call it with a `profile` re-resolved inside `configMutationLock`. Auth
+ * profile writes take that same lock (ui/authProfileEditorPanel.ts), so a check
+ * made while holding it stays true through the write it is guarding.
+ */
+function inventoryAuthProfileRejection(
+  authProfileId: string | undefined,
+  rendered: RenderedSourceAuthProfile | undefined,
+  profile: AuthProfile | undefined
+): string | undefined {
+  if (authProfileId === undefined) {
+    return undefined;
+  }
+  if (profile === undefined) {
+    return MISSING_AUTH_PROFILE_MESSAGE;
+  }
+  if (authProfileNeedsServerKeyPath(profile)) {
+    // Ahead of the drift check on purpose: a keyless key profile cannot be
+    // linked at all, so "add a key file to that profile, or choose another" is
+    // the repair even when its username moved too — re-selecting it would only
+    // land the user back on this same refusal.
+    return keylessKeyAuthProfileMessage(profile);
+  }
+  if (rendered?.id === authProfileId && rendered.username !== authProfileOwnedCredentials(profile).username) {
+    return changedAuthProfileUsernameMessage(profile);
+  }
+  return undefined;
+}
+
+/**
+ * REVIEW FINDING (P2) — the fallback username a source records. Called by both
+ * persist helpers with the profile they just re-resolved (above), i.e. at the
+ * exact moment the record is written.
+ *
+ * INVARIANT: every save through these two helpers — i.e. every save the Add and
+ * Edit Source forms can make — stores the LINKED PROFILE's username as the
+ * source's `defaultUsername`. (Nothing here reaches configCommands' backup
+ * import, which restores whatever pair a file happens to carry; that path
+ * writes records wholesale and is not a form save.) The form's
+ * mirror-and-lock of the field (onAutofill -> `{ defaultUsername }`, plus the
+ * read-only rendering formHtml gives every managed key) is therefore purely
+ * COSMETIC: it shows the user what will be stored, it does not decide it.
+ *
+ * It cannot be what decides it. The mirror is an asynchronous webview round
+ * trip, so a Save clicked before it returns posts the NEW `authProfileId`
+ * alongside the PREVIOUS `defaultUsername`, and both persist paths used to
+ * write that submitted value verbatim — the re-resolve above only proves the id
+ * still names a profile, never that the two agree. The result was a linked
+ * source whose locked fallback username disagreed with its own profile, and
+ * nothing surfaced it: reopening the form re-renders the mirror, showing the
+ * profile's username over a record holding a different one. Deriving here makes
+ * the invariant unconditional and enforceable rather than dependent on webview
+ * timing.
+ *
+ * WHICH username is derived is THE ONE RULE (`authProfileOwnedCredentials`,
+ * models/config.ts): the profile's, when it supplies a usable one — trimmed,
+ * exactly as parseSourceFormValues treats the field, so the derived value is
+ * bit-identical to what a completed mirror would have posted. A profile whose
+ * username is whitespace-only (reachable only through an imported backup — the
+ * profile editor trims and rejects blanks) supplies none, so the submitted
+ * username stands, which the parser already proved non-empty: a stored empty
+ * `defaultUsername` fails validateInventorySource and would take the whole
+ * source record down with it at the next load.
+ *
+ * REVIEW FINDING (P2) — that blank-profile branch is DEFENCE IN DEPTH, not the
+ * primary handling. The mirror itself declines to fill a blank username
+ * (authProfileUsernameMirror), so the form always submits a username the user
+ * can see and edit; this branch covers the submissions that reach here with no
+ * completed mirror behind them — Save clicked before the round trip returned,
+ * which is the same race the whole helper exists for. It is deliberately kept:
+ * derivation must be total, because the alternative is storing a whitespace
+ * (or empty) `defaultUsername` that no SSH login can use.
+ *
+ * REVIEW FINDING (P2) — and the fallback it stores is now HONOURED rather than
+ * quietly discarded. `SilentAuthSshFactory.resolveServer` used to overwrite
+ * every synced server's username with the profile's own whitespace, so this
+ * valid fallback reached the record and was then ignored at connect time; it
+ * reads the same rule now, so a profile that supplies no username leaves the
+ * username this helper chose in place.
+ */
+function fallbackUsernameForSource(profile: AuthProfile | undefined, submittedUsername: string): string {
+  return authProfileOwnedCredentials(profile).username ?? submittedUsername;
+}
+
+/**
+ * The Auth Profile select's mirror payload, shared by the Add and Edit Source
+ * forms (`onAutofill`). Selecting a profile posts its id here; whatever comes
+ * back is written into the form's fields verbatim by the webview, and the
+ * managed field is then rendered read-only.
+ *
+ * REVIEW FINDING (P2) — a profile whose username is whitespace-only (reachable
+ * through an imported backup: `validateAuthProfile` only checks length, while
+ * the profile editor trims and rejects blanks) must mirror NOTHING. Returning
+ * `{ defaultUsername: "   " }` used to write whitespace into a field that is
+ * both REQUIRED and, once a profile is linked, read-only — so
+ * `parseSourceFormValues` trimmed it, rejected the save with "Default SSH
+ * Username is required", and left the user no field to fix it in. The accepted
+ * profile could not be linked through the form at all, and
+ * `fallbackUsernameForSource`'s blank-profile branch — which exists precisely
+ * for this profile — was unreachable from the real flow.
+ *
+ * Leaving the user's own value alone is also the CORRECT mirror: when the
+ * profile has no usable username, `fallbackUsernameForSource` stores the
+ * submitted one, so the field is genuinely not managed by the profile and the
+ * webview must not pretend otherwise (formHtml's `updateProfileManagedFields`
+ * completes the pairing — it never locks a managed field the profile left
+ * empty).
+ *
+ * `{}` rather than `undefined` for that case: `undefined` means "no answer",
+ * and WebviewFormPanel suppresses the `fillFields` round trip entirely, so the
+ * form would not re-evaluate the lock after the selection. An empty payload is
+ * a positive "this profile fills nothing" — it writes no values but still
+ * drives the re-evaluation. `undefined` stays reserved for an id that resolves
+ * to no profile at all (deleted while the form sat open), where touching the
+ * form would be guessing.
+ *
+ * Whether there is a username to mirror, and its trimmed form, both come from
+ * THE ONE RULE (`authProfileOwnedCredentials`, models/config.ts) — the same
+ * one `fallbackUsernameForSource` derives the stored value from and the same
+ * one `authProfileFilledKeys` seeds the lock from, so what the mirror shows,
+ * what the save stores, and what the form locks cannot disagree.
+ *
+ * REVIEW FINDING (P2) — takes the RESOLVED profile rather than an id to look up
+ * itself, so the caller's single `getAuthProfile` feeds both this answer and
+ * the render stamp `inventoryAuthProfileRejection` later checks it against
+ * (`renderedSourceAuthProfile`). Two lookups could straddle a profile edit and
+ * stamp a shape the form was never shown.
+ */
+function authProfileUsernameMirror(profile: AuthProfile | undefined): Record<string, string> | undefined {
+  if (!profile) {
+    return undefined;
+  }
+  const username = authProfileOwnedCredentials(profile).username;
+  return username !== undefined ? { defaultUsername: username } : {};
 }
 
 export interface NewInventorySourceInput {
   name: string;
   targetFolder: string;
+  authProfileId?: string;
+  /**
+   * What the form last showed as `authProfileId`'s username, or `undefined`
+   * where it has shown none — see `inventoryAuthProfileRejection`. Declared
+   * required-but-nullable so neither form path can quietly omit it.
+   */
+  renderedAuthProfile: RenderedSourceAuthProfile | undefined;
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
   provider: InventoryProvider;
@@ -501,7 +900,7 @@ async function persistNewInventorySource(
   vault: SecretVault,
   input: NewInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, defaultUsername, prunePolicy, provider, config, secrets } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, secrets } = input;
   const id = randomUUID();
   const passwordFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
 
@@ -543,17 +942,62 @@ async function persistNewInventorySource(
       throw new Error("Could not store credentials in the system keychain — the source was not created.");
     }
 
+    // REVIEW FINDING (P2) — re-resolve the selected profile against live core
+    // state (see MISSING_AUTH_PROFILE_MESSAGE for why this exists and why it
+    // rejects instead of clearing). This path has no RECORD drift guard of its
+    // own: there is no prior record, so nothing to compare a revision against —
+    // which is exactly why the form's own render stamp is threaded in here
+    // (`renderedAuthProfile`, see inventoryAuthProfileRejection): on Add it is
+    // the only account of what this form put on screen.
+    //
+    // TOCTOU: the profile-deletion path (AuthProfileEditorPanel's delete
+    // handler) takes this SAME configMutationLock around its vault deletes and
+    // NexusCore.removeAuthProfile — see that handler and removeAuthProfile's
+    // own doc for why the lock lives at the caller rather than inside the core
+    // method — so a deletion cannot interleave with this section at all. Even
+    // without that, no `await` separates this check from the
+    // addOrUpdateInventorySource call below, so on the extension host's single
+    // thread nothing can run between them; and a deletion landing after this
+    // whole section is harmless, because addOrUpdateInventorySource inserts the
+    // record into the map before removeAuthProfile scans it, so the reference
+    // is cleared off this source exactly as it would be off any other holder.
+    const linkedProfile = authProfileId !== undefined ? core.getAuthProfile(authProfileId) : undefined;
+    const authProfileRejection = inventoryAuthProfileRejection(authProfileId, renderedAuthProfile, linkedProfile);
+    if (authProfileRejection !== undefined) {
+      // Same best-effort rollback as FINDING B / FINDING 1 below: the source
+      // is not created on this path either, so nothing would ever enumerate
+      // these keys to clean them up.
+      for (const fieldId of secretFieldIds) {
+        try {
+          await vault.delete(inventorySecretKey(id, fieldId));
+        } catch {
+          // best-effort rollback — ignore
+        }
+      }
+      throw new Error(authProfileRejection);
+    }
+
     // ITEM A — stamp the provider's fingerprint at creation time: the user
     // is knowingly configuring against WHICHEVER registrant currently holds
     // `provider.id` right now, so that registrant's observable shape is the
     // baseline every later sync compares against.
+    //
+    // Built HERE, below the re-resolve rather than above it, because
+    // `defaultUsername` is derived from the profile that resolve produced.
+    // Purely a move of the object literal: it is synchronous, so the TOCTOU
+    // argument above (nothing runs between the resolve and the persist) is
+    // untouched.
     const source: InventorySourceConfig = {
       id,
       providerId: provider.id,
       name,
       targetFolder,
       prunePolicy,
-      defaultUsername,
+      authProfileId,
+      // REVIEW FINDING (P2) — the profile's username, not the posted one; see
+      // fallbackUsernameForSource for the invariant and why the form's mirror
+      // cannot be trusted to have landed before Save.
+      defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds,
       providerFingerprint: computeProviderFingerprint(provider)
@@ -584,6 +1028,10 @@ async function persistNewInventorySource(
 export interface UpdatedInventorySourceInput {
   name: string;
   targetFolder: string;
+  /** `undefined` clears an existing link — the field is always written, never merged. */
+  authProfileId?: string;
+  /** As `NewInventorySourceInput` — see `inventoryAuthProfileRejection`. */
+  renderedAuthProfile: RenderedSourceAuthProfile | undefined;
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
   provider: InventoryProvider;
@@ -610,7 +1058,7 @@ async function persistUpdatedInventorySource(
   source: InventorySourceConfig,
   input: UpdatedInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, defaultUsername, prunePolicy, provider, config, reenteredSecrets } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, reenteredSecrets } = input;
   const existingSecretFieldIds = new Set(source.secretFieldIds);
 
   return configMutationLock.runExclusive(async (): Promise<InventorySourceConfig> => {
@@ -660,20 +1108,6 @@ async function persistUpdatedInventorySource(
       .filter((f) => f.type === "password" && (reenteredSecrets[f.id] !== undefined || existingSecretFieldIds.has(f.id)))
       .map((f) => f.id);
 
-    // ITEM A — restamp on every save: the user has the form open against
-    // `provider` (whichever registrant currently answers `source.providerId`)
-    // and is knowingly interacting with it, exactly like at creation time.
-    const updated: InventorySourceConfig = {
-      ...source,
-      name,
-      targetFolder,
-      prunePolicy,
-      defaultUsername,
-      config,
-      secretFieldIds: newSecretFieldIds,
-      providerFingerprint: computeProviderFingerprint(provider)
-    };
-
     // ITEM 4 — re-read the record immediately before persisting. configCommands
     // flows (importMergeReplace, completeReset) mutate inventory sources
     // directly and bypass inFlightSourceIds entirely, so an import/reset can
@@ -691,6 +1125,55 @@ async function persistUpdatedInventorySource(
       await rollbackThisRunsVaultWrites();
       throw new Error("Inventory source changed while editing — reopen Edit Source.");
     }
+
+    // REVIEW FINDING (P2) — the same live re-resolve the create path does; see
+    // MISSING_AUTH_PROFILE_MESSAGE for the rationale and
+    // persistNewInventorySource for the TOCTOU reasoning (identical here: no
+    // `await` separates this check from the persist below).
+    //
+    // Deliberately AFTER the ITEM 4 guard, not folded into it. The two catch
+    // different things and ITEM 4's answer ("reopen Edit Source") is the more
+    // fundamental one when both apply: removeAuthProfile re-revisions ONLY the
+    // sources that already reference the deleted profile, so a source that was
+    // already linked trips ITEM 4 and is told to reopen, while a source being
+    // switched ONTO that profile keeps its revision, sails through ITEM 4
+    // untouched, and is caught here. The same split covers the third check: a
+    // profile EDIT revises no source at all, so ITEM 4 sees nothing whatsoever
+    // when the username under this open form moves.
+    const linkedProfile = authProfileId !== undefined ? core.getAuthProfile(authProfileId) : undefined;
+    const authProfileRejection = inventoryAuthProfileRejection(authProfileId, renderedAuthProfile, linkedProfile);
+    if (authProfileRejection !== undefined) {
+      await rollbackThisRunsVaultWrites();
+      throw new Error(authProfileRejection);
+    }
+
+    // ITEM A — restamp on every save: the user has the form open against
+    // `provider` (whichever registrant currently answers `source.providerId`)
+    // and is knowingly interacting with it, exactly like at creation time.
+    //
+    // Built HERE, below both guards rather than above them, because
+    // `defaultUsername` is derived from the profile the re-resolve above
+    // produced. Nothing between the two guards reads `updated`, and building an
+    // object literal is synchronous, so neither guard's reasoning changes —
+    // ITEM 4 still runs first, and still no `await` separates the auth-profile
+    // resolve from the persist below.
+    const updated: InventorySourceConfig = {
+      ...source,
+      name,
+      targetFolder,
+      prunePolicy,
+      // Assigned unconditionally (never spread-guarded): `undefined` is the
+      // form's `(None)` answer and MUST overwrite a previously linked id,
+      // which a conditional spread over `...source` would silently preserve.
+      authProfileId,
+      // REVIEW FINDING (P2) — the profile's username, not the posted one; see
+      // fallbackUsernameForSource for the invariant and why the form's mirror
+      // cannot be trusted to have landed before Save.
+      defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
+      config,
+      secretFieldIds: newSecretFieldIds,
+      providerFingerprint: computeProviderFingerprint(provider)
+    };
 
     // FINDING 1 — persist BEFORE any vault cleanup. If persistence rejects,
     // the pre-existing secretFieldIds keys must be left untouched (they're
@@ -743,8 +1226,48 @@ function countJumpHostDependents(allServers: ServerConfig[], removedIds: Readonl
   return allServers.filter((s) => !removedIds.has(s.id) && s.proxy?.type === "ssh" && removedIds.has(s.proxy.jumpHostId)).length;
 }
 
-/** m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync plan for the confirm modal's `detail`. */
-function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[]): string {
+/**
+ * The updates whose auth profile actually changes — the retro-apply and
+ * retro-UNAPPLY subsets of `plan.updates` together. Both directions are
+ * credential mutations on existing servers, so both are disclosed and both are
+ * covered by the drift comparison; the two renderings below split them, because
+ * "gains a profile" and "loses one" are not the same news.
+ */
+function authProfileSwitches(plan: InventorySyncPlan): Array<{ before: ServerConfig; after: ServerConfig }> {
+  return plan.updates.filter((u) => u.before.authProfileId !== u.after.authProfileId);
+}
+
+/** The switches that ADOPT a profile — computeSyncPlan's AUTH 2 retro-apply. */
+function authProfileAdoptions(plan: InventorySyncPlan): Array<{ before: ServerConfig; after: ServerConfig }> {
+  return authProfileSwitches(plan).filter((u) => u.after.authProfileId !== undefined);
+}
+
+/**
+ * REVIEW FINDING (P1) — the switches that REMOVE the source's profile:
+ * computeSyncPlan's AUTH 2b, which undoes a link the source applied once the
+ * profile can no longer honour it (a key profile that lost its key file). Split
+ * out from the adoptions above because rendering it as "will switch to auth
+ * profile X" would tell the user the exact opposite of what the plan does.
+ */
+function authProfileClears(plan: InventorySyncPlan): Array<{ before: ServerConfig; after: ServerConfig }> {
+  return authProfileSwitches(plan).filter((u) => u.after.authProfileId === undefined);
+}
+
+/**
+ * m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync
+ * plan for the confirm modal's `detail`.
+ *
+ * `authProfileName` is the name of the profile the plan was computed against —
+ * the caller's `resolveSourceAuthProfile` result for the SAME source snapshot
+ * that produced `plan` (see syncNow's pairing rule). It is a render-time
+ * argument rather than something derived from the plan because the plan carries
+ * only ids and this file's modal copy is names-never-UUIDs (m3).
+ *
+ * Exported for direct unit testing: the nameless-switch branch below is
+ * unreachable through syncNow (every call site pairs plan and resolution), and
+ * a guard that cannot be exercised is a guard nobody can prove still works.
+ */
+export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[], authProfileName?: string): string {
   const lines: string[] = [];
   if (plan.adds.length > 0) {
     const n = plan.adds.length;
@@ -761,6 +1284,51 @@ function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[])
   if (plan.updates.length > 0) {
     const n = plan.updates.length;
     lines.push(`${n} server${n === 1 ? "" : "s"} will be updated.`);
+  }
+  // The retro-apply consent line (UX §4). Derived from the plan's own
+  // before/after pairs rather than a dedicated plan field, so it can never
+  // disagree with what `updates` will actually write. It annotates a SUBSET of
+  // the "will be updated" line it sits directly under — the same
+  // subset-annotation placement manualDuplicateCount uses after adds — because
+  // every auth switch is also counted there.
+  //
+  // A switch with no name is unreachable by construction: an update can only
+  // change authProfileId when computeSyncPlan resolved the source's profile,
+  // and every call site passes the resolution produced for the very same source
+  // snapshot as the plan (see resolveSourceAuthProfile's pairing rule in
+  // syncNow). It still renders, namelessly, because the alternative fails
+  // SILENTLY: a future caller that breaks the pairing CONSISTENTLY — no name to
+  // the modal render and none to either drift render — produces matching texts
+  // with no switch line anywhere, so planDetailDrift sees no drift and the
+  // stamps apply with zero disclosure. (Drift only catches the INCONSISTENT
+  // case, where one render has the name and another doesn't.) A line naming no
+  // profile is less useful than one that does, but it is still consent: the
+  // user is told how many servers change auth, and can cancel.
+  const authProfileSwitchCount = authProfileAdoptions(plan).length;
+  if (authProfileSwitchCount > 0) {
+    const n = authProfileSwitchCount;
+    lines.push(
+      authProfileName !== undefined
+        ? `${n} server${n === 1 ? "" : "s"} will switch to auth profile "${authProfileName}".`
+        : `${n} server${n === 1 ? "" : "s"} will switch to a different auth profile.`
+    );
+  }
+  // REVIEW FINDING (P1) — the other direction, on its own line and in the same
+  // place: unlinking a server the source had linked is a credential change to an
+  // existing record, so it is disclosed exactly like the adoption it reverses,
+  // never folded into it. Wording matches the auth-profile delete confirmation
+  // ("will revert to their own stored credentials") — the same event from the
+  // server's point of view, and the reason the line does not promise SSH agent
+  // authentication specifically: what a server falls back to is whatever its own
+  // record holds.
+  const authProfileClearCount = authProfileClears(plan).length;
+  if (authProfileClearCount > 0) {
+    const n = authProfileClearCount;
+    lines.push(
+      authProfileName !== undefined
+        ? `${n} server${n === 1 ? "" : "s"} will stop using auth profile "${authProfileName}" and revert to their own stored credentials.`
+        : `${n} server${n === 1 ? "" : "s"} will stop using their auth profile and revert to their own stored credentials.`
+    );
   }
   const orphaned = plan.prunes.filter((p) => p.policy === "orphan").length;
   const deleted = plan.prunes.filter((p) => p.policy === "delete").length;
@@ -822,9 +1390,96 @@ function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[])
   return lines.join("\n");
 }
 
+/**
+ * The buffer behind the confirm modal's `Show Warnings` button: the plan's own
+ * warnings, plus — whenever the retro-apply rule would move servers onto the
+ * source's auth profile — one line NAMING them. The modal's own detail keeps
+ * the aggregate ("5 servers will switch to auth profile X."); this is where a
+ * fleet-wide switch becomes inspectable instead of merely countable, one click
+ * before Apply.
+ *
+ * EVERY switching server is listed, one per line under a counted heading — not
+ * the count-plus-three-examples of syncEngine.ts's pushSkipSummary. That idiom
+ * fits what it was written for: skipped devices are an aggregate the user acts
+ * on as a group, and the examples exist only to hint at the category. This list
+ * is the opposite — it is the audit of a credential change about to be applied
+ * to named, individually-owned records, and "e.g." is worthless to someone
+ * checking whether one particular server is in the set. The buffer opens as a
+ * scrollable text document (openInventoryIssuesText), so length costs nothing,
+ * and inspectability before Apply is the entire reason the names are here.
+ * Names come from `before`, i.e. what the servers are called in the tree right
+ * now, not what this same sync might rename them to.
+ *
+ * Deliberately NOT pushed into `plan.warnings` by the engine: that array is
+ * also surfaced after a successful apply ("N warnings during sync") and in the
+ * nothing-to-change toast, and a switch the user just consented to is not an
+ * issue to report back to them.
+ */
+function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: string): string[] {
+  const buffer = [...plan.warnings];
+  const switches = authProfileAdoptions(plan);
+  if (switches.length > 0) {
+    const n = switches.length;
+    const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "a different auth profile";
+    // Heading keeps the count (the modal's own line is an aggregate too, and the
+    // two must agree at a glance); the colon marks the lines below as belonging
+    // to it, and the indent keeps them from reading as sibling warnings when the
+    // plan also carries engine warnings above.
+    buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
+    for (const u of switches) {
+      buffer.push(`  "${u.before.name}"`);
+    }
+  }
+  // REVIEW FINDING (P1) — the unlink list, in the same shape and for the same
+  // reason: every affected server named, so "is MY server in this set" is
+  // answerable one click before Apply. Its own heading rather than a shared one,
+  // because a plan can in principle carry both (the engine's two rules are
+  // mutually exclusive per sync today, but the render must not depend on that to
+  // stay truthful).
+  const clears = authProfileClears(plan);
+  if (clears.length > 0) {
+    const n = clears.length;
+    const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "their auth profile";
+    buffer.push(`${n} server${n === 1 ? "" : "s"} will stop using ${target} and revert to their own stored credentials:`);
+    for (const u of clears) {
+      buffer.push(`  "${u.before.name}"`);
+    }
+  }
+  return buffer;
+}
+
 /** The set of server ids the plan would actually delete (prune policy "delete"). */
 function deletePruneIds(plan: InventorySyncPlan): Set<string> {
   return new Set(plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id));
+}
+
+/**
+ * REVIEW FINDING (P2) — the set of server ids the plan would move onto a
+ * different auth profile, the identity behind `authProfileSwitches`' count.
+ * Read off `before.id` for the same reason `planWarningsBuffer` names
+ * `before.name`: it is the record as it exists right now, which is what the
+ * user is being asked to consent to.
+ *
+ * Deliberately the UNION of both directions (`authProfileSwitches`, not just the
+ * adoptions): an unlink is a credential change to a named, disclosed server too,
+ * so a mid-modal swap of WHICH server gets unlinked has to drift exactly as an
+ * adoption swap does.
+ */
+function authProfileSwitchIds(plan: InventorySyncPlan): Set<string> {
+  return new Set(authProfileSwitches(plan).map((u) => u.before.id));
+}
+
+/** Set equality over server ids — the shape both id-set drift comparisons below use. */
+function serverIdSetsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) {
+    return false;
+  }
+  for (const id of a) {
+    if (!b.has(id)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // FINDING 1 (P2, jump-host-dependents-drift review) — describePlanDetail IS
@@ -855,25 +1510,71 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
 // from the old comparator is dropped as redundant now that the rendered
 // string covers it; this is the one aggregate that isn't fully captured by
 // the text and so earns its own dedicated check for teardown-safety.
+//
+// REVIEW FINDING (P2) — the AUTH-SWITCH server-id set is compared the same
+// way and for the same reason. describePlanDetail renders only a COUNT of
+// switches ("5 servers will switch to auth profile X."), so a mid-modal
+// change that makes one server ineligible for retro-apply and another
+// eligible produces byte-identical text with an identical delete set: no
+// drift, and the fresh plan then stamps the profile onto a server that was
+// never disclosed. It is disclosed BY NAME — `planWarningsBuffer` lists every
+// switching server behind Show Warnings precisely so a fleet-wide credential
+// change is inspectable one click before Apply — so the consent the modal
+// collected is consent for THOSE servers, and an identity swap invalidates it
+// exactly as a delete-set swap invalidates the teardown. Same shape as
+// deleteIds (a captured set compared for equality) rather than a parallel
+// mechanism, so there is one discipline here, not two.
+//
+// `nextAuthProfileName` follows the same rule as `nextServers`: it is the
+// resolution taken FRESH alongside `nextPlan`, not the one the shown modal
+// rendered with. That is what makes a mid-modal profile rename (same plan,
+// different name → different text) and a mid-modal profile delete (no
+// resolution → no switch line, plus a dangling-profile warning) both surface
+// as ordinary drift, with no dedicated comparison of their own.
 function planDetailDrift(
-  previous: { detail: string; deleteIds: ReadonlySet<string> },
+  previous: { detail: string; deleteIds: ReadonlySet<string>; authSwitchIds: ReadonlySet<string> },
   nextPlan: InventorySyncPlan,
-  nextServers: ServerConfig[]
+  nextServers: ServerConfig[],
+  nextAuthProfileName: string | undefined
 ): { drift: boolean; detail: string } {
-  const nextDetail = describePlanDetail(nextPlan, nextServers);
+  const nextDetail = describePlanDetail(nextPlan, nextServers, nextAuthProfileName);
   if (nextDetail !== previous.detail) {
     return { drift: true, detail: nextDetail };
   }
-  const nextDeleteIds = deletePruneIds(nextPlan);
-  if (nextDeleteIds.size !== previous.deleteIds.size) {
+  if (!serverIdSetsEqual(previous.deleteIds, deletePruneIds(nextPlan))) {
     return { drift: true, detail: nextDetail };
   }
-  for (const id of previous.deleteIds) {
-    if (!nextDeleteIds.has(id)) {
-      return { drift: true, detail: nextDetail };
-    }
+  if (!serverIdSetsEqual(previous.authSwitchIds, authProfileSwitchIds(nextPlan))) {
+    return { drift: true, detail: nextDetail };
   }
   return { drift: false, detail: nextDetail };
+}
+
+/**
+ * computeSyncPlan is pure and has no core access, so the source's auth profile
+ * is resolved here and handed in — exactly like `now`. Returns `undefined` when
+ * the source has no profile AND when its id no longer names one (a profile
+ * deleted by a build that predates removeAuthProfile's source-ref clearing, or
+ * deleted in the window this sync is running in); the engine turns that second
+ * case into its dangling-profile warning. The WHOLE profile is handed over, not
+ * a `{ id, name }` pair: the engine decides for itself whether the profile is
+ * usable by the servers it is about to stamp (AUTH 1b, syncEngine.ts) rather
+ * than trusting a caller to have asked that question first.
+ *
+ * THE PAIRING RULE (extends the FINDING 1 captured-vs-fresh discipline to the
+ * profile): every computeSyncPlan call site calls this immediately before the
+ * call, against the SAME source snapshot it passes as `source`, and the
+ * resulting (plan, resolution) pair travels together to whichever
+ * describePlanDetail / planDetailDrift render belongs to that plan. Resolving
+ * once at sync start and reusing the name for the drift render would compare a
+ * fresh plan against a stale name, so a profile renamed while the confirm modal
+ * is open would be applied under the name the user did NOT consent to.
+ */
+function resolveSourceAuthProfile(core: NexusCore, source: InventorySourceConfig): AuthProfile | undefined {
+  if (source.authProfileId === undefined) {
+    return undefined;
+  }
+  return core.getAuthProfile(source.authProfileId);
 }
 
 export function registerInventoryCommands(
@@ -886,7 +1587,12 @@ export function registerInventoryCommands(
   // run; editSource/removeSource hold it for their whole run too (they mutate
   // servers/secrets); every command refuses to start work on a source another
   // command already marked busy.
-  const inFlightSourceIds = new Set<string>();
+  //
+  // Keyed by source id, valued by WHY it is claimed (see SourceBusyReason):
+  // the three claimants are not interchangeable to the user, so the refusal
+  // each command renders is driven by the holder's reason rather than by the
+  // one-size-fits-all "is currently syncing" this used to be.
+  const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
   /**
    * Shared Test-button handler for both the Add and Edit forms. Never throws
@@ -961,13 +1667,35 @@ export function registerInventoryCommands(
     // (vault-first, delete-on-persist-failure) still runs to completion
     // exactly as if the panel were still open — the panel's lifecycle plays
     // no part in that sequencing. No closure-local tracking is needed here.
-    const definition = inventorySourceFormDefinition(provider, undefined, mostCommonUsername(core.getSnapshot().servers));
-    WebviewFormPanel.open(`inventory-source-add-${provider.id}`, definition, {
+    const snapshot = core.getSnapshot();
+    const definition = inventorySourceFormDefinition(
+      provider,
+      undefined,
+      mostCommonUsername(snapshot.servers),
+      snapshot.authProfiles
+    );
+    // Same controller/handler triple the server edit form uses
+    // (serverCommands.ts) — the only difference is onAutofill's payload: this
+    // form mirrors the profile's username into `defaultUsername`, not into
+    // `username`/`authType`/`keyPath` (fields it doesn't have).
+    const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
+    // REVIEW FINDING (P2) — the profile whose username this form is currently
+    // showing, checked against live state at Save by
+    // `inventoryAuthProfileRejection`. Seeded as `undefined` and NOT from any
+    // record: an Add form opens on `(None)` with the user's own default
+    // username in the field, so every username it ever displays FOR A PROFILE
+    // arrives through an `onAutofill` answer below — a selection, or
+    // `addSelectOption` after an inline create, both post one — and that is
+    // what "rendered" means on this path.
+    let renderedAuthProfile: RenderedSourceAuthProfile | undefined = undefined;
+    const panel = WebviewFormPanel.open(`inventory-source-add-${provider.id}`, definition, {
       onSubmit: async (values) => {
         const parsed = await parseSourceFormValues(values, provider);
         const created = await persistNewInventorySource(core, vault, {
           name: parsed.name,
           targetFolder: parsed.targetFolder,
+          authProfileId: parsed.authProfileId,
+          renderedAuthProfile,
           defaultUsername: parsed.defaultUsername,
           prunePolicy: parsed.prunePolicy,
           provider,
@@ -990,27 +1718,45 @@ export function registerInventoryCommands(
           }
         })();
       },
-      onTest: (values) => handleFormTest(values, provider, provider.label)
+      onTest: (values) => handleFormTest(values, provider, provider.label),
+      onCreateInline: inlineAuthProfile.handleCreateInline,
+      onAutofill: async (_key, value) => {
+        // ONE lookup feeds both: what the form is about to show, and what Save
+        // checks that against.
+        const profile = core.getAuthProfile(value);
+        renderedAuthProfile = renderedSourceAuthProfile(profile);
+        return authProfileUsernameMirror(profile);
+      }
     });
+    inlineAuthProfile.attachPanel(panel);
   }
 
-  async function editSource(): Promise<void> {
-    const source = await pickInventorySource(core, registry);
-    if (!source) return;
-    if (inFlightSourceIds.has(source.id)) {
-      void vscode.window.showWarningMessage(`"${source.name}" is currently syncing — try again once the sync finishes.`);
+  // `sourceIdArg` mirrors syncNow's: the manage hub (and any future caller
+  // that already knows which source the user picked) passes the id so the
+  // picker is not shown a second time. Everything below — the busy claim, the
+  // provider-fingerprint gate, the form lifecycle — is downstream of source
+  // selection and is unchanged by this.
+  async function editSource(sourceIdArg?: string): Promise<void> {
+    const source = sourceIdArg ? core.getInventorySource(sourceIdArg) : await pickInventorySource(core, registry);
+    if (!source) {
+      if (sourceIdArg) void vscode.window.showErrorMessage("That inventory source no longer exists.");
+      return;
+    }
+    const editBusyReason = inFlightSourceIds.get(source.id);
+    if (editBusyReason !== undefined) {
+      void vscode.window.showWarningMessage(sourceBusyMessage(source.name, editBusyReason, "edit"));
       return;
     }
 
     // REVIEW FINDING 2 (P2) — claimed HERE, synchronously adjacent to the
-    // has()-check above (no await in between — mirrors syncNow's own
+    // busy-check above (no await in between — mirrors syncNow's own
     // "Marked busy synchronously right after the last check above" comment),
     // NOT after the fingerprint-mismatch modal below. The fingerprint check
     // awaits on a user decision that can sit open for an arbitrary amount of
     // time; claiming the marker only after it returns leaves a window where
     // this source has already passed ITS OWN not-busy check but is not yet
     // recorded as busy, and a concurrent Sync Now (or another Edit) sails
-    // through the SAME has()-check and claims the id too. Both then run
+    // through the SAME busy-check and claims the id too. Both then run
     // against the same source concurrently, and whichever's dispose/finally
     // fires first deletes the shared Set entry out from under the other,
     // which is then free to race a THIRD command in.
@@ -1026,7 +1772,12 @@ export function registerInventoryCommands(
     // Every OTHER exit from here on (provider-missing abort, fingerprint
     // Cancel, open() throw) must also release it — see releaseInFlight below,
     // called at each of those points as well as from onDidDispose.
-    inFlightSourceIds.add(source.id);
+    //
+    // Claimed as "edit", not merely claimed: for the whole time that form
+    // stays open, every other command's refusal must name the open tab (which
+    // the user can close) instead of an in-flight sync (which the user can
+    // only wait out, and which is not happening).
+    inFlightSourceIds.set(source.id, "edit");
     let releasedInFlight = false;
 
     // BUG FIX (post-#52 review) — onDidDispose used to release the marker
@@ -1038,7 +1789,7 @@ export function registerInventoryCommands(
     // (and firing every onDidDispose listener, including this one)
     // WHILE that first submit is still awaiting vault/repository I/O. That
     // left a window where the busy marker was gone — so a concurrent Sync
-    // Now would sail past the has()-check above and read/send credentials
+    // Now would sail past the busy-check above and read/send credentials
     // against a source that persistUpdatedInventorySource had already
     // partially mutated (vault overwritten, config record not yet
     // persisted; see its FINDING 1/FINDING C comments for that exact
@@ -1103,7 +1854,29 @@ export function registerInventoryCommands(
     }
 
     const existingSecretFieldIds = new Set(source.secretFieldIds);
-    const definition = inventorySourceFormDefinition(provider, source);
+    // LIVE profiles, read here rather than reused from anything captured
+    // earlier: the list both populates the select and decides whether the
+    // seeded `source.authProfileId` survives sanitization, so a stale list
+    // would render a real link as `(None)` and quietly drop it on Save.
+    const authProfiles = core.getSnapshot().authProfiles;
+    const definition = inventorySourceFormDefinition(provider, source, undefined, authProfiles);
+    // REVIEW FINDING (P2) — as addSource's, but seeded: this form opens already
+    // showing the LINKED profile's username in Default SSH Username, locked
+    // (`inventorySourceFormDefinition`'s render rule), so on Edit "rendered"
+    // starts as that render and is re-stamped by every later `onAutofill`
+    // answer. Read from the SAME list the definition above was built from — a
+    // second lookup could describe a profile this form never rendered. An id
+    // that resolves to nothing in that list stamps `undefined`, matching the
+    // definition's own sanitization of such a seed down to `(None)`.
+    let renderedAuthProfile: RenderedSourceAuthProfile | undefined =
+      source.authProfileId !== undefined
+        ? renderedSourceAuthProfile(authProfiles.find((profile) => profile.id === source.authProfileId))
+        : undefined;
+    // Holding editSource's busy marker across inline profile creation is
+    // correct and deliberate: creating a profile never touches the source
+    // record, so nothing this controller does can race the edit it is nested
+    // in. The marker machinery below is untouched by this wiring.
+    const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
     let panel: ReturnType<typeof WebviewFormPanel.open>;
     try {
       // F6 — WebviewFormPanel.open can throw synchronously (or reject — see
@@ -1112,8 +1885,9 @@ export function registerInventoryCommands(
       // editSource with the busy flag already set above, and nothing is ever
       // left to call releaseInFlight. That strands the source busy forever —
       // every later editSource/syncNow/removeSource for this exact id would
-      // then be refused with "currently syncing" until the extension host
-      // restarts.
+      // then be refused as still open in Edit Source (a tab that does not
+      // exist, so closing it can never free the source) until the extension
+      // host restarts.
       panel = WebviewFormPanel.open(`inventory-source-edit-${source.id}`, definition, {
         // Deliberately NOT an `async` arrow function: an async function's
         // body only starts executing when it's CALLED, but the promise it
@@ -1131,6 +1905,8 @@ export function registerInventoryCommands(
             const updated = await persistUpdatedInventorySource(core, vault, source, {
               name: parsed.name,
               targetFolder: parsed.targetFolder,
+              authProfileId: parsed.authProfileId,
+              renderedAuthProfile,
               defaultUsername: parsed.defaultUsername,
               prunePolicy: parsed.prunePolicy,
               provider,
@@ -1139,7 +1915,39 @@ export function registerInventoryCommands(
             });
 
             const folderNote = updated.targetFolder !== source.targetFolder ? " Servers move to the new folder on the next sync." : "";
-            void vscode.window.showInformationMessage(`Inventory source "${updated.name}" updated.${folderNote}`);
+            // Only a SET-or-SWITCHED profile earns the suffix and the button.
+            // Clearing to `(None)` deliberately does not: the retro-apply rule
+            // never strips a profile from a server that already has one, so
+            // the next sync would change nothing and the sentence — plus the
+            // Sync Now button under it — would be advertising a no-op.
+            //
+            // The wording is "servers still on the sync default", not "synced
+            // servers", because the rule only adopts servers still carrying
+            // exactly what the sync gave them. On a first-set that is every
+            // untouched synced server; on an A -> B switch it is only the
+            // stragglers the earlier syncs never reached — and promising THOSE
+            // servers a switch would be contradicted by the very next sync's
+            // "nothing to change (N unchanged)". One sentence, true in both.
+            const authNote =
+              updated.authProfileId !== source.authProfileId && updated.authProfileId !== undefined
+                ? " Servers still on the sync default switch to it on the next sync."
+                : "";
+            if (authNote) {
+              // Same detached-toast idiom as addSource's (F1 above): awaiting
+              // a thenable VS Code may auto-hide without resolving would leave
+              // onSubmit pending forever and swallow every later Save.
+              void (async (): Promise<void> => {
+                const choice = await vscode.window.showInformationMessage(
+                  `Inventory source "${updated.name}" updated.${folderNote}${authNote}`,
+                  "Sync Now"
+                );
+                if (choice === "Sync Now") {
+                  await vscode.commands.executeCommand("nexus.inventory.syncNow", updated.id);
+                }
+              })();
+            } else {
+              void vscode.window.showInformationMessage(`Inventory source "${updated.name}" updated.${folderNote}`);
+            }
           })();
           currentSubmit = submitPromise;
           // This `.finally()`/`.catch()` pair is a SECOND, closure-local
@@ -1161,24 +1969,40 @@ export function registerInventoryCommands(
             });
           return submitPromise;
         },
-        onTest: (values) => handleFormTest(values, provider, source.name, source)
+        onTest: (values) => handleFormTest(values, provider, source.name, source),
+        onCreateInline: inlineAuthProfile.handleCreateInline,
+        onAutofill: async (_key, value) => {
+          // ONE lookup feeds both — see addSource's copy.
+          const profile = core.getAuthProfile(value);
+          renderedAuthProfile = renderedSourceAuthProfile(profile);
+          return authProfileUsernameMirror(profile);
+        }
       });
     } catch (error) {
       releaseInFlight();
       throw error;
     }
     panel.onDidDispose(releaseInFlight);
+    inlineAuthProfile.attachPanel(panel);
   }
 
-  async function removeSource(): Promise<void> {
-    const source = await pickInventorySource(core, registry);
-    if (!source) return;
-    if (inFlightSourceIds.has(source.id)) {
-      void vscode.window.showWarningMessage(`"${source.name}" is currently syncing — try again once the sync finishes.`);
+  /** `sourceIdArg` as in editSource/syncNow — see editSource's note. */
+  async function removeSource(sourceIdArg?: string): Promise<void> {
+    const source = sourceIdArg ? core.getInventorySource(sourceIdArg) : await pickInventorySource(core, registry);
+    if (!source) {
+      if (sourceIdArg) void vscode.window.showErrorMessage("That inventory source no longer exists.");
+      return;
+    }
+    const removeBusyReason = inFlightSourceIds.get(source.id);
+    if (removeBusyReason !== undefined) {
+      void vscode.window.showWarningMessage(sourceBusyMessage(source.name, removeBusyReason, "remove"));
       return;
     }
 
-    inFlightSourceIds.add(source.id);
+    // Claimed as "remove" — the confirm modal below, and the mutation after
+    // it, are neither a sync nor an open form, and reporting this window as
+    // either would be the same lie in a third command.
+    inFlightSourceIds.set(source.id, "remove");
     try {
       const snapshot = core.getSnapshot();
       const owned = snapshot.servers.filter((s) => s.origin?.sourceId === source.id);
@@ -1548,8 +2372,9 @@ export function registerInventoryCommands(
       if (sourceIdArg) void vscode.window.showErrorMessage("That inventory source no longer exists.");
       return;
     }
-    if (inFlightSourceIds.has(source.id)) {
-      void vscode.window.showWarningMessage(`"${source.name}" is already syncing.`);
+    const syncBusyReason = inFlightSourceIds.get(source.id);
+    if (syncBusyReason !== undefined) {
+      void vscode.window.showWarningMessage(sourceBusyMessage(source.name, syncBusyReason, "sync"));
       return;
     }
     const provider = registry.get(source.providerId);
@@ -1560,7 +2385,8 @@ export function registerInventoryCommands(
 
     // Marked busy synchronously right after the last check above (no await in
     // between) so a second invocation arriving on the next microtask sees it.
-    inFlightSourceIds.add(source.id);
+    // This is the one claimant for which "syncing" is the honest word.
+    inFlightSourceIds.set(source.id, "sync");
     try {
       // ITEM A (provider trust fingerprint) / F3 — strictly BEFORE any vault
       // read for this source (the required-secret presence loop right below
@@ -1640,7 +2466,12 @@ export function registerInventoryCommands(
         return;
       }
 
-      let plan = computeSyncPlan({ source, tree, currentServers: core.getSnapshot().servers, now: Date.now() });
+      // PAIRING RULE (see resolveSourceAuthProfile) — resolved immediately
+      // before the call it feeds, against `source`, and reassigned in lockstep
+      // with `plan` at every point below where `plan` itself is reassigned
+      // (the fast-path fall-through and the retry loop).
+      let planAuthProfile = resolveSourceAuthProfile(core, source);
+      let plan = computeSyncPlan({ source, tree, currentServers: core.getSnapshot().servers, now: Date.now(), authProfile: planAuthProfile });
 
       // Nothing to do: apply an empty application to bump lastSyncAt without a confirm modal.
       if (plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0) {
@@ -1666,7 +2497,7 @@ export function registerInventoryCommands(
         // friendly error instead of an unhandled command rejection.
         type FastPathResult =
           | { kind: "done"; plan: InventorySyncPlan; removedEmptyFolderCount: number; source: InventorySourceConfig }
-          | { kind: "not-empty"; plan: InventorySyncPlan }
+          | { kind: "not-empty"; plan: InventorySyncPlan; authProfile: AuthProfile | undefined }
           | { kind: "abort" };
         const fastPathResult: FastPathResult = await configMutationLock.runExclusive(async (): Promise<FastPathResult> => {
           const freshSource = core.getInventorySource(source.id);
@@ -1680,9 +2511,16 @@ export function registerInventoryCommands(
             );
             return { kind: "abort" };
           }
-          const recomputed = computeSyncPlan({ source: freshSource, tree, currentServers: core.getSnapshot().servers, now: Date.now() });
+          const freshAuthProfile = resolveSourceAuthProfile(core, freshSource);
+          const recomputed = computeSyncPlan({
+            source: freshSource,
+            tree,
+            currentServers: core.getSnapshot().servers,
+            now: Date.now(),
+            authProfile: freshAuthProfile
+          });
           if (recomputed.adds.length > 0 || recomputed.updates.length > 0 || recomputed.prunes.length > 0) {
-            return { kind: "not-empty", plan: recomputed };
+            return { kind: "not-empty", plan: recomputed, authProfile: freshAuthProfile };
           }
           try {
             const applyResult = await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
@@ -1731,6 +2569,7 @@ export function registerInventoryCommands(
         // "not-empty" — lock already released above; fall through into the
         // normal confirmation flow below with the freshly recomputed plan.
         plan = fastPathResult.plan;
+        planAuthProfile = fastPathResult.authProfile;
       }
 
       // FINDING 1 — the post-teardown final recompute (below) can turn up a
@@ -1751,7 +2590,7 @@ export function registerInventoryCommands(
       // updated plan, "success" means applyInventorySyncPlan committed.
       type SyncAttempt =
         | { kind: "abort" }
-        | { kind: "retry"; plan: InventorySyncPlan }
+        | { kind: "retry"; plan: InventorySyncPlan; authProfile: AuthProfile | undefined }
         | {
             kind: "success";
             finalPlan: InventorySyncPlan;
@@ -1770,16 +2609,26 @@ export function registerInventoryCommands(
         // plan and the same server snapshot describePlanDetail was called
         // with here, not a re-derived approximation of either.
         const shownServers = core.getSnapshot().servers;
-        const shownDetail = describePlanDetail(plan, shownServers);
+        const shownDetail = describePlanDetail(plan, shownServers, planAuthProfile?.name);
         const shownDeleteIds = deletePruneIds(plan);
-        const buttons = plan.warnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
+        // Captured alongside the delete set, from the SAME plan this modal
+        // renders — these are the servers `shownWarnings` is about to name.
+        const shownAuthSwitchIds = authProfileSwitchIds(plan);
+        // The button is keyed on the BUFFER, not on plan.warnings: a retro-apply
+        // sync usually carries no engine warnings at all, and without this the
+        // one place that names the servers about to switch would be unreachable
+        // in exactly the case it exists for. Nothing here feeds the drift
+        // comparison — choosing Show Warnings ends the command (below), so the
+        // names are never a consent artifact something later applies against.
+        const shownWarnings = planWarningsBuffer(plan, planAuthProfile?.name);
+        const buttons = shownWarnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
         const choice = await vscode.window.showInformationMessage(
           `Apply inventory sync from "${source.name}"?`,
           { modal: true, detail: shownDetail },
           ...buttons
         );
         if (choice === "Show Warnings") {
-          await openInventoryIssuesText(plan.warnings);
+          await openInventoryIssuesText(shownWarnings);
           return;
         }
         if (choice !== "Apply") return;
@@ -1815,14 +2664,26 @@ export function registerInventoryCommands(
           }
 
           const freshServersForRecompute = core.getSnapshot().servers;
-          const recomputed = computeSyncPlan({ source: freshSource, tree, currentServers: freshServersForRecompute, now: Date.now() });
+          // Resolved FRESH here, inside the lock, against `freshSource` — never
+          // the `planAuthProfile` the modal rendered with. That is the whole
+          // point of the pairing rule: a profile renamed or deleted while the
+          // modal was open changes this render and drifts.
+          const freshAuthProfile = resolveSourceAuthProfile(core, freshSource);
+          const recomputed = computeSyncPlan({
+            source: freshSource,
+            tree,
+            currentServers: freshServersForRecompute,
+            now: Date.now(),
+            authProfile: freshAuthProfile
+          });
           const recomputedDrift = planDetailDrift(
-            { detail: shownDetail, deleteIds: shownDeleteIds },
+            { detail: shownDetail, deleteIds: shownDeleteIds, authSwitchIds: shownAuthSwitchIds },
             recomputed,
-            freshServersForRecompute
+            freshServersForRecompute,
+            freshAuthProfile?.name
           );
           if (recomputedDrift.drift) {
-            return { kind: "retry", plan: recomputed };
+            return { kind: "retry", plan: recomputed, authProfile: freshAuthProfile };
           }
 
           const application = planToApplication(recomputed, freshSource);
@@ -1903,7 +2764,16 @@ export function registerInventoryCommands(
           // check inside applyInventorySyncPlan is what still catches the
           // source record itself being replaced during this window.
           const finalServersForRecompute = core.getSnapshot().servers;
-          const finalPlan = computeSyncPlan({ source: freshSource, tree, currentServers: finalServersForRecompute, now: Date.now() });
+          // Resolved fresh again — the teardown loop and the FINDING D vault
+          // re-read above are awaits a profile rename/delete can land inside.
+          const finalAuthProfile = resolveSourceAuthProfile(core, freshSource);
+          const finalPlan = computeSyncPlan({
+            source: freshSource,
+            tree,
+            currentServers: finalServersForRecompute,
+            now: Date.now(),
+            authProfile: finalAuthProfile
+          });
           const finalApplication = planToApplication(finalPlan, freshSource);
 
           // FINDING 1 — compare the post-teardown final recompute's rendered
@@ -1915,9 +2785,10 @@ export function registerInventoryCommands(
           // (applyInventorySyncPlan hasn't been called), so re-declining on
           // the next confirmation leaves state untouched.
           const finalDrift = planDetailDrift(
-            { detail: recomputedDrift.detail, deleteIds: deletePruneIds(recomputed) },
+            { detail: recomputedDrift.detail, deleteIds: deletePruneIds(recomputed), authSwitchIds: authProfileSwitchIds(recomputed) },
             finalPlan,
-            finalServersForRecompute
+            finalServersForRecompute,
+            finalAuthProfile?.name
           );
           if (finalDrift.drift) {
             finalRecomputeMismatchCount++;
@@ -1927,7 +2798,7 @@ export function registerInventoryCommands(
               );
               return { kind: "abort" };
             }
-            return { kind: "retry", plan: finalPlan };
+            return { kind: "retry", plan: finalPlan, authProfile: finalAuthProfile };
           }
 
           // FINDING E — even after the checks above, the source record could
@@ -2048,6 +2919,9 @@ export function registerInventoryCommands(
         if (attempt.kind === "abort") return;
         if (attempt.kind === "retry") {
           plan = attempt.plan;
+          // Reassigned in lockstep with `plan` — the re-shown modal must render
+          // the resolution the retried plan was actually computed against.
+          planAuthProfile = attempt.authProfile;
           continue;
         }
 
@@ -2102,10 +2976,78 @@ export function registerInventoryCommands(
     }
   }
 
+  /**
+   * nexus.inventory.manage — the Settings-tree hub (Settings ▸ Inventory
+   * Sources). Two-level plain showQuickPick that ROUTES into the four
+   * existing, race-guarded commands rather than reimplementing any of them:
+   * no new persistence, no new webview, no new critical section. Level 2
+   * dispatches through vscode.commands.executeCommand (never the local
+   * function) so hub, palette and keybinding invocations share one path — and
+   * always with the source id, so the target command never re-opens a picker
+   * the user has already answered.
+   *
+   * Deliberately NOT here: a "Reapply auth to synced servers" row. Retro-apply
+   * belongs to the sync plan preview and its confirm modal; a second bulk
+   * mutation path bypassing that preview is exactly the rejected option C.
+   */
+  async function manageSources(): Promise<void> {
+    const sources = core.getSnapshot().inventorySources;
+
+    interface SourceHubItem extends vscode.QuickPickItem {
+      source?: InventorySourceConfig;
+      addSource?: boolean;
+    }
+    const rows: SourceHubItem[] = sources.map((source) => ({
+      label: source.name,
+      description: sourceDescription(source, registry),
+      source
+    }));
+    if (rows.length > 0) {
+      rows.push({ label: "", kind: vscode.QuickPickItemKind.Separator });
+    }
+    rows.push({ label: "$(add) Add Inventory Source…", addSource: true });
+
+    const picked = await vscode.window.showQuickPick(rows, {
+      title: "Inventory Sources",
+      // Empty state stays INSIDE the picker: the user is already mid-gesture,
+      // so the add row is the affordance and pickInventorySource's M2d warning
+      // toast ("No inventory sources configured. Add one first.") would be a
+      // dead-end interruption here. That toast still serves the direct
+      // command paths.
+      placeHolder:
+        sources.length === 0
+          ? "No inventory sources yet — add one to sync servers from your infrastructure"
+          : "Choose a source to sync, edit, or remove"
+    });
+    if (!picked) return;
+    if (picked.addSource) {
+      await vscode.commands.executeCommand("nexus.inventory.addSource");
+      return;
+    }
+    const source = picked.source;
+    if (!source) return;
+
+    interface SourceActionItem extends vscode.QuickPickItem {
+      commandId: string;
+    }
+    const actions: SourceActionItem[] = [
+      { label: "$(sync) Sync Now", description: "Fetch devices and preview changes", commandId: "nexus.inventory.syncNow" },
+      { label: "$(edit) Edit…", description: "Change settings, credentials, or the auth profile", commandId: "nexus.inventory.editSource" },
+      { label: "$(trash) Remove…", description: "Choose what happens to its synced servers", commandId: "nexus.inventory.removeSource" }
+    ];
+    const action = await vscode.window.showQuickPick(actions, { title: source.name });
+    if (!action) return;
+    await vscode.commands.executeCommand(action.commandId, source.id);
+  }
+
   return [
     vscode.commands.registerCommand("nexus.inventory.addSource", addSource),
-    vscode.commands.registerCommand("nexus.inventory.editSource", editSource),
-    vscode.commands.registerCommand("nexus.inventory.removeSource", removeSource),
-    vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(typeof arg === "string" ? arg : undefined))
+    // Same arg widening as syncNow's below: a menu/tree invocation hands the
+    // handler its context object, which must fall through to the picker
+    // rather than being read as a source id.
+    vscode.commands.registerCommand("nexus.inventory.editSource", (arg?: unknown) => editSource(typeof arg === "string" ? arg : undefined)),
+    vscode.commands.registerCommand("nexus.inventory.removeSource", (arg?: unknown) => removeSource(typeof arg === "string" ? arg : undefined)),
+    vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(typeof arg === "string" ? arg : undefined)),
+    vscode.commands.registerCommand("nexus.inventory.manage", manageSources)
   ];
 }

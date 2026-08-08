@@ -171,6 +171,14 @@ export class SettingsTreeProvider
     items.push(
       new SettingsLinkItem("Auth Profiles", "nexus.authProfile.manage", "key", "Create and manage reusable credential templates")
     );
+    // Inventory sources had no home in this tree at all — editing one meant
+    // knowing the palette command "Nexus: Edit Inventory Source". The link
+    // opens the nexus.inventory.manage QuickPick hub, which routes into the
+    // four existing inventory commands (add / sync / edit / remove). It must
+    // NOT point at bare addSource: that would still leave edit unreachable.
+    items.push(
+      new SettingsLinkItem("Inventory Sources", "nexus.inventory.manage", "server-environment", "Add, edit, sync, and remove inventory sources")
+    );
 
     return items;
   }

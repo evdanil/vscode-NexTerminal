@@ -143,6 +143,49 @@ export interface InventorySourceConfig {
   // mirrors the already-documented behavior of leaving synced servers'
   // folders alone on source removal).
   managedFolders?: string[];
+  // The auth profile (AuthProfile.id) servers synced from this source connect
+  // with. Stamped by the LINK ONLY — the profile's username/authType/keyPath
+  // are never copied into the server record, so a profile edit reaches every
+  // server it owns without a re-sync (copies rot; a reference cannot).
+  //
+  // Applied at add time, and — on each sync — retroactively to owned servers
+  // still sitting on the never-configured default (authProfileId undefined &&
+  // ServerOrigin.syncedAuthProfileId undefined && authType "agent" && keyPath
+  // undefined && username still equal to the one the sync itself stamped,
+  // ServerOrigin.syncedUsername; exactly the shape the
+  // add path writes). Matching the add path's own output is what makes
+  // retro-apply safe: a hand-edit to the auth fields OR to the username takes
+  // the server out of the set, so a hand-configured server is never re-stamped
+  // (the username clause matters because no shipped provider supplies endpoint
+  // usernames, so a manual username edit survives every sync and would
+  // otherwise still look untouched). The comparison deliberately does NOT use
+  // this source's current `defaultUsername`: selecting a profile on the source
+  // form mirrors that profile's username INTO `defaultUsername`, so a
+  // current-default comparison would treat every already-synced server as
+  // hand-edited the moment a profile is linked — defeating retro-apply in its
+  // own main flow. Servers synced before `syncedUsername` existed have no stamp
+  // and fall back to `defaultUsername`, i.e. the earlier behavior, and are never
+  // excluded for lacking it. Changing this field from one profile to another
+  // does NOT re-stamp already-linked servers, and clearing it does NOT strip
+  // them — both would silently undo a user's per-server decision.
+  //
+  // The `syncedAuthProfileId` clause is what makes a PER-SERVER opt-out possible
+  // (review finding, P2): clearing a source-applied profile in the server editor
+  // leaves the record satisfying every other clause, so without a record of what
+  // the sync itself linked the next sync simply reattached it. A cleared link now
+  // reads as "no profile, against a stamp naming one" and is left alone from then
+  // on — including after this field is later pointed at a DIFFERENT profile, since
+  // the opt-out is about what the sync last wrote on that server, not about which
+  // profile the source currently names.
+  //
+  // Optional for backward compat, same reasoning as `revision`/
+  // `providerFingerprint`/`managedFolders` above: a source saved before this
+  // field existed simply has none, and absent means today's pre-feature
+  // behavior bit-for-bit (defaultUsername + SSH agent). A dangling reference
+  // (profile deleted out from under it) degrades to that same behavior with a
+  // warning rather than failing the sync. See computeSyncPlan in
+  // services/inventory/syncEngine.ts for both rules.
+  authProfileId?: string;
 }
 
 /**
@@ -259,6 +302,13 @@ function secretFieldIdsEqual(a: readonly string[], b: readonly string[]): boolea
  * happens to still match. Only when either side predates the revision field
  * (a legacy record) does this fall back to the old field-by-field structural
  * comparison — the same one used before this finding.
+ *
+ * `authProfileId` is compared in the structural fallback ONLY, like every
+ * other field here: once both sides carry a revision, the revision already
+ * decides (every write through NexusCore.addOrUpdateInventorySource assigns a
+ * fresh one, so a profile change on a live record is caught there). The
+ * fallback needs it so a legacy-record comparison cannot call a profile-only
+ * change "unchanged" and let a tree fetched under the old profile apply.
  */
 export function sourceConfigUnchanged(a: InventorySourceConfig, b: InventorySourceConfig): boolean {
   if (a.revision !== undefined && b.revision !== undefined) {
@@ -269,6 +319,7 @@ export function sourceConfigUnchanged(a: InventorySourceConfig, b: InventorySour
     a.targetFolder === b.targetFolder &&
     a.prunePolicy === b.prunePolicy &&
     a.defaultUsername === b.defaultUsername &&
+    a.authProfileId === b.authProfileId &&
     inventorySourceValuesEqual(a.config, b.config) &&
     secretFieldIdsEqual(a.secretFieldIds, b.secretFieldIds)
   );

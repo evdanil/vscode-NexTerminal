@@ -52,7 +52,25 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     return false;
   }
   const obj = value as Record<string, unknown>;
-  return isNonEmptyString(obj.sourceId) && isNonEmptyString(obj.externalId) && typeof obj.syncedAt === "number";
+  // `syncedUsername` and `syncedAuthProfileId` are optional (absent on every
+  // server synced before each field existed) but shape-checked like the rest:
+  // this guard is the ONLY thing standing between a hand-edited backup /
+  // version-skewed globalState and the retro-apply rule that reads them, and an
+  // origin member the engine did not write makes the whole marker untrustworthy.
+  // Empty is rejected as well as non-string: neither ServerConfig.username nor
+  // AuthProfile.id can ever be empty, so an empty stamp could not have come from
+  // a sync. The disposition for a malformed origin is unchanged and
+  // deliberately loud — both callers of this guard strip the WHOLE origin (see
+  // VscodeConfigRepository.getServers and addServerSanitizingOrigin), which costs
+  // that server its sync ownership and makes the next sync report an id collision
+  // rather than silently mis-deciding whether it was ever hand-edited.
+  return (
+    isNonEmptyString(obj.sourceId) &&
+    isNonEmptyString(obj.externalId) &&
+    typeof obj.syncedAt === "number" &&
+    isOptionalNonEmptyString(obj.syncedUsername) &&
+    isOptionalNonEmptyString(obj.syncedAuthProfileId)
+  );
 }
 
 export function validateServerConfig(item: unknown): item is ServerConfig {
@@ -84,6 +102,33 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
     return false;
   }
   if (obj.authProfileId !== undefined && (typeof obj.authProfileId !== "string" || obj.authProfileId === "")) {
+    return false;
+  }
+  // REVIEW FINDING (P2) — the same shape check `validateAuthProfile` now makes
+  // of `AuthProfile.keyPath`, for the same reason and with the same deliberate
+  // limits. `ServerConfig.keyPath` is declared `string | undefined`, but until
+  // this line nothing checked it, so a hand-edited backup or a version-skewed
+  // globalState row could carry a number/object/array here and still be handed
+  // out typed as `ServerConfig`. `hasOwnKeyPath` (services/inventory/syncEngine.ts)
+  // then trims it while planning a sync whose key profile has lost its key
+  // file, and the TypeError aborts the WHOLE sync after the inventory has
+  // already been fetched — not one bad row skipped, the entire run lost.
+  //
+  // A TYPE check, deliberately not `isOptionalNonEmptyString`: `""` reads
+  // identically to absent everywhere that matters (`buildConnectConfig` rejects
+  // both with the same message, `hasOwnKeyPath` counts neither as a key of the
+  // server's own), so rejecting it would discard a merely untidy record for
+  // nothing. And rejection is destructive out of proportion to a malformed
+  // bookkeeping field: a rejected server row is dropped by the import and by
+  // the globalState load, taking its group, proxy, tunnels' jump-host target
+  // and inventory-sync ownership with it. No version of Nexus has ever WRITTEN
+  // a non-string here (`formValuesToServer` stores `string | undefined`), so
+  // this line can only reject records that are already broken.
+  //
+  // The use site stays defensive too (see `hasOwnKeyPath`): this boundary is
+  // what should stop such a value existing, not the only thing standing
+  // between one and a thrown `.trim()`.
+  if (obj.keyPath !== undefined && typeof obj.keyPath !== "string") {
     return false;
   }
   // F13/FIX 5 — a malformed `origin` does not invalidate the whole server
@@ -162,6 +207,22 @@ export function validateInventorySource(item: unknown): item is InventorySourceC
   // metadata here; that would also strip it from legitimate storage-layer
   // loads, which must keep it.
   if (obj.managedFolders !== undefined && (!Array.isArray(obj.managedFolders) || !obj.managedFolders.every((v) => typeof v === "string"))) {
+    return false;
+  }
+  // Optional for backward compat, same reasoning as `revision`/
+  // `providerFingerprint` above: a source saved before this field existed
+  // simply has none. When present it must be a non-empty string — an empty
+  // one would read downstream as a dangling profile reference rather than as
+  // "no profile", which is what absent means.
+  //
+  // Unlike `managedFolders`, this is user-authored config, not extension
+  // bookkeeping, so it is deliberately NOT stripped by
+  // `sanitizeImportedInventorySources` in configCommands.ts: a malformed
+  // value rejects the whole source here, exactly as a malformed `revision`
+  // does. (A reference that is well-formed but points at a profile the import
+  // didn't bring along is a different problem — resolution, not shape — and
+  // is handled by the post-import dangling clear, not here.)
+  if (obj.authProfileId !== undefined && !isNonEmptyString(obj.authProfileId)) {
     return false;
   }
   return true;
@@ -243,10 +304,53 @@ export function validateAuthProfile(item: unknown): item is AuthProfile {
     return false;
   }
   const obj = item as Record<string, unknown>;
-  return (
-    isNonEmptyString(obj.id) &&
-    isNonEmptyString(obj.name) &&
-    isNonEmptyString(obj.username) &&
-    (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
-  );
+  if (
+    !(
+      isNonEmptyString(obj.id) &&
+      isNonEmptyString(obj.name) &&
+      isNonEmptyString(obj.username) &&
+      (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
+    )
+  ) {
+    return false;
+  }
+  // REVIEW FINDING (P2) — optional `keyPath` was the one declared field this
+  // guard never looked at, so a hand-edited backup or a version-skewed
+  // globalState row could carry a number/object/array here and still be handed
+  // out typed as `AuthProfile`. Everything downstream then treats it as a
+  // string: `authProfileOwnedCredentials` trims it (models/config.ts) and
+  // `formatAuthProfileLabel` hands it to `path.posix.basename` via
+  // `normalizeKeyPathForComparison` (utils/authProfileLabel.ts) for every
+  // option of every Auth Profile select and every server tooltip in the tree.
+  // A TypeError there is not a rejected record, it is a sidebar that fails to
+  // render, so the shape is settled HERE, once, at the two boundaries a
+  // foreign record can arrive through (`VscodeConfigRepository.getAuthProfiles`
+  // and both import paths in configCommands.ts).
+  //
+  // A TYPE check, deliberately not `isOptionalNonEmptyString`:
+  //
+  //   * `""` is harmless and must stay accepted. It reads identically to
+  //     absent everywhere that matters — THE ONE RULE owns no blank key path,
+  //     and `formatAuthProfileLabel` skips a falsy one — so rejecting it would
+  //     buy nothing while newly discarding a record that is merely untidy.
+  //   * No version of Nexus has ever WRITTEN a non-string here
+  //     (`authProfileEditorPanel.ts` stores `string | undefined`), so nothing
+  //     a user legitimately holds can be rejected by this line. That matters
+  //     because rejection is destructive in a way a shape check on a
+  //     bookkeeping field is not: a rejected profile is skipped by the import
+  //     (counted, but not named), its vault password/passphrase are not
+  //     restored — `restoreSecrets` is scoped to the ids actually imported —
+  //     and the post-import dangling-reference sweep then strips the link from
+  //     every server and inventory source that pointed at it. In REPLACE mode
+  //     the local copy is already gone by the time this runs. Rejecting only
+  //     values no writer of ours can produce keeps that blast radius aimed
+  //     exclusively at records that are already broken.
+  //
+  // The rule itself stays defensive too (see `authProfileOwnedCredentials`):
+  // this boundary is what should stop such a value existing, not the only
+  // thing standing between one and a thrown `.trim()`.
+  if (obj.keyPath !== undefined && typeof obj.keyPath !== "string") {
+    return false;
+  }
+  return true;
 }

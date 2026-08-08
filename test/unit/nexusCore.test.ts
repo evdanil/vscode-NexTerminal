@@ -735,6 +735,67 @@ describe("NexusCore", () => {
     expect(core2.getServer("s1")?.authProfileId).toBeUndefined();
   });
 
+  it("removeAuthProfile also drops the inventory stamp recording that the SYNC applied that profile (kills leaving the stamp behind, which reads as a per-server opt-out nobody chose)", async () => {
+    const repository = new InMemoryConfigRepository(
+      [],
+      [],
+      [],
+      [],
+      [{ id: "ap1", name: "Prod", username: "root", authType: "password" }]
+    );
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    // A server an inventory sync created and linked to ap1: the link and the
+    // stamp recording it agree, which is exactly what the sync writes.
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "agent", isHidden: false, authProfileId: "ap1",
+      origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "u", syncedAuthProfileId: "ap1" }
+    });
+
+    await core.removeAuthProfile("ap1");
+
+    const cleared = core.getServer("s1");
+    expect(cleared?.authProfileId).toBeUndefined();
+    // The stamp describes a link this cascade just removed, and the removal is
+    // the system's doing rather than a user decision. Left behind it would read
+    // as "the user cleared the source's profile here", so re-pointing the source
+    // at a replacement profile would silently skip the very servers the sync
+    // itself had configured.
+    expect(cleared?.origin?.syncedAuthProfileId).toBeUndefined();
+    // The rest of the ownership marker is untouched — losing it would cost the
+    // server its sync ownership entirely.
+    expect(cleared?.origin).toEqual({ sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "u", syncedAuthProfileId: undefined });
+  });
+
+  it("removeAuthProfile leaves the stamp standing on a server whose link the USER already cleared (kills a blanket sweep that would erase an opt-out when the profile is deleted)", async () => {
+    const repository = new InMemoryConfigRepository(
+      [],
+      [],
+      [],
+      [],
+      [{ id: "ap1", name: "Prod", username: "root", authType: "password" }]
+    );
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    // Opted out: the sync linked ap1, the user removed the link in the server
+    // editor (which preserves `origin`), so `authProfileId` is already undefined.
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "agent", isHidden: false,
+      origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "u", syncedAuthProfileId: "ap1" }
+    });
+
+    await core.removeAuthProfile("ap1");
+
+    // Deleting the profile is not consent to re-manage this server: the opt-out
+    // must survive it, or the next sync (against whatever profile the source is
+    // re-pointed at) reattaches a link the user deliberately removed.
+    expect(core.getServer("s1")?.origin?.syncedAuthProfileId).toBe("ap1");
+  });
+
   it("markSessionActivity adds session to activitySessionIds and emits change", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

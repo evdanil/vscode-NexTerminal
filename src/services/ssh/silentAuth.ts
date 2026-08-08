@@ -1,5 +1,6 @@
 import type { Duplex } from "node:stream";
 import type { AuthProfile, ServerConfig } from "../../models/config";
+import { authProfileOwnedCredentials } from "../../models/config";
 import type { KeyboardInteractiveHandler, PasswordPrompt, SecretVault, SshConnection, SshConnector, SshFactory } from "./contracts";
 
 export type InputPromptFn = (message: string, password: boolean) => Promise<string | undefined>;
@@ -76,11 +77,21 @@ export class SilentAuthSshFactory implements SshFactory {
         passphraseKey: passphraseSecretKey(server.id)
       };
     }
+    // REVIEW FINDING (P2) — only the fields the profile actually SUPPLIES are
+    // taken over (authProfileOwnedCredentials, models/config.ts); the server
+    // keeps its own value for the rest. This used to overwrite all three
+    // unconditionally, so an imported profile with a whitespace-only username
+    // replaced every linked server's working username with whitespace — for a
+    // synced server, the very fallback `fallbackUsernameForSource` had just
+    // taken care to store — and a `key` profile with no key path blanked the
+    // server's own `keyPath`, the one the server form now lets you set
+    // precisely because the profile does not supply it.
+    const resolved: ServerConfig = { ...server, ...authProfileOwnedCredentials(profile) };
     return {
-      resolved: { ...server, username: profile.username, authType: profile.authType, keyPath: profile.keyPath },
-      passwordKey: profile.authType === "password" ? authProfilePasswordSecretKey(profile.id) : passwordSecretKey(server.id),
-      passphraseKey: profile.authType === "key" ? authProfilePassphraseSecretKey(profile.id) : passphraseSecretKey(server.id),
-      legacyServerPassphraseKey: profile.authType === "key" ? passphraseSecretKey(server.id) : undefined
+      resolved,
+      passwordKey: resolved.authType === "password" ? authProfilePasswordSecretKey(profile.id) : passwordSecretKey(server.id),
+      passphraseKey: resolved.authType === "key" ? authProfilePassphraseSecretKey(profile.id) : passphraseSecretKey(server.id),
+      legacyServerPassphraseKey: resolved.authType === "key" ? passphraseSecretKey(server.id) : undefined
     };
   }
 

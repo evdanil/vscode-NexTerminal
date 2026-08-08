@@ -252,6 +252,87 @@ describe("SilentAuthSshFactory", () => {
     );
   });
 
+  /**
+   * REVIEW FINDING (P2) — a profile takes over only the fields it actually
+   * SUPPLIES (`authProfileOwnedCredentials`, models/config.ts). Each fixture is
+   * built so the wrong implementation — overwriting all three unconditionally —
+   * VISIBLY differs: the server carries a usable value in exactly the slot the
+   * profile leaves empty.
+   */
+  it("keeps a synced server's own username when the profile's is whitespace-only (kills substituting profile.username wholesale: the inventory source stored that username as the fallback for precisely this profile, and the connection then ignored it and offered whitespace)", async () => {
+    // Only an imported backup can produce this profile: validateAuthProfile
+    // checks length, not content, while the profile editor trims and refuses
+    // blanks.
+    const profile: AuthProfile = { id: "prof-blank", name: "Imported", username: "   ", authType: "password" };
+    // What a NetBox sync writes for a source linked to that profile:
+    // fallbackUsernameForSource stored the submitted default username, and the
+    // sync stamped the link (see syncEngine.ts).
+    const server: ServerConfig = {
+      ...baseServer,
+      username: "labuser",
+      authType: "agent",
+      authProfileId: "prof-blank"
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const vault = createVault({ [authProfilePasswordSecretKey("prof-blank")]: "profile-secret" });
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, (id) =>
+      id === "prof-blank" ? profile : undefined
+    );
+
+    await factory.connect(server);
+
+    expect(connector.connect).toHaveBeenCalledWith(
+      // The auth type IS supplied, so it still comes from the profile — that is
+      // the whole point of the link on a synced server.
+      expect.objectContaining({ username: "labuser", authType: "password" }),
+      expect.objectContaining({ password: "profile-secret" })
+    );
+    expect(prompt.prompt).not.toHaveBeenCalled();
+  });
+
+  it("keeps the server's own key path when a key profile carries none (kills blanking keyPath from a profile that has nothing to put there — the server form leaves that control editable for exactly this profile)", async () => {
+    const profile: AuthProfile = { id: "prof-keyless", name: "Shared Key", username: "keyuser", authType: "key" };
+    const server: ServerConfig = {
+      ...baseServer,
+      username: "stored-user",
+      authType: "password",
+      keyPath: "/home/me/.ssh/chosen",
+      authProfileId: "prof-keyless"
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const vault = createVault({});
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, (id) =>
+      id === "prof-keyless" ? profile : undefined
+    );
+
+    await factory.connect(server);
+
+    expect(connector.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ username: "keyuser", authType: "key", keyPath: "/home/me/.ssh/chosen" }),
+      expect.anything()
+    );
+  });
+
+  it("trims the credentials it does take over, so what a form displayed is what the connection uses", async () => {
+    const profile: AuthProfile = { id: "prof-pad", name: "Padded", username: "  bob  ", authType: "password" };
+    const server: ServerConfig = { ...baseServer, username: "stored-user", authProfileId: "prof-pad" };
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const vault = createVault({ [authProfilePasswordSecretKey("prof-pad")]: "profile-secret" });
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, (id) =>
+      id === "prof-pad" ? profile : undefined
+    );
+
+    await factory.connect(server);
+
+    expect(connector.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ username: "bob" }),
+      expect.anything()
+    );
+  });
+
   it("uses server credentials when no lookup provided", async () => {
     const server: ServerConfig = {
       ...baseServer,

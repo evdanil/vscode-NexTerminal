@@ -4,7 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { AuthProfile, AuthType, ProxyConfig, ServerConfig } from "../models/config";
-import { cloneServerConfig, mergeServerConfigFields, serverConfigsEqual } from "../models/config";
+import {
+  authProfileOwnedCredentials,
+  authProfileOwnershipSignature,
+  cloneServerConfig,
+  formOfferedServerCredentials,
+  mergeServerConfigFields,
+  serverConfigsEqual
+} from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
@@ -333,11 +340,23 @@ async function pickKeyForDeployment(sshDir: string): Promise<SelectedDeployKey |
   return { publicKeyPath: generated.publicKeyPath, privateKeyPath: generated.privateKeyPath };
 }
 
+/**
+ * The username a connection to `server` will actually use — the deploy-key flow
+ * needs it to name the account the public key is installed for, and to stamp
+ * the converted/linked record.
+ *
+ * REVIEW FINDING (P2) — resolved through the shared ownership rule, so a
+ * profile that supplies no usable username leaves the server's own standing.
+ * `profile.username ?? server.username` used to hand back a whitespace-only
+ * username, which `buildStandaloneKeyServer` then wrote onto the record as its
+ * own — a `username` that `validateServerConfig` rejects, i.e. a server that
+ * disappears at the next load.
+ */
 function resolveEffectiveUsername(core: import("../core/nexusCore").NexusCore, server: ServerConfig): string {
   if (!server.authProfileId) {
     return server.username;
   }
-  return core.getAuthProfile(server.authProfileId)?.username ?? server.username;
+  return authProfileOwnedCredentials(core.getAuthProfile(server.authProfileId)).username ?? server.username;
 }
 
 function buildStandaloneKeyServer(server: ServerConfig, username: string, privateKeyPath: string): ServerConfig {
@@ -402,18 +421,52 @@ async function pickDeployConversionMode(
   return undefined;
 }
 
+/**
+ * The existing key profiles that are interchangeable with the one this flow
+ * would otherwise create — i.e. that supply the same account and the same key
+ * file as `{ username, authType: "key", keyPath: privateKeyPath }` would.
+ *
+ * REVIEW FINDING (P3) — every candidate field is read through THE ONE RULE
+ * (`authProfileOwnedCredentials`, models/config.ts), the same rule
+ * `resolveEffectiveUsername` above uses to derive `username`. A raw
+ * `profile.username === username` compared a trimmed value against an untrimmed
+ * one, so an imported profile with a padded username (`"deploy-user "` — reachable
+ * because `validateAuthProfile` only checks length) was not offered even though
+ * it is the very profile the user already has for this account and this key: the
+ * flow then prompted them to create a duplicate that behaves identically, because
+ * the connect path trims too.
+ *
+ * WHAT DOES NOT CHANGE — a profile that supplies NO usable username still
+ * matches nothing. `resolveEffectiveUsername`'s `?? server.username` fallback is
+ * NOT part of the rule and has no counterpart here: there it answers "what
+ * account does this already-chosen pairing connect as", and the server is the
+ * other half of that pairing. Here the question is "which profile supplies the
+ * account I need", and a profile that owns no username supplies none — so
+ * `undefined !== username` for every possible target, which is right. Adopting
+ * the fallback instead (`owned.username ?? username`) would make a blank-username
+ * profile match EVERY account, offering the user a known-broken record as the
+ * reusable profile for a key they just deployed.
+ *
+ * `authType` and `keyPath` read off the same rule for consistency, which is
+ * behaviour-preserving: `authType` is always owned, and
+ * `normalizeKeyPathForComparison` already trimmed what the old comparison passed
+ * it.
+ */
 function findMatchingKeyAuthProfiles(
   core: import("../core/nexusCore").NexusCore,
   username: string,
   privateKeyPath: string
 ): AuthProfile[] {
   const normalizedKeyPath = normalizeKeyPathForComparison(privateKeyPath);
-  return core.getSnapshot().authProfiles.filter((profile) =>
-    profile.authType === "key" &&
-    profile.username === username &&
-    typeof profile.keyPath === "string" &&
-    normalizeKeyPathForComparison(profile.keyPath) === normalizedKeyPath
-  );
+  return core.getSnapshot().authProfiles.filter((profile) => {
+    const owned = authProfileOwnedCredentials(profile);
+    return (
+      owned.authType === "key" &&
+      owned.username === username &&
+      owned.keyPath !== undefined &&
+      normalizeKeyPathForComparison(owned.keyPath) === normalizedKeyPath
+    );
+  });
 }
 
 function getDefaultKeyAuthProfileName(username: string, privateKeyPath: string): string {
@@ -588,16 +641,172 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
   };
 }
 
-export function preserveLinkedServerCredentials(existing: ServerConfig | undefined, next: ServerConfig): ServerConfig {
+/**
+ * REVIEW FINDING (P2) — the linked-profile half of a server edit's save.
+ *
+ * WHY IT EXISTS: a field the profile supplies is rendered read-only holding the
+ * profile's mirrored value, and a read-only control still SUBMITS. Writing that
+ * echo through would overwrite the server's own stored credential with the
+ * profile's, so unlinking later would leave the server on credentials it never
+ * had. This puts the stored value back underneath the link.
+ *
+ * WHY IT IS SCOPED — and REVIEW FINDING (P1), the scoping rule itself: a
+ * submitted credential is kept only where the form OFFERED that field, i.e.
+ * rendered it visible AND unlocked (`formOfferedServerCredentials`,
+ * models/config.ts, which states the invariant in full and why ownership alone
+ * cannot express it). Everything else is put back from the stored record.
+ *
+ * The two directions this replaces, each of which was a separate defect:
+ *
+ *   * restoring all three whenever a link existed silently discarded exactly
+ *     the edits the form had — correctly — permitted: the username under a
+ *     profile whose own username is blank, and the key path under a `key`
+ *     profile that carries none. The user saw the field unlock, typed into it,
+ *     saved, and got the old value back with nothing said.
+ *   * restoring only the OWNED keys then erased the key path of a `key` server
+ *     linked to a `password`/`agent` profile. That profile owns `authType`, so
+ *     the form renders its type, which hides the Private Key File control,
+ *     which drops it from the submission — and this declined to restore a field
+ *     the profile does not own. A rename was enough to destroy the file.
+ *
+ * `existing`, not the live record, is the source of a restored field: it is
+ * what the form was rendered from, which keeps a credential the user never saw
+ * behaving like every other field of this submission under the last-writer-wins
+ * rule the edit path documents at its `liveRecord` capture.
+ *
+ * An id resolving to NOTHING (profile deleted while the form sat open) owns
+ * nothing, so every field is treated as offered — the same conclusion the
+ * connect path and the form's own render-time seed reach for that id, since
+ * with no profile to mirror from the form opened those fields unlocked and
+ * prefilled from the record. The edit path rejects such a submission outright
+ * (`serverAuthProfileRejection`) rather than relying on that agreement.
+ */
+export function preserveLinkedServerCredentials(
+  existing: ServerConfig | undefined,
+  next: ServerConfig,
+  profile: AuthProfile | undefined
+): ServerConfig {
   if (!existing || !next.authProfileId) {
     return next;
   }
+  const offered = formOfferedServerCredentials(next, profile);
   return {
     ...next,
-    username: existing.username,
-    authType: existing.authType,
-    keyPath: existing.keyPath
+    ...(offered.username ? {} : { username: existing.username }),
+    ...(offered.authType ? {} : { authType: existing.authType }),
+    ...(offered.keyPath ? {} : { keyPath: existing.keyPath })
   };
+}
+
+/**
+ * REVIEW FINDING (P1) — what a server edit form committed to when it rendered
+ * (or last mirrored) the credentials of the profile it is linked to. Compared
+ * against LIVE core state at Save by `serverAuthProfileRejection`.
+ */
+export interface RenderedAuthProfile {
+  /** The id whose credentials the form is currently showing. */
+  id: string;
+  /** `authProfileOwnershipSignature` of the profile it showed them from. */
+  signature: string;
+}
+
+const MISSING_AUTH_PROFILE_MESSAGE =
+  "The selected auth profile no longer exists. Choose another, or clear the Auth Profile field.";
+
+function changedAuthProfileMessage(profile: AuthProfile): string {
+  return `The auth profile "${profile.name}" changed which credentials it supplies while this form was open, so the fields on screen are no longer the ones a save would keep. Re-select it in the Auth Profile list (or reopen this server) to pick up its current credentials, then save again.`;
+}
+
+/**
+ * REVIEW FINDING (P1) — "may this server be saved carrying this auth profile?",
+ * the server form's equivalent of `inventoryAuthProfileRejection`
+ * (commands/inventoryCommands.ts), which the inventory source form has had
+ * since this feature landed while the server form went without.
+ *
+ * WHY IT IS NEEDED. A form can sit open indefinitely, and auth profile
+ * add/edit/delete are ordinary commands. Two things go wrong without this:
+ *
+ *   * the profile is DELETED. `NexusCore.removeAuthProfile` already strips the
+ *     link off every referencing server, but the open form still holds the id
+ *     and the deleted profile's mirrored username and key path in fields that
+ *     have since unlocked. Saving resurrected the dangling id and adopted those
+ *     mirrored credentials as the server's own.
+ *   * the profile's OWNERSHIP SHAPE changed (`authProfileOwnershipSignature`,
+ *     models/config.ts, which lists exactly what counts and why a changed
+ *     VALUE does not). `preserveLinkedServerCredentials` reads the LIVE profile
+ *     to decide which submitted fields are user input, so a shape that moved
+ *     under it makes that decision about a form nobody rendered: a key path the
+ *     user typed is discarded, or the profile's own mirrored path is written
+ *     onto the server as its own — silently, either way.
+ *
+ * REJECT rather than repair. The values needed to re-render correctly live in
+ * the webview's own transition machinery (`profileDisplacedValues`,
+ * ui/formHtml.ts), which restores what a profile displaced before applying the
+ * next one; pushing a bare `fillFields` from here would apply the new shape
+ * WITHOUT that release, leaving a field the profile no longer fills unlocked
+ * and still holding the profile's value — the precise state this exists to
+ * prevent. The message therefore names the one action that runs the real
+ * transition: re-select the profile.
+ *
+ * Call it with a `live` re-resolved inside `configMutationLock`. Auth profile
+ * writes take that same lock (ui/authProfileEditorPanel.ts), so a check made
+ * while holding it stays true through the write it is guarding.
+ */
+export function serverAuthProfileRejection(
+  submittedId: string | undefined,
+  rendered: RenderedAuthProfile | undefined,
+  live: AuthProfile | undefined
+): string | undefined {
+  if (submittedId === undefined) {
+    // No link: every credential on screen was the user's own, unlocked, and
+    // `preserveLinkedServerCredentials` keeps all of it. Nothing to compare.
+    return undefined;
+  }
+  if (live === undefined) {
+    return MISSING_AUTH_PROFILE_MESSAGE;
+  }
+  if (rendered === undefined || rendered.id !== submittedId) {
+    // The submission names a profile this form never showed credentials for —
+    // a Save clicked between choosing one and its mirror answering. The fields
+    // still hold the previous state, so the save would be decided against a
+    // profile nobody has seen.
+    return changedAuthProfileMessage(live);
+  }
+  if (rendered.signature !== authProfileOwnershipSignature(live)) {
+    return changedAuthProfileMessage(live);
+  }
+  return undefined;
+}
+
+/**
+ * The Auth Profile select's mirror payload for the SSH server form and the
+ * unified profile form (`onAutofill`), the counterpart of the inventory source
+ * form's `authProfileUsernameMirror`. Sends exactly the keys the profile owns
+ * (`authProfileOwnedCredentials`), so the webview's own ownership record —
+ * rebuilt from this payload — matches the render-time seed
+ * (`authProfileFilledKeys`, ui/formDefinitions.ts) and matches what
+ * `preserveLinkedServerCredentials` will keep at Save.
+ *
+ * `undefined` (not `{}`) for an id that resolves to no profile: that is
+ * WebviewFormPanel's "no answer", which suppresses the fillFields round trip
+ * entirely — touching the form when the profile is gone would be guessing.
+ */
+export function authProfileCredentialMirror(profile: AuthProfile | undefined): Record<string, string> | undefined {
+  if (!profile) {
+    return undefined;
+  }
+  const owned = authProfileOwnedCredentials(profile);
+  const values: Record<string, string> = {};
+  if (owned.username !== undefined) {
+    values.username = owned.username;
+  }
+  if (owned.authType !== undefined) {
+    values.authType = owned.authType;
+  }
+  if (owned.keyPath !== undefined) {
+    values.keyPath = owned.keyPath;
+  }
+  return values;
 }
 
 export { browseForKey, collectGroups };
@@ -1019,6 +1228,22 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
       const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
       const inlineAuthProfile = createInlineAuthProfileCreation(ctx);
+      // REVIEW FINDING (P1) — the profile shape this form is currently showing
+      // credentials from, checked against live state at Save by
+      // `serverAuthProfileRejection` (see its doc comment for the two ways an
+      // unchecked submission goes wrong). Seeded from the SAME profile list the
+      // definition above was built with, so it describes the render rather than
+      // a second, later lookup; then re-stamped by every `onAutofill` answer,
+      // which is the only other point at which this form is handed a profile's
+      // credentials — a selection, and `addSelectOption` after an inline
+      // create, both post one.
+      let renderedAuthProfile: RenderedAuthProfile | undefined =
+        existing.authProfileId !== undefined
+          ? {
+              id: existing.authProfileId,
+              signature: authProfileOwnershipSignature(snapshot.authProfiles.find((p) => p.id === existing.authProfileId))
+            }
+          : undefined;
       const panel = WebviewFormPanel.open("server-edit", definition, {
         onSubmit: async (values) => {
           if (normalizeOptionalFolderPath(values.group) === null) {
@@ -1028,7 +1253,6 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (!candidate) {
             return;
           }
-          const linked = preserveLinkedServerCredentials(existing, candidate);
           // P1 — the edit form has no field for `origin` (it's an inventory-sync
           // ownership marker, not a user-editable setting), so formValuesToServer's
           // reconstruction never carries it. Without restoring it here, saving any
@@ -1064,6 +1288,26 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // just after is fire-and-forget (`void`, never awaited) and stays
           // outside the lock regardless.
           await configMutationLock.runExclusive(async () => {
+            // REVIEW FINDING (P1) — the profile is re-resolved against LIVE
+            // core state (the select was populated when the form opened and
+            // the form can sit open indefinitely) and checked against what
+            // this form actually rendered, BEFORE anything is written and
+            // while holding the lock every auth profile write also takes
+            // (ui/authProfileEditorPanel.ts) — so the shape this save is
+            // decided against cannot move between the check and the write.
+            // This is the server form's copy of the guard the inventory
+            // source form has always had (`inventoryAuthProfileRejection`,
+            // commands/inventoryCommands.ts): throwing here reaches the user
+            // as "Save failed: …" and leaves the panel open, which is what
+            // both of its messages tell the user to act on.
+            const linkedProfile = candidate.authProfileId ? ctx.core.getAuthProfile(candidate.authProfileId) : undefined;
+            const authProfileRejection = serverAuthProfileRejection(candidate.authProfileId, renderedAuthProfile, linkedProfile);
+            if (authProfileRejection) {
+              throw new Error(authProfileRejection);
+            }
+            // Which submitted credentials are this user's own, and which the
+            // stored record keeps — see preserveLinkedServerCredentials.
+            const linked = preserveLinkedServerCredentials(existing, candidate, linkedProfile);
             const proxySecretKey = proxyPasswordSecretKey(existing.id);
             // FINDING 1 (P2, baseline-before-vault-read review) — this
             // secret-capture await MUST run BEFORE the baseline snapshot
@@ -1342,14 +1586,16 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         onCreateInline: inlineAuthProfile.handleCreateInline,
         onAutofill: async (_key, value) => {
           const profile = ctx.core.getAuthProfile(value);
-          if (!profile) {
-            return undefined;
-          }
-          return {
-            username: profile.username,
-            authType: profile.authType,
-            ...(profile.keyPath ? { keyPath: profile.keyPath } : {})
-          };
+          // Stamped from the SAME lookup the mirror is built from, so what the
+          // form is about to show and what Save checks against are one fact.
+          // `undefined` for an id that resolves to nothing: the mirror answers
+          // nothing either (WebviewFormPanel then suppresses the fillFields
+          // round trip entirely), so this form is showing no profile's
+          // credentials and a Save carrying that id is refused as missing.
+          renderedAuthProfile = profile
+            ? { id: profile.id, signature: authProfileOwnershipSignature(profile) }
+            : undefined;
+          return authProfileCredentialMirror(profile);
         }
       });
       inlineAuthProfile.attachPanel(panel);
