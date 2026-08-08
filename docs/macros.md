@@ -254,7 +254,7 @@ do not retype what Nexus already knows. Write them as `${profile.<field>}`:
 | `${profile.name}` | the profile's name |
 | `${profile.host}` | its SSH host |
 | `${profile.port}` | its SSH port |
-| `${profile.username}` | its username |
+| `${profile.username}` | the username it connects as — the linked **auth profile**'s where one supplies it, the server's own otherwise |
 | `${profile.ipmiHost}` | its **IPMI / BMC Host** (Advanced section of the server form) |
 
 Nothing else is exposed — key paths, ids and inventory bookkeeping are
@@ -286,7 +286,7 @@ checked:
 | `${profile.host}`, `${profile.ipmiHost}` | letters, digits, `.`, `-`, `_`, `:`, and `[]` for IPv6 — the address only, no `https://` and no path |
 | `${profile.port}` | digits |
 | `${profile.username}` | letters, digits, `.`, `_`, `-`, `@` |
-| `${profile.name}` | anything except `$`, a backtick, quotes, `;`, `|`, `&`, `<`, `>`, `\` — spaces and parentheses are fine |
+| `${profile.name}` | anything except `$`, a backtick, quotes, `;`, `|`, `&`, `<`, `>`, `\`, `(`, `)`, `{`, `}` — spaces, `[`, `]`, `/` and accents are fine |
 
 No value may contain a `$` or a backtick, in any token. A profile carrying shell
 syntax — which can reach your config through an inventory sync or an imported
@@ -294,6 +294,16 @@ backup — refuses the run instead of executing it, and the message names the
 offending value and what the field accepts. This is a charset check, not
 quoting: the rest of the command line is still yours to quote (see **No
 automatic quoting**).
+
+The shell a **Local terminal** macro lands in is the platform default, which is
+PowerShell on Windows — so the accepted set is the intersection of what bash and
+PowerShell treat as plain text. That is why parentheses and braces are refused in
+a profile **name**: PowerShell evaluates `(…)` even in argument position, so a
+server named `(Start-Process calc)` would otherwise run it. Rename the profile —
+`Core Switch DC1` rather than `Core Switch (DC1)` — or escape the token
+(`$${profile.name}`) if you only want the literal text. Square brackets stay
+legal in every token: `Rack A [Spare]` is fine, and `${profile.host}` needs them
+for bracketed IPv6.
 
 A macro that uses profile tokens cannot auto-trigger, whichever **Run in** it
 has: a rule fired by terminal output has no server to resolve the tokens

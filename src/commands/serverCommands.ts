@@ -8,6 +8,7 @@ import {
   authProfileOwnedCredentials,
   authProfileOwnershipSignature,
   cloneServerConfig,
+  effectiveServerUsername,
   formOfferedServerCredentials,
   mergeServerConfigFields,
   serverConfigsEqual
@@ -356,7 +357,7 @@ function resolveEffectiveUsername(core: import("../core/nexusCore").NexusCore, s
   if (!server.authProfileId) {
     return server.username;
   }
-  return authProfileOwnedCredentials(core.getAuthProfile(server.authProfileId)).username ?? server.username;
+  return effectiveServerUsername(server, core.getAuthProfile(server.authProfileId));
 }
 
 function buildStandaloneKeyServer(server: ServerConfig, username: string, privateKeyPath: string): ServerConfig {

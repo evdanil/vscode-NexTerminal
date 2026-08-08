@@ -60,7 +60,9 @@ const PROFILE_TOKEN_CHARSET_GUIDANCE: Record<ProfileTokenName, string> = {
     'Use the address only — letters, digits, ".", "-", "_", ":" and "[]" for IPv6 — without a scheme like https:// or a path.',
   port: "Use the port number only — digits, nothing else.",
   username: 'Use letters, digits, ".", "_", "-" and "@" only.',
-  name: 'Remove $, `, quotes, ";", "|", "&", "<", ">" and "\\" from the name — spaces and parentheses are fine.'
+  name:
+    'Remove $, `, quotes, ";", "|", "&", "<", ">", "\\", parentheses and braces from the name — spaces, ' +
+    'square brackets, "/" and accents are fine.'
 };
 
 /** The server-form label for a token, so pickers and errors name the same field. */
@@ -132,11 +134,35 @@ const DIGITS_ONLY = /^[0-9]+$/;
  */
 const USERNAME_CHARSET = /^[A-Za-z0-9._@\-]+$/;
 /**
- * `name` is a genuinely free-form label — "Core Switch (DC1)" must keep working
- * — so it gets a blacklist rather than a charset: everything a shell would read
- * as syntax is refused, while spaces, parentheses and accents are not.
+ * `name` is a genuinely free-form label — "Rack 4 / Ünit 2" must keep working —
+ * so it gets a blacklist rather than a charset: everything a shell would read as
+ * syntax is refused, while spaces, accents, "/" and square brackets are not.
+ *
+ * REVIEW FINDING (P1) — PARENTHESES AND BRACES ARE REFUSED, which means
+ * "Core Switch (DC1)" no longer resolves. The shell this list has to survive is
+ * not only bash: a `localTerminal` macro's resolved text goes to a FRESH
+ * `vscode.window.createTerminal()`, whose default shell on Windows is
+ * PowerShell, and PowerShell evaluates a parenthesised subexpression even in
+ * ARGUMENT position — `Write-Output (Start-Process calc)` starts calc before
+ * Write-Output is ever handed an argument. A server name arrives from a backup
+ * import and from inventory sync, so `(Start-Process calc)` is a value someone
+ * else can put in the config, and it used no character this list refused.
+ *
+ * BRACES go with them, for the invocation one character away: `{ … }` is a
+ * scriptblock literal, and the operators that RUN one are `&` (already refused)
+ * and `.` — and `.` has to stay legal, every site-code-ish label has dots. So
+ * `.{Start-Process calc}` executes wherever the token starts a statement, out of
+ * characters this list used to permit. A display name needs neither form.
+ *
+ * SQUARE BRACKETS ARE NOT REFUSED, deliberately. `[Type]::Member` does put
+ * PowerShell into expression mode, but a type literal is not by itself an
+ * invocation: reaching a method needs `(` (call) or `{` (scriptblock), and both
+ * are now gone — what is left is at worst a name that resolves to a type, or a
+ * glob pattern in a POSIX shell. Neither runs anything. "Rack A [Spare]" is as
+ * ordinary a label as "Rack A - Spare", and `host`/`ipmiHost` keep `[]` for
+ * bracketed IPv6, so the rules stay consistent about the same two characters.
  */
-const NAME_FORBIDDEN_CHARS = /["'$`;|&<>\\]/;
+const NAME_FORBIDDEN_CHARS = /["'$`;|&<>\\(){}]/;
 /**
  * Refused in EVERY token, no exceptions. `$` and a backtick are what turn a
  * substituted value into syntax rather than data — for the shell, and for this
@@ -161,6 +187,10 @@ const CONTROL_CHARS_GLOBAL = /[\u0000-\u001F\u007F-\u009F]/g;
  * when it was saved" is not true of the records that matter. The resolved text
  * then goes to a LOCAL shell (a `localTerminal` macro running `ipmitool`), where
  * a host of `1.2.3.4; rm -rf ~` is command execution on the user's own machine.
+ * WHICH local shell is not ours to choose: a fresh `vscode.window.createTerminal()`
+ * uses the platform default, which is PowerShell on Windows — so "reads as
+ * syntax" means the union of what bash and PowerShell read as syntax, not what
+ * bash alone does (see `NAME_FORBIDDEN_CHARS`).
  *
  * The answer is a charset, not quoting: quoting rules differ per shell, and a
  * half-implemented quoter creates confidence it cannot back. So a value that

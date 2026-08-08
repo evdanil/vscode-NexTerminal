@@ -496,6 +496,29 @@ export function authProfileOwnedCredentials(profile: AuthProfile | undefined): A
 }
 
 /**
+ * The username a connection to `server` will ACTUALLY log in as, given the auth
+ * profile it links to (`undefined` for no link, or a link that resolves to
+ * nothing). One line, but it is the one line the CONNECT path decides by —
+ * `SilentAuthSshFactory.resolveServer` spreads `authProfileOwnedCredentials`
+ * over the server, so an owned username replaces the server's and an unowned one
+ * leaves it standing — and a linked server keeps its own `username` stored
+ * UNDERNEATH the link, so `server.username` and this can legitimately differ.
+ *
+ * REVIEW FINDING (P2) — anything that tells the user, or a command line, which
+ * account is in play must ask THIS rather than read `server.username`, or it
+ * describes a login that will not happen. Callers: the deploy-key flow
+ * (`resolveEffectiveUsername`, commands/serverCommands.ts) and `${profile.username}`
+ * (commands/serverMacroCommands.ts), whose whole contract is "resolves to what
+ * this server connects with".
+ */
+export function effectiveServerUsername(
+  server: Pick<ServerConfig, "username">,
+  profile: AuthProfile | undefined
+): string {
+  return authProfileOwnedCredentials(profile).username ?? server.username;
+}
+
+/**
  * REVIEW FINDING (P1) — the companion question THE ONE RULE above cannot
  * answer on its own: "can a server that brings NO key path of its own connect
  * through this profile?"

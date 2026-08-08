@@ -205,10 +205,57 @@ describe("resolveProfileTokens — injection defense", () => {
   });
 
   it("still allows a free-form display name — it is a label, not an address", () => {
-    expect(resolved("# ${profile.name}", server({ name: "Core Switch (DC1)" }))).toBe("# Core Switch (DC1)");
-    // Spaces, parens, accents and slashes stay legal: `name` is a blacklist, not
-    // a charset, and refusing these would break ordinary profile names.
+    expect(resolved("# ${profile.name}", server({ name: "Core Switch DC1" }))).toBe("# Core Switch DC1");
+    // Spaces, accents, slashes and SQUARE BRACKETS stay legal: `name` is a
+    // blacklist, not a charset, and refusing these would break ordinary profile
+    // names. Brackets are kept on purpose — `[Type]::Member` needs `(` or `{` to
+    // become an invocation, and both of those are now refused (see below).
     expect(resolved("# ${profile.name}", server({ name: "Rack 4 / Ünit 2" }))).toBe("# Rack 4 / Ünit 2");
+    expect(resolved("# ${profile.name}", server({ name: "Rack A [Spare]" }))).toBe("# Rack A [Spare]");
+  });
+
+  it("refuses parentheses in a display name, which USED TO BE ACCEPTED as \"Core Switch (DC1)\"", () => {
+    // DELIBERATE FLIP of the old "parentheses are fine" assertion. The local
+    // shell a `localTerminal` macro lands in is the platform default, which on
+    // Windows is PowerShell, and PowerShell evaluates a parenthesised
+    // subexpression in ARGUMENT position: the resolved line below started calc
+    // before Write-Output was handed anything. A server name reaches the config
+    // from a backup import and from inventory sync, so this is attacker-supplied
+    // input that needed no character the old blacklist refused.
+    const outcome = resolveProfileTokens("Write-Output ${profile.name}\n", server({ name: "(Start-Process calc)" }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.kind).toBe("invalid");
+    expect(outcome.error.token).toBe("name");
+    // The exact executable line the pre-fix implementation produced.
+    expect(JSON.stringify(outcome)).not.toContain("Write-Output (Start-Process calc)");
+    // And the message names what to remove, or it is a dead end.
+    expect(outcome.error.message).toContain("parentheses");
+    // The ordinary label, minus the parens, still runs.
+    expect(resolved("Write-Output ${profile.name}\n", server({ name: "Core Switch DC1" }))).toBe(
+      "Write-Output Core Switch DC1\n"
+    );
+  });
+
+  it("refuses braces in a display name — `.{…}` invokes a scriptblock out of characters otherwise legal", () => {
+    // `&` is already refused, but `.` cannot be (every site-code label has dots),
+    // so a scriptblock literal is one permitted character away from running.
+    const outcome = resolveProfileTokens("${profile.name}\n", server({ name: ".{Start-Process calc}" }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.token).toBe("name");
+    expect(JSON.stringify(outcome)).not.toContain(".{Start-Process calc}\\n");
+    expect(outcome.error.message).toContain("braces");
+  });
+
+  it("refuses parens and braces one at a time, and only in `name` — the address charsets are untouched", () => {
+    for (const bad of ["a(b", "a)b", "a{b", "a}b", "(id)", "Core Switch (DC1)"]) {
+      expect(resolveProfileTokens("x ${profile.name}", server({ name: bad })).ok, `name ${bad}`).toBe(false);
+    }
+    // `host`/`ipmiHost` never accepted these anyway (they are charsets, not
+    // blacklists) and MUST keep accepting `[]` for bracketed IPv6.
+    expect(resolveProfileTokens("-H ${profile.ipmiHost}", server({ ipmiHost: "(id)" })).ok).toBe(false);
+    expect(resolved("-H ${profile.ipmiHost}", server({ ipmiHost: "[fe80::1]" }))).toBe("-H [fe80::1]");
   });
 
   it("refuses a username carrying shell syntax — it reaches a local command line too", () => {

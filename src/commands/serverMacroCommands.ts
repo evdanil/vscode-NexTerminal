@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
+import { effectiveServerUsername } from "../models/config";
 import type { TerminalMacro } from "../models/terminalMacro";
 import { macroRunTargetBadge, resolveMacroRunTarget } from "../models/terminalMacro";
 import { getMacros } from "../macroSettings";
@@ -269,6 +270,33 @@ async function reportProfileTokenError(error: ProfileTokenError, server: ServerC
 }
 
 /**
+ * The server facts `${profile.*}` resolves against: `server`, with `username`
+ * replaced by the one a CONNECTION would actually use.
+ *
+ * REVIEW FINDING (P2) — a server that links an auth profile keeps its own
+ * `username` stored underneath the link, and the connect path
+ * (`SilentAuthSshFactory.resolveServer`) logs in as the PROFILE's when the
+ * profile supplies one. Reading `server.username` here therefore resolved
+ * `${profile.username}` to an account the session is not using — silently wrong
+ * in exactly the shipped case this token exists for, `ipmitool -U
+ * ${profile.username}`, where the two credentials belong to the same appliance.
+ * The precedence is not re-derived: `effectiveServerUsername` (models/config.ts)
+ * is the same rule the connect path decides by.
+ *
+ * Only `username` moves. Every other token is the server's own field, and the
+ * ORIGINAL `server` is what the refusal path hands to `nexus.server.edit` — the
+ * record the user can actually edit. (A profile-supplied username that fails the
+ * charset check is therefore reported against the server whose run it refused,
+ * with the repair one hop further on, in the linked auth profile; the message
+ * names the offending value, which is what identifies it.)
+ */
+function profileTokenServer(ctx: CommandContext, server: ServerConfig): ServerConfig {
+  const profile = server.authProfileId ? ctx.core.getAuthProfile(server.authProfileId) : undefined;
+  const username = effectiveServerUsername(server, profile);
+  return username === server.username ? server : { ...server, username };
+}
+
+/**
  * The macro the caller already picked, if any. `nexus.macro.run` and the
  * keybinding paths know WHICH macro but not which server, so they redirect here
  * (`runOrSendMacro` in macroCommands.ts) — re-asking for the macro would make
@@ -321,9 +349,14 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
     return;
   }
 
+  // What the tokens see — `server` plus the linked auth profile's username where
+  // there is one. The PICKER is built from it too, so the flag it shows and the
+  // refusal on selection cannot disagree.
+  const tokenServer = profileTokenServer(ctx, server);
+
   let macro = preselectedMacro(arg, macros);
   if (!macro) {
-    const picked = await vscode.window.showQuickPick(buildServerMacroPicks(macros, server), {
+    const picked = await vscode.window.showQuickPick(buildServerMacroPicks(macros, tokenServer), {
       title: `Run Macro on "${server.name}"`,
       placeHolder: "Select a macro — ${profile.…} tokens resolve against this server"
     });
@@ -336,7 +369,7 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
   // Profile tokens are resolved FIRST and synchronously: a macro that cannot be
   // resolved against this server must fail before anything is connected, any
   // terminal is created, and any prompt is shown.
-  const resolution = resolveProfileTokens(macro.text, server);
+  const resolution = resolveProfileTokens(macro.text, tokenServer);
   if (!resolution.ok) {
     await reportProfileTokenError(resolution.error, server);
     return;
