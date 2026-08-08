@@ -71,7 +71,11 @@ export class WebviewFormPanel {
       if (message.type === "autofill" && this.onAutofill) {
         const result = await this.onAutofill(message.key, message.value);
         if (result && !this.disposed) {
-          void this.panel.webview.postMessage({ type: "fillFields", values: result });
+          // `key` travels back with the values: the webview tracks which keys
+          // the AUTH PROFILE select filled (formHtml's profileFilledKeys), and
+          // must not let another autofill-capable select's answer be mistaken
+          // for the profile's.
+          void this.panel.webview.postMessage({ type: "fillFields", key: message.key, values: result });
         }
       }
       if (message.type === "test" && this.onTest) {

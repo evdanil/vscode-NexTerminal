@@ -531,13 +531,14 @@ describe("renderFormHtml", () => {
   });
 
   /**
-   * FINDING 2 (P2) — the lock half of the blank-username fix. Exercised by
-   * running the real `updateProfileManagedFields` out of the rendered script
-   * against a stub DOM (same extract-and-invoke idiom as
-   * macroEditorHtml.test.ts), because a string assertion cannot tell whether
-   * the guard actually keeps an empty field editable.
+   * REVIEW FINDING (P2) — field ownership is TRACKED (which keys the current
+   * autofill supplied), never inferred from what the field happens to hold.
+   * Exercised by running the real functions out of the rendered script against
+   * a stub DOM (same extract-and-invoke idiom as macroEditorHtml.test.ts),
+   * because a string assertion cannot tell whether the guard actually keeps a
+   * field editable.
    */
-  describe("updateProfileManagedFields — locking only what the linked profile filled", () => {
+  describe("profile-managed field locking — tracked ownership, not the field's current value", () => {
     interface StubElement {
       tagName: string;
       type?: string;
@@ -549,8 +550,8 @@ describe("renderFormHtml", () => {
       closest?: (selector: string) => unknown;
     }
 
-    function extractUpdateProfileManagedFields(html: string): (doc: unknown) => void {
-      const signature = "function updateProfileManagedFields()";
+    /** Slices one top-level function out of the rendered script by brace depth. */
+    function extractFunctionSource(html: string, signature: string): string {
       const start = html.indexOf(signature);
       expect(start).toBeGreaterThan(-1);
       let depth = 0;
@@ -566,14 +567,38 @@ describe("renderFormHtml", () => {
         }
       }
       expect(end).toBeGreaterThan(start);
-      const source = html.slice(start, end + 1);
-      // `document` is the only global the extracted function touches, so it is
-      // injected as the factory's parameter and closed over by the returned
-      // function — one stub DOM per invocation.
-      const factory = new Function("document", `${source}\nreturn updateProfileManagedFields;`) as (
+      return html.slice(start, end + 1);
+    }
+
+    function extractUpdateProfileManagedFields(
+      html: string
+    ): (doc: unknown, filledKeys: Record<string, boolean>) => void {
+      const source = extractFunctionSource(html, "function updateProfileManagedFields()");
+      // `document` and `profileFilledKeys` are the only two things the
+      // extracted function reads from its closure, so both are injected as
+      // factory parameters — and the second one IS the signal under test.
+      const factory = new Function(
+        "document",
+        "profileFilledKeys",
+        `${source}\nreturn updateProfileManagedFields;`
+      ) as (doc: unknown, filledKeys: Record<string, boolean>) => () => void;
+      return (doc, filledKeys) => factory(doc, filledKeys)();
+    }
+
+    function extractSeededProfileFilledKeys(html: string): (doc: unknown) => Record<string, boolean> {
+      const source = extractFunctionSource(html, "function seededProfileFilledKeys()");
+      const factory = new Function("document", `${source}\nreturn seededProfileFilledKeys;`) as (
         doc: unknown
-      ) => () => void;
+      ) => () => Record<string, boolean>;
       return (doc: unknown) => factory(doc)();
+    }
+
+    function extractFilledKeysFromValues(html: string): (values: Record<string, unknown>) => Record<string, boolean> {
+      const source = extractFunctionSource(html, "function filledKeysFromValues(values)");
+      const factory = new Function(`${source}\nreturn filledKeysFromValues;`) as () => (
+        values: Record<string, unknown>
+      ) => Record<string, boolean>;
+      return factory();
     }
 
     /**
@@ -619,35 +644,44 @@ describe("renderFormHtml", () => {
 
     const run = renderFormHtml({ title: "Test", fields: [] });
 
-    it("locks a managed field the profile filled", () => {
+    it("locks a managed field the current autofill supplied", () => {
       const update = extractUpdateProfileManagedFields(run);
       const { document, field, button } = makeDom({ linkedProfileId: "ap1", fieldValue: "labuser" });
-      update(document);
+      update(document, { defaultUsername: true });
       expect(field.readOnly).toBe(true);
       expect(field.style.opacity).toBe("0.6");
       expect(button.disabled).toBe(true);
     });
 
-    it("leaves a managed field the linked profile left EMPTY editable (kills locking on `isLinked` alone, which freezes a required field the mirror never filled — an imported profile with a whitespace-only username, or a key profile with no key path — leaving the user nothing to correct and Save permanently refused)", () => {
+    it("leaves a PREFILLED managed field editable when the linked profile supplied nothing for it (kills inferring ownership from the field's current value: on Edit the record prefills it and on Add mostCommonUsername does, so a value test locks the user's own fallback under a blank-username profile — the very field authProfileUsernameMirror declined to touch — and it can never be changed while that profile stays selected)", () => {
       const update = extractUpdateProfileManagedFields(run);
-      const { document, field, button } = makeDom({ linkedProfileId: "ap1", fieldValue: "" });
-      update(document);
+      const { document, field, button } = makeDom({ linkedProfileId: "ap1", fieldValue: "labuser" });
+      update(document, {});
       expect(field.readOnly).toBe(false);
       expect(field.style.opacity).toBe("");
       expect(button.disabled).toBe(false);
     });
 
-    it("treats a whitespace-only field value as empty too (kills a bare `!== \"\"` check that a mirrored \"   \" would satisfy)", () => {
+    it("leaves a managed field the linked profile left EMPTY editable (kills locking on `isLinked` alone, which freezes a required field the mirror never filled — an imported profile with a whitespace-only username, or a key profile with no key path — leaving the user nothing to correct and Save permanently refused)", () => {
       const update = extractUpdateProfileManagedFields(run);
-      const { document, field } = makeDom({ linkedProfileId: "ap1", fieldValue: "   " });
-      update(document);
+      const { document, field, button } = makeDom({ linkedProfileId: "ap1", fieldValue: "" });
+      update(document, {});
       expect(field.readOnly).toBe(false);
+      expect(field.style.opacity).toBe("");
+      expect(button.disabled).toBe(false);
+    });
+
+    it("keeps a field the profile DID supply locked even once its value is cleared (kills re-adding a \"the field holds something\" conjunct: emptying a mirrored field does not hand ownership back, and unlocking it there would let a value be typed that the save overwrites from the profile anyway)", () => {
+      const update = extractUpdateProfileManagedFields(run);
+      const { document, field } = makeDom({ linkedProfileId: "ap1", fieldValue: "" });
+      update(document, { defaultUsername: true });
+      expect(field.readOnly).toBe(true);
     });
 
     it("never locks an unlinked field, however filled (kills dropping the isLinked half of the condition)", () => {
       const update = extractUpdateProfileManagedFields(run);
       const { document, field, button } = makeDom({ linkedProfileId: "", fieldValue: "hand-typed" });
-      update(document);
+      update(document, { defaultUsername: true });
       expect(field.readOnly).toBe(false);
       expect(button.disabled).toBe(false);
     });
@@ -657,10 +691,73 @@ describe("renderFormHtml", () => {
       const { document, field, button } = makeDom({ linkedProfileId: "ap1", fieldValue: "" });
       field.readOnly = true;
       button.disabled = true;
-      update(document);
+      update(document, {});
       expect(field.readOnly).toBe(true);
       expect(button.disabled).toBe(true);
     });
+
+    /** The initial-render entry point: ownership before any autofill has run. */
+    function makeSeedDom(autofillFilled: string | undefined) {
+      return {
+        getElementById: (id: string): unknown =>
+          id === "field-authProfileId" ? { dataset: { autofillFilled } } : null
+      };
+    }
+
+    it("seeds ownership from the select's data-autofill-filled attribute (kills leaving the initial render with no record at all, which unlocks every mirrored field on Edit until the profile is re-picked)", () => {
+      const seed = extractSeededProfileFilledKeys(run);
+      expect(seed(makeSeedDom('["username","authType","defaultUsername"]'))).toEqual({
+        username: true,
+        authType: true,
+        defaultUsername: true
+      });
+    });
+
+    it("seeds nothing when the selected profile fills nothing (no attribute rendered)", () => {
+      const seed = extractSeededProfileFilledKeys(run);
+      expect(seed(makeSeedDom(undefined))).toEqual({});
+    });
+
+    it("survives a malformed seed attribute (kills an unguarded JSON.parse taking the whole form script down)", () => {
+      const seed = extractSeededProfileFilledKeys(run);
+      expect(seed(makeSeedDom("{not json"))).toEqual({});
+    });
+
+    it("records exactly the keys a fill response supplied", () => {
+      const record = extractFilledKeysFromValues(run);
+      expect(record({ defaultUsername: "labuser" })).toEqual({ defaultUsername: true });
+      expect(record({})).toEqual({});
+    });
+
+    it("does not record a key whose supplied value is blank (kills trusting the payload verbatim: the server and unified profile forms' mirrors send profile.username unfiltered, so an imported whitespace-only username would lock a required field onto a value no login can use)", () => {
+      const record = extractFilledKeysFromValues(run);
+      expect(record({ username: "   ", authType: "password" })).toEqual({ authType: true });
+    });
+  });
+
+  it("resets tracked ownership when a different auth profile is picked, before re-evaluating the lock (kills carrying the previous profile's keys across a selection: they stay locked through the whole round trip, and forever if the new profile fills nothing)", () => {
+    const html = renderFormHtml({ title: "Test", fields: [] });
+    // Slice the user-click callback out so the addSelectOption handler's own
+    // reset cannot satisfy these assertions.
+    const start = html.indexOf("initCustomSelects(function(wrapper, opt) {");
+    const end = html.indexOf("initCustomComboboxes();");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = html.slice(start, end);
+    const resetIndex = block.indexOf("profileFilledKeys = {};");
+    expect(resetIndex).toBeGreaterThan(-1);
+    expect(block.indexOf("updateProfileManagedFields();")).toBeGreaterThan(resetIndex);
+  });
+
+  it("attributes a fillFields answer to the auth profile select by the echoed key (kills recording another autofill-capable select's answer as the profile's, and kills never recording at all)", () => {
+    const html = renderFormHtml({ title: "Test", fields: [] });
+    const start = html.indexOf('if (msg.type === "fillFields")');
+    const end = html.indexOf('if (msg.type === "validationError")');
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = html.slice(start, end);
+    expect(block).toContain('if (msg.key === "authProfileId") {');
+    expect(block).toContain("profileFilledKeys = filledKeysFromValues(fillValues);");
   });
 
   it("locks Default SSH Username alongside the server form's credential fields while a profile is linked", () => {
@@ -691,6 +788,49 @@ describe("renderFormHtml", () => {
     expect(block).toContain("updateProfileManagedFields();");
     expect(block.indexOf("type: 'autofill'")).toBeGreaterThan(selectIndex);
     expect(block.indexOf("updateProfileManagedFields();")).toBeGreaterThan(selectIndex);
+    // Including the ownership reset: an inline-created profile owns nothing
+    // until its own fill answers, exactly like one picked from the list.
+    expect(block).toContain("profileFilledKeys = {};");
+  });
+
+  it("renders the initially selected profile's filled keys onto the Auth Profile select (kills leaving the render-time seed off, which is the only thing the webview can know before the first autofill)", () => {
+    const html = renderFormHtml({
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "authProfileId",
+          label: "Auth Profile",
+          options: [
+            { label: "(None)", value: "" },
+            { label: "Prod", value: "ap1" }
+          ],
+          value: "ap1",
+          autofill: true,
+          autofillFilledKeys: ["username", "authType"]
+        }
+      ]
+    });
+    expect(html).toContain("data-autofill-filled='[&quot;username&quot;,&quot;authType&quot;]'");
+  });
+
+  it("omits the seed attribute entirely when the selected profile fills nothing", () => {
+    const html = renderFormHtml({
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "authProfileId",
+          label: "Auth Profile",
+          options: [{ label: "(None)", value: "" }],
+          value: "",
+          autofill: true,
+          autofillFilledKeys: []
+        }
+      ]
+    });
+    // The attribute itself, not the script comment that names it.
+    expect(html).not.toContain("data-autofill-filled='");
   });
 
   it("renders a dangling seeded auth profile id as an empty hidden value, not just an empty label", () => {

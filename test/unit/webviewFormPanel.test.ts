@@ -96,8 +96,12 @@ describe("WebviewFormPanel submit handling", () => {
     await Promise.resolve(messageHandler!({ type: "autofill", key: "authProfileId", value: "ap1" }));
 
     expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1");
+    // `key` echoes the request: the webview tracks which managed fields the
+    // AUTH PROFILE select filled, and must not read another autofill-capable
+    // select's answer as the profile's (kills dropping the echo).
     expect(postMessage).toHaveBeenCalledWith({
       type: "fillFields",
+      key: "authProfileId",
       values: { username: "root", authType: "key" }
     });
   });

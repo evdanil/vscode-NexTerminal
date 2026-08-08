@@ -8,6 +8,7 @@ import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigReposi
 // --- vscode mock state ---
 const mockPostMessage = vi.fn();
 const mockShowWarningMessage = vi.fn();
+const mockShowErrorMessage = vi.fn();
 const mockShowOpenDialog = vi.fn();
 let onDidReceiveMessageHandler: ((msg: Record<string, unknown>) => void) | undefined;
 let onDidDisposeHandler: (() => void) | undefined;
@@ -31,6 +32,7 @@ vi.mock("vscode", () => ({
       dispose: vi.fn()
     })),
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
+    showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
     showOpenDialog: (...args: unknown[]) => mockShowOpenDialog(...args)
   },
   ViewColumn: { Active: 1 },
@@ -355,6 +357,146 @@ describe("AuthProfileEditorPanel", () => {
     // was deleted, restored by a write that had already been superseded.
     expect(persisted[0].authProfileId).toBeUndefined();
     expect(core.getSnapshot().inventorySources[0].authProfileId).toBeUndefined();
+  });
+
+  /**
+   * REVIEW FINDING (P2) — the confirmation's linked-source count is sampled
+   * BEFORE the modal, but the deletion only runs after the modal AND after the
+   * wait for configMutationLock. An inventory-source save that is already
+   * inside that lock and still awaiting its vault I/O commits its profile link
+   * inside exactly that window, so the deletion would clear a source the
+   * warning never disclosed.
+   *
+   * Every test below gates the concurrent write instead of racing it: the
+   * writer parks in the lock until the test releases it, so it is GUARANTEED to
+   * commit while the deletion is queued behind it. A test that merely usually
+   * wins the race proves nothing.
+   */
+  describe("delete confirmation re-checked after the lock wait", () => {
+    /** Parks inside the lock until released — the "awaiting vault I/O" phase. */
+    function gatedLockedWrite(
+      lock: { runExclusive: <T>(fn: () => Promise<T>) => Promise<T> },
+      write: () => Promise<void>
+    ): { done: Promise<void>; release: () => void } {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const done = lock.runExclusive(async () => {
+        await gate;
+        await write();
+      });
+      return { done, release };
+    }
+
+    it("(REVIEW FINDING, P2) refuses when an inventory source was linked to the profile while the deletion waited for the lock, instead of clearing a source the warning never mentioned (kills sampling the linked set only before the modal)", async () => {
+      const profile = makeAuthProfile({ id: "ap1" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+      // Unlinked when the warning is composed — this is what makes the shown
+      // text under-disclose.
+      await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1" }));
+
+      const { configMutationLock } = await import("../../src/services/configMutationLock");
+      const save = gatedLockedWrite(configMutationLock, () =>
+        core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1", authProfileId: "ap1" }))
+      );
+      await settle();
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+      // Snapshot taken and modal answered; the deletion is now parked on the
+      // lock the save still holds. The warning promised nothing about sources.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Delete auth profile "Prod Auth"?',
+        { modal: true },
+        "Delete"
+      );
+
+      save.release();
+      await save.done;
+      await deletion;
+
+      expect(core.getAuthProfile("ap1")).toBeDefined();
+      expect(core.getInventorySource("src-1")?.authProfileId).toBe("ap1");
+      expect(vault.delete).not.toHaveBeenCalled();
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        'Auth profile "Prod Auth" changed while the confirmation was open — nothing was deleted. Delete it again to review what is linked now.'
+      );
+    });
+
+    it("(REVIEW FINDING, P2) refuses when the profile was renamed while the deletion waited, so a profile is never deleted under a name the user was not shown (kills comparing only the linked counts instead of the rendered warning)", async () => {
+      const profile = makeAuthProfile({ id: "ap1" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+
+      const { configMutationLock } = await import("../../src/services/configMutationLock");
+      const rename = gatedLockedWrite(configMutationLock, () =>
+        core.addOrUpdateAuthProfile({ ...profile, name: "Staging Auth" })
+      );
+      await settle();
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+
+      rename.release();
+      await rename.done;
+      await deletion;
+
+      expect(core.getAuthProfile("ap1")?.name).toBe("Staging Auth");
+      expect(vault.delete).not.toHaveBeenCalled();
+      // Quoted by the name the modal used — that is the profile the user acted on.
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        'Auth profile "Prod Auth" changed while the confirmation was open — nothing was deleted. Delete it again to review what is linked now.'
+      );
+    });
+
+    it("(REVIEW FINDING, P2) says so when the profile was deleted by something else while the confirmation was open, rather than reporting a deletion it did not perform", async () => {
+      const profile = makeAuthProfile({ id: "ap1" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+
+      const { configMutationLock } = await import("../../src/services/configMutationLock");
+      const wipe = gatedLockedWrite(configMutationLock, () => core.removeAuthProfile("ap1"));
+      await settle();
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+
+      wipe.release();
+      await wipe.done;
+      await deletion;
+
+      expect(vault.delete).not.toHaveBeenCalled();
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        'Auth profile "Prod Auth" was deleted while the confirmation was open — nothing more was removed.'
+      );
+    });
+
+    it("still deletes when an unrelated inventory write lands while it waits, because what would be disclosed is unchanged (kills aborting on any concurrent change rather than on a changed disclosure)", async () => {
+      const profile = makeAuthProfile({ id: "ap1" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+      await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1" }));
+
+      const { configMutationLock } = await import("../../src/services/configMutationLock");
+      const save = gatedLockedWrite(configMutationLock, () =>
+        core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1", name: "Renamed NetBox" }))
+      );
+      await settle();
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+
+      save.release();
+      await save.done;
+      await deletion;
+
+      expect(core.getAuthProfile("ap1")).toBeUndefined();
+      expect(vault.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
+      expect(vault.delete).toHaveBeenCalledWith(authProfilePassphraseSecretKey("ap1"));
+      expect(mockShowErrorMessage).not.toHaveBeenCalled();
+    });
   });
 
   it("delete profile does nothing if user cancels", async () => {

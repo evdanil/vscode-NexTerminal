@@ -89,6 +89,12 @@ function renderField(field: FormFieldDescriptor): string {
       const selectedLabel = selectedOpt?.label ?? "";
       const selectedValue = field.value ?? field.options[0]?.value ?? "";
       const autofillAttr = field.autofill ? ' data-autofill="true"' : "";
+      // The initial ownership record: which keys the ALREADY SELECTED option's
+      // autofill fills. Omitted when it fills nothing, which the script reads
+      // as the same empty set.
+      const filledAttr = field.autofillFilledKeys && field.autofillFilledKeys.length > 0
+        ? ` data-autofill-filled='${escapeHtml(JSON.stringify(field.autofillFilledKeys))}'`
+        : "";
       const optionsHtml = field.options.map((opt) =>
         `<div class="custom-select-option${opt.value === selectedValue ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">` +
         `<div class="custom-select-option-label">${escapeHtml(opt.label)}</div>` +
@@ -97,7 +103,7 @@ function renderField(field: FormFieldDescriptor): string {
       ).join("\n      ");
       return `<div class="form-group"${vw}>
   <label>${escapeHtml(field.label)}</label>
-  <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}>
+  <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}>
     <input type="hidden" name="${key}" value="${escapeHtml(selectedValue)}" />
     <div class="custom-select-trigger" tabindex="0">
       <span class="custom-select-text">${escapeHtml(selectedLabel)}</span>
@@ -212,6 +218,66 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
     (function() {
       var vscode = acquireVsCodeApi();
       var form = document.getElementById("nexus-form");
+
+      // ── WHICH MANAGED FIELDS THE LINKED AUTH PROFILE SUPPLIED ──────────
+      // REVIEW FINDING (P2) — ownership is TRACKED, never inferred from what a
+      // managed field currently holds. Every entry point into the form arrives
+      // with those fields already populated: Edit prefills them from the
+      // record, and Add prefills Default SSH Username from mostCommonUsername.
+      // So "the field has a value" is evidence of nothing — least of all for
+      // the profile that fills NOTHING (an imported profile whose username is
+      // whitespace-only: authProfileUsernameMirror answers an EMPTY payload
+      // precisely to leave the user's own value alone), where a value test
+      // locks the very fallback the mirror just declined to touch and the user
+      // is left unable to change it while that profile stays selected.
+      //
+      // The signal is the autofill itself: the keys the CURRENT profile's fill
+      // response actually supplied, seeded at render time from the select's
+      // data-autofill-filled attribute and replaced on every later transition
+      // — emptied the moment a different profile is chosen (it has supplied
+      // nothing yet), then rebuilt when that choice's fillFields answer lands.
+      var profileFilledKeys = seededProfileFilledKeys();
+
+      /** The render-time seed — the keys the initially selected profile fills. */
+      function seededProfileFilledKeys() {
+        var wrapper = document.getElementById("field-authProfileId");
+        var raw = wrapper && wrapper.dataset ? wrapper.dataset.autofillFilled : "";
+        var filled = {};
+        if (!raw) {
+          return filled;
+        }
+        try {
+          var parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            for (var i = 0; i < parsed.length; i++) {
+              filled[parsed[i]] = true;
+            }
+          }
+        } catch (_error) {
+          // Same posture as parseVisibleWhen: a malformed attribute leaves the
+          // fields editable rather than taking the whole form script down.
+        }
+        return filled;
+      }
+
+      /**
+       * The ownership record a fill response implies. A key whose supplied
+       * value is blank counts as NOT filled: the server and profile forms'
+       * mirrors hand over profile.username verbatim, so a whitespace-only
+       * username would otherwise lock a required field onto a value no login
+       * can use — the same rule authProfileUsernameMirror applies before it
+       * ever answers.
+       */
+      function filledKeysFromValues(values) {
+        var filled = {};
+        for (var key in values) {
+          var value = values[key];
+          if (value === undefined || value === null) continue;
+          if (String(value).trim() === "") continue;
+          filled[key] = true;
+        }
+        return filled;
+      }
 
       function parseVisibleWhen(raw) {
         if (!raw) {
@@ -366,24 +432,24 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           if (!fieldEl) continue;
           var group = fieldEl.closest ? fieldEl.closest(".form-group") : fieldEl.parentElement;
           if (!group) continue;
-          // REVIEW FINDING (P2) — a managed field is locked only when it
-          // actually HOLDS something. A linked profile that supplies no value
-          // for this field (an imported profile whose username is
-          // whitespace-only; a key profile with no key path) leaves it empty,
-          // and locking an empty REQUIRED field is a dead end: the mirror wrote
-          // nothing, the user cannot type, and Save is refused by the
-          // required-field check with no field left to correct. Locking only
-          // what the profile filled keeps the two halves consistent — the
-          // mirror declines to fill a blank (see inventoryCommands'
-          // authProfileUsernameMirror) and the lock declines to freeze it.
-          // Evaluated against the field's CURRENT value, so it re-settles on
-          // every call: on selection (pre-mirror), when the mirror's fillFields
-          // lands, and on an injected inline-created option.
-          var valueEl = fieldEl.tagName === "INPUT" || fieldEl.tagName === "TEXTAREA"
-            ? fieldEl
-            : fieldEl.querySelector('[name="' + managedKeys[mi] + '"]');
-          var hasValue = !!valueEl && String(valueEl.value == null ? "" : valueEl.value).trim() !== "";
-          var locked = !!isLinked && hasValue;
+          // A managed field is locked only when the LINKED PROFILE supplied it
+          // (see profileFilledKeys above). Two cases that separates, which a
+          // test over the field's own value cannot:
+          //   * a profile that fills nothing for this key (whitespace-only
+          //     username; key profile with no key path) leaves the field
+          //     editable whether it is empty or was prefilled by the form —
+          //     locking an empty REQUIRED field is a dead end (nothing wrote
+          //     it, nobody can type into it, Save is refused for a field there
+          //     is no longer any way to fill), and locking a PREFILLED one
+          //     freezes the user's own fallback, which is the value the save
+          //     will actually store for such a profile;
+          //   * a key the profile DID fill stays locked even once its value is
+          //     cleared, because clearing a mirrored field does not hand
+          //     ownership back.
+          // Re-settles on every call, since profileFilledKeys is maintained at
+          // each entry point: initial render, selection (pre-fill), the
+          // fillFields answer, and an injected inline-created option.
+          var locked = !!isLinked && profileFilledKeys[managedKeys[mi]] === true;
           var inputs = group.querySelectorAll("input, textarea");
           for (var ii = 0; ii < inputs.length; ii++) {
             var input = inputs[ii];
@@ -433,6 +499,11 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: value });
         }
         if (wrapper.dataset.name === 'authProfileId') {
+          // The newly chosen profile has supplied nothing yet — the previous
+          // one's ownership dies with the selection, so the fields it filled
+          // unlock until this profile's own fillFields says which of them it
+          // fills. Also covers (None), which posts no autofill at all.
+          profileFilledKeys = {};
           updateProfileManagedFields();
         }
       });
@@ -470,6 +541,9 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
               vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value });
             }
             if (wrapper.dataset.name === 'authProfileId') {
+              // Same ownership reset as the user-click path above — an
+              // inline-created profile starts owning nothing.
+              profileFilledKeys = {};
               updateProfileManagedFields();
             }
           }
@@ -485,6 +559,13 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             if (wrapper && wrapper.classList.contains("custom-select")) {
               selectCustomOption(wrapper, fillValues[fk]);
             }
+          }
+          // The answer to the auth-profile autofill IS the ownership record:
+          // these keys, and only these, came from the profile just selected.
+          // Scoped by the echoed key so another autofill-capable select's
+          // answer can never be read as the profile's.
+          if (msg.key === "authProfileId") {
+            profileFilledKeys = filledKeysFromValues(fillValues);
           }
           updateVisibility();
           updateProfileManagedFields();

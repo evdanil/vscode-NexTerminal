@@ -20,6 +20,47 @@ interface AuthProfileSelectOptions {
   hint?: string;
 }
 
+/**
+ * REVIEW FINDING (P2) \u2014 the render-time half of the webview's field-ownership
+ * tracking (`profileFilledKeys` in formHtml.ts). A form opens with its managed
+ * fields already populated \u2014 Edit from the record, Add from
+ * `mostCommonUsername` \u2014 so the webview cannot tell from a field's contents
+ * whether the linked profile put them there; it has to be told, and only this
+ * side knows the profile.
+ *
+ * ONE RULE, shared with the two runtime mirrors this seeds for: a profile owns
+ * a managed key only when it has a usable (non-blank) value for it.
+ *   * `username` / `defaultUsername` \u2014 the server and unified profile forms'
+ *     `onAutofill` sends `profile.username`, the inventory source form's
+ *     `authProfileUsernameMirror` sends it as `defaultUsername` and answers
+ *     `{}` when it is blank. The webview drops blank values on arrival, so
+ *     both agree with the blank test below.
+ *   * `authType` \u2014 always sent by the forms that render it, and never blank.
+ *   * `keyPath` \u2014 sent only when the profile has one.
+ * Keys a form does not render are skipped by the lock loop, so one list serves
+ * every form that renders this select (the same arrangement as its
+ * `managedKeys`).
+ */
+function authProfileFilledKeys(profile: AuthProfile | undefined): string[] {
+  if (!profile) {
+    return [];
+  }
+  // Listed in the webview's own managedKeys order, so the two read together.
+  const hasUsername = profile.username.trim() !== "";
+  const keys: string[] = [];
+  if (hasUsername) {
+    keys.push("username");
+  }
+  keys.push("authType");
+  if ((profile.keyPath ?? "").trim() !== "") {
+    keys.push("keyPath");
+  }
+  if (hasUsername) {
+    keys.push("defaultUsername");
+  }
+  return keys;
+}
+
 function authProfileSelectField(
   authProfiles?: AuthProfile[],
   vw?: VisibleWhen,
@@ -31,6 +72,7 @@ function authProfileSelectField(
     ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id })),
     { label: "Create new auth profile\u2026", value: "__create__authProfile" }
   ];
+  const selectedProfile = selectedId ? (authProfiles ?? []).find((p) => p.id === selectedId) : undefined;
   return {
     type: "select",
     key: "authProfileId",
@@ -40,6 +82,7 @@ function authProfileSelectField(
     hint: opts?.hint ?? AUTH_PROFILE_HINT,
     advanced: opts?.advanced ?? true,
     autofill: true,
+    autofillFilledKeys: authProfileFilledKeys(selectedProfile),
     visibleWhen: vw
   };
 }

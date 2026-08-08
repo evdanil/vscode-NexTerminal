@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
-import type { AuthProfile, AuthType } from "../models/config";
+import type { AuthProfile, AuthType, ServerConfig } from "../models/config";
+import type { InventorySourceConfig } from "../models/inventory";
 import { configMutationLock } from "../services/configMutationLock";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import { renderAuthProfileEditorHtml } from "./authProfileEditorHtml";
@@ -21,6 +22,40 @@ function isAuthType(value: unknown): value is AuthType {
 
 function profileSignature(profiles: AuthProfile[]): string {
   return profiles.map((p) => `${p.id}:${p.name}:${p.username}:${p.authType}:${p.keyPath ?? ""}`).join("|");
+}
+
+/**
+ * The delete confirmation's text, in full — the profile's name and everything
+ * losing its link to it.
+ *
+ * Inventory sources link a profile too, and this delete silently clears that
+ * link (NexusCore.removeAuthProfile). Afterwards nothing else says so: the sync
+ * engine sees a plain profile-less source, so its dangling-profile warning
+ * never fires either, and the next device synced arrives on the default
+ * username + SSH agent — broken on password/key infrastructure, with no signal
+ * anywhere. This sentence is the only disclosure, so it has to be here.
+ *
+ * REVIEW FINDING (P2) — factored out of the handler so the SHOWN text can be
+ * rendered again after the lock is acquired and compared, following the
+ * captured-vs-fresh discipline `planDetailDrift` established in
+ * inventoryCommands.ts: the rendered string IS the comparator, so every fact
+ * the modal discloses is covered — the two counts and the profile's own name —
+ * with no per-field list to keep in sync by hand.
+ */
+function describeDeleteDetail(
+  profile: AuthProfile,
+  servers: ServerConfig[],
+  sources: InventorySourceConfig[]
+): string {
+  const linkedCount = servers.filter((s) => s.authProfileId === profile.id).length;
+  const linkedNote = linkedCount > 0
+    ? ` ${linkedCount} server(s) are linked and will revert to their own stored credentials.`
+    : "";
+  const linkedSourceCount = sources.filter((s) => s.authProfileId === profile.id).length;
+  const sourceNote = linkedSourceCount > 0
+    ? ` ${linkedSourceCount} inventory source${linkedSourceCount === 1 ? " is" : "s are"} linked; servers ${linkedSourceCount === 1 ? "it syncs" : "they sync"} will use the default username with SSH agent authentication.`
+    : "";
+  return `Delete auth profile "${profile.name}"?${linkedNote}${sourceNote}`;
 }
 
 export class AuthProfileEditorPanel {
@@ -179,27 +214,9 @@ export class AuthProfileEditorPanel {
           if (!profile) break;
 
           const snapshot = this.core.getSnapshot();
-          const linkedCount = snapshot.servers.filter(
-            (s) => s.authProfileId === id
-          ).length;
-          const linkedNote = linkedCount > 0
-            ? ` ${linkedCount} server(s) are linked and will revert to their own stored credentials.`
-            : "";
-          // Inventory sources link a profile too, and this delete silently
-          // clears that link (NexusCore.removeAuthProfile). Afterwards nothing
-          // else says so: the sync engine sees a plain profile-less source, so
-          // its dangling-profile warning never fires either, and the next
-          // device synced arrives on the default username + SSH agent — broken
-          // on password/key infrastructure, with no signal anywhere. This
-          // sentence is the only disclosure, so it has to be here.
-          const linkedSourceCount = snapshot.inventorySources.filter(
-            (s) => s.authProfileId === id
-          ).length;
-          const sourceNote = linkedSourceCount > 0
-            ? ` ${linkedSourceCount} inventory source${linkedSourceCount === 1 ? " is" : "s are"} linked; servers ${linkedSourceCount === 1 ? "it syncs" : "they sync"} will use the default username with SSH agent authentication.`
-            : "";
+          const shownDetail = describeDeleteDetail(profile, snapshot.servers, snapshot.inventorySources);
           const confirm = await vscode.window.showWarningMessage(
-            `Delete auth profile "${profile.name}"?${linkedNote}${sourceNote}`,
+            shownDetail,
             { modal: true },
             "Delete"
           );
@@ -234,13 +251,57 @@ export class AuthProfileEditorPanel {
           // already resolved and nothing below shows UI (the re-render is a
           // webview post, not a prompt), matching the "acquire after the last
           // prompt" rule the lock documents.
+          let refusal: string | undefined;
           await configMutationLock.runExclusive(async () => {
+            // REVIEW FINDING (P2) — re-read the disclosure AFTER the wait, not
+            // just before the modal. The snapshot above is taken while another
+            // flow can already be inside this lock and merely awaiting vault
+            // I/O — addOrUpdateInventorySource's store loop is exactly that —
+            // so it can report zero linked sources, that save can then commit
+            // the link, and the deletion (queued behind it on this lock) would
+            // clear a source the warning never mentioned. Rendering the
+            // disclosure again HERE is the narrowest window available: once
+            // this lock is held, no other lock-holding write can commit.
+            //
+            // ABORT, NOT RECONFIRM. inventoryCommands has both precedents —
+            // syncNow loops back to the modal on planDetailDrift, editSource
+            // aborts with "reopen Edit Source." — and this is the second. A
+            // reconfirmation would have to release the lock to show UI (the
+            // lock forbids holding it across a modal), re-acquire, and re-check,
+            // i.e. syncNow's bounded retry loop; syncNow earns that machinery
+            // because it has a fetched tree and completed teardowns to protect,
+            // while re-running this delete is one click and rebuilds every fact
+            // from scratch. For a destructive single-object delete whose
+            // consequences no longer match what was consented to, doing nothing
+            // and saying so is the conservative answer.
+            //
+            // The message is deferred rather than shown here: nothing may
+            // display UI while this lock is held.
+            const currentProfile = this.core.getAuthProfile(id);
+            if (!currentProfile) {
+              refusal = `Auth profile "${profile.name}" was deleted while the confirmation was open — nothing more was removed.`;
+              return;
+            }
+            const current = this.core.getSnapshot();
+            const currentDetail = describeDeleteDetail(currentProfile, current.servers, current.inventorySources);
+            if (currentDetail !== shownDetail) {
+              // Quoted by the name the modal used, not the current one: that is
+              // the profile the user acted on, and a rename is one of the
+              // things this catches.
+              refusal = `Auth profile "${profile.name}" changed while the confirmation was open — nothing was deleted. Delete it again to review what is linked now.`;
+              return;
+            }
+
             if (this.secretVault) {
               await this.secretVault.delete(authProfilePasswordSecretKey(id));
               await this.secretVault.delete(authProfilePassphraseSecretKey(id));
             }
             await this.core.removeAuthProfile(id);
           });
+          if (refusal !== undefined) {
+            void vscode.window.showErrorMessage(refusal);
+            break;
+          }
 
           const profiles = this.core.getSnapshot().authProfiles;
           this.selectedId = profiles.length > 0 ? profiles[0].id : null;

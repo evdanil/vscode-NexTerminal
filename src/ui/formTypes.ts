@@ -17,7 +17,15 @@ export type FormFieldDescriptor =
   | ({ type: "textarea"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; rows?: number } & FormFieldCommon)
   | ({ type: "password"; key: string; label: string; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; step?: number | "any"; placeholder?: string; value?: number } & FormFieldCommon)
-  | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string }[]; value?: string; autofill?: boolean } & FormFieldCommon)
+  /**
+   * `autofillFilledKeys` is the render-time half of field-ownership tracking
+   * (see `updateProfileManagedFields` in formHtml.ts): the form keys the
+   * CURRENTLY SELECTED option's autofill fills. The webview locks exactly
+   * these until the next selection replaces them with the keys that
+   * selection's `fillFields` answer actually filled. Only meaningful
+   * alongside `autofill`.
+   */
+  | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string }[]; value?: string; autofill?: boolean; autofillFilledKeys?: string[] } & FormFieldCommon)
   | ({ type: "combobox"; key: string; label: string; suggestions: string[]; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "checkbox"; key: string; label: string; value?: boolean } & FormFieldCommon)
   | ({ type: "file"; key: string; label: string; value?: string } & FormFieldCommon)
@@ -49,4 +57,6 @@ export type ExtensionMessage =
   | { type: "browseResult"; key: string; path: string }
   | { type: "validationError"; errors: Record<string, string> }
   | { type: "addSelectOption"; key: string; value: string; label: string }
-  | { type: "fillFields"; values: Record<string, string> };
+  /** `key` echoes the `autofill` message this answers, so the webview can
+   *  attribute the filled values to the select that asked for them. */
+  | { type: "fillFields"; key: string; values: Record<string, string> };

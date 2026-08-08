@@ -433,4 +433,40 @@ describe("inventorySourceFormDefinition", () => {
       expect(field.value).toBe("p1");
     }
   });
+
+  /**
+   * REVIEW FINDING (P2) — the render-time half of field-ownership tracking. The
+   * webview locks exactly the keys it has been told the selected profile fills;
+   * before the first autofill round trip, this is the only source of that.
+   */
+  describe("autofillFilledKeys — which managed fields the selected profile fills", () => {
+    function filledKeys(definition: ReturnType<typeof inventorySourceFormDefinition>): string[] | undefined {
+      const field = keyedField(definition, "authProfileId");
+      return field.type === "select" ? field.autofillFilledKeys : undefined;
+    }
+
+    it("claims the username keys for a profile that has one, and the key path only for a key profile that has one", () => {
+      expect(filledKeys(inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: "p1" }), undefined, authProfiles)))
+        .toEqual(["username", "authType", "defaultUsername"]);
+      expect(filledKeys(inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: "p2" }), undefined, authProfiles)))
+        .toEqual(["username", "authType", "keyPath", "defaultUsername"]);
+    });
+
+    it("claims NO username key for a profile whose username is whitespace-only (kills seeding ownership from the mere fact that a profile is linked: the form opens with Default SSH Username prefilled — from the record on Edit, from mostCommonUsername on Add — and such a profile fills none of it, so locking it freezes the user's own fallback with no way to change it)", () => {
+      const blank: AuthProfile[] = [{ id: "p3", name: "Imported", username: "   ", authType: "password" }];
+      const definition = inventorySourceFormDefinition(
+        fakeProvider,
+        sourceSeed({ authProfileId: "p3", defaultUsername: "labuser" }),
+        undefined,
+        blank
+      );
+      expect(filledKeys(definition)).toEqual(["authType"]);
+    });
+
+    it("claims nothing when no profile is selected, or when the seeded id resolves to none", () => {
+      expect(filledKeys(inventorySourceFormDefinition(fakeProvider, undefined, undefined, authProfiles))).toEqual([]);
+      expect(filledKeys(inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: "ghost" }), undefined, authProfiles)))
+        .toEqual([]);
+    });
+  });
 });
