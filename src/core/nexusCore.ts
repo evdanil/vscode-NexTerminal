@@ -219,20 +219,178 @@ export class NexusCore {
     this.emitChanged();
   }
 
+  /**
+   * Deletes the profile and clears every reference to it, so nothing is left
+   * pointing at an id that no longer resolves. Two kinds of holder:
+   *
+   *   - servers (`ServerConfig.authProfileId`) — cleared in place, as before;
+   *   - inventory sources (`InventorySourceConfig.authProfileId`) — cleared
+   *     with a FRESH `revision`, because clearing one is a new INCARNATION of
+   *     the record in exactly the sense addOrUpdateInventorySource documents.
+   *     A sync in flight against the old incarnation must abort on
+   *     sourceConfigUnchanged (inventoryCommands' "configuration changed while
+   *     syncing" guard) rather than stamp a profile that was just deleted;
+   *     reusing the revision would let it through. Only referencing sources are
+   *     re-revisioned — churning an unrelated source's revision would abort ITS
+   *     in-flight sync for no reason.
+   *
+   * Persist order is authProfiles -> servers -> inventorySources, each written
+   * only when it actually changed, with a single emitChanged() on the way out
+   * whether the saves succeeded or threw: the profile record must be gone from
+   * disk before the cleared references are, so a rejection midway can never
+   * leave references cleared on disk while the profile they pointed at
+   * survives.
+   *
+   * FINDING A — same discipline as addOrUpdateInventorySource: the source map
+   * is mutated first (repo-wide in-memory-first pattern), but a rejected
+   * saveInventorySources must leave NO trace, or the half-cleared, already
+   * re-revisioned records would be silently committed by the next unrelated
+   * saveInventorySources call from some other command. Capture the previous
+   * entries before mutating and restore them on rejection.
+   *
+   * FINDING 2 (P2) — that restore covers EVERY failure BEFORE the deletion
+   * commits, not just a rejected saveInventorySources. A rejected
+   * saveAuthProfiles leaves the sources cleared and re-revisioned in memory
+   * while disk still holds both the profile and the links, and the next
+   * unrelated inventory-source save from any other command persists the whole
+   * map — silently committing a deletion that failed. The restore therefore
+   * lives in a catch around all three saves, INSIDE the try/finally that owns
+   * the emission, so it always runs before observers are told to re-read (see
+   * the emission note below).
+   *
+   * REVIEW FINDING (P2) — but it is gated on `deletionCommitted`, because past
+   * the FIRST save the restore stops being a rollback and becomes corruption.
+   * Once saveAuthProfiles resolves the profile record is GONE FROM DISK: putting
+   * `authProfileId` back on a source then points memory (and, via the next
+   * unrelated saveInventorySources, disk) at a profile that no longer exists
+   * anywhere. Every later sync falls back to agent authentication with the
+   * dangling-profile warning, and the deletion cannot be retried to fix it —
+   * there is no profile left to select, so nothing can reach removeAuthProfile
+   * with this id again.
+   *
+   * Rolling the WHOLE deletion back instead is not available: the profile's
+   * vault secrets are deleted by the caller BEFORE this method is entered
+   * (AuthProfileEditorPanel's delete handler), so re-saving the record would
+   * resurrect a profile whose password and passphrase are already gone —
+   * a silently broken credential in place of a missing one.
+   *
+   * So the two halves of the rule are:
+   *   - saveAuthProfiles rejected -> nothing committed; restore the sources so
+   *     the map matches disk and the delete stays retryable.
+   *   - saveAuthProfiles resolved, a later save rejected -> the deletion HAS
+   *     committed; keep the cleared sources. Memory is then correct, and the
+   *     "a foreign command's next saveInventorySources persists this map"
+   *     property that made a leftover dangerous above is what heals disk here.
+   *     The clears not reaching disk in this run is survivable on its own: a
+   *     source reloaded with a link to a profile that is gone resolves to
+   *     nothing and degrades to agent auth with a warning, which is exactly the
+   *     dangling case computeSyncPlan already handles.
+   *
+   * SERIALIZATION IS THE CALLER'S JOB (FINDING 1, P2). The clears above are
+   * persisted as snapshots taken synchronously at each save's call time, so an
+   * inventory write that started earlier (applyInventorySyncPlan /
+   * addOrUpdateInventorySource, still awaiting its repository write with a
+   * PRE-clear snapshot) can commit last and put the cleared references back on
+   * disk while memory looks correct. The fix is to serialize this method
+   * against those sections under `services/configMutationLock` — but that lock
+   * MUST NOT be acquired here: `AsyncMutex` is not re-entrant, and two of the
+   * three call sites already hold it (configCommands' importMergeReplaceLocked
+   * and completeReset both run their whole mutation phase inside
+   * `runExclusive`), so taking it here would deadlock the extension host on a
+   * backup restore or a complete reset. The third and only lock-free caller,
+   * `AuthProfileEditorPanel`'s delete handler, acquires it around this call
+   * instead. Any NEW caller must either already hold `configMutationLock` or
+   * acquire it around this call.
+   *
+   * KNOWN ASYMMETRY, and how the gate above reconciles with it: the
+   * `authProfiles` and `servers` in-memory mutations are NOT rolled back when
+   * their own saves reject. Those two are the deletion's primary intent rather
+   * than incidental reference clearing, and the emission contract below is
+   * written around them staying applied — observers are told the profile is
+   * gone. The source clears are now held to the SAME standard rather than a
+   * different one: they are undone only while the deletion can still be said not
+   * to have happened, and from the moment it has, they stay applied exactly like
+   * the other two. The asymmetry that remains is only in the one window where
+   * the deletion genuinely did not happen.
+   */
   public async removeAuthProfile(profileId: string): Promise<void> {
     this.authProfiles.delete(profileId);
     let serversChanged = false;
     for (const [id, server] of this.servers.entries()) {
       if (server.authProfileId === profileId) {
-        this.servers.set(id, { ...server, authProfileId: undefined });
+        const cleared: ServerConfig = { ...server, authProfileId: undefined };
+        // The inventory sync's record that IT linked this profile goes with the
+        // link. Without this, deleting a profile an inventory source applied
+        // would leave every server it owned looking permanently opted OUT (no
+        // `authProfileId`, but a stamp naming a profile) — so re-pointing the
+        // source at a replacement profile would silently skip exactly the
+        // servers the sync itself had configured, which nobody ever hand-edited.
+        // This clear is the system's doing, not a user decision, so the stamp
+        // must not outlive the link it describes.
+        //
+        // Scoped to the servers whose `authProfileId` is being cleared here: a
+        // server whose link the USER already cleared (stamp names this profile,
+        // `authProfileId` already undefined) is not touched, so its opt-out
+        // survives the profile's deletion — which is the whole point of it.
+        if (server.origin?.syncedAuthProfileId === profileId) {
+          cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
+        }
+        this.servers.set(id, cleared);
         serversChanged = true;
       }
     }
-    await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
-    if (serversChanged) {
-      await this.repository.saveServers([...this.servers.values()]);
+    const previousSources = new Map<string, InventorySourceConfig>();
+    for (const [id, source] of this.inventorySources.entries()) {
+      if (source.authProfileId === profileId) {
+        previousSources.set(id, source);
+        this.inventorySources.set(id, { ...source, authProfileId: undefined, revision: randomUUID() });
+      }
     }
-    this.emitChanged();
+    // The emission is in a `finally`, not on the success path: by the time any
+    // of these saves can reject, the profile is already gone from this.authProfiles
+    // and the server references are already cleared in memory (and, past the
+    // first await, on disk). Returning through a rejection without emitting
+    // would leave every observer rendering a profile that no longer exists and
+    // links that no longer resolve, until some unrelated change happened to fire
+    // an emission. Whatever the in-memory state ends up being — fully applied,
+    // or with the inventory-source clears rolled back below — observers are told
+    // about it exactly once.
+    // The single fact the restore below is gated on: has the profile record
+    // itself left disk yet? Set between the save and the next await, so nothing
+    // can observe it out of step with what has been persisted.
+    let deletionCommitted = false;
+    try {
+      try {
+        await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
+        deletionCommitted = true;
+        if (serversChanged) {
+          await this.repository.saveServers([...this.servers.values()]);
+        }
+        if (previousSources.size > 0) {
+          await this.repository.saveInventorySources([...this.inventorySources.values()]);
+        }
+      } catch (error) {
+        // FINDING A / FINDING 2 — restore the sources for a rejection that
+        // happened BEFORE the profile record left disk, then rethrow. A no-op
+        // when nothing was cleared (`previousSources` empty), so it needs no
+        // guard of its own. This catch is nested inside the emitting try/finally
+        // rather than wrapping it, so the restore is complete before the
+        // emission fires.
+        //
+        // REVIEW FINDING (P2) — once `deletionCommitted` is true the restore is
+        // SKIPPED: re-linking a source to a profile that no longer exists (and
+        // can no longer be deleted again) is worse than leaving the link
+        // cleared. See the two-halves rule in the doc comment above.
+        if (!deletionCommitted) {
+          for (const [id, source] of previousSources) {
+            this.inventorySources.set(id, source);
+          }
+        }
+        throw error;
+      }
+    } finally {
+      this.emitChanged();
+    }
   }
 
   public getInventorySource(id: string): InventorySourceConfig | undefined {

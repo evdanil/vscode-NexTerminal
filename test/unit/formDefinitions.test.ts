@@ -8,7 +8,10 @@ import {
   unifiedProfileFormId
 } from "../../src/ui/formDefinitions";
 import type { FormDefinition, FormFieldDescriptor } from "../../src/ui/formTypes";
-import type { InventoryProvider } from "../../src/models/inventory";
+import type { InventoryProvider, InventorySourceConfig } from "../../src/models/inventory";
+import type { AuthProfile } from "../../src/models/config";
+import { authProfileOwnedCredentials } from "../../src/models/config";
+import { formatAuthProfileLabel } from "../../src/utils/authProfileLabel";
 
 function keyedField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { key: string }> {
   const field = definition.fields.find(
@@ -84,7 +87,19 @@ describe("formDefinitions keyPath visibility", () => {
     expect(authProfileField!.options.some((option) => option.label === "Shared Key — key — deploy — id_ed25519")).toBe(true);
   });
 
-  it("preserves stored server credentials in edit form when auth profile is linked", () => {
+  /**
+   * REVIEW FINDING (P1) — the edit form renders what the LINKED PROFILE will
+   * impose, and retains the record's own values beside it rather than in the
+   * fields. Showing the record's values under a lock the profile owns is what
+   * put the two out of step: `authType` rendered `password` while the profile
+   * imposed `key`, which hid (and therefore disabled, and therefore dropped
+   * from the submission) the Private Key File control — see the end-to-end
+   * proof in authProfileSwitchTransition.test.ts, which follows it all the way
+   * to the persisted record. Preservation of the stored values is
+   * `preserveLinkedServerCredentials`' job at save, plus the displaced seed
+   * below for an unlink; it was never this descriptor's.
+   */
+  it("renders the linked profile's credentials, and hands the stored ones to the webview's restore seed instead of into the fields", () => {
     const definition = serverFormDefinition(
       {
         id: "srv-1",
@@ -98,12 +113,70 @@ describe("formDefinitions keyPath visibility", () => {
       [],
       [{ id: "ap-1", name: "Production", username: "live-user", authType: "key", keyPath: "/live/key" }]
     );
-    const usernameField = definition.fields.find(
-      (field): field is Extract<(typeof definition.fields)[number], { key: string; value?: unknown }> =>
-        "key" in field && field.key === "username"
+
+    expect(keyedField(definition, "username").value).toBe("live-user");
+    expect(keyedField(definition, "authType").value).toBe("key");
+    expect(keyedField(definition, "keyPath").value).toBe("/live/key");
+
+    const select = keyedField(definition, "authProfileId");
+    expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({
+      username: "stored-user",
+      authType: "password",
+      keyPath: "/stored/key"
+    });
+  });
+
+  it("displaces only the keys the profile actually supplies, so a field it leaves alone keeps the record's value AND stays out of the restore seed (kills overriding on the mere fact of a link: a keyless key profile would blank the server's own key file at render, which is the field it exists to let you set)", () => {
+    const definition = serverFormDefinition(
+      {
+        id: "srv-1",
+        username: "stored-user",
+        authType: "password",
+        keyPath: "/stored/key",
+        authProfileId: "ap-keyless"
+      },
+      [],
+      true,
+      [],
+      [{ id: "ap-keyless", name: "Shared key", username: "live-user", authType: "key" }]
     );
-    expect(usernameField).toBeDefined();
-    expect(usernameField!.value).toBe("stored-user");
+
+    // Supplied → rendered from the profile, and the record's own is retained.
+    expect(keyedField(definition, "username").value).toBe("live-user");
+    expect(keyedField(definition, "authType").value).toBe("key");
+    // NOT supplied → the record's own file stays in the field, where the
+    // profile-imposed `key` auth type now makes it visible and submittable.
+    expect(keyedField(definition, "keyPath").value).toBe("/stored/key");
+
+    const select = keyedField(definition, "authProfileId");
+    expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({
+      username: "stored-user",
+      authType: "password"
+    });
+  });
+
+  it("displaces nothing when there is no link, or when the linked id resolves to no profile (kills seeding a restore for values no profile replaced — the release would then overwrite the user's own edits with a stale snapshot of the form's opening state)", () => {
+    const seed = {
+      id: "srv-1",
+      username: "stored-user",
+      authType: "password" as const,
+      keyPath: "/stored/key",
+      authProfileId: "ap-gone"
+    };
+    const profiles = [{ id: "ap-1", name: "Production", username: "live-user", authType: "key" as const, keyPath: "/live/key" }];
+
+    for (const definition of [
+      serverFormDefinition({ ...seed, authProfileId: undefined }, [], true, [], profiles),
+      serverFormDefinition(seed, [], true, [], profiles)
+    ]) {
+      expect(keyedField(definition, "username").value).toBe("stored-user");
+      expect(keyedField(definition, "authType").value).toBe("password");
+      const select = keyedField(definition, "authProfileId");
+      // Empty, exactly as `autofillFilledKeys` is `[]` for the same two cases —
+      // and `renderField` omits the attribute entirely for an empty record, so
+      // the webview seeds nothing.
+      expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({});
+    }
   });
 
   it("marks optional SSH setup fields as advanced in the unified profile form", () => {
@@ -328,5 +401,242 @@ describe("inventorySourceFormDefinition", () => {
     const field = keyedField(definition, "cfg_pollInterval") as Extract<FormFieldDescriptor, { type: "number" }>;
     expect(field.value).toBe(0.5);
     expect(field.step).toBe("any");
+  });
+
+  const authProfiles: AuthProfile[] = [
+    { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" },
+    { id: "p2", name: "Prod key", username: "deploy", authType: "key", keyPath: "/keys/id_ed25519" }
+  ];
+
+  function sourceSeed(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
+    return {
+      id: "src1",
+      providerId: "fake",
+      name: "Fake",
+      targetFolder: "",
+      prunePolicy: "orphan",
+      defaultUsername: "seeded-user",
+      config: {},
+      secretFieldIds: [],
+      ...overrides
+    };
+  }
+
+  it("renders the Auth Profile select outside Advanced, directly above Default SSH Username", () => {
+    const definition = inventorySourceFormDefinition(fakeProvider, undefined, undefined, authProfiles);
+    const keys = definition.fields.map((field) => ("key" in field ? field.key : undefined));
+    const authProfileIndex = keys.indexOf("authProfileId");
+    const defaultUsernameIndex = keys.indexOf("defaultUsername");
+
+    expect(authProfileIndex).toBeGreaterThan(-1);
+    expect(defaultUsernameIndex).toBe(authProfileIndex + 1);
+
+    const field = keyedField(definition, "authProfileId");
+    // The whole point of the feature: on this form the select is the primary
+    // auth decision, not a power-user shortcut buried in Advanced (which is
+    // where the shared helper's default puts it, and where the server form
+    // keeps it).
+    expect(field.advanced).toBeFalsy();
+    expect(field.type).toBe("select");
+    expect(field.hint).toBe(
+      "Servers synced from this source connect with this profile's saved credentials. (None) uses the default username with SSH agent authentication."
+    );
+    if (field.type === "select") {
+      expect(field.autofill).toBe(true);
+      expect(field.value).toBe("");
+      expect(field.options).toEqual([
+        { label: "(None)", value: "" },
+        { label: formatAuthProfileLabel(authProfiles[0]), value: "p1" },
+        { label: formatAuthProfileLabel(authProfiles[1]), value: "p2" },
+        { label: "Create new auth profile…", value: "__create__authProfile" }
+      ]);
+    }
+  });
+
+  it("the Default SSH Username hint explains why the field stays visible but locked while a profile is selected", () => {
+    const definition = inventorySourceFormDefinition(fakeProvider, undefined, undefined, authProfiles);
+    const field = keyedField(definition, "defaultUsername");
+    // Selecting a profile mirrors its username in here and makes the field
+    // read-only and dimmed. A hint that stops at the first sentence leaves the
+    // user staring at a locked field with no explanation of where its value
+    // came from or why it is still worth having.
+    expect(field.hint).toBe(
+      "Used when the inventory source doesn't provide a username. With an auth profile selected it comes from that profile, and is the fallback if the profile is ever removed."
+    );
+  });
+
+  it("leaves the server and unified profile forms' Auth Profile select advanced with its original hint", () => {
+    for (const definition of [serverFormDefinition(), unifiedProfileFormDefinition()]) {
+      const field = keyedField(definition, "authProfileId");
+      expect(field.advanced).toBe(true);
+      expect(field.hint).toBe("Reuse saved SSH credentials instead of entering them here.");
+    }
+  });
+
+  it("sanitizes a dangling seeded auth profile id to the (None) value so the form cannot submit a dead id", () => {
+    const definition = inventorySourceFormDefinition(
+      fakeProvider,
+      sourceSeed({ authProfileId: "ghost" }),
+      undefined,
+      authProfiles
+    );
+    const field = keyedField(definition, "authProfileId");
+    expect(field.type).toBe("select");
+    if (field.type === "select") {
+      // Passing "ghost" straight through would render the (None) LABEL (the
+      // select renderer falls back to options[0] for the label) while the
+      // hidden input still carries "ghost" as its VALUE — displaying one thing
+      // and submitting another.
+      expect(field.value).toBe("");
+      expect(field.options.some((option) => option.value === "ghost")).toBe(false);
+    }
+  });
+
+  it("keeps a seeded auth profile id that still resolves", () => {
+    const definition = inventorySourceFormDefinition(
+      fakeProvider,
+      sourceSeed({ authProfileId: "p1" }),
+      undefined,
+      authProfiles
+    );
+    const field = keyedField(definition, "authProfileId");
+    if (field.type === "select") {
+      expect(field.value).toBe("p1");
+    }
+  });
+
+  /**
+   * REVIEW FINDING (P2) — the OTHER render-time half, and the source form's
+   * copy of what `serverFormDefinition` already does: the lock seed above says
+   * Default SSH Username is the profile's, so the field must SHOW the profile's
+   * value. Rendering the record's underneath that lock is how the form came to
+   * display one username and Save store another — `fallbackUsernameForSource`
+   * (inventoryCommands.ts) derives the stored value from the live profile, so
+   * the two part company the moment the profile is renamed, and the lock means
+   * the user cannot even see it happen. Followed all the way to the persisted
+   * record in inventoryCommands.test.ts.
+   */
+  it("renders Default SSH Username from the LINKED PROFILE, and hands the stored fallback to the webview's restore seed instead of leaving it in the field", () => {
+    const definition = inventorySourceFormDefinition(
+      fakeProvider,
+      sourceSeed({ authProfileId: "p1", defaultUsername: "stored-fallback" }),
+      undefined,
+      authProfiles
+    );
+
+    expect(keyedField(definition, "defaultUsername").value).toBe("labuser");
+    const select = keyedField(definition, "authProfileId");
+    expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({
+      defaultUsername: "stored-fallback"
+    });
+  });
+
+  it("keeps the record's own username, and seeds no restore, for a profile that supplies none (kills displacing on the mere fact of a link: that field is not locked for such a profile, so a restore entry would overwrite an edit the user is free to make)", () => {
+    const blank: AuthProfile[] = [{ id: "p3", name: "Imported", username: "   ", authType: "password" }];
+    const definition = inventorySourceFormDefinition(
+      fakeProvider,
+      sourceSeed({ authProfileId: "p3", defaultUsername: "stored-fallback" }),
+      undefined,
+      blank
+    );
+
+    expect(keyedField(definition, "defaultUsername").value).toBe("stored-fallback");
+    const select = keyedField(definition, "authProfileId");
+    expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({});
+  });
+
+  it("displaces nothing on Add, nor when the seeded id resolves to no profile (kills seeding a restore for a value no profile replaced — the next release would then overwrite what the user typed)", () => {
+    for (const definition of [
+      inventorySourceFormDefinition(fakeProvider, undefined, "most-common-account", authProfiles),
+      inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: "ghost" }), undefined, authProfiles)
+    ]) {
+      expect(keyedField(definition, "defaultUsername").value).not.toBe("labuser");
+      const select = keyedField(definition, "authProfileId");
+      expect(select.type === "select" ? select.autofillDisplacedValues : undefined).toEqual({});
+    }
+  });
+
+  /**
+   * REVIEW FINDING (P2) — the render-time half of field-ownership tracking. The
+   * webview locks exactly the keys it has been told the selected profile fills;
+   * before the first autofill round trip, this is the only source of that.
+   */
+  describe("autofillFilledKeys — which managed fields the selected profile fills", () => {
+    function filledKeys(definition: ReturnType<typeof inventorySourceFormDefinition>): string[] | undefined {
+      const field = keyedField(definition, "authProfileId");
+      return field.type === "select" ? field.autofillFilledKeys : undefined;
+    }
+
+    it("claims the username keys for a profile that has one, and the key path only for a key profile that has one", () => {
+      expect(filledKeys(inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: "p1" }), undefined, authProfiles)))
+        .toEqual(["username", "authType", "defaultUsername"]);
+      expect(filledKeys(inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: "p2" }), undefined, authProfiles)))
+        .toEqual(["username", "authType", "keyPath", "defaultUsername"]);
+    });
+
+    it("claims NO username key for a profile whose username is whitespace-only (kills seeding ownership from the mere fact that a profile is linked: the form opens with Default SSH Username prefilled — from the record on Edit, from mostCommonUsername on Add — and such a profile fills none of it, so locking it freezes the user's own fallback with no way to change it)", () => {
+      const blank: AuthProfile[] = [{ id: "p3", name: "Imported", username: "   ", authType: "password" }];
+      const definition = inventorySourceFormDefinition(
+        fakeProvider,
+        sourceSeed({ authProfileId: "p3", defaultUsername: "labuser" }),
+        undefined,
+        blank
+      );
+      expect(filledKeys(definition)).toEqual(["authType"]);
+    });
+
+    it("claims nothing when no profile is selected, or when the seeded id resolves to none", () => {
+      expect(filledKeys(inventorySourceFormDefinition(fakeProvider, undefined, undefined, authProfiles))).toEqual([]);
+      expect(filledKeys(inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: "ghost" }), undefined, authProfiles)))
+        .toEqual([]);
+    });
+
+    /**
+     * REVIEW FINDING (P2) — the seed is a DERIVATION of the shared ownership
+     * rule (`authProfileOwnedCredentials`, models/config.ts), not a second
+     * opinion about it. The connect path and the save path read that same rule,
+     * so pinning the seed to it here is what stops the three drifting apart
+     * again — which is exactly how both findings on this branch arose.
+     */
+    it("is the shared ownership rule, key for key, on both forms that render the select", () => {
+      const cases: AuthProfile[] = [
+        { id: "c1", name: "Password", username: "root", authType: "password" },
+        { id: "c2", name: "Key", username: "root", authType: "key", keyPath: "/keys/id" },
+        { id: "c3", name: "Imported blank", username: "   ", authType: "password" },
+        { id: "c4", name: "Keyless key", username: "root", authType: "key" },
+        { id: "c5", name: "Padded", username: "  bob  ", authType: "key", keyPath: "   " }
+      ];
+
+      for (const profile of cases) {
+        const owned = authProfileOwnedCredentials(profile);
+        // The order is the webview lock loop's own managedKeys order, and
+        // `defaultUsername` is the inventory source form's name for the very
+        // username key the server form calls `username`.
+        const expected = [
+          ...(owned.username !== undefined ? ["username"] : []),
+          ...(owned.authType !== undefined ? ["authType"] : []),
+          ...(owned.keyPath !== undefined ? ["keyPath"] : []),
+          ...(owned.username !== undefined ? ["defaultUsername"] : [])
+        ];
+
+        expect(
+          filledKeys(inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: profile.id }), undefined, [profile])),
+          `inventory source form seed for ${profile.name}`
+        ).toEqual(expected);
+
+        const serverDefinition = serverFormDefinition(
+          { id: "s1", name: "S", host: "h", port: 22, username: "stored", authType: "password", isHidden: false, authProfileId: profile.id },
+          [],
+          false,
+          [],
+          [profile]
+        );
+        const serverField = keyedField(serverDefinition, "authProfileId");
+        expect(
+          serverField.type === "select" ? serverField.autofillFilledKeys : undefined,
+          `server form seed for ${profile.name}`
+        ).toEqual(expected);
+      }
+    });
   });
 });

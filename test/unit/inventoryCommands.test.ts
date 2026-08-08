@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { registerInventoryCommands, type InventoryRuntimeTeardown } from "../../src/commands/inventoryCommands";
+import { describePlanDetail, registerInventoryCommands, type InventoryRuntimeTeardown } from "../../src/commands/inventoryCommands";
 import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/nexusCore";
-import type { ServerConfig } from "../../src/models/config";
+import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import {
   computeProviderFingerprint,
   inventorySecretKey,
@@ -10,12 +10,14 @@ import {
   type InventoryTree
 } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
-import { ORPHAN_FOLDER_NAME } from "../../src/services/inventory/syncEngine";
+import { deterministicServerId } from "../../src/services/inventory/deterministicId";
+import { ORPHAN_FOLDER_NAME, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 import type { FormDefinition, FormValues } from "../../src/ui/formTypes";
+import { openForm } from "../helpers/formScriptHarness";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
@@ -27,6 +29,7 @@ const mockExecuteCommand = vi.fn();
 const mockOpenTextDocument = vi.fn();
 const mockShowTextDocument = vi.fn();
 const mockWebviewOpen = vi.fn();
+const mockAuthProfileEditorOpenNew = vi.fn();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -48,7 +51,10 @@ vi.mock("vscode", () => ({
   workspace: {
     openTextDocument: (...args: unknown[]) => mockOpenTextDocument(...args)
   },
-  ProgressLocation: { Notification: 15 }
+  ProgressLocation: { Notification: 15 },
+  // Real enum values (Separator = -1, Default = 0) so the hub's separator row
+  // is asserted against the same constant VS Code renders on.
+  QuickPickItemKind: { Separator: -1, Default: 0 }
 }));
 
 // Mirrors profileCommands.test.ts's idiom for driving a WebviewFormPanel-based
@@ -61,6 +67,17 @@ vi.mock("vscode", () => ({
 vi.mock("../../src/ui/webviewFormPanel", () => ({
   WebviewFormPanel: {
     open: (...args: unknown[]) => mockWebviewOpen(...args)
+  }
+}));
+
+// The inline auth-profile controller opens the real singleton editor panel,
+// which builds a live vscode.WebviewPanel. Stubbed so the inline-creation
+// round trip (createInline -> editor opens -> new profile injected into the
+// still-open source form) can be driven end to end without a webview.
+vi.mock("../../src/ui/authProfileEditorPanel", () => ({
+  AuthProfileEditorPanel: {
+    openNew: (...args: unknown[]) => mockAuthProfileEditorOpenNew(...args),
+    open: vi.fn()
   }
 }));
 
@@ -92,6 +109,8 @@ function latestFormCall(): {
   panel: FakePanel;
   onSubmit: (values: FormValues) => Promise<void>;
   onTest?: (values: FormValues) => Promise<void>;
+  onCreateInline?: (key: string) => void;
+  onAutofill?: (key: string, value: string) => Promise<Record<string, string> | undefined>;
 } {
   const call = mockWebviewOpen.mock.results.at(-1);
   const callArgs = mockWebviewOpen.mock.calls.at(-1);
@@ -99,13 +118,17 @@ function latestFormCall(): {
   const handlers = callArgs![2] as {
     onSubmit: (values: FormValues) => Promise<void>;
     onTest?: (values: FormValues) => Promise<void>;
+    onCreateInline?: (key: string) => void;
+    onAutofill?: (key: string, value: string) => Promise<Record<string, string> | undefined>;
   };
   return {
     formId: callArgs![0] as string,
     definition: callArgs![1] as FormDefinition,
     panel: call!.value as FakePanel,
     onSubmit: handlers.onSubmit,
-    onTest: handlers.onTest
+    onTest: handlers.onTest,
+    onCreateInline: handlers.onCreateInline,
+    onAutofill: handlers.onAutofill
   };
 }
 
@@ -172,6 +195,16 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
     ...overrides
   };
 }
+
+// The four busy refusals, verbatim (against makeSource()'s "My Source").
+// Asserted as EXACT strings, never by substring, because the bug these pin is
+// a wording bug: the busy marker used to be a bare Set, so an open Edit Source
+// form and an in-flight removal both reported themselves as a running sync.
+// A "some warning appeared" assertion passes against that exact lie.
+const BUSY_SYNC_FROM_SYNC = '"My Source" is already syncing.';
+const BUSY_SYNC_FROM_OTHER = '"My Source" is currently syncing — try again once the sync finishes.';
+const BUSY_EDIT = '"My Source" is open in Edit Source — close that tab, then try again.';
+const BUSY_REMOVE = '"My Source" is currently being removed — try again once the removal finishes.';
 
 describe("inventoryCommands", () => {
   beforeEach(() => {
@@ -869,9 +902,11 @@ describe("inventoryCommands", () => {
 
       // A second edit attempt while the first form is still open must refuse
       // — the wrong implementation (no busy flag while the form is open)
-      // would open a second form here instead.
+      // would open a second form here instead. The refusal names the open
+      // tab: no sync is running, so the pre-fix "currently syncing" wording
+      // was a straight falsehood.
       await cmd();
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_EDIT);
       expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
 
       // Closing the form (Cancel, or WebviewFormPanel's own post-submit
@@ -880,7 +915,7 @@ describe("inventoryCommands", () => {
       panel.fireDispose();
       mockShowWarningMessage.mockClear();
       await cmd();
-      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
       expect(mockWebviewOpen).toHaveBeenCalledTimes(2);
     });
 
@@ -983,7 +1018,10 @@ describe("inventoryCommands", () => {
       for (let i = 0; i < 10; i++) await Promise.resolve();
 
       expect(syncSettled).toBe(true);
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      // The marker is held by the still-open (mid-save) Edit form, so the
+      // refusal names that form — not a sync, which is exactly what is NOT
+      // happening here.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_EDIT);
       expect(provider.fetchInventory).not.toHaveBeenCalled();
 
       // Let the gated persist complete, and drain both promises so nothing
@@ -999,7 +1037,7 @@ describe("inventoryCommands", () => {
       // subsequent Sync Now proceeds normally.
       mockShowWarningMessage.mockClear();
       await syncCmd("src-1");
-      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
       expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
     });
 
@@ -1022,10 +1060,10 @@ describe("inventoryCommands", () => {
 
       // If F6 were reverted (no try/catch around WebviewFormPanel.open), the
       // busy flag set just before the throwing call would never be released
-      // — every later editSource for this exact source id would be refused
-      // with "currently syncing" forever.
+      // — every later editSource for this exact source id would be refused as
+      // open in an Edit Source tab that does not exist, forever.
       await cmd();
-      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
       expect(mockWebviewOpen).toHaveBeenCalledTimes(2);
     });
 
@@ -1043,9 +1081,8 @@ describe("inventoryCommands", () => {
 
       // Controllable: the fingerprint-mismatch modal (an `{modal: true}` call)
       // stays pending until resolveModal is invoked; any OTHER
-      // showWarningMessage call (e.g. the "currently syncing" / "already
-      // syncing" busy notices, both fire-and-forget) resolves immediately —
-      // they're never awaited by their callers anyway.
+      // showWarningMessage call (e.g. the busy refusals, all fire-and-forget)
+      // resolves immediately — they're never awaited by their callers anyway.
       let resolveModal!: (choice: string | undefined) => void;
       const modalChoice = new Promise<string | undefined>((resolve) => (resolveModal = resolve));
       mockShowWarningMessage.mockImplementation((...args: unknown[]) => {
@@ -1083,7 +1120,9 @@ describe("inventoryCommands", () => {
       await Promise.resolve();
 
       expect(syncSettled).toBe(true);
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      // Held by editSource (which is parked on its fingerprint modal), so the
+      // refusal names the edit, not a sync.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_EDIT);
       expect(provider.fetchInventory).not.toHaveBeenCalled();
 
       // Clean up: let the still-open edit modal (and, if the assertions
@@ -1115,13 +1154,13 @@ describe("inventoryCommands", () => {
 
       // If Cancel left the marker claimed (e.g. releaseInFlight only wired
       // for the open()-throw/dispose paths, not this one), the sync below
-      // would be refused with "already syncing" and never reach
+      // would be refused as still open in Edit Source and never reach
       // fetchInventory.
       mockShowWarningMessage.mockResolvedValueOnce("Continue"); // syncNow's own fingerprint check (still stale)
       const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
       await syncCmd("src-1");
 
-      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
       expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
     });
 
@@ -2118,7 +2157,9 @@ describe("inventoryCommands", () => {
       const removeCmd = registeredCommands.get("nexus.inventory.removeSource")!;
       await removeCmd();
 
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("currently syncing"));
+      // A sync really IS in flight here, so the sync wording is the truthful
+      // one — the fix must not have made every refusal name an edit instead.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_SYNC_FROM_OTHER);
       expect(core.getSnapshot().inventorySources).toHaveLength(1);
       expect(core.getSnapshot().servers).toHaveLength(1);
 
@@ -2746,7 +2787,7 @@ describe("inventoryCommands", () => {
       // existed.
       await Promise.resolve();
 
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("already syncing"));
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_SYNC_FROM_SYNC);
       expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
 
       resolveFetch({ contractVersion: 1, devices: [] });
@@ -3588,5 +3629,1727 @@ describe("inventoryCommands", () => {
       expect(core.getInventorySource("src-1")?.lastSyncAt).toBeUndefined();
       expect(mockShowInformationMessage).not.toHaveBeenCalled();
     });
+  });
+
+  describe("inventory source auth profile", () => {
+    const LAB_PROFILE: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
+
+    /** Lets a detached (`void (async () => …)()`) post-save toast settle. */
+    const flushDetached = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+    async function makeHarness(
+      options: {
+        servers?: ServerConfig[];
+        profiles?: AuthProfile[];
+        source?: Partial<InventorySourceConfig>;
+        provider?: Partial<InventoryProvider>;
+      } = {}
+    ): Promise<{ core: NexusCore; provider: InventoryProvider; vault: ReturnType<typeof makeVault> }> {
+      const core = new NexusCore(new InMemoryConfigRepository(options.servers ?? []));
+      await core.initialize();
+      for (const profile of options.profiles ?? []) {
+        await core.addOrUpdateAuthProfile(profile);
+      }
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider(options.provider);
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      if (options.source) {
+        await core.addOrUpdateInventorySource(
+          makeSource({ targetFolder: "Infra", secretFieldIds: ["apiToken"], config: { host: "netbox.local" }, ...options.source })
+        );
+      }
+      return { core, provider, vault };
+    }
+
+    function ownedServer(overrides: Partial<ServerConfig> & { id: string; externalId: string }): ServerConfig {
+      const { externalId, ...rest } = overrides;
+      // username defaults to makeSource()'s defaultUsername ("admin"), NOT
+      // makeServer()'s "netops": the retro-apply rule adopts only servers still
+      // carrying everything the add path stamped, the source's default username
+      // included. A server whose username differs reads as hand-edited and is
+      // deliberately left alone — see the hand-edited-username test below.
+      return makeServer({ username: "admin", origin: { sourceId: "src-1", externalId, syncedAt: 1 }, ...rest });
+    }
+
+    function modalCalls(): Array<[string, { detail: string }]> {
+      return mockShowInformationMessage.mock.calls.filter(
+        (call) => typeof call[1] === "object" && call[1] !== null && (call[1] as { modal?: boolean }).modal === true
+      ) as Array<[string, { detail: string }]>;
+    }
+
+    it("addSource persists the selected Auth Profile id onto the source record (kills parseSourceFormValues / persistNewInventorySource dropping the field)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        authProfileId: "p1",
+        defaultUsername: "labuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      // Without the parse+persist wiring this reads `undefined`: the select is
+      // rendered, the user picks a profile, and Save silently discards it.
+      expect(core.getSnapshot().inventorySources[0].authProfileId).toBe("p1");
+    });
+
+    it("the select's (None) option persists as undefined, never the raw empty string (kills storing \"\" as an id that then reads as a dangling reference)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        authProfileId: "",
+        defaultUsername: "labuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      // A stored "" would fail validateInventorySource's non-empty-string
+      // shape check, count as a config change against `undefined` in
+      // sourceConfigUnchanged, and make computeSyncPlan warn about a dangling
+      // profile on every single sync.
+      expect(core.getSnapshot().inventorySources[0].authProfileId).toBeUndefined();
+    });
+
+    it("addSource refuses to save a profile deleted while the form sat open, and rolls back its vault write (kills persisting a dangling reference on the one path that has no record to revision-guard)", async () => {
+      const { core, vault } = await makeHarness({ profiles: [LAB_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      // The profile the still-open form's select points at is deleted
+      // elsewhere (AuthProfileEditorPanel -> NexusCore.removeAuthProfile).
+      // Nothing references it yet, so removeAuthProfile clears nothing and
+      // there is no record here to carry a bumped revision anyway.
+      await core.removeAuthProfile("p1");
+
+      await expect(
+        onSubmit({
+          name: "My NetBox",
+          targetFolder: "Infra",
+          authProfileId: "p1",
+          defaultUsername: "labuser",
+          prunePolicy: "orphan",
+          cfg_host: "netbox.local",
+          cfg_apiToken: "secret-token"
+        })
+      ).rejects.toThrow(/The selected auth profile no longer exists/);
+
+      // Without the pre-persist re-resolve the source IS created, carrying an
+      // id that resolves to nothing — and every later sync of it silently
+      // falls back to the default username with SSH agent auth.
+      expect(core.getSnapshot().inventorySources).toEqual([]);
+
+      // Vault-first means the API token was already written by the time the
+      // rejection lands; with no source record to enumerate it, an un-rolled-
+      // back key would be orphaned forever.
+      const storedKey = vault.store.mock.calls.at(-1)?.[0] as string | undefined;
+      expect(storedKey).toBeDefined();
+      expect(await vault.get(storedKey!)).toBeUndefined();
+    });
+
+    it("editSource refuses to switch onto a profile deleted while the form sat open, even though the ITEM 4 revision guard cannot see it (kills leaning on removeAuthProfile's re-revisioning, which only touches sources ALREADY referencing the profile)", async () => {
+      const otherProfile: AuthProfile = { id: "p2", name: "Other", username: "otheruser", authType: "password" };
+      const { core, vault } = await makeHarness({ profiles: [LAB_PROFILE, otherProfile], source: { authProfileId: "p1" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+
+      const revisionBefore = core.getInventorySource("src-1")!.revision;
+      // p2 — the profile the user picked in the open form, which this source
+      // is NOT yet linked to — is deleted elsewhere.
+      await core.removeAuthProfile("p2");
+      // Precisely why ITEM 4 can't catch this one: the source never referenced
+      // p2, so removeAuthProfile leaves its revision (and every other field)
+      // alone and the drift guard sees no drift at all.
+      expect(core.getInventorySource("src-1")!.revision).toBe(revisionBefore);
+
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          authProfileId: "p2",
+          defaultUsername: "labuser",
+          prunePolicy: "orphan",
+          cfg_host: "netbox.local",
+          cfg_apiToken: "new-token"
+        })
+      ).rejects.toThrow(/The selected auth profile no longer exists/);
+
+      // The record must be left exactly as the user last saved it — still on
+      // p1. Neither switched to a dangling p2 nor silently cleared to (None):
+      // both would hand this source's next sync the default username plus SSH
+      // agent auth without ever saying so.
+      expect(core.getInventorySource("src-1")?.authProfileId).toBe("p1");
+      expect(core.getInventorySource("src-1")?.revision).toBe(revisionBefore);
+
+      // This run's re-entered secret is restored to its pre-run value, same as
+      // every other rejection inside this critical section.
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("tok");
+    });
+
+    it("a profile that still exists saves normally even when a DIFFERENT profile was just deleted (kills a re-check that rejects on any deletion, or that resolves against the option list captured when the form opened)", async () => {
+      const otherProfile: AuthProfile = { id: "p2", name: "Other", username: "otheruser", authType: "password" };
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE, otherProfile] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await core.removeAuthProfile("p2");
+
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        authProfileId: "p1",
+        defaultUsername: "labuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      expect(core.getSnapshot().inventorySources[0].authProfileId).toBe("p1");
+    });
+
+    it("clearing to (None) still saves when the profile the form offered has since been deleted (kills a re-check that fires on the empty selection instead of only on a chosen id)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE], source: {} });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+
+      // Deleting a profile this source never referenced leaves its revision
+      // untouched, so the ITEM 4 guard stays out of the way and the save
+      // reaches the auth-profile re-check with `undefined` in hand.
+      await core.removeAuthProfile("p1");
+
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        authProfileId: "",
+        defaultUsername: "labuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      });
+
+      // `undefined` is a deliberate answer, not a stale reference — a lookup
+      // that skips the "was anything even chosen" guard resolves it to
+      // "missing" and blocks a save the user is entitled to.
+      expect(core.getInventorySource("src-1")?.authProfileId).toBeUndefined();
+      await flushDetached();
+      expect(mockShowInformationMessage.mock.calls.map((call) => call[0])).toEqual(['Inventory source "My Source" updated.']);
+    });
+
+    /**
+     * REVIEW FINDING (P1) — the second reason a selected profile cannot be
+     * honoured, refused by the same persist-time re-resolve as the first.
+     *
+     * A `key` profile with no key file is a shape the profile editor accepts on
+     * purpose (it is the shared-passphrase, per-server-key-file pattern), but no
+     * server an inventory sync produces can supply the missing half: the add
+     * path writes `authType: "agent"` with no `keyPath`, and retro-apply adopts
+     * only servers still carrying exactly that. The profile forces
+     * `authType: "key"` at connect time, so `buildConnectConfig` rejects every
+     * one of them with "Missing keyPath" — the fleet-wide unusability the whole
+     * feature exists to end, arriving through the Auth Profile select.
+     */
+    const KEYLESS_KEY_PROFILE: AuthProfile = { id: "pk", name: "Shared Key", username: "keyuser", authType: "key" };
+    // Pinned verbatim — this is the "Save failed: …" banner text.
+    const KEYLESS_KEY_REJECTION =
+      'The auth profile "Shared Key" uses private key authentication but has no key file. Servers synced from this source have no key of their own, so none of them could connect. Add a key file to that profile, or choose another.';
+
+    it("addSource refuses to link a key profile that carries no key file, and rolls back its vault write (kills a persist-time check that only asks whether the profile still EXISTS)", async () => {
+      const { core, vault } = await makeHarness({ profiles: [LAB_PROFILE, KEYLESS_KEY_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await expect(
+        onSubmit({
+          name: "My NetBox",
+          targetFolder: "Infra",
+          authProfileId: "pk",
+          defaultUsername: "keyuser",
+          prunePolicy: "orphan",
+          cfg_host: "netbox.local",
+          cfg_apiToken: "secret-token"
+        })
+      ).rejects.toThrow(KEYLESS_KEY_REJECTION);
+
+      // The profile resolves perfectly well, so an existence-only check creates
+      // this source — and every device it ever syncs arrives unable to connect.
+      expect(core.getSnapshot().inventorySources).toEqual([]);
+      // Same vault-first rollback the missing-profile rejection owes.
+      const storedKey = vault.store.mock.calls.at(-1)?.[0] as string | undefined;
+      expect(storedKey).toBeDefined();
+      expect(await vault.get(storedKey!)).toBeUndefined();
+    });
+
+    it("editSource refuses to switch a source onto a key profile that carries no key file, leaving the record on its previous profile (kills covering only the add path)", async () => {
+      const { core, vault } = await makeHarness({
+        profiles: [LAB_PROFILE, KEYLESS_KEY_PROFILE],
+        source: { authProfileId: "p1" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          authProfileId: "pk",
+          defaultUsername: "keyuser",
+          prunePolicy: "orphan",
+          cfg_host: "netbox.local",
+          cfg_apiToken: "new-token"
+        })
+      ).rejects.toThrow(KEYLESS_KEY_REJECTION);
+
+      expect(core.getInventorySource("src-1")?.authProfileId).toBe("p1");
+      // This run's re-entered secret is restored, same as every other rejection
+      // inside that critical section.
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("tok");
+    });
+
+    it("a key profile that DOES carry a key file links normally (kills rejecting every key profile rather than the keyless ones)", async () => {
+      const keyProfile: AuthProfile = { ...KEYLESS_KEY_PROFILE, keyPath: "/keys/id_ed25519" };
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE, keyProfile] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        authProfileId: "pk",
+        defaultUsername: "keyuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      expect(core.getSnapshot().inventorySources[0].authProfileId).toBe("pk");
+    });
+
+    it("a source whose linked profile LOST its key file after linking syncs without stamping it — new servers connect, an already-working agent server is left alone, and the plan says why (kills relying on the form check alone, which no later profile edit passes through)", async () => {
+      // The form check cannot govern this: the pairing was legal when it was
+      // made. Only the engine sees the profile as it is at sync time.
+      const { core } = await makeHarness({
+        profiles: [KEYLESS_KEY_PROFILE],
+        source: { targetFolder: "", authProfileId: "pk" },
+        servers: [ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" })],
+        provider: {
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [
+              { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
+              { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] }
+            ]
+          }))
+        }
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined); // the post-apply "N warnings" toast
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const added = core.getServer(deterministicServerId("src-1", "device:2"));
+      expect(added?.authProfileId).toBeUndefined();
+      expect(added?.authType).toBe("agent");
+      // Retro-apply must not fire either: owned-1 is exactly the server the rule
+      // adopts, and adopting it here would take a server that connects today and
+      // make it unable to connect at all.
+      expect(core.getServer("owned-1")?.authProfileId).toBeUndefined();
+      expect(core.getServer("owned-1")?.authType).toBe("agent");
+
+      const detail = modalCalls()[0][1].detail;
+      expect(detail).not.toContain("will switch to auth profile");
+      expect(detail).toContain("1 warning");
+    });
+
+    /**
+     * REVIEW FINDING (P2) — the mirror that fills Default SSH Username from the
+     * selected profile is an async webview round trip (onAutofill). Save can win
+     * that race, and then the form posts the NEW authProfileId next to the
+     * PREVIOUS defaultUsername. Every payload below reproduces exactly that:
+     * `authProfileId: "p1"` (LAB_PROFILE, username "labuser") alongside the
+     * stale "admin" the field still held.
+     *
+     * Both persist helpers used to write the posted username verbatim — the
+     * existence re-check only proves the id resolves, never that the two agree —
+     * leaving a linked source whose locked fallback username disagreed with its
+     * own profile, invisibly (reopening the form re-renders the mirror, showing
+     * the profile's username over a record holding a different one).
+     */
+    it("addSource stores the RESOLVED PROFILE's username as the fallback, not the stale one posted alongside it (kills persisting the submitted defaultUsername verbatim when Save beats the autofill round trip)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        authProfileId: "p1",
+        defaultUsername: "admin", // stale — the mirror had not landed yet
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      const created = core.getSnapshot().inventorySources[0];
+      expect(created.authProfileId).toBe("p1");
+      expect(created.defaultUsername).toBe("labuser");
+    });
+
+    it("editSource stores the RESOLVED PROFILE's username too (kills fixing only the create path)", async () => {
+      // Starts unlinked on "admin" — the state a user is in when they pick a
+      // profile for the first time and click Save immediately.
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE], source: { defaultUsername: "admin" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        authProfileId: "p1",
+        defaultUsername: "admin", // stale
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      });
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBe("p1");
+      expect(updated.defaultUsername).toBe("labuser");
+    });
+
+    it("an UNLINKED save keeps the username the user typed (kills a derivation that reaches past the `(None)` answer — e.g. to the previously linked profile — or blanks the field)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE], source: { authProfileId: "p1", defaultUsername: "labuser" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        authProfileId: "", // (None) — the field is unlocked and hand-typed again
+        defaultUsername: "hand-typed",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      });
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBeUndefined();
+      expect(updated.defaultUsername).toBe("hand-typed");
+    });
+
+    it("a profile whose username is whitespace-only falls back to the submitted username when Save beats the mirror (kills storing an unusable/empty defaultUsername that validateInventorySource drops the whole record for)", async () => {
+      // Only reachable through an imported backup: the profile editor trims and
+      // refuses a blank username, but validateAuthProfile only checks length.
+      //
+      // This posts authProfileId next to a username the mirror never touched —
+      // i.e. Save clicked before the autofill round trip returned, the same
+      // race the two tests above cover. The mirror-completed path is covered
+      // separately below (see the selection -> autofill -> submit tests), which
+      // is what the form flow actually produces.
+      const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
+      const { core } = await makeHarness({ profiles: [blankish] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        authProfileId: "p3",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      const created = core.getSnapshot().inventorySources[0];
+      expect(created.authProfileId).toBe("p3");
+      // Neither the untrimmed "   " nor the "" a bare trim would produce: the
+      // former is a username no SSH login can use, the latter fails
+      // validateInventorySource and takes the whole record down at next load.
+      expect(created.defaultUsername).toBe("admin");
+    });
+
+    /**
+     * FINDING 2 (P2) — drives the path the USER drives, not the one the
+     * persist helper happens to accept: pick a profile in the Auth Profile
+     * select (`onAutofill`), let the mirror land on the form's fields exactly
+     * as the webview's `fillFields` handler writes them (`el.value =
+     * fillValues[fk]`, key by key, leaving untouched keys alone), then Save.
+     *
+     * Posting a hand-built payload straight into `onSubmit` cannot show
+     * whether the form can produce that payload at all — which is the whole
+     * defect here: the mirror used to write a whitespace username into a field
+     * that is both required and, once linked, read-only, so
+     * `parseSourceFormValues` rejected the save and the profile could not be
+     * linked through the form no matter what the persist helper would have
+     * done with it.
+     */
+    async function selectProfileThenSubmit(values: FormValues, profileId: string): Promise<void> {
+      const { onAutofill, onSubmit } = latestFormCall();
+      const mirrored = await onAutofill!("authProfileId", profileId);
+      await onSubmit({ ...values, authProfileId: profileId, ...(mirrored ?? {}) });
+    }
+
+    const BASE_ADD_VALUES: FormValues = {
+      name: "My NetBox",
+      targetFolder: "Infra",
+      defaultUsername: "admin",
+      prunePolicy: "orphan",
+      cfg_host: "netbox.local",
+      cfg_apiToken: "secret-token"
+    };
+
+    it("(FINDING 2, P2) selecting an imported profile whose username is whitespace-only leaves the user's own username in the form, so the save the user drives actually goes through (kills a mirror that writes whitespace into the required, read-only field and makes the profile unlinkable)", async () => {
+      const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
+      const { core } = await makeHarness({ profiles: [blankish] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      // Mirroring "   " here makes this call REJECT with "Default SSH Username
+      // is required" — the user's dead end, reproduced.
+      await selectProfileThenSubmit(BASE_ADD_VALUES, "p3");
+
+      const created = core.getSnapshot().inventorySources[0];
+      expect(created.authProfileId).toBe("p3");
+      expect(created.defaultUsername).toBe("admin");
+    });
+
+    it("(FINDING 2, P2) the same holds on the edit form (kills fixing only the add form's mirror)", async () => {
+      const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
+      const { core } = await makeHarness({ profiles: [blankish], source: { defaultUsername: "admin" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      await selectProfileThenSubmit(
+        { name: "My Source", targetFolder: "Infra", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "netbox.local", cfg_apiToken: "" },
+        "p3"
+      );
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBe("p3");
+      expect(updated.defaultUsername).toBe("admin");
+    });
+
+    it("(FINDING 2, P2) a blank-username profile still ANSWERS the autofill with an empty payload, while an id that resolves to nothing answers not at all (kills collapsing the two onto `undefined`, which suppresses the fillFields round trip and leaves the form's lock never re-evaluated)", async () => {
+      const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
+      await makeHarness({ profiles: [LAB_PROFILE, blankish] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onAutofill } = latestFormCall();
+
+      // WebviewFormPanel posts `fillFields` for any truthy result and skips it
+      // entirely for `undefined`; only the empty object re-runs the webview's
+      // lock evaluation without writing a value.
+      expect(await onAutofill!("authProfileId", "p3")).toEqual({});
+      expect(await onAutofill!("authProfileId", "no-such-profile")).toBeUndefined();
+    });
+
+    it("(FINDING 2, P2) the mirror posts the profile's TRIMMED username, so what the field shows is what the record stores (kills mirroring a padded value the saved source then quietly disagrees with)", async () => {
+      const padded: AuthProfile = { id: "p4", name: "Padded", username: "  labuser  ", authType: "agent" };
+      const { core } = await makeHarness({ profiles: [padded] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onAutofill } = latestFormCall();
+      expect(await onAutofill!("authProfileId", "p4")).toEqual({ defaultUsername: "labuser" });
+
+      await selectProfileThenSubmit(BASE_ADD_VALUES, "p4");
+      const created = core.getSnapshot().inventorySources[0];
+      // fallbackUsernameForSource trims too, so an untrimmed mirror would show
+      // "  labuser  " over a record holding "labuser".
+      expect(created.defaultUsername).toBe("labuser");
+    });
+
+    /* ── the form the user actually sees, running its real script ─────────
+     *
+     * REVIEW FINDING (P2) — both defects below are "the form displayed one
+     * thing and Save stored another", so neither end alone can see them: the
+     * hand-built `onSubmit` payloads above prove what the persist helper does
+     * with a submission, never that the form can produce that submission. These
+     * open the REAL rendered form over the definition the command handed
+     * WebviewFormPanel (`openForm`, test/helpers/formScriptHarness.ts), drive
+     * it, and submit exactly what it posts into the command's own onSubmit —
+     * so the oracle is the persisted record and the comparand is what the field
+     * was showing.
+     */
+    it("Edit Source opens showing the LINKED PROFILE's current username, and an untouched Save stores exactly what it showed (kills seeding the field from the stored record: the profile's username is what fallbackUsernameForSource persists, so a profile renamed since the last save left the form displaying one username, locked, while Save quietly wrote another)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        // What the last save stored — the profile's username AT THAT TIME.
+        source: { authProfileId: "p1", defaultUsername: "labuser" }
+      });
+      // …and the profile's username is changed afterwards, in the profile
+      // editor, while the source record keeps the older fallback.
+      await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, username: "renamed-labuser" });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+
+      // The field is locked, so this is the ONLY value the user could save.
+      expect(harness.locked("defaultUsername")).toBe(true);
+      expect(harness.value("defaultUsername")).toBe("renamed-labuser");
+
+      await onSubmit(harness.submit());
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBe("p1");
+      expect(updated.defaultUsername).toBe("renamed-labuser");
+      // The invariant, stated directly: a locked field and the record behind it
+      // cannot disagree.
+      expect(updated.defaultUsername).toBe(harness.value("defaultUsername"));
+    });
+
+    it("and setting that same form back to (None) hands the SOURCE's stored fallback back, which is what Save then stores (kills rendering the profile's username without seeding the restore: unlinking would leave it in the unlocked field and the source would adopt the username of a profile it is no longer using)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { authProfileId: "p1", defaultUsername: "source-own-account" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+      expect(harness.value("defaultUsername")).toBe("labuser");
+
+      harness.choose("authProfileId", "");
+      expect(harness.value("defaultUsername")).toBe("source-own-account");
+      expect(harness.locked("defaultUsername")).toBe(false);
+
+      await onSubmit(harness.submit());
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBeUndefined();
+      expect(updated.defaultUsername).toBe("source-own-account");
+    });
+
+    it("discards an autofill answer that lands after the profile was deselected (kills applying a fillFields payload without checking which profile it describes: the release has already handed the source's own username back, and an unlinked save stores whatever the form submits)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { defaultUsername: "source-own-account" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onAutofill, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+
+      // The round trip is GATED, not raced: the request is posted…
+      harness.choose("authProfileId", "p1");
+      const requested = [...harness.posted].reverse().find((msg) => msg.type === "autofill");
+      expect(requested?.type).toBe("autofill");
+      const requestedId = requested!.type === "autofill" ? requested.value : "";
+      // …the extension composes its real answer…
+      const answer = await onAutofill!("authProfileId", requestedId);
+      expect(answer).toEqual({ defaultUsername: "labuser" });
+      // …the user reaches (None) before it can be delivered…
+      harness.choose("authProfileId", "");
+      // …and only now does it arrive, exactly as WebviewFormPanel posts it.
+      harness.deliver({ type: "fillFields", key: "authProfileId", value: requestedId, values: answer! });
+
+      expect(harness.value("defaultUsername")).toBe("source-own-account");
+      expect(harness.locked("defaultUsername")).toBe(false);
+
+      await onSubmit(harness.submit());
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBeUndefined();
+      expect(updated.defaultUsername).toBe("source-own-account");
+    });
+
+    /* ── the profile moves while the form sits open ──────────────────────────
+     *
+     * REVIEW FINDING (P2) — `fallbackUsernameForSource` derives Default SSH
+     * Username from the LIVE profile, so a username edited in the Auth Profile
+     * Editor while a source form sits open is persisted without ever having
+     * been on screen — in a field the profile had LOCKED, so the user could not
+     * have corrected it. Nothing else catches it: a profile edit revises no
+     * source record, so the edit path's ITEM 4 drift comparison passes
+     * untouched and saving any unrelated field carries the new username in.
+     *
+     * The oracle in each of these is the PERSISTED SOURCE RECORD measured
+     * against what the form was displaying — never the refusal on its own.
+     */
+    it("editSource refuses to save when the linked profile's username changed under the open form, and the record keeps the username the form is still showing (kills leaning on the ITEM 4 drift guard, which a profile edit never trips: renaming the source was enough to replace its fallback username with one no screen ever displayed)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { authProfileId: "p1", defaultUsername: "labuser" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+      // What the user is looking at — and cannot edit, the profile owns it.
+      expect(harness.locked("defaultUsername")).toBe(true);
+      expect(harness.value("defaultUsername")).toBe("labuser");
+
+      // The profile is edited elsewhere (AuthProfileEditorPanel) meanwhile.
+      const revisionBefore = core.getInventorySource("src-1")!.revision;
+      await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, username: "svc-account" });
+      // …which leaves the source record — revision included — untouched, so
+      // there is no drift for the ITEM 4 comparison to find. This guard is the
+      // only one that can see it.
+      expect(core.getInventorySource("src-1")!.revision).toBe(revisionBefore);
+      expect(core.getInventorySource("src-1")!.defaultUsername).toBe("labuser");
+
+      // …and the user changes something else entirely, then saves.
+      harness.type("name", "Renamed source");
+      const failure = await onSubmit(harness.submit()).then(
+        () => undefined,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+      // THE ORACLE, asserted before the message: the persisted record against
+      // what the field was showing. Unguarded this reads "svc-account" — the
+      // username every server the source syncs is stamped with, and the one
+      // they all fall back to if the profile is ever removed, chosen by nobody.
+      const stored = core.getInventorySource("src-1")!;
+      expect(stored.defaultUsername).toBe("labuser");
+      expect(stored.defaultUsername).toBe(harness.value("defaultUsername"));
+      // The unrelated edit does not ride in on the back of it either.
+      expect(stored.name).toBe("My Source");
+      // And the user is told which profile moved, and the one action that fixes it.
+      expect(failure).toContain('The auth profile "Lab credentials" changed the username it supplies while this form was open');
+      expect(failure).toContain("Re-select it in the Auth Profile list");
+    });
+
+    it("addSource refuses the same drift, on the path with no stored record to compare anything against (kills a guard that only the edit path carries: on Add, the mirror's answer is the ONLY account of what the form displayed)", async () => {
+      const { core, vault } = await makeHarness({ profiles: [LAB_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onAutofill, onSubmit } = latestFormCall();
+      // The user picks the profile and the mirror lands — "labuser", locked.
+      const mirrored = await onAutofill!("authProfileId", "p1");
+      expect(mirrored).toEqual({ defaultUsername: "labuser" });
+
+      await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, username: "svc-account" });
+
+      const failure = await onSubmit({ ...BASE_ADD_VALUES, authProfileId: "p1", ...mirrored! }).then(
+        () => undefined,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+      // Unguarded, the source IS created — holding "svc-account" behind a form
+      // that showed "labuser".
+      expect(core.getSnapshot().inventorySources.map((s) => s.defaultUsername)).toEqual([]);
+      expect(failure).toContain("changed the username it supplies while this form was open");
+      // And the vault-first write is rolled back, as every sibling refusal in
+      // this critical section owes.
+      const storedKey = vault.store.mock.calls.at(-1)?.[0] as string | undefined;
+      expect(storedKey).toBeDefined();
+      expect(await vault.get(storedKey!)).toBeUndefined();
+    });
+
+    it("addSource refuses when a profile that supplied NO username gains one under the open form, keeping the fallback the user typed (kills comparing only the two usernames a profile happens to have: the field was unlocked and holding the user's own value, and the save would have swapped the profile's in)", async () => {
+      // Whitespace-only — reachable through an imported backup, and the one
+      // shape that leaves Default SSH Username unlocked under a live link.
+      const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
+      const { core } = await makeHarness({ profiles: [blankish], servers: [makeServer({ username: "admin" })] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { definition, onAutofill, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+      harness.type("targetFolder", "Infra"); // an empty one asks for a second Save first
+      harness.type("cfg_host", "netbox.local");
+      harness.type("cfg_apiToken", "secret-token");
+
+      harness.choose("authProfileId", "p3");
+      const answer = await onAutofill!("authProfileId", "p3");
+      harness.deliver({ type: "fillFields", key: "authProfileId", value: "p3", values: answer! });
+      // The profile fills nothing, so this is the user's own fallback (seeded
+      // from mostCommonUsername), still editable.
+      expect(harness.locked("defaultUsername")).toBe(false);
+      expect(harness.value("defaultUsername")).toBe("admin");
+
+      // The imported profile is given a real username in the profile editor.
+      await core.addOrUpdateAuthProfile({ ...blankish, username: "svc-account" });
+
+      const failure = await onSubmit(harness.submit()).then(
+        () => undefined,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+      // Unguarded, `fallbackUsernameForSource` now prefers the profile's, and
+      // the source is created on "svc-account" over the "admin" the user typed
+      // and is still looking at.
+      expect(core.getSnapshot().inventorySources.map((s) => s.defaultUsername)).toEqual([]);
+      expect(failure).toContain('The auth profile "Imported" changed the username it supplies');
+    });
+
+    it("editSource refuses when the linked profile STOPS supplying a username, and re-selecting it — what the message asks for — clears the refusal (kills firing only where the live profile still has a username to compare: the field is left locked against a profile that no longer fills it, and only the re-select runs the release that could unlock it)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { authProfileId: "p1", defaultUsername: "labuser" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onAutofill, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+      expect(harness.locked("defaultUsername")).toBe(true);
+
+      // A restored backup can carry a whitespace username (validateAuthProfile
+      // only checks length); THE ONE RULE reads that as supplying none, so what
+      // the locked field on screen claims about this profile is now false.
+      await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, username: "   " });
+
+      await expect(onSubmit(harness.submit())).rejects.toThrow(/changed the username it supplies/);
+
+      // Not a dead end: the one action the message names re-stamps what the
+      // form is showing, and the same save then goes through.
+      expect(await onAutofill!("authProfileId", "p1")).toEqual({});
+      await onSubmit(harness.submit());
+
+      const stored = core.getInventorySource("src-1")!;
+      expect(stored.authProfileId).toBe("p1");
+      // The profile supplies none, so the source keeps its own fallback — the
+      // blank-profile branch of fallbackUsernameForSource, reached through the
+      // form rather than through a raced mirror.
+      expect(stored.defaultUsername).toBe("labuser");
+    });
+
+    it("a profile edit that changes nothing this save writes still saves (kills reusing the server form's authProfileOwnershipSignature here: a source record takes the profile's USERNAME and nothing else, so the authentication type that signature carries moving under the form is not drift and refusing it would refuse a correct save)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { authProfileId: "p1", defaultUsername: "labuser" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+      expect(harness.value("defaultUsername")).toBe("labuser");
+
+      // Renamed, and switched from password to SSH agent: a linked SOURCE
+      // stores neither, so the form on screen still describes this save
+      // exactly. (On the server form the same edit is drift — it decides which
+      // credential control is rendered at all.)
+      await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, name: "Lab (agent)", authType: "agent" });
+
+      harness.type("name", "Renamed source");
+      await onSubmit(harness.submit());
+
+      const stored = core.getInventorySource("src-1")!;
+      expect(stored.name).toBe("Renamed source");
+      expect(stored.authProfileId).toBe("p1");
+      expect(stored.defaultUsername).toBe("labuser");
+    });
+
+    it("addSource wires inline auth-profile creation end to end and an autofill that mirrors ONLY defaultUsername (kills the server form's {username, authType, keyPath} payload, an unwired onAutofill, and a controller that is never attached to the panel)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { definition, onCreateInline, onAutofill, panel } = latestFormCall();
+
+      // The form was built from the LIVE profile snapshot.
+      const select = definition.fields.find((f) => "key" in f && f.key === "authProfileId") as
+        | { options?: Array<{ value: string }> }
+        | undefined;
+      expect(select?.options?.map((o) => o.value)).toContain("p1");
+
+      // toEqual, not toMatchObject: the server form's payload
+      // ({ username, authType, keyPath }) must NOT be what this form returns —
+      // none of those keys exist here, so mirroring them would silently do
+      // nothing and leave Default SSH Username stale and unlocked.
+      expect(await onAutofill!("authProfileId", "p1")).toEqual({ defaultUsername: "labuser" });
+      expect(await onAutofill!("authProfileId", "no-such-profile")).toBeUndefined();
+
+      // Inline creation round trip: the sentinel option opens the editor, and
+      // the profile created there is injected back into the still-open form.
+      // Both halves depend on attachPanel having been called — without it the
+      // controller has no panel and handleCreateInline no-ops.
+      onCreateInline!("authProfileId");
+      expect(mockAuthProfileEditorOpenNew).toHaveBeenCalled();
+      await core.addOrUpdateAuthProfile({ id: "p2", name: "Inline", username: "inline-user", authType: "agent" });
+      expect(panel.addSelectOption).toHaveBeenCalledWith("authProfileId", "p2", expect.stringContaining("Inline"));
+    });
+
+    it("editSource wires the same inline creation and defaultUsername-only autofill (kills wiring only the add form)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE], source: { authProfileId: "p1" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { definition, onCreateInline, onAutofill, panel } = latestFormCall();
+
+      const select = definition.fields.find((f) => "key" in f && f.key === "authProfileId") as
+        | { value?: string; options?: Array<{ value: string }> }
+        | undefined;
+      expect(select?.value).toBe("p1");
+
+      expect(await onAutofill!("authProfileId", "p1")).toEqual({ defaultUsername: "labuser" });
+
+      onCreateInline!("authProfileId");
+      expect(mockAuthProfileEditorOpenNew).toHaveBeenCalled();
+      await core.addOrUpdateAuthProfile({ id: "p2", name: "Inline", username: "inline-user", authType: "agent" });
+      expect(panel.addSelectOption).toHaveBeenCalledWith("authProfileId", "p2", expect.stringContaining("Inline"));
+    });
+
+    it("edit toast — setting a profile appends the switch sentence and offers Sync Now, which syncs THAT source (kills a suffix with no button and a button pointed at the wrong source)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE], source: {} });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+
+      mockShowInformationMessage.mockResolvedValueOnce("Sync Now");
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        authProfileId: "p1",
+        defaultUsername: "labuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      });
+
+      expect(core.getInventorySource("src-1")?.authProfileId).toBe("p1");
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(
+        'Inventory source "My Source" updated. Servers still on the sync default switch to it on the next sync.',
+        "Sync Now"
+      );
+      await flushDetached();
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.syncNow", "src-1");
+    });
+
+    it("edit toast — switching from profile A to profile B promises only what the retro-apply rule actually does (kills \"Synced servers switch to the new auth profile\", which the very next sync contradicts with \"nothing to change\")", async () => {
+      const otherProfile: AuthProfile = { id: "p2", name: "Other", username: "otheruser", authType: "password" };
+      await makeHarness({ profiles: [LAB_PROFILE, otherProfile], source: { authProfileId: "p1" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        authProfileId: "p2",
+        defaultUsername: "labuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      });
+
+      await flushDetached();
+      // Servers already carrying A are never re-stamped (UX §4), so a sentence
+      // saying "synced servers switch to the new auth profile" would be a
+      // promise the next sync breaks. The shipped sentence is true here (only
+      // servers still on the sync default move) and true on a first set.
+      expect(mockShowInformationMessage).toHaveBeenCalledWith(
+        'Inventory source "My Source" updated. Servers still on the sync default switch to it on the next sync.',
+        "Sync Now"
+      );
+    });
+
+    it("edit toast — re-saving the SAME profile adds no suffix and no Sync Now button (kills an unconditional suffix that advertises a sync changing nothing)", async () => {
+      await makeHarness({ profiles: [LAB_PROFILE], source: { authProfileId: "p1" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        authProfileId: "p1",
+        defaultUsername: "labuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      });
+
+      await flushDetached();
+      expect(mockShowInformationMessage.mock.calls.map((call) => call[0])).toEqual(['Inventory source "My Source" updated.']);
+      // A one-argument call is a buttonless toast; the suffix variant passes
+      // "Sync Now" as a second argument.
+      expect(mockShowInformationMessage.mock.calls[0]).toHaveLength(1);
+      expect(mockExecuteCommand).not.toHaveBeenCalled();
+    });
+
+    it("edit toast — clearing the profile to (None) adds no suffix and no Sync Now button (kills advertising a sync for a change the retro-apply rule deliberately never makes)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE], source: { authProfileId: "p1" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        authProfileId: "",
+        defaultUsername: "labuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      });
+
+      // The clear itself must still persist — this is not a no-op save.
+      expect(core.getInventorySource("src-1")?.authProfileId).toBeUndefined();
+      await flushDetached();
+      expect(mockShowInformationMessage.mock.calls.map((call) => call[0])).toEqual(['Inventory source "My Source" updated.']);
+      expect(mockShowInformationMessage.mock.calls[0]).toHaveLength(1);
+      expect(mockExecuteCommand).not.toHaveBeenCalled();
+    });
+
+    it("the confirm modal counts ONLY the updates whose auth profile actually changes, on the line directly under \"N servers will be updated.\" (kills a missing line, a count taken from every update, and a line rendered somewhere else in the detail)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { targetFolder: "", authProfileId: "p1" },
+        servers: [
+          // Two servers on the untouched add-path default: name/host/port/group
+          // already match their device exactly, so the retro-apply stamp is the
+          // ONLY thing that can turn either into an update.
+          ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" }),
+          ownedServer({ id: "owned-2", externalId: "device:2", name: "sw2", host: "10.0.0.2" }),
+          // Hand-linked to another profile: an update (its name drifted) that
+          // must NOT be counted as a switch.
+          ownedServer({ id: "owned-3", externalId: "device:3", name: "stale-name", host: "10.0.0.3", authProfileId: "q" })
+        ],
+        provider: {
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [
+              { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
+              { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] },
+              { externalId: "device:3", name: "sw3", endpoints: [{ kind: "ssh" as const, host: "10.0.0.3", port: 22 }] }
+            ]
+          }))
+        }
+      });
+
+      // Dismiss the modal — this test is only about what it says.
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const [, options] = modalCalls()[0];
+      const lines = options.detail.split("\n");
+      const updatedIndex = lines.indexOf("3 servers will be updated.");
+      expect(updatedIndex).toBeGreaterThanOrEqual(0);
+      expect(lines[updatedIndex + 1]).toBe('2 servers will switch to auth profile "Lab credentials".');
+      // Nothing was applied — owned-3 keeps the profile it was hand-linked to.
+      expect(core.getServer("owned-3")?.authProfileId).toBe("q");
+    });
+
+    it("the modal's Show Warnings buffer names EVERY switching server, not a sample, and the button is offered even when the plan has no other warning (kills a count-only disclosure a fleet-wide switch cannot be inspected from, and the count-plus-three-examples idiom that cannot answer 'is MY server in this list')", async () => {
+      // Five, deliberately: more than the three a pushSkipSummary-style
+      // "(e.g. …)" parenthetical would show, so a truncating implementation
+      // visibly loses names here.
+      const devices = [1, 2, 3, 4, 5].map((n) => ({
+        externalId: `device:${n}`,
+        name: `sw${n}`,
+        endpoints: [{ kind: "ssh" as const, host: `10.0.0.${n}`, port: 22 }]
+      }));
+      await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { targetFolder: "", authProfileId: "p1" },
+        // Five servers on the untouched add-path default: name/host/port/group
+        // already match their device, so the retro-apply stamp is the only
+        // thing turning any of them into an update.
+        servers: devices.map((d, i) => ownedServer({ id: `owned-${i + 1}`, externalId: d.externalId, name: d.name, host: d.endpoints[0].host })),
+        provider: { fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices })) }
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Show Warnings");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const modalCall = mockShowInformationMessage.mock.calls.find(
+        (call) => typeof call[1] === "object" && call[1] !== null && (call[1] as { modal?: boolean }).modal === true
+      )!;
+      // This plan carries NO engine warnings, so a button keyed on
+      // plan.warnings.length would be "Apply" alone and the names would be
+      // unreachable in exactly the case they exist for.
+      expect(modalCall.slice(2)).toEqual(["Apply", "Show Warnings"]);
+
+      const [openArgs] = mockOpenTextDocument.mock.calls as Array<[{ content: string }]>;
+      // Whole-buffer equality: a counted heading followed by one indented,
+      // quoted name per switching server — ALL of them. A sampled rendering
+      // ("(e.g. …)") fails on both the heading's shape and the two missing
+      // names; a list that dropped the count fails on the heading.
+      expect(openArgs[0].content).toBe(
+        [
+          '5 servers will switch to auth profile "Lab credentials":',
+          '  "sw1"',
+          '  "sw2"',
+          '  "sw3"',
+          '  "sw4"',
+          '  "sw5"'
+        ].join("\n")
+      );
+    });
+
+    /**
+     * REVIEW FINDING (P1) — the engine's AUTH 2b unlink, seen from the command
+     * layer. It is a credential mutation on existing servers, so it travels the
+     * same disclosure route as the adoption it reverses: a counted line in the
+     * modal and every affected server named behind Show Warnings.
+     *
+     * The two `not.toContain` assertions are the point. Before the split, an
+     * unlink satisfied `before.authProfileId !== after.authProfileId` and was
+     * rendered by the SWITCH branch — the modal told the user their servers were
+     * about to start using the very profile the plan was taking away from them.
+     */
+    function previouslyLinkedHarness(): Promise<{ core: NexusCore; provider: InventoryProvider; vault: ReturnType<typeof makeVault> }> {
+      const devices = [1, 2].map((n) => ({
+        externalId: `device:${n}`,
+        name: `sw${n}`,
+        endpoints: [{ kind: "ssh" as const, host: `10.0.0.${n}`, port: 22 }]
+      }));
+      return makeHarness({
+        profiles: [KEYLESS_KEY_PROFILE],
+        source: { targetFolder: "", authProfileId: "pk" },
+        // Exactly what an earlier sync left behind while the profile still had a
+        // key file: the link, plus the stamp recording that the SYNC made it.
+        servers: devices.map((d, i) =>
+          ownedServer({
+            id: `owned-${i + 1}`,
+            externalId: d.externalId,
+            name: d.name,
+            host: d.endpoints[0].host,
+            authProfileId: "pk",
+            origin: { sourceId: "src-1", externalId: d.externalId, syncedAt: 1, syncedAuthProfileId: "pk" }
+          })
+        ),
+        provider: { fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices })) }
+      });
+    }
+
+    it("(REVIEW FINDING, P1) the confirm modal discloses an UNLINK as an unlink, and Apply performs it (kills rendering it through the switch branch, which claims the opposite of what the plan does)", async () => {
+      const { core } = await previouslyLinkedHarness();
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const [, options] = modalCalls()[0];
+      expect(options.detail).toContain(
+        '2 servers will stop using auth profile "Shared Key" and revert to their own stored credentials.'
+      );
+      expect(options.detail).not.toContain("will switch to");
+      // And it is a real change, applied — not a line the modal renders about
+      // nothing. Both halves of the record go: the link and the sync's stamp.
+      expect(core.getServer("owned-1")?.authProfileId).toBeUndefined();
+      expect(core.getServer("owned-2")?.authProfileId).toBeUndefined();
+      expect(core.getServer("owned-1")?.origin?.syncedAuthProfileId).toBeUndefined();
+    });
+
+    it("(REVIEW FINDING, P1) Show Warnings names every server being unlinked, under its own heading (kills a count-only disclosure, and kills reusing the switch heading)", async () => {
+      await previouslyLinkedHarness();
+
+      mockShowInformationMessage.mockResolvedValueOnce("Show Warnings");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const [openArgs] = mockOpenTextDocument.mock.calls as Array<[{ content: string }]>;
+      const lines = openArgs[0].content.split("\n");
+      expect(lines).toContain('2 servers will stop using auth profile "Shared Key" and revert to their own stored credentials:');
+      expect(lines).toContain('  "sw1"');
+      expect(lines).toContain('  "sw2"');
+      expect(openArgs[0].content).not.toContain("will switch to");
+      // The engine's own explanation of WHY sits in the same buffer.
+      expect(openArgs[0].content).toContain("uses private key authentication but has no key file");
+    });
+
+    it("describePlanDetail renders a NAMELESS switch line rather than none when the caller loses the profile name (kills the silent drop that would slip the stamps past the modal with no disclosure at all)", () => {
+      function planWithSwitches(count: number): InventorySyncPlan {
+        const updates = Array.from({ length: count }, (_, i) => {
+          const before = ownedServer({ id: `owned-${i}`, externalId: `device:${i}`, name: `sw${i}` });
+          return { before, after: { ...before, authProfileId: "p1" } };
+        });
+        return {
+          sourceId: "src-1",
+          syncedAt: 1,
+          adds: [],
+          updates,
+          prunes: [],
+          unchangedCount: 0,
+          folders: [],
+          warnings: [],
+          hiddenPruneCount: 0,
+          manualDuplicateCount: 0
+        };
+      }
+
+      // Unreachable through syncNow — every call site pairs a plan with the
+      // resolution it was computed from. It is the CONSISTENTLY broken future
+      // caller this guards: no name to the modal render and none to either
+      // drift render renders identical texts, so planDetailDrift sees no drift
+      // and the stamps would apply with nothing said. The line has to survive
+      // on its own.
+      expect(describePlanDetail(planWithSwitches(2), [], undefined)).toContain("2 servers will switch to a different auth profile.");
+      expect(describePlanDetail(planWithSwitches(1), [], undefined)).toContain("1 server will switch to a different auth profile.");
+      // The named form is untouched by the fallback.
+      expect(describePlanDetail(planWithSwitches(2), [], "Lab credentials")).toContain(
+        '2 servers will switch to auth profile "Lab credentials".'
+      );
+
+      // REVIEW FINDING (P1) — the unlink line carries the same nameless
+      // fallback, exercised directly for the same reason: it is unreachable
+      // through syncNow (an unlink only happens for a profile that resolves, so
+      // the name is always in hand), and a guard nobody can run is a guard
+      // nobody can prove still works.
+      function planWithClears(count: number): InventorySyncPlan {
+        const plan = planWithSwitches(count);
+        return {
+          ...plan,
+          updates: plan.updates.map((u) => ({ before: { ...u.before, authProfileId: "p1" }, after: { ...u.after, authProfileId: undefined } }))
+        };
+      }
+
+      expect(describePlanDetail(planWithClears(2), [], undefined)).toContain(
+        "2 servers will stop using their auth profile and revert to their own stored credentials."
+      );
+      expect(describePlanDetail(planWithClears(1), [], undefined)).toContain(
+        "1 server will stop using their auth profile and revert to their own stored credentials."
+      );
+      // An unlink must never be rendered by the switch branch — that line claims
+      // the opposite of what the plan does.
+      expect(describePlanDetail(planWithClears(2), [], "Lab credentials")).not.toContain("will switch to");
+    });
+
+    it("syncNow retro-applies the source's profile to a server still on the bare agent default: the confirm modal appears (not the nothing-to-change fast path) and Apply stamps the link (kills a caller that never resolves/passes authProfile into computeSyncPlan)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { targetFolder: "", authProfileId: "p1" },
+        servers: [ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" })],
+        provider: {
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [{ externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+          }))
+        }
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // Without the plumbing the plan is empty, syncNow takes the "nothing to
+      // change" fast path, and no modal is ever shown.
+      const shown = modalCalls();
+      expect(shown).toHaveLength(1);
+      expect(shown[0][1].detail).toContain("1 server will be updated.");
+      expect(shown[0][1].detail).toContain('1 server will switch to auth profile "Lab credentials".');
+
+      const updated = core.getServer("owned-1");
+      expect(updated?.authProfileId).toBe("p1");
+      // Linked, never copied: the record keeps its own credential fields —
+      // the profile's own username is "labuser", which must NOT appear here.
+      expect(updated?.authType).toBe("agent");
+      expect(updated?.username).toBe("admin");
+    });
+
+    it("a profile renamed while the confirm modal is open re-confirms under the NEW name (kills resolving the profile once at sync start and reusing that name for the drift render)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { targetFolder: "", authProfileId: "p1" },
+        servers: [ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" })],
+        provider: {
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [{ externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+          }))
+        }
+      });
+
+      mockShowInformationMessage
+        // The rename lands WHILE the first modal is open. It changes nothing
+        // computeSyncPlan itself returns — same source, same servers, same
+        // profile id, so the plan is byte-identical — only the name the modal
+        // renders moves. A resolve-once implementation therefore sees no drift
+        // and applies straight away under the stale name.
+        .mockImplementationOnce(async () => {
+          await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, name: "Renamed" });
+          return "Apply";
+        })
+        .mockResolvedValueOnce("Apply");
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modalCalls();
+      expect(shown).toHaveLength(2);
+      expect(shown[0][1].detail).toContain('1 server will switch to auth profile "Lab credentials".');
+      expect(shown[1][1].detail).toContain('1 server will switch to auth profile "Renamed".');
+      expect(core.getServer("owned-1")?.authProfileId).toBe("p1");
+    });
+
+    it("REVIEW FINDING (P2) — a mid-modal swap of WHICH server is eligible for retro-apply re-confirms, even though both plans render byte-identical detail and delete nothing (kills a drift check that compares only the rendered text and the delete-id set)", async () => {
+      const otherProfile: AuthProfile = { id: "p2", name: "Other", username: "otheruser", authType: "password" };
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE, otherProfile],
+        source: { targetFolder: "", authProfileId: "p1" },
+        servers: [
+          // sw1 is eligible right now: no profile, agent auth, no key path,
+          // still on the username the sync stamped.
+          ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" }),
+          // sw2 is not: it already carries a link, which is a DECIDED state.
+          ownedServer({ id: "owned-2", externalId: "device:2", name: "sw2", host: "10.0.0.2", authProfileId: "p2" })
+        ],
+        provider: {
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [
+              { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
+              { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] }
+            ]
+          }))
+        }
+      });
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage
+        // Both edits land WHILE the first modal is open, and they EXCHANGE the
+        // two servers' eligibility rather than changing how many are eligible:
+        // sw1 gains a hand-set link (decided — retro-apply must leave it), sw2
+        // has its link cleared (indistinguishable from never-configured —
+        // retro-apply adopts it). Every number describePlanDetail renders is
+        // untouched: 0 added, 1 updated, 1 switching, 1 unchanged, 0 pruned, 0
+        // warnings. Only the IDENTITY of the switching server moves — the very
+        // thing the modal's Show Warnings buffer discloses by name.
+        .mockImplementationOnce(async () => {
+          await core.addOrUpdateServer({ ...core.getServer("owned-1")!, authProfileId: "p2" });
+          await core.addOrUpdateServer({ ...core.getServer("owned-2")!, authProfileId: undefined });
+          return "Apply";
+        })
+        .mockResolvedValueOnce(undefined); // cancel the reconfirmation modal
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modalCalls();
+      expect(shown).toHaveLength(2);
+      // THE FIXTURE'S NON-VACUITY, asserted rather than assumed: the two modals
+      // are byte-identical, so nothing a text comparison can see has moved, and
+      // neither plan deletes anything, so the delete-id set has not moved
+      // either. Drift can only be detected from the switch-id set.
+      expect(shown[1][1].detail).toBe(shown[0][1].detail);
+      expect(shown[0][1].detail).toContain("1 server will be updated.");
+      expect(shown[0][1].detail).toContain('1 server will switch to auth profile "Lab credentials".');
+      expect(shown[0][1].detail).toContain("1 server is unchanged.");
+      expect(shown[0][1].detail).not.toContain("will be deleted");
+
+      // Without the switch-id comparison the fresh plan applies unseen and
+      // stamps "Lab credentials" onto owned-2 — a server that never appeared in
+      // the Show Warnings list behind the modal the user confirmed, which named
+      // owned-1 and only owned-1.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("owned-1")?.authProfileId).toBe("p2");
+      expect(core.getServer("owned-2")?.authProfileId).toBeUndefined();
+    });
+
+    it("a dangling authProfileId surfaces the exact dangling-profile warning through the modal's Show Warnings buffer (kills a caller that fabricates a resolution for an id nothing resolves)", async () => {
+      await makeHarness({
+        source: { targetFolder: "", authProfileId: "ghost" },
+        provider: {
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [{ externalId: "device:9", name: "new-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.9", port: 22 }] }]
+          }))
+        }
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Show Warnings");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const [openArgs] = mockOpenTextDocument.mock.calls as Array<[{ content: string }]>;
+      expect(openArgs[0].content).toContain(
+        'The auth profile for "My Source" no longer exists — synced servers use the default username with SSH agent authentication. Edit the source to choose another profile.'
+      );
+    });
+
+    it("a dangling authProfileId adds servers UNLINKED — the dead id is never stamped through as if it had resolved (kills passing source.authProfileId along without a live lookup)", async () => {
+      const { core } = await makeHarness({
+        source: { targetFolder: "", authProfileId: "ghost" },
+        provider: {
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [{ externalId: "device:9", name: "new-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.9", port: 22 }] }]
+          }))
+        }
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      // The dangling warning also fires the post-apply "N warnings" toast.
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const servers = core.getSnapshot().servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0].authProfileId).toBeUndefined();
+      // Pre-feature fallback, field for field.
+      expect(servers[0].authType).toBe("agent");
+      expect(servers[0].username).toBe("admin");
+    });
+  });
+
+  // The busy-marker refusal wording. One marker is shared by three claimants
+  // (syncNow, editSource's open form, removeSource's confirm-and-mutate run)
+  // and it used to be a bare Set<string>, so every refusal was worded as an
+  // in-flight sync regardless of who actually held it. Reported by the repo
+  // owner: an Edit Source tab left open made Sync Now insist the source was
+  // "currently syncing", and the only way to discover the truth was to close
+  // the tab and watch the problem vanish.
+  //
+  // Every test below asserts the EXACT sentence at EVERY reporting site, for
+  // each holder in turn: a substring/"some warning appeared" assertion cannot
+  // tell the fixed code from the lie it replaced.
+  describe("busy-marker refusals name the real holder", () => {
+    async function setupBusyFixture(fetchInventory?: InventoryProvider["fetchInventory"]): Promise<{
+      core: NexusCore;
+      provider: InventoryProvider;
+      syncCmd: (...args: unknown[]) => Promise<void>;
+      editCmd: (...args: unknown[]) => Promise<void>;
+      removeCmd: (...args: unknown[]) => Promise<void>;
+    }> {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider(fetchInventory ? { fetchInventory } : {});
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+      return {
+        core,
+        provider,
+        syncCmd: registeredCommands.get("nexus.inventory.syncNow")! as (...args: unknown[]) => Promise<void>,
+        editCmd: registeredCommands.get("nexus.inventory.editSource")! as (...args: unknown[]) => Promise<void>,
+        removeCmd: registeredCommands.get("nexus.inventory.removeSource")! as (...args: unknown[]) => Promise<void>
+      };
+    }
+
+    /** Every message the three commands passed to showWarningMessage as their sole argument. */
+    function singleArgWarnings(): string[] {
+      return mockShowWarningMessage.mock.calls.filter((call) => call.length === 1).map((call) => String(call[0]));
+    }
+
+    it("holder = a running sync: syncNow says already syncing, editSource and removeSource say to wait for it (kills a fix that renders every refusal as the edit/removal wording, and the syncNow/other phrasing swap)", async () => {
+      let resolveFetch!: (tree: InventoryTree) => void;
+      const { core, provider, syncCmd, editCmd, removeCmd } = await setupBusyFixture(
+        vi.fn(() => new Promise<InventoryTree>((resolve) => (resolveFetch = resolve)))
+      );
+
+      // Claimed as "sync" and parked inside fetchInventory (a few awaited
+      // hops in: the fingerprint gate, then the vault reads).
+      const syncPromise = syncCmd("src-1");
+      await vi.waitFor(() => {
+        expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      });
+      mockShowWarningMessage.mockClear();
+
+      await syncCmd("src-1");
+      await editCmd("src-1");
+      await removeCmd("src-1");
+
+      // This is the ONE holder for which "syncing" is true, so all three
+      // sentences must still say so — and syncNow's keeps its own phrasing
+      // (the user asked for the thing already running).
+      expect(singleArgWarnings()).toEqual([BUSY_SYNC_FROM_SYNC, BUSY_SYNC_FROM_OTHER, BUSY_SYNC_FROM_OTHER]);
+      // None of them started work: no second fetch, no form, no removal.
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      expect(mockWebviewOpen).not.toHaveBeenCalled();
+      expect(core.getSnapshot().inventorySources).toHaveLength(1);
+
+      resolveFetch({ contractVersion: 1, devices: [] });
+      await syncPromise;
+    });
+
+    it("holder = an open Edit Source form: all three commands name the open tab and none claims a sync is running (kills the reported bug — the shared Set reported this holder as an in-flight sync)", async () => {
+      const { core, provider, syncCmd, editCmd, removeCmd } = await setupBusyFixture();
+
+      // Claimed as "edit" for as long as the form stays open (F4). Nothing is
+      // syncing: fetchInventory has never been called.
+      await editCmd("src-1");
+      const { panel } = latestFormCall();
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
+      mockShowWarningMessage.mockClear();
+
+      await syncCmd("src-1");
+      await removeCmd("src-1");
+      await editCmd("src-1");
+
+      expect(singleArgWarnings()).toEqual([BUSY_EDIT, BUSY_EDIT, BUSY_EDIT]);
+      // The pre-fix wording, spelled out so a regression to it is unmissable:
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_SYNC_FROM_SYNC);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_SYNC_FROM_OTHER);
+      for (const message of singleArgWarnings()) {
+        expect(message).not.toMatch(/sync/i);
+      }
+      // Refused, not merely mis-worded: no fetch, no second form, no removal.
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
+      expect(core.getSnapshot().inventorySources).toHaveLength(1);
+
+      // The instruction the sentence gives has to be the one that works:
+      // closing that tab frees the source.
+      panel.fireDispose();
+      mockShowWarningMessage.mockClear();
+      await syncCmd("src-1");
+      expect(singleArgWarnings()).toEqual([]);
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+    });
+
+    it("holder = a removal awaiting its confirm modal: all three commands say the source is being removed (kills a two-member reason enum that has to file removeSource under 'sync' or 'edit')", async () => {
+      const { core, provider, syncCmd, editCmd, removeCmd } = await setupBusyFixture();
+
+      // The confirm modal stays open, holding the marker; every other
+      // showWarningMessage (i.e. the busy refusals, all fire-and-forget)
+      // resolves immediately.
+      let resolveConfirm!: (choice: string | undefined) => void;
+      const confirmChoice = new Promise<string | undefined>((resolve) => (resolveConfirm = resolve));
+      mockShowWarningMessage.mockImplementation((...args: unknown[]) => {
+        const isModal = typeof args[1] === "object" && args[1] !== null && (args[1] as { modal?: boolean }).modal === true;
+        return isModal ? confirmChoice : Promise.resolve(undefined);
+      });
+
+      const removePromise = removeCmd("src-1");
+      await Promise.resolve();
+      const modalCalls = (): number =>
+        mockShowWarningMessage.mock.calls.filter(
+          (call) => typeof call[1] === "object" && call[1] !== null && (call[1] as { modal?: boolean }).modal === true
+        ).length;
+      expect(modalCalls()).toBe(1);
+
+      await syncCmd("src-1");
+      await editCmd("src-1");
+      await removeCmd("src-1");
+
+      expect(singleArgWarnings()).toEqual([BUSY_REMOVE, BUSY_REMOVE, BUSY_REMOVE]);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_SYNC_FROM_SYNC);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_SYNC_FROM_OTHER);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+      expect(mockWebviewOpen).not.toHaveBeenCalled();
+      // The second removeSource was refused before it could open a modal of
+      // its own — one confirm dialog, still exactly one.
+      expect(modalCalls()).toBe(1);
+
+      // Dismissing the modal aborts the removal and releases the marker.
+      resolveConfirm(undefined);
+      await removePromise;
+      expect(core.getSnapshot().inventorySources).toHaveLength(1);
+      mockShowWarningMessage.mockClear();
+      await syncCmd("src-1");
+      expect(singleArgWarnings()).toEqual([]);
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+    });
+
+    it("editSource's provider-missing abort still releases the marker — a source whose provider extension was disabled is not left permanently 'open in Edit Source' (kills dropping releaseInFlight from that early return)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      // Deliberately empty: the extension that registered "fake" is disabled.
+      const registry = new InventoryProviderRegistry();
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      const editCmd = registeredCommands.get("nexus.inventory.editSource")! as (...args: unknown[]) => Promise<void>;
+      await editCmd("src-1");
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining('Inventory provider "fake" is not available'));
+      expect(mockWebviewOpen).not.toHaveBeenCalled();
+
+      // The extension comes back. Without the release on that abort the marker
+      // is stranded, and every later command reports a source held open by an
+      // Edit Source tab that never existed — the F6 failure mode, on a second
+      // early-return path.
+      registry.register(makeProvider());
+      await editCmd("src-1");
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(BUSY_EDIT);
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // T6 — the Settings-tree hub. Every level-2 row routes through
+  // vscode.commands.executeCommand WITH the source id, so each of the four
+  // existing race-guarded flows runs unchanged and no picker is shown twice.
+  describe("nexus.inventory.manage — Settings-tree hub", () => {
+    interface HubItem {
+      label: string;
+      description?: string;
+      kind?: number;
+    }
+    interface HubOptions {
+      title?: string;
+      placeHolder?: string;
+    }
+
+    function quickPickCall(index: number): { items: HubItem[]; options: HubOptions } {
+      const call = mockShowQuickPick.mock.calls[index] as [HubItem[], HubOptions];
+      expect(call).toBeDefined();
+      return { items: call[0], options: call[1] };
+    }
+
+    async function setupHub(sources: InventorySourceConfig[]): Promise<NexusCore> {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      for (const source of sources) {
+        await core.addOrUpdateInventorySource(source);
+      }
+      return core;
+    }
+
+    it("level 1 lists every source with its sourceDescription() line, then a separator and the add row", async () => {
+      await setupHub([
+        makeSource({ id: "src-1", name: "Alpha" }),
+        makeSource({ id: "src-2", name: "Beta", lastSyncAt: Date.now() })
+      ]);
+      mockShowQuickPick.mockResolvedValueOnce(undefined); // dismissed
+
+      await registeredCommands.get("nexus.inventory.manage")!();
+
+      expect(mockShowQuickPick).toHaveBeenCalledTimes(1);
+      const { items, options } = quickPickCall(0);
+      expect(options).toEqual({ title: "Inventory Sources", placeHolder: "Choose a source to sync, edit, or remove" });
+      expect(items.map((item) => item.label)).toEqual(["Alpha", "Beta", "", "$(add) Add Inventory Source…"]);
+      // Reused verbatim from pickInventorySource's row description — provider
+      // label plus the relative last-sync phrasing.
+      expect(items[0].description).toBe("Fake Provider — never synced");
+      expect(items[1].description).toBe("Fake Provider — synced just now");
+      expect(items[2].kind).toBe(-1); // QuickPickItemKind.Separator
+      expect(items[3].kind).toBeUndefined();
+      // Dismissing level 1 is a cancel, not an implicit "add".
+      expect(mockExecuteCommand).not.toHaveBeenCalled();
+    });
+
+    it("picking a source shows the three action rows titled with the source name", async () => {
+      await setupHub([makeSource({ id: "src-1", name: "Alpha" }), makeSource({ id: "src-2", name: "Beta" })]);
+      mockShowQuickPick
+        .mockImplementationOnce(async (items: HubItem[]) => items.find((item) => item.label === "Beta"))
+        .mockResolvedValueOnce(undefined);
+
+      await registeredCommands.get("nexus.inventory.manage")!();
+
+      expect(mockShowQuickPick).toHaveBeenCalledTimes(2);
+      const { items, options } = quickPickCall(1);
+      expect(options.title).toBe("Beta");
+      expect(items.map((item) => [item.label, item.description])).toEqual([
+        ["$(sync) Sync Now", "Fetch devices and preview changes"],
+        ["$(edit) Edit…", "Change settings, credentials, or the auth profile"],
+        ["$(trash) Remove…", "Choose what happens to its synced servers"]
+      ]);
+    });
+
+    it.each([
+      ["$(sync) Sync Now", "nexus.inventory.syncNow"],
+      ["$(edit) Edit…", "nexus.inventory.editSource"],
+      ["$(trash) Remove…", "nexus.inventory.removeSource"]
+    ])("routing %s executes %s with the picked source id (kills a hub that drops the id and re-picks downstream)", async (rowLabel, commandId) => {
+      await setupHub([makeSource({ id: "src-1", name: "Alpha" }), makeSource({ id: "src-2", name: "Beta" })]);
+      mockShowQuickPick
+        .mockImplementationOnce(async (items: HubItem[]) => items.find((item) => item.label === "Beta"))
+        .mockImplementationOnce(async (items: HubItem[]) => items.find((item) => item.label === rowLabel));
+
+      await registeredCommands.get("nexus.inventory.manage")!();
+
+      expect(mockExecuteCommand).toHaveBeenCalledTimes(1);
+      expect(mockExecuteCommand).toHaveBeenCalledWith(commandId, "src-2");
+    });
+
+    it("empty state offers only the add row with the in-picker placeholder and never the pickInventorySource warning toast", async () => {
+      await setupHub([]);
+      mockShowQuickPick.mockImplementationOnce(async (items: HubItem[]) => items[0]);
+
+      await registeredCommands.get("nexus.inventory.manage")!();
+
+      expect(mockShowQuickPick).toHaveBeenCalledTimes(1);
+      const { items, options } = quickPickCall(0);
+      expect(items).toHaveLength(1);
+      expect(items[0].label).toBe("$(add) Add Inventory Source…");
+      // No trailing period: its sibling ("Choose a source to sync, edit, or
+      // remove") has none, and two placeholders on the same picker punctuating
+      // differently is the inconsistency this asserts against.
+      expect(options.placeHolder).toBe("No inventory sources yet — add one to sync servers from your infrastructure");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.addSource");
+      // M2d's "No inventory sources configured. Add one first." belongs to the
+      // direct-command paths only — inside a picker the add row IS the affordance.
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("dismissing level 2 executes nothing", async () => {
+      await setupHub([makeSource({ id: "src-1", name: "Alpha" })]);
+      mockShowQuickPick
+        .mockImplementationOnce(async (items: HubItem[]) => items.find((item) => item.label === "Alpha"))
+        .mockResolvedValueOnce(undefined);
+
+      await registeredCommands.get("nexus.inventory.manage")!();
+
+      expect(mockExecuteCommand).not.toHaveBeenCalled();
+    });
+  });
+
+  // T6 — editSource/removeSource gain syncNow's optional-id-with-picker-fallback
+  // pattern so the hub's rows land straight on the chosen source.
+  describe("inventory command source-id arguments", () => {
+    async function setupTwoSources(): Promise<NexusCore> {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-1", name: "Alpha" }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-2", name: "Beta" }));
+      return core;
+    }
+
+    it("editSource(sourceId) skips the picker and opens the form seeded from exactly that source", async () => {
+      await setupTwoSources();
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-2");
+
+      // Two sources means pickInventorySource cannot auto-select — an
+      // arg-ignoring editSource would show the picker here (and, with the
+      // default undefined resolution, never open a form at all).
+      expect(mockShowQuickPick).not.toHaveBeenCalled();
+      const { definition } = latestFormCall();
+      const nameField = definition.fields.find((field) => field.key === "name") as { value?: string };
+      expect(nameField.value).toBe("Beta");
+    });
+
+    it("editSource(unknownId) reports the source is gone without falling back to the picker", async () => {
+      await setupTwoSources();
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-gone");
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith("That inventory source no longer exists.");
+      expect(mockShowQuickPick).not.toHaveBeenCalled();
+      expect(mockWebviewOpen).not.toHaveBeenCalled();
+    });
+
+    it("removeSource(sourceId) skips the picker and confirms against exactly that source", async () => {
+      await setupTwoSources();
+      mockShowWarningMessage.mockResolvedValueOnce(undefined); // dismiss the confirm
+
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-2");
+
+      expect(mockShowQuickPick).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Remove inventory source "Beta"?',
+        expect.objectContaining({ modal: true }),
+        "Remove"
+      );
+    });
+
+    it("removeSource(unknownId) reports the source is gone without falling back to the picker", async () => {
+      await setupTwoSources();
+
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-gone");
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith("That inventory source no longer exists.");
+      expect(mockShowQuickPick).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it.each(["nexus.inventory.editSource", "nexus.inventory.removeSource"])(
+      "%s falls back to the picker for a non-string argument (menu/tree context objects must not be read as ids)",
+      async (commandId) => {
+        await setupTwoSources();
+        mockShowQuickPick.mockResolvedValueOnce(undefined);
+
+        await registeredCommands.get(commandId)!({ contextValue: "nexus.server" });
+
+        expect(mockShowQuickPick).toHaveBeenCalledTimes(1);
+        expect(mockShowErrorMessage).not.toHaveBeenCalled();
+      }
+    );
   });
 });

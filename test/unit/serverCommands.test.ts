@@ -3,17 +3,20 @@ import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
 import {
   registerServerCommands,
+  authProfileCredentialMirror,
   formValuesToServer,
   formValuesToProxy,
   preserveLinkedServerCredentials,
+  serverAuthProfileRejection,
   syncProxyPasswordSecret,
   teardownServerRuntime
 } from "../../src/commands/serverCommands";
 import type { AuthProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
+import { authProfileOwnershipSignature } from "../../src/models/config";
 import { FolderTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
-import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { SshPty } from "../../src/services/ssh/sshPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 
@@ -1051,6 +1054,13 @@ describe("formValuesToServer File Explorer auto-open", () => {
 });
 
 describe("preserveLinkedServerCredentials", () => {
+  const fullProfile: AuthProfile = {
+    id: "ap-123",
+    name: "Production",
+    username: "profile-user",
+    authType: "password"
+  };
+
   it("preserves existing local credentials when auth profile is linked", () => {
     const existing = makeServer({
       username: "stored-user",
@@ -1062,7 +1072,11 @@ describe("preserveLinkedServerCredentials", () => {
       authType: "password",
       authProfileId: "ap-123"
     });
-    expect(preserveLinkedServerCredentials(existing, next)).toEqual(
+    // keyPath is preserved here because THIS profile supplies one — see the
+    // key-profile-without-a-key case below for the other half of the rule.
+    expect(
+      preserveLinkedServerCredentials(existing, next, { ...fullProfile, authType: "key", keyPath: "/profile/key" })
+    ).toEqual(
       expect.objectContaining({
         username: "stored-user",
         authType: "key",
@@ -1075,7 +1089,186 @@ describe("preserveLinkedServerCredentials", () => {
   it("leaves standalone servers unchanged", () => {
     const existing = makeServer({ username: "stored-user", authType: "key", keyPath: "/stored/key" });
     const next = makeServer({ username: "edited-user", authType: "password" });
-    expect(preserveLinkedServerCredentials(existing, next)).toEqual(next);
+    expect(preserveLinkedServerCredentials(existing, next, undefined)).toEqual(next);
+  });
+
+  // REVIEW FINDING (P2) — kills restoring every credential whenever a link
+  // exists. The form unlocks exactly the fields the profile does not supply, so
+  // restoring those discards the edit the user was invited to make. Each
+  // fixture below is built so the wrong implementation VISIBLY differs: the
+  // submitted value never equals the stored one.
+  it("keeps an edited username under a profile whose own username is blank (kills restoring username unconditionally: the form unlocks that field because the profile fills nothing there, and the old save handed the stored value straight back)", () => {
+    const blank: AuthProfile = { id: "ap-blank", name: "Imported", username: "   ", authType: "password" };
+    const existing = makeServer({ username: "stored-user", authType: "password" });
+    const next = makeServer({ username: "edited-user", authType: "password", authProfileId: "ap-blank" });
+
+    expect(preserveLinkedServerCredentials(existing, next, blank).username).toBe("edited-user");
+  });
+
+  it("keeps an edited key path under a key profile that carries none, while still restoring the username and auth type it does supply (kills restoring keyPath unconditionally)", () => {
+    const keyless: AuthProfile = { id: "ap-key", name: "Shared Key", username: "profile-user", authType: "key" };
+    const existing = makeServer({ username: "stored-user", authType: "password", keyPath: undefined });
+    const next = makeServer({
+      username: "profile-user",
+      authType: "key",
+      keyPath: "/home/me/.ssh/edited",
+      authProfileId: "ap-key"
+    });
+
+    expect(preserveLinkedServerCredentials(existing, next, keyless)).toEqual(
+      expect.objectContaining({
+        username: "stored-user",
+        authType: "password",
+        keyPath: "/home/me/.ssh/edited"
+      })
+    );
+  });
+
+  it("keeps every submitted value when the linked id resolves to no profile (kills restoring on the strength of the id alone: with nothing to mirror from, the form opened those fields unlocked and prefilled from the record, so what comes back is the user's own edit)", () => {
+    const existing = makeServer({ username: "stored-user", authType: "password", keyPath: "/stored/key" });
+    const next = makeServer({
+      username: "edited-user",
+      authType: "key",
+      keyPath: "/edited/key",
+      authProfileId: "ap-deleted"
+    });
+
+    expect(preserveLinkedServerCredentials(existing, next, undefined)).toEqual(next);
+  });
+
+  // REVIEW FINDING (P1) — the MIRROR IMAGE of the two cases above, and the
+  // reason ownership alone cannot decide this. A profile that owns no keyPath
+  // may still be the reason the key field is missing from the submission: it
+  // owns `authType`, the form renders that type, and the Private Key File
+  // control only exists for `key`. "The profile does not own it" and "the user
+  // answered for it" are different questions.
+  it("keeps the server's own key path when the linked profile HIDES the Private Key File control (kills restoring only the fields the profile owns: a password profile owns no keyPath, so a submission that could not carry one erased the file the server still needs)", () => {
+    const existing = makeServer({ username: "stored-user", authType: "key", keyPath: "/stored/key" });
+    // What the form submits under a password profile: its auth type, locked;
+    // no keyPath at all, because updateVisibility disables what it hides and
+    // the submit loop skips every disabled control.
+    const next = makeServer({
+      username: "profile-user",
+      authType: "password",
+      keyPath: undefined,
+      authProfileId: fullProfile.id
+    });
+
+    expect(preserveLinkedServerCredentials(existing, next, fullProfile)).toEqual(
+      expect.objectContaining({ username: "stored-user", authType: "key", keyPath: "/stored/key" })
+    );
+  });
+
+  it("keeps it under an agent profile too (kills fixing only the profile type the report named)", () => {
+    const agent: AuthProfile = { id: "ap-agent", name: "Bastion", username: "agent-user", authType: "agent" };
+    const existing = makeServer({ authType: "key", keyPath: "/stored/key" });
+    const next = makeServer({ authType: "agent", keyPath: undefined, authProfileId: agent.id });
+
+    expect(preserveLinkedServerCredentials(existing, next, agent).keyPath).toBe("/stored/key");
+  });
+
+  it("clears a key path the user cleared in a control the form DID show (kills preserving the stored value whenever the profile owns no keyPath: under a key profile that carries none the field is on screen and empty means empty)", () => {
+    const keyless: AuthProfile = { id: "ap-key", name: "Shared Key", username: "profile-user", authType: "key" };
+    const existing = makeServer({ authType: "key", keyPath: "/stored/key" });
+    const next = makeServer({ authType: "key", keyPath: undefined, authProfileId: keyless.id });
+
+    expect(preserveLinkedServerCredentials(existing, next, keyless).keyPath).toBeUndefined();
+  });
+});
+
+/**
+ * REVIEW FINDING (P1) — the server form's copy of the guard the inventory
+ * source form has always had (`inventoryAuthProfileRejection`). A form can sit
+ * open indefinitely while auth profile add/edit/delete run as ordinary
+ * commands, and `preserveLinkedServerCredentials` decides which submitted
+ * credentials are user input by reading the LIVE profile — so a profile that
+ * moved under an open form makes that decision about a form nobody rendered.
+ */
+describe("serverAuthProfileRejection", () => {
+  const profile = makeAuthProfile({ id: "ap1", authType: "key", keyPath: "/profile/key" });
+  const rendered = { id: "ap1", signature: authProfileOwnershipSignature(profile) };
+
+  it("accepts a submission whose profile is exactly what the form rendered", () => {
+    expect(serverAuthProfileRejection("ap1", rendered, profile)).toBeUndefined();
+  });
+
+  it("accepts a submission carrying no link at all — every field on screen was the user's own", () => {
+    expect(serverAuthProfileRejection(undefined, rendered, undefined)).toBeUndefined();
+  });
+
+  it("refuses an id that no longer resolves (kills saving a deleted profile's id back onto the server, together with the credentials it had mirrored into fields that have since unlocked)", () => {
+    expect(serverAuthProfileRejection("ap1", rendered, undefined)).toContain("no longer exists");
+  });
+
+  it("refuses a profile that has since LOST its key file, naming it (kills comparing the id alone: that profile now owns no keyPath, so the path it had mirrored into a locked field would be written onto the server as the server's own)", () => {
+    const stripped = makeAuthProfile({ id: "ap1", authType: "key", keyPath: undefined });
+    expect(serverAuthProfileRejection("ap1", rendered, stripped)).toContain(stripped.name);
+  });
+
+  it("refuses a profile that has since GAINED one (kills checking only the direction that overwrites: this one silently discards the key path the user typed into a field the form had unlocked)", () => {
+    const keyless = makeAuthProfile({ id: "ap1", authType: "key", keyPath: undefined });
+    const renderedKeyless = { id: "ap1", signature: authProfileOwnershipSignature(keyless) };
+    expect(serverAuthProfileRejection("ap1", renderedKeyless, profile)).toContain(profile.name);
+  });
+
+  it("refuses a submission naming a profile this form never showed credentials for — a Save clicked before the mirror answered", () => {
+    expect(serverAuthProfileRejection("ap1", { id: "ap-other", signature: "x" }, profile)).toContain(profile.name);
+    expect(serverAuthProfileRejection("ap1", undefined, profile)).toContain(profile.name);
+  });
+
+  it("accepts a changed username or key path VALUE (kills rejecting on the whole profile: a linked server stores neither, so nothing this submission writes depends on them, and refusing would fail saves that are correct)", () => {
+    const moved = makeAuthProfile({ id: "ap1", username: "someone-else", authType: "key", keyPath: "/rotated/key" });
+    expect(serverAuthProfileRejection("ap1", rendered, moved)).toBeUndefined();
+  });
+});
+
+/**
+ * REVIEW FINDING (P2) — the third layer. The mirror payload IS the webview's
+ * ownership record (formHtml's `filledKeysFromValues` rebuilds
+ * `profileFilledKeys` from it), so a payload carrying a key the profile does
+ * not supply is what locks a field the save then refuses to keep. It must
+ * carry exactly `authProfileOwnedCredentials`.
+ */
+describe("authProfileCredentialMirror", () => {
+  it("sends every key a profile supplies", () => {
+    const profile: AuthProfile = { id: "ap", name: "Key", username: "root", authType: "key", keyPath: "/keys/id" };
+    expect(authProfileCredentialMirror(profile)).toEqual({
+      username: "root",
+      authType: "key",
+      keyPath: "/keys/id"
+    });
+  });
+
+  it("omits a whitespace-only username (kills sending profile.username unfiltered, which overwrites the username the user typed with whitespace and then locks the field holding it)", () => {
+    const profile: AuthProfile = { id: "ap", name: "Imported", username: "   ", authType: "password" };
+    expect(authProfileCredentialMirror(profile)).toEqual({ authType: "password" });
+  });
+
+  it("omits keyPath for a key profile that carries none (kills sending an empty string, which locks the control the user needs to supply one)", () => {
+    const profile: AuthProfile = { id: "ap", name: "Shared Key", username: "root", authType: "key", keyPath: "  " };
+    expect(authProfileCredentialMirror(profile)).toEqual({ username: "root", authType: "key" });
+  });
+
+  it("answers `undefined` — WebviewFormPanel's 'no answer' — for an id that resolves to nothing", () => {
+    expect(authProfileCredentialMirror(undefined)).toBeUndefined();
+  });
+
+  it("is what the server edit form actually posts back (kills a form left wired to its own inline payload)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+    const blank: AuthProfile = { id: "ap-blank", name: "Imported", username: "   ", authType: "password" };
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], authProfiles: [blank] });
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    const options = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as {
+      onAutofill: (key: string, value: string) => Promise<Record<string, string> | undefined>;
+    };
+
+    expect(await options.onAutofill("authProfileId", "ap-blank")).toEqual({ authType: "password" });
+    expect(await options.onAutofill("authProfileId", "no-such-profile")).toBeUndefined();
   });
 });
 
@@ -1226,6 +1419,39 @@ describe("deploy key command", () => {
     );
     expect(secretDelete).not.toHaveBeenCalledWith(passwordSecretKey("srv-1"));
     expect(connection.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  // REVIEW FINDING (P2) — the deploy flow's own reader of a linked profile's
+  // username. `profile.username ?? server.username` treated whitespace as a
+  // usable value, so the converted record was written with a username
+  // validateServerConfig rejects: a server that vanishes at the next load.
+  it("converts on the server's own username when the linked profile supplies only whitespace (kills `?? server.username` reading a blank profile username as usable)", async () => {
+    const blankProfile = makeAuthProfile({ id: "ap-blank", username: "   ", authType: "password" });
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "stored-user", authProfileId: "ap-blank" })],
+      authProfiles: [blankProfile]
+    });
+    (ctx.sshFactory as any).connect = vi.fn(async () => ({ dispose: vi.fn() }));
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    ]);
+    vi.mocked(vscode.window.showQuickPick as any).mockResolvedValueOnce({
+      label: "id_ed25519",
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    });
+    vi.mocked(readFile).mockResolvedValueOnce("ssh-ed25519 AAAA user@example");
+    vi.mocked(deployPublicKeyToRemote).mockResolvedValueOnce({ alreadyDeployed: false });
+    vi.mocked(vscode.window.showInformationMessage as any).mockResolvedValueOnce("Use standalone key");
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.deployKey")!("srv-1");
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "srv-1", username: "stored-user", authType: "key" })
+    );
   });
 
   it("offers to remove a stale server password secret after converting a profile-linked password server", async () => {
@@ -1911,6 +2137,167 @@ describe("directory sync (issue #35) — OSC 7 observer + lifecycle holes", () =
   });
 });
 
+/**
+ * REVIEW FINDING (P1) — both halves of the fix measured where they matter: the
+ * PERSISTED RECORD. Every defect in this family is the form and the save path
+ * disagreeing, so an assertion about what the webview shows passes while the
+ * bug is fully intact.
+ */
+describe("nexus.server.edit — the auth profile a submission was composed against (P1)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  interface EditPanel {
+    onSubmit: (v: Record<string, unknown>) => Promise<void>;
+    onAutofill: (key: string, value: string) => Promise<Record<string, string> | undefined>;
+  }
+
+  async function openEdit(ctx: CommandContext): Promise<EditPanel> {
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    return mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as EditPanel;
+  }
+
+  const KEYED = makeAuthProfile({ id: "ap1", name: "Datacenter key", authType: "key", keyPath: "/profile/key" });
+  const KEYLESS = makeAuthProfile({ id: "ap1", name: "Datacenter key", authType: "key", keyPath: undefined });
+  const PASSWORD = makeAuthProfile({ id: "ap1", name: "Lab password", authType: "password" });
+
+  /** A rename, submitted exactly as the form composes it under a linked
+   *  profile: the mirrored values in the locked fields, and nothing at all for
+   *  a control the profile's auth type hid. */
+  function renameUnder(profile: AuthProfile, keyPath?: string): Record<string, unknown> {
+    return {
+      name: "Renamed Server",
+      host: "example.com",
+      port: 22,
+      username: profile.username,
+      authType: profile.authType,
+      ...(keyPath !== undefined ? { keyPath } : {}),
+      authProfileId: profile.id
+    };
+  }
+
+  it("keeps the server's own key file through an unrelated rename under a profile that hides the control (kills restoring only the fields the profile owns — measured on the record, where a webview assertion would have said the form looked right)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ authType: "key", keyPath: "/stored/key", username: "stored-user", authProfileId: "ap1" })],
+      authProfiles: [PASSWORD]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(renameUnder(PASSWORD));
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.name).toBe("Renamed Server");
+    expect(saved.keyPath).toBe("/stored/key");
+    expect(saved.authType).toBe("key");
+    expect(saved.username).toBe("stored-user");
+  });
+
+  it("refuses the save when the linked profile was deleted while the form sat open (kills trusting the form's own id: the dangling link is written back and the deleted profile's mirrored username is adopted as the server's own)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "stored-user", authProfileId: "ap1" })],
+      authProfiles: [PASSWORD]
+    });
+
+    const panel = await openEdit(ctx);
+    // The deletion lands while the panel is open. NexusCore.removeAuthProfile
+    // strips the link off the live record too — the open form is the only place
+    // the id still exists.
+    vi.mocked(ctx.core.getAuthProfile).mockReturnValue(undefined);
+
+    await expect(panel.onSubmit(renameUnder(PASSWORD))).rejects.toThrow(/no longer exists/);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it("refuses it when the profile LOST its key file after the form mirrored one (kills comparing the id alone: that path is locked on screen as the profile's, and the save would store it on the server as its own)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ authType: "agent", keyPath: undefined, authProfileId: "ap1" })],
+      authProfiles: [KEYED]
+    });
+
+    const panel = await openEdit(ctx);
+    vi.mocked(ctx.core.getAuthProfile).mockReturnValue(KEYLESS);
+
+    // The form still submits the key path it mirrored from the profile.
+    await expect(panel.onSubmit(renameUnder(KEYED, "/profile/key"))).rejects.toThrow(/Datacenter key/);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it("refuses it when the profile GAINED one after the form left the field to the user (kills guarding only the direction that overwrites: this one silently discards the key path the user typed)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ authType: "password", keyPath: undefined, authProfileId: "ap1" })],
+      authProfiles: [KEYLESS]
+    });
+
+    const panel = await openEdit(ctx);
+    vi.mocked(ctx.core.getAuthProfile).mockReturnValue(KEYED);
+
+    await expect(panel.onSubmit(renameUnder(KEYLESS, "/typed/by/hand"))).rejects.toThrow(/Datacenter key/);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it("still saves when the profile only changed VALUES (kills rejecting on the whole profile — a rotated key path or a renamed account changes nothing a linked server stores)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ authType: "agent", authProfileId: "ap1" })],
+      authProfiles: [KEYED]
+    });
+
+    const panel = await openEdit(ctx);
+    vi.mocked(ctx.core.getAuthProfile).mockReturnValue({ ...KEYED, keyPath: "/rotated/key", username: "someone-else" });
+
+    await panel.onSubmit(renameUnder(KEYED, "/profile/key"));
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+  });
+
+  it("follows the profile the form switched to, so a save after picking another one is not refused (kills stamping the rendered profile once at form open and never again)", async () => {
+    const other = makeAuthProfile({ id: "ap2", name: "Other", authType: "password" });
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ authProfileId: "ap1" })],
+      authProfiles: [KEYED, other]
+    });
+
+    const panel = await openEdit(ctx);
+    // The select's round trip, which is where the form is handed the new
+    // profile's credentials in the first place.
+    expect(await panel.onAutofill("authProfileId", "ap2")).toEqual({ username: other.username, authType: "password" });
+
+    await panel.onSubmit(renameUnder(other));
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    expect((addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig).authProfileId).toBe("ap2");
+  });
+
+  it("refuses a save that names a profile the form was never handed credentials for (kills accepting whatever id the submission carries: a Save clicked before the select's round trip answered is decided against a profile nobody has seen)", async () => {
+    const other = makeAuthProfile({ id: "ap2", name: "Other", authType: "password" });
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ authProfileId: "ap1" })],
+      authProfiles: [KEYED, other]
+    });
+
+    const panel = await openEdit(ctx);
+    await expect(panel.onSubmit(renameUnder(other))).rejects.toThrow(/Other/);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+});
+
 describe("nexus.server.edit — origin preservation (P1)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -2024,6 +2411,122 @@ describe("nexus.server.edit — origin preservation (P1)", () => {
     // marker onto a record it no longer owns. The fix sources from the LIVE
     // record captured inside the mutation lock, which has no origin.
     expect(saved.origin).toBeUndefined();
+  });
+});
+
+/**
+ * REVIEW FINDING (P2) — the END-TO-END consequence of the shared ownership
+ * rule, across the two layers that used to disagree about it. Each test drives
+ * the real Edit form's onSubmit, reads back the record that was actually
+ * persisted, and then hands THAT record to the real SilentAuthSshFactory with
+ * the same profile the save saw. Both findings on this branch existed because
+ * a fix was verified at one layer while another still disagreed, so neither
+ * leg is asserted on its own here.
+ */
+describe("nexus.server.edit → connect — a profile owns only what it supplies", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  async function submitEdit(ctx: CommandContext, values: Record<string, unknown>): Promise<void> {
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    const options = call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+    await options.onSubmit(values);
+  }
+
+  /** Resolves `server` the way a real connection would, and reports the
+   *  ServerConfig the SSH connector was actually handed. */
+  async function resolveForConnect(server: ServerConfig, profiles: AuthProfile[]): Promise<ServerConfig> {
+    const connection = {
+      openShell: vi.fn(), openDirectTcp: vi.fn(), openSftp: vi.fn(), exec: vi.fn(),
+      requestForwardIn: vi.fn(), cancelForwardIn: vi.fn(),
+      onTcpConnection: vi.fn().mockReturnValue(() => {}), onClose: vi.fn().mockReturnValue(() => {}),
+      getBanner: vi.fn().mockReturnValue(undefined), dispose: vi.fn()
+    };
+    const connector = { connect: vi.fn(async () => connection) };
+    const vault = { get: vi.fn(async () => undefined), store: vi.fn(async () => {}), delete: vi.fn(async () => {}) };
+    const prompt = { prompt: vi.fn(async () => ({ password: "typed", save: false })) };
+    const factory = new SilentAuthSshFactory(
+      connector as never,
+      vault as never,
+      prompt as never,
+      undefined,
+      (id: string) => profiles.find((p) => p.id === id)
+    );
+    await factory.connect(server);
+    return connector.connect.mock.calls[0][0] as ServerConfig;
+  }
+
+  it("saves AND then connects with the username you typed under a profile whose own username is blank (kills the save reverting it, and kills the connect overwriting it with the profile's whitespace)", async () => {
+    // Reachable only through an imported backup — validateAuthProfile checks
+    // length, not content, while the profile editor trims and refuses blanks.
+    const blank: AuthProfile = { id: "ap-blank", name: "Imported", username: "   ", authType: "password" };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      authProfiles: [blank],
+      servers: [makeServer({ username: "stored-user", authType: "password", authProfileId: "ap-blank" })]
+    });
+
+    // The form leaves Username editable for this profile (it fills nothing
+    // there), so this is a legitimate edit, not a mirror echo.
+    await submitEdit(ctx, {
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "edited-user",
+      authType: "password",
+      authProfileId: "ap-blank"
+    });
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.username).toBe("edited-user");
+    expect(saved.authProfileId).toBe("ap-blank");
+
+    // ...and the connection uses it, rather than the profile's whitespace.
+    const resolved = await resolveForConnect(saved, [blank]);
+    expect(resolved.username).toBe("edited-user");
+  });
+
+  it("saves AND then connects with the key path you chose under a key profile that carries none, while the auth type the profile does supply still comes from the profile", async () => {
+    const keyless: AuthProfile = { id: "ap-key", name: "Shared Key", username: "keyuser", authType: "key" };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      authProfiles: [keyless],
+      // The server's own stored auth type is password — so a connect config
+      // that reads "key" can only have come from the profile, and a stored
+      // record that reads "key" would mean the mirror echo leaked into the
+      // record.
+      servers: [makeServer({ username: "stored-user", authType: "password", authProfileId: "ap-key" })]
+    });
+
+    await submitEdit(ctx, {
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "keyuser", // read-only echo of the profile's username
+      authType: "key", // read-only echo of the profile's auth type
+      keyPath: "/home/me/.ssh/chosen", // editable: this profile has no key path
+      authProfileId: "ap-key"
+    });
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.keyPath).toBe("/home/me/.ssh/chosen");
+    // The two keys the profile DOES supply keep the server's own stored values
+    // underneath the link, so unlinking later restores what it always had.
+    expect(saved.username).toBe("stored-user");
+    expect(saved.authType).toBe("password");
+
+    const resolved = await resolveForConnect(saved, [keyless]);
+    expect(resolved.keyPath).toBe("/home/me/.ssh/chosen");
+    expect(resolved.username).toBe("keyuser");
+    expect(resolved.authType).toBe("key");
   });
 });
 

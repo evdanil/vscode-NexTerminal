@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { AuthProfile } from "../../src/models/config";
+import type { InventorySourceConfig } from "../../src/models/inventory";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 
 // --- vscode mock state ---
 const mockPostMessage = vi.fn();
 const mockShowWarningMessage = vi.fn();
+const mockShowErrorMessage = vi.fn();
 const mockShowOpenDialog = vi.fn();
 let onDidReceiveMessageHandler: ((msg: Record<string, unknown>) => void) | undefined;
 let onDidDisposeHandler: (() => void) | undefined;
@@ -30,6 +32,7 @@ vi.mock("vscode", () => ({
       dispose: vi.fn()
     })),
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
+    showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
     showOpenDialog: (...args: unknown[]) => mockShowOpenDialog(...args)
   },
   ViewColumn: { Active: 1 },
@@ -67,11 +70,31 @@ function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
   };
 }
 
-async function makeCore(authProfiles: AuthProfile[] = []) {
-  const repo = new InMemoryConfigRepository([], [], [], [], authProfiles);
+function makeInventorySource(overrides: Partial<InventorySourceConfig> & { id: string }): InventorySourceConfig {
+  return {
+    providerId: "netbox",
+    name: "Lab NetBox",
+    targetFolder: "",
+    prunePolicy: "orphan",
+    defaultUsername: "admin",
+    config: {},
+    secretFieldIds: [],
+    ...overrides
+  };
+}
+
+async function makeCore(authProfiles: AuthProfile[] = [], repository?: InMemoryConfigRepository) {
+  const repo = repository ?? new InMemoryConfigRepository([], [], [], [], authProfiles);
   const core = new NexusCore(repo);
   await core.initialize();
   return core;
+}
+
+/** Drains the microtask queue plus a macrotask turn, twice — enough for any
+ *  ungated await chain in the panel's delete handler to run to completion. */
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 describe("AuthProfileEditorPanel", () => {
@@ -86,9 +109,10 @@ describe("AuthProfileEditorPanel", () => {
   async function openPanel(
     authProfiles: AuthProfile[] = [],
     secrets: Record<string, string> = {},
-    openNew = false
+    openNew = false,
+    repository?: InMemoryConfigRepository
   ) {
-    const core = await makeCore(authProfiles);
+    const core = await makeCore(authProfiles, repository);
     const vault = makeVault(secrets);
     // Fresh import to get clean singleton state
     const { AuthProfileEditorPanel } = await import("../../src/ui/authProfileEditorPanel");
@@ -207,6 +231,399 @@ describe("AuthProfileEditorPanel", () => {
     expect(core.getAuthProfile("ap1")).toBeUndefined();
     expect(vault.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
     expect(vault.delete).toHaveBeenCalledWith(authProfilePassphraseSecretKey("ap1"));
+  });
+
+  it("delete confirmation discloses linked INVENTORY SOURCES, not only linked servers (kills a server-only count: the source's link is cleared silently, after which the engine sees a profile-less source and never warns either)", async () => {
+    const profile = makeAuthProfile({ id: "ap1" });
+    const { core, sendMessage } = await openPanel([profile]);
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1", authProfileId: "ap1" }));
+    // A source linked to a DIFFERENT profile must not be counted.
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-2", authProfileId: "other" }));
+
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    await sendMessage({ type: "delete", id: "ap1" });
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Delete auth profile "Prod Auth"? 1 inventory source is linked; servers it syncs will use the default username with SSH agent authentication.',
+      { modal: true },
+      "Delete"
+    );
+  });
+
+  it("delete confirmation pluralizes the inventory-source sentence correctly and keeps the server sentence before it", async () => {
+    const profile = makeAuthProfile({ id: "ap1" });
+    const { core, sendMessage } = await openPanel([profile]);
+    await core.addOrUpdateServer({
+      id: "srv-1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, authProfileId: "ap1"
+    });
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1", authProfileId: "ap1" }));
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-2", authProfileId: "ap1" }));
+
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    await sendMessage({ type: "delete", id: "ap1" });
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Delete auth profile "Prod Auth"? 1 server(s) are linked and will revert to their own stored credentials.' +
+        " 2 inventory sources are linked; servers they sync will use the default username with SSH agent authentication.",
+      { modal: true },
+      "Delete"
+    );
+  });
+
+  it("delete confirmation says nothing about inventory sources when none are linked", async () => {
+    const profile = makeAuthProfile({ id: "ap1" });
+    const { core, sendMessage } = await openPanel([profile]);
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1" }));
+
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    await sendMessage({ type: "delete", id: "ap1" });
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith('Delete auth profile "Prod Auth"?', { modal: true }, "Delete");
+  });
+
+  /**
+   * FINDING 1 (P2) — profile deletion vs. an in-flight inventory write.
+   *
+   * Every core write persists a snapshot taken synchronously at call time
+   * (`[...map.values()]`) and then awaits. So an inventory write that started
+   * FIRST is holding a PRE-clear snapshot while removeAuthProfile clears the
+   * profile's id off the same source and writes its own. If the older write
+   * commits last, both operations report success and memory is correct, but
+   * DISK is left referencing a profile that no longer exists — and nothing
+   * ever surfaces it.
+   *
+   * The gate below makes that ordering deterministic rather than incidental:
+   * the first repository write parks until the test releases it, so the stale
+   * snapshot is guaranteed to land after the clearing one. With the deletion
+   * serialized under the same configMutationLock the inventory sections hold,
+   * the deletion's write cannot even start until the older write has committed,
+   * and it commits last by construction.
+   */
+  it("(FINDING 1, P2) a profile deletion queues behind an in-flight inventory-source write, so the older write cannot commit its pre-clear snapshot last and leave the deleted profile's id on disk (kills a lock-free deletion path)", async () => {
+    const profile = makeAuthProfile({ id: "ap1" });
+    const repo = new InMemoryConfigRepository([], [], [], [], [profile]);
+    const { core, sendMessage } = await openPanel([profile], {}, false, repo);
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1", authProfileId: "ap1" }));
+
+    // Installed only now, so the seeding write above is untouched. The first
+    // write from here on parks with its snapshot already captured.
+    let releaseInventoryWrite!: () => void;
+    const inventoryWriteGate = new Promise<void>((resolve) => {
+      releaseInventoryWrite = resolve;
+    });
+    const realSave = repo.saveInventorySources.bind(repo);
+    let saveCount = 0;
+    repo.saveInventorySources = async (sources: InventorySourceConfig[]): Promise<void> => {
+      const captured = sources.map((source) => ({ ...source }));
+      if (saveCount++ === 0) {
+        await inventoryWriteGate;
+      }
+      await realSave(captured);
+    };
+
+    // The same lock singleton the panel resolves — imported from the module
+    // graph vi.resetModules() rebuilt for this test, not the pre-reset one.
+    const { configMutationLock } = await import("../../src/services/configMutationLock");
+
+    // An inventory write of exactly the kind the finding names: it snapshots
+    // the sources map (link intact) and then parks in its repository write,
+    // holding the lock the whole time — as addSource/editSource/syncNow do.
+    const inventoryWrite = configMutationLock.runExclusive(async () => {
+      await core.addOrUpdateInventorySource(
+        makeInventorySource({ id: "src-1", name: "Renamed NetBox", authProfileId: "ap1" })
+      );
+    });
+    await settle();
+    expect(saveCount).toBe(1);
+
+    mockShowWarningMessage.mockResolvedValue("Delete");
+    const deletion = sendMessage({ type: "delete", id: "ap1" });
+    // A lock-free deletion runs to completion right here: its cleared snapshot
+    // commits while the older write is still parked, and the older write then
+    // overwrites it. Serialized, nothing has happened yet — the deletion is
+    // queued on the lock the inventory write still holds.
+    await settle();
+
+    releaseInventoryWrite();
+    await inventoryWrite;
+    await deletion;
+
+    const persisted = await repo.getInventorySources();
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].name).toBe("Renamed NetBox");
+    // The assertion the finding is about: what is ON DISK, not what is in
+    // memory. Unserialized, this reads "ap1" — a reference to a profile that
+    // was deleted, restored by a write that had already been superseded.
+    expect(persisted[0].authProfileId).toBeUndefined();
+    expect(core.getSnapshot().inventorySources[0].authProfileId).toBeUndefined();
+  });
+
+  /**
+   * REVIEW FINDING (P2) — the confirmation's linked-source count is sampled
+   * BEFORE the modal, but the deletion only runs after the modal AND after the
+   * wait for configMutationLock. An inventory-source save that is already
+   * inside that lock and still awaiting its vault I/O commits its profile link
+   * inside exactly that window, so the deletion would clear a source the
+   * warning never disclosed.
+   *
+   * Every test below gates the concurrent write instead of racing it: the
+   * writer parks in the lock until the test releases it, so it is GUARANTEED to
+   * commit while the deletion is queued behind it. A test that merely usually
+   * wins the race proves nothing.
+   */
+  describe("delete confirmation re-checked after the lock wait", () => {
+    /** Parks inside the lock until released — the "awaiting vault I/O" phase. */
+    function gatedLockedWrite(
+      lock: { runExclusive: <T>(fn: () => Promise<T>) => Promise<T> },
+      write: () => Promise<void>
+    ): { done: Promise<void>; release: () => void } {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const done = lock.runExclusive(async () => {
+        await gate;
+        await write();
+      });
+      return { done, release };
+    }
+
+    it("(REVIEW FINDING, P2) refuses when an inventory source was linked to the profile while the deletion waited for the lock, instead of clearing a source the warning never mentioned (kills sampling the linked set only before the modal)", async () => {
+      const profile = makeAuthProfile({ id: "ap1" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+      // Unlinked when the warning is composed — this is what makes the shown
+      // text under-disclose.
+      await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1" }));
+
+      const { configMutationLock } = await import("../../src/services/configMutationLock");
+      const save = gatedLockedWrite(configMutationLock, () =>
+        core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1", authProfileId: "ap1" }))
+      );
+      await settle();
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+      // Snapshot taken and modal answered; the deletion is now parked on the
+      // lock the save still holds. The warning promised nothing about sources.
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Delete auth profile "Prod Auth"?',
+        { modal: true },
+        "Delete"
+      );
+
+      save.release();
+      await save.done;
+      await deletion;
+
+      expect(core.getAuthProfile("ap1")).toBeDefined();
+      expect(core.getInventorySource("src-1")?.authProfileId).toBe("ap1");
+      expect(vault.delete).not.toHaveBeenCalled();
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        'Auth profile "Prod Auth" changed while the confirmation was open — nothing was deleted. Delete it again to review what is linked now.'
+      );
+    });
+
+    it("(REVIEW FINDING, P2) refuses when the profile was renamed while the deletion waited, so a profile is never deleted under a name the user was not shown (kills comparing only the linked counts instead of the rendered warning)", async () => {
+      const profile = makeAuthProfile({ id: "ap1" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+
+      const { configMutationLock } = await import("../../src/services/configMutationLock");
+      const rename = gatedLockedWrite(configMutationLock, () =>
+        core.addOrUpdateAuthProfile({ ...profile, name: "Staging Auth" })
+      );
+      await settle();
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+
+      rename.release();
+      await rename.done;
+      await deletion;
+
+      expect(core.getAuthProfile("ap1")?.name).toBe("Staging Auth");
+      expect(vault.delete).not.toHaveBeenCalled();
+      // Quoted by the name the modal used — that is the profile the user acted on.
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        'Auth profile "Prod Auth" changed while the confirmation was open — nothing was deleted. Delete it again to review what is linked now.'
+      );
+    });
+
+    it("(REVIEW FINDING, P2) says so when the profile was deleted by something else while the confirmation was open, rather than reporting a deletion it did not perform", async () => {
+      const profile = makeAuthProfile({ id: "ap1" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+
+      const { configMutationLock } = await import("../../src/services/configMutationLock");
+      const wipe = gatedLockedWrite(configMutationLock, () => core.removeAuthProfile("ap1"));
+      await settle();
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+
+      wipe.release();
+      await wipe.done;
+      await deletion;
+
+      expect(vault.delete).not.toHaveBeenCalled();
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        'Auth profile "Prod Auth" was deleted while the confirmation was open — nothing more was removed.'
+      );
+    });
+
+    it("still deletes when an unrelated inventory write lands while it waits, because what would be disclosed is unchanged (kills aborting on any concurrent change rather than on a changed disclosure)", async () => {
+      const profile = makeAuthProfile({ id: "ap1" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+      await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1" }));
+
+      const { configMutationLock } = await import("../../src/services/configMutationLock");
+      const save = gatedLockedWrite(configMutationLock, () =>
+        core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1", name: "Renamed NetBox" }))
+      );
+      await settle();
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+
+      save.release();
+      await save.done;
+      await deletion;
+
+      expect(core.getAuthProfile("ap1")).toBeUndefined();
+      expect(vault.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
+      expect(vault.delete).toHaveBeenCalledWith(authProfilePassphraseSecretKey("ap1"));
+      expect(mockShowErrorMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * REVIEW FINDING (P2) — the SAVE path was outside the mutex the delete path
+   * runs in. Deletion pauses inside the lock across two awaited vault deletes,
+   * and a lock-free save lands squarely in that pause.
+   *
+   * Both tests gate the operation that must be inside the window rather than
+   * racing it: the parked one holds its position until the test releases it, so
+   * the interleaving is guaranteed rather than usual. The assertion that kills
+   * the pre-fix code is always the MID-WINDOW one — sampled while the gate is
+   * still closed — because in both orderings the two flows happen to converge on
+   * the same final profile map, and only the intermediate state (and, in the
+   * second test, the vault) tells them apart.
+   */
+  describe("profile saves are serialized against deletion", () => {
+    /** Parks the Nth call to a vault method until released, then runs the real one. */
+    function gateVaultCall(
+      method: { getMockImplementation: () => ((key: string, value?: string) => Promise<void>) | undefined; mockImplementation: (fn: (key: string, value?: string) => Promise<void>) => unknown },
+      gateOnCall: number
+    ): { release: () => void } {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const real = method.getMockImplementation()!;
+      let calls = 0;
+      method.mockImplementation(async (key: string, value?: string) => {
+        if (calls++ === gateOnCall) {
+          await gate;
+        }
+        await real(key, value);
+      });
+      return { release };
+    }
+
+    it("(REVIEW FINDING, P2) a save issued while a deletion is paused in its vault deletes cannot rewrite the record being deleted, and is refused instead of re-creating it afterwards (kills a lock-free save path)", async () => {
+      const profile = makeAuthProfile({ id: "ap1", authType: "password" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+
+      // The deletion's FIRST vault delete parks — the exact pause the finding
+      // names, after its stale-confirmation check has already passed.
+      const passwordDelete = gateVaultCall(vault.delete, 0);
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+      // Precondition: the deletion really is parked mid-flight.
+      expect(core.getAuthProfile("ap1")).toBeDefined();
+      expect(vault.delete).toHaveBeenCalledTimes(1);
+
+      const save = sendMessage({
+        type: "save",
+        id: "ap1",
+        name: "Renamed",
+        username: "root",
+        authType: "password",
+        password: "new-secret",
+        keyPath: ""
+      });
+      await settle();
+
+      // THE KILL. Lock-free, the save has already committed by now and the
+      // record reads "Renamed" — which the paused deletion then removes without
+      // ever looking again, discarding a save it reported as successful.
+      expect(core.getAuthProfile("ap1")?.name).toBe("Prod Auth");
+      expect(vault.store).not.toHaveBeenCalled();
+
+      passwordDelete.release();
+      await deletion;
+      await save;
+
+      // SECOND KILL — for a half-fix that takes the lock but does not re-read
+      // the profile inside it: the queued save's `id` no longer resolves, the
+      // pre-fix code fell through to `existingId = null`, and a brand-new
+      // profile called "Renamed" (fresh uuid, its own stored password) appeared
+      // in place of the one just deleted.
+      expect(core.getSnapshot().authProfiles).toEqual([]);
+      expect(vault.store).not.toHaveBeenCalled();
+      expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        'Auth profile "Renamed" was deleted while you were editing it — nothing was saved. Create it again if you still need it.'
+      );
+    });
+
+    it("(REVIEW FINDING, P2) a deletion issued while a save is paused in its vault write waits for it, so the save's password is never stored after the deletion has wiped it (kills a save that holds no lock while it writes secrets)", async () => {
+      const profile = makeAuthProfile({ id: "ap1", authType: "password" });
+      const { core, vault, sendMessage } = await openPanel([profile]);
+
+      // The save's vault write parks — its record is already committed to core,
+      // the secret is not yet written.
+      const passwordStore = gateVaultCall(vault.store, 0);
+
+      const save = sendMessage({
+        type: "save",
+        id: "ap1",
+        name: "Renamed",
+        username: "root",
+        authType: "password",
+        password: "new-secret",
+        keyPath: ""
+      });
+      await settle();
+      expect(core.getAuthProfile("ap1")?.name).toBe("Renamed");
+      expect(vault.store).toHaveBeenCalledTimes(1);
+
+      mockShowWarningMessage.mockResolvedValue("Delete");
+      const deletion = sendMessage({ type: "delete", id: "ap1" });
+      await settle();
+
+      // THE KILL. With the save holding no lock, the deletion runs to completion
+      // right here — profile gone, both secret keys deleted — while the save is
+      // still holding an unwritten password for it.
+      expect(core.getAuthProfile("ap1")).toBeDefined();
+      expect(vault.delete).not.toHaveBeenCalled();
+
+      passwordStore.release();
+      await save;
+      await deletion;
+
+      expect(core.getAuthProfile("ap1")).toBeUndefined();
+      // SECOND KILL, on the end state rather than the window: unserialized, the
+      // store lands after the deletion's deletes and leaves a password in the
+      // vault for a profile that no longer exists — unreachable by any UI, and
+      // adopted wholesale by the next profile to be created under that id.
+      expect(await vault.get(authProfilePasswordSecretKey("ap1"))).toBeUndefined();
+    });
   });
 
   it("delete profile does nothing if user cancels", async () => {

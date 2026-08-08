@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
-import type { AuthProfile, AuthType } from "../models/config";
+import type { AuthProfile, AuthType, ServerConfig } from "../models/config";
+import type { InventorySourceConfig } from "../models/inventory";
+import { configMutationLock } from "../services/configMutationLock";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import { renderAuthProfileEditorHtml } from "./authProfileEditorHtml";
 import { createWebviewNonce } from "./shared/webviewNonce";
@@ -20,6 +22,40 @@ function isAuthType(value: unknown): value is AuthType {
 
 function profileSignature(profiles: AuthProfile[]): string {
   return profiles.map((p) => `${p.id}:${p.name}:${p.username}:${p.authType}:${p.keyPath ?? ""}`).join("|");
+}
+
+/**
+ * The delete confirmation's text, in full — the profile's name and everything
+ * losing its link to it.
+ *
+ * Inventory sources link a profile too, and this delete silently clears that
+ * link (NexusCore.removeAuthProfile). Afterwards nothing else says so: the sync
+ * engine sees a plain profile-less source, so its dangling-profile warning
+ * never fires either, and the next device synced arrives on the default
+ * username + SSH agent — broken on password/key infrastructure, with no signal
+ * anywhere. This sentence is the only disclosure, so it has to be here.
+ *
+ * REVIEW FINDING (P2) — factored out of the handler so the SHOWN text can be
+ * rendered again after the lock is acquired and compared, following the
+ * captured-vs-fresh discipline `planDetailDrift` established in
+ * inventoryCommands.ts: the rendered string IS the comparator, so every fact
+ * the modal discloses is covered — the two counts and the profile's own name —
+ * with no per-field list to keep in sync by hand.
+ */
+function describeDeleteDetail(
+  profile: AuthProfile,
+  servers: ServerConfig[],
+  sources: InventorySourceConfig[]
+): string {
+  const linkedCount = servers.filter((s) => s.authProfileId === profile.id).length;
+  const linkedNote = linkedCount > 0
+    ? ` ${linkedCount} server(s) are linked and will revert to their own stored credentials.`
+    : "";
+  const linkedSourceCount = sources.filter((s) => s.authProfileId === profile.id).length;
+  const sourceNote = linkedSourceCount > 0
+    ? ` ${linkedSourceCount} inventory source${linkedSourceCount === 1 ? " is" : "s are"} linked; servers ${linkedSourceCount === 1 ? "it syncs" : "they sync"} will use the default username with SSH agent authentication.`
+    : "";
+  return `Delete auth profile "${profile.name}"?${linkedNote}${sourceNote}`;
 }
 
 export class AuthProfileEditorPanel {
@@ -131,40 +167,101 @@ export class AuthProfileEditorPanel {
           const password = typeof msg.password === "string" ? msg.password : "";
           const keyPath = typeof msg.keyPath === "string" && msg.keyPath.trim() ? msg.keyPath.trim() : undefined;
           const requestedId = typeof msg.id === "string" ? msg.id : null;
-          const previousProfile = requestedId ? this.core.getAuthProfile(requestedId) : undefined;
-          const existingId = previousProfile ? requestedId : null;
 
-          const profile: AuthProfile = {
-            id: existingId ?? randomUUID(),
-            name,
-            username,
-            authType,
-            keyPath: authType === "key" ? keyPath : undefined
-          };
+          // CONFIG MUTATION LOCK (REVIEW FINDING, P2 — save vs. deletion).
+          // The delete handler below pauses inside this lock across two awaited
+          // vault deletes before calling removeAuthProfile. A lock-free save
+          // lands squarely in that pause and breaks it both ways: the record it
+          // writes (a rename, an auth-type change, a new key path) is removed by
+          // a deletion that already revalidated and will not look again, and a
+          // save queued the other way round resurrects — under the very id the
+          // deletion just cleared off every server and inventory source — a
+          // profile built from a form snapshot taken before the delete. Both
+          // operations then report success. Serializing the record write and its
+          // secret writes into the same critical section is what makes one of
+          // them see the other's result.
+          //
+          // NO PROMPT INSIDE: everything below is a core write plus vault I/O.
+          // The re-render and the "saved" post are webview writes, not UI the
+          // user has to answer, and they are kept outside the section anyway.
+          //
+          // DEADLOCK CHECK (AsyncMutex is not re-entrant). The only way into
+          // this branch is `panel.webview.onDidReceiveMessage` -> handleMessage;
+          // handleMessage is private and called from nowhere else, and the two
+          // constructors of this panel (authProfileCommands' two commands and
+          // inlineAuthProfileCreation's openNew) only create/reveal it — neither
+          // holds the lock, and neither awaits a message handler. Nothing that
+          // runs inside a held section can therefore be sitting above this frame.
+          // The core write's synchronous `emitChanged()` reaches tree/panel
+          // observers, none of which acquires this lock. The lock stays OUT of
+          // NexusCore.addOrUpdateAuthProfile for the same reason it stays out of
+          // removeAuthProfile: configCommands' importMergeReplaceLocked and
+          // completeReset both call it from inside a held section.
+          let savedId: string | undefined;
+          let refusal: string | undefined;
+          await configMutationLock.runExclusive(async () => {
+            // Re-read INSIDE the lock. The pre-lock read this replaced could be
+            // taken while a deletion was already inside the section and merely
+            // awaiting its vault deletes.
+            const previousProfile = requestedId !== null ? this.core.getAuthProfile(requestedId) : undefined;
+            if (requestedId !== null && previousProfile === undefined) {
+              // ABORT, NOT RESURRECT — the same call the delete handler makes
+              // when its disclosure goes stale. The pre-lock code fell through to
+              // `existingId = null` here and created a NEW profile under a fresh
+              // id: a duplicate of the record the user thought they were editing,
+              // carrying its password under a key nothing else references, while
+              // every server and source the deletion unlinked stays unlinked.
+              // Saying so and keeping the form's contents is the conservative
+              // answer for a save whose subject no longer exists.
+              refusal = `Auth profile "${name}" was deleted while you were editing it — nothing was saved. Create it again if you still need it.`;
+              return;
+            }
+            const existingId = previousProfile ? requestedId : null;
 
-          await this.core.addOrUpdateAuthProfile(profile);
+            const profile: AuthProfile = {
+              id: existingId ?? randomUUID(),
+              name,
+              username,
+              authType,
+              keyPath: authType === "key" ? keyPath : undefined
+            };
 
-          // Handle password in SecretVault
-          if (this.secretVault) {
-            const passwordKey = authProfilePasswordSecretKey(profile.id);
-            const passphraseKey = authProfilePassphraseSecretKey(profile.id);
-            if (authType !== "password") {
-              // Switching away from password auth — remove stored password
-              await this.secretVault.delete(passwordKey);
-            } else if (password) {
-              // New or updated password
-              await this.secretVault.store(passwordKey, password);
-            } else if (existingId !== null && previousProfile && previousProfile.authType !== "password") {
-              // Switching to password auth with no password should not retain stale secret.
-              await this.secretVault.delete(passwordKey);
+            await this.core.addOrUpdateAuthProfile(profile);
+
+            // Handle password in SecretVault
+            if (this.secretVault) {
+              const passwordKey = authProfilePasswordSecretKey(profile.id);
+              const passphraseKey = authProfilePassphraseSecretKey(profile.id);
+              if (authType !== "password") {
+                // Switching away from password auth — remove stored password
+                await this.secretVault.delete(passwordKey);
+              } else if (password) {
+                // New or updated password
+                await this.secretVault.store(passwordKey, password);
+              } else if (existingId !== null && previousProfile && previousProfile.authType !== "password") {
+                // Switching to password auth with no password should not retain stale secret.
+                await this.secretVault.delete(passwordKey);
+              }
+
+              if (authType !== "key") {
+                await this.secretVault.delete(passphraseKey);
+              }
             }
 
-            if (authType !== "key") {
-              await this.secretVault.delete(passphraseKey);
-            }
+            savedId = profile.id;
+          });
+          if (refusal !== undefined) {
+            // Deferred out of the section for the same reason the delete
+            // handler's refusal is: nothing may show UI while the lock is held.
+            // No "saved" post either — the editor must not report a write it did
+            // not make. The panel has already re-rendered off the deletion's own
+            // emission (the onDidChange signature watcher), so nothing is
+            // re-rendered here.
+            void vscode.window.showErrorMessage(refusal);
+            break;
           }
 
-          this.selectedId = profile.id;
+          this.selectedId = savedId ?? this.selectedId;
           this.render();
           void this.panel.webview.postMessage({ type: "saved" });
           break;
@@ -177,24 +274,95 @@ export class AuthProfileEditorPanel {
           const profile = this.core.getAuthProfile(id);
           if (!profile) break;
 
-          const linkedCount = this.core.getSnapshot().servers.filter(
-            (s) => s.authProfileId === id
-          ).length;
-          const linkedNote = linkedCount > 0
-            ? ` ${linkedCount} server(s) are linked and will revert to their own stored credentials.`
-            : "";
+          const snapshot = this.core.getSnapshot();
+          const shownDetail = describeDeleteDetail(profile, snapshot.servers, snapshot.inventorySources);
           const confirm = await vscode.window.showWarningMessage(
-            `Delete auth profile "${profile.name}"?${linkedNote}`,
+            shownDetail,
             { modal: true },
             "Delete"
           );
           if (confirm !== "Delete") break;
 
-          if (this.secretVault) {
-            await this.secretVault.delete(authProfilePasswordSecretKey(id));
-            await this.secretVault.delete(authProfilePassphraseSecretKey(id));
+          // CONFIG MUTATION LOCK (P2 — profile deletion vs. inventory writes).
+          // removeAuthProfile clears the deleted profile off every referencing
+          // server and inventory source and persists those clears. Every core
+          // write persists a snapshot taken synchronously at call time
+          // (`[...map.values()]`) and then awaits, so an inventory write that
+          // started earlier — applyInventorySyncPlan / addOrUpdateInventorySource,
+          // both of which hold this same lock in inventoryCommands.ts — can
+          // still be awaiting its repository write with a PRE-clear snapshot in
+          // hand. If that older write commits last, both operations "succeed"
+          // while disk is left holding servers/sources that reference a profile
+          // that no longer exists; memory looks correct, so nothing ever
+          // surfaces it. Serializing the whole disposition (vault keys first,
+          // then the record + its reference clearing) against those sections is
+          // what closes that window.
+          //
+          // WHY HERE AND NOT IN NexusCore.removeAuthProfile: AsyncMutex is not
+          // re-entrant (see services/configMutationLock.ts), and two of the
+          // three call sites into removeAuthProfile ALREADY hold this lock —
+          // configCommands' importMergeReplaceLocked (replace-mode wipe) and
+          // completeReset both run their whole mutation phase inside
+          // runExclusive. Acquiring it inside the core method would deadlock the
+          // extension host permanently on a backup restore or a complete reset.
+          // This panel is the only lock-free path, so it is the one that has to
+          // take it.
+          //
+          // Safe to hold across this span: the confirmation modal above has
+          // already resolved and nothing below shows UI (the re-render is a
+          // webview post, not a prompt), matching the "acquire after the last
+          // prompt" rule the lock documents.
+          let refusal: string | undefined;
+          await configMutationLock.runExclusive(async () => {
+            // REVIEW FINDING (P2) — re-read the disclosure AFTER the wait, not
+            // just before the modal. The snapshot above is taken while another
+            // flow can already be inside this lock and merely awaiting vault
+            // I/O — addOrUpdateInventorySource's store loop is exactly that —
+            // so it can report zero linked sources, that save can then commit
+            // the link, and the deletion (queued behind it on this lock) would
+            // clear a source the warning never mentioned. Rendering the
+            // disclosure again HERE is the narrowest window available: once
+            // this lock is held, no other lock-holding write can commit.
+            //
+            // ABORT, NOT RECONFIRM. inventoryCommands has both precedents —
+            // syncNow loops back to the modal on planDetailDrift, editSource
+            // aborts with "reopen Edit Source." — and this is the second. A
+            // reconfirmation would have to release the lock to show UI (the
+            // lock forbids holding it across a modal), re-acquire, and re-check,
+            // i.e. syncNow's bounded retry loop; syncNow earns that machinery
+            // because it has a fetched tree and completed teardowns to protect,
+            // while re-running this delete is one click and rebuilds every fact
+            // from scratch. For a destructive single-object delete whose
+            // consequences no longer match what was consented to, doing nothing
+            // and saying so is the conservative answer.
+            //
+            // The message is deferred rather than shown here: nothing may
+            // display UI while this lock is held.
+            const currentProfile = this.core.getAuthProfile(id);
+            if (!currentProfile) {
+              refusal = `Auth profile "${profile.name}" was deleted while the confirmation was open — nothing more was removed.`;
+              return;
+            }
+            const current = this.core.getSnapshot();
+            const currentDetail = describeDeleteDetail(currentProfile, current.servers, current.inventorySources);
+            if (currentDetail !== shownDetail) {
+              // Quoted by the name the modal used, not the current one: that is
+              // the profile the user acted on, and a rename is one of the
+              // things this catches.
+              refusal = `Auth profile "${profile.name}" changed while the confirmation was open — nothing was deleted. Delete it again to review what is linked now.`;
+              return;
+            }
+
+            if (this.secretVault) {
+              await this.secretVault.delete(authProfilePasswordSecretKey(id));
+              await this.secretVault.delete(authProfilePassphraseSecretKey(id));
+            }
+            await this.core.removeAuthProfile(id);
+          });
+          if (refusal !== undefined) {
+            void vscode.window.showErrorMessage(refusal);
+            break;
           }
-          await this.core.removeAuthProfile(id);
 
           const profiles = this.core.getSnapshot().authProfiles;
           this.selectedId = profiles.length > 0 ? profiles[0].id : null;

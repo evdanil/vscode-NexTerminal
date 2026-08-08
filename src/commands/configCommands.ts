@@ -3,7 +3,7 @@ import { chmod } from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
-import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../models/config";
+import type { AuthProfile, LocalShellProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
@@ -1547,13 +1547,70 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
       else skipped++;
     };
 
+    // REVIEW FINDING (P2) — the ids of the profiles that actually LANDED, which is
+    // NOT the auth-profile half of `idMap`. `idMap` is filled in the first pass,
+    // before a single record has been validated, so a profile rejected by
+    // `validateAuthProfile` still holds a fresh id there — and a server remapped
+    // through `idMap` alone arrives linked to a profile that was never imported.
+    // Nothing downstream notices: the server persists with a link that resolves to
+    // nothing, `SilentAuthSshFactory` finds no profile and silently falls back to
+    // the server's own credentials, and no message anywhere says the link is dead.
+    // The reachable shape is the one `validateAuthProfile` was taught to reject a
+    // round ago (a non-string `keyPath`), but nothing about this is specific to it.
+    //
+    // WHY AT CONSTRUCTION rather than a post-import sweep like the backup path's:
+    // both reach the same end state — no record left pointing at a profile that
+    // does not exist — and each expresses that one rule where its own path can. The
+    // backup path preserves ids on BOTH sides, so it has no remap to build and the
+    // post-import snapshot is the only place a dangle becomes visible; it also has
+    // to inspect records it did not write, because merge mode keeps a local record
+    // in preference to the payload's. The share path builds every link value itself
+    // from a map it owns, so the check belongs there — and keeping it there means a
+    // share import still never rewrites a local record the payload never mentioned.
+    const importedProfileIds = new Set<string>();
+
     for (const profile of authProfiles) {
+      const newId = idMap.get(profile.id)!;
       const remappedProfile: AuthProfile = {
         ...profile,
-        id: idMap.get(profile.id)!
+        id: newId
       };
-      tally(await addIfValid(remappedProfile, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e)));
+      const added = await addIfValid(remappedProfile, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
+      if (added) {
+        importedProfileIds.add(newId);
+      }
+      tally(added);
     }
+
+    /**
+     * The one lens every profile reference on an imported server passes through:
+     * remap through `idMap`, then keep it only if that profile survived import.
+     * `undefined` for anything else — a profile absent from the payload, one
+     * rejected on import, or an id `idMap` re-pointed at a SERVER because a
+     * malformed payload reused it across the two buckets.
+     */
+    const linkToImportedProfile = (id: string | undefined): string | undefined => {
+      if (!id) {
+        return undefined;
+      }
+      const remapped = idMap.get(id);
+      return remapped !== undefined && importedProfileIds.has(remapped) ? remapped : undefined;
+    };
+
+    /**
+     * `origin.syncedAuthProfileId` is a profile reference too — the sync's record of
+     * which profile IT linked — and it is the only one nothing here used to remap,
+     * so on a payload carrying an origin it named a stranger's id unconditionally.
+     * It goes through the same lens as the link for the reason the backup path's
+     * sweep drops the two together: a stamp naming a profile that is not here reads
+     * as a per-server opt-out nobody chose and locks that server out of retro-apply
+     * for good. Passed through untouched when there is no stamp, so a server that
+     * never carried one does not acquire the field.
+     */
+    const remapOriginStamp = (origin: ServerOrigin | undefined): ServerOrigin | undefined =>
+      origin === undefined || origin.syncedAuthProfileId === undefined
+        ? origin
+        : { ...origin, syncedAuthProfileId: linkToImportedProfile(origin.syncedAuthProfileId) };
 
     for (const server of servers) {
       let remappedProxy = server.proxy;
@@ -1569,7 +1626,8 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         ...server,
         id: idMap.get(server.id)!,
         proxy: remappedProxy,
-        authProfileId: server.authProfileId ? idMap.get(server.authProfileId) : undefined
+        authProfileId: linkToImportedProfile(server.authProfileId),
+        origin: remapOriginStamp(server.origin)
       };
       tally(await addIfValid(remappedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
     }
@@ -1763,7 +1821,35 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     const knownProfileIds = new Set(postImportSnapshot.authProfiles.map((p) => p.id));
     for (const server of postImportSnapshot.servers) {
       if (server.authProfileId && !knownProfileIds.has(server.authProfileId)) {
-        await core.addOrUpdateServer({ ...server, authProfileId: undefined });
+        const cleared: ServerConfig = { ...server, authProfileId: undefined };
+        // Same rule as NexusCore.removeAuthProfile: the inventory sync's record
+        // that IT applied this profile (origin.syncedAuthProfileId) dies with the
+        // link it describes. Left behind, it would read as a per-server opt-out —
+        // no `authProfileId`, but a stamp naming a profile — and lock a server
+        // nobody hand-configured out of retro-apply for good. Only the stamp
+        // naming the very profile being cleared is dropped; a stamp the user has
+        // already diverged from is their decision and is left alone.
+        if (server.origin?.syncedAuthProfileId === server.authProfileId) {
+          cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
+        }
+        await core.addOrUpdateServer(cleared);
+      }
+    }
+    // Same clear for inventory sources, whose `authProfileId` links their synced
+    // servers to a profile the same way. Backup import preserves ids on BOTH sides
+    // (importPreservingIds above), so a surviving reference needs no remap — but it
+    // can still dangle: a payload can carry a source whose profile was never exported
+    // (or was skipped/rejected on import), and merge mode may keep a local profile-less
+    // record while importing nothing to satisfy it. Resolution is checked against the
+    // POST-import snapshot, not the payload, so a source that links to a profile this
+    // machine already has keeps its link. A dangling id left in place would survive
+    // every later resolution attempt as a permanent no-op — the sync engine degrades to
+    // the default username + SSH agent and warns on every run — so it is cleared here
+    // exactly as the server refs above are. `addOrUpdateInventorySource` re-revisions,
+    // which is correct: this is a new incarnation of the record.
+    for (const source of postImportSnapshot.inventorySources) {
+      if (source.authProfileId && !knownProfileIds.has(source.authProfileId)) {
+        await core.addOrUpdateInventorySource({ ...source, authProfileId: undefined });
       }
     }
 

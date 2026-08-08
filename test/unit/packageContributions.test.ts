@@ -577,6 +577,22 @@ describe("package contributions", () => {
     expect(paletteEntry?.when).not.toBe("false");
   });
 
+  // The Settings-tree link is a broken button unless the command it points at
+  // is BOTH declared here and registered; this covers the declaration half
+  // (registration is covered by inventoryCommands.test.ts's hub tests, and the
+  // web-extension stub by webExtensionCommands.test.ts).
+  it("contributes nexus.inventory.manage as a palette-invocable Nexus command", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.manage");
+    expect(command).toBeDefined();
+    expect(command?.title).toBe("Manage Inventory Sources");
+    expect(command?.category).toBe("Nexus");
+
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    const paletteEntry = paletteMenu.find((item) => item.command === "nexus.inventory.manage");
+    expect(paletteEntry).toBeDefined();
+    expect(paletteEntry?.when).toBe("true");
+  });
+
   describe("Edit as Root (nexus.files.editAsRoot)", () => {
     it("contributes the command with a Nexus category and shield icon", () => {
       const cmd = packageJson.contributes.commands.find((c) => c.command === "nexus.files.editAsRoot");

@@ -4,7 +4,7 @@ import { unifiedProfileFormDefinition, unifiedProfileFormId } from "../ui/formDe
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, LocalShellProfileTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
-import { formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
+import { authProfileCredentialMirror, formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
 import { serverConfigsEqual } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
 import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
@@ -196,17 +196,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
     onBrowse: browseForKey,
     onScan: () => scanForPort(ctx),
     onCreateInline: inlineAuthProfile.handleCreateInline,
-    onAutofill: async (_key, value) => {
-      const profile = ctx.core.getAuthProfile(value);
-      if (!profile) {
-        return undefined;
-      }
-      return {
-        username: profile.username,
-        authType: profile.authType,
-        ...(profile.keyPath ? { keyPath: profile.keyPath } : {})
-      };
-    },
+    onAutofill: async (_key, value) => authProfileCredentialMirror(ctx.core.getAuthProfile(value)),
     onTest: async (values: FormValues) => {
       if (values.profileType === "serial") {
         const draft = formValuesToSerial(values);
