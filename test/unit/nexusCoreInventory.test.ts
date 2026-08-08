@@ -2120,7 +2120,7 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
     expect(result.removedEmptyFolderCount).toBe(1);
   });
 
-  it("(REVIEW FINDING 2, P2 — cross-source ownership) a folder both sources manage survives one source dropping it while the other still manages it, and is only GC'd once BOTH have dropped it", async () => {
+  it("(REVIEW FINDING 2, P2 — cross-source ownership) a folder both sources manage survives one source dropping it while the other still manages it; once BOTH have dropped it, retained bookkeeping on both sides makes it linger rather than reclaim on the very next sync (round-9's exact-match retention exclusion was the bug — see the mutual-abandonment test below for the fix's own documented consequence)", async () => {
     const ownedByX: ServerConfig = {
       id: "device-x",
       name: "sw-x",
@@ -2177,15 +2177,30 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
 
     // KILLS own-set-only check: RackA survives because source-2 still
     // manages it, even though it is genuinely empty and dropped out of
-    // source-1's own managed set on this very call.
+    // source-1's own device footprint on this very call.
     expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
     expect(resultX.removedEmptyFolderCount).toBe(0);
-    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackB"]);
+    // RackA was deferred (protected by source-2's claim), not removed, so
+    // source-1's own bookkeeping RETAINS it alongside the newly-created
+    // "NetBox/RackB" — this is the fix under test: round-9's now-removed
+    // exclusion would have dropped RackA here (["NetBox/RackB"] only)
+    // because it exactly matched source-2's OWN managedFolders at the time,
+    // which is precisely what left it unreclaimable if source-2 were later
+    // REMOVED instead of re-synced (see the "co-owner removed" test below).
+    expect([...(core.getInventorySource("source-1")?.managedFolders ?? [])].sort()).toEqual(
+      ["NetBox/RackA", "NetBox/RackB"].sort()
+    );
     expect(core.getInventorySource("source-2")?.managedFolders).toEqual(["NetBox/RackA"]);
 
-    // source-2 now drops it too — nothing manages it anymore, and it is
-    // still genuinely empty. The very next sync of either source may now
-    // reclaim it.
+    // source-2 now drops it too — nothing occupies/names it anymore, and it
+    // is still genuinely empty. Unlike before this fix, this does NOT
+    // reclaim it on the very next sync: source-1's own retained entry (just
+    // asserted above) is itself a live claim from source-2's point of view,
+    // so source-2 defers right back onto source-1's still-retained
+    // bookkeeping. This is the documented, bounded lingering consequence of
+    // the fix (see the "(mutual abandonment lingers, stably)" test) — never
+    // data loss, just a leftover empty folder until one side is removed or
+    // genuinely reclaims the path.
     const resultY = await core.applyInventorySyncPlan({
       sourceId: "source-2",
       syncedAt: 2,
@@ -2195,8 +2210,9 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
       expectedSource: core.getInventorySource("source-2")!
     });
 
-    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
-    expect(resultY.removedEmptyFolderCount).toBe(1);
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(resultY.removedEmptyFolderCount).toBe(0);
+    expect(core.getInventorySource("source-2")?.managedFolders).toEqual(["NetBox/RackA"]);
   });
 
   it("(cross-source target-root protection; REVIEW FINDING 1, P2 — retain candidates the GC did not actually remove) another source's configured targetFolder — even with an EMPTY managedFolders set — protects a folder from GC; source-1 REMEMBERS the deferred candidate on its own, with no manual re-seed, and reclaims it once that source's record is removed", async () => {
@@ -2486,7 +2502,7 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
     expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackB"]);
   });
 
-  it("(old-target co-ownership) a folder under the OLD target still managed by ANOTHER source survives a targetFolder edit + move, and is only GC'd once that other source also drops it", async () => {
+  it("(old-target co-ownership) a folder under the OLD target still managed by ANOTHER source survives a targetFolder edit + move; once that other source also drops it, retained bookkeeping on both sides makes it linger rather than reclaim on the very next sync", async () => {
     const ownedByX: ServerConfig = {
       id: "device-x",
       name: "sw-x",
@@ -2537,16 +2553,26 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
 
     // KILLS own-set-only / new-target-only checks: "NetBox/RackA" survives
     // because source-2 still manages it, even though it is genuinely empty
-    // and source-1 both dropped it from its own managed set AND retargeted
-    // away from "NetBox" entirely on this very call.
+    // and source-1 both dropped it from its own device footprint AND
+    // retargeted away from "NetBox" entirely on this very call.
     expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
     expect(resultX.removedEmptyFolderCount).toBe(0);
-    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["Infra/RackA"]);
+    // Deferred, not removed — source-1's own bookkeeping RETAINS the old
+    // "NetBox/RackA" claim alongside the new "Infra/RackA" one (round-9's
+    // now-removed exclusion would have dropped it here instead, exactly the
+    // bug this fix closes — see the "co-owner removed" test).
+    expect([...(core.getInventorySource("source-1")?.managedFolders ?? [])].sort()).toEqual(
+      ["Infra/RackA", "NetBox/RackA"].sort()
+    );
     expect(core.getInventorySource("source-2")?.managedFolders).toEqual(["NetBox/RackA"]);
 
-    // source-2 now drops it too — nothing manages it anymore, and it is
-    // still genuinely empty. The very next sync of either source may now
-    // reclaim it.
+    // source-2 now drops it too — nothing occupies/names it anymore, and it
+    // is still genuinely empty. Unlike before this fix, this does NOT
+    // reclaim it on the very next sync: source-1's own retained entry (just
+    // asserted above) is itself a live claim from source-2's point of view,
+    // so the folder lingers (bounded, no data loss — see the "(mutual
+    // abandonment lingers, stably)" test) until one side is removed or
+    // genuinely reclaims the path.
     const resultY = await core.applyInventorySyncPlan({
       sourceId: "source-2",
       syncedAt: 2,
@@ -2556,8 +2582,170 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
       expectedSource: core.getInventorySource("source-2")!
     });
 
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(resultY.removedEmptyFolderCount).toBe(0);
+    expect(core.getInventorySource("source-2")?.managedFolders).toEqual(["NetBox/RackA"]);
+  });
+
+  it("(co-owner removed, reclaim survives — THE finding's scenario) source-1 defers a folder because source-2's managedFolders exactly names it; source-2 is REMOVED (never syncs again); source-1's next sync still reclaims the folder (kills round-9's exact-match retention exclusion, which forgot the path the moment it was deferred)", async () => {
+    const ownedByOne: ServerConfig = {
+      id: "device-1",
+      name: "sw-1",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    // Seed the co-owned steady state directly, exactly as the sibling
+    // cross-source tests above do.
+    const repository = new InMemoryConfigRepository([ownedByOne], [], [], ["NetBox", "NetBox/RackA"]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(
+      makeSourceConfig({ id: "source-1", targetFolder: "NetBox", managedFolders: ["NetBox/RackA"] })
+    );
+    await core.addOrUpdateInventorySource(
+      makeSourceConfig({ id: "source-2", targetFolder: "NetBox", managedFolders: ["NetBox/RackA"] })
+    );
+
+    // source-1's device moves away — "NetBox/RackA" becomes genuinely empty
+    // and drops out of source-1's own footprint/folder list on this sync.
+    // source-2's OWN managedFolders exactly names "NetBox/RackA" at this
+    // point, so the candidate is deferred (not removed) by cross-source
+    // protection.
+    const movedOne = { ...ownedByOne, group: "NetBox/RackB" };
+    const resultAbandon = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [movedOne],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(resultAbandon.removedEmptyFolderCount).toBe(0);
+    // KILLS THE BUG: under round-9's exact-match exclusion, source-1 would
+    // forget "NetBox/RackA" right here (managedFolders === ["NetBox/RackB"]
+    // only), reasoning that source-2's own next sync would re-diff it
+    // independently. That reasoning assumed source-2 SYNCS again — it does
+    // not have to.
+    expect([...(core.getInventorySource("source-1")?.managedFolders ?? [])].sort()).toEqual(
+      ["NetBox/RackA", "NetBox/RackB"].sort()
+    );
+
+    // source-2 is REMOVED — not re-synced. removeInventorySource deliberately
+    // leaves folders alone and only deletes the ownership record, so
+    // "NetBox/RackA" is never touched by this call itself.
+    await core.removeInventorySource("source-2");
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+
+    // source-1 syncs again with nothing new to say about "NetBox/RackA" (its
+    // own inputs are unchanged from the abandon sync above) — source-2's
+    // protection is gone along with its record, and source-1 STILL
+    // remembers owning the candidate from `resultAbandon`, so this is a
+    // genuine end-to-end reclaim, not a synthetic re-seed.
+    const resultReclaim = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 3,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
     expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
-    expect(resultY.removedEmptyFolderCount).toBe(1);
+    expect(resultReclaim.removedEmptyFolderCount).toBe(1);
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackB"]);
+  });
+
+  it("(mutual abandonment lingers, stably) two sources that BOTH abandon a co-created folder each retain it and defer on the other's claim; the folder survives, and both sides' managedFolders/protection are stable (no growth, no flapping) across two further syncs each", async () => {
+    const ownedByOne: ServerConfig = {
+      id: "device-1",
+      name: "sw-1",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const repository = new InMemoryConfigRepository([ownedByOne], [], [], ["NetBox", "NetBox/RackA"]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(
+      makeSourceConfig({ id: "source-1", targetFolder: "NetBox", managedFolders: ["NetBox/RackA"] })
+    );
+    await core.addOrUpdateInventorySource(
+      makeSourceConfig({ id: "source-2", targetFolder: "NetBox", managedFolders: ["NetBox/RackA"] })
+    );
+
+    // Both sources abandon "NetBox/RackA" — source-1's device moves away
+    // first, then source-2 simply stops naming it. Neither is removed.
+    const movedOne = { ...ownedByOne, group: "NetBox/RackB" };
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [movedOne],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-2",
+      syncedAt: 2,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: [],
+      expectedSource: core.getInventorySource("source-2")!
+    });
+
+    // Both have now genuinely dropped it, yet it lingers: each retained it
+    // when it was deferred, and each now defers on the other's retained
+    // claim.
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    const managed1AfterRound1 = [...(core.getInventorySource("source-1")?.managedFolders ?? [])].sort();
+    const managed2AfterRound1 = [...(core.getInventorySource("source-2")?.managedFolders ?? [])].sort();
+    expect(managed1AfterRound1).toEqual(["NetBox/RackA", "NetBox/RackB"].sort());
+    expect(managed2AfterRound1).toEqual(["NetBox/RackA"]);
+
+    // Two more rounds of the exact same (already-abandoned) inputs from each
+    // side — the sets must be STABLE: no growth, no flapping, and the folder
+    // must never be removed out from under the lingering mutual claim.
+    for (let round = 0; round < 2; round++) {
+      const resultOne = await core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 3 + round,
+        upsertServers: [],
+        removeServerIds: [],
+        folders: ["NetBox/RackB"],
+        expectedSource: core.getInventorySource("source-1")!
+      });
+      expect(resultOne.removedEmptyFolderCount).toBe(0);
+      expect([...(core.getInventorySource("source-1")?.managedFolders ?? [])].sort()).toEqual(managed1AfterRound1);
+
+      const resultTwo = await core.applyInventorySyncPlan({
+        sourceId: "source-2",
+        syncedAt: 3 + round,
+        upsertServers: [],
+        removeServerIds: [],
+        folders: [],
+        expectedSource: core.getInventorySource("source-2")!
+      });
+      expect(resultTwo.removedEmptyFolderCount).toBe(0);
+      expect([...(core.getInventorySource("source-2")?.managedFolders ?? [])].sort()).toEqual(managed2AfterRound1);
+
+      expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    }
+
+    // Bounded, not permanent: removing either side lifts its half of the
+    // lingering claim and the folder becomes genuinely reclaimable again
+    // (already covered end-to-end by the "co-owner removed" test above) —
+    // this test only pins that nothing WORSE than lingering happens while
+    // both sides remain.
   });
 
   it("(REVIEW FINDING 1, P2 — root retarget still strands old-tree cleanup) retargeting a source to root (\"\") still reclaims the OLD non-root target's now-empty managed folder, while the new managed set is stamped empty and no root-level folder is ever swept", async () => {

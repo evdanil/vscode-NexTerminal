@@ -854,21 +854,12 @@ export class NexusCore {
     // root-targeted (`targetFolder === ""`) other source contributes nothing
     // here, exactly like it never accumulates `managedFolders` itself.
     //
-    // `otherSourcesExactManagedFolders` — REVIEW FINDING 1 (P2, retain
-    // candidates the GC did not actually remove) needs this SEPARATELY from
-    // `otherSourcesProtectedPaths` below: see that finding's note on
-    // `retainedGcCandidates` further down for why a candidate EXACTLY present
-    // in another source's OWN `managedFolders` must NOT be retained back into
-    // THIS source's bookkeeping, even though it is (correctly) never removed
-    // here.
-    const otherSourcesExactManagedFolders = new Set<string>();
     const otherSourcesProtectedPaths = new Set<string>();
     for (const [otherId, otherSource] of this.inventorySources) {
       if (otherId === apply.sourceId) {
         continue;
       }
       for (const managed of otherSource.managedFolders ?? []) {
-        otherSourcesExactManagedFolders.add(managed);
         for (const ancestor of getAncestorPaths(managed)) {
           otherSourcesProtectedPaths.add(ancestor);
         }
@@ -936,34 +927,42 @@ export class NexusCore {
     // and it could never be reclaimed ("protection lifts" only held true
     // WITHIN the single apply that observed it).
     //
-    // `retainedGcCandidates` = gcOwnedCandidates − actuallyRemoved − (paths
-    // EXACTLY present in another source's OWN `managedFolders`). That last
-    // subtraction is deliberate and NOT redundant with the
-    // `crossSourceProtectedPaths` skip inside `pruneEmptyFoldersUnderTarget`
-    // above (which already guarantees this candidate was never actually
-    // removed): retaining it here TOO would double-book it. When another
-    // source X's own `managedFolders` exactly names this path, X's OWN next
-    // apply independently re-diffs it from X's OWN `previousManagedFolders`
-    // regardless of whether THIS source also remembers it — X is already the
-    // one carrying it forward. Retaining it on THIS source's side as well
-    // creates a genuine mutual-retention deadlock: THIS source's retained
-    // entry then shows up in X's `otherSourcesProtectedPaths` on X's next
-    // apply, deferring X's own reclaim of the very same path, which in turn
-    // keeps IT in THIS source's `otherSourcesProtectedPaths` next time round
-    // — neither source ever independently lets go, even after BOTH have
-    // genuinely stopped naming/occupying it (see
-    // nexusCoreInventory.test.ts's "(REVIEW FINDING 2, P2 — cross-source
-    // ownership)" and "(old-target co-ownership)" tests, which pin exactly
-    // this "reclaimed once BOTH have dropped it" guarantee and would
-    // regress into a permanent deadlock without this exclusion). This
-    // exclusion does NOT apply to protection arising only from another
-    // source's `targetFolder` (not its `managedFolders`) — that source has
-    // no `previousManagedFolders` entry for this path to re-diff on its own
-    // next sync (it may never have synced anything into it at all), so THIS
-    // source retaining the candidate is the ONLY way it is ever revisited —
-    // exactly the scenario REVIEW FINDING 1 exists to fix (see
-    // nexusCoreInventory.test.ts's "(cross-source target-root protection)"
-    // test).
+    // `retainedGcCandidates` = gcOwnedCandidates − actuallyRemoved (minus
+    // candidates whose folder no longer exists at all — see below). NO
+    // carve-out for candidates EXACTLY present in another source's OWN
+    // `managedFolders` — round-9 of this fix (see git history) tried
+    // excluding those, on the theory that source X's own next sync would
+    // independently re-diff the same path from X's OWN
+    // `previousManagedFolders`, so THIS source didn't also need to remember
+    // it. That reasoning had a hole: `removeInventorySource` deliberately
+    // leaves folders alone and just deletes the ownership record (see its
+    // doc) — if X is REMOVED rather than re-synced, X's "own next apply"
+    // never happens, and a THIS-source candidate excluded from retention on
+    // the strength of X's now-deleted claim is forgotten forever; no later
+    // sync of any source can ever reclaim it again. Retaining unconditionally
+    // (the plain round-9 rule, no carve-out) fixes that — see
+    // nexusCoreInventory.test.ts's "(co-owner removed, reclaim survives)"
+    // test, which pins exactly this scenario.
+    //
+    // CONSEQUENCE — two sources that both abandon a co-created path (neither
+    // removed, both simply stop naming/occupying it on their own later
+    // syncs) now each retain it and each defer on the other's still-retained
+    // claim: source A's retained entry shows up in B's
+    // `otherSourcesProtectedPaths` on B's next apply (deferring B's reclaim),
+    // and B's retained entry likewise defers A's. This is a real,
+    // symmetric-lingering limitation — the empty folder stays until either
+    // side is REMOVED (lifting its claim entirely) or one side genuinely
+    // reclaims the path by naming/occupying it again — but it is bounded and
+    // safe: nothing is ever deleted while it lingers (worst case is a leftover
+    // empty folder, never data loss), and the retained sets do not grow or
+    // flap across repeated syncs — each source's own candidate list is stable
+    // once both have abandoned (see nexusCoreInventory.test.ts's "(mutual
+    // abandonment lingers, stably)" test, which traces this across multiple
+    // syncs of each side). Protection arising from cross-source co-ownership
+    // during ACTIVE use (one side still naming/occupying the path) is
+    // unaffected by any of this — it was never gated on this exclusion in the
+    // first place; see the "(REVIEW FINDING 2, P2 — cross-source ownership)"
+    // and "(old-target co-ownership)" tests.
     //
     // A candidate whose folder no longer exists in `explicitGroups` at all
     // (removed through some path other than this GC — e.g. a user's manual
@@ -971,9 +970,7 @@ export class NexusCore {
     // retained: there is nothing left to ever reclaim, so bookkeeping a
     // ghost path forever would only grow the set without bound.
     const retainedGcCandidates = new Set(
-      [...gcOwnedCandidates].filter(
-        (f) => !removedEmptyGroups.has(f) && !otherSourcesExactManagedFolders.has(f) && this.explicitGroups.has(f)
-      )
+      [...gcOwnedCandidates].filter((f) => !removedEmptyGroups.has(f) && this.explicitGroups.has(f))
     );
     const stampedManagedFolders = new Set([...newManagedFolders, ...retainedGcCandidates]);
     // FINDING 4 (focus review) — same conditional-restore principle as
