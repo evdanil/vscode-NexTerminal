@@ -328,6 +328,203 @@ export class NexusCore {
   }
 
   /**
+   * ITEM B (empty-folder GC) — called synchronously from within
+   * applyInventorySyncPlan's mutation phase, AFTER the batch's own
+   * upserts/removes have already been applied to `this.servers` (so
+   * emptiness reflects the POST-sync state, not the pre-sync one). Removes
+   * explicit folders that are:
+   *   - in `ownedCandidates` (REVIEW FINDING 1, P2 — the source's OWN prior
+   *     `managedFolders`, minus the folders this very sync still names OR
+   *     still occupies with its own devices). A folder never named by any of
+   *     this source's own past applies is NEVER a candidate here, however
+   *     empty it is — it might be a manually-created folder the user
+   *     deliberately keeps empty (e.g. a staging area under the same
+   *     targetFolder), or one owned by a completely different source. GC only
+   *     ever reclaims a folder that this source itself created and has since
+   *     stopped naming/occupying,
+   *   - not in `crossSourceProtectedPaths` (any path another source currently
+   *     manages, or has as an ancestor of a managed path, or that sits under
+   *     another source's own configured `targetFolder` — REVIEW FINDING 2,
+   *     P2, and its CROSS-SOURCE TARGET-ROOT extension; see
+   *     applyInventorySyncPlan's call site for the full derivation) — never
+   *     sweeps cross-owned territory out from under a still-live claim.
+   *     REVIEW FINDING 1 (P2, retain candidates the GC did not actually
+   *     remove) — a candidate skipped for THIS reason is deliberately handled
+   *     the exact same way as an occupied one: this method simply never adds
+   *     it to the returned `removed` set, so the caller's bookkeeping
+   *     (`retainedGcCandidates` at the call site) keeps remembering it until
+   *     the protection genuinely lifts and a later apply finds it reclaimable,
+   *
+   *     TARGET-EDIT FIX — `ownedCandidates` is evaluated at EACH candidate's
+   *     OWN path, not filtered to live under the CURRENT `targetFolder`. A
+   *     candidate drawn from `previousManagedFolders` was stamped relative to
+   *     whatever `targetFolder` was in effect on the sync that created it,
+   *     which can differ from the CURRENT `targetFolder` when the source's
+   *     `targetFolder` was edited between syncs (e.g. "NetBox" -> "Infra") —
+   *     restricting candidates to `startsWith(targetFolder + "/")` would
+   *     silently exclude every folder still sitting under the OLD target
+   *     (e.g. "NetBox/RackA"), so it could never be reclaimed even after it
+   *     goes empty, and the very next restamp of `managedFolders` (see the
+   *     call site) then replaces the set with only new-target paths —
+   *     permanently losing the cleanup opportunity for the old target's tree.
+   *     The `targetFolder` parameter is kept only to protect the CURRENT
+   *     target's own root from ever being reclaimed (see below); it is no
+   *     longer used to restrict WHICH candidates are considered,
+   *   - not in `keepFolders` (the application's own `folders` list, with
+   *     ancestors included) — a folder this very sync still names must never
+   *     be GC'd out from under it just because it happens to be empty this
+   *     run (this is implied by `ownedCandidates` already excluding the new
+   *     managed set, kept here too as defense-in-depth),
+   *   - not equal to `targetFolder` itself — the CURRENT target's own root
+   *     always survives, even if it happens to appear in `ownedCandidates`.
+   *     Under normal stamping this never happens (`newManagedFolders` and
+   *     `previousManagedFolders` both only ever hold paths STRICTLY under
+   *     their respective target, so a target's own root is never itself a
+   *     member — see the call site), but a source whose `targetFolder` is
+   *     edited to a value that happens to equal a PREVIOUS candidate path
+   *     (e.g. old target "A" with candidate "A/B", then `targetFolder`
+   *     edited to "A/B") could otherwise coincide with it; this check is the
+   *     backstop,
+   *   - structurally well-formed and already in normalized form (own path
+   *     has a "/", `normalizeFolderPath` accepts it unchanged) — defensive
+   *     only. Every candidate a REAL sync ever stamps into `managedFolders`
+   *     is a strict descendant of some non-root `targetFolder` (root-target
+   *     sources never ACCUMULATE `managedFolders` themselves — `newManaged
+   *     Folders` is unconditionally empty whenever the CURRENT `targetFolder`
+   *     is "", see the call site — so a legitimately-stamped candidate always
+   *     has at least one "/"; a root-targeted source's `previousManagedFolders`
+   *     can still be non-empty for exactly one apply, right after it was
+   *     retargeted away from a non-root value, and those inherited candidates
+   *     are still multi-segment), but `validateInventorySource` accepts ANY
+   *     string array for `managedFolders`, so a legacy/imported source
+   *     record could carry an arbitrary (even single-segment, root-level)
+   *     path here. A single-segment candidate is treated the same as a
+   *     root-level folder and skipped, mirroring the "never sweep a
+   *     root-level folder" rule applied to normal target folders, and
+   *   - completely empty: no server (ANY origin — manual or synced from a
+   *     DIFFERENT source), serial profile, or local-shell profile currently
+   *     assigned to it, AND no descendant folder that is itself still
+   *     present.
+   *
+   * Processes candidates deepest-first (most path segments first) so a
+   * folder that becomes empty only because ALL of its children were removed
+   * earlier in this SAME pass is itself removed too — "no non-empty
+   * descendant" is evaluated against what remains after this pass's own
+   * removals, not against the pre-GC tree.
+   *
+   * Entity coverage: ServerConfig, SerialProfile, and LocalShellProfile are
+   * the only three record types that carry a `group` participating in
+   * `this.explicitGroups` (see removeFolderCascade / _renameFolderPath /
+   * getItemsInFolder above, which enumerate exactly these three). Terminal
+   * macros also have a folder concept, but it is a COMPLETELY SEPARATE
+   * list (`nexus.macros.folders`, owned by `services/macroFolders.ts`) that
+   * NexusCore never reads or writes — nothing of theirs lives in
+   * `this.explicitGroups`, so there is nothing to check here.
+   *
+   * Only ever DELETES from `this.explicitGroups` and returns exactly the set
+   * of paths it removed; persisting the result and restoring any of the
+   * returned ids on a rolled-back persist is the caller's job (see
+   * applyInventorySyncPlan's rollback, which extends its existing
+   * `addedExplicitGroups` conditional-restore machinery to a mirrored
+   * `removedEmptyGroups` one for exactly this reason).
+   */
+  private pruneEmptyFoldersUnderTarget(
+    targetFolder: string,
+    keepFolders: ReadonlySet<string>,
+    ownedCandidates: ReadonlySet<string>,
+    crossSourceProtectedPaths: ReadonlySet<string>
+  ): Set<string> {
+    const removed = new Set<string>();
+    const candidates = [...ownedCandidates]
+      .filter((candidate) => {
+        if (candidate === targetFolder || keepFolders.has(candidate)) {
+          return false;
+        }
+        if (crossSourceProtectedPaths.has(candidate)) {
+          // REVIEW FINDING 2 (P2, cross-source ownership) + its
+          // CROSS-SOURCE TARGET-ROOT extension — another source still
+          // manages this path exactly, has it as an ancestor of a managed
+          // path, or has it under its own configured targetFolder. Skipped,
+          // not removed — the caller's bookkeeping decides separately
+          // whether to keep remembering it (see REVIEW FINDING 1, P2 at the
+          // call site).
+          return false;
+        }
+        if (!candidate.includes("/")) {
+          // Defensive: a legitimately-stamped candidate is always strictly
+          // under SOME non-root target and therefore always has a "/" — see
+          // the doc above. A single-segment path only reaches here via a
+          // legacy/imported record with a hand-edited `managedFolders`
+          // array; refuse to touch it, same as a root-level folder.
+          return false;
+        }
+        if (normalizeFolderPath(candidate) !== candidate) {
+          // Defensive: same legacy/imported-record concern — only act on
+          // candidates already in normalized form.
+          return false;
+        }
+        return this.explicitGroups.has(candidate);
+      })
+      .sort((a, b) => b.split("/").length - a.split("/").length);
+
+    for (const candidate of candidates) {
+      if (!this.explicitGroups.has(candidate)) {
+        continue; // already removed earlier in this same pass (shouldn't happen — candidates are deduped — stays defensive)
+      }
+      // F4 — an occupant at an IMPLICIT descendant path (a hand-typed group
+      // like "NetBox/RackA/Special" that was never itself added to
+      // explicitGroups) must still protect "NetBox/RackA" from being GC'd:
+      // exact-match alone missed this, since nothing ever creates an
+      // explicit folder entry for "Special" the way the tree UI would for a
+      // folder a user actually browsed to. Every group at or under
+      // `candidate` (candidate itself, or any "candidate/..." descendant,
+      // implicit or explicit) counts as occupying it.
+      const occupiesCandidate = (group: string | undefined): boolean =>
+        group !== undefined && (group === candidate || group.startsWith(`${candidate}/`));
+      let occupied = false;
+      for (const server of this.servers.values()) {
+        if (occupiesCandidate(server.group)) {
+          occupied = true;
+          break;
+        }
+      }
+      if (!occupied) {
+        for (const profile of this.serialProfiles.values()) {
+          if (occupiesCandidate(profile.group)) {
+            occupied = true;
+            break;
+          }
+        }
+      }
+      if (!occupied) {
+        for (const profile of this.localShellProfiles.values()) {
+          if (occupiesCandidate(profile.group)) {
+            occupied = true;
+            break;
+          }
+        }
+      }
+      if (occupied) {
+        continue;
+      }
+      const descendantPrefix = `${candidate}/`;
+      let hasDescendant = false;
+      for (const group of this.explicitGroups) {
+        if (group !== candidate && group.startsWith(descendantPrefix)) {
+          hasDescendant = true;
+          break;
+        }
+      }
+      if (hasDescendant) {
+        continue;
+      }
+      this.explicitGroups.delete(candidate);
+      removed.add(candidate);
+    }
+    return removed;
+  }
+
+  /**
    * Applies one computed inventory sync as a single atomic batch: one
    * `saveServers`/`saveGroups`/`saveInventorySources` round-trip, one
    * `emitChanged()` — mirrors `addServersBatch`'s reasoning for why a
@@ -367,8 +564,20 @@ export class NexusCore {
    * secrets, runtime teardown) must iterate this list, not their own
    * pre-apply candidate list — a candidate this call skipped was never
    * touched and must not have its secrets/sessions torn down either.
+   *
+   * ITEM B (empty-folder GC) — also returns `removedEmptyFolderCount`: how
+   * many explicit folders `pruneEmptyFoldersUnderTarget` removed as part of
+   * this same batch (see that method's doc; always 0 in "absent" mode). A
+   * root-targeted (`targetFolder === ""`) source never GCs anything IT
+   * SEEDED — it never accumulates `managedFolders` in the first place — but
+   * CAN still be nonzero for one that was just retargeted TO root: candidates
+   * inherited from its previous non-root target are still processed (REVIEW
+   * FINDING 1, P2), only ever at their own multi-segment path, never at the
+   * root level. Zero in every case this method predates this feature.
    */
-  public async applyInventorySyncPlan(apply: InventorySyncApplication): Promise<{ skippedCount: number; removedServerIds: string[] }> {
+  public async applyInventorySyncPlan(
+    apply: InventorySyncApplication
+  ): Promise<{ skippedCount: number; removedServerIds: string[]; removedEmptyFolderCount: number }> {
     const source = this.inventorySources.get(apply.sourceId);
     // FINDING 2 (removeSource review) — the actual entries this call mutates.
     // In the normal (non-"absent") case these are exactly apply's own arrays;
@@ -505,6 +714,11 @@ export class NexusCore {
     // "changed since" and leaves it alone.
     const batchWrittenServers = new Map<string, ServerConfig | undefined>(); // undefined = this batch deleted it
     const addedExplicitGroups = new Set<string>(); // paths this batch added that were NOT already present
+    // ITEM B — every folder (with ancestors) this application's own `folders`
+    // list touches, whether newly added above or already present. GC below
+    // must never remove one of these even if it turns out empty this run —
+    // this sync itself still names it.
+    const applicationFolderSet = new Set<string>();
 
     for (const folder of apply.folders) {
       const normalized = normalizeFolderPath(folder);
@@ -512,6 +726,7 @@ export class NexusCore {
         continue;
       }
       for (const ancestor of getAncestorPaths(normalized)) {
+        applicationFolderSet.add(ancestor);
         if (!this.explicitGroups.has(ancestor)) {
           this.explicitGroups.add(ancestor);
           addedExplicitGroups.add(ancestor);
@@ -527,6 +742,237 @@ export class NexusCore {
       this.servers.set(server.id, server);
       batchWrittenServers.set(server.id, cloneServerConfig(server));
     }
+    // OWNERSHIP FIX (USE is not ownership) — a folder the user pre-created by
+    // hand (e.g. "NetBox/RackA" made via the tree UI before this source ever
+    // synced) that a sync merely PLACES a device into must never enter
+    // `managedFolders` on that basis alone: the sync didn't create it, so it
+    // doesn't own it, and it must never become GC-eligible later just because
+    // the device that happens to sit there moves away. Ownership can only
+    // come from two places: (a) a path this apply itself just ADDED to
+    // `explicitGroups` (it didn't exist before — this apply's own act of
+    // syncing brought it into being), or (b) a path this source already
+    // owned on a PRIOR apply (`previousManagedFolders`) that is still in
+    // actual use by this source (current footprint or this apply's own
+    // `folders` list) — carrying ownership forward, not re-deriving it from
+    // occupancy alone.
+    //
+    // `sourceOwnedFootprint` — walk `this.servers` (already mutated above)
+    // for every record this source currently owns (`origin?.sourceId ===
+    // apply.sourceId`) and collect its group plus all ancestors, restricted
+    // to strictly-under-`targetFolder`. This is USE, not ownership by
+    // itself — see below, it only ever re-affirms a folder already in
+    // `previousManagedFolders`, it never seeds a brand-new one.
+    const sourceOwnedFootprint = new Set<string>();
+    if (source && source.targetFolder !== "") {
+      const prefix = `${source.targetFolder}/`;
+      for (const server of this.servers.values()) {
+        if (server.origin?.sourceId !== apply.sourceId || !server.group) {
+          continue;
+        }
+        for (const ancestor of getAncestorPaths(server.group)) {
+          if (ancestor.startsWith(prefix)) {
+            sourceOwnedFootprint.add(ancestor);
+          }
+        }
+      }
+    }
+    // `applicationFolderSetFiltered` — this apply's own `folders` list (with
+    // ancestors), restricted to strictly-under-`targetFolder`. Covers a
+    // folder this apply just created but which is momentarily empty (e.g. a
+    // fresh orphan destination with nothing moved into it yet on THIS apply)
+    // — same role `applicationFolderSet` played before this fix, just scoped
+    // to the target.
+    const applicationFolderSetFiltered =
+      source && source.targetFolder !== ""
+        ? new Set([...applicationFolderSet].filter((f) => f.startsWith(`${source.targetFolder}/`)))
+        : new Set<string>();
+    // `previousManagedFolders` — what this source owned coming INTO this
+    // apply (empty for a legacy record or a source's first-ever non-"absent"
+    // apply — nothing to carry forward yet).
+    const previousManagedFolders = new Set(source?.managedFolders ?? []);
+    // `createdThisApply` — paths THIS apply's own `folders` list caused to be
+    // newly added to `explicitGroups` (see `addedExplicitGroups` above),
+    // restricted to strictly-under-`targetFolder`. This is the ONLY source of
+    // brand-new ownership: a path already present in `explicitGroups` before
+    // this apply ran — pre-created by the user, or owned by a different
+    // source — is never in `addedExplicitGroups`, however this apply's own
+    // footprint or `folders` list happens to use it.
+    const createdThisApply =
+      source && source.targetFolder !== ""
+        ? new Set([...addedExplicitGroups].filter((f) => f.startsWith(`${source.targetFolder}/`)))
+        : new Set<string>();
+    // This REPLACES the source's previous `managedFolders` wholesale — it is
+    // NOT an accumulating history. `newManagedFolders` = (paths this source
+    // already owned that are still in actual use) UNION (paths this apply
+    // just created). A previously-owned path no longer in use (occupied by
+    // none of this source's own devices AND not named by this apply's own
+    // `folders` list — e.g. a renamed rack) drops out here, becoming a GC
+    // candidate below. A path merely USED (footprint) but never OWNED
+    // (neither previously-managed nor newly-created) never enters the set at
+    // all — see the fix comment above; this is what makes a user-pre-created
+    // folder immune to GC forever, exactly as it must be.
+    const currentFootprintOrNamed = new Set([...sourceOwnedFootprint, ...applicationFolderSetFiltered]);
+    const newManagedFolders: Set<string> =
+      source && source.targetFolder !== ""
+        ? new Set([...[...previousManagedFolders].filter((f) => currentFootprintOrNamed.has(f)), ...createdThisApply])
+        : new Set<string>();
+    // `gcOwnedCandidates` — the previous managed set MINUS the new one:
+    // folders this source itself OWNED (not merely used) on some prior sync
+    // and has now stopped naming/occupying. Only these are eligible for GC
+    // below; a folder never in the source's own managed history (hand-created
+    // by the user, or owned by a DIFFERENT source under the same
+    // targetFolder) is never touched, however empty it is.
+    //
+    // REVIEW FINDING 2 (P2, cross-source ownership) — two sources can target
+    // overlapping trees and both legitimately manage the very same folder
+    // (e.g. two NetBox sources pointed at the same "NetBox" targetFolder,
+    // each syncing devices into "NetBox/RackA"). If source X drops the folder
+    // from its own managed set while it's momentarily empty, GC must not
+    // reclaim it out from under source Y, which still names it. Exclude from
+    // removal (see `pruneEmptyFoldersUnderTarget` below) any path that is
+    // EXACTLY managed by another source, OR is an ANCESTOR of a path another
+    // source manages — deleting an ancestor would orphan that other source's
+    // chain even though the ancestor itself isn't in the other source's set
+    // verbatim.
+    //
+    // CROSS-SOURCE TARGET-ROOT FIX — `managedFolders` is deliberately never
+    // stamped with a source's own `targetFolder` root (see
+    // `pruneEmptyFoldersUnderTarget`'s doc — a target's own root is never a
+    // member of its own managed set). That is correct for a source's OWN GC,
+    // but it left a gap here: another source's `targetFolder` can be pointed
+    // at a folder THIS source owns (e.g. source A created "NetBox/RackA" via
+    // its own sync; source B is later configured with `targetFolder ===
+    // "NetBox/RackA"` and simply hasn't synced any device into it yet, so
+    // `managedFolders` for B is still empty). Checking only `managedFolders`
+    // means B's own configured root carries no protection at all — A
+    // abandoning its last device leaves "NetBox/RackA" a GC candidate for A,
+    // and it gets deleted out from under B's still-live configuration, even
+    // though B never got a chance to sync anything into it. Fold every OTHER
+    // source's own non-root `targetFolder` (plus its ancestors) into the same
+    // protected set — a configured target root is a live claim on that
+    // folder regardless of whether that source has synced into it yet. A
+    // root-targeted (`targetFolder === ""`) other source contributes nothing
+    // here, exactly like it never accumulates `managedFolders` itself.
+    //
+    const otherSourcesProtectedPaths = new Set<string>();
+    for (const [otherId, otherSource] of this.inventorySources) {
+      if (otherId === apply.sourceId) {
+        continue;
+      }
+      for (const managed of otherSource.managedFolders ?? []) {
+        for (const ancestor of getAncestorPaths(managed)) {
+          otherSourcesProtectedPaths.add(ancestor);
+        }
+      }
+      if (otherSource.targetFolder !== "") {
+        for (const ancestor of getAncestorPaths(otherSource.targetFolder)) {
+          otherSourcesProtectedPaths.add(ancestor);
+        }
+      }
+    }
+    // REVIEW FINDING 1 (P2, retain candidates the GC did not actually remove)
+    // — `gcOwnedCandidates` used to ALSO subtract `otherSourcesProtectedPaths`
+    // here, which meant a candidate deferred by cross-source protection never
+    // even reached `pruneEmptyFoldersUnderTarget` — it silently vanished from
+    // consideration. That collapsed two different things into one: "must
+    // never be REMOVED right now" (still true, and still enforced — see the
+    // `pruneEmptyFoldersUnderTarget` call below, which now takes
+    // `otherSourcesProtectedPaths` itself and skips a protected candidate the
+    // same way it skips an occupied one) versus "this source no longer needs
+    // to REMEMBER it created this folder" (false — the source's bookkeeping
+    // ownership must survive until the folder is GENUINELY reclaimed; see
+    // `retainedGcCandidates` below). `gcOwnedCandidates` now holds every
+    // candidate this source has stopped naming/occupying, protected or not —
+    // protection is enforced once, inside the prune call, not twice.
+    const gcOwnedCandidates = new Set([...previousManagedFolders].filter((f) => !newManagedFolders.has(f)));
+    // ITEM B (empty-folder GC) — runs synchronously here, in the mutation
+    // phase, AFTER the upserts/removes above so it sees the POST-sync server
+    // set. Scoped to non-"absent" applications only (REMOVAL disposition
+    // leaves folders alone — the source is gone, there is nothing to sync
+    // back into them, and leaving them is the documented, conservative
+    // choice) with a live `source` record (guaranteed non-"absent" branch).
+    //
+    // REVIEW FINDING 1 (P2, root retarget strands old-tree cleanup) — this
+    // call is NOT gated on `source.targetFolder !== ""` anymore. Root ("")
+    // keeps exactly ONE invariant: it never ACCUMULATES new ownership — see
+    // `newManagedFolders` above, which is unconditionally empty for a root
+    // target, so a root source's own footprint/folder-list can never seed a
+    // future GC candidate, and `pruneEmptyFoldersUnderTarget` independently
+    // refuses to ever touch a single-segment (root-level) candidate or one
+    // equal to `targetFolder` itself. What root no longer blocks is
+    // processing `gcOwnedCandidates` INHERITED from a previous non-root
+    // `targetFolder` (e.g. a source retargeted from "NetBox" to "" still
+    // carries ["NetBox/RackA"] in `previousManagedFolders` until this apply
+    // restamps it) — those candidates are multi-segment by construction and
+    // are evaluated at their own path with every existing safety check
+    // (occupancy, descendants, cross-source ownership), so gating the whole
+    // call on the CURRENT targetFolder being non-root did nothing but strand
+    // that one-time cleanup forever the moment `managedFolders` got restamped
+    // to `[]` immediately below. "Empty at the top level might be
+    // deliberate" is still honored — it just now means "never sweep a
+    // root-level folder", not "never run GC for a root-targeted source".
+    const removedEmptyGroups: Set<string> =
+      apply.expectedSource !== "absent" && source
+        ? this.pruneEmptyFoldersUnderTarget(source.targetFolder, applicationFolderSet, gcOwnedCandidates, otherSourcesProtectedPaths)
+        : new Set<string>();
+    // REVIEW FINDING 1 (P2, retain candidates the GC did not actually
+    // remove) — a candidate that fell out of `newManagedFolders` but was NOT
+    // actually deleted above (deferred by cross-source protection, still
+    // occupied, still has a live descendant, or skipped as
+    // defensively-malformed) must not simply vanish from this source's own
+    // bookkeeping. Before this fix, `managedFolders` was stamped from
+    // `newManagedFolders` alone, so the very next persist silently forgot
+    // that this source ever created the folder — if the thing protecting it
+    // was later removed or retargeted, nothing remembered the path anymore
+    // and it could never be reclaimed ("protection lifts" only held true
+    // WITHIN the single apply that observed it).
+    //
+    // `retainedGcCandidates` = gcOwnedCandidates − actuallyRemoved (minus
+    // candidates whose folder no longer exists at all — see below). NO
+    // carve-out for candidates EXACTLY present in another source's OWN
+    // `managedFolders` — round-9 of this fix (see git history) tried
+    // excluding those, on the theory that source X's own next sync would
+    // independently re-diff the same path from X's OWN
+    // `previousManagedFolders`, so THIS source didn't also need to remember
+    // it. That reasoning had a hole: `removeInventorySource` deliberately
+    // leaves folders alone and just deletes the ownership record (see its
+    // doc) — if X is REMOVED rather than re-synced, X's "own next apply"
+    // never happens, and a THIS-source candidate excluded from retention on
+    // the strength of X's now-deleted claim is forgotten forever; no later
+    // sync of any source can ever reclaim it again. Retaining unconditionally
+    // (the plain round-9 rule, no carve-out) fixes that — see
+    // nexusCoreInventory.test.ts's "(co-owner removed, reclaim survives)"
+    // test, which pins exactly this scenario.
+    //
+    // CONSEQUENCE — two sources that both abandon a co-created path (neither
+    // removed, both simply stop naming/occupying it on their own later
+    // syncs) now each retain it and each defer on the other's still-retained
+    // claim: source A's retained entry shows up in B's
+    // `otherSourcesProtectedPaths` on B's next apply (deferring B's reclaim),
+    // and B's retained entry likewise defers A's. This is a real,
+    // symmetric-lingering limitation — the empty folder stays until either
+    // side is REMOVED (lifting its claim entirely) or one side genuinely
+    // reclaims the path by naming/occupying it again — but it is bounded and
+    // safe: nothing is ever deleted while it lingers (worst case is a leftover
+    // empty folder, never data loss), and the retained sets do not grow or
+    // flap across repeated syncs — each source's own candidate list is stable
+    // once both have abandoned (see nexusCoreInventory.test.ts's "(mutual
+    // abandonment lingers, stably)" test, which traces this across multiple
+    // syncs of each side). Protection arising from cross-source co-ownership
+    // during ACTIVE use (one side still naming/occupying the path) is
+    // unaffected by any of this — it was never gated on this exclusion in the
+    // first place; see the "(REVIEW FINDING 2, P2 — cross-source ownership)"
+    // and "(old-target co-ownership)" tests.
+    //
+    // A candidate whose folder no longer exists in `explicitGroups` at all
+    // (removed through some path other than this GC — e.g. a user's manual
+    // "Delete Folder" from the tree UI) is also dropped here rather than
+    // retained: there is nothing left to ever reclaim, so bookkeeping a
+    // ghost path forever would only grow the set without bound.
+    const retainedGcCandidates = new Set(
+      [...gcOwnedCandidates].filter((f) => !removedEmptyGroups.has(f) && this.explicitGroups.has(f))
+    );
+    const stampedManagedFolders = new Set([...newManagedFolders, ...retainedGcCandidates]);
     // FINDING 4 (focus review) — same conditional-restore principle as
     // servers/groups above, applied to focusedSessionId: record what THIS
     // batch's own synchronous mutation phase left focusedSessionId as
@@ -543,7 +989,16 @@ export class NexusCore {
     // alone. The bucket is still included in the persist below (unchanged
     // content), keeping the existing one-persist-one-emit shape intact
     // rather than special-casing the "absent" apply into its own save call.
-    const writtenSourceRecord = source ? { ...source, lastSyncAt: apply.syncedAt } : undefined;
+    //
+    // REVIEW FINDING 1 (P2, folder-GC ownership) — `managedFolders` is
+    // stamped here, in the SAME object/write as the `lastSyncAt` bump, so it
+    // shares that field's revision semantics: this is a routine sync stamp,
+    // not a new incarnation of the record, so `revision` is deliberately NOT
+    // touched (addOrUpdateInventorySource remains the only place a live
+    // record's revision is ever reassigned — see that method's doc).
+    const writtenSourceRecord = source
+      ? { ...source, lastSyncAt: apply.syncedAt, managedFolders: [...stampedManagedFolders] }
+      : undefined;
     if (writtenSourceRecord) {
       this.inventorySources.set(apply.sourceId, writtenSourceRecord);
     }
@@ -583,15 +1038,26 @@ export class NexusCore {
       // either erase the concurrent edit or keep the rejected batch write —
       // see REVIEW FINDING 1 below for the merge that replaces the old
       // skip-whole-record behavior in the UPDATE case.
+      //
+      // GROUP-REMAP (P2) — records this batch DELETED are not re-inserted
+      // here; they are collected and re-inserted AFTER the folder-restore
+      // pass below, because the folder chain their `group` points at has to
+      // be judged against the tree as it stands once every other rollback
+      // step has run. Nothing between here and there reads `this.servers`
+      // (the folder-restore pass looks only at `explicitGroups`), and the
+      // whole block is synchronous, so deferring is behavior-neutral for
+      // every other participant.
+      const pendingRemovedServerRestores: Array<[string, ServerConfig]> = [];
       for (const [id, priorServer] of priorServers) {
         const batchSnapshot = batchWrittenServers.get(id);
         const current = this.servers.get(id);
         if (batchSnapshot === undefined) {
           // This batch deleted the record. Restore it only if nothing has
           // recreated it since (current still absent) — a concurrent
-          // recreation is left alone entirely.
-          if (current === undefined && priorServer) {
-            this.servers.set(id, priorServer);
+          // recreation is left alone entirely. Presence is re-checked at the
+          // deferred re-insert below, which is where the restore happens.
+          if (priorServer) {
+            pendingRemovedServerRestores.push([id, priorServer]);
           }
           continue;
         }
@@ -646,6 +1112,180 @@ export class NexusCore {
       for (const group of addedExplicitGroups) {
         this.explicitGroups.delete(group);
       }
+      // ITEM B (empty-folder GC rollback) — mirrors the addedExplicitGroups
+      // restore just above, for the OPPOSITE direction: folders THIS batch's
+      // GC pass removed must be put back on a rejected persist, but only if
+      // nothing concurrent has since re-added the exact same path (e.g. a
+      // concurrent addGroup, or a concurrent addOrUpdateServer assigning a
+      // server back into it) while the persist above was in flight — a
+      // wholesale unconditional re-add would clobber that concurrent state
+      // the same way an unconditional restore would for addedExplicitGroups.
+      //
+      // PARENT-CHAIN FIX — presence-of-the-exact-path alone isn't enough.
+      // Lock-free tree commands (`_renameFolderPath` / `removeFolderCascade`)
+      // are NOT serialized against this batch's pending persist (same window
+      // FINDING 3/REVIEW FINDING 2 above already contend with for servers),
+      // so the surrounding tree can be renamed or deleted out from under a
+      // removed candidate while this save is in flight — e.g. the whole
+      // "NetBox" branch renamed to "Lab" while this batch is mid-persist
+      // after GC'ing the now-empty "NetBox/RackA". "NetBox/RackA" is still
+      // ABSENT from `explicitGroups` at rollback time (it was never
+      // recreated at that exact path — it just moved, along with its
+      // parent), so the presence check alone would wrongly resurrect a
+      // stale, now-orphaned path under a parent tree the user just renamed
+      // away, and the compensating re-persist below would then write that
+      // resurrection to disk — undoing the user's concurrent rename/delete.
+      //
+      // A GC candidate is always multi-segment (see
+      // `pruneEmptyFoldersUnderTarget`'s doc — a target's own root and any
+      // single-segment path are never candidates), so `parentPath` always
+      // returns a defined immediate parent here. Restore only if that parent
+      // is CURRENTLY in `explicitGroups` — i.e. this candidate's own chain
+      // still exists to hang it back off. Process shallowest-first (fewest
+      // path segments first) so a parent restored earlier in this SAME loop
+      // (e.g. "NetBox/RackA" before "NetBox/RackA/Sub", both GC'd together)
+      // is visible to its child's parent check via the ordinary
+      // `explicitGroups.has` lookup — no separate "restoring in this pass"
+      // bookkeeping needed, the loop's own insertion order provides it.
+      //
+      // RESIDUAL (documented, acceptable) — a concurrent rename that
+      // happens to leave an IDENTICALLY-NAMED parent behind (coincidence,
+      // not the same folder) is indistinguishable from "the chain still
+      // exists" and this restore proceeds anyway. Bounded and rare; the
+      // realistic, common case this guards is exactly the rename/delete
+      // scenario above, where the parent is verifiably gone.
+      const sortedRemovedEmptyGroups = [...removedEmptyGroups].sort(
+        (a, b) => a.split("/").length - b.split("/").length
+      );
+      for (const group of sortedRemovedEmptyGroups) {
+        if (this.explicitGroups.has(group)) {
+          continue; // (a) someone re-created this exact path since — leave theirs.
+        }
+        const parent = parentPath(group);
+        if (parent !== undefined && !this.explicitGroups.has(parent)) {
+          continue; // (b) the chain this path hung off no longer exists — do not resurrect an orphan.
+        }
+        this.explicitGroups.add(group);
+      }
+      // GROUP-REMAP — the parent-chain guard above protects EXPLICIT folder
+      // entries only, but the Connection Hub derives a folder from every
+      // `server.group` prefix as well (see NexusTreeProvider.computeFolderCache:
+      // explicit groups AND every item group contribute ancestors), so a
+      // removed server restored with its old `group` resurrects that whole
+      // path just as surely as re-adding the explicit entry would. The exact
+      // hole: delete-prune removes the last server in the managed folder
+      // "NetBox/RackA"; while the persist is pending the user renames
+      // "NetBox" -> "Lab" (the rename cannot touch the removed server — it is
+      // not in the map at that moment); the persist then fails and the
+      // restore puts the server back with group "NetBox/RackA", re-deriving
+      // the stale "NetBox" branch the folder-entry guard just refused to
+      // re-add.
+      //
+      // The server itself must ALWAYS come back — dropping it would be data
+      // loss, and this batch is supposed to have had NO effect. So the group
+      // is REMAPPED instead: onto the deepest still-existing folder on its
+      // own chain, or to the root when none of it survived.
+      //
+      // `survivingFolderPaths` is the folder tree as it stands at this exact
+      // point of the rollback (ancestor-closed, exactly how the tree derives
+      // it): explicit groups AFTER the guarded restore pass above (so a
+      // folder that pass legitimately put back counts as surviving), plus
+      // every ancestor chain of the groups of the records currently in the
+      // maps — servers as the server-rollback loop above left them, and
+      // serial / local-shell profiles, which this batch never touches but
+      // which keep a folder just as alive as a server does (same three
+      // record types pruneEmptyFoldersUnderTarget counts as occupants).
+      //
+      // ORDER — the removed servers themselves are NOT in that initial set
+      // (this batch deleted them and they have not been re-inserted yet), and
+      // that is the deliberate choice: a removed server may never vouch for
+      // another removed server's chain, otherwise two servers pruned out of
+      // the same concurrently-renamed folder would each certify the other's
+      // stale path and the guard would evaporate exactly when it is needed.
+      // What a restored server DOES contribute is its FINAL group — the
+      // original one when it was judged sound, the remapped one otherwise —
+      // so restores are processed shallowest-group-first (ties broken by id,
+      // for a fully deterministic outcome): a parent-level server restored
+      // into a surviving chain then legitimately extends the tree for its
+      // deeper siblings, while a stale chain never enters the set at all.
+      //
+      // LEAF EXEMPTION — only the STRICT ancestors of a group have to
+      // survive; the deepest segment itself may be absent. That mirrors the
+      // folder pass above (a child is restorable into a surviving parent) and
+      // is what keeps the ordinary case unchanged: the removed server was
+      // usually the last occupant of its own folder, so its leaf path is
+      // gone precisely BECAUSE of this batch — restoring the server merely
+      // re-derives its own folder. A root-level (single-segment) group has no
+      // ancestors to judge at all and is likewise always restored as-is —
+      // same rule the folder pass applies to a `parentPath` of undefined.
+      //
+      // RESIDUAL (documented, inherited from the folder pass) — a concurrent
+      // rename of the LEAF segment alone, or one that happens to leave an
+      // identically-named ancestor behind, is indistinguishable here from
+      // "the chain still exists" and the restore proceeds unchanged. The
+      // realistic case this guards is an ancestor that is verifiably gone.
+      const survivingFolderPaths = new Set<string>();
+      const addSurvivingFolderChain = (group: string | undefined): void => {
+        if (!group) {
+          return;
+        }
+        for (const ancestor of getAncestorPaths(group)) {
+          survivingFolderPaths.add(ancestor);
+        }
+      };
+      for (const group of this.explicitGroups) {
+        addSurvivingFolderChain(group);
+      }
+      for (const server of this.servers.values()) {
+        addSurvivingFolderChain(server.group);
+      }
+      for (const profile of this.serialProfiles.values()) {
+        addSurvivingFolderChain(profile.group);
+      }
+      for (const profile of this.localShellProfiles.values()) {
+        addSurvivingFolderChain(profile.group);
+      }
+      const orderedRemovedServerRestores = [...pendingRemovedServerRestores].sort(
+        ([idA, serverA], [idB, serverB]) => {
+          const depthA = serverA.group ? serverA.group.split("/").length : 0;
+          const depthB = serverB.group ? serverB.group.split("/").length : 0;
+          return depthA !== depthB ? depthA - depthB : idA.localeCompare(idB);
+        }
+      );
+      for (const [id, priorServer] of orderedRemovedServerRestores) {
+        if (this.servers.get(id) !== undefined) {
+          continue; // something concurrent recreated this record — leave theirs.
+        }
+        const group = priorServer.group;
+        const parent = group === undefined ? undefined : parentPath(group);
+        if (group === undefined || parent === undefined || survivingFolderPaths.has(parent)) {
+          // Sound chain (or nothing to judge): restore the captured pre-batch
+          // record itself, byte-for-byte, exactly as before this fix.
+          this.servers.set(id, priorServer);
+          addSurvivingFolderChain(group);
+          continue;
+        }
+        // The chain is stale: walk up to the deepest ancestor that still
+        // exists (the set is ancestor-closed, so the first hit going up is
+        // the longest surviving prefix); `undefined` — the codebase's
+        // representation of "no folder", see _renameFolderPath's own
+        // root-remap — when none of it survived.
+        const ancestors = getAncestorPaths(group);
+        let remappedGroup: string | undefined;
+        for (let i = ancestors.length - 2; i >= 0; i--) {
+          if (survivingFolderPaths.has(ancestors[i])) {
+            remappedGroup = ancestors[i];
+            break;
+          }
+        }
+        // Mutate a DETACHED clone only: `priorServer` is the pre-batch record
+        // captured by reference, and other rollback branches (and any
+        // concurrent holder) must never see a group this pass invented.
+        const restored = cloneServerConfig(priorServer);
+        restored.group = remappedGroup;
+        this.servers.set(id, restored);
+        addSurvivingFolderChain(remappedGroup);
+      }
       // TOMBSTONE — a captured session that was genuinely torn down by
       // unregisterSession during the awaited persist (window opened just
       // above) must NOT be resurrected here: the terminal is actually gone,
@@ -683,7 +1323,13 @@ export class NexusCore {
       // batch wrote; a concurrent edit to the same source since must not be
       // clobbered. REORDER — "absent": writtenSourceRecord is undefined, so
       // this is a no-op, exactly matching "nothing was written, nothing to
-      // roll back".
+      // roll back". REVIEW FINDING 1 (P2, folder-GC ownership) —
+      // `managedFolders` rides along for free here: `source!` is the whole
+      // pre-apply record (this apply's mutation phase only ever builds a
+      // NEW `writtenSourceRecord` object — see above — it never mutates
+      // `source` in place), so restoring it wholesale also reverts
+      // `managedFolders` to its pre-apply value, exactly as it must on a
+      // rejected persist.
       if (writtenSourceRecord && this.inventorySources.get(apply.sourceId) === writtenSourceRecord) {
         this.inventorySources.set(apply.sourceId, source!);
       }
@@ -713,7 +1359,7 @@ export class NexusCore {
     this.inventorySyncApplyInFlight = false;
     this.inventorySyncTombstonedSessionIds.clear();
     this.emitChanged();
-    return { skippedCount, removedServerIds: [...removeServerIds] };
+    return { skippedCount, removedServerIds: [...removeServerIds], removedEmptyFolderCount: removedEmptyGroups.size };
   }
 
   public isServerConnected(serverId: string): boolean {

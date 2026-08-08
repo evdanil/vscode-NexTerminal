@@ -62,6 +62,25 @@ describe("renderFormHtml", () => {
     expect(html).toContain('max="65535"');
   });
 
+  it("omits the step attribute for a number field that doesn't set one (no-behavior-change guard)", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [{ type: "number", key: "port", label: "Port", min: 1, max: 65535, value: 22 }]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).not.toContain("step=");
+  });
+
+  it("renders step=\"any\" on a number field that opts in, allowing fractional values past native validation", () => {
+    const definition: FormDefinition = {
+      title: "Test",
+      fields: [{ type: "number", key: "pollInterval", label: "Poll Interval", value: 0.5, step: "any" }]
+    };
+    const html = renderFormHtml(definition);
+    expect(html).toContain('step="any"');
+    expect(html).toContain('value="0.5"');
+  });
+
   it("renders password fields with password input type", () => {
     const definition: FormDefinition = {
       title: "Test",

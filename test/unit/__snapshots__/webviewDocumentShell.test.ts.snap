@@ -159,6 +159,11 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
     }
+    .custom-select-option-desc {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 1px;
+    }
     .custom-select-group {
       padding: 6px 8px 2px;
       font-size: 11px;
@@ -504,7 +509,8 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
         if (options[i].dataset.value === value) {
           options[i].classList.add('selected');
           options[i].setAttribute('aria-selected', 'true');
-          textEl.textContent = options[i].textContent;
+          var labelEl = options[i].querySelector('.custom-select-option-label');
+          textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
         }
       }
       hiddenInput.value = value;
@@ -917,6 +923,11 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
     }
+    .custom-select-option-desc {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 1px;
+    }
     .custom-select-group {
       padding: 6px 8px 2px;
       font-size: 11px;
@@ -1199,7 +1210,8 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         if (options[i].dataset.value === value) {
           options[i].classList.add('selected');
           options[i].setAttribute('aria-selected', 'true');
-          textEl.textContent = options[i].textContent;
+          var labelEl = options[i].querySelector('.custom-select-option-label');
+          textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
         }
       }
       hiddenInput.value = value;
@@ -1746,6 +1758,11 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
     }
+    .custom-select-option-desc {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 1px;
+    }
     .custom-select-group {
       padding: 6px 8px 2px;
       font-size: 11px;
@@ -2028,7 +2045,8 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         if (options[i].dataset.value === value) {
           options[i].classList.add('selected');
           options[i].setAttribute('aria-selected', 'true');
-          textEl.textContent = options[i].textContent;
+          var labelEl = options[i].querySelector('.custom-select-option-label');
+          textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
         }
       }
       hiddenInput.value = value;
@@ -2575,6 +2593,11 @@ exports[`webview document shell (byte-identity guard) > highlight rule editor 1`
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
     }
+    .custom-select-option-desc {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 1px;
+    }
     .custom-select-group {
       padding: 6px 8px 2px;
       font-size: 11px;
@@ -3010,7 +3033,8 @@ DEBUG: packet sent 1024 bytes</div>
         if (options[i].dataset.value === value) {
           options[i].classList.add('selected');
           options[i].setAttribute('aria-selected', 'true');
-          textEl.textContent = options[i].textContent;
+          var labelEl = options[i].querySelector('.custom-select-option-label');
+          textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
         }
       }
       hiddenInput.value = value;
@@ -3682,6 +3706,11 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
     }
+    .custom-select-option-desc {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 1px;
+    }
     .custom-select-group {
       padding: 6px 8px 2px;
       font-size: 11px;
@@ -4122,7 +4151,8 @@ echo hi</textarea>
         if (options[i].dataset.value === value) {
           options[i].classList.add('selected');
           options[i].setAttribute('aria-selected', 'true');
-          textEl.textContent = options[i].textContent;
+          var labelEl = options[i].querySelector('.custom-select-option-label');
+          textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
         }
       }
       hiddenInput.value = value;
@@ -5044,6 +5074,11 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
     .custom-select-option.selected {
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
+    }
+    .custom-select-option-desc {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 1px;
     }
     .custom-select-group {
       padding: 6px 8px 2px;
@@ -5969,7 +6004,8 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
         if (options[i].dataset.value === value) {
           options[i].classList.add('selected');
           options[i].setAttribute('aria-selected', 'true');
-          textEl.textContent = options[i].textContent;
+          var labelEl = options[i].querySelector('.custom-select-option-label');
+          textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
         }
       }
       hiddenInput.value = value;
@@ -6517,6 +6553,11 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
     }
+    .custom-select-option-desc {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 1px;
+    }
     .custom-select-group {
       padding: 6px 8px 2px;
       font-size: 11px;
@@ -7012,7 +7053,8 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
         if (options[i].dataset.value === value) {
           options[i].classList.add('selected');
           options[i].setAttribute('aria-selected', 'true');
-          textEl.textContent = options[i].textContent;
+          var labelEl = options[i].querySelector('.custom-select-option-label');
+          textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
         }
       }
       hiddenInput.value = value;
@@ -7560,6 +7602,11 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
     }
+    .custom-select-option-desc {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 1px;
+    }
     .custom-select-group {
       padding: 6px 8px 2px;
       font-size: 11px;
@@ -8033,7 +8080,8 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
         if (options[i].dataset.value === value) {
           options[i].classList.add('selected');
           options[i].setAttribute('aria-selected', 'true');
-          textEl.textContent = options[i].textContent;
+          var labelEl = options[i].querySelector('.custom-select-option-label');
+          textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
         }
       }
       hiddenInput.value = value;

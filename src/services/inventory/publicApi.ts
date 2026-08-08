@@ -12,12 +12,27 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * registered it. An inventory source only remembers the `id` it was
  * configured against; at sync time it is handed to whichever provider
  * currently holds that `id` in the registry. If two extensions (or a
- * reinstalled/updated version of one) register the same `id`, a source
- * silently starts syncing against the new registrant — Nexus performs no
- * publisher/identity check. Because `fetchInventory`/`testConnection` receive
- * the source's decrypted secrets (e.g. API tokens) as plain arguments, only
- * register providers for ids you trust, and be aware that any extension
- * enabled in the same VS Code instance can claim an id first.
+ * reinstalled/updated version of one) register the same `id`, a source would
+ * silently start syncing against the new registrant — Nexus performs no
+ * publisher/identity check, because VS Code exposes no caller identity for
+ * `registerInventoryProvider` at all. Because `fetchInventory`/`testConnection`
+ * receive the source's decrypted secrets (e.g. API tokens) as plain
+ * arguments, only register providers for ids you trust, and be aware that
+ * any extension enabled in the same VS Code instance can claim an id first.
+ *
+ * Mitigation (honest, not a real identity check): each inventory source
+ * stores a `providerFingerprint` — a hash of the registered provider's
+ * OBSERVABLE shape (its `label` and `configFields`) taken at the moment the
+ * source was created or last edited (see `computeProviderFingerprint()` in
+ * `models/inventory.ts`). Before reading any of the source's saved
+ * credentials, `syncNow` recomputes that fingerprint against the CURRENT
+ * registrant for the source's `providerId` and, on a mismatch, shows a modal
+ * asking the user to confirm handing that registrant the saved credentials
+ * (Cancel aborts before any secret is read). This only detects that the
+ * registrant's declared shape changed — a replacement provider that happens
+ * to declare an identical label/configFields (or a user who clicks through
+ * the warning) is indistinguishable from the original. It closes the SILENT
+ * handover, not the trust boundary itself.
  */
 export interface NexusExtensionApi {
   readonly contractVersion: 1;

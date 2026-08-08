@@ -24,6 +24,7 @@ import { AsyncMutex, configMutationLock } from "../../src/services/configMutatio
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { setActiveMacroStore } from "../../src/macroSettings";
 import { passwordSecretKey, passphraseSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import type { FormDefinition, FormValues } from "../../src/ui/formTypes";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
@@ -37,6 +38,7 @@ const mockOpenTextDocument = vi.fn();
 const mockShowTextDocument = vi.fn();
 const mockReadFile = vi.fn();
 const mockWithProgress = vi.fn();
+const mockWebviewOpen = vi.fn();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -79,6 +81,62 @@ vi.mock("vscode", () => ({
   ProgressLocation: { Notification: 15 },
   QuickPickItemKind: { Separator: -1, Default: 0 }
 }));
+
+// Mirrors test/unit/inventoryCommands.test.ts's idiom for driving a
+// WebviewFormPanel-based command (editSource no longer runs a sequential
+// prompt wizard — it opens a webview form and mutates on submit): capture the
+// (formId, definition, options) triple WebviewFormPanel.open was called with,
+// and invoke onSubmit directly rather than going through a real webview.
+vi.mock("../../src/ui/webviewFormPanel", () => ({
+  WebviewFormPanel: {
+    open: (...args: unknown[]) => mockWebviewOpen(...args)
+  }
+}));
+
+interface FakePanel {
+  dispose: ReturnType<typeof vi.fn>;
+  onDidDispose: ReturnType<typeof vi.fn>;
+  addSelectOption: ReturnType<typeof vi.fn>;
+  fireDispose: () => void;
+}
+
+function makeFakePanel(): FakePanel {
+  const listeners: Array<() => void> = [];
+  return {
+    dispose: vi.fn(),
+    onDidDispose: vi.fn((listener: () => void) => {
+      listeners.push(listener);
+      return { dispose: vi.fn() };
+    }),
+    addSelectOption: vi.fn(),
+    fireDispose: () => {
+      for (const listener of listeners) listener();
+    }
+  };
+}
+
+function latestFormCall(): {
+  formId: string;
+  definition: FormDefinition;
+  panel: FakePanel;
+  onSubmit: (values: FormValues) => Promise<void>;
+  onTest?: (values: FormValues) => Promise<void>;
+} {
+  const call = mockWebviewOpen.mock.results.at(-1);
+  const callArgs = mockWebviewOpen.mock.calls.at(-1);
+  expect(callArgs).toBeDefined();
+  const handlers = callArgs![2] as {
+    onSubmit: (values: FormValues) => Promise<void>;
+    onTest?: (values: FormValues) => Promise<void>;
+  };
+  return {
+    formId: callArgs![0] as string,
+    definition: callArgs![1] as FormDefinition,
+    panel: call!.value as FakePanel,
+    onSubmit: handlers.onSubmit,
+    onTest: handlers.onTest
+  };
+}
 
 function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProvider {
   return {
@@ -133,6 +191,7 @@ describe("configMutationLock — real call-site serialization", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
+    mockWebviewOpen.mockImplementation(() => makeFakePanel());
     const store = new InMemoryMacroStore();
     await store.initialize();
     setActiveMacroStore(store);
@@ -379,25 +438,30 @@ describe("configMutationLock — real call-site serialization", () => {
       await delay(10);
       expect(events).toEqual(["capture:start"]);
 
-      // Now attempt a full editSource mutation that renames the source AND
-      // rotates its token — while the capture is still mid-flight. Mirrors
-      // the exact prompt sequence editSource issues for a single registered
-      // source with this provider's two config fields (host, apiToken).
-      mockShowInputBox
-        .mockResolvedValueOnce("Renamed Source") // name
-        .mockResolvedValueOnce("Infra") // targetFolder
-        .mockResolvedValueOnce("admin") // defaultUsername
-        .mockResolvedValueOnce("netbox.local") // host
-        .mockResolvedValueOnce("new-token"); // apiToken — rotated
-      mockShowQuickPick.mockResolvedValueOnce({ value: "orphan" }); // prunePolicy
-
+      // Now open editSource's form and submit it with values that rename the
+      // source AND rotate its token — while the capture is still mid-flight.
+      // editSource no longer runs a sequential prompt wizard: it opens a
+      // webview form (pickInventorySource auto-selects the single registered
+      // source, no UI) and only touches configMutationLock once onSubmit
+      // runs — mirrors test/unit/inventoryCommands.test.ts's WebviewFormPanel
+      // entry point.
       const editCmd = registeredCommands.get("nexus.inventory.editSource")!;
-      const editPromise = editCmd();
+      await editCmd();
+      const { onSubmit } = latestFormCall();
 
-      // Give editSource's UI-only prefix (prompts + testConnection, none of
-      // which touch configMutationLock) time to run all the way up to its
-      // own runExclusive call — it must queue there, not run its store
-      // ahead of the still-in-flight capture.
+      const editPromise = onSubmit({
+        name: "Renamed Source",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "new-token" // rotated
+      });
+
+      // Give onSubmit's UI-only prefix (form-value parsing, none of which
+      // touches configMutationLock since targetFolder is non-blank here) time
+      // to run all the way up to its own runExclusive call — it must queue
+      // there, not run its store ahead of the still-in-flight capture.
       await delay(10);
       expect(events).toEqual(["capture:start"]);
       expect(core.getInventorySource("src-1")?.name).toBe("NetBox");
@@ -484,9 +548,14 @@ describe("configMutationLock — real call-site serialization", () => {
       registerConfigCommands(core, vault);
       await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete", secretFieldIds: ["apiToken"] }));
 
-      // Same call-ordering spy as the tests above.
+      // Same call-ordering spy as the tests above. A third label ("restamp")
+      // is included because this source has no `providerFingerprint` yet
+      // (ITEM A) — syncNow stamps one silently after its first successful
+      // sync, via its own SEPARATE, non-nested configMutationLock
+      // acquisition taken after the sync's own "syncNow" span has already
+      // resolved (see restampProviderFingerprintBestEffort's doc).
       const events: string[] = [];
-      const labels = ["capture", "syncNow"];
+      const labels = ["capture", "syncNow", "restamp"];
       let nextLabel = 0;
       const realRunExclusive = AsyncMutex.prototype.runExclusive;
       vi.spyOn(configMutationLock, "runExclusive").mockImplementation(function (
@@ -535,7 +604,12 @@ describe("configMutationLock — real call-site serialization", () => {
       const captured = await capturePromise;
       await syncPromise;
 
-      expect(events).toEqual(["capture:start", "capture:end", "syncNow:start", "syncNow:end"]);
+      // ITEM A — the trailing "restamp" span is a SEPARATE, later lock
+      // acquisition (the sync's own "syncNow" span has already fully
+      // resolved by the time it starts) — it never overlaps or reorders
+      // relative to "syncNow:end", which is what this sequence assertion
+      // actually guards.
+      expect(events).toEqual(["capture:start", "capture:end", "syncNow:start", "syncNow:end", "restamp:start", "restamp:end"]);
 
       // The captured pair is CONSISTENT: the server record captured is the
       // pre-sync one (still owning its origin), and the password captured

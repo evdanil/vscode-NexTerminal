@@ -2817,6 +2817,127 @@ describe("backup import", () => {
     expect(configStore.get("nexus.scripts.path")).toBe("/tmp/redirected-scripts");
     expect((mockWriteFile.mock.calls[0][0] as { fsPath: string }).fsPath).toBe("/workspace/.nexus/scripts/hello.js");
   });
+
+  it("merge-mode import does not overwrite a retained server's vault password with the backup's; a newly-imported server's password still restores; replace mode restores everything (kills restoreSecrets()'s pre-fix unconditional write)", async () => {
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    // A local server "s1" already exists, with its own working vault password.
+    await core.addOrUpdateServer(makeServer({ id: "s1", name: "Local Server" }));
+    await vault.store("password-s1", "local-pw");
+
+    // Backup carries the SAME server id (s1, with a different password — simulating a stale
+    // backup) plus a server that doesn't exist locally yet (s2).
+    const secrets = {
+      passwords: { s1: "backup-pw", s2: "new-pw" },
+      passphrases: {}
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [
+        makeServer({ id: "s1", name: "Backup Server" }),
+        makeServer({ id: "s2", name: "New Server" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      encryptedSecrets
+    };
+
+    // --- Merge mode: importPreservingIds skips s1 (id already exists locally) and imports s2
+    // (new). The secret restore must follow the same split: s1's vault password is left alone,
+    // s2's is restored.
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getServer("s1")?.name).toBe("Local Server"); // config retained
+    expect(await vault.get("password-s1")).toBe("local-pw"); // secret NOT overwritten
+    expect(await vault.get("password-s2")).toBe("new-pw"); // newly-imported server restored
+
+    // --- Replace mode: the existing s1 is removed and every backup server (re)imported — both
+    // s1 and s2 land in importedIds and both secrets restore — s1's password IS overwritten.
+    registeredCommands.clear();
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1");
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    registerConfigCommands(core, vault);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getServer("s1")?.name).toBe("Backup Server");
+    expect(await vault.get("password-s1")).toBe("backup-pw");
+    expect(await vault.get("password-s2")).toBe("new-pw");
+  });
+
+  it("merge-mode import does not overwrite a retained auth profile's vault password with the backup's; a newly-imported profile's password still restores; replace mode restores everything (kills restoreSecrets()'s pre-fix unconditional write)", async () => {
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    // A local auth profile "ap1" already exists, with its own working vault password.
+    await core.addOrUpdateAuthProfile(makeAuthProfile({ id: "ap1", name: "Local Profile" }));
+    await vault.store("auth-profile-password-ap1", "local-pw");
+
+    // Backup carries the SAME profile id (ap1, with a different password) plus a profile that
+    // doesn't exist locally yet (ap2).
+    const secrets = {
+      passwords: {},
+      passphrases: {},
+      authProfilePasswords: { ap1: "backup-pw", ap2: "new-pw" }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [
+        makeAuthProfile({ id: "ap1", name: "Backup Profile" }),
+        makeAuthProfile({ id: "ap2", name: "New Profile" })
+      ],
+      encryptedSecrets
+    };
+
+    // --- Merge mode: importPreservingIds skips ap1 (id already exists locally) and imports
+    // ap2 (new). The secret restore must follow the same split: ap1's vault password is left
+    // alone, ap2's is restored.
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getSnapshot().authProfiles.find((p) => p.id === "ap1")?.name).toBe("Local Profile"); // config retained
+    expect(await vault.get("auth-profile-password-ap1")).toBe("local-pw"); // secret NOT overwritten
+    expect(await vault.get("auth-profile-password-ap2")).toBe("new-pw"); // newly-imported profile restored
+
+    // --- Replace mode: the existing ap1 is removed and every backup profile (re)imported —
+    // both ap1 and ap2 land in importedIds and both secrets restore — ap1's password IS
+    // overwritten.
+    registeredCommands.clear();
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/merge.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1");
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    registerConfigCommands(core, vault);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getSnapshot().authProfiles.find((p) => p.id === "ap1")?.name).toBe("Backup Profile");
+    expect(await vault.get("auth-profile-password-ap1")).toBe("backup-pw");
+    expect(await vault.get("auth-profile-password-ap2")).toBe("new-pw");
+  });
 });
 
 describe("share import", () => {
@@ -4805,6 +4926,151 @@ describe("backup export round-trip", () => {
     await registeredCommands.get("nexus.config.import")!();
 
     expect(core.getInventorySource("src1")?.name).toBe("Incoming Name From Backup");
+  });
+
+  it("REVIEW FINDING 2 (P2, imported managedFolders are untrusted) — a backup-imported inventory source has managedFolders stripped at the import boundary, and a later sync re-accumulates ownership normally (kills passthrough)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // A backup carries a source whose managedFolders names a folder it never
+    // actually created on THIS machine — e.g. hand-edited, copied from
+    // another machine's tree, or simply stale. Without the strip, this would
+    // hand the imported source GC authority over "Manual/Staging" and the
+    // very next sync could delete it.
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ managedFolders: ["Manual/Staging"] })]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/untrusted-managed-folders.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    // KILLS PASSTHROUGH: under a wrong implementation that hands the
+    // validated record straight to core.addOrUpdateInventorySource, this
+    // would be ["Manual/Staging"] — the imported source would already own a
+    // folder it never created, ready to be swept on its next sync.
+    expect(core.getInventorySource("src1")?.managedFolders).toBeUndefined();
+
+    // The imported record is otherwise intact (only managedFolders is
+    // stripped — the strip must not silently drop the whole source).
+    expect(core.getInventorySource("src1")?.name).toBe("NetBox");
+    expect(core.getInventorySource("src1")?.targetFolder).toBe("NetBox");
+
+    // Re-accumulation path: the imported source's very next sync CREATES a
+    // folder and must record ownership of it exactly as any other
+    // never-synced source would (see nexusCoreInventory.test.ts's "(legacy
+    // source)" case for the underlying mechanism) — the strip is not a
+    // permanent handicap, ownership simply re-builds from what this source
+    // itself creates going forward.
+    const device: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "src1", externalId: "device:1", syncedAt: 1 }
+    };
+    await core.applyInventorySyncPlan({
+      sourceId: "src1",
+      syncedAt: 1,
+      upsertServers: [device],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("src1")!
+    });
+    expect(core.getInventorySource("src1")?.managedFolders).toEqual(["NetBox/RackA"]);
+  });
+
+  it("ROUND (validate-before-strip) FINDING — a backup source with a malformed managedFolders (null) is sanitized BEFORE validation, not rejected by it, so replace mode still imports the source and restores its secret (kills validate-before-strip rejection)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // A local source "src1" already exists locally, with its own working vault secret —
+    // exactly the destructive replace-mode scenario: by the time importPreservingIds runs,
+    // this local record and its vault secret have ALREADY been cleared (see the replace-mode
+    // wipe in importMergeReplaceLocked), so if the backup's source is wrongly rejected, it is
+    // gone for good — nothing to fall back to.
+    await core.addOrUpdateInventorySource(makeInventorySource({ name: "Local NetBox" }));
+    await vault.store(inventorySecretKey("src1", "apiToken"), "local-token");
+    registerConfigCommands(core, vault);
+
+    // The backup's source is otherwise perfectly valid EXCEPT managedFolders is `null` — not
+    // the documented shape (absent, or string[]), but untrusted GC bookkeeping a hand-edited or
+    // version-skewed backup can carry in any shape. Under the wrong implementation (strip inside
+    // importPreservingIds's `add` callback, which only runs once validateInventorySource has
+    // already passed) this fails the shape check and importPreservingIds skips the ENTIRE
+    // source — id, config, defaultUsername and all — not just the untrusted field.
+    const malformedSource = {
+      ...makeInventorySource({ name: "Backup NetBox" }),
+      managedFolders: null
+    } as unknown as InventorySourceConfig;
+    const secrets = {
+      inventorySourceSecrets: {
+        src1: { apiToken: "backup-token" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [malformedSource],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/malformed-managed-folders.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    // KILLS VALIDATE-BEFORE-STRIP: under the wrong implementation this source never lands —
+    // core.getInventorySource("src1") would be undefined (rejected by validateInventorySource,
+    // and the prior local record was already removed by the replace-mode wipe above it).
+    expect(core.getInventorySource("src1")?.name).toBe("Backup NetBox");
+    // The malformed field itself must not survive the sanitize — deleted regardless of its
+    // (invalid) type, not merely "left null" on the persisted record.
+    expect(core.getInventorySource("src1")?.managedFolders).toBeUndefined();
+    // The rest of the record is untouched by the sanitize.
+    expect(core.getInventorySource("src1")?.targetFolder).toBe("NetBox");
+    // The secret restore loop scopes to importedIds — under the wrong implementation src1 never
+    // lands in importedIds (validateInventorySource rejected it), so this would be undefined,
+    // and the destructive part: the OLD local secret ("local-token") is already gone too, since
+    // replace mode deletes it unconditionally before import runs. A validate-before-strip
+    // rejection here is a silent, permanent credential loss.
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("backup-token");
   });
 
   it("merge-mode import does not overwrite a retained source's vault secret with the backup's; a newly-imported source's secret still restores; replace mode restores everything", async () => {

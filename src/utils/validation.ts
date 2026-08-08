@@ -134,6 +134,36 @@ export function validateInventorySource(item: unknown): item is InventorySourceC
   if (obj.revision !== undefined && !isNonEmptyString(obj.revision)) {
     return false;
   }
+  // ITEM A (provider trust fingerprint) — optional for backward compat, same
+  // reasoning as `revision` above: a source saved before this field existed
+  // simply has none. When present it must be a non-empty string.
+  if (obj.providerFingerprint !== undefined && !isNonEmptyString(obj.providerFingerprint)) {
+    return false;
+  }
+  // REVIEW FINDING 1 (P2, folder-GC ownership) — optional for backward
+  // compat, same reasoning as `revision`/`providerFingerprint` above: a
+  // record persisted before this field existed (or one that has never
+  // completed a sync) simply has none. When present, every entry must be a
+  // string (folder paths — not otherwise validated here, mirroring
+  // `secretFieldIds` just above; applyInventorySyncPlan only ever writes
+  // paths it itself normalized).
+  //
+  // REVIEW FINDING 2 (P2, imported managedFolders are untrusted) —
+  // deliberately a SHAPE check only, same as every other field here. This
+  // function also guards ordinary storage-layer loads of the extension's OWN
+  // persisted state (VscodeConfigRepository), where `managedFolders` genuinely
+  // IS trusted (this extension is the only writer), so it must stay
+  // permissive. Backup-imported records are a DIFFERENT trust boundary — see
+  // `sanitizeImportedInventorySources` in configCommands.ts, which strips the
+  // field entirely from the backup payload BEFORE it ever reaches this
+  // function (not after — a malformed value, e.g. `null` or a mixed-type
+  // array, would otherwise fail this shape check and reject the entire
+  // source, not just the untrusted field) — do NOT "fix" untrusted ownership
+  // metadata here; that would also strip it from legitimate storage-layer
+  // loads, which must keep it.
+  if (obj.managedFolders !== undefined && (!Array.isArray(obj.managedFolders) || !obj.managedFolders.every((v) => typeof v === "string"))) {
+    return false;
+  }
   return true;
 }
 

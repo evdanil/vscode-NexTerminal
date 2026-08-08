@@ -155,6 +155,11 @@ export function baseWebviewCss(): string {
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
     }
+    .custom-select-option-desc {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 1px;
+    }
     .custom-select-group {
       padding: 6px 8px 2px;
       font-size: 11px;

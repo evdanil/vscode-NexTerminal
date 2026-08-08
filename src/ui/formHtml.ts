@@ -75,12 +75,14 @@ function renderField(field: FormFieldDescriptor): string {
   <div class="field-error" id="error-${key}"></div>
 </div>`;
 
-    case "number":
+    case "number": {
+      const step = field.step !== undefined ? ` step="${field.step}"` : "";
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
-  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />${renderHint(field)}
+  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}"${step} placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
+    }
 
     case "select": {
       const selectedOpt = field.options.find((opt) => opt.value === field.value) ?? field.options[0];
@@ -88,7 +90,10 @@ function renderField(field: FormFieldDescriptor): string {
       const selectedValue = field.value ?? field.options[0]?.value ?? "";
       const autofillAttr = field.autofill ? ' data-autofill="true"' : "";
       const optionsHtml = field.options.map((opt) =>
-        `<div class="custom-select-option${opt.value === selectedValue ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}</div>`
+        `<div class="custom-select-option${opt.value === selectedValue ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">` +
+        `<div class="custom-select-option-label">${escapeHtml(opt.label)}</div>` +
+        (opt.description ? `<div class="custom-select-option-desc">${escapeHtml(opt.description)}</div>` : "") +
+        `</div>`
       ).join("\n      ");
       return `<div class="form-group"${vw}>
   <label>${escapeHtml(field.label)}</label>

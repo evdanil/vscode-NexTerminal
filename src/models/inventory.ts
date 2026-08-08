@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export const INVENTORY_CONTRACT_VERSION = 1 as const;
 
@@ -95,6 +95,83 @@ export interface InventorySourceConfig {
   // See sourceConfigUnchanged() below for how this decides identity once
   // both sides being compared have one.
   revision?: string;
+  // ITEM A (provider trust fingerprint) — a stable hash of the PROVIDER's
+  // observable shape (label + ordered configFields) at the moment this
+  // source was last saved (addSource) or edited (editSource), computed by
+  // computeProviderFingerprint() below. VS Code exposes no caller identity
+  // for `registerInventoryProvider` (see publicApi.ts's trust-model doc), so
+  // this cannot prove WHICH extension is answering to `providerId` — only
+  // that the currently-registered provider's declared shape still looks like
+  // the one the user last knowingly configured. syncNow compares this
+  // against computeProviderFingerprint(currentRegistrant) before reading any
+  // vault secret for the source; a mismatch means the id was re-registered
+  // (by an update, or by a different extension entirely) with a materially
+  // different provider since, and the user is asked to confirm handing that
+  // registrant the saved credentials. Optional for backward compatibility —
+  // a source saved before this field existed has none; syncNow stamps it
+  // silently on that source's first successful sync afterward (nothing to
+  // compare it against yet, so no warning is shown).
+  providerFingerprint?: string;
+  // REVIEW FINDING 1 (P2, folder-GC ownership) — the folder paths (strictly
+  // under `targetFolder`, ancestors included) that THIS source's own syncs
+  // have created/used, as of the most recent `applyInventorySyncPlan` call
+  // (non-"absent" mode only). Recomputed and overwritten wholesale on every
+  // such apply — it is a snapshot of "what this sync's own `folders` list
+  // named", not an accumulating history — so a folder this source stops
+  // naming (e.g. a renamed rack) drops out of the set on the very sync that
+  // stops naming it, making it eligible for GC on that same pass.
+  //
+  // Exists so `pruneEmptyFoldersUnderTarget` can tell "a folder THIS source
+  // created and then abandoned" (safe to GC when empty) apart from "a folder
+  // that happens to be empty right now" (never safe to GC on that basis
+  // alone — it could be a manually-created folder the user deliberately
+  // keeps empty, like a staging area, or a folder owned by a DIFFERENT
+  // source under the same targetFolder). Only paths ever present in a
+  // source's own `managedFolders` are GC candidates for that source; an
+  // explicit folder never named by any of this source's applies is never
+  // touched, however empty it is.
+  //
+  // Optional for backward compatibility: a source record persisted before
+  // this field existed (or one that has simply never completed a
+  // non-"absent" apply) has none. `applyInventorySyncPlan` treats a missing
+  // `managedFolders` as an empty set for the purpose of computing GC
+  // candidates — so a legacy/first sync stamps the set for the first time
+  // but removes NOTHING as a side effect of that stamping (there is no prior
+  // set to diff against yet). removeSource deletes the source record
+  // wholesale, so `managedFolders` dies with it — any folders it names are
+  // left behind, exactly like the rest of the source's bookkeeping (this
+  // mirrors the already-documented behavior of leaving synced servers'
+  // folders alone on source removal).
+  managedFolders?: string[];
+}
+
+/**
+ * ITEM A (provider trust fingerprint) — pure hash over exactly the provider
+ * shape a user can actually SEE and reason about when they configured a
+ * source: its label and its configFields' (id, label, type, required),
+ * in the provider's own declared order. Deliberately excludes
+ * testConnection/fetchInventory (functions — not hashable, and not what the
+ * user "configured against") and `id` itself (the fingerprint's whole
+ * purpose is to detect a DIFFERENT provider answering to the SAME id; hashing
+ * the id would make every mismatch invisible). No `vscode` import — callable
+ * from models/ and safe for both the command layer and tests.
+ *
+ * sha256, hex-encoded, truncated to the first 16 characters — this is a
+ * drift-detection fingerprint, not a security credential, so collision
+ * resistance at full sha256 strength is unnecessary; 16 hex chars (64 bits)
+ * is already far more than this UI-facing comparison needs.
+ */
+export function computeProviderFingerprint(provider: Pick<InventoryProvider, "label" | "configFields">): string {
+  const shape = {
+    label: provider.label,
+    configFields: provider.configFields.map((field) => ({
+      id: field.id,
+      label: field.label,
+      type: field.type,
+      required: field.required === true
+    }))
+  };
+  return createHash("sha256").update(JSON.stringify(shape)).digest("hex").slice(0, 16);
 }
 
 /**

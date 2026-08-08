@@ -22,7 +22,8 @@ export function baseWebviewJs(): string {
         if (options[i].dataset.value === value) {
           options[i].classList.add('selected');
           options[i].setAttribute('aria-selected', 'true');
-          textEl.textContent = options[i].textContent;
+          var labelEl = options[i].querySelector('.custom-select-option-label');
+          textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
         }
       }
       hiddenInput.value = value;

@@ -1,5 +1,7 @@
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
 import { resolveTunnelType } from "../models/config";
+import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues } from "../models/inventory";
+import { ORPHAN_FOLDER_NAME } from "../services/inventory/syncEngine";
 import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
@@ -577,6 +579,164 @@ export function unifiedProfileFormDefinition(
       ...serialFields(undefined, serialVw),
       ...localShellFields(undefined, localShellVw, localShellOptions),
       ...sharedFields
+    ]
+  };
+}
+
+/**
+ * F2 — every provider-declared field's FORM key (never its `field.id`
+ * itself — that stays the raw key used in InventorySourceValues/Secrets and
+ * the vault) is prefixed so it can never collide with a reserved top-level
+ * source field key ("name", "targetFolder", "defaultUsername",
+ * "prunePolicy"). A provider whose configFields include e.g. `{ id: "name" }`
+ * previously clobbered whichever of the two — the source's own Name field or
+ * the provider's "name" config value — happened to be assigned last into the
+ * single flat FormValues object; there was no way for both to coexist.
+ * inventoryConfigFieldPrefixedKey is the one shared mapping both this
+ * descriptor (writing the form key) and inventoryCommands.ts's
+ * formValuesToProviderConfig (reading it back, then writing the VALUE under
+ * the unprefixed `field.id` into config/secrets) call, so the two stay in
+ * sync by construction rather than by convention.
+ */
+export function inventoryConfigFieldPrefixedKey(fieldId: string): string {
+  return `cfg_${fieldId}`;
+}
+
+/**
+ * Maps one provider-declared InventoryConfigField to a form field descriptor.
+ * `existingSecretFieldIds` (edit mode only) marks which password fields
+ * already have a saved vault value: those become optional in the form (blank
+ * means "keep the saved value", mirroring the placeholder text) even when the
+ * provider itself declares the field required — required-ness for a NEW
+ * value only applies when there's nothing saved yet to fall back on.
+ */
+function inventoryConfigFieldDescriptor(
+  field: InventoryConfigField,
+  existingConfig: InventorySourceValues,
+  existingSecretFieldIds: ReadonlySet<string>
+): FormFieldDescriptor {
+  const key = inventoryConfigFieldPrefixedKey(field.id);
+  if (field.type === "password") {
+    const hasSaved = existingSecretFieldIds.has(field.id);
+    return {
+      type: "password",
+      key,
+      label: field.label,
+      required: field.required && !hasSaved,
+      placeholder: hasSaved ? "Leave empty to keep the saved value" : field.placeholder,
+      hint: field.description
+    };
+  }
+  if (field.type === "boolean") {
+    return {
+      type: "checkbox",
+      key,
+      label: field.label,
+      value: existingConfig[field.id] === true,
+      hint: field.description
+    };
+  }
+  if (field.type === "number") {
+    const existing = existingConfig[field.id];
+    return {
+      type: "number",
+      key,
+      label: field.label,
+      required: field.required,
+      // The provider contract (`InventoryConfigField`) has no integer
+      // constraint — providers may store fractional values (e.g. a 0.5-second
+      // poll interval). `step: "any"` disables the browser's default
+      // step="1" native validation, which otherwise silently blocks Save
+      // (including on reopening a source that already has a fractional value
+      // saved) with no visible error.
+      step: "any",
+      placeholder: field.placeholder,
+      value: typeof existing === "number" ? existing : undefined,
+      hint: field.description
+    };
+  }
+  const existing = existingConfig[field.id];
+  return {
+    type: "text",
+    key,
+    label: field.label,
+    required: field.required,
+    placeholder: field.placeholder,
+    value: existing !== undefined ? String(existing) : "",
+    hint: field.description
+  };
+}
+
+/**
+ * Add/Edit Inventory Source form. Collection-only — every persistence
+ * decision (vault-first secret storage, drift guards, stale-key cleanup,
+ * secret hydration for kept values, testConnection plumbing) lives in
+ * inventoryCommands.ts's onSubmit/onTest closures, which call the same
+ * shared critical-section functions the old sequential-prompt wizard used to
+ * call after its last prompt resolved.
+ *
+ * `defaultUsernameSeed` is only consulted on Add (mostCommonUsername from the
+ * caller); Edit always prefills from `seed.defaultUsername`.
+ */
+export function inventorySourceFormDefinition(
+  provider: InventoryProvider,
+  seed?: InventorySourceConfig,
+  defaultUsernameSeed?: string
+): FormDefinition {
+  const isEdit = Boolean(seed);
+  const existingSecretFieldIds = new Set(seed?.secretFieldIds ?? []);
+  const existingConfig = seed?.config ?? {};
+
+  return {
+    title: `${isEdit ? "Edit" : "Add"} Inventory Source (${provider.label})`,
+    testable: true,
+    fields: [
+      { type: "text", key: "name", label: "Name", required: true, value: seed?.name ?? provider.label },
+      {
+        type: "text",
+        key: "targetFolder",
+        label: "Target Folder",
+        placeholder: "e.g. Datacenter/NetBox — leave empty for the top level",
+        value: seed?.targetFolder ?? "",
+        hint: "Servers synced from this source are placed under this folder. Leave empty for the top level."
+      },
+      {
+        type: "text",
+        key: "defaultUsername",
+        label: "Default SSH Username",
+        required: true,
+        value: seed?.defaultUsername ?? defaultUsernameSeed ?? "",
+        hint: "Used when the inventory source doesn't provide a username."
+      },
+      {
+        type: "select",
+        key: "prunePolicy",
+        label: "Removed-Device Policy",
+        // NIT — the old sequential-prompt wizard could show the FULL
+        // destination path (`${targetFolder}/${ORPHAN_FOLDER_NAME}`) because
+        // it prompted for Target Folder and this policy as two separate,
+        // ordered steps and could read the just-entered folder back. Here
+        // both live as sibling fields in one static form descriptor built
+        // once at open time — Target Folder is itself just another field the
+        // user can still edit after this descriptor is built, so recomputing
+        // "${liveTargetFolder}/${ORPHAN_FOLDER_NAME}" here would either go
+        // stale the moment the user retypes Target Folder, or require wiring
+        // a live cross-field recompute into the (currently static) option
+        // list — disproportionate for a label. Chosen instead: wording that
+        // stays true regardless of what Target Folder currently holds.
+        options: [
+          {
+            label: `Move to the source's "${ORPHAN_FOLDER_NAME}" subfolder`,
+            value: "orphan",
+            description: "Recommended — keeps synced settings if the device returns"
+          },
+          { label: "Delete", value: "delete", description: "Removes the server and its saved credentials" },
+          { label: "Keep", value: "keep", description: "Leaves the server where it is" }
+        ],
+        value: seed?.prunePolicy ?? "orphan",
+        hint: "What should happen when a device disappears from the source."
+      },
+      ...provider.configFields.map((field) => inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds))
     ]
   };
 }
