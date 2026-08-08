@@ -1038,15 +1038,26 @@ export class NexusCore {
       // either erase the concurrent edit or keep the rejected batch write —
       // see REVIEW FINDING 1 below for the merge that replaces the old
       // skip-whole-record behavior in the UPDATE case.
+      //
+      // GROUP-REMAP (P2) — records this batch DELETED are not re-inserted
+      // here; they are collected and re-inserted AFTER the folder-restore
+      // pass below, because the folder chain their `group` points at has to
+      // be judged against the tree as it stands once every other rollback
+      // step has run. Nothing between here and there reads `this.servers`
+      // (the folder-restore pass looks only at `explicitGroups`), and the
+      // whole block is synchronous, so deferring is behavior-neutral for
+      // every other participant.
+      const pendingRemovedServerRestores: Array<[string, ServerConfig]> = [];
       for (const [id, priorServer] of priorServers) {
         const batchSnapshot = batchWrittenServers.get(id);
         const current = this.servers.get(id);
         if (batchSnapshot === undefined) {
           // This batch deleted the record. Restore it only if nothing has
           // recreated it since (current still absent) — a concurrent
-          // recreation is left alone entirely.
-          if (current === undefined && priorServer) {
-            this.servers.set(id, priorServer);
+          // recreation is left alone entirely. Presence is re-checked at the
+          // deferred re-insert below, which is where the restore happens.
+          if (priorServer) {
+            pendingRemovedServerRestores.push([id, priorServer]);
           }
           continue;
         }
@@ -1155,6 +1166,125 @@ export class NexusCore {
           continue; // (b) the chain this path hung off no longer exists — do not resurrect an orphan.
         }
         this.explicitGroups.add(group);
+      }
+      // GROUP-REMAP — the parent-chain guard above protects EXPLICIT folder
+      // entries only, but the Connection Hub derives a folder from every
+      // `server.group` prefix as well (see NexusTreeProvider.computeFolderCache:
+      // explicit groups AND every item group contribute ancestors), so a
+      // removed server restored with its old `group` resurrects that whole
+      // path just as surely as re-adding the explicit entry would. The exact
+      // hole: delete-prune removes the last server in the managed folder
+      // "NetBox/RackA"; while the persist is pending the user renames
+      // "NetBox" -> "Lab" (the rename cannot touch the removed server — it is
+      // not in the map at that moment); the persist then fails and the
+      // restore puts the server back with group "NetBox/RackA", re-deriving
+      // the stale "NetBox" branch the folder-entry guard just refused to
+      // re-add.
+      //
+      // The server itself must ALWAYS come back — dropping it would be data
+      // loss, and this batch is supposed to have had NO effect. So the group
+      // is REMAPPED instead: onto the deepest still-existing folder on its
+      // own chain, or to the root when none of it survived.
+      //
+      // `survivingFolderPaths` is the folder tree as it stands at this exact
+      // point of the rollback (ancestor-closed, exactly how the tree derives
+      // it): explicit groups AFTER the guarded restore pass above (so a
+      // folder that pass legitimately put back counts as surviving), plus
+      // every ancestor chain of the groups of the records currently in the
+      // maps — servers as the server-rollback loop above left them, and
+      // serial / local-shell profiles, which this batch never touches but
+      // which keep a folder just as alive as a server does (same three
+      // record types pruneEmptyFoldersUnderTarget counts as occupants).
+      //
+      // ORDER — the removed servers themselves are NOT in that initial set
+      // (this batch deleted them and they have not been re-inserted yet), and
+      // that is the deliberate choice: a removed server may never vouch for
+      // another removed server's chain, otherwise two servers pruned out of
+      // the same concurrently-renamed folder would each certify the other's
+      // stale path and the guard would evaporate exactly when it is needed.
+      // What a restored server DOES contribute is its FINAL group — the
+      // original one when it was judged sound, the remapped one otherwise —
+      // so restores are processed shallowest-group-first (ties broken by id,
+      // for a fully deterministic outcome): a parent-level server restored
+      // into a surviving chain then legitimately extends the tree for its
+      // deeper siblings, while a stale chain never enters the set at all.
+      //
+      // LEAF EXEMPTION — only the STRICT ancestors of a group have to
+      // survive; the deepest segment itself may be absent. That mirrors the
+      // folder pass above (a child is restorable into a surviving parent) and
+      // is what keeps the ordinary case unchanged: the removed server was
+      // usually the last occupant of its own folder, so its leaf path is
+      // gone precisely BECAUSE of this batch — restoring the server merely
+      // re-derives its own folder. A root-level (single-segment) group has no
+      // ancestors to judge at all and is likewise always restored as-is —
+      // same rule the folder pass applies to a `parentPath` of undefined.
+      //
+      // RESIDUAL (documented, inherited from the folder pass) — a concurrent
+      // rename of the LEAF segment alone, or one that happens to leave an
+      // identically-named ancestor behind, is indistinguishable here from
+      // "the chain still exists" and the restore proceeds unchanged. The
+      // realistic case this guards is an ancestor that is verifiably gone.
+      const survivingFolderPaths = new Set<string>();
+      const addSurvivingFolderChain = (group: string | undefined): void => {
+        if (!group) {
+          return;
+        }
+        for (const ancestor of getAncestorPaths(group)) {
+          survivingFolderPaths.add(ancestor);
+        }
+      };
+      for (const group of this.explicitGroups) {
+        addSurvivingFolderChain(group);
+      }
+      for (const server of this.servers.values()) {
+        addSurvivingFolderChain(server.group);
+      }
+      for (const profile of this.serialProfiles.values()) {
+        addSurvivingFolderChain(profile.group);
+      }
+      for (const profile of this.localShellProfiles.values()) {
+        addSurvivingFolderChain(profile.group);
+      }
+      const orderedRemovedServerRestores = [...pendingRemovedServerRestores].sort(
+        ([idA, serverA], [idB, serverB]) => {
+          const depthA = serverA.group ? serverA.group.split("/").length : 0;
+          const depthB = serverB.group ? serverB.group.split("/").length : 0;
+          return depthA !== depthB ? depthA - depthB : idA.localeCompare(idB);
+        }
+      );
+      for (const [id, priorServer] of orderedRemovedServerRestores) {
+        if (this.servers.get(id) !== undefined) {
+          continue; // something concurrent recreated this record — leave theirs.
+        }
+        const group = priorServer.group;
+        const parent = group === undefined ? undefined : parentPath(group);
+        if (group === undefined || parent === undefined || survivingFolderPaths.has(parent)) {
+          // Sound chain (or nothing to judge): restore the captured pre-batch
+          // record itself, byte-for-byte, exactly as before this fix.
+          this.servers.set(id, priorServer);
+          addSurvivingFolderChain(group);
+          continue;
+        }
+        // The chain is stale: walk up to the deepest ancestor that still
+        // exists (the set is ancestor-closed, so the first hit going up is
+        // the longest surviving prefix); `undefined` — the codebase's
+        // representation of "no folder", see _renameFolderPath's own
+        // root-remap — when none of it survived.
+        const ancestors = getAncestorPaths(group);
+        let remappedGroup: string | undefined;
+        for (let i = ancestors.length - 2; i >= 0; i--) {
+          if (survivingFolderPaths.has(ancestors[i])) {
+            remappedGroup = ancestors[i];
+            break;
+          }
+        }
+        // Mutate a DETACHED clone only: `priorServer` is the pre-batch record
+        // captured by reference, and other rollback branches (and any
+        // concurrent holder) must never see a group this pass invented.
+        const restored = cloneServerConfig(priorServer);
+        restored.group = remappedGroup;
+        this.servers.set(id, restored);
+        addSurvivingFolderChain(remappedGroup);
       }
       // TOMBSTONE — a captured session that was genuinely torn down by
       // unregisterSession during the awaited persist (window opened just

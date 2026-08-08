@@ -1943,6 +1943,219 @@ describe("applyInventorySyncPlan — empty-folder GC (ITEM B)", () => {
     expect(groups.filter((g) => g === "NetBox/RackA")).toHaveLength(1);
     expect(groups).toContain("NetBox/RackA");
   });
+
+  // Every folder path the Connection Hub would render, derived exactly the way
+  // NexusTreeProvider.computeFolderCache derives it: explicit groups PLUS every
+  // ancestor of every item's `group`. A restored server's group resurrects a
+  // folder here just as surely as an explicit entry does — which is the whole
+  // point of the GROUP-REMAP tests below.
+  function derivedFolderPaths(core: NexusCore): string[] {
+    const snapshot = core.getSnapshot();
+    const paths = new Set<string>();
+    const addChain = (group: string | undefined): void => {
+      if (!group) {
+        return;
+      }
+      const segments = group.split("/");
+      for (let i = 0; i < segments.length; i++) {
+        paths.add(segments.slice(0, i + 1).join("/"));
+      }
+    };
+    for (const group of snapshot.explicitGroups) {
+      addChain(group);
+    }
+    for (const server of snapshot.servers) {
+      addChain(server.group);
+    }
+    for (const profile of snapshot.serialProfiles) {
+      addChain(profile.group);
+    }
+    for (const profile of snapshot.localShellProfiles) {
+      addChain(profile.group);
+    }
+    return [...paths];
+  }
+
+  it("(GROUP-REMAP) a delete-pruned server is restored on a rejected persist but NOT into the folder chain a concurrent rename destroyed — the stale path is not re-derived through server.group (kills restore-with-original-group)", async () => {
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core, repository } = await makeCoreWithSource([owned], { targetFolder: "NetBox" });
+    // Prior sync: the source owns "NetBox/RackA" and the device sits in it.
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+
+    // Hold this batch's own saveGroups pending so a concurrent renameFolder
+    // (lock-free, NOT serialized against an in-flight apply) can land while
+    // the persist is still outstanding. The compensating re-persist after
+    // rollback must reach the real implementation.
+    const originalSaveGroups = repository.saveGroups.bind(repository);
+    let rejectBatchSave!: (err: Error) => void;
+    let batchCallSeen = false;
+    vi.spyOn(repository, "saveGroups").mockImplementation(async (groups) => {
+      if (!batchCallSeen) {
+        batchCallSeen = true;
+        return new Promise<void>((_resolve, reject) => {
+          rejectBatchSave = reject;
+        });
+      }
+      return originalSaveGroups(groups);
+    });
+
+    // The device is gone at the source: delete-prune removes it, which leaves
+    // "NetBox/RackA" empty, so this same batch's GC removes that folder too.
+    const applyPromise = core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [],
+      removeServerIds: ["device-1"],
+      folders: [],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    // Mutation phase has already run synchronously: server gone, folder GC'd.
+    expect(core.getServer("device-1")).toBeUndefined();
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
+
+    // Concurrent command while the persist is pending: the user renames the
+    // whole "NetBox" branch to "Lab". It cannot touch the pruned server — that
+    // record is not in the map at this moment.
+    await core.renameFolder("NetBox", "Lab");
+    expect(core.getSnapshot().explicitGroups).toContain("Lab");
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox");
+
+    rejectBatchSave(new Error("disk full"));
+    await expect(applyPromise).rejects.toThrow("disk full");
+
+    // The server itself must ALWAYS come back — dropping it would be data loss.
+    const restored = core.getServer("device-1");
+    expect(restored).toBeDefined();
+    expect(restored?.name).toBe("core-sw");
+    expect(restored?.host).toBe("10.0.0.1");
+    expect(restored?.origin?.sourceId).toBe("source-1");
+
+    // THE KILL ASSERTION — restoring it with its old group re-derives the
+    // stale "NetBox" branch the user just renamed away, straight through the
+    // tree's group-derived folders, even though the folder-entry guard
+    // (PARENT-CHAIN FIX) correctly refused to re-add "NetBox/RackA" itself.
+    expect(restored?.group).not.toBe("NetBox/RackA");
+    expect(derivedFolderPaths(core).filter((p) => p === "NetBox" || p.startsWith("NetBox/"))).toEqual([]);
+    // Nothing of the chain survived (the rename took "NetBox" with it), so the
+    // remap target is the root — the codebase's "no folder" is `undefined`.
+    expect(restored?.group).toBeUndefined();
+    // The user's concurrent rename survives untouched.
+    expect(core.getSnapshot().explicitGroups).toContain("Lab");
+  });
+
+  it("(GROUP-REMAP) partial-chain survival: the restored server's own leaf folder is gone but its parent chain survives — the original group is kept, not truncated (kills a full-chain-including-leaf check)", async () => {
+    // The device sits one level BELOW the folder the source manages, so
+    // "NetBox/RackA/Slot1" exists only by derivation from this very server —
+    // there is no explicit entry for it and no other occupant. Once the device
+    // is pruned, that leaf legitimately disappears; its parent does not.
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA/Slot1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core, repository } = await makeCoreWithSource([owned], { targetFolder: "NetBox" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA/Slot1");
+
+    vi.spyOn(repository, "saveGroups").mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 2,
+        upsertServers: [],
+        removeServerIds: ["device-1"],
+        folders: [],
+        expectedSource: core.getInventorySource("source-1")!
+      })
+    ).rejects.toThrow("disk full");
+
+    // "NetBox/RackA" was GC'd by this batch and put back by the guarded folder
+    // restore (its parent "NetBox" is untouched), so the chain the server hangs
+    // off is intact — only the server's OWN leaf is absent, and it is absent
+    // precisely BECAUSE this batch removed the server. Restoring the server
+    // re-derives its own folder; the group must survive verbatim.
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(core.getServer("device-1")?.group).toBe("NetBox/RackA/Slot1");
+    expect(derivedFolderPaths(core)).toEqual(expect.arrayContaining(["NetBox", "NetBox/RackA", "NetBox/RackA/Slot1"]));
+  });
+
+  it("(GROUP-REMAP control) with no concurrent tree mutation a rejected delete-prune restores the server with its ORIGINAL group and the GC'd folder intact (kills an over-eager remap / a surviving-set computed before the folder restore)", async () => {
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core, repository } = await makeCoreWithSource([owned], { targetFolder: "NetBox" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+
+    vi.spyOn(repository, "saveGroups").mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 2,
+        upsertServers: [],
+        removeServerIds: ["device-1"],
+        folders: [],
+        expectedSource: core.getInventorySource("source-1")!
+      })
+    ).rejects.toThrow("disk full");
+
+    // Nothing raced this batch, so the rollback is a plain undo: the folder
+    // comes back (its parent chain is untouched) and the server comes back
+    // exactly where it was. A remap decided against the tree as it looked
+    // BEFORE the folder restore pass would have found "NetBox/RackA" missing
+    // and truncated the group to "NetBox".
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(core.getServer("device-1")?.group).toBe("NetBox/RackA");
+    expect(core.getServer("device-1")?.name).toBe("core-sw");
+  });
 });
 
 describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1, P2)", () => {
