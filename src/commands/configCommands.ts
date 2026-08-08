@@ -555,6 +555,46 @@ async function addServerSanitizingOrigin(server: ServerConfig, add: (entity: Ser
   await add(server);
 }
 
+/**
+ * REVIEW FINDING 2 (P2, imported managedFolders are untrusted) — strip
+ * `managedFolders` from a backup-imported inventory source before it is ever
+ * persisted. `managedFolders` is GC-ownership bookkeeping this extension
+ * itself writes (see `applyInventorySyncPlan` in nexusCore.ts) — it is never
+ * something a user or provider is meant to author. `validateInventorySource`
+ * only checks its SHAPE (an array of strings), by design: that check also
+ * guards the extension's OWN persisted state on ordinary storage-layer loads
+ * (VscodeConfigRepository), where the field genuinely is trusted, so it must
+ * stay permissive there. A backup file is a different trust boundary — it can
+ * be hand-edited, come from another machine's differently-shaped folder tree,
+ * or simply be stale — so a `managedFolders` array copied verbatim from one
+ * would hand this source GC authority over folder paths (e.g.
+ * "Manual/Staging") it never actually created on THIS machine. The next sync
+ * would then delete a folder the source never owns, because
+ * `applyInventorySyncPlan` trusts `managedFolders` completely once it's on
+ * the record.
+ *
+ * Stripping it here (at the import boundary, not in `validateInventorySource`)
+ * is the safe direction: an imported source simply starts with no bookkept
+ * ownership, exactly like a legacy/never-synced record. Its very next sync
+ * re-accumulates `managedFolders` normally from the folders THAT sync
+ * actually creates (see `createdThisApply` in `applyInventorySyncPlan`) — any
+ * folder that already existed before the import (including ones the ORIGINAL
+ * machine's source once owned) simply stops being a GC candidate rather than
+ * becoming a wrongly-trusted one; it is never deleted on the strength of
+ * imported metadata alone.
+ */
+async function stripImportedManagedFolders(
+  source: InventorySourceConfig,
+  add: (entity: InventorySourceConfig) => Promise<void>
+): Promise<void> {
+  if (source.managedFolders !== undefined) {
+    const { managedFolders: _managedFolders, ...rest } = source;
+    await add(rest as InventorySourceConfig);
+    return;
+  }
+  await add(source);
+}
+
 /** Mechanical validate-then-add tail shared by the share-import remap loops; remap stays inline. */
 async function addIfValid<T>(
   entity: T,
@@ -1681,7 +1721,12 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // Kept in its own variable (not folded into the array below) because the inventory-secret
     // restore loop further down needs to know exactly which source ids this run imported — see
     // the comment there.
-    const inventorySourceTally = await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) => core.addOrUpdateInventorySource(e));
+    // REVIEW FINDING 2 (P2) — strip `managedFolders` at the import boundary;
+    // see `stripImportedManagedFolders`'s doc for why this can't live in
+    // `validateInventorySource` instead.
+    const inventorySourceTally = await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) =>
+      stripImportedManagedFolders(e, (s) => core.addOrUpdateInventorySource(s))
+    );
     const localShellTally = await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e));
     const authProfileTally = await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
     for (const tally of [serverTally, tunnelTally, serialTally, inventorySourceTally, localShellTally, authProfileTally]) {

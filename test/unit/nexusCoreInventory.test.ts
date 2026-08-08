@@ -2199,7 +2199,7 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
     expect(resultY.removedEmptyFolderCount).toBe(1);
   });
 
-  it("(cross-source target-root protection) another source's configured targetFolder — even with an EMPTY managedFolders set — protects a folder from GC; the protection lifts once that source's record is removed", async () => {
+  it("(cross-source target-root protection; REVIEW FINDING 1, P2 — retain candidates the GC did not actually remove) another source's configured targetFolder — even with an EMPTY managedFolders set — protects a folder from GC; source-1 REMEMBERS the deferred candidate on its own, with no manual re-seed, and reclaims it once that source's record is removed", async () => {
     const ownedByA: ServerConfig = {
       id: "device-a",
       name: "sw-a",
@@ -2249,21 +2249,28 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
     // candidate right out from under source-2's still-configured target.
     expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
     expect(resultAbandon.removedEmptyFolderCount).toBe(0);
-    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackB"]);
+    // KILLS THE FORGOTTEN CANDIDATE (REVIEW FINDING 1, P2): "NetBox/RackA"
+    // was deferred by source-2's target-root protection, not actually
+    // removed — source-1 must keep bookkeeping ownership of it, alongside
+    // the newly-created "NetBox/RackB", rather than letting the restamp
+    // below drop it silently. Under the pre-fix implementation this would be
+    // `["NetBox/RackB"]` — the candidate quietly forgotten the moment this
+    // apply's own `managedFolders` restamp ran.
+    expect([...(core.getInventorySource("source-1")?.managedFolders ?? [])].sort()).toEqual(
+      ["NetBox/RackA", "NetBox/RackB"].sort()
+    );
 
     // source-2's record is removed entirely — the protection its target root
     // granted must lift along with it, not linger.
     await core.removeInventorySource("source-2");
 
-    // Re-seed source-1's managedFolders to once again name "NetBox/RackA",
-    // reproducing the exact same abandon scenario as above (folder empty,
-    // named by neither this apply's footprint nor its `folders` list) with
-    // source-2 gone as the only changed variable.
-    await core.addOrUpdateInventorySource({
-      ...core.getInventorySource("source-1")!,
-      managedFolders: ["NetBox/RackA", "NetBox/RackB"]
-    });
-
+    // NO MANUAL RE-SEED: unlike before this fix (which had to hand-restore
+    // "NetBox/RackA" into source-1's managedFolders here to even exercise the
+    // reclaim path), source-1 already remembers the candidate from
+    // `resultAbandon` above on its own. Drive the exact same sync again
+    // (nothing about source-1's own inputs changes) with source-2 gone as
+    // the ONLY changed variable, and confirm the real end-to-end flow
+    // reclaims it — not a synthetic re-seeded state.
     const resultReclaim = await core.applyInventorySyncPlan({
       sourceId: "source-1",
       syncedAt: 3,
@@ -2274,9 +2281,15 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
     });
 
     // Protection lifted with the record: the identical candidate is now
-    // reclaimed.
+    // reclaimed, purely because source-1 remembered it — again, this would
+    // fail under the pre-fix implementation, which had already forgotten
+    // "NetBox/RackA" after `resultAbandon` and so would have nothing left to
+    // reclaim here even with source-2 gone.
     expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
     expect(resultReclaim.removedEmptyFolderCount).toBe(1);
+    // Genuinely removed: it leaves the bookkeeping set too — no unbounded
+    // growth from a candidate that really is gone now.
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackB"]);
   });
 
   it("(kills new-target-only filtering) editing targetFolder ('NetBox' -> 'Infra') still reclaims the OLD target's now-empty managed folder, and the old target's own root survives untouched", async () => {
@@ -2392,6 +2405,85 @@ describe("applyInventorySyncPlan — empty-folder GC ownership (REVIEW FINDING 1
 
     expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
     expect(result.removedEmptyFolderCount).toBe(0);
+  });
+
+  it("(REVIEW FINDING 1, P2 — retain candidates the GC did not actually remove) a folder occupied by a manual server at abandonment is retained in this source's own bookkeeping, and is reclaimed once the occupant is later gone (kills occupancy-forgetting)", async () => {
+    const manualServer: ServerConfig = {
+      id: "manual-1",
+      name: "hand-added",
+      host: "192.168.1.1",
+      port: 22,
+      username: "root",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA" // no `origin` — added by hand, not by this source
+    };
+    const owned: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+    };
+    const { core } = await makeCoreWithSource([manualServer, owned], { targetFolder: "NetBox" });
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackA"]);
+
+    // This source's own device moves away — "NetBox/RackA" drops out of the
+    // footprint/folders-list this apply names, but the manual server still
+    // occupies it, so `pruneEmptyFoldersUnderTarget` skips (does not remove)
+    // it.
+    const moved = { ...owned, group: "NetBox/RackB" };
+    const result = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2,
+      upsertServers: [moved],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).toContain("NetBox/RackA");
+    expect(result.removedEmptyFolderCount).toBe(0);
+    // KILLS OCCUPANCY-FORGETTING: "NetBox/RackA" was skipped for being
+    // occupied, not genuinely removed — this source must keep remembering it
+    // owns that folder, alongside the newly-created "NetBox/RackB". Under the
+    // pre-fix implementation this would be `["NetBox/RackB"]` only: the
+    // occupied-but-skipped candidate silently dropped out of bookkeeping the
+    // moment this apply's own `managedFolders` restamp ran, even though it
+    // was never actually reclaimed.
+    expect([...(core.getInventorySource("source-1")?.managedFolders ?? [])].sort()).toEqual(
+      ["NetBox/RackA", "NetBox/RackB"].sort()
+    );
+
+    // The manual occupant is removed by hand — "NetBox/RackA" is now
+    // genuinely empty. A LATER sync of the same source, naming nothing new,
+    // must still reclaim it — only possible because the prior apply kept
+    // remembering it.
+    await core.removeServer("manual-1");
+    const resultReclaim = await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 3,
+      upsertServers: [],
+      removeServerIds: [],
+      folders: ["NetBox/RackB"],
+      expectedSource: core.getInventorySource("source-1")!
+    });
+    expect(core.getSnapshot().explicitGroups).not.toContain("NetBox/RackA");
+    expect(resultReclaim.removedEmptyFolderCount).toBe(1);
+    // Genuinely removed: it leaves the bookkeeping set too — no unbounded
+    // growth from a candidate that really is gone now.
+    expect(core.getInventorySource("source-1")?.managedFolders).toEqual(["NetBox/RackB"]);
   });
 
   it("(old-target co-ownership) a folder under the OLD target still managed by ANOTHER source survives a targetFolder edit + move, and is only GC'd once that other source also drops it", async () => {

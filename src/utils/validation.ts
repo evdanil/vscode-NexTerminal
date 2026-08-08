@@ -147,6 +147,18 @@ export function validateInventorySource(item: unknown): item is InventorySourceC
   // string (folder paths — not otherwise validated here, mirroring
   // `secretFieldIds` just above; applyInventorySyncPlan only ever writes
   // paths it itself normalized).
+  //
+  // REVIEW FINDING 2 (P2, imported managedFolders are untrusted) —
+  // deliberately a SHAPE check only, same as every other field here. This
+  // function also guards ordinary storage-layer loads of the extension's OWN
+  // persisted state (VscodeConfigRepository), where `managedFolders` genuinely
+  // IS trusted (this extension is the only writer), so it must stay
+  // permissive. Backup-imported records are a DIFFERENT trust boundary — see
+  // `stripImportedManagedFolders` in configCommands.ts, which strips the
+  // field entirely at the import boundary, after this shape check passes but
+  // before the record is ever persisted — do NOT "fix" untrusted ownership
+  // metadata here; that would also strip it from legitimate storage-layer
+  // loads, which must keep it.
   if (obj.managedFolders !== undefined && (!Array.isArray(obj.managedFolders) || !obj.managedFolders.every((v) => typeof v === "string"))) {
     return false;
   }

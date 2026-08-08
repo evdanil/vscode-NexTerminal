@@ -335,17 +335,25 @@ export class NexusCore {
    * explicit folders that are:
    *   - in `ownedCandidates` (REVIEW FINDING 1, P2 — the source's OWN prior
    *     `managedFolders`, minus the folders this very sync still names OR
-   *     still occupies with its own devices, and minus any path another
-   *     source currently manages or has as an ancestor of a managed path —
-   *     REVIEW FINDING 2, P2; see applyInventorySyncPlan's call site). A
-   *     folder never named by any of this source's own past applies is NEVER
-   *     a candidate here, however empty it is — it might be a
-   *     manually-created folder the user deliberately keeps empty (e.g. a
-   *     staging area under the same targetFolder), or one owned by a
-   *     completely different source. GC only ever reclaims a folder that
-   *     this source itself created and has since stopped naming/occupying,
-   *     and that no OTHER source still manages — never sweeps unowned or
-   *     cross-owned territory,
+   *     still occupies with its own devices). A folder never named by any of
+   *     this source's own past applies is NEVER a candidate here, however
+   *     empty it is — it might be a manually-created folder the user
+   *     deliberately keeps empty (e.g. a staging area under the same
+   *     targetFolder), or one owned by a completely different source. GC only
+   *     ever reclaims a folder that this source itself created and has since
+   *     stopped naming/occupying,
+   *   - not in `crossSourceProtectedPaths` (any path another source currently
+   *     manages, or has as an ancestor of a managed path, or that sits under
+   *     another source's own configured `targetFolder` — REVIEW FINDING 2,
+   *     P2, and its CROSS-SOURCE TARGET-ROOT extension; see
+   *     applyInventorySyncPlan's call site for the full derivation) — never
+   *     sweeps cross-owned territory out from under a still-live claim.
+   *     REVIEW FINDING 1 (P2, retain candidates the GC did not actually
+   *     remove) — a candidate skipped for THIS reason is deliberately handled
+   *     the exact same way as an occupied one: this method simply never adds
+   *     it to the returned `removed` set, so the caller's bookkeeping
+   *     (`retainedGcCandidates` at the call site) keeps remembering it until
+   *     the protection genuinely lifts and a later apply finds it reclaimable,
    *
    *     TARGET-EDIT FIX — `ownedCandidates` is evaluated at EACH candidate's
    *     OWN path, not filtered to live under the CURRENT `targetFolder`. A
@@ -423,12 +431,23 @@ export class NexusCore {
   private pruneEmptyFoldersUnderTarget(
     targetFolder: string,
     keepFolders: ReadonlySet<string>,
-    ownedCandidates: ReadonlySet<string>
+    ownedCandidates: ReadonlySet<string>,
+    crossSourceProtectedPaths: ReadonlySet<string>
   ): Set<string> {
     const removed = new Set<string>();
     const candidates = [...ownedCandidates]
       .filter((candidate) => {
         if (candidate === targetFolder || keepFolders.has(candidate)) {
+          return false;
+        }
+        if (crossSourceProtectedPaths.has(candidate)) {
+          // REVIEW FINDING 2 (P2, cross-source ownership) + its
+          // CROSS-SOURCE TARGET-ROOT extension — another source still
+          // manages this path exactly, has it as an ancestor of a managed
+          // path, or has it under its own configured targetFolder. Skipped,
+          // not removed — the caller's bookkeeping decides separately
+          // whether to keep remembering it (see REVIEW FINDING 1, P2 at the
+          // call site).
           return false;
         }
         if (!candidate.includes("/")) {
@@ -810,10 +829,11 @@ export class NexusCore {
     // each syncing devices into "NetBox/RackA"). If source X drops the folder
     // from its own managed set while it's momentarily empty, GC must not
     // reclaim it out from under source Y, which still names it. Exclude from
-    // `gcOwnedCandidates` any path that is EXACTLY managed by another source,
-    // OR is an ANCESTOR of a path another source manages — deleting an
-    // ancestor would orphan that other source's chain even though the
-    // ancestor itself isn't in the other source's set verbatim.
+    // removal (see `pruneEmptyFoldersUnderTarget` below) any path that is
+    // EXACTLY managed by another source, OR is an ANCESTOR of a path another
+    // source manages — deleting an ancestor would orphan that other source's
+    // chain even though the ancestor itself isn't in the other source's set
+    // verbatim.
     //
     // CROSS-SOURCE TARGET-ROOT FIX — `managedFolders` is deliberately never
     // stamped with a source's own `targetFolder` root (see
@@ -833,12 +853,22 @@ export class NexusCore {
     // folder regardless of whether that source has synced into it yet. A
     // root-targeted (`targetFolder === ""`) other source contributes nothing
     // here, exactly like it never accumulates `managedFolders` itself.
+    //
+    // `otherSourcesExactManagedFolders` — REVIEW FINDING 1 (P2, retain
+    // candidates the GC did not actually remove) needs this SEPARATELY from
+    // `otherSourcesProtectedPaths` below: see that finding's note on
+    // `retainedGcCandidates` further down for why a candidate EXACTLY present
+    // in another source's OWN `managedFolders` must NOT be retained back into
+    // THIS source's bookkeeping, even though it is (correctly) never removed
+    // here.
+    const otherSourcesExactManagedFolders = new Set<string>();
     const otherSourcesProtectedPaths = new Set<string>();
     for (const [otherId, otherSource] of this.inventorySources) {
       if (otherId === apply.sourceId) {
         continue;
       }
       for (const managed of otherSource.managedFolders ?? []) {
+        otherSourcesExactManagedFolders.add(managed);
         for (const ancestor of getAncestorPaths(managed)) {
           otherSourcesProtectedPaths.add(ancestor);
         }
@@ -849,9 +879,21 @@ export class NexusCore {
         }
       }
     }
-    const gcOwnedCandidates = new Set(
-      [...previousManagedFolders].filter((f) => !newManagedFolders.has(f) && !otherSourcesProtectedPaths.has(f))
-    );
+    // REVIEW FINDING 1 (P2, retain candidates the GC did not actually remove)
+    // — `gcOwnedCandidates` used to ALSO subtract `otherSourcesProtectedPaths`
+    // here, which meant a candidate deferred by cross-source protection never
+    // even reached `pruneEmptyFoldersUnderTarget` — it silently vanished from
+    // consideration. That collapsed two different things into one: "must
+    // never be REMOVED right now" (still true, and still enforced — see the
+    // `pruneEmptyFoldersUnderTarget` call below, which now takes
+    // `otherSourcesProtectedPaths` itself and skips a protected candidate the
+    // same way it skips an occupied one) versus "this source no longer needs
+    // to REMEMBER it created this folder" (false — the source's bookkeeping
+    // ownership must survive until the folder is GENUINELY reclaimed; see
+    // `retainedGcCandidates` below). `gcOwnedCandidates` now holds every
+    // candidate this source has stopped naming/occupying, protected or not —
+    // protection is enforced once, inside the prune call, not twice.
+    const gcOwnedCandidates = new Set([...previousManagedFolders].filter((f) => !newManagedFolders.has(f)));
     // ITEM B (empty-folder GC) — runs synchronously here, in the mutation
     // phase, AFTER the upserts/removes above so it sees the POST-sync server
     // set. Scoped to non-"absent" applications only (REMOVAL disposition
@@ -880,8 +922,60 @@ export class NexusCore {
     // root-level folder", not "never run GC for a root-targeted source".
     const removedEmptyGroups: Set<string> =
       apply.expectedSource !== "absent" && source
-        ? this.pruneEmptyFoldersUnderTarget(source.targetFolder, applicationFolderSet, gcOwnedCandidates)
+        ? this.pruneEmptyFoldersUnderTarget(source.targetFolder, applicationFolderSet, gcOwnedCandidates, otherSourcesProtectedPaths)
         : new Set<string>();
+    // REVIEW FINDING 1 (P2, retain candidates the GC did not actually
+    // remove) — a candidate that fell out of `newManagedFolders` but was NOT
+    // actually deleted above (deferred by cross-source protection, still
+    // occupied, still has a live descendant, or skipped as
+    // defensively-malformed) must not simply vanish from this source's own
+    // bookkeeping. Before this fix, `managedFolders` was stamped from
+    // `newManagedFolders` alone, so the very next persist silently forgot
+    // that this source ever created the folder — if the thing protecting it
+    // was later removed or retargeted, nothing remembered the path anymore
+    // and it could never be reclaimed ("protection lifts" only held true
+    // WITHIN the single apply that observed it).
+    //
+    // `retainedGcCandidates` = gcOwnedCandidates − actuallyRemoved − (paths
+    // EXACTLY present in another source's OWN `managedFolders`). That last
+    // subtraction is deliberate and NOT redundant with the
+    // `crossSourceProtectedPaths` skip inside `pruneEmptyFoldersUnderTarget`
+    // above (which already guarantees this candidate was never actually
+    // removed): retaining it here TOO would double-book it. When another
+    // source X's own `managedFolders` exactly names this path, X's OWN next
+    // apply independently re-diffs it from X's OWN `previousManagedFolders`
+    // regardless of whether THIS source also remembers it — X is already the
+    // one carrying it forward. Retaining it on THIS source's side as well
+    // creates a genuine mutual-retention deadlock: THIS source's retained
+    // entry then shows up in X's `otherSourcesProtectedPaths` on X's next
+    // apply, deferring X's own reclaim of the very same path, which in turn
+    // keeps IT in THIS source's `otherSourcesProtectedPaths` next time round
+    // — neither source ever independently lets go, even after BOTH have
+    // genuinely stopped naming/occupying it (see
+    // nexusCoreInventory.test.ts's "(REVIEW FINDING 2, P2 — cross-source
+    // ownership)" and "(old-target co-ownership)" tests, which pin exactly
+    // this "reclaimed once BOTH have dropped it" guarantee and would
+    // regress into a permanent deadlock without this exclusion). This
+    // exclusion does NOT apply to protection arising only from another
+    // source's `targetFolder` (not its `managedFolders`) — that source has
+    // no `previousManagedFolders` entry for this path to re-diff on its own
+    // next sync (it may never have synced anything into it at all), so THIS
+    // source retaining the candidate is the ONLY way it is ever revisited —
+    // exactly the scenario REVIEW FINDING 1 exists to fix (see
+    // nexusCoreInventory.test.ts's "(cross-source target-root protection)"
+    // test).
+    //
+    // A candidate whose folder no longer exists in `explicitGroups` at all
+    // (removed through some path other than this GC — e.g. a user's manual
+    // "Delete Folder" from the tree UI) is also dropped here rather than
+    // retained: there is nothing left to ever reclaim, so bookkeeping a
+    // ghost path forever would only grow the set without bound.
+    const retainedGcCandidates = new Set(
+      [...gcOwnedCandidates].filter(
+        (f) => !removedEmptyGroups.has(f) && !otherSourcesExactManagedFolders.has(f) && this.explicitGroups.has(f)
+      )
+    );
+    const stampedManagedFolders = new Set([...newManagedFolders, ...retainedGcCandidates]);
     // FINDING 4 (focus review) — same conditional-restore principle as
     // servers/groups above, applied to focusedSessionId: record what THIS
     // batch's own synchronous mutation phase left focusedSessionId as
@@ -905,7 +999,9 @@ export class NexusCore {
     // not a new incarnation of the record, so `revision` is deliberately NOT
     // touched (addOrUpdateInventorySource remains the only place a live
     // record's revision is ever reassigned — see that method's doc).
-    const writtenSourceRecord = source ? { ...source, lastSyncAt: apply.syncedAt, managedFolders: [...newManagedFolders] } : undefined;
+    const writtenSourceRecord = source
+      ? { ...source, lastSyncAt: apply.syncedAt, managedFolders: [...stampedManagedFolders] }
+      : undefined;
     if (writtenSourceRecord) {
       this.inventorySources.set(apply.sourceId, writtenSourceRecord);
     }

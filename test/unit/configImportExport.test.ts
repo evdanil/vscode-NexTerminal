@@ -4928,6 +4928,79 @@ describe("backup export round-trip", () => {
     expect(core.getInventorySource("src1")?.name).toBe("Incoming Name From Backup");
   });
 
+  it("REVIEW FINDING 2 (P2, imported managedFolders are untrusted) — a backup-imported inventory source has managedFolders stripped at the import boundary, and a later sync re-accumulates ownership normally (kills passthrough)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // A backup carries a source whose managedFolders names a folder it never
+    // actually created on THIS machine — e.g. hand-edited, copied from
+    // another machine's tree, or simply stale. Without the strip, this would
+    // hand the imported source GC authority over "Manual/Staging" and the
+    // very next sync could delete it.
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ managedFolders: ["Manual/Staging"] })]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/untrusted-managed-folders.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    // KILLS PASSTHROUGH: under a wrong implementation that hands the
+    // validated record straight to core.addOrUpdateInventorySource, this
+    // would be ["Manual/Staging"] — the imported source would already own a
+    // folder it never created, ready to be swept on its next sync.
+    expect(core.getInventorySource("src1")?.managedFolders).toBeUndefined();
+
+    // The imported record is otherwise intact (only managedFolders is
+    // stripped — the strip must not silently drop the whole source).
+    expect(core.getInventorySource("src1")?.name).toBe("NetBox");
+    expect(core.getInventorySource("src1")?.targetFolder).toBe("NetBox");
+
+    // Re-accumulation path: the imported source's very next sync CREATES a
+    // folder and must record ownership of it exactly as any other
+    // never-synced source would (see nexusCoreInventory.test.ts's "(legacy
+    // source)" case for the underlying mechanism) — the strip is not a
+    // permanent handicap, ownership simply re-builds from what this source
+    // itself creates going forward.
+    const device: ServerConfig = {
+      id: "device-1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox/RackA",
+      origin: { sourceId: "src1", externalId: "device:1", syncedAt: 1 }
+    };
+    await core.applyInventorySyncPlan({
+      sourceId: "src1",
+      syncedAt: 1,
+      upsertServers: [device],
+      removeServerIds: [],
+      folders: ["NetBox/RackA"],
+      expectedSource: core.getInventorySource("src1")!
+    });
+    expect(core.getInventorySource("src1")?.managedFolders).toEqual(["NetBox/RackA"]);
+  });
+
   it("merge-mode import does not overwrite a retained source's vault secret with the backup's; a newly-imported source's secret still restores; replace mode restores everything", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
