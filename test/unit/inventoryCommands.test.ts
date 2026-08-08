@@ -4268,6 +4268,182 @@ describe("inventoryCommands", () => {
       expect(updated.defaultUsername).toBe("source-own-account");
     });
 
+    /* ── the profile moves while the form sits open ──────────────────────────
+     *
+     * REVIEW FINDING (P2) — `fallbackUsernameForSource` derives Default SSH
+     * Username from the LIVE profile, so a username edited in the Auth Profile
+     * Editor while a source form sits open is persisted without ever having
+     * been on screen — in a field the profile had LOCKED, so the user could not
+     * have corrected it. Nothing else catches it: a profile edit revises no
+     * source record, so the edit path's ITEM 4 drift comparison passes
+     * untouched and saving any unrelated field carries the new username in.
+     *
+     * The oracle in each of these is the PERSISTED SOURCE RECORD measured
+     * against what the form was displaying — never the refusal on its own.
+     */
+    it("editSource refuses to save when the linked profile's username changed under the open form, and the record keeps the username the form is still showing (kills leaning on the ITEM 4 drift guard, which a profile edit never trips: renaming the source was enough to replace its fallback username with one no screen ever displayed)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { authProfileId: "p1", defaultUsername: "labuser" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+      // What the user is looking at — and cannot edit, the profile owns it.
+      expect(harness.locked("defaultUsername")).toBe(true);
+      expect(harness.value("defaultUsername")).toBe("labuser");
+
+      // The profile is edited elsewhere (AuthProfileEditorPanel) meanwhile.
+      const revisionBefore = core.getInventorySource("src-1")!.revision;
+      await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, username: "svc-account" });
+      // …which leaves the source record — revision included — untouched, so
+      // there is no drift for the ITEM 4 comparison to find. This guard is the
+      // only one that can see it.
+      expect(core.getInventorySource("src-1")!.revision).toBe(revisionBefore);
+      expect(core.getInventorySource("src-1")!.defaultUsername).toBe("labuser");
+
+      // …and the user changes something else entirely, then saves.
+      harness.type("name", "Renamed source");
+      const failure = await onSubmit(harness.submit()).then(
+        () => undefined,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+      // THE ORACLE, asserted before the message: the persisted record against
+      // what the field was showing. Unguarded this reads "svc-account" — the
+      // username every server the source syncs is stamped with, and the one
+      // they all fall back to if the profile is ever removed, chosen by nobody.
+      const stored = core.getInventorySource("src-1")!;
+      expect(stored.defaultUsername).toBe("labuser");
+      expect(stored.defaultUsername).toBe(harness.value("defaultUsername"));
+      // The unrelated edit does not ride in on the back of it either.
+      expect(stored.name).toBe("My Source");
+      // And the user is told which profile moved, and the one action that fixes it.
+      expect(failure).toContain('The auth profile "Lab credentials" changed the username it supplies while this form was open');
+      expect(failure).toContain("Re-select it in the Auth Profile list");
+    });
+
+    it("addSource refuses the same drift, on the path with no stored record to compare anything against (kills a guard that only the edit path carries: on Add, the mirror's answer is the ONLY account of what the form displayed)", async () => {
+      const { core, vault } = await makeHarness({ profiles: [LAB_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onAutofill, onSubmit } = latestFormCall();
+      // The user picks the profile and the mirror lands — "labuser", locked.
+      const mirrored = await onAutofill!("authProfileId", "p1");
+      expect(mirrored).toEqual({ defaultUsername: "labuser" });
+
+      await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, username: "svc-account" });
+
+      const failure = await onSubmit({ ...BASE_ADD_VALUES, authProfileId: "p1", ...mirrored! }).then(
+        () => undefined,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+      // Unguarded, the source IS created — holding "svc-account" behind a form
+      // that showed "labuser".
+      expect(core.getSnapshot().inventorySources.map((s) => s.defaultUsername)).toEqual([]);
+      expect(failure).toContain("changed the username it supplies while this form was open");
+      // And the vault-first write is rolled back, as every sibling refusal in
+      // this critical section owes.
+      const storedKey = vault.store.mock.calls.at(-1)?.[0] as string | undefined;
+      expect(storedKey).toBeDefined();
+      expect(await vault.get(storedKey!)).toBeUndefined();
+    });
+
+    it("addSource refuses when a profile that supplied NO username gains one under the open form, keeping the fallback the user typed (kills comparing only the two usernames a profile happens to have: the field was unlocked and holding the user's own value, and the save would have swapped the profile's in)", async () => {
+      // Whitespace-only — reachable through an imported backup, and the one
+      // shape that leaves Default SSH Username unlocked under a live link.
+      const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
+      const { core } = await makeHarness({ profiles: [blankish], servers: [makeServer({ username: "admin" })] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { definition, onAutofill, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+      harness.type("targetFolder", "Infra"); // an empty one asks for a second Save first
+      harness.type("cfg_host", "netbox.local");
+      harness.type("cfg_apiToken", "secret-token");
+
+      harness.choose("authProfileId", "p3");
+      const answer = await onAutofill!("authProfileId", "p3");
+      harness.deliver({ type: "fillFields", key: "authProfileId", value: "p3", values: answer! });
+      // The profile fills nothing, so this is the user's own fallback (seeded
+      // from mostCommonUsername), still editable.
+      expect(harness.locked("defaultUsername")).toBe(false);
+      expect(harness.value("defaultUsername")).toBe("admin");
+
+      // The imported profile is given a real username in the profile editor.
+      await core.addOrUpdateAuthProfile({ ...blankish, username: "svc-account" });
+
+      const failure = await onSubmit(harness.submit()).then(
+        () => undefined,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+      // Unguarded, `fallbackUsernameForSource` now prefers the profile's, and
+      // the source is created on "svc-account" over the "admin" the user typed
+      // and is still looking at.
+      expect(core.getSnapshot().inventorySources.map((s) => s.defaultUsername)).toEqual([]);
+      expect(failure).toContain('The auth profile "Imported" changed the username it supplies');
+    });
+
+    it("editSource refuses when the linked profile STOPS supplying a username, and re-selecting it — what the message asks for — clears the refusal (kills firing only where the live profile still has a username to compare: the field is left locked against a profile that no longer fills it, and only the re-select runs the release that could unlock it)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { authProfileId: "p1", defaultUsername: "labuser" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onAutofill, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+      expect(harness.locked("defaultUsername")).toBe(true);
+
+      // A restored backup can carry a whitespace username (validateAuthProfile
+      // only checks length); THE ONE RULE reads that as supplying none, so what
+      // the locked field on screen claims about this profile is now false.
+      await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, username: "   " });
+
+      await expect(onSubmit(harness.submit())).rejects.toThrow(/changed the username it supplies/);
+
+      // Not a dead end: the one action the message names re-stamps what the
+      // form is showing, and the same save then goes through.
+      expect(await onAutofill!("authProfileId", "p1")).toEqual({});
+      await onSubmit(harness.submit());
+
+      const stored = core.getInventorySource("src-1")!;
+      expect(stored.authProfileId).toBe("p1");
+      // The profile supplies none, so the source keeps its own fallback — the
+      // blank-profile branch of fallbackUsernameForSource, reached through the
+      // form rather than through a raced mirror.
+      expect(stored.defaultUsername).toBe("labuser");
+    });
+
+    it("a profile edit that changes nothing this save writes still saves (kills reusing the server form's authProfileOwnershipSignature here: a source record takes the profile's USERNAME and nothing else, so the authentication type that signature carries moving under the form is not drift and refusing it would refuse a correct save)", async () => {
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE],
+        source: { authProfileId: "p1", defaultUsername: "labuser" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { definition, onSubmit } = latestFormCall();
+      const harness = openForm(definition);
+      expect(harness.value("defaultUsername")).toBe("labuser");
+
+      // Renamed, and switched from password to SSH agent: a linked SOURCE
+      // stores neither, so the form on screen still describes this save
+      // exactly. (On the server form the same edit is drift — it decides which
+      // credential control is rendered at all.)
+      await core.addOrUpdateAuthProfile({ ...LAB_PROFILE, name: "Lab (agent)", authType: "agent" });
+
+      harness.type("name", "Renamed source");
+      await onSubmit(harness.submit());
+
+      const stored = core.getInventorySource("src-1")!;
+      expect(stored.name).toBe("Renamed source");
+      expect(stored.authProfileId).toBe("p1");
+      expect(stored.defaultUsername).toBe("labuser");
+    });
+
     it("addSource wires inline auth-profile creation end to end and an autofill that mirrors ONLY defaultUsername (kills the server form's {username, authType, keyPath} payload, an unwired onAutofill, and a controller that is never attached to the panel)", async () => {
       const { core } = await makeHarness({ profiles: [LAB_PROFILE] });
 

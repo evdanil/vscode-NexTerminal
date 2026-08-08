@@ -601,15 +601,144 @@ function keylessKeyAuthProfileMessage(profile: AuthProfile): string {
 }
 
 /**
+ * REVIEW FINDING (P2) — what an Add or Edit Source form committed to when it
+ * last put a profile's username on screen. Compared against LIVE core state at
+ * Save by `inventoryAuthProfileRejection`, the source form's counterpart of the
+ * server form's `RenderedAuthProfile` (commands/serverCommands.ts).
+ */
+export interface RenderedSourceAuthProfile {
+  /** The id whose username the form is currently showing. */
+  id: string;
+  /**
+   * The username that profile SUPPLIED at that moment — THE ONE RULE
+   * (`authProfileOwnedCredentials`), i.e. precisely what
+   * `fallbackUsernameForSource` would have stored had Save been pressed then,
+   * and `undefined` where it supplied none and Default SSH Username kept the
+   * user's own value, unlocked.
+   *
+   * The value itself rather than the hashed shape the server form compares
+   * (`authProfileOwnershipSignature`): there is exactly ONE profile fact a
+   * source save reads, so `===` over `string | undefined` states it exactly,
+   * with nothing to encode and nothing to collide.
+   */
+  username: string | undefined;
+}
+
+/**
+ * The stamp for a profile this form is about to be handed the username of,
+ * built from the SAME lookup the render (or the mirror) is built from, so what
+ * the form shows and what Save checks against are one fact rather than two
+ * lookups that can disagree.
+ *
+ * `undefined` for an id that resolves to no profile — the state in which the
+ * form is showing NO profile's username: the mirror answers nothing (so
+ * WebviewFormPanel suppresses the fillFields round trip entirely) and the Edit
+ * render sanitizes such a seed down to `(None)` (`inventorySourceFormDefinition`,
+ * ui/formDefinitions.ts). A Save that still carries that id is refused as
+ * missing, one check earlier.
+ */
+function renderedSourceAuthProfile(profile: AuthProfile | undefined): RenderedSourceAuthProfile | undefined {
+  return profile ? { id: profile.id, username: authProfileOwnedCredentials(profile).username } : undefined;
+}
+
+/**
+ * REVIEW FINDING (P2) — the third reason a selected profile cannot be honoured,
+ * refused in the same breath as the other two: the profile still exists and is
+ * still linkable, but it no longer supplies the username the form is showing
+ * for it.
+ *
+ * Named, like the keyless-key refusal and unlike the missing one: the profile
+ * is still there to be named (m3 — a name, never the id), and the repair is a
+ * single action in THIS form.
+ */
+function changedAuthProfileUsernameMessage(profile: AuthProfile): string {
+  return `The auth profile "${profile.name}" changed the username it supplies while this form was open, so Default SSH Username on screen is not the one a save would store. Re-select it in the Auth Profile list to pick up its current username, then save again.`;
+}
+
+/**
  * The single answer to "may this source be saved carrying this auth profile?",
  * shared by both persist helpers so the Add and Edit paths cannot diverge on
  * it. Returns the message to reject with, or `undefined` to proceed.
  *
  * `profile` is what `authProfileId` resolved to against LIVE core state a
  * statement earlier — the caller does the lookup because only it knows which
- * rollback its own critical section owes on the way out.
+ * rollback its own critical section owes on the way out. `rendered` is the
+ * form's own stamp (`renderedSourceAuthProfile`), threaded through the persist
+ * input so both paths are answered by this one function.
+ *
+ * REVIEW FINDING (P2) — THE THIRD CHECK, and why its comparand is not the
+ * server form's.
+ *
+ * WHAT GOES WRONG WITHOUT IT: `fallbackUsernameForSource` derives
+ * `defaultUsername` from the LIVE profile, deliberately and unconditionally. So
+ * a username edited in the Auth Profile Editor while this form sat open makes
+ * Save store a username the form never displayed — in a field the profile had
+ * LOCKED, so the user could not have corrected it even had they noticed — and
+ * nothing else surfaces it. Editing a profile does not revise the source, so
+ * the edit path's ITEM 4 drift guard passes; saving any unrelated field
+ * (a rename, a new target folder) is enough to carry it in. What lands is not
+ * cosmetic either: `defaultUsername` is the username every server this source
+ * syncs is stamped with, and the one `SilentAuthSshFactory` falls back to for
+ * all of them if the profile is ever removed.
+ *
+ * THE COMPARAND IS THE USERNAME, AND ONLY THE USERNAME. The server form
+ * compares `authProfileOwnershipSignature`, which deliberately EXCLUDES the
+ * profile's values: a linked server stores neither the profile's username nor
+ * its key path, so a value that moves under an open server form changes nothing
+ * that save writes, and only the ownership SHAPE (plus `authType`, which
+ * decides which credential control is rendered at all) can. Here that reasoning
+ * INVERTS. A source record takes exactly one thing from its profile — the
+ * username's VALUE, via `fallbackUsernameForSource` — and takes nothing else:
+ * no `authType`, no key path, no name. So this compares the value the server
+ * form omits, and omits everything the server form compares. Both halves cost
+ * something to get wrong: including `authType` would refuse saves that are
+ * correct (switching a profile from password to SSH agent changes nothing a
+ * source record holds), and omitting the value would let the finding straight
+ * through.
+ *
+ * "SUPPLIES NONE" IS A DISTINCT STATE, not a blank — which is the one thing
+ * this shares with the server's signature, applied to the single field this
+ * form has. GAINING a username (an imported blank-username profile edited into
+ * a real one) turns the fallback the user typed and can see, in an unlocked
+ * field, into one the save silently replaces. LOSING it leaves Default SSH
+ * Username locked on screen against a profile that no longer fills it; the
+ * string written happens to coincide, but what it MEANS does not — it stops
+ * being the profile's username and becomes the source's own account, and only
+ * a re-select runs the webview's release (`profileDisplacedValues`,
+ * ui/formHtml.ts) that unlocks the field the user would need to change it in.
+ *
+ * ONLY WHEN `rendered` NAMES THE SUBMITTED ID — and this is where the server's
+ * guard deliberately goes further than this one. There, a submission naming a
+ * profile the form never rendered is refused outright, because
+ * `preserveLinkedServerCredentials` reads the live profile to decide which
+ * submitted fields are the user's own input, and that decision would be made
+ * about a form nobody saw. Here the save does not decide anything from the
+ * submission: it DERIVES the username from the live profile, so a Save that
+ * beats the mirror's round trip stores exactly what the completed mirror would
+ * have shown a moment later. That is `fallbackUsernameForSource`'s documented
+ * purpose — making the invariant independent of webview timing — and refusing
+ * it would reintroduce the very timing dependence that helper removed (the
+ * "Save beats the autofill round trip" tests in
+ * test/unit/inventoryCommands.test.ts pin it). What is checked is therefore
+ * what this form actually PUT ON SCREEN for this profile, which is established
+ * by the mirror's answer or by the Edit form's own render, and by nothing else.
+ *
+ * REJECT rather than re-render, for the same reason the server form does: the
+ * values needed to re-render correctly live in the webview's transition
+ * machinery, and pushing a bare `fillFields` from here would apply the new
+ * state WITHOUT the release step, leaving a field the profile no longer fills
+ * unlocked and still holding the profile's value. The message names the one
+ * action that runs the real transition — re-select the profile.
+ *
+ * Call it with a `profile` re-resolved inside `configMutationLock`. Auth
+ * profile writes take that same lock (ui/authProfileEditorPanel.ts), so a check
+ * made while holding it stays true through the write it is guarding.
  */
-function inventoryAuthProfileRejection(authProfileId: string | undefined, profile: AuthProfile | undefined): string | undefined {
+function inventoryAuthProfileRejection(
+  authProfileId: string | undefined,
+  rendered: RenderedSourceAuthProfile | undefined,
+  profile: AuthProfile | undefined
+): string | undefined {
   if (authProfileId === undefined) {
     return undefined;
   }
@@ -617,7 +746,14 @@ function inventoryAuthProfileRejection(authProfileId: string | undefined, profil
     return MISSING_AUTH_PROFILE_MESSAGE;
   }
   if (authProfileNeedsServerKeyPath(profile)) {
+    // Ahead of the drift check on purpose: a keyless key profile cannot be
+    // linked at all, so "add a key file to that profile, or choose another" is
+    // the repair even when its username moved too — re-selecting it would only
+    // land the user back on this same refusal.
     return keylessKeyAuthProfileMessage(profile);
+  }
+  if (rendered?.id === authProfileId && rendered.username !== authProfileOwnedCredentials(profile).username) {
+    return changedAuthProfileUsernameMessage(profile);
   }
   return undefined;
 }
@@ -714,9 +850,14 @@ function fallbackUsernameForSource(profile: AuthProfile | undefined, submittedUs
  * one `fallbackUsernameForSource` derives the stored value from and the same
  * one `authProfileFilledKeys` seeds the lock from, so what the mirror shows,
  * what the save stores, and what the form locks cannot disagree.
+ *
+ * REVIEW FINDING (P2) — takes the RESOLVED profile rather than an id to look up
+ * itself, so the caller's single `getAuthProfile` feeds both this answer and
+ * the render stamp `inventoryAuthProfileRejection` later checks it against
+ * (`renderedSourceAuthProfile`). Two lookups could straddle a profile edit and
+ * stamp a shape the form was never shown.
  */
-function authProfileUsernameMirror(core: NexusCore, profileId: string): Record<string, string> | undefined {
-  const profile = core.getAuthProfile(profileId);
+function authProfileUsernameMirror(profile: AuthProfile | undefined): Record<string, string> | undefined {
   if (!profile) {
     return undefined;
   }
@@ -728,6 +869,12 @@ export interface NewInventorySourceInput {
   name: string;
   targetFolder: string;
   authProfileId?: string;
+  /**
+   * What the form last showed as `authProfileId`'s username, or `undefined`
+   * where it has shown none — see `inventoryAuthProfileRejection`. Declared
+   * required-but-nullable so neither form path can quietly omit it.
+   */
+  renderedAuthProfile: RenderedSourceAuthProfile | undefined;
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
   provider: InventoryProvider;
@@ -753,7 +900,7 @@ async function persistNewInventorySource(
   vault: SecretVault,
   input: NewInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, authProfileId, defaultUsername, prunePolicy, provider, config, secrets } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, secrets } = input;
   const id = randomUUID();
   const passwordFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
 
@@ -797,8 +944,11 @@ async function persistNewInventorySource(
 
     // REVIEW FINDING (P2) — re-resolve the selected profile against live core
     // state (see MISSING_AUTH_PROFILE_MESSAGE for why this exists and why it
-    // rejects instead of clearing). This path has no drift guard of its own:
-    // there is no prior record, so nothing to compare a revision against.
+    // rejects instead of clearing). This path has no RECORD drift guard of its
+    // own: there is no prior record, so nothing to compare a revision against —
+    // which is exactly why the form's own render stamp is threaded in here
+    // (`renderedAuthProfile`, see inventoryAuthProfileRejection): on Add it is
+    // the only account of what this form put on screen.
     //
     // TOCTOU: the profile-deletion path (AuthProfileEditorPanel's delete
     // handler) takes this SAME configMutationLock around its vault deletes and
@@ -812,7 +962,7 @@ async function persistNewInventorySource(
     // record into the map before removeAuthProfile scans it, so the reference
     // is cleared off this source exactly as it would be off any other holder.
     const linkedProfile = authProfileId !== undefined ? core.getAuthProfile(authProfileId) : undefined;
-    const authProfileRejection = inventoryAuthProfileRejection(authProfileId, linkedProfile);
+    const authProfileRejection = inventoryAuthProfileRejection(authProfileId, renderedAuthProfile, linkedProfile);
     if (authProfileRejection !== undefined) {
       // Same best-effort rollback as FINDING B / FINDING 1 below: the source
       // is not created on this path either, so nothing would ever enumerate
@@ -880,6 +1030,8 @@ export interface UpdatedInventorySourceInput {
   targetFolder: string;
   /** `undefined` clears an existing link — the field is always written, never merged. */
   authProfileId?: string;
+  /** As `NewInventorySourceInput` — see `inventoryAuthProfileRejection`. */
+  renderedAuthProfile: RenderedSourceAuthProfile | undefined;
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
   provider: InventoryProvider;
@@ -906,7 +1058,7 @@ async function persistUpdatedInventorySource(
   source: InventorySourceConfig,
   input: UpdatedInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, authProfileId, defaultUsername, prunePolicy, provider, config, reenteredSecrets } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, reenteredSecrets } = input;
   const existingSecretFieldIds = new Set(source.secretFieldIds);
 
   return configMutationLock.runExclusive(async (): Promise<InventorySourceConfig> => {
@@ -985,9 +1137,11 @@ async function persistUpdatedInventorySource(
     // sources that already reference the deleted profile, so a source that was
     // already linked trips ITEM 4 and is told to reopen, while a source being
     // switched ONTO that profile keeps its revision, sails through ITEM 4
-    // untouched, and is caught here.
+    // untouched, and is caught here. The same split covers the third check: a
+    // profile EDIT revises no source at all, so ITEM 4 sees nothing whatsoever
+    // when the username under this open form moves.
     const linkedProfile = authProfileId !== undefined ? core.getAuthProfile(authProfileId) : undefined;
-    const authProfileRejection = inventoryAuthProfileRejection(authProfileId, linkedProfile);
+    const authProfileRejection = inventoryAuthProfileRejection(authProfileId, renderedAuthProfile, linkedProfile);
     if (authProfileRejection !== undefined) {
       await rollbackThisRunsVaultWrites();
       throw new Error(authProfileRejection);
@@ -1525,6 +1679,15 @@ export function registerInventoryCommands(
     // form mirrors the profile's username into `defaultUsername`, not into
     // `username`/`authType`/`keyPath` (fields it doesn't have).
     const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
+    // REVIEW FINDING (P2) — the profile whose username this form is currently
+    // showing, checked against live state at Save by
+    // `inventoryAuthProfileRejection`. Seeded as `undefined` and NOT from any
+    // record: an Add form opens on `(None)` with the user's own default
+    // username in the field, so every username it ever displays FOR A PROFILE
+    // arrives through an `onAutofill` answer below — a selection, or
+    // `addSelectOption` after an inline create, both post one — and that is
+    // what "rendered" means on this path.
+    let renderedAuthProfile: RenderedSourceAuthProfile | undefined = undefined;
     const panel = WebviewFormPanel.open(`inventory-source-add-${provider.id}`, definition, {
       onSubmit: async (values) => {
         const parsed = await parseSourceFormValues(values, provider);
@@ -1532,6 +1695,7 @@ export function registerInventoryCommands(
           name: parsed.name,
           targetFolder: parsed.targetFolder,
           authProfileId: parsed.authProfileId,
+          renderedAuthProfile,
           defaultUsername: parsed.defaultUsername,
           prunePolicy: parsed.prunePolicy,
           provider,
@@ -1556,7 +1720,13 @@ export function registerInventoryCommands(
       },
       onTest: (values) => handleFormTest(values, provider, provider.label),
       onCreateInline: inlineAuthProfile.handleCreateInline,
-      onAutofill: async (_key, value) => authProfileUsernameMirror(core, value)
+      onAutofill: async (_key, value) => {
+        // ONE lookup feeds both: what the form is about to show, and what Save
+        // checks that against.
+        const profile = core.getAuthProfile(value);
+        renderedAuthProfile = renderedSourceAuthProfile(profile);
+        return authProfileUsernameMirror(profile);
+      }
     });
     inlineAuthProfile.attachPanel(panel);
   }
@@ -1688,7 +1858,20 @@ export function registerInventoryCommands(
     // earlier: the list both populates the select and decides whether the
     // seeded `source.authProfileId` survives sanitization, so a stale list
     // would render a real link as `(None)` and quietly drop it on Save.
-    const definition = inventorySourceFormDefinition(provider, source, undefined, core.getSnapshot().authProfiles);
+    const authProfiles = core.getSnapshot().authProfiles;
+    const definition = inventorySourceFormDefinition(provider, source, undefined, authProfiles);
+    // REVIEW FINDING (P2) — as addSource's, but seeded: this form opens already
+    // showing the LINKED profile's username in Default SSH Username, locked
+    // (`inventorySourceFormDefinition`'s render rule), so on Edit "rendered"
+    // starts as that render and is re-stamped by every later `onAutofill`
+    // answer. Read from the SAME list the definition above was built from — a
+    // second lookup could describe a profile this form never rendered. An id
+    // that resolves to nothing in that list stamps `undefined`, matching the
+    // definition's own sanitization of such a seed down to `(None)`.
+    let renderedAuthProfile: RenderedSourceAuthProfile | undefined =
+      source.authProfileId !== undefined
+        ? renderedSourceAuthProfile(authProfiles.find((profile) => profile.id === source.authProfileId))
+        : undefined;
     // Holding editSource's busy marker across inline profile creation is
     // correct and deliberate: creating a profile never touches the source
     // record, so nothing this controller does can race the edit it is nested
@@ -1723,6 +1906,7 @@ export function registerInventoryCommands(
               name: parsed.name,
               targetFolder: parsed.targetFolder,
               authProfileId: parsed.authProfileId,
+              renderedAuthProfile,
               defaultUsername: parsed.defaultUsername,
               prunePolicy: parsed.prunePolicy,
               provider,
@@ -1787,7 +1971,12 @@ export function registerInventoryCommands(
         },
         onTest: (values) => handleFormTest(values, provider, source.name, source),
         onCreateInline: inlineAuthProfile.handleCreateInline,
-        onAutofill: async (_key, value) => authProfileUsernameMirror(core, value)
+        onAutofill: async (_key, value) => {
+          // ONE lookup feeds both — see addSource's copy.
+          const profile = core.getAuthProfile(value);
+          renderedAuthProfile = renderedSourceAuthProfile(profile);
+          return authProfileUsernameMirror(profile);
+        }
       });
     } catch (error) {
       releaseInFlight();
