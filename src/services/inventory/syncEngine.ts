@@ -99,6 +99,77 @@ function hasOwnKeyPath(server: ServerConfig): boolean {
   return typeof server.keyPath === "string" && server.keyPath.trim() !== "";
 }
 
+/**
+ * AUTH 2b — what this sync must do about ONE owned server's link to a profile
+ * that can no longer honour it. Three outcomes, and the two that are not "none"
+ * are both reportable: `unlink` is what the sync DID, `retain-own-key` is what
+ * it deliberately did NOT do (REVIEW FINDING, P2 — the warning has to tell those
+ * apart, because a retained server keeps using the profile and is not on SSH
+ * agent authentication).
+ *
+ * REVIEW FINDING (P1) — extracted from the update loop it used to live inside,
+ * because the decision has nothing to do with whether THIS RUN can map the
+ * device to a usable endpoint. It reads the server's own three fields and the
+ * profile id, so both callers — the mapped path in the loop and the pass over
+ * owned servers the loop skipped — reach the same verdict from the same code.
+ * Duplicating the clauses instead was the alternative, and the one thing this
+ * rule cannot survive is its two halves drifting: `hasOwnKeyPath` is already
+ * shared with retro-apply for exactly that reason (a server unlinked by one rule
+ * and refused a re-link by another is unlinked forever).
+ *
+ * The clauses, and what each refuses to touch:
+ *  - `unusableProfileId !== undefined`: only the keyless-key case. A DELETED
+ *    profile never reaches here — NexusCore.removeAuthProfile already clears link
+ *    and stamp together — and a healthy profile has nothing to undo.
+ *  - `authProfileId === id && origin.syncedAuthProfileId === id`: the link is
+ *    THIS SYNC'S OWN, still exactly as it wrote it. A hand-set link carries no
+ *    matching stamp and is not the sync's to clear (the same opt-out rule
+ *    retro-apply reads, in the other direction), and a link the user has since
+ *    MOVED to another profile is likewise left alone.
+ *  - `hasOwnKeyPath`: a server that brings its own key file connects perfectly
+ *    well through a keyless key profile (the profile supplies authType and the
+ *    passphrase, the server supplies the key) — that is the pairing the ownership
+ *    rule exists to allow, so unlinking it would break a working server to fix
+ *    one that is not broken. It is `retain-own-key` rather than `none` so the
+ *    warning can say so: this server is the exception to the sentence about
+ *    synced servers having no key of their own.
+ *
+ * NOT scoped by `authType`: whatever the server's own type is, the profile
+ * overrides it at connect time, so every server that reaches `unlink` is unusable
+ * today and lands on its own credentials once unlinked.
+ */
+type SourceAuthRollback = "unlink" | "retain-own-key" | "none";
+
+function decideSourceAuthRollback(server: ServerConfig, unusableProfileId: string | undefined): SourceAuthRollback {
+  if (
+    unusableProfileId === undefined ||
+    server.authProfileId !== unusableProfileId ||
+    server.origin?.syncedAuthProfileId !== unusableProfileId
+  ) {
+    return "none";
+  }
+  return hasOwnKeyPath(server) ? "retain-own-key" : "unlink";
+}
+
+/**
+ * The record AUTH 2b writes when it unlinks: the link gone, and the stamp gone
+ * with it. Leaving the stamp behind would read as a per-server opt-out nobody
+ * chose and lock the server out of retro-apply forever — the same reasoning
+ * removeAuthProfile applies when a deleted profile's links are cleared.
+ *
+ * Nothing else on the record is touched, which is what makes the unlink safe to
+ * apply to a server whose device this sync could not map: it is not a partial
+ * device update, it is one field and its receipt.
+ */
+function withSourceLinkCleared(server: ServerConfig): ServerConfig {
+  const origin = server.origin;
+  return {
+    ...server,
+    authProfileId: undefined,
+    origin: origin === undefined ? undefined : { ...origin, syncedAuthProfileId: undefined }
+  };
+}
+
 /** N1 — appends one summary warning for a category of non-owned device skips, naming up to 3 examples. No-op when the category is empty. */
 function pushSkipSummary(warnings: string[], reason: string, examples: string[]): void {
   const count = examples.length;
@@ -163,10 +234,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   //
   // Degrading is only half of it, though (REVIEW FINDING, P1): refusing to stamp
   // stops NEW damage, while every server a previous sync already linked stays
-  // linked and stays unable to connect. AUTH 2b in the update loop is the other
-  // half — it UNDOES the links this source applied, which is also what makes the
-  // warning's "they use SSH agent authentication instead" true of the servers it
-  // is describing rather than only of the ones being created right now.
+  // linked and stays unable to connect. AUTH 2b (`decideSourceAuthRollback`, and
+  // the two passes that call it) is the other half — it UNDOES the links this
+  // source applied, which is also what makes the warning's "they use SSH agent
+  // authentication instead" true of the servers it is describing rather than only
+  // of the ones being created right now.
   //
   // The source form rejects this pairing where the user chooses it (see
   // `inventoryAuthProfileRejection` in commands/inventoryCommands.ts), so
@@ -178,14 +250,16 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const keylessKeyProfile = matchedProfile !== undefined && authProfileNeedsServerKeyPath(matchedProfile);
   const resolvedProfileId = keylessKeyProfile ? undefined : matchedProfile?.id;
   // AUTH 1c (REVIEW FINDING, P1) — the id whose SOURCE-APPLIED links this plan
-  // must UNDO, and `undefined` whenever there is nothing to undo. See AUTH 2b in
-  // the update loop for the per-server rule and why it is scoped this narrowly.
+  // must UNDO, and `undefined` whenever there is nothing to undo. See
+  // `decideSourceAuthRollback` for the per-server rule and why it is scoped this
+  // narrowly.
   const unusableProfileId = keylessKeyProfile ? matchedProfile?.id : undefined;
   // The warning below is composed here (where the reason is known) but pushed
-  // AFTER the device loop, because its final sentence has to state how many
-  // servers this sync actually unlinked — a number only the loop produces. It is
-  // then SPLICED back to this position rather than appended, so the ordering
-  // users see is unchanged: tree warnings, this one, then per-device warnings.
+  // AFTER both rollback passes, because its closing sentences have to state how
+  // many servers this sync actually unlinked and how many it deliberately left
+  // linked — numbers only those passes produce. It is then SPLICED back to this
+  // position rather than appended, so the ordering users see is unchanged: tree
+  // warnings, this one, then per-device warnings.
   const authWarningIndex = warnings.length;
   const emitAuthWarning = source.authProfileId !== undefined && resolvedProfileId === undefined;
 
@@ -193,8 +267,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const updates: Array<{ before: ServerConfig; after: ServerConfig }> = [];
   const prunes: InventorySyncPlan["prunes"] = [];
   let unchangedCount = 0;
-  /** AUTH 2b — how many source-applied links this plan UNDOES (see the update loop). */
+  /** AUTH 2b — how many source-applied links this plan UNDOES (see `decideSourceAuthRollback`). */
   let clearedLinkCount = 0;
+  /**
+   * AUTH 2b — how many source-applied links this plan deliberately LEAVES IN
+   * PLACE because the server brings its own key file (REVIEW FINDING, P2). Those
+   * servers go on using the profile, so the warning must not describe them as
+   * having no key and falling back to SSH agent authentication.
+   */
+  let retainedOwnKeyLinkCount = 0;
   const folderSet = new Set<string>();
 
   const serversById = new Map(currentServers.map((s) => [s.id, s] as const));
@@ -238,6 +319,19 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // otherwise a device the provider merely couldn't fully map looks
   // indistinguishable from one that was deleted at the source.
   const presentExternalIds = new Set<string>();
+  /**
+   * AUTH 2b (REVIEW FINDING, P1) — the externalIds whose owned server the device
+   * loop below actually REACHED, i.e. mapped to an endpoint and pushed as an
+   * update or counted as unchanged. Its complement (within `presentExternalIds`)
+   * is precisely the set of owned servers whose device the source still reports
+   * but this run could not map — empty name, no usable SSH endpoint, invalid
+   * port, or a duplicate externalId whose first-seen device was itself skipped —
+   * and those are the servers the rollback pass after the loop picks up.
+   *
+   * Recorded per externalId rather than per device so a duplicate device can
+   * never make the same owned server decide twice.
+   */
+  const decidedOwnedExternalIds = new Set<string>();
   let manualDuplicateCount = 0;
 
   // N1 — a device skip is only reported per-device when it could be masking
@@ -321,6 +415,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
 
     const ownedServer = ownedByExternalId.get(device.externalId);
     if (ownedServer) {
+      // This owned server is being decided HERE, with a mapped endpoint in hand;
+      // the rollback pass after the loop must not decide it a second time.
+      decidedOwnedExternalIds.add(device.externalId);
       // Field ownership: only name/host/port/group are always taken from the
       // device; username only when the endpoint supplies one. Everything
       // else (authProfileId, keyPath, proxy, multiplexing, isHidden,
@@ -534,15 +631,16 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         after.origin = { ...afterOrigin, syncedAuthProfileId: resolvedProfileId };
       }
 
-      // AUTH 2b (REVIEW FINDING, P1) — RETRO-UNAPPLY. Retro-apply above stops
-      // this sync from stamping a link the profile cannot honour; on its own that
-      // only prevents NEW damage. The servers a PREVIOUS sync linked while the
-      // profile still had a key file keep `authProfileId`, because everything the
-      // update path builds starts from `ownedServer` — so `SilentAuthSshFactory`
-      // still resolves them to `authType: "key"` with no key path anywhere and
-      // `buildConnectConfig` throws `Missing keyPath for key auth on <server>` on
-      // every connect. The old warning claimed those servers were on SSH agent
-      // authentication; they were not connecting at all.
+      // AUTH 2b (REVIEW FINDING, P1) — RETRO-UNAPPLY, for the servers this run
+      // DID map. Retro-apply above stops this sync from stamping a link the
+      // profile cannot honour; on its own that only prevents NEW damage. The
+      // servers a PREVIOUS sync linked while the profile still had a key file keep
+      // `authProfileId`, because everything the update path builds starts from
+      // `ownedServer` — so `SilentAuthSshFactory` still resolves them to
+      // `authType: "key"` with no key path anywhere and `buildConnectConfig`
+      // throws `Missing keyPath for key auth on <server>` on every connect. The
+      // old warning claimed those servers were on SSH agent authentication; they
+      // were not connecting at all.
       //
       // WHY CLEAR RATHER THAN ONLY REPORT. Reporting leaves a fleet down until
       // someone repairs the profile, and the sync cannot tell whether that ever
@@ -576,36 +674,16 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // and Show Warnings names every affected server — the same disclosure the
       // switch list gives the opposite direction.
       //
-      // The three clauses, and what each refuses to touch:
-      //  - `unusableProfileId !== undefined`: only the keyless-key case. A
-      //    DELETED profile never reaches here — NexusCore.removeAuthProfile
-      //    already clears link and stamp together — and a healthy profile has
-      //    nothing to undo.
-      //  - `authProfileId === id && origin.syncedAuthProfileId === id`: the link
-      //    is THIS SYNC'S OWN, still exactly as it wrote it. A hand-set link
-      //    carries no matching stamp and is not the sync's to clear (the same
-      //    opt-out rule retro-apply reads, in the other direction), and a link the
-      //    user has since MOVED to another profile is likewise left alone.
-      //  - `!hasOwnKeyPath(ownedServer)`: a server that brings its own key file
-      //    connects perfectly well through a keyless key profile (the profile
-      //    supplies authType and the passphrase, the server supplies the key) —
-      //    that is the pairing the ownership rule exists to allow, so unlinking it
-      //    would break a working server to fix one that is not broken.
+      // The clauses live in `decideSourceAuthRollback` (top of this file), which
+      // the pass after the loop calls with the same server fields and no endpoint
+      // at all — that shared verdict is the whole point of the extraction.
       //
-      // NOT scoped by `authType`: whatever the server's own type is, the profile
-      // overrides it at connect time, so every server matching the clauses above
-      // is unusable today and lands on its own credentials once unlinked.
-      //
-      // Only servers whose device is in this fetch are reachable here. One being
+      // Only servers whose device is in this fetch are decided at all. One being
       // PRUNED is out of the sync's active set by the policy the user chose —
       // "keep in place" and "move to _orphaned" both mean stop reconfiguring it —
       // and a "delete" prune removes it outright.
-      if (
-        unusableProfileId !== undefined &&
-        ownedServer.authProfileId === unusableProfileId &&
-        ownedServer.origin?.syncedAuthProfileId === unusableProfileId &&
-        !hasOwnKeyPath(ownedServer)
-      ) {
+      const mappedRollback = decideSourceAuthRollback(ownedServer, unusableProfileId);
+      if (mappedRollback === "unlink") {
         after.authProfileId = undefined;
         // The stamp goes with the link it describes — leaving it behind would
         // read as a per-server opt-out nobody chose and lock the server out of
@@ -613,6 +691,8 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // applies when a deleted profile's links are cleared.
         after.origin = { ...afterOrigin, syncedAuthProfileId: undefined };
         clearedLinkCount++;
+      } else if (mappedRollback === "retain-own-key") {
+        retainedOwnKeyLinkCount++;
       }
 
       // AUTH 3 — authProfileId joins the comparison because a retro-apply stamp
@@ -717,6 +797,67 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
   }
 
+  // AUTH 2b, SECOND PASS (REVIEW FINDING, P1) — the same rollback decision for
+  // every owned server the source STILL RECOGNISES but whose device this run
+  // could not map to a usable endpoint.
+  //
+  // The hole this closes: the decision used to live inside the update loop, after
+  // four `continue`s that mapping validation reaches first. A device with an
+  // empty name, no usable SSH endpoint, an invalid port, or a duplicate
+  // externalId whose first-seen copy was itself skipped never got as far as the
+  // rollback — so the servers that most need the repair were the ones excluded
+  // from it. That is not a corner: the NetBox provider emits a device with ZERO
+  // endpoints whenever it has no primary IP (it warns and carries on), and the
+  // server for that device is still there from the sync when it did have one.
+  // Losing an IP at the source is a routine maintenance state; being unable to
+  // connect to every such device until it comes back is not.
+  //
+  // A SEPARATE PASS rather than a reorder inside the loop, for three reasons:
+  //  - It cannot regress the skip semantics. The `continue`s, the warnings they
+  //    push and the FIX 1 present/absent bookkeeping are untouched, so a skipped
+  //    device still produces no add, no rename, no host/port change and no folder
+  //    move — this pass writes exactly one field and its receipt
+  //    (`withSourceLinkCleared`) and adds nothing to `folderSet`.
+  //  - It cannot double-decide. Reordering would have to run before validation
+  //    but after ownership resolution, and a duplicate device would then reach the
+  //    same owned server twice; `decidedOwnedExternalIds` makes "the loop already
+  //    decided this server" explicit instead of implicit in control flow.
+  //  - It states the actual rule. Whether a server's link is honourable has
+  //    nothing to do with whether today's fetch could map its device — mixing the
+  //    two is the bug, so the fix keeps them apart rather than interleaving them
+  //    more carefully.
+  //
+  // Absent devices stay out, exactly as before: `presentExternalIds` is FIX 1's
+  // "the source still reports this device" set, and an owned server missing from
+  // it is the prune phase's business under the policy the user chose. A skipped
+  // device is likewise still NOT prunable — this pass never touches that set.
+  for (const [externalId, ownedServer] of ownedByExternalId.entries()) {
+    if (decidedOwnedExternalIds.has(externalId) || !presentExternalIds.has(externalId)) {
+      continue;
+    }
+    const unmappedRollback = decideSourceAuthRollback(ownedServer, unusableProfileId);
+    if (unmappedRollback === "retain-own-key") {
+      retainedOwnKeyLinkCount++;
+      continue;
+    }
+    if (unmappedRollback !== "unlink") {
+      continue;
+    }
+    // Straight into `updates`, so this unlink is disclosed by the same machinery
+    // as the mapped one — the confirm modal's "will stop using auth profile" line,
+    // the named list behind Show Warnings, and the drift comparison all derive
+    // from `before.authProfileId !== after.authProfileId` and know nothing about
+    // which pass produced the pair.
+    //
+    // `origin.syncedAt` is deliberately NOT advanced: this sync did not map the
+    // device, so claiming it did would be the very confusion this pass exists to
+    // undo. Nothing reads `syncedAt` for eligibility (`serverOriginStampsEqual`
+    // ignores it), and the unlink does not repeat next sync — the link it keys on
+    // is gone.
+    updates.push({ before: ownedServer, after: withSourceLinkCleared(ownedServer) });
+    clearedLinkCount++;
+  }
+
   if (emitAuthWarning) {
     // Deliberately unconditional on counts: even a sync with zero adds, zero
     // updates and zero unlinks must say the link is dead, because the source form
@@ -734,11 +875,25 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       clearedLinkCount > 0
         ? ` ${clearedLinkCount} server${clearedLinkCount === 1 ? "" : "s"} this sync had already linked to it ${clearedLinkCount === 1 ? "is" : "are"} unlinked here so ${clearedLinkCount === 1 ? "it can connect" : "they can connect"} again; a later sync re-links ${clearedLinkCount === 1 ? "it" : "them"} once the profile has a key file.`
         : "";
+    // REVIEW FINDING (P2) — the same discipline for the servers the rollback
+    // deliberately LEFT LINKED. The sentence before it is a statement of policy
+    // about the records this sync WRITES ("servers this source creates"), which
+    // is exactly true of them: the add path stamps agent auth and no key, and
+    // retro-apply is refused while the profile is unusable. A server that has
+    // since been given a key file of its own is the one case where the policy's
+    // premise does not hold — it keeps the profile and goes on connecting through
+    // it — so saying nothing would leave the user reading "they use SSH agent
+    // authentication instead" about a server that does no such thing, and looking
+    // for an unlink that never happened.
+    const retainedNote =
+      retainedOwnKeyLinkCount > 0
+        ? ` ${retainedOwnKeyLinkCount} server${retainedOwnKeyLinkCount === 1 ? "" : "s"} this sync had already linked to it ${retainedOwnKeyLinkCount === 1 ? "keeps" : "keep"} the link, because ${retainedOwnKeyLinkCount === 1 ? "it carries a key file of its own" : "they carry key files of their own"} and still ${retainedOwnKeyLinkCount === 1 ? "connects" : "connect"} through the profile.`
+        : "";
     warnings.splice(
       authWarningIndex,
       0,
       keylessKeyProfile && matchedProfile !== undefined
-        ? `The auth profile "${matchedProfile.name}" for "${source.name}" uses private key authentication but has no key file — servers this source syncs have no key of their own, so the sync does not apply it: they use the default username with SSH agent authentication instead. Add a key file to the profile, or choose another.${clearedNote}`
+        ? `The auth profile "${matchedProfile.name}" for "${source.name}" uses private key authentication but has no key file — servers this source creates have no key of their own, so the sync does not apply it: they use the default username with SSH agent authentication instead. Add a key file to the profile, or choose another.${clearedNote}${retainedNote}`
         : `The auth profile for "${source.name}" no longer exists — synced servers use the default username with SSH agent authentication. Edit the source to choose another profile.`
     );
   }

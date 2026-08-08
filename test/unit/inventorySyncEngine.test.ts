@@ -929,8 +929,17 @@ describe("computeSyncPlan — auth profile link", () => {
 
   // Pinned verbatim, same reason as DANGLING_WARNING: this is what the
   // plan-preview modal shows. makeSource()'s name is "NetBox".
+  //
+  // REVIEW FINDING (P2) — "servers this source CREATES", not "syncs". The
+  // sentence is a statement of policy about the records the sync writes, and of
+  // those it is exactly true (the add path stamps agent auth and no key path, and
+  // retro-apply is refused while the profile is unusable). Said of every server
+  // the source has ever synced it was false for the one shape this rule
+  // deliberately leaves alone — a server given a key file of its own, which keeps
+  // the profile and goes on connecting through it — and that server is now named
+  // by its own trailing sentence rather than contradicted by this one.
   const KEYLESS_KEY_WARNING =
-    'The auth profile "Shared Key" for "NetBox" uses private key authentication but has no key file — servers this source syncs have no key of their own, so the sync does not apply it: they use the default username with SSH agent authentication instead. Add a key file to the profile, or choose another.';
+    'The auth profile "Shared Key" for "NetBox" uses private key authentication but has no key file — servers this source creates have no key of their own, so the sync does not apply it: they use the default username with SSH agent authentication instead. Add a key file to the profile, or choose another.';
 
   it("AUTH 1b — a source linked to a key profile with no key file adds servers that can actually open a connection, and says why the link was not used (kills stamping a link whose authType every synced server is unable to satisfy)", async () => {
     const source = makeSource({ authProfileId: "p1", defaultUsername: "labuser" });
@@ -1195,9 +1204,19 @@ describe("computeSyncPlan — auth profile link", () => {
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.unchangedCount).toBe(1);
-    // Pinned as the bare warning: an over-broad implementation both unlinks this
-    // server AND appends "1 server … is unlinked here" to this text.
-    expect(plan.warnings).toContain(KEYLESS_KEY_WARNING);
+    // An over-broad implementation both unlinks this server AND appends
+    // "1 server … is unlinked here" to this text, so the absence of that clause
+    // is asserted as part of the exact string.
+    //
+    // REVIEW FINDING (P2) — and the retained clause is asserted verbatim in its
+    // place. Under the wrong implementation (the unconditional sentence this
+    // replaced) the user is told this server has no key of its own and is using
+    // SSH agent authentication; it has one, it is still on the profile, and the
+    // whole point of reading this warning is to know which servers the sync
+    // touched.
+    expect(plan.warnings).toContain(
+      `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it keeps the link, because it carries a key file of its own and still connects through the profile.`
+    );
 
     // Why it must be left alone: the pairing works. The profile supplies the
     // auth type (and its passphrase), the server supplies the key.
@@ -1250,6 +1269,194 @@ describe("computeSyncPlan — auth profile link", () => {
     expect(plan.updates[0].after.authProfileId).toBeUndefined();
   });
 
+  /**
+   * REVIEW FINDING (P1) — the rollback ran INSIDE the update loop, after four
+   * `continue`s that mapping validation reaches first, so it was skipped for
+   * exactly the servers most likely to need it.
+   *
+   * The faithful case, and the reason this is a P1 rather than a curiosity: the
+   * NetBox provider emits a device with ZERO endpoints when it has no primary IP
+   * (documented, deliberate — it warns and carries on), and the server for that
+   * device is still there from the sync when it did have one. So a source whose
+   * key profile lost its key file left every de-IP'd device's server linked and
+   * unable to connect, with no route back short of hand-editing each one — while
+   * the plan's own warning said those servers were on SSH agent authentication.
+   *
+   * Asserted through `buildConnectConfig` at both ends for the same reason the
+   * mapped case is: "still linked" IS the failure, and only the function that
+   * builds what is sent to the SSH server can tell a repaired record from a
+   * plausible-looking one.
+   */
+  it("AUTH 2b decides the rollback for an owned server whose device this run cannot map — the no-primary-IP case — so that server can open a connection again (kills running the rollback after mapping validation's skips)", async () => {
+    // "delete" rather than the fixture default, so a pass that mistook a skipped
+    // device for an absent one would DELETE this server rather than merely move it.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin", prunePolicy: "delete" });
+    const before = previouslyLinkedServer();
+
+    // The premise, proven rather than assumed.
+    const brokenResolved = await resolveThroughConnect(before, KEYLESS_KEY_PROFILE);
+    expect(brokenResolved.authType).toBe("key");
+    await expect(buildConnectConfig(brokenResolved)).rejects.toThrow("Missing keyPath for key auth on core-sw-1");
+
+    const plan = computeSyncPlan({
+      source,
+      // Exactly what the provider emits for a device with no primary IP: present,
+      // named, zero endpoints. Renamed at the source as well, so a "fix" that
+      // simply moved the validation exits below the update-building would be
+      // visible as a rename this sync has no business writing.
+      tree: makeTree([makeDevice({ name: "renamed-at-source", endpoints: [] })]),
+      currentServers: [before],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+
+    // Under the wrong implementation this plan is empty and the server stays
+    // linked, unusable, forever.
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.authProfileId).toBeUndefined();
+    expect(after.origin?.syncedAuthProfileId).toBeUndefined();
+
+    // The skip semantics are untouched. No add; no prune (FIX 1 — a device the
+    // provider could not map is not a deleted device); the per-device warning
+    // still names it; no rename, no folder move, and no claim that this sync
+    // mapped the device.
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.prunes).toHaveLength(0);
+    expect(plan.warnings).toContain('Device "renamed-at-source" (device:1) has no usable SSH endpoint and was skipped.');
+    expect(after.name).toBe("core-sw-1");
+    expect(after.host).toBe("10.0.0.1");
+    expect(after.port).toBe(22);
+    expect(after.group).toBe("NetBox");
+    expect(after.username).toBe("admin");
+    expect(after.origin?.syncedAt).toBe(1000);
+    expect(after.origin?.syncedUsername).toBe("admin");
+    expect(plan.folders).toEqual(["NetBox"]);
+
+    // THE ASSERTION THAT MATTERS — the record this plan writes connects.
+    const resolved = await resolveThroughConnect(after, KEYLESS_KEY_PROFILE);
+    expect(resolved.authType).toBe("agent");
+    const config = await buildConnectConfig(resolved);
+    expect(config).toMatchObject({ host: "10.0.0.1", port: 22, username: "admin" });
+    expect(config.privateKey).toBeUndefined();
+  });
+
+  it("AUTH 2b covers the other mapping-validation skips too — an empty device name and an invalid port — without letting either device write anything else (kills a fix that special-cases only the no-endpoint skip)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const emptyNamed = previouslyLinkedServer();
+    const badPort = previouslyLinkedServer({
+      id: deterministicServerId("source-1", "device:2"),
+      name: "core-sw-2",
+      host: "10.0.0.2",
+      origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" }
+    });
+
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([
+        // Both devices carry a DIFFERENT host (and the second a different name)
+        // than the server they own, so any implementation that reaches the
+        // rollback by letting a skipped device fall through into the update path
+        // shows up as a host change or a rename rather than as a passing test.
+        makeDevice({ name: "", endpoints: [{ kind: "ssh", host: "10.9.9.9" }] }),
+        makeDevice({ externalId: "device:2", name: "renamed-at-source", endpoints: [{ kind: "ssh", host: "10.9.9.9", port: 0 }] })
+      ]),
+      currentServers: [emptyNamed, badPort],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+
+    expect(plan.updates).toHaveLength(2);
+    for (const update of plan.updates) {
+      expect(update.after.authProfileId).toBeUndefined();
+      expect(update.after.origin?.syncedAuthProfileId).toBeUndefined();
+      expect(update.after.host).toBe(update.before.host);
+      expect(update.after.name).toBe(update.before.name);
+      expect(update.after.port).toBe(22);
+    }
+    // The skips themselves are still skips.
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.warnings).toContain('Device "device:1" has an empty name and was skipped.');
+    expect(plan.warnings).toContain('Device "renamed-at-source" (device:2) has an invalid port 0 and was skipped.');
+    expect(plan.warnings).toContain(
+      `${KEYLESS_KEY_WARNING} 2 servers this sync had already linked to it are unlinked here so they can connect again; a later sync re-links them once the profile has a key file.`
+    );
+  });
+
+  it("AUTH 2b decides an owned server exactly once when the source reports its device twice and the first copy is itself skipped (kills deciding per device rather than per owned server)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+
+    const plan = computeSyncPlan({
+      source,
+      // First copy: skipped for having no endpoint — and it is the copy that
+      // claims the externalId, so the second is skipped as a duplicate. Neither
+      // reaches the update path, and the owned server behind them is one server.
+      tree: makeTree([makeDevice({ endpoints: [] }), makeDevice({ name: "core-sw-1-again" })]),
+      currentServers: [previouslyLinkedServer()],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+
+    // A rollback moved ABOVE the validation exits instead of into its own pass
+    // decides this server once per device: two updates for one record, and a
+    // warning claiming two servers were unlinked when there is only one.
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.authProfileId).toBeUndefined();
+    expect(plan.warnings).toContain('Duplicate device ID "device:1" — kept first ("core-sw-1").');
+    expect(plan.warnings).toContain(
+      `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it is unlinked here so it can connect again; a later sync re-links it once the profile has a key file.`
+    );
+  });
+
+  it("AUTH 2b still leaves a server whose device is GONE from the fetch to the prune policy (kills a pass over every owned server, which would rewrite the credentials of a server the same plan reports as kept in place)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin", prunePolicy: "keep" });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([]),
+      currentServers: [previouslyLinkedServer()],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.prunes).toEqual([{ policy: "keep", server: previouslyLinkedServer() }]);
+    // Bare: no unlink happened, so the warning must not claim one.
+    expect(plan.warnings).toContain(KEYLESS_KEY_WARNING);
+  });
+
+  it("the pass over unmapped devices applies the same clauses as the mapped one — a hand-set link is left alone, and a server with its own key is retained AND reported as retained (kills an unmapped pass that unlinks whatever it finds)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    // Linked by hand: carries the profile but no stamp naming it. Not the sync's to clear.
+    const handLinked = makeOwnedServer({
+      authProfileId: "p1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+    // The sync's own link, on a server that has since been given its own key file:
+    // the pairing still connects, so the link stays.
+    const withOwnKey = previouslyLinkedServer({
+      id: deterministicServerId("source-1", "device:2"),
+      name: "core-sw-2",
+      host: "10.0.0.2",
+      authType: "key",
+      keyPath: "/keys/own_ed25519",
+      origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" }
+    });
+
+    const plan = computeSyncPlan({
+      source,
+      // Both devices unmappable — the pass is the only thing that sees them.
+      tree: makeTree([makeDevice({ endpoints: [] }), makeDevice({ externalId: "device:2", name: "core-sw-2", endpoints: [] })]),
+      currentServers: [handLinked, withOwnKey],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.warnings).toContain(
+      `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it keeps the link, because it carries a key file of its own and still connects through the profile.`
+    );
+  });
+
   // Pinned verbatim in both grammatical numbers: this sentence is the finding.
   // The old text told the user that servers already linked to the profile were
   // using SSH agent authentication while they were in fact unable to connect,
@@ -1288,6 +1495,82 @@ describe("computeSyncPlan — auth profile link", () => {
     });
     expect(two.warnings).toContain(
       `${KEYLESS_KEY_WARNING} 2 servers this sync had already linked to it are unlinked here so they can connect again; a later sync re-links them once the profile has a key file.`
+    );
+  });
+
+  /**
+   * REVIEW FINDING (P2) — the same discipline for the other outcome. The warning
+   * stated one policy unconditionally ("servers … have no key of their own …
+   * they use the default username with SSH agent authentication instead") while
+   * the rollback right above it deliberately LEFT a server linked, still using
+   * the profile, because it carries a key file of its own — a state a user
+   * reaches simply by giving one synced server its own key after the profile
+   * lost its. The reader was told an unlink had happened to a server it had not
+   * happened to.
+   *
+   * Both directions in one plan, because that is where the old text was most
+   * wrong and where a partial fix (count the unlinks, say nothing about the
+   * retentions) still reads as though every linked server was cleared.
+   */
+  it("the warning reports the links it deliberately kept as well as the ones it cleared, so neither set is described as the other (kills an unconditional sentence that puts a retained own-key server on SSH agent authentication)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([
+        makeDevice(),
+        makeDevice({ externalId: "device:2", name: "core-sw-2", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] })
+      ]),
+      currentServers: [
+        // No key of its own — unlinked.
+        previouslyLinkedServer(),
+        // Its own key — the pairing works, so the link stays.
+        previouslyLinkedServer({
+          id: deterministicServerId("source-1", "device:2"),
+          name: "core-sw-2",
+          host: "10.0.0.2",
+          authType: "key",
+          keyPath: "/keys/own_ed25519",
+          origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" }
+        })
+      ],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].before.name).toBe("core-sw-1");
+    expect(plan.warnings).toContain(
+      `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it is unlinked here so it can connect again; a later sync re-links it once the profile has a key file.` +
+        " 1 server this sync had already linked to it keeps the link, because it carries a key file of its own and still connects through the profile."
+    );
+  });
+
+  it("the retained-link sentence is plural-correct, and appears with no unlink sentence when nothing was unlinked (kills a note welded onto the unlink count)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const ownKey = (externalId: string, name: string, host: string): ServerConfig =>
+      previouslyLinkedServer({
+        id: deterministicServerId("source-1", externalId),
+        name,
+        host,
+        authType: "key",
+        keyPath: "/keys/own_ed25519",
+        origin: { sourceId: "source-1", externalId, syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" }
+      });
+
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([
+        makeDevice(),
+        makeDevice({ externalId: "device:2", name: "core-sw-2", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] })
+      ]),
+      currentServers: [ownKey("device:1", "core-sw-1", "10.0.0.1"), ownKey("device:2", "core-sw-2", "10.0.0.2")],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.warnings).toContain(
+      `${KEYLESS_KEY_WARNING} 2 servers this sync had already linked to it keep the link, because they carry key files of their own and still connect through the profile.`
     );
   });
 
