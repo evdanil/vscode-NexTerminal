@@ -3701,6 +3701,134 @@ describe("inventoryCommands", () => {
       expect(core.getSnapshot().inventorySources[0].authProfileId).toBeUndefined();
     });
 
+    it("addSource refuses to save a profile deleted while the form sat open, and rolls back its vault write (kills persisting a dangling reference on the one path that has no record to revision-guard)", async () => {
+      const { core, vault } = await makeHarness({ profiles: [LAB_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      // The profile the still-open form's select points at is deleted
+      // elsewhere (AuthProfileEditorPanel -> NexusCore.removeAuthProfile).
+      // Nothing references it yet, so removeAuthProfile clears nothing and
+      // there is no record here to carry a bumped revision anyway.
+      await core.removeAuthProfile("p1");
+
+      await expect(
+        onSubmit({
+          name: "My NetBox",
+          targetFolder: "Infra",
+          authProfileId: "p1",
+          defaultUsername: "labuser",
+          prunePolicy: "orphan",
+          cfg_host: "netbox.local",
+          cfg_apiToken: "secret-token"
+        })
+      ).rejects.toThrow(/The selected auth profile no longer exists/);
+
+      // Without the pre-persist re-resolve the source IS created, carrying an
+      // id that resolves to nothing — and every later sync of it silently
+      // falls back to the default username with SSH agent auth.
+      expect(core.getSnapshot().inventorySources).toEqual([]);
+
+      // Vault-first means the API token was already written by the time the
+      // rejection lands; with no source record to enumerate it, an un-rolled-
+      // back key would be orphaned forever.
+      const storedKey = vault.store.mock.calls.at(-1)?.[0] as string | undefined;
+      expect(storedKey).toBeDefined();
+      expect(await vault.get(storedKey!)).toBeUndefined();
+    });
+
+    it("editSource refuses to switch onto a profile deleted while the form sat open, even though the ITEM 4 revision guard cannot see it (kills leaning on removeAuthProfile's re-revisioning, which only touches sources ALREADY referencing the profile)", async () => {
+      const otherProfile: AuthProfile = { id: "p2", name: "Other", username: "otheruser", authType: "password" };
+      const { core, vault } = await makeHarness({ profiles: [LAB_PROFILE, otherProfile], source: { authProfileId: "p1" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+
+      const revisionBefore = core.getInventorySource("src-1")!.revision;
+      // p2 — the profile the user picked in the open form, which this source
+      // is NOT yet linked to — is deleted elsewhere.
+      await core.removeAuthProfile("p2");
+      // Precisely why ITEM 4 can't catch this one: the source never referenced
+      // p2, so removeAuthProfile leaves its revision (and every other field)
+      // alone and the drift guard sees no drift at all.
+      expect(core.getInventorySource("src-1")!.revision).toBe(revisionBefore);
+
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          authProfileId: "p2",
+          defaultUsername: "labuser",
+          prunePolicy: "orphan",
+          cfg_host: "netbox.local",
+          cfg_apiToken: "new-token"
+        })
+      ).rejects.toThrow(/The selected auth profile no longer exists/);
+
+      // The record must be left exactly as the user last saved it — still on
+      // p1. Neither switched to a dangling p2 nor silently cleared to (None):
+      // both would hand this source's next sync the default username plus SSH
+      // agent auth without ever saying so.
+      expect(core.getInventorySource("src-1")?.authProfileId).toBe("p1");
+      expect(core.getInventorySource("src-1")?.revision).toBe(revisionBefore);
+
+      // This run's re-entered secret is restored to its pre-run value, same as
+      // every other rejection inside this critical section.
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("tok");
+    });
+
+    it("a profile that still exists saves normally even when a DIFFERENT profile was just deleted (kills a re-check that rejects on any deletion, or that resolves against the option list captured when the form opened)", async () => {
+      const otherProfile: AuthProfile = { id: "p2", name: "Other", username: "otheruser", authType: "password" };
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE, otherProfile] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await core.removeAuthProfile("p2");
+
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        authProfileId: "p1",
+        defaultUsername: "labuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      expect(core.getSnapshot().inventorySources[0].authProfileId).toBe("p1");
+    });
+
+    it("clearing to (None) still saves when the profile the form offered has since been deleted (kills a re-check that fires on the empty selection instead of only on a chosen id)", async () => {
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE], source: {} });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+
+      // Deleting a profile this source never referenced leaves its revision
+      // untouched, so the ITEM 4 guard stays out of the way and the save
+      // reaches the auth-profile re-check with `undefined` in hand.
+      await core.removeAuthProfile("p1");
+
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Infra",
+        authProfileId: "",
+        defaultUsername: "labuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      });
+
+      // `undefined` is a deliberate answer, not a stale reference — a lookup
+      // that skips the "was anything even chosen" guard resolves it to
+      // "missing" and blocks a save the user is entitled to.
+      expect(core.getInventorySource("src-1")?.authProfileId).toBeUndefined();
+      await flushDetached();
+      expect(mockShowInformationMessage.mock.calls.map((call) => call[0])).toEqual(['Inventory source "My Source" updated.']);
+    });
+
     it("addSource wires inline auth-profile creation end to end and an autofill that mirrors ONLY defaultUsername (kills the server form's {username, authType, keyPath} payload, an unwired onAutofill, and a controller that is never attached to the panel)", async () => {
       const { core } = await makeHarness({ profiles: [LAB_PROFILE] });
 

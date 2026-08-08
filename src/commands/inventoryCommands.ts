@@ -470,11 +470,11 @@ async function parseSourceFormValues(
   // dangling reference and warn on every sync. Normalized to `undefined`
   // here, once, so nothing downstream has to know about the empty option.
   //
-  // No existence check against core: the select only ever offers ids that
-  // exist, and every downstream consumer already degrades safely on a
-  // reference that stops resolving (form seed sanitization, the engine's
-  // dangling-profile warning, removeAuthProfile's ref clearing). This
-  // mirrors formValuesToServer, which likewise persists the posted id as-is.
+  // No existence check HERE: parsing has no core access, and a check at this
+  // point would sit an entire keychain round trip away from the write it is
+  // meant to protect. The posted id is re-resolved against live core state
+  // immediately before the record is persisted instead — see
+  // MISSING_AUTH_PROFILE_MESSAGE and the two persist helpers below.
   const rawAuthProfileId = values.authProfileId;
   const authProfileId = typeof rawAuthProfileId === "string" && rawAuthProfileId !== "" ? rawAuthProfileId : undefined;
 
@@ -491,6 +491,35 @@ async function parseSourceFormValues(
 
   return { name, targetFolder, authProfileId, defaultUsername, prunePolicy, config, secrets };
 }
+
+/**
+ * REVIEW FINDING (P2) — shared by both persist helpers below, which re-resolve
+ * the form's selected auth profile against LIVE core state immediately before
+ * writing the source record.
+ *
+ * WHY A LATE RE-CHECK AT ALL: the select is populated once, when the form
+ * opens, and the form can then sit open indefinitely. Deleting that profile in
+ * the meantime (AuthProfileEditorPanel -> NexusCore.removeAuthProfile) leaves
+ * the still-open form posting an id that no longer names anything.
+ * removeAuthProfile's own reference clearing cannot help: it only touches
+ * sources that ALREADY reference the profile. So the two cases it re-revisions
+ * nothing for — an Add form (no record yet, hence nothing for the edit path's
+ * ITEM 4 drift guard to compare against) and an Edit form switching a source
+ * ONTO a profile it wasn't linked to — would persist a dangling reference,
+ * and every later sync of that source would quietly fall back to the default
+ * username with SSH agent auth: the exact defect this link exists to prevent,
+ * with only a per-sync warning to show for it.
+ *
+ * WHY REJECT RATHER THAN CLEAR TO `(None)`: the user made an explicit
+ * credential choice that can no longer be honoured. Saving without it is how
+ * synced devices land on credentials nobody chose; refusing keeps the form
+ * open (WebviewFormPanel's "Save failed: ..." banner) with the choice intact
+ * so it can be re-pointed or deliberately cleared.
+ *
+ * Named, not id'd: this file's copy never shows a UUID (m3), and the profile
+ * is gone by now, so there is no name left to quote either.
+ */
+const MISSING_AUTH_PROFILE_MESSAGE = "The selected auth profile no longer exists. Choose another, or clear the Auth Profile field.";
 
 export interface NewInventorySourceInput {
   name: string;
@@ -579,6 +608,35 @@ async function persistNewInventorySource(
       secretFieldIds,
       providerFingerprint: computeProviderFingerprint(provider)
     };
+
+    // REVIEW FINDING (P2) — re-resolve the selected profile against live core
+    // state (see MISSING_AUTH_PROFILE_MESSAGE for why this exists and why it
+    // rejects instead of clearing). This path has no drift guard of its own:
+    // there is no prior record, so nothing to compare a revision against.
+    //
+    // TOCTOU: NexusCore.removeAuthProfile deliberately does NOT take
+    // configMutationLock, so holding that lock here excludes import/reset but
+    // not a profile deletion. What actually closes the window is that no
+    // `await` separates this check from the addOrUpdateInventorySource call
+    // below — on the extension host's single thread nothing else can run
+    // between them. A deletion landing later, during that call's own awaited
+    // persist, is harmless: addOrUpdateInventorySource inserts the record into
+    // the map synchronously before its first await, so removeAuthProfile finds
+    // this source and clears the reference off it exactly as it would for any
+    // other holder.
+    if (authProfileId !== undefined && core.getAuthProfile(authProfileId) === undefined) {
+      // Same best-effort rollback as FINDING B / FINDING 1 below: the source
+      // is not created on this path either, so nothing would ever enumerate
+      // these keys to clean them up.
+      for (const fieldId of secretFieldIds) {
+        try {
+          await vault.delete(inventorySecretKey(id, fieldId));
+        } catch {
+          // best-effort rollback — ignore
+        }
+      }
+      throw new Error(MISSING_AUTH_PROFILE_MESSAGE);
+    }
 
     // FINDING 1 — if persisting the new source record fails, the vault keys
     // just written above have no source to be enumerated/cleaned up by, so
@@ -717,6 +775,23 @@ async function persistUpdatedInventorySource(
     if (!currentSourceBeforePersist || !sourceConfigUnchanged(currentSourceBeforePersist, source) || currentSourceBeforePersist.name !== source.name) {
       await rollbackThisRunsVaultWrites();
       throw new Error("Inventory source changed while editing — reopen Edit Source.");
+    }
+
+    // REVIEW FINDING (P2) — the same live re-resolve the create path does; see
+    // MISSING_AUTH_PROFILE_MESSAGE for the rationale and
+    // persistNewInventorySource for the TOCTOU reasoning (identical here: no
+    // `await` separates this check from the persist below).
+    //
+    // Deliberately AFTER the ITEM 4 guard, not folded into it. The two catch
+    // different things and ITEM 4's answer ("reopen Edit Source") is the more
+    // fundamental one when both apply: removeAuthProfile re-revisions ONLY the
+    // sources that already reference the deleted profile, so a source that was
+    // already linked trips ITEM 4 and is told to reopen, while a source being
+    // switched ONTO that profile keeps its revision, sails through ITEM 4
+    // untouched, and is caught here.
+    if (authProfileId !== undefined && core.getAuthProfile(authProfileId) === undefined) {
+      await rollbackThisRunsVaultWrites();
+      throw new Error(MISSING_AUTH_PROFILE_MESSAGE);
     }
 
     // FINDING 1 — persist BEFORE any vault cleanup. If persistence rejects,
