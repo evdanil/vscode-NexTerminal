@@ -139,7 +139,7 @@ If your target server is behind a firewall or bastion host:
 If your device inventory already lives in NetBox, you don't have to re-type it:
 
 1. Run `Nexus: Add Inventory Source (NetBox)` — or open **Settings → Inventory Sources**, which lists every configured source with **Sync Now**, **Edit**, and **Remove**
-2. Enter your NetBox base URL and an API token with read access to DCIM (and Virtualization, if you include VMs). The token is stored in VS Code SecretStorage, and **Test Connection** verifies the pair before you save
+2. Enter your NetBox base URL and an API token with read access to DCIM (and Virtualization, if you include VMs). The token is stored in VS Code SecretStorage. **Test Connection** confirms the URL is reachable and the token is accepted — it does not check that the token can read your devices, so a token NetBox accepts but hasn't granted DCIM access will pass here and fail on the first sync
 3. Optionally narrow the sync with a device filter (e.g. `status=active&site=syd`), shape the folder layout with a template (`{site}/{rack}` by default), and set a **Target Folder** to keep synced servers under
 4. Pick an **Auth Profile** so the servers the sync creates can actually connect — choose an existing profile or create one inline without leaving the form. Its username fills the **Default SSH Username** field; with **(None)**, servers use the default username with SSH agent authentication
 5. Save, then choose **Sync Now**. The plan is shown before anything is applied — how many servers will be added, updated, moved, or removed, and, when credentials would change, exactly which servers by name under **Show Warnings**
