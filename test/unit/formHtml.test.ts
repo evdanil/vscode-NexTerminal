@@ -525,9 +525,142 @@ describe("renderFormHtml", () => {
     };
     const html = renderFormHtml(definition);
     expect(html).toContain("if (input.type === \"hidden\") continue;");
-    expect(html).toContain("input.readOnly = isLinked || input.dataset.baseReadonly === \"true\";");
-    expect(html).toContain("button.disabled = isLinked || button.dataset.baseDisabled === \"true\";");
+    expect(html).toContain("input.readOnly = locked || input.dataset.baseReadonly === \"true\";");
+    expect(html).toContain("button.disabled = locked || button.dataset.baseDisabled === \"true\";");
     expect(html).toContain("trigger.style.pointerEvents = \"none\"");
+  });
+
+  /**
+   * FINDING 2 (P2) — the lock half of the blank-username fix. Exercised by
+   * running the real `updateProfileManagedFields` out of the rendered script
+   * against a stub DOM (same extract-and-invoke idiom as
+   * macroEditorHtml.test.ts), because a string assertion cannot tell whether
+   * the guard actually keeps an empty field editable.
+   */
+  describe("updateProfileManagedFields — locking only what the linked profile filled", () => {
+    interface StubElement {
+      tagName: string;
+      type?: string;
+      value?: string;
+      readOnly: boolean;
+      disabled?: boolean;
+      dataset: Record<string, string | undefined>;
+      style: Record<string, string>;
+      closest?: (selector: string) => unknown;
+    }
+
+    function extractUpdateProfileManagedFields(html: string): (doc: unknown) => void {
+      const signature = "function updateProfileManagedFields()";
+      const start = html.indexOf(signature);
+      expect(start).toBeGreaterThan(-1);
+      let depth = 0;
+      let end = -1;
+      for (let i = html.indexOf("{", start); i < html.length; i++) {
+        if (html[i] === "{") depth++;
+        else if (html[i] === "}") {
+          depth--;
+          if (depth === 0) {
+            end = i;
+            break;
+          }
+        }
+      }
+      expect(end).toBeGreaterThan(start);
+      const source = html.slice(start, end + 1);
+      // `document` is the only global the extracted function touches, so it is
+      // injected as the factory's parameter and closed over by the returned
+      // function — one stub DOM per invocation.
+      const factory = new Function("document", `${source}\nreturn updateProfileManagedFields;`) as (
+        doc: unknown
+      ) => () => void;
+      return (doc: unknown) => factory(doc)();
+    }
+
+    /**
+     * One managed field ("defaultUsername") in its own .form-group, plus the
+     * Auth Profile select's hidden input that decides `isLinked`. `button`
+     * models the Browse/Clear pair a file-typed managed field (keyPath) carries
+     * in the same group.
+     */
+    function makeDom(opts: { linkedProfileId: string; fieldValue: string }) {
+      const field: StubElement = {
+        tagName: "INPUT",
+        type: "text",
+        value: opts.fieldValue,
+        readOnly: false,
+        dataset: {},
+        style: {}
+      };
+      const button: StubElement = {
+        tagName: "BUTTON",
+        readOnly: false,
+        disabled: false,
+        dataset: {},
+        style: {}
+      };
+      const group = {
+        querySelectorAll: (selector: string): StubElement[] =>
+          selector === "input, textarea" ? [field] : selector === "button" ? [button] : [],
+        querySelector: (): unknown => null
+      };
+      field.closest = (selector: string) => (selector === ".form-group" ? group : null);
+      const profileWrapper = {
+        querySelector: (): unknown => ({ value: opts.linkedProfileId })
+      };
+      const document = {
+        getElementById: (id: string): unknown => {
+          if (id === "field-authProfileId") return profileWrapper;
+          if (id === "field-defaultUsername") return field;
+          return null;
+        }
+      };
+      return { document, field, button };
+    }
+
+    const run = renderFormHtml({ title: "Test", fields: [] });
+
+    it("locks a managed field the profile filled", () => {
+      const update = extractUpdateProfileManagedFields(run);
+      const { document, field, button } = makeDom({ linkedProfileId: "ap1", fieldValue: "labuser" });
+      update(document);
+      expect(field.readOnly).toBe(true);
+      expect(field.style.opacity).toBe("0.6");
+      expect(button.disabled).toBe(true);
+    });
+
+    it("leaves a managed field the linked profile left EMPTY editable (kills locking on `isLinked` alone, which freezes a required field the mirror never filled — an imported profile with a whitespace-only username, or a key profile with no key path — leaving the user nothing to correct and Save permanently refused)", () => {
+      const update = extractUpdateProfileManagedFields(run);
+      const { document, field, button } = makeDom({ linkedProfileId: "ap1", fieldValue: "" });
+      update(document);
+      expect(field.readOnly).toBe(false);
+      expect(field.style.opacity).toBe("");
+      expect(button.disabled).toBe(false);
+    });
+
+    it("treats a whitespace-only field value as empty too (kills a bare `!== \"\"` check that a mirrored \"   \" would satisfy)", () => {
+      const update = extractUpdateProfileManagedFields(run);
+      const { document, field } = makeDom({ linkedProfileId: "ap1", fieldValue: "   " });
+      update(document);
+      expect(field.readOnly).toBe(false);
+    });
+
+    it("never locks an unlinked field, however filled (kills dropping the isLinked half of the condition)", () => {
+      const update = extractUpdateProfileManagedFields(run);
+      const { document, field, button } = makeDom({ linkedProfileId: "", fieldValue: "hand-typed" });
+      update(document);
+      expect(field.readOnly).toBe(false);
+      expect(button.disabled).toBe(false);
+    });
+
+    it("still honours a field's own baseline readonly/disabled state when unlocked (kills using the computed lock to UNLOCK a natively read-only field, e.g. the file input behind Browse)", () => {
+      const update = extractUpdateProfileManagedFields(run);
+      const { document, field, button } = makeDom({ linkedProfileId: "ap1", fieldValue: "" });
+      field.readOnly = true;
+      button.disabled = true;
+      update(document);
+      expect(field.readOnly).toBe(true);
+      expect(button.disabled).toBe(true);
+    });
   });
 
   it("locks Default SSH Username alongside the server form's credential fields while a profile is linked", () => {

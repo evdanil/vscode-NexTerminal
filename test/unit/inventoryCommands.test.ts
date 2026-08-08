@@ -3905,9 +3905,15 @@ describe("inventoryCommands", () => {
       expect(updated.defaultUsername).toBe("hand-typed");
     });
 
-    it("a profile whose username is whitespace-only falls back to the submitted username (kills storing an unusable/empty defaultUsername that validateInventorySource drops the whole record for)", async () => {
+    it("a profile whose username is whitespace-only falls back to the submitted username when Save beats the mirror (kills storing an unusable/empty defaultUsername that validateInventorySource drops the whole record for)", async () => {
       // Only reachable through an imported backup: the profile editor trims and
       // refuses a blank username, but validateAuthProfile only checks length.
+      //
+      // This posts authProfileId next to a username the mirror never touched —
+      // i.e. Save clicked before the autofill round trip returned, the same
+      // race the two tests above cover. The mirror-completed path is covered
+      // separately below (see the selection -> autofill -> submit tests), which
+      // is what the form flow actually produces.
       const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
       const { core } = await makeHarness({ profiles: [blankish] });
 
@@ -3929,6 +3935,94 @@ describe("inventoryCommands", () => {
       // former is a username no SSH login can use, the latter fails
       // validateInventorySource and takes the whole record down at next load.
       expect(created.defaultUsername).toBe("admin");
+    });
+
+    /**
+     * FINDING 2 (P2) — drives the path the USER drives, not the one the
+     * persist helper happens to accept: pick a profile in the Auth Profile
+     * select (`onAutofill`), let the mirror land on the form's fields exactly
+     * as the webview's `fillFields` handler writes them (`el.value =
+     * fillValues[fk]`, key by key, leaving untouched keys alone), then Save.
+     *
+     * Posting a hand-built payload straight into `onSubmit` cannot show
+     * whether the form can produce that payload at all — which is the whole
+     * defect here: the mirror used to write a whitespace username into a field
+     * that is both required and, once linked, read-only, so
+     * `parseSourceFormValues` rejected the save and the profile could not be
+     * linked through the form no matter what the persist helper would have
+     * done with it.
+     */
+    async function selectProfileThenSubmit(values: FormValues, profileId: string): Promise<void> {
+      const { onAutofill, onSubmit } = latestFormCall();
+      const mirrored = await onAutofill!("authProfileId", profileId);
+      await onSubmit({ ...values, authProfileId: profileId, ...(mirrored ?? {}) });
+    }
+
+    const BASE_ADD_VALUES: FormValues = {
+      name: "My NetBox",
+      targetFolder: "Infra",
+      defaultUsername: "admin",
+      prunePolicy: "orphan",
+      cfg_host: "netbox.local",
+      cfg_apiToken: "secret-token"
+    };
+
+    it("(FINDING 2, P2) selecting an imported profile whose username is whitespace-only leaves the user's own username in the form, so the save the user drives actually goes through (kills a mirror that writes whitespace into the required, read-only field and makes the profile unlinkable)", async () => {
+      const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
+      const { core } = await makeHarness({ profiles: [blankish] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      // Mirroring "   " here makes this call REJECT with "Default SSH Username
+      // is required" — the user's dead end, reproduced.
+      await selectProfileThenSubmit(BASE_ADD_VALUES, "p3");
+
+      const created = core.getSnapshot().inventorySources[0];
+      expect(created.authProfileId).toBe("p3");
+      expect(created.defaultUsername).toBe("admin");
+    });
+
+    it("(FINDING 2, P2) the same holds on the edit form (kills fixing only the add form's mirror)", async () => {
+      const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
+      const { core } = await makeHarness({ profiles: [blankish], source: { defaultUsername: "admin" } });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      await selectProfileThenSubmit(
+        { name: "My Source", targetFolder: "Infra", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "netbox.local", cfg_apiToken: "" },
+        "p3"
+      );
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.authProfileId).toBe("p3");
+      expect(updated.defaultUsername).toBe("admin");
+    });
+
+    it("(FINDING 2, P2) a blank-username profile still ANSWERS the autofill with an empty payload, while an id that resolves to nothing answers not at all (kills collapsing the two onto `undefined`, which suppresses the fillFields round trip and leaves the form's lock never re-evaluated)", async () => {
+      const blankish: AuthProfile = { id: "p3", name: "Imported", username: "   ", authType: "agent" };
+      await makeHarness({ profiles: [LAB_PROFILE, blankish] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onAutofill } = latestFormCall();
+
+      // WebviewFormPanel posts `fillFields` for any truthy result and skips it
+      // entirely for `undefined`; only the empty object re-runs the webview's
+      // lock evaluation without writing a value.
+      expect(await onAutofill!("authProfileId", "p3")).toEqual({});
+      expect(await onAutofill!("authProfileId", "no-such-profile")).toBeUndefined();
+    });
+
+    it("(FINDING 2, P2) the mirror posts the profile's TRIMMED username, so what the field shows is what the record stores (kills mirroring a padded value the saved source then quietly disagrees with)", async () => {
+      const padded: AuthProfile = { id: "p4", name: "Padded", username: "  labuser  ", authType: "agent" };
+      const { core } = await makeHarness({ profiles: [padded] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onAutofill } = latestFormCall();
+      expect(await onAutofill!("authProfileId", "p4")).toEqual({ defaultUsername: "labuser" });
+
+      await selectProfileThenSubmit(BASE_ADD_VALUES, "p4");
+      const created = core.getSnapshot().inventorySources[0];
+      // fallbackUsernameForSource trims too, so an untrimmed mirror would show
+      // "  labuser  " over a record holding "labuser".
+      expect(created.defaultUsername).toBe("labuser");
     });
 
     it("addSource wires inline auth-profile creation end to end and an autofill that mirrors ONLY defaultUsername (kills the server form's {username, authType, keyPath} payload, an unwired onAutofill, and a controller that is never attached to the panel)", async () => {

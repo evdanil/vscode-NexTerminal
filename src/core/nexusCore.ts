@@ -258,6 +258,22 @@ export class NexusCore {
    * that owns the emission, so it always runs before observers are told to
    * re-read (see the emission note below).
    *
+   * SERIALIZATION IS THE CALLER'S JOB (FINDING 1, P2). The clears above are
+   * persisted as snapshots taken synchronously at each save's call time, so an
+   * inventory write that started earlier (applyInventorySyncPlan /
+   * addOrUpdateInventorySource, still awaiting its repository write with a
+   * PRE-clear snapshot) can commit last and put the cleared references back on
+   * disk while memory looks correct. The fix is to serialize this method
+   * against those sections under `services/configMutationLock` — but that lock
+   * MUST NOT be acquired here: `AsyncMutex` is not re-entrant, and two of the
+   * three call sites already hold it (configCommands' importMergeReplaceLocked
+   * and completeReset both run their whole mutation phase inside
+   * `runExclusive`), so taking it here would deadlock the extension host on a
+   * backup restore or a complete reset. The third and only lock-free caller,
+   * `AuthProfileEditorPanel`'s delete handler, acquires it around this call
+   * instead. Any NEW caller must either already hold `configMutationLock` or
+   * acquire it around this call.
+   *
    * KNOWN ASYMMETRY, deliberately left alone: the `authProfiles` and `servers`
    * in-memory mutations are NOT rolled back when their own saves reject. Those
    * two are the deletion's primary intent rather than incidental reference

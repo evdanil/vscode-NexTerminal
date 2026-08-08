@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { InventorySourceRemovalMismatchError, NexusCore, type InventorySyncApplication } from "../../src/core/nexusCore";
+import { configMutationLock } from "../../src/services/configMutationLock";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { validateInventorySource, validateServerConfig } from "../../src/utils/validation";
 import { mergeServerConfigFields, serverConfigsEqual, serverOriginStampsEqual } from "../../src/models/config";
@@ -1451,6 +1452,37 @@ describe("removeAuthProfile — dangling references on inventory sources (T2)", 
     expect(core.getServer("srv-1")?.authProfileId).toBeUndefined();
     expect(core.getAuthProfile("p1")).toBeUndefined();
     expect(core.getSnapshot().authProfiles.map((p) => p.id)).toEqual(["p2"]);
+  });
+
+  /**
+   * FINDING 1 (P2) — the serialization that closes the resurrection window
+   * lives at the CALLERS (AuthProfileEditorPanel's delete handler), never
+   * inside this method. Two of its three call sites — configCommands'
+   * importMergeReplaceLocked and completeReset — already run inside
+   * `configMutationLock.runExclusive`, and AsyncMutex is not re-entrant: an
+   * acquisition inside removeAuthProfile would wait on a tail promise only the
+   * still-running outer section can advance, wedging the extension host for
+   * good on a backup restore or a complete reset.
+   *
+   * Reproduced literally here — the call is made from inside a held section,
+   * exactly as those two callers make it. The race guards the assertion so the
+   * regression reports as a failed expectation instead of a hung suite.
+   */
+  it("completes when called from INSIDE a held configMutationLock section, as importMergeReplaceLocked and completeReset both do (kills acquiring the non-re-entrant lock inside the core method — a permanent deadlock on backup restore / complete reset)", async () => {
+    const { core } = makeCore();
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", authProfileId: "p1" }));
+
+    const outcome = await Promise.race([
+      configMutationLock.runExclusive(async () => {
+        await core.removeAuthProfile("p1");
+        return "completed" as const;
+      }),
+      new Promise<"deadlocked">((resolve) => setTimeout(() => resolve("deadlocked"), 250))
+    ]);
+
+    expect(outcome).toBe("completed");
+    expect(core.getInventorySource("source-1")?.authProfileId).toBeUndefined();
   });
 
   it("leaves sources referencing OTHER profiles (or none) byte-identical — same authProfileId AND same revision (kills a loop that re-revisions every source)", async () => {

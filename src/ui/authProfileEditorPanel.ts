@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, AuthType } from "../models/config";
+import { configMutationLock } from "../services/configMutationLock";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import { renderAuthProfileEditorHtml } from "./authProfileEditorHtml";
 import { createWebviewNonce } from "./shared/webviewNonce";
@@ -204,11 +205,42 @@ export class AuthProfileEditorPanel {
           );
           if (confirm !== "Delete") break;
 
-          if (this.secretVault) {
-            await this.secretVault.delete(authProfilePasswordSecretKey(id));
-            await this.secretVault.delete(authProfilePassphraseSecretKey(id));
-          }
-          await this.core.removeAuthProfile(id);
+          // CONFIG MUTATION LOCK (P2 — profile deletion vs. inventory writes).
+          // removeAuthProfile clears the deleted profile off every referencing
+          // server and inventory source and persists those clears. Every core
+          // write persists a snapshot taken synchronously at call time
+          // (`[...map.values()]`) and then awaits, so an inventory write that
+          // started earlier — applyInventorySyncPlan / addOrUpdateInventorySource,
+          // both of which hold this same lock in inventoryCommands.ts — can
+          // still be awaiting its repository write with a PRE-clear snapshot in
+          // hand. If that older write commits last, both operations "succeed"
+          // while disk is left holding servers/sources that reference a profile
+          // that no longer exists; memory looks correct, so nothing ever
+          // surfaces it. Serializing the whole disposition (vault keys first,
+          // then the record + its reference clearing) against those sections is
+          // what closes that window.
+          //
+          // WHY HERE AND NOT IN NexusCore.removeAuthProfile: AsyncMutex is not
+          // re-entrant (see services/configMutationLock.ts), and two of the
+          // three call sites into removeAuthProfile ALREADY hold this lock —
+          // configCommands' importMergeReplaceLocked (replace-mode wipe) and
+          // completeReset both run their whole mutation phase inside
+          // runExclusive. Acquiring it inside the core method would deadlock the
+          // extension host permanently on a backup restore or a complete reset.
+          // This panel is the only lock-free path, so it is the one that has to
+          // take it.
+          //
+          // Safe to hold across this span: the confirmation modal above has
+          // already resolved and nothing below shows UI (the re-render is a
+          // webview post, not a prompt), matching the "acquire after the last
+          // prompt" rule the lock documents.
+          await configMutationLock.runExclusive(async () => {
+            if (this.secretVault) {
+              await this.secretVault.delete(authProfilePasswordSecretKey(id));
+              await this.secretVault.delete(authProfilePassphraseSecretKey(id));
+            }
+            await this.core.removeAuthProfile(id);
+          });
 
           const profiles = this.core.getSnapshot().authProfiles;
           this.selectedId = profiles.length > 0 ? profiles[0].id : null;

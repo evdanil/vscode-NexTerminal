@@ -553,12 +553,66 @@ const MISSING_AUTH_PROFILE_MESSAGE = "The selected auth profile no longer exists
  * the submitted username, which the parser already proved non-empty: a stored
  * empty `defaultUsername` fails validateInventorySource and would take the
  * whole source record down with it at the next load.
+ *
+ * REVIEW FINDING (P2) — that blank-profile branch is DEFENCE IN DEPTH, not the
+ * primary handling. The mirror itself now declines to fill a blank username
+ * (authProfileUsernameMirror), so the form always submits a username the user
+ * can see and edit; this branch covers the submissions that reach here with no
+ * completed mirror behind them — Save clicked before the round trip returned,
+ * which is the same race the whole helper exists for. It is deliberately kept:
+ * derivation must be total, because the alternative is storing a whitespace
+ * (or empty) `defaultUsername` that no SSH login can use.
  */
 function fallbackUsernameForSource(profile: AuthProfile | undefined, submittedUsername: string): string {
   if (profile === undefined) {
     return submittedUsername;
   }
   return profile.username.trim() || submittedUsername;
+}
+
+/**
+ * The Auth Profile select's mirror payload, shared by the Add and Edit Source
+ * forms (`onAutofill`). Selecting a profile posts its id here; whatever comes
+ * back is written into the form's fields verbatim by the webview, and the
+ * managed field is then rendered read-only.
+ *
+ * REVIEW FINDING (P2) — a profile whose username is whitespace-only (reachable
+ * through an imported backup: `validateAuthProfile` only checks length, while
+ * the profile editor trims and rejects blanks) must mirror NOTHING. Returning
+ * `{ defaultUsername: "   " }` used to write whitespace into a field that is
+ * both REQUIRED and, once a profile is linked, read-only — so
+ * `parseSourceFormValues` trimmed it, rejected the save with "Default SSH
+ * Username is required", and left the user no field to fix it in. The accepted
+ * profile could not be linked through the form at all, and
+ * `fallbackUsernameForSource`'s blank-profile branch — which exists precisely
+ * for this profile — was unreachable from the real flow.
+ *
+ * Leaving the user's own value alone is also the CORRECT mirror: when the
+ * profile has no usable username, `fallbackUsernameForSource` stores the
+ * submitted one, so the field is genuinely not managed by the profile and the
+ * webview must not pretend otherwise (formHtml's `updateProfileManagedFields`
+ * completes the pairing — it never locks a managed field the profile left
+ * empty).
+ *
+ * `{}` rather than `undefined` for that case: `undefined` means "no answer",
+ * and WebviewFormPanel suppresses the `fillFields` round trip entirely, so the
+ * form would not re-evaluate the lock after the selection. An empty payload is
+ * a positive "this profile fills nothing" — it writes no values but still
+ * drives the re-evaluation. `undefined` stays reserved for an id that resolves
+ * to no profile at all (deleted while the form sat open), where touching the
+ * form would be guessing.
+ *
+ * The username is trimmed, matching `parseSourceFormValues` and
+ * `fallbackUsernameForSource`: what the mirror shows is then bit-identical to
+ * what the save stores.
+ */
+function authProfileUsernameMirror(core: NexusCore, profileId: string): Record<string, string> | undefined {
+  const profile = core.getAuthProfile(profileId);
+  if (!profile) {
+    return undefined;
+  }
+  const username = profile.username.trim();
+  return username ? { defaultUsername: username } : {};
 }
 
 export interface NewInventorySourceInput {
@@ -637,16 +691,17 @@ async function persistNewInventorySource(
     // rejects instead of clearing). This path has no drift guard of its own:
     // there is no prior record, so nothing to compare a revision against.
     //
-    // TOCTOU: NexusCore.removeAuthProfile deliberately does NOT take
-    // configMutationLock, so holding that lock here excludes import/reset but
-    // not a profile deletion. What actually closes the window is that no
-    // `await` separates this check from the addOrUpdateInventorySource call
-    // below — on the extension host's single thread nothing else can run
-    // between them. A deletion landing later, during that call's own awaited
-    // persist, is harmless: addOrUpdateInventorySource inserts the record into
-    // the map synchronously before its first await, so removeAuthProfile finds
-    // this source and clears the reference off it exactly as it would for any
-    // other holder.
+    // TOCTOU: the profile-deletion path (AuthProfileEditorPanel's delete
+    // handler) takes this SAME configMutationLock around its vault deletes and
+    // NexusCore.removeAuthProfile — see that handler and removeAuthProfile's
+    // own doc for why the lock lives at the caller rather than inside the core
+    // method — so a deletion cannot interleave with this section at all. Even
+    // without that, no `await` separates this check from the
+    // addOrUpdateInventorySource call below, so on the extension host's single
+    // thread nothing can run between them; and a deletion landing after this
+    // whole section is harmless, because addOrUpdateInventorySource inserts the
+    // record into the map before removeAuthProfile scans it, so the reference
+    // is cleared off this source exactly as it would be off any other holder.
     const linkedProfile = authProfileId !== undefined ? core.getAuthProfile(authProfileId) : undefined;
     if (authProfileId !== undefined && linkedProfile === undefined) {
       // Same best-effort rollback as FINDING B / FINDING 1 below: the source
@@ -1289,10 +1344,7 @@ export function registerInventoryCommands(
       },
       onTest: (values) => handleFormTest(values, provider, provider.label),
       onCreateInline: inlineAuthProfile.handleCreateInline,
-      onAutofill: async (_key, value) => {
-        const profile = core.getAuthProfile(value);
-        return profile ? { defaultUsername: profile.username } : undefined;
-      }
+      onAutofill: async (_key, value) => authProfileUsernameMirror(core, value)
     });
     inlineAuthProfile.attachPanel(panel);
   }
@@ -1516,10 +1568,7 @@ export function registerInventoryCommands(
         },
         onTest: (values) => handleFormTest(values, provider, source.name, source),
         onCreateInline: inlineAuthProfile.handleCreateInline,
-        onAutofill: async (_key, value) => {
-          const profile = core.getAuthProfile(value);
-          return profile ? { defaultUsername: profile.username } : undefined;
-        }
+        onAutofill: async (_key, value) => authProfileUsernameMirror(core, value)
       });
     } catch (error) {
       releaseInFlight();

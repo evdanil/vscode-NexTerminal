@@ -366,6 +366,24 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           if (!fieldEl) continue;
           var group = fieldEl.closest ? fieldEl.closest(".form-group") : fieldEl.parentElement;
           if (!group) continue;
+          // REVIEW FINDING (P2) — a managed field is locked only when it
+          // actually HOLDS something. A linked profile that supplies no value
+          // for this field (an imported profile whose username is
+          // whitespace-only; a key profile with no key path) leaves it empty,
+          // and locking an empty REQUIRED field is a dead end: the mirror wrote
+          // nothing, the user cannot type, and Save is refused by the
+          // required-field check with no field left to correct. Locking only
+          // what the profile filled keeps the two halves consistent — the
+          // mirror declines to fill a blank (see inventoryCommands'
+          // authProfileUsernameMirror) and the lock declines to freeze it.
+          // Evaluated against the field's CURRENT value, so it re-settles on
+          // every call: on selection (pre-mirror), when the mirror's fillFields
+          // lands, and on an injected inline-created option.
+          var valueEl = fieldEl.tagName === "INPUT" || fieldEl.tagName === "TEXTAREA"
+            ? fieldEl
+            : fieldEl.querySelector('[name="' + managedKeys[mi] + '"]');
+          var hasValue = !!valueEl && String(valueEl.value == null ? "" : valueEl.value).trim() !== "";
+          var locked = !!isLinked && hasValue;
           var inputs = group.querySelectorAll("input, textarea");
           for (var ii = 0; ii < inputs.length; ii++) {
             var input = inputs[ii];
@@ -373,8 +391,8 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             if (input.dataset.baseReadonly === undefined) {
               input.dataset.baseReadonly = input.readOnly ? "true" : "false";
             }
-            input.readOnly = isLinked || input.dataset.baseReadonly === "true";
-            input.style.opacity = isLinked ? "0.6" : "";
+            input.readOnly = locked || input.dataset.baseReadonly === "true";
+            input.style.opacity = locked ? "0.6" : "";
           }
           var buttons = group.querySelectorAll("button");
           for (var bi = 0; bi < buttons.length; bi++) {
@@ -382,15 +400,15 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             if (button.dataset.baseDisabled === undefined) {
               button.dataset.baseDisabled = button.disabled ? "true" : "false";
             }
-            button.disabled = isLinked || button.dataset.baseDisabled === "true";
-            button.style.opacity = isLinked ? "0.6" : "";
+            button.disabled = locked || button.dataset.baseDisabled === "true";
+            button.style.opacity = locked ? "0.6" : "";
           }
           // For custom-select wrappers (authType), also disable the trigger
           var customSelect = group.querySelector(".custom-select");
           if (customSelect) {
             var trigger = customSelect.querySelector(".custom-select-trigger");
             if (trigger) {
-              if (isLinked) {
+              if (locked) {
                 trigger.style.pointerEvents = "none";
                 trigger.style.opacity = "0.6";
               } else {

@@ -81,11 +81,18 @@ function makeInventorySource(overrides: Partial<InventorySourceConfig> & { id: s
   };
 }
 
-async function makeCore(authProfiles: AuthProfile[] = []) {
-  const repo = new InMemoryConfigRepository([], [], [], [], authProfiles);
+async function makeCore(authProfiles: AuthProfile[] = [], repository?: InMemoryConfigRepository) {
+  const repo = repository ?? new InMemoryConfigRepository([], [], [], [], authProfiles);
   const core = new NexusCore(repo);
   await core.initialize();
   return core;
+}
+
+/** Drains the microtask queue plus a macrotask turn, twice — enough for any
+ *  ungated await chain in the panel's delete handler to run to completion. */
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 describe("AuthProfileEditorPanel", () => {
@@ -100,9 +107,10 @@ describe("AuthProfileEditorPanel", () => {
   async function openPanel(
     authProfiles: AuthProfile[] = [],
     secrets: Record<string, string> = {},
-    openNew = false
+    openNew = false,
+    repository?: InMemoryConfigRepository
   ) {
-    const core = await makeCore(authProfiles);
+    const core = await makeCore(authProfiles, repository);
     const vault = makeVault(secrets);
     // Fresh import to get clean singleton state
     const { AuthProfileEditorPanel } = await import("../../src/ui/authProfileEditorPanel");
@@ -270,6 +278,83 @@ describe("AuthProfileEditorPanel", () => {
     await sendMessage({ type: "delete", id: "ap1" });
 
     expect(mockShowWarningMessage).toHaveBeenCalledWith('Delete auth profile "Prod Auth"?', { modal: true }, "Delete");
+  });
+
+  /**
+   * FINDING 1 (P2) — profile deletion vs. an in-flight inventory write.
+   *
+   * Every core write persists a snapshot taken synchronously at call time
+   * (`[...map.values()]`) and then awaits. So an inventory write that started
+   * FIRST is holding a PRE-clear snapshot while removeAuthProfile clears the
+   * profile's id off the same source and writes its own. If the older write
+   * commits last, both operations report success and memory is correct, but
+   * DISK is left referencing a profile that no longer exists — and nothing
+   * ever surfaces it.
+   *
+   * The gate below makes that ordering deterministic rather than incidental:
+   * the first repository write parks until the test releases it, so the stale
+   * snapshot is guaranteed to land after the clearing one. With the deletion
+   * serialized under the same configMutationLock the inventory sections hold,
+   * the deletion's write cannot even start until the older write has committed,
+   * and it commits last by construction.
+   */
+  it("(FINDING 1, P2) a profile deletion queues behind an in-flight inventory-source write, so the older write cannot commit its pre-clear snapshot last and leave the deleted profile's id on disk (kills a lock-free deletion path)", async () => {
+    const profile = makeAuthProfile({ id: "ap1" });
+    const repo = new InMemoryConfigRepository([], [], [], [], [profile]);
+    const { core, sendMessage } = await openPanel([profile], {}, false, repo);
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1", authProfileId: "ap1" }));
+
+    // Installed only now, so the seeding write above is untouched. The first
+    // write from here on parks with its snapshot already captured.
+    let releaseInventoryWrite!: () => void;
+    const inventoryWriteGate = new Promise<void>((resolve) => {
+      releaseInventoryWrite = resolve;
+    });
+    const realSave = repo.saveInventorySources.bind(repo);
+    let saveCount = 0;
+    repo.saveInventorySources = async (sources: InventorySourceConfig[]): Promise<void> => {
+      const captured = sources.map((source) => ({ ...source }));
+      if (saveCount++ === 0) {
+        await inventoryWriteGate;
+      }
+      await realSave(captured);
+    };
+
+    // The same lock singleton the panel resolves — imported from the module
+    // graph vi.resetModules() rebuilt for this test, not the pre-reset one.
+    const { configMutationLock } = await import("../../src/services/configMutationLock");
+
+    // An inventory write of exactly the kind the finding names: it snapshots
+    // the sources map (link intact) and then parks in its repository write,
+    // holding the lock the whole time — as addSource/editSource/syncNow do.
+    const inventoryWrite = configMutationLock.runExclusive(async () => {
+      await core.addOrUpdateInventorySource(
+        makeInventorySource({ id: "src-1", name: "Renamed NetBox", authProfileId: "ap1" })
+      );
+    });
+    await settle();
+    expect(saveCount).toBe(1);
+
+    mockShowWarningMessage.mockResolvedValue("Delete");
+    const deletion = sendMessage({ type: "delete", id: "ap1" });
+    // A lock-free deletion runs to completion right here: its cleared snapshot
+    // commits while the older write is still parked, and the older write then
+    // overwrites it. Serialized, nothing has happened yet — the deletion is
+    // queued on the lock the inventory write still holds.
+    await settle();
+
+    releaseInventoryWrite();
+    await inventoryWrite;
+    await deletion;
+
+    const persisted = await repo.getInventorySources();
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].name).toBe("Renamed NetBox");
+    // The assertion the finding is about: what is ON DISK, not what is in
+    // memory. Unserialized, this reads "ap1" — a reference to a profile that
+    // was deleted, restored by a write that had already been superseded.
+    expect(persisted[0].authProfileId).toBeUndefined();
+    expect(core.getSnapshot().inventorySources[0].authProfileId).toBeUndefined();
   });
 
   it("delete profile does nothing if user cancels", async () => {
