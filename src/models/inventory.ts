@@ -150,8 +150,9 @@ export interface InventorySourceConfig {
   //
   // Applied at add time, and — on each sync — retroactively to owned servers
   // still sitting on the never-configured default (authProfileId undefined &&
-  // authType "agent" && keyPath undefined && username still equal to the one
-  // the sync itself stamped, ServerOrigin.syncedUsername; exactly the shape the
+  // ServerOrigin.syncedAuthProfileId undefined && authType "agent" && keyPath
+  // undefined && username still equal to the one the sync itself stamped,
+  // ServerOrigin.syncedUsername; exactly the shape the
   // add path writes). Matching the add path's own output is what makes
   // retro-apply safe: a hand-edit to the auth fields OR to the username takes
   // the server out of the set, so a hand-configured server is never re-stamped
@@ -167,6 +168,15 @@ export interface InventorySourceConfig {
   // excluded for lacking it. Changing this field from one profile to another
   // does NOT re-stamp already-linked servers, and clearing it does NOT strip
   // them — both would silently undo a user's per-server decision.
+  //
+  // The `syncedAuthProfileId` clause is what makes a PER-SERVER opt-out possible
+  // (review finding, P2): clearing a source-applied profile in the server editor
+  // leaves the record satisfying every other clause, so without a record of what
+  // the sync itself linked the next sync simply reattached it. A cleared link now
+  // reads as "no profile, against a stamp naming one" and is left alone from then
+  // on — including after this field is later pointed at a DIFFERENT profile, since
+  // the opt-out is about what the sync last wrote on that server, not about which
+  // profile the source currently names.
   //
   // Optional for backward compat, same reasoning as `revision`/
   // `providerFingerprint`/`managedFolders` above: a source saved before this

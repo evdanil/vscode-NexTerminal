@@ -145,4 +145,42 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
     expect(warnSpy).toHaveBeenCalledTimes(2);
     warnSpy.mockRestore();
   });
+
+  it("getServers keeps an origin carrying syncedAuthProfileId, and keeps one that omits it (kills a shape check that rejects the opt-out stamp, or that requires it and strips every pre-existing server's origin)", async () => {
+    const stamped = { sourceId: "src", externalId: "ext", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" };
+    const legacy = { sourceId: "src", externalId: "ext2", syncedAt: 1000, syncedUsername: "admin" };
+    const repo = new VscodeConfigRepository(
+      makeContext({
+        "nexus.servers": [
+          { ...validServer, id: "s8", origin: stamped },
+          { ...validServer, id: "s9", origin: legacy }
+        ]
+      })
+    );
+
+    const servers = await repo.getServers();
+
+    expect(servers[0].origin).toEqual(stamped);
+    expect(servers[1].origin).toEqual(legacy);
+  });
+
+  it("getServers strips an origin whose syncedAuthProfileId is not a non-empty string (kills leaving the opt-out stamp unchecked, which would feed the retro-apply rule a marker no sync could have written)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const repo = new VscodeConfigRepository(
+      makeContext({
+        "nexus.servers": [
+          { ...validServer, id: "s10", origin: { sourceId: "src", externalId: "ext", syncedAt: 1000, syncedAuthProfileId: 42 } },
+          { ...validServer, id: "s11", origin: { sourceId: "src", externalId: "ext2", syncedAt: 1000, syncedAuthProfileId: "" } }
+        ]
+      })
+    );
+
+    const servers = await repo.getServers();
+
+    expect(servers.map((s) => s.id)).toEqual(["s10", "s11"]);
+    expect(servers[0].origin).toBeUndefined();
+    expect(servers[1].origin).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    warnSpy.mockRestore();
+  });
 });

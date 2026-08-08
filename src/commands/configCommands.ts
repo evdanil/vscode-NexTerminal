@@ -1763,7 +1763,18 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     const knownProfileIds = new Set(postImportSnapshot.authProfiles.map((p) => p.id));
     for (const server of postImportSnapshot.servers) {
       if (server.authProfileId && !knownProfileIds.has(server.authProfileId)) {
-        await core.addOrUpdateServer({ ...server, authProfileId: undefined });
+        const cleared: ServerConfig = { ...server, authProfileId: undefined };
+        // Same rule as NexusCore.removeAuthProfile: the inventory sync's record
+        // that IT applied this profile (origin.syncedAuthProfileId) dies with the
+        // link it describes. Left behind, it would read as a per-server opt-out —
+        // no `authProfileId`, but a stamp naming a profile — and lock a server
+        // nobody hand-configured out of retro-apply for good. Only the stamp
+        // naming the very profile being cleared is dropped; a stamp the user has
+        // already diverged from is their decision and is left alone.
+        if (server.origin?.syncedAuthProfileId === server.authProfileId) {
+          cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
+        }
+        await core.addOrUpdateServer(cleared);
       }
     }
     // Same clear for inventory sources, whose `authProfileId` links their synced

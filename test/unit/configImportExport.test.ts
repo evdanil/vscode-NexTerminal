@@ -4880,6 +4880,64 @@ describe("backup export round-trip", () => {
     expect(snapshot.servers[0].authProfileId).toBeUndefined();
   });
 
+  it("import clearing a dangling authProfileId also drops the inventory stamp that recorded it, but leaves a stamp the user has already diverged from", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    const importData = {
+      version: 1,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [
+        // Synced and linked by the sync itself: link and stamp agree, and the
+        // profile is nowhere to be found after the import. Clearing the link
+        // while leaving the stamp would make this server read as a per-server
+        // opt-out nobody chose, and the next sync would skip it for good.
+        makeServer({
+          id: "s1",
+          authProfileId: "nonexistent-profile",
+          origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "dev", syncedAuthProfileId: "nonexistent-profile" }
+        }),
+        // Opted out and then hand-linked elsewhere: the dangling link being
+        // cleared is NOT the one the stamp names, so the stamp — the user's own
+        // decision — must survive.
+        makeServer({
+          id: "s2",
+          authProfileId: "another-missing-profile",
+          origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1000, syncedUsername: "dev", syncedAuthProfileId: "p-sync" }
+        })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: []
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/import.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    const s1 = core.getServer("s1");
+    expect(s1?.authProfileId).toBeUndefined();
+    expect(s1?.origin?.syncedAuthProfileId).toBeUndefined();
+    // The rest of the ownership marker survives — the sweep clears a link, not
+    // a server's sync ownership.
+    expect(s1?.origin?.externalId).toBe("device:1");
+
+    const s2 = core.getServer("s2");
+    expect(s2?.authProfileId).toBeUndefined();
+    expect(s2?.origin?.syncedAuthProfileId).toBe("p-sync");
+  });
+
   it("import clears a dangling authProfileId on an inventory source when the profile is not imported", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();

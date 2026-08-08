@@ -1,4 +1,5 @@
-import type { ServerConfig } from "../../models/config";
+import type { ServerConfig, ServerOrigin } from "../../models/config";
+import { serverOriginStampsEqual } from "../../models/config";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../models/inventory";
 import type { InventorySyncApplication } from "../../core/nexusCore";
 import { normalizeFolderPath } from "../../utils/folderPaths";
@@ -240,40 +241,55 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // device; username only when the endpoint supplies one. Everything
       // else (authProfileId, keyPath, proxy, multiplexing, isHidden,
       // logSession, ...) is copied untouched from `before`.
+      const afterOrigin: ServerOrigin = {
+        sourceId: source.id,
+        externalId: device.externalId,
+        syncedAt: now,
+        // AUTH 2a — `syncedUsername` records what the SYNC wrote, so it is
+        // refreshed exactly when this sync writes `username` (the line below:
+        // only when the endpoint supplies one) and otherwise carried forward
+        // from the previous stamp verbatim — including forward as `undefined`
+        // for a server synced before the field existed, which is what keeps
+        // that server on the defaultUsername fallback instead of excluding it.
+        //
+        // The two rejected alternatives, both of which break the rule this
+        // field exists to serve:
+        //   - `syncedUsername: after.username` (or ownedServer.username) —
+        //     records the record's CURRENT value, so the first sync after a
+        //     hand-edit would enshrine the hand-edited username as "what the
+        //     sync stamped" and the sync after that would adopt the server.
+        //     A hand-edit laundered into "untouched" is precisely the hole the
+        //     rule exists to close.
+        //   - `syncedUsername: source.defaultUsername` unconditionally —
+        //     records a value this sync did NOT write onto the record. On a
+        //     pre-existing server whose source default has since been rewritten
+        //     (the profile-mirroring case) it would backfill the NEW default
+        //     over a server still carrying the old one, permanently excluding a
+        //     server the fallback adopts correctly today.
+        // Nothing infers a stamp that was never taken: absent stays absent.
+        syncedUsername: endpoint.username ?? ownedServer.origin?.syncedUsername,
+        // AUTH 2c — the auth-profile stamp obeys the SAME "records what the sync
+        // wrote" discipline: carried forward verbatim here, and overwritten only
+        // where this sync actually writes `authProfileId`, i.e. inside the
+        // retro-apply branch below (nowhere else in the update path touches the
+        // link). Carry-forward is load-bearing rather than cosmetic: an update
+        // fired for a totally unrelated reason — a device renamed at the source —
+        // rebuilds `origin` from scratch, and a rebuild that forgot this member
+        // would ERASE a user's opt-out and let the very next sync reattach the
+        // source's profile.
+        //
+        // Deliberately NOT `ownedServer.authProfileId`: that is the value the
+        // rule audits, so recording it would launder a hand-link into "this is
+        // what the sync put here" one sync later.
+        syncedAuthProfileId: ownedServer.origin?.syncedAuthProfileId
+      };
       const after: ServerConfig = {
         ...ownedServer,
         name: device.name,
         host: endpoint.host,
         port,
         group,
-        origin: {
-          sourceId: source.id,
-          externalId: device.externalId,
-          syncedAt: now,
-          // AUTH 2a — `syncedUsername` records what the SYNC wrote, so it is
-          // refreshed exactly when this sync writes `username` (the line below:
-          // only when the endpoint supplies one) and otherwise carried forward
-          // from the previous stamp verbatim — including forward as `undefined`
-          // for a server synced before the field existed, which is what keeps
-          // that server on the defaultUsername fallback instead of excluding it.
-          //
-          // The two rejected alternatives, both of which break the rule this
-          // field exists to serve:
-          //   - `syncedUsername: after.username` (or ownedServer.username) —
-          //     records the record's CURRENT value, so the first sync after a
-          //     hand-edit would enshrine the hand-edited username as "what the
-          //     sync stamped" and the sync after that would adopt the server.
-          //     A hand-edit laundered into "untouched" is precisely the hole the
-          //     rule exists to close.
-          //   - `syncedUsername: source.defaultUsername` unconditionally —
-          //     records a value this sync did NOT write onto the record. On a
-          //     pre-existing server whose source default has since been rewritten
-          //     (the profile-mirroring case) it would backfill the NEW default
-          //     over a server still carrying the old one, permanently excluding a
-          //     server the fallback adopts correctly today.
-          // Nothing infers a stamp that was never taken: absent stays absent.
-          syncedUsername: endpoint.username ?? ownedServer.origin?.syncedUsername
-        }
+        origin: afterOrigin
       };
       if (endpoint.username !== undefined) {
         after.username = endpoint.username;
@@ -283,13 +299,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // above, and the only reason servers synced before the source had a
       // profile ever become usable without hand-editing each one.
       //
-      // The five clauses below admit exactly one state: a source profile that
+      // The six clauses below admit exactly one state: a source profile that
       // actually resolves, plus a server still carrying EXACTLY what the add
       // path stamps (see the adds.push near the end of this loop) — agent auth,
-      // no key, no profile, and the username that sync wrote. That equality is
-      // the whole safety argument — it is what lets the condition mean "created
-      // by this source and never auth-configured since". Each clause carries its
-      // own weight:
+      // no key, no profile THIS SYNC PUT THERE OR TOOK AWAY, and the username
+      // that sync wrote. That equality is the whole safety argument — it is what
+      // lets the condition mean "created by this source and never auth-configured
+      // since". Each clause carries its own weight:
       //
       //  - resolvedProfileId !== undefined: a source with no profile, or with a
       //    dangling one, must behave exactly as it did before this feature.
@@ -299,6 +315,35 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       //    profile is in a DECIDED state, and a hand-link is indistinguishable
       //    from one this source stamped. Drop it and the source wins every A->B
       //    change, silently stomping per-server links (rejected option D).
+      //  - ownedServer.origin?.syncedAuthProfileId === undefined: the OPT-OUT
+      //    clause (REVIEW FINDING 1, P2). `authProfileId === undefined` alone
+      //    cannot tell "the sync never linked anything here" apart from "the sync
+      //    linked a profile and the user cleared it in the server editor" — after
+      //    such a clear the record satisfies every other clause again (agent
+      //    auth, no key, stamped username), so the next sync reattached the
+      //    source's profile and a per-server opt-out was impossible. The stamp
+      //    records what the sync itself last linked, so a cleared link reads as
+      //    `authProfileId === undefined` against a stamp that NAMES a profile:
+      //    visibly the user's doing, and left alone from then on.
+      //
+      //    Together with the clause above this is exactly the reviewer-suggested
+      //    "`authProfileId` still equals what the sync stamped", restricted to
+      //    the both-undefined branch. The other branch — adopting when the record
+      //    still carries the very profile the sync stamped, i.e. re-stamping it
+      //    when the SOURCE switches A->B — is deliberately NOT taken: it would
+      //    reverse the documented contract that "changing this field from one
+      //    profile to another does NOT re-stamp already-linked servers"
+      //    (models/inventory.ts), which is a separate behavior change from the
+      //    one this finding asks for, and it would silently move a link on a
+      //    server whose user re-selected that same profile by hand. A source
+      //    switch therefore still leaves already-linked servers alone; the
+      //    folder-level Apply Auth Profile command is the deliberate way to move
+      //    them.
+      //
+      //    Servers synced before this stamp existed carry none, which reads the
+      //    same as "the sync linked nothing" — both are the state retro-apply is
+      //    allowed to fill, so legacy servers are adopted exactly as before and
+      //    are never excluded for lacking the field.
       //  - ownedServer.authType === "agent": password/key auth on a synced
       //    server is a working hand-configuration. Drop it and those servers get
       //    a profile bolted on that OVERRIDES their credentials at connect time
@@ -359,10 +404,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // Apply Auth Profile fixes into one nothing fixes.
       //
       // What none of this catches, by design: a WORKING agent-auth server whose
-      // username still matches — indistinguishable from a never-configured one.
-      // It is adopted, and the plan-preview modal disclosing the switch (plus
-      // the named list behind Show Warnings) is what makes that consented to
-      // rather than silent.
+      // username still matches and whose link the sync never set — that includes
+      // one whose HAND-set link the user has since cleared, which is
+      // indistinguishable from a never-configured server (both carry no profile
+      // and no stamp). It is adopted, and the plan-preview modal disclosing the
+      // switch (plus the named list behind Show Warnings) is what makes that
+      // consented to rather than silent.
       //
       // If the add path's defaults ever change, this condition must change with
       // it or retro-apply stops matching its own output.
@@ -370,11 +417,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       if (
         resolvedProfileId !== undefined &&
         ownedServer.authProfileId === undefined &&
+        ownedServer.origin?.syncedAuthProfileId === undefined &&
         ownedServer.authType === "agent" &&
         ownedServer.keyPath === undefined &&
         ownedServer.username === stampedUsername
       ) {
         after.authProfileId = resolvedProfileId;
+        // The stamp is written HERE and only here on the update path, in the same
+        // breath as the link itself — that is what makes a LATER clear of this
+        // link visible to the next sync as an opt-out instead of reading as
+        // "never linked" and being reattached forever.
+        after.origin = { ...afterOrigin, syncedAuthProfileId: resolvedProfileId };
       }
 
       // AUTH 3 — authProfileId joins the comparison because a retro-apply stamp
@@ -383,12 +436,28 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // Without this clause the stamp above is computed and then discarded as
       // "unchanged": the servers stay broken and unchangedCount lies to the
       // plan-preview modal about what the sync is doing.
+      //
+      // AUTH 3a (REVIEW FINDING 2, P2) — and the ORIGIN STAMPS join it for the
+      // same reason one layer down. `after.origin` can carry a stamp the record
+      // does not have yet while every user-visible field above is identical: a
+      // legacy owned server with no `syncedUsername`, whose provider supplies an
+      // endpoint username EQUAL to the one it already has, computes
+      // `syncedUsername` for the first time and changes nothing else. Discarding
+      // `after` there throws the newly computed stamp away, so that server never
+      // gains one — and is then misclassified as hand-edited by every later sync
+      // that compares against the source's (by then profile-mirrored) default
+      // username, which is exactly the retro-apply gap the stamp exists to close.
+      //
+      // `serverOriginStampsEqual`, NOT `serverOriginsEqual`: the latter also
+      // compares `syncedAt`, which this sync always advances, so using it here
+      // would report every owned server as an update on every single sync.
       const changed =
         ownedServer.name !== after.name ||
         ownedServer.host !== after.host ||
         ownedServer.port !== after.port ||
         ownedServer.group !== after.group ||
         ownedServer.authProfileId !== after.authProfileId ||
+        !serverOriginStampsEqual(ownedServer.origin, after.origin) ||
         (endpoint.username !== undefined && ownedServer.username !== after.username);
       if (changed) {
         updates.push({ before: ownedServer, after });
@@ -436,13 +505,27 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       authProfileId: resolvedProfileId,
       isHidden: false,
       group,
-      // `syncedUsername` mirrors the `username` two lines above — the value this
-      // sync is writing onto the record, which is what makes a later
-      // "still exactly what I stamped" comparison possible (AUTH 2). Recorded
-      // UNCONDITIONALLY, whether or not the source has a profile today: a source
-      // that gains one later must find the stamp already there, and a source that
-      // never gains one pays nothing for carrying it.
-      origin: { sourceId: source.id, externalId: device.externalId, syncedAt: now, syncedUsername: endpoint.username ?? source.defaultUsername }
+      // `syncedUsername` mirrors the `username` two lines above, and
+      // `syncedAuthProfileId` mirrors the `authProfileId` above it — the values
+      // this sync is writing onto the record, which is what makes a later
+      // "still exactly what I stamped" comparison possible (AUTH 2). Both are
+      // recorded UNCONDITIONALLY, whether or not the source has a profile today:
+      // a source that gains one later must find the stamps already there, and a
+      // source that never gains one pays nothing for carrying them.
+      //
+      // `syncedAuthProfileId` mirrors the RESOLVED id, never `source.authProfileId`
+      // — a dangling reference writes no link, so it must record none either, or
+      // a server that was never linked would read as one whose link the user
+      // cleared and would be locked out of retro-apply forever. When the source
+      // has no profile the stamp is `undefined`, i.e. bit-identical to a legacy
+      // record, which is the point: both mean "the sync put no profile here".
+      origin: {
+        sourceId: source.id,
+        externalId: device.externalId,
+        syncedAt: now,
+        syncedUsername: endpoint.username ?? source.defaultUsername,
+        syncedAuthProfileId: resolvedProfileId
+      }
     });
     if (group !== undefined) {
       folderSet.add(group);

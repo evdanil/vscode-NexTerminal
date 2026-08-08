@@ -596,6 +596,249 @@ describe("computeSyncPlan — auth profile link", () => {
     expect(plan.unchangedCount).toBe(1);
     expect(plan.warnings).toContain(DANGLING_WARNING);
   });
+
+  it("the add path records the profile it linked, alongside the username stamp (kills an add that links without recording the link)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [], now: 1000, authProfile: profile });
+
+    // Whole-object equality on the origin: the stamp pair IS the retro-apply
+    // rule's memory, so a missing member has to fail here and not only in the
+    // behavioural round-trips below.
+    expect(plan.adds[0].origin).toEqual({
+      sourceId: "source-1",
+      externalId: "device:1",
+      syncedAt: 1000,
+      syncedUsername: "admin",
+      syncedAuthProfileId: "p1"
+    });
+  });
+
+  it("the add path records the RESOLVED profile, never the source's dangling reference (kills stamping source.authProfileId, which would lock a never-linked server out of retro-apply)", () => {
+    // The source names "p1" but nothing resolved it, so the add writes NO link.
+    // Recording "p1" anyway would describe a link that was never made — and the
+    // sync after this one, once a real profile is chosen, would read
+    // "authProfileId undefined against a stamp naming p1" as the user having
+    // cleared a link they never had, and skip the server forever.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const first = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [], now: 1000 }); // unresolved
+    expect(first.adds[0].authProfileId).toBeUndefined();
+    expect(first.adds[0].origin?.syncedAuthProfileId).toBeUndefined();
+
+    const relinked = makeSource({ authProfileId: "p2", defaultUsername: "admin" });
+    const second = computeSyncPlan({
+      source: relinked,
+      tree: makeTree([makeDevice()]),
+      currentServers: [first.adds[0]],
+      now: 2000,
+      authProfile: { id: "p2", name: "Other" }
+    });
+    expect(second.updates).toHaveLength(1);
+    expect(second.updates[0].after.authProfileId).toBe("p2");
+  });
+
+  it("REVIEW FINDING 1 — a per-server clear of the source's profile is honored: the next sync does not reattach it (kills a rule that cannot tell 'never linked' from 'link removed')", () => {
+    // Everything else about this record is EXACTLY the add path's output — agent
+    // auth, no key path, the username the sync stamped — so every other clause
+    // matches and the stamp is the only thing standing between the user's
+    // decision and the sync silently undoing it. Without it there is no
+    // per-server opt-out at all: the field simply grows back on every sync.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer({
+      authProfileId: undefined,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" }
+    });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("REVIEW FINDING 1, end to end — a server the sync just added, whose link the user then clears, is left alone by the very next sync", () => {
+    // The full user story rather than a hand-built fixture: sync 1 creates the
+    // server with the source's profile, the user clears the Auth Profile field in
+    // the server editor (which preserves `origin` verbatim — see the P1 origin
+    // restore in serverCommands.ts), sync 2 must not put it back.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const first = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [], now: 1000, authProfile: profile });
+    expect(first.adds[0].authProfileId).toBe("p1");
+
+    const cleared: ServerConfig = { ...first.adds[0], authProfileId: undefined };
+    const second = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [cleared], now: 2000, authProfile: profile });
+
+    expect(second.updates).toHaveLength(0);
+    expect(second.unchangedCount).toBe(1);
+  });
+
+  it("retro-apply records the profile it just applied, so clearing THAT link is an opt-out too (kills applying the link without stamping it — the half-fix that leaves the loop open one sync later)", () => {
+    // A legacy server (no stamps at all) is adopted on sync 1. If the adoption
+    // writes `authProfileId` but not `origin.syncedAuthProfileId`, the record
+    // afterwards is indistinguishable from a never-linked one, so the user's
+    // clear on sync 2 is invisible and sync 3 reattaches — the finding, moved one
+    // sync into the future rather than fixed.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer({ origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 } });
+    const adopt = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(adopt.updates).toHaveLength(1);
+    expect(adopt.updates[0].after.authProfileId).toBe("p1");
+    expect(adopt.updates[0].after.origin?.syncedAuthProfileId).toBe("p1");
+
+    const cleared: ServerConfig = { ...adopt.updates[0].after, authProfileId: undefined };
+    const after = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [cleared], now: 3000, authProfile: profile });
+    expect(after.updates).toHaveLength(0);
+    expect(after.unchangedCount).toBe(1);
+  });
+
+  it("an update fired for an unrelated reason carries the opt-out stamp forward instead of erasing it (kills a rebuilt origin that forgets the new member)", () => {
+    // The device was RENAMED, so `origin` is rebuilt on a sync that has nothing
+    // to do with authentication. A rebuild that drops `syncedAuthProfileId`
+    // silently converts the user's opt-out back into "never linked", and the sync
+    // after this one reattaches the profile.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer({
+      authProfileId: undefined,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" }
+    });
+    const renamed = computeSyncPlan({ source, tree: makeTree([makeDevice({ name: "core-sw-1-renamed" })]), currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(renamed.updates).toHaveLength(1);
+    expect(renamed.updates[0].after.name).toBe("core-sw-1-renamed");
+    expect(renamed.updates[0].after.authProfileId).toBeUndefined();
+    expect(renamed.updates[0].after.origin).toEqual({
+      sourceId: "source-1",
+      externalId: "device:1",
+      syncedAt: 2000,
+      syncedUsername: "admin",
+      syncedAuthProfileId: "p1"
+    });
+
+    // ...and the opt-out is still standing on the sync after that one.
+    const next = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed" })]),
+      currentServers: [renamed.updates[0].after],
+      now: 3000,
+      authProfile: profile
+    });
+    expect(next.updates).toHaveLength(0);
+    expect(next.unchangedCount).toBe(1);
+  });
+
+  it("an opt-out survives the source being pointed at a DIFFERENT profile (kills remembering the opt-out only for the profile the source currently names)", () => {
+    // Intended semantics, pinned: the stamp records what the SYNC last wrote on
+    // THIS server, not which profile the source happens to name today. A rule
+    // phrased as "skip only when the stamp equals the profile being applied"
+    // reads p1 !== p2 and reattaches — so a user who opted out would be
+    // overruled by an unrelated edit to the source.
+    const source = makeSource({ authProfileId: "p2", defaultUsername: "admin" });
+    const before = makeOwnedServer({
+      authProfileId: undefined,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" }
+    });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [before], now: 2000, authProfile: { id: "p2", name: "Other" } });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("a server still carrying the profile the sync stamped is NOT re-stamped when the source switches A -> B (kills replacing the `authProfileId === undefined` clause with bare equality against the stamp)", () => {
+    // Intended semantics, pinned: bare "current link still equals the stamp"
+    // would match here (both p1) and move the server onto p2 — reversing the
+    // documented contract that changing a source's profile never re-stamps
+    // already-linked servers, and moving the link of anyone who deliberately
+    // re-selected p1 by hand. Only the both-undefined branch of that equality is
+    // taken; a source switch is applied through Apply Auth Profile instead.
+    const source = makeSource({ authProfileId: "p2", defaultUsername: "admin" });
+    const before = makeOwnedServer({
+      authProfileId: "p1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" }
+    });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [before], now: 2000, authProfile: { id: "p2", name: "Other" } });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("a hand-linked profile is never recorded as the sync's own (kills a stamp inferred from the record's current authProfileId)", () => {
+    // The user linked "q" by hand; the sync has never linked anything here. An
+    // implementation that records `syncedAuthProfileId: ownedServer.authProfileId`
+    // would launder that hand-link into "what the sync put there" — the same
+    // failure mode the username stamp already guards against, and the reason the
+    // stamp is only ever written where the sync itself writes the link.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer({ authProfileId: "q" });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice({ name: "core-sw-1-renamed" })]), currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.authProfileId).toBe("q");
+    expect(plan.updates[0].after.origin?.syncedAuthProfileId).toBeUndefined();
+  });
+
+  it("a server synced before EITHER stamp existed is still adopted — an absent syncedAuthProfileId is 'the sync linked nothing', never 'ineligible'", () => {
+    // Backward compatibility for the population the feature was written for:
+    // `origin` here is the exact three-member shape older builds wrote. A clause
+    // that demanded the stamp be PRESENT (or equal to the profile being applied)
+    // would refuse every one of them.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer({ origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 } });
+    expect(before.origin?.syncedAuthProfileId).toBeUndefined();
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.authProfileId).toBe("p1");
+  });
+
+  it("REVIEW FINDING 2 — a legacy server gains its username stamp even when the endpoint username it computes already equals the one it has (kills a `changed` check that ignores the origin stamp)", () => {
+    // The exact discard the finding names: `syncedUsername` is computed for the
+    // first time from the endpoint, but name/host/port/group/authProfileId and
+    // the username itself are all identical, so a comparison over those fields
+    // alone calls the record unchanged and throws the freshly computed stamp
+    // away. This server would then never gain one, however many times it syncs.
+    const source = makeSource({ authProfileId: undefined, defaultUsername: "admin" });
+    const before = makeOwnedServer({ username: "admin", origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 } });
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1", username: "admin" }] })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000 });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.unchangedCount).toBe(0);
+    expect(plan.updates[0].after.origin?.syncedUsername).toBe("admin");
+    // Nothing else moved — the stamp is the entire reason this is an update.
+    expect(plan.updates[0].after.username).toBe("admin");
+    expect(plan.updates[0].after.name).toBe(before.name);
+  });
+
+  it("REVIEW FINDING 2, the harm — once that stamp lands, linking a profile with a different username still retro-applies (without it the server is misclassified as hand-edited forever)", () => {
+    // Continuation of the case above. The source later gains profile "Lab
+    // credentials" (username "labuser"), which the source form mirrors into
+    // `defaultUsername`. With the stamp persisted, the comparison runs against
+    // "admin" — what the sync actually wrote — and the server is adopted. With
+    // the stamp discarded by the previous sync, it falls back to the source's
+    // CURRENT default ("labuser"), reads "admin" as a hand-edit, and is skipped
+    // on this sync and every later one.
+    const source = makeSource({ authProfileId: undefined, defaultUsername: "admin" });
+    const before = makeOwnedServer({ username: "admin", origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 } });
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1", username: "admin" }] })]);
+    const stamped = computeSyncPlan({ source, tree, currentServers: [before], now: 2000 }).updates[0].after;
+
+    const withProfile = makeSource({ authProfileId: "p1", defaultUsername: "labuser" });
+    const plan = computeSyncPlan({ source: withProfile, tree, currentServers: [stamped], now: 3000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.authProfileId).toBe("p1");
+    expect(plan.updates[0].after.username).toBe("admin");
+  });
+
+  it("a sync that computes no new stamp still reports the server as unchanged (kills comparing origins wholesale — syncedAt advances every run, so every owned server would be an update forever)", () => {
+    const source = makeSource({ authProfileId: undefined, defaultUsername: "admin" });
+    const before = makeOwnedServer({
+      username: "admin",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: undefined }
+    });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [before], now: 9999 });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
 });
 
 describe("computeSyncPlan — prunes", () => {

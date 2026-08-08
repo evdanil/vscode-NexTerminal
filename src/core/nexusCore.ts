@@ -271,7 +271,24 @@ export class NexusCore {
     let serversChanged = false;
     for (const [id, server] of this.servers.entries()) {
       if (server.authProfileId === profileId) {
-        this.servers.set(id, { ...server, authProfileId: undefined });
+        const cleared: ServerConfig = { ...server, authProfileId: undefined };
+        // The inventory sync's record that IT linked this profile goes with the
+        // link. Without this, deleting a profile an inventory source applied
+        // would leave every server it owned looking permanently opted OUT (no
+        // `authProfileId`, but a stamp naming a profile) — so re-pointing the
+        // source at a replacement profile would silently skip exactly the
+        // servers the sync itself had configured, which nobody ever hand-edited.
+        // This clear is the system's doing, not a user decision, so the stamp
+        // must not outlive the link it describes.
+        //
+        // Scoped to the servers whose `authProfileId` is being cleared here: a
+        // server whose link the USER already cleared (stamp names this profile,
+        // `authProfileId` already undefined) is not touched, so its opt-out
+        // survives the profile's deletion — which is the whole point of it.
+        if (server.origin?.syncedAuthProfileId === profileId) {
+          cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
+        }
+        this.servers.set(id, cleared);
         serversChanged = true;
       }
     }

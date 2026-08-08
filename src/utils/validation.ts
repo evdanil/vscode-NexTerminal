@@ -52,13 +52,14 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     return false;
   }
   const obj = value as Record<string, unknown>;
-  // `syncedUsername` is optional (absent on every server synced before the field
-  // existed) but shape-checked like the rest: this guard is the ONLY thing
-  // standing between a hand-edited backup / version-skewed globalState and the
-  // retro-apply rule that reads it, and an origin member the engine did not write
-  // makes the whole marker untrustworthy. Empty is rejected as well as non-string:
-  // ServerConfig.username can never be empty, so an empty stamp could not have
-  // come from a sync. The disposition for a malformed origin is unchanged and
+  // `syncedUsername` and `syncedAuthProfileId` are optional (absent on every
+  // server synced before each field existed) but shape-checked like the rest:
+  // this guard is the ONLY thing standing between a hand-edited backup /
+  // version-skewed globalState and the retro-apply rule that reads them, and an
+  // origin member the engine did not write makes the whole marker untrustworthy.
+  // Empty is rejected as well as non-string: neither ServerConfig.username nor
+  // AuthProfile.id can ever be empty, so an empty stamp could not have come from
+  // a sync. The disposition for a malformed origin is unchanged and
   // deliberately loud — both callers of this guard strip the WHOLE origin (see
   // VscodeConfigRepository.getServers and addServerSanitizingOrigin), which costs
   // that server its sync ownership and makes the next sync report an id collision
@@ -67,7 +68,8 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     isNonEmptyString(obj.sourceId) &&
     isNonEmptyString(obj.externalId) &&
     typeof obj.syncedAt === "number" &&
-    isOptionalNonEmptyString(obj.syncedUsername)
+    isOptionalNonEmptyString(obj.syncedUsername) &&
+    isOptionalNonEmptyString(obj.syncedAuthProfileId)
   );
 }
 

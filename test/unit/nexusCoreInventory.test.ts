@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { InventorySourceRemovalMismatchError, NexusCore, type InventorySyncApplication } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { validateInventorySource, validateServerConfig } from "../../src/utils/validation";
-import { mergeServerConfigFields, serverConfigsEqual } from "../../src/models/config";
+import { mergeServerConfigFields, serverConfigsEqual, serverOriginStampsEqual } from "../../src/models/config";
 import type { ServerConfig, SerialProfile, LocalShellProfile } from "../../src/models/config";
 import { computeProviderFingerprint, sourceConfigUnchanged, type InventoryProvider, type InventorySourceConfig } from "../../src/models/inventory";
 
@@ -3848,5 +3848,46 @@ describe("serverConfigsEqual / mergeServerConfigFields — origin.syncedUsername
     expect(merged.origin).toEqual({ sourceId: "src-1", externalId: "device:1", syncedAt: 2000, syncedUsername: "svc-netbox" });
     // The rejected batch's own fields still fall back to prior.
     expect(merged.name).toBe("core-sw");
+  });
+
+  it("two servers differing ONLY in origin.syncedAuthProfileId are not equal (kills an origin comparator that ignores the opt-out stamp)", () => {
+    const linkedOrigin = { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" };
+    const linked = server({ origin: linkedOrigin });
+    const optedOut = server({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" } });
+    // `authProfileId` itself is undefined on BOTH (the user cleared the link), so
+    // the stamp is the only thing separating "the sync linked p1 here" from "the
+    // sync never linked anything here" — a comparator that skips it lets the
+    // rollback merge drop a freshly written opt-out marker.
+    expect(serverConfigsEqual(linked, optedOut)).toBe(false);
+    expect(serverConfigsEqual(linked, server({ origin: { ...linkedOrigin, syncedAuthProfileId: "p2" } }))).toBe(false);
+    expect(serverConfigsEqual(linked, server({ origin: { ...linkedOrigin } }))).toBe(true);
+  });
+
+  it("the rollback merge keeps a concurrently-written syncedAuthProfileId instead of reverting it (kills the same blind spot one layer up)", () => {
+    // Same construction as the syncedUsername case above: `syncedAt` is identical
+    // in batchSnapshot and current so the profile stamp is the only difference.
+    const originBase = { sourceId: "src-1", externalId: "device:1", syncedUsername: "admin" };
+    const prior = server({ origin: { ...originBase, syncedAt: 1000 } });
+    const batchSnapshot = server({ name: "renamed", origin: { ...originBase, syncedAt: 2000 } });
+    const current = server({ name: "renamed", origin: { ...originBase, syncedAt: 2000, syncedAuthProfileId: "p1" } });
+
+    const merged = mergeServerConfigFields(prior, batchSnapshot, current);
+
+    expect(merged.origin).toEqual({ ...originBase, syncedAt: 2000, syncedAuthProfileId: "p1" });
+    expect(merged.name).toBe("core-sw");
+  });
+
+  it("serverOriginStampsEqual ignores syncedAt but not the stamps (kills both a wholesale origin comparison in the sync engine and one that skips a stamp)", () => {
+    const base = { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" };
+    // syncedAt advances on EVERY sync, so counting it would make computeSyncPlan
+    // report every owned server as an update forever.
+    expect(serverOriginStampsEqual(base, { ...base, syncedAt: 9999 })).toBe(true);
+    // ...while a stamp the sync just computed must read as a difference, or it is
+    // silently discarded together with the update that carried it.
+    expect(serverOriginStampsEqual(base, { ...base, syncedUsername: "labuser" })).toBe(false);
+    expect(serverOriginStampsEqual(base, { ...base, syncedAuthProfileId: undefined })).toBe(false);
+    expect(serverOriginStampsEqual(base, { ...base, externalId: "device:2" })).toBe(false);
+    expect(serverOriginStampsEqual(undefined, undefined)).toBe(true);
+    expect(serverOriginStampsEqual(base, undefined)).toBe(false);
   });
 });

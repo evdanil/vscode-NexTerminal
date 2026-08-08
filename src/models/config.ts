@@ -60,6 +60,36 @@ export interface ServerOrigin {
    * exactly the pre-existing behavior. Absent must never mean "ineligible".
    */
   syncedUsername?: string;
+  /**
+   * The auth profile the sync itself last LINKED on this server — the source's
+   * resolved profile as of that write, and `undefined` when the sync linked none
+   * (a profile-less source, or one whose reference no longer resolves).
+   *
+   * Recorded so a later sync can tell "the sync's own link, still exactly as
+   * written" apart from "the user cleared the source's profile on THIS server".
+   * Both leave `authProfileId` undefined, so without the stamp the retro-apply
+   * rule reattaches the source's profile on the very next sync and a per-server
+   * opt-out is impossible — the record satisfies every other clause again.
+   *
+   * Written ONLY where the sync writes `authProfileId` — the add path always
+   * (whatever the source resolved to, `undefined` included), the update path only
+   * when retro-apply actually fires — and never inferred from the record's current
+   * value, which would launder a hand-edit into "as stamped" one sync later.
+   *
+   * Optional for backward compat, exactly like `syncedUsername`: servers synced by
+   * a build before this field existed have none, which reads identically to a
+   * server the sync deliberately linked nothing on. Both mean "the sync never put
+   * a profile here" — precisely the state retro-apply is allowed to fill — so
+   * absent must never mean "ineligible".
+   *
+   * Cleared alongside `authProfileId` by `NexusCore.removeAuthProfile` and by the
+   * backup-import dangling sweep (commands/configCommands.ts) when the stamped
+   * profile is DELETED: that clear is the system's doing, not a user opt-out, so
+   * leaving the stamp behind would permanently exclude a server nobody ever
+   * hand-configured. A stamp is only ever left standing against an `authProfileId`
+   * the USER moved.
+   */
+  syncedAuthProfileId?: string;
 }
 
 export interface ServerConfig {
@@ -112,16 +142,43 @@ function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefine
   }
 }
 
+/**
+ * Every member of ServerOrigin EXCEPT `syncedAt` — i.e. the ownership key plus
+ * the two stamps the sync writes as decision INPUTS for its own next run
+ * (`syncedUsername`, `syncedAuthProfileId`).
+ *
+ * Exists for computeSyncPlan's `changed` check, which must be able to ask "did
+ * this sync compute a stamp the record does not already carry?" without asking
+ * "is this a different sync run?". `syncedAt` advances on every single run by
+ * construction, so comparing origins WHOLESALE there would mark every owned
+ * server as an update on every sync forever — a plan preview that always claims
+ * to be rewriting the entire fleet, and a persist that always does.
+ *
+ * `serverOriginsEqual` below is defined in terms of this one so a member added
+ * to ServerOrigin can only be forgotten in a single place.
+ */
+export function serverOriginStampsEqual(a: ServerOrigin | undefined, b: ServerOrigin | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.sourceId === b.sourceId &&
+    a.externalId === b.externalId &&
+    a.syncedUsername === b.syncedUsername &&
+    a.syncedAuthProfileId === b.syncedAuthProfileId
+  );
+}
+
 function serverOriginsEqual(a: ServerOrigin | undefined, b: ServerOrigin | undefined): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
-  // Every member of ServerOrigin is compared, `syncedUsername` included: it is
-  // what the retro-apply rule reads, so an origin that differs only there is a
-  // materially different record. Leaving it out would let the rollback merge in
+  // Every member of ServerOrigin is compared, the `syncedUsername` /
+  // `syncedAuthProfileId` stamps included: they are what the retro-apply rule
+  // reads, so an origin that differs only there is a materially different
+  // record. Leaving either out would let the rollback merge in
   // mergeServerConfigFields call two origins "equal" and drop a freshly written
   // stamp back to the pre-batch one — after which the next sync would compare
-  // against a username the record no longer carries.
-  return a.sourceId === b.sourceId && a.externalId === b.externalId && a.syncedAt === b.syncedAt && a.syncedUsername === b.syncedUsername;
+  // against a username, or a profile link, the record no longer carries.
+  return serverOriginStampsEqual(a, b) && a.syncedAt === b.syncedAt;
 }
 
 /**
