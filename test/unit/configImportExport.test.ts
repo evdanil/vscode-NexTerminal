@@ -3003,6 +3003,135 @@ describe("share import", () => {
     expect(importedTunnel.defaultServerId).toBe(importedServer.id);
   });
 
+  /**
+   * REVIEW FINDING (P2) — the share path's half of "a rejected record must not
+   * leave references pointing at nothing". `importShareData` assigns every auth
+   * profile a fresh id in its FIRST pass, before anything is validated, then remaps
+   * each server's `authProfileId` through that map — so a profile rejected on
+   * import (a non-string `keyPath` is the reachable shape, and the one
+   * `validateAuthProfile` was taught to reject) still hands the server a fresh id
+   * naming a profile that was never persisted. The server then silently falls back
+   * to its own credentials with nothing anywhere saying the link is dead. The
+   * backup path has swept for exactly this since before the feature; the share path
+   * had no equivalent.
+   *
+   * BOTH links are asserted in one test on purpose. Either half alone is passed by
+   * a wrong implementation: today's code passes "the good link is remapped", and a
+   * blanket `authProfileId: undefined` passes "the dead link is cleared".
+   */
+  it("share import clears a server's link to a profile it REJECTED while keeping the link to one it imported (kills remapping through the id map alone, which hands the server a fresh id for a profile that was never persisted)", async () => {
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [
+        makeServer({ id: "share-s-dead", name: "Dead Link", authProfileId: "ap-rejected" }),
+        makeServer({ id: "share-s-live", name: "Live Link", authProfileId: "ap-ok" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [
+        // `keyPath` must be a string; only a hand-edited file can carry this, which
+        // is precisely why the guard that rejects it must not strand the servers.
+        { ...makeAuthProfile({ id: "ap-rejected", name: "Rejected" }), keyPath: 12345 },
+        makeAuthProfile({ id: "ap-ok", name: "Kept" })
+      ]
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-authprofiles.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    // The premise, proven rather than assumed: one profile really was rejected.
+    expect(snapshot.authProfiles.map((p) => p.name)).toEqual(["Kept"]);
+    // …and neither server was dropped along with it. An import never deletes a
+    // credential record the user still holds.
+    expect(snapshot.servers).toHaveLength(2);
+
+    const knownProfileIds = new Set(snapshot.authProfiles.map((p) => p.id));
+    const dead = snapshot.servers.find((s) => s.name === "Dead Link")!;
+    const live = snapshot.servers.find((s) => s.name === "Live Link")!;
+
+    // THE ASSERTION — as the invariant, not as a value: no imported server may hold
+    // an `authProfileId` that resolves to nothing. Under the wrong implementation
+    // this one holds a fresh UUID for the profile that was thrown away.
+    expect(dead.authProfileId).toBeUndefined();
+    expect(live.authProfileId).toBeDefined();
+    expect(knownProfileIds.has(live.authProfileId!)).toBe(true);
+    // Still the share path's fresh id, not the payload's — the clearing must not
+    // have been bought by abandoning the remap.
+    expect(live.authProfileId).not.toBe("ap-ok");
+  });
+
+  /**
+   * The same reference one field over. `origin.syncedAuthProfileId` — the record of
+   * which profile the inventory sync itself linked — is a profile id too, and the
+   * share path never remapped it at all, so on any payload carrying an origin it
+   * kept the EXPORTING machine's id: a reference that resolves to nothing by
+   * construction. Left there it reads exactly as a per-server opt-out (no link, but
+   * a stamp naming a profile), which is the state that locks a server out of
+   * retro-apply for good — which is why the backup path's sweep drops the stamp
+   * together with the link it describes.
+   */
+  it("share import remaps the sync's auth-profile stamp with the link it describes, clears it when that profile was rejected, and invents one for nobody (kills carrying `origin.syncedAuthProfileId` across unremapped)", async () => {
+    const remoteOrigin = (syncedAuthProfileId?: string) => ({
+      sourceId: "src-on-the-other-machine",
+      externalId: "device:1",
+      syncedAt: 1000,
+      syncedUsername: "dev",
+      ...(syncedAuthProfileId === undefined ? {} : { syncedAuthProfileId })
+    });
+
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [
+        makeServer({ id: "share-s-live", name: "Live Link", authProfileId: "ap-ok", origin: remoteOrigin("ap-ok") }),
+        makeServer({ id: "share-s-dead", name: "Dead Link", authProfileId: "ap-rejected", origin: remoteOrigin("ap-rejected") }),
+        makeServer({ id: "share-s-none", name: "No Stamp", origin: remoteOrigin() })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [
+        { ...makeAuthProfile({ id: "ap-rejected", name: "Rejected" }), keyPath: 12345 },
+        makeAuthProfile({ id: "ap-ok", name: "Kept" })
+      ]
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-origin-stamp.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const live = snapshot.servers.find((s) => s.name === "Live Link")!;
+    const dead = snapshot.servers.find((s) => s.name === "Dead Link")!;
+    const none = snapshot.servers.find((s) => s.name === "No Stamp")!;
+
+    // The premise: the origins survived import at all (a malformed one is stripped
+    // whole by addServerSanitizingOrigin, which would make every assertion below
+    // pass for the wrong reason).
+    expect(live.origin?.externalId).toBe("device:1");
+
+    // Remapped with the link, so the two still name the same profile — and it is the
+    // local one. Under the wrong implementation this is still "ap-ok", which exists
+    // on nobody's machine but the exporter's.
+    expect(live.origin?.syncedAuthProfileId).toBe(live.authProfileId);
+    expect(live.origin?.syncedAuthProfileId).not.toBe("ap-ok");
+    expect(new Set(snapshot.authProfiles.map((p) => p.id)).has(live.origin!.syncedAuthProfileId!)).toBe(true);
+
+    // Cleared with the link, for the same reason the backup path clears it: a stamp
+    // naming a profile that is not here is an opt-out nobody chose.
+    expect(dead.authProfileId).toBeUndefined();
+    expect(dead.origin?.syncedAuthProfileId).toBeUndefined();
+
+    // And a server that never carried a stamp does not acquire one, nor lose the
+    // rest of its origin.
+    expect(none.origin?.syncedAuthProfileId).toBeUndefined();
+    expect(none.origin?.syncedUsername).toBe("dev");
+  });
+
   it("v1 share import reads legacy macros from settings key", async () => {
     const v1ShareData = {
       version: 1,

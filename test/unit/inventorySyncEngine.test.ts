@@ -1093,6 +1093,63 @@ describe("computeSyncPlan — auth profile link", () => {
     expect(relink.updates[0].after.origin?.syncedAuthProfileId).toBe("p1");
   });
 
+  /**
+   * REVIEW FINDING (P2) — the reversibility promise above, tested on the shape it
+   * did not hold for. AUTH 2b decides "brings no usable key of its own" with
+   * `hasOwnKeyPath`, so it unlinks a server carrying `keyPath: "   "` — correctly,
+   * that is not a key file — while leaving the value where it found it. Retro-apply
+   * used to ask the same question with a literal `keyPath === undefined`, which
+   * that value does not satisfy, so the unlink was permanent for precisely the
+   * servers the unlink is reachable on.
+   *
+   * Reachable, not hypothetical: a keyless key profile leaves Private Key File
+   * EDITABLE on a linked server on purpose (that is the pairing
+   * `authProfileNeedsServerKeyPath` exists to allow), and `formValuesToServer`
+   * stores any truthy string verbatim — so typing spaces into that control saves
+   * exactly this record.
+   *
+   * A ROUND TRIP rather than a one-way assertion, because either half alone passes
+   * against the bug: the unlink was always right, and a re-link asserted on a
+   * `keyPath: undefined` server (the test above) was always right too. Only running
+   * the sync twice over the same record shows the two rules contradicting each
+   * other.
+   */
+  it("AUTH 2b's reversal holds for the whitespace key path it unlinks on: repair the profile and the next sync re-links that server (kills retro-apply's literal `keyPath === undefined`, which unlinks by one rule and then refuses to re-link by another)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+
+    const unlinked = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice()]),
+      currentServers: [previouslyLinkedServer({ keyPath: "   " })],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    }).updates[0].after;
+    expect(unlinked.authProfileId).toBeUndefined();
+    expect(unlinked.origin?.syncedAuthProfileId).toBeUndefined();
+    // The unlink leaves the server's own credential field exactly as it found it —
+    // the update path copies `keyPath` untouched from `before`. Normalizing it away
+    // here was the other candidate fix, and this assertion pins that it is NOT what
+    // makes the re-link below work.
+    expect(unlinked.keyPath).toBe("   ");
+
+    const repaired: AuthProfile = { ...KEYLESS_KEY_PROFILE, keyPath: "/keys/id_ed25519" };
+    const relink = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice()]),
+      currentServers: [unlinked],
+      now: 3000,
+      authProfile: repaired
+    });
+
+    // Under the wrong implementation this plan is empty — unchangedCount 1 — and
+    // the server the sync took the link off never gets it back, on this sync or any
+    // later one, however healthy the profile becomes.
+    expect(relink.updates).toHaveLength(1);
+    expect(relink.unchangedCount).toBe(0);
+    expect(relink.updates[0].after.authProfileId).toBe("p1");
+    expect(relink.updates[0].after.origin?.syncedAuthProfileId).toBe("p1");
+  });
+
   it("AUTH 2b leaves a HAND-set link alone, and one the user MOVED to another profile (kills a sweep over every server linked to the profile, which would clear a link the sync never applied)", () => {
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
     // Linked by hand: carries the profile but no stamp naming it.

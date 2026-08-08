@@ -433,9 +433,29 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       //    a profile bolted on that OVERRIDES their credentials at connect time
       //    (SilentAuthSshFactory resolves the profile before the record's own
       //    fields), i.e. the fix would break exactly the servers already fixed.
-      //  - ownedServer.keyPath === undefined: "agent" plus an explicit identity
-      //    file is a deliberate agent-with-key setup, not this engine's output.
-      //    Drop it and those get re-pointed at the profile too.
+      //  - !hasOwnKeyPath(ownedServer): "agent" plus an explicit identity file is
+      //    a deliberate agent-with-key setup, not this engine's output. Drop it
+      //    and those get re-pointed at the profile too.
+      //
+      //    REVIEW FINDING (P2) — the SAME predicate AUTH 2b unlinks by, not a
+      //    literal `keyPath === undefined`. The two are one question asked twice
+      //    ("does this server bring a key file of its own?"), so they must not be
+      //    able to answer it differently: a server carrying `keyPath: "   "` is
+      //    unlinked by AUTH 2b as bringing no usable key, and a literal-undefined
+      //    re-link check then refuses it forever — the unlink stops being
+      //    reversible for exactly the shape the UI makes reachable, since a keyless
+      //    key profile deliberately leaves Private Key File editable and
+      //    `formValuesToServer` (serverCommands.ts) stores any truthy string
+      //    verbatim. Normalizing the stored path during the unapply instead was
+      //    rejected: it would have this clause keep answering a question it gets
+      //    wrong, and it would rewrite a credential field the update path's own
+      //    ownership rule promises to copy untouched from `before`.
+      //
+      //    Widening from "absent" to "no usable path" costs the clause nothing it
+      //    was protecting: blank, whitespace and (defensively) non-string are none
+      //    of them an identity file — `buildConnectConfig` rejects the empty string
+      //    outright and would try to READ a whitespace path — so a server carrying
+      //    one is in the add path's shape in every way that decides a connection.
       //  - ownedServer.username === stampedUsername: the one hand-edit the auth
       //    clauses cannot see. No shipped provider emits endpoint usernames
       //    (NetBox does not), so the update path above never overwrites
@@ -503,7 +523,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.authProfileId === undefined &&
         ownedServer.origin?.syncedAuthProfileId === undefined &&
         ownedServer.authType === "agent" &&
-        ownedServer.keyPath === undefined &&
+        !hasOwnKeyPath(ownedServer) &&
         ownedServer.username === stampedUsername
       ) {
         after.authProfileId = resolvedProfileId;
@@ -529,8 +549,26 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // happened. Clearing puts each server back on exactly the record the add
       // path gives it — the state it was in and working before the link — and is
       // REVERSIBLE by construction: the stamp goes with the link, so once the
-      // profile has a key file again all six retro-apply clauses hold and the very
-      // next sync re-links it. Nothing is lost that a later sync cannot restore.
+      // profile has a key file again retro-apply's clauses hold and the very next
+      // sync re-links it. Nothing is lost that a later sync cannot restore.
+      //
+      // That reversal is why retro-apply's key clause reads `hasOwnKeyPath` rather
+      // than `keyPath === undefined` (REVIEW FINDING, P2 — see its clause list
+      // above). Both rules ask this same field the same question, so a server
+      // unlinked HERE for bringing no usable key must not then be refused a re-link
+      // for carrying one; with the literal check it was, and `keyPath: "   "` — a
+      // value the server form can store, because a keyless key profile leaves that
+      // control editable on purpose — made the unlink permanent.
+      //
+      // "Reversible" is scoped to servers still in the shape retro-apply admits,
+      // which is the ordinary case: while the link is on, a profile supplying a
+      // username and an auth type owns both, so the form locks them and `keyPath`
+      // is the one credential field that can move underneath it. A server whose
+      // `authType` or `username` diverged some other way (a hand-edited backup, or
+      // a profile that supplies no username of its own and so leaves that field
+      // editable) is deliberately NOT re-linked — those are the hand-edit clauses
+      // doing their job — and lands on its own credentials until Apply Auth Profile
+      // is used on it.
       //
       // It is still a credential mutation on existing servers, so it goes through
       // the plan like every other one: it lands in `updates` (AUTH 3's
