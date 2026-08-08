@@ -19,7 +19,7 @@ presses Enter.
 
 If you want a macro that asks you for input every time it runs — a host, a
 username, a password — skip ahead to **Variables**, below, and start from the
-**Prompted command** template instead of **Send command**.
+**IPMI SOL console** template instead of **Send command**.
 
 ## Blank Macros vs Template Macros
 
@@ -41,9 +41,12 @@ Built-in templates include:
   appears.
 - **Scoped auto-trigger example**: shows a prompt-triggered command that starts
   paused until you resume it.
-- **Prompted command**: prompts for host, username, and password, then sends a
-  templated `ipmitool` command — a complete worked example of **Variables**
-  (below).
+- **IPMI SOL console**: prompts for a username and password, fills the BMC
+  address in from the server profile, and runs a templated `ipmitool` command in
+  a local terminal — a complete worked example of **Variables** (below) and of
+  **Profile tokens**.
+- **Launch IPMI web console**: opens a server's BMC web interface in the
+  browser, using the profile's IPMI / BMC Host.
 
 ## Sending Text and Newlines
 
@@ -108,7 +111,7 @@ the Text field in the Macro Editor to catch that.
 ### Declaring a variable
 
 Open a macro in the Macro Editor and use the new **Variables** section, or
-start from the **Prompted command** template (see Quick Start, above). Each
+start from the **IPMI SOL console** template (see Quick Start, above). Each
 variable has:
 
 - **Name** — must match `/^[A-Za-z_][A-Za-z0-9_]{0,31}$/` (letters, digits, and
@@ -156,7 +159,7 @@ sent this time.
 
 ### Worked example: IPMI SOL console
 
-The **Prompted command** template starts from this macro:
+The **IPMI SOL console** template starts from this macro:
 
 ```
 Text:      ipmitool -I lanplus -H ${profile.ipmiHost} -U $username -P $password sol activate
@@ -265,7 +268,7 @@ the literal text. A token that is not in the table above is sent as-is.
 
 ### Running a profile macro
 
-Right-click a server in the Command Center and choose **Run Macro on Server…**
+Right-click a server in the Connectivity Hub and choose **Run Macro on Server…**
 (also available from **Profile Actions**). The picker lists every macro, with
 profile-token macros first. Tokens then resolve against **that server** — not
 against whatever terminal happens to be active.
@@ -275,16 +278,32 @@ Host**), the run is refused with a message naming the server and the field, and
 an **Edit Server** button. Nexus never sends a command containing an unresolved
 token, and never one with the argument silently emptied.
 
-Values are also checked before they are substituted: a host or BMC address must
-look like an address (letters, digits, `.`, `-`, `_`, `:`, and `[]` for IPv6),
-and a port must be digits. A profile whose host contains shell syntax — which
-can reach your config through an inventory sync or an imported backup — refuses
-the run instead of executing it. This is a charset check, not quoting: the rest
-of the command line is still yours to quote (see **No automatic quoting**).
+Values are also checked before they are substituted, and every token is
+checked:
+
+| Token | Accepted |
+|---|---|
+| `${profile.host}`, `${profile.ipmiHost}` | letters, digits, `.`, `-`, `_`, `:`, and `[]` for IPv6 — the address only, no `https://` and no path |
+| `${profile.port}` | digits |
+| `${profile.username}` | letters, digits, `.`, `_`, `-`, `@` |
+| `${profile.name}` | anything except `$`, a backtick, quotes, `;`, `|`, `&`, `<`, `>`, `\` — spaces and parentheses are fine |
+
+No value may contain a `$` or a backtick, in any token. A profile carrying shell
+syntax — which can reach your config through an inventory sync or an imported
+backup — refuses the run instead of executing it, and the message names the
+offending value and what the field accepts. This is a charset check, not
+quoting: the rest of the command line is still yours to quote (see **No
+automatic quoting**).
+
+A macro that uses profile tokens cannot auto-trigger, whichever **Run in** it
+has: a rule fired by terminal output has no server to resolve the tokens
+against. The macro editor refuses the combination, and a macro that reaches the
+store some other way (a hand-edited settings file, an import) simply never
+compiles a trigger rule.
 
 ## Where a macro runs
 
-**Run In**, in the macro editor, decides where the resolved text goes:
+**Run in**, in the macro editor, decides where the resolved text goes:
 
 - **Session terminal** (default, and what every existing macro does) — the
   connected session. From **Run Macro on Server…** that means a session *of
@@ -300,7 +319,7 @@ run them from **Run Macro on Server…**. Neither can auto-trigger: firing a
 browser window, or a local command, on every matching line of terminal output
 is not something a pattern match should be able to do.
 
-An older Nexus build that does not know **Run In** treats such a macro as an
+An older Nexus build that does not know **Run in** treats such a macro as an
 ordinary session macro. The shipped **Launch IPMI web console** template
 therefore stores its URL without a trailing newline: on such a build it is
 pasted into a terminal rather than executed.

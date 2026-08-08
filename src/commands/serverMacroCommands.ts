@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
-import type { MacroRunTarget, TerminalMacro } from "../models/terminalMacro";
-import { macroRunTargetLabel, resolveMacroRunTarget } from "../models/terminalMacro";
+import type { TerminalMacro } from "../models/terminalMacro";
+import { macroRunTargetBadge, resolveMacroRunTarget } from "../models/terminalMacro";
 import { getMacros } from "../macroSettings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import { bindingToDisplayLabel } from "../macroBindings";
@@ -66,10 +66,6 @@ function issueSummary(issue: ProfileTokenError, server: ServerConfig): string {
     : `$(warning) "${server.name}" ${profileTokenLabel(issue.token)} cannot be used in a command`;
 }
 
-function runTargetBadge(target: MacroRunTarget): string {
-  return target === "session" ? "" : `[${macroRunTargetLabel(target)}] `;
-}
-
 /**
  * The macro picker's items, in display order: macros that reference
  * `${profile.*}` first (they are what this command exists for), each remaining
@@ -86,7 +82,7 @@ export function buildServerMacroPicks(macros: readonly TerminalMacro[], server: 
     const binding = getAssignedBinding(macro);
     const prefix = binding ? `[${bindingToDisplayLabel(binding)}] ` : "";
     const marker = macroWillPrompt(macro) ? VARIABLE_MARKER : "";
-    const badge = runTargetBadge(resolveMacroRunTarget(macro));
+    const badge = macroRunTargetBadge(macro);
     const issue = profileTokenIssue(macro, server);
     const details = [issue ? issueSummary(issue, server) : undefined, folderDetail(macro)];
     return {
@@ -141,16 +137,25 @@ function localTerminalTarget(macro: TerminalMacro, server: ServerConfig): MacroS
   };
 }
 
-function browserTarget(macro: TerminalMacro): MacroSendTarget {
+function browserTarget(macro: TerminalMacro, macroIndex: number): MacroSendTarget {
   return {
     description: "the browser",
     isStillValid: () => true,
     async send(text: string): Promise<boolean> {
       const url = resolveMacroBrowserUrl(text);
       if (!url) {
-        void vscode.window.showErrorMessage(
-          `"${macro.name}" is set to run in the browser, but its text is not an http:// or https:// URL. Nothing was opened.`
+        // The fix is always in the macro's text, so offer the same one-click
+        // route to it that a profile-token refusal offers to the server form.
+        const action = await vscode.window.showErrorMessage(
+          `"${macro.name}" is set to run in the browser, but its text is not an http:// or https:// URL. Nothing was opened.`,
+          "Edit Macro"
         );
+        if (action === "Edit Macro") {
+          // `{ macro, index }` is the row shape every macro command accepts
+          // (`MacroRowLike` in services/macroMutation.ts), so the target is
+          // re-resolved against a freshly read array rather than trusted.
+          await vscode.commands.executeCommand("nexus.macro.edit", { macro, index: macroIndex });
+        }
         return false;
       }
       await vscode.env.openExternal(vscode.Uri.parse(url));
@@ -256,8 +261,41 @@ async function resolveServerSessionTarget(
 async function reportProfileTokenError(error: ProfileTokenError, server: ServerConfig): Promise<void> {
   const action = await vscode.window.showErrorMessage(error.message, "Edit Server");
   if (action === "Edit Server") {
-    await vscode.commands.executeCommand("nexus.server.edit", { server });
+    // `expandAdvanced` — "IPMI / BMC Host" is an advanced field, so without it
+    // the button lands on a form with the field the error named collapsed out
+    // of sight.
+    await vscode.commands.executeCommand("nexus.server.edit", { server, expandAdvanced: true });
   }
+}
+
+/**
+ * The macro the caller already picked, if any. `nexus.macro.run` and the
+ * keybinding paths know WHICH macro but not which server, so they redirect here
+ * (`runOrSendMacro` in macroCommands.ts) — re-asking for the macro would make
+ * the redirect cost the user their own selection.
+ *
+ * Resolved against the CURRENT list by id where there is one, so the stored
+ * record wins over whatever the caller was holding; a caller with no id (or an
+ * id that no longer exists) falls back to a shape check on the object itself,
+ * which is enough to run it. Anything else — a tree item, a server argument,
+ * nothing at all — means "no preselection", and the picker opens as before.
+ */
+function preselectedMacro(arg: unknown, macros: readonly TerminalMacro[]): TerminalMacro | undefined {
+  if (!arg || typeof arg !== "object") {
+    return undefined;
+  }
+  const { macroId, macro } = arg as { macroId?: unknown; macro?: unknown };
+  const id = typeof macroId === "string" ? macroId : undefined;
+  const candidate = macro && typeof macro === "object" ? (macro as TerminalMacro) : undefined;
+  const wantedId = id ?? (typeof candidate?.id === "string" ? candidate.id : undefined);
+  if (wantedId) {
+    const stored = macros.filter((m) => m.id === wantedId);
+    // Exactly one match only: two macros sharing an id is a real state in this
+    // codebase (see services/macroMutation.ts), and running "one of them" is
+    // the guess that file exists to refuse.
+    if (stored.length === 1) return stored[0];
+  }
+  return typeof candidate?.name === "string" && typeof candidate?.text === "string" ? candidate : undefined;
 }
 
 export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Promise<void> {
@@ -268,21 +306,32 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
 
   const macros = getMacros();
   if (macros.length === 0) {
-    const action = await vscode.window.showInformationMessage("No macros defined.", "Add Blank Macro");
-    if (action === "Add Blank Macro") {
+    // The templates are the fastest route to a working profile-token macro, and
+    // this command is exactly where someone arrives wanting one.
+    const action = await vscode.window.showInformationMessage(
+      "No macros yet. The IPMI templates are a good starting point — they fill the BMC address in from the server profile.",
+      "Add From Template…",
+      "Add Blank Macro"
+    );
+    if (action === "Add From Template…") {
+      await vscode.commands.executeCommand("nexus.macro.addFromTemplate");
+    } else if (action === "Add Blank Macro") {
       await vscode.commands.executeCommand("nexus.macro.add");
     }
     return;
   }
 
-  const picked = await vscode.window.showQuickPick(buildServerMacroPicks(macros, server), {
-    title: `Run Macro on "${server.name}"`,
-    placeHolder: "Select a macro — ${profile.…} tokens resolve against this server"
-  });
-  if (!picked) {
-    return;
+  let macro = preselectedMacro(arg, macros);
+  if (!macro) {
+    const picked = await vscode.window.showQuickPick(buildServerMacroPicks(macros, server), {
+      title: `Run Macro on "${server.name}"`,
+      placeHolder: "Select a macro — ${profile.…} tokens resolve against this server"
+    });
+    if (!picked) {
+      return;
+    }
+    macro = picked.macro;
   }
-  const macro = picked.macro;
 
   // Profile tokens are resolved FIRST and synchronously: a macro that cannot be
   // resolved against this server must fail before anything is connected, any
@@ -308,7 +357,7 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
       target = localTerminalTarget(macro, server);
       break;
     case "browser":
-      target = browserTarget(macro);
+      target = browserTarget(macro, macros.indexOf(macro));
       break;
     default:
       target = await resolveServerSessionTarget(ctx, server, macro);

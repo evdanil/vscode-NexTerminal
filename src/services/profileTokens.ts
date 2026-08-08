@@ -19,6 +19,7 @@
  * bookkeeping into command lines. The list below is the curated set; adding to
  * it later is one line plus a charset decision.
  */
+import { serializeForInlineScript } from "../ui/shared/inlineScriptData";
 import type { ServerConfig } from "../models/config";
 
 export const PROFILE_TOKEN_WHITELIST = ["host", "port", "username", "name", "ipmiHost"] as const;
@@ -32,6 +33,34 @@ const PROFILE_TOKEN_FIELD_LABELS: Record<ProfileTokenName, string> = {
   username: "Username",
   name: "Name",
   ipmiHost: "IPMI / BMC Host"
+};
+
+/**
+ * WHERE the field lives on the server form, so a "not set" refusal can send the
+ * user to the right place. `ipmiHost` is `advanced: true`
+ * (ui/formDefinitions.ts), so the form opens with it COLLAPSED — an error that
+ * says only "Edit Server" lands on a form where the field is not visible.
+ */
+const PROFILE_TOKEN_FIELD_LOCATION: Record<ProfileTokenName, string> = {
+  host: "in the server form",
+  port: "in the server form",
+  username: "in the server form",
+  name: "in the server form",
+  ipmiHost: "under Advanced options in the server form"
+};
+
+/**
+ * What IS allowed, per token — the half of a charset refusal that lets the user
+ * fix it. Naming only what is forbidden leaves them guessing which of the
+ * characters they typed was the problem.
+ */
+const PROFILE_TOKEN_CHARSET_GUIDANCE: Record<ProfileTokenName, string> = {
+  host: 'Use the address only — letters, digits, ".", "-", "_", ":" and "[]" for IPv6 — without a scheme like https:// or a path.',
+  ipmiHost:
+    'Use the address only — letters, digits, ".", "-", "_", ":" and "[]" for IPv6 — without a scheme like https:// or a path.',
+  port: "Use the port number only — digits, nothing else.",
+  username: 'Use letters, digits, ".", "_", "-" and "@" only.',
+  name: 'Remove $, `, quotes, ";", "|", "&", "<", ">" and "\\" from the name — spaces and parentheses are fine.'
 };
 
 /** The server-form label for a token, so pickers and errors name the same field. */
@@ -92,8 +121,36 @@ function isProfileTokenName(name: string): name is ProfileTokenName {
  */
 const ADDRESS_CHARSET = /^[A-Za-z0-9._:\-\[\]]+$/;
 const DIGITS_ONLY = /^[0-9]+$/;
+/**
+ * Usernames: letters, digits, `.`, `_`, `-` and `@` — enough for every real
+ * account name including the email-style `user@realm` form, and nothing a shell
+ * reads as syntax. A username reaches a LOCAL command line through the shipped
+ * ipmitool template (`-U ${profile.username}`) and arrives in the config from
+ * inventory sync (`syncEngine.ts` writes `after.username` straight from the
+ * endpoint) and from backup import, so it needs the same use-time check as the
+ * address fields.
+ */
+const USERNAME_CHARSET = /^[A-Za-z0-9._@\-]+$/;
+/**
+ * `name` is a genuinely free-form label — "Core Switch (DC1)" must keep working
+ * — so it gets a blacklist rather than a charset: everything a shell would read
+ * as syntax is refused, while spaces, parentheses and accents are not.
+ */
+const NAME_FORBIDDEN_CHARS = /["'$`;|&<>\\]/;
+/**
+ * Refused in EVERY token, no exceptions. `$` and a backtick are what turn a
+ * substituted value into syntax rather than data — for the shell, and for this
+ * extension's own second pass: `runMacroOnServer` hands the resolved text to
+ * `resolveMacroText`, which re-scans it for `$name` placeholders, so a profile
+ * value able to carry a `$` could splice a prompted secret's value into the
+ * command. This invariant is what makes that re-scan safe (and what lets the
+ * substitution loop below treat every value as opaque).
+ */
+const SHELL_EXPANSION_CHARS = /[$`]/;
 /** C0 and C1 control characters, `\n` / `\r` included. */
 const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/;
+/** Same class, global — used to render an offending value inside an error message. */
+const CONTROL_CHARS_GLOBAL = /[\u0000-\u001F\u007F-\u009F]/g;
 
 /**
  * THE INJECTION DEFENSE, and the reason it lives at the substitution site
@@ -111,16 +168,17 @@ const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/;
  * substituted anyway, and never silently emptied (an empty `-H` argument is its
  * own failure mode).
  *
- * Control characters are rejected for EVERY token, `name` and `username`
- * included: the resolved text is sent to a terminal, so an embedded newline in
- * any substituted value executes whatever follows it, no shell metacharacter
- * required. Beyond that, `name` is a free-form label (parentheses, spaces and
- * accents are ordinary in it) and is not charset-restricted — a macro author
- * putting a display name inside a command owns the quoting of it, exactly as
- * they own the rest of their template.
+ * EVERY token is checked — there is no "it is only a label" exemption, because
+ * every token ends up in the same command line. Control characters are refused
+ * throughout (an embedded newline executes whatever follows it, no shell
+ * metacharacter required), and so are `$` and a backtick (see
+ * `SHELL_EXPANSION_CHARS`). On top of that each token gets the narrowest rule
+ * its content allows: an address charset for `host`/`ipmiHost`, digits for
+ * `port`, a real-username charset for `username`, and — because a display name
+ * is genuinely free-form — a metacharacter blacklist for `name`.
  */
 function validateTokenValue(token: ProfileTokenName, value: string): boolean {
-  if (CONTROL_CHARS.test(value)) {
+  if (CONTROL_CHARS.test(value) || SHELL_EXPANSION_CHARS.test(value)) {
     return false;
   }
   switch (token) {
@@ -129,9 +187,24 @@ function validateTokenValue(token: ProfileTokenName, value: string): boolean {
       return ADDRESS_CHARSET.test(value);
     case "port":
       return DIGITS_ONLY.test(value);
+    case "username":
+      return USERNAME_CHARSET.test(value);
+    case "name":
+      return !NAME_FORBIDDEN_CHARS.test(value);
     default:
-      return true;
+      // A token added to the whitelist without a rule of its own refuses rather
+      // than passes: the charset decision is part of adding it, not optional.
+      return false;
   }
+}
+
+/** The offending value, made safe and short enough to show inside a notification. */
+function displayValue(value: string): string {
+  // Control characters are why some values are refused; printing them raw would
+  // reflow the notification (or hide the problem entirely), so they are shown as
+  // a visible placeholder instead.
+  const printable = value.replace(CONTROL_CHARS_GLOBAL, "·");
+  return printable.length > 64 ? `${printable.slice(0, 64)}…` : printable;
 }
 
 /** The raw string a whitelisted token stands for, or `""` when the field carries nothing usable. */
@@ -150,16 +223,20 @@ function missingError(token: ProfileTokenName, serverName: string): ProfileToken
     kind: "missing",
     token,
     serverName,
-    message: `"${serverName}" has no ${PROFILE_TOKEN_FIELD_LABELS[token]} set, but this macro uses \${profile.${token}}. Nothing was sent.`
+    message:
+      `"${serverName}" has no ${PROFILE_TOKEN_FIELD_LABELS[token]} set, but this macro uses \${profile.${token}}. ` +
+      `Add it ${PROFILE_TOKEN_FIELD_LOCATION[token]}. Nothing was sent.`
   };
 }
 
-function invalidError(token: ProfileTokenName, serverName: string): ProfileTokenError {
+function invalidError(token: ProfileTokenName, serverName: string, value: string): ProfileTokenError {
   return {
     kind: "invalid",
     token,
     serverName,
-    message: `The ${PROFILE_TOKEN_FIELD_LABELS[token]} of "${serverName}" contains characters that are not safe to place in a command, so \${profile.${token}} was not substituted. Nothing was sent.`
+    message:
+      `The ${PROFILE_TOKEN_FIELD_LABELS[token]} of "${serverName}" ("${displayValue(value)}") has characters that ` +
+      `can't be placed in a command or URL. ${PROFILE_TOKEN_CHARSET_GUIDANCE[token]} Nothing was sent.`
   };
 }
 
@@ -171,8 +248,16 @@ function invalidError(token: ProfileTokenName, serverName: string): ProfileToken
  * joining, never `text.replace(re, value)`. In string-replacement mode
  * JavaScript interprets `$&`, `` $` ``, `$'`, `$1` and `$$` inside the
  * REPLACEMENT — a stored value containing those would splice surrounding text
- * into the result. Array-append treats every profile value as opaque and
- * never rescans it.
+ * into the result. Array-append treats every profile value as opaque and never
+ * rescans it.
+ *
+ * That opacity holds only for THIS pass. `runMacroOnServer` hands the resolved
+ * text to `resolveMacroText`, which scans it again for `$name` placeholders, so
+ * the array-append rule alone would not stop a profile value from introducing a
+ * `$` that the SECOND pass expands (into a prompted secret's value, say). What
+ * makes the pipeline safe end to end is the invariant enforced by
+ * `validateTokenValue()`: no substituted value can ever contain `$` or a
+ * backtick. Relaxing that charset means revisiting the second pass.
  *
  *   token not whitelisted → push the match verbatim (escaped or not) + warn
  *   escaped (`$${…}`)     → push the match minus one leading `$`
@@ -226,7 +311,7 @@ export function resolveProfileTokens(
       return { ok: false, error: missingError(name, serverName) };
     }
     if (!validateTokenValue(name, value)) {
-      return { ok: false, error: invalidError(name, serverName) };
+      return { ok: false, error: invalidError(name, serverName, value) };
     }
     out.push(value);
   }
@@ -256,7 +341,51 @@ export function profileTokensUsed(text: string): ProfileTokenName[] {
   return used;
 }
 
+/**
+ * The message shown when a macro tries to do both — shared by the macro
+ * editor's live warning, its save-time check, and the host's re-validation, so
+ * the three cannot drift. Auto-firing is the reason: a rule compiled from
+ * terminal output has no server to resolve `${profile.…}` against, so it would
+ * send the literal token text.
+ */
+export const PROFILE_TOKEN_TRIGGER_CONFLICT_MESSAGE =
+  "Macros using ${profile...} tokens resolve against a chosen server, so they cannot auto-trigger. Remove the trigger pattern or the profile tokens.";
+
 /** Does `text` reference any profile token at all (used to sort pickers)? */
 export function hasProfileTokens(text: string): boolean {
   return profileTokensUsed(text).length > 0;
+}
+
+/**
+ * Webview-JS twin of `profileTokensUsed()` plus the unknown-token list, built
+ * on the `macroVariablesWebviewJs()` precedent (services/macroVariables.ts):
+ * the regex and the whitelist are INTERPOLATED from the definitions above, so
+ * the macro editor's live hints cannot drift from what a run actually does.
+ * Returns `{ used, unknown }` — whitelisted tokens the text resolves, and
+ * `${profile.…}` names that will be sent as-is (typically a typo).
+ */
+export function profileTokensWebviewJs(): string {
+  // No leading newline — see macroVariablesWebviewJs() for why (the call site is
+  // indented and a whitespace-only line fails `git diff --check` on the snapshot).
+  return `var PROFILE_TOKEN_NAMES = ${JSON.stringify(PROFILE_TOKEN_WHITELIST)};
+      function scanProfileTokens(text) {
+        var re = new RegExp(${serializeForInlineScript(PROFILE_TOKEN_SOURCE)}, "g");
+        var used = [];
+        var unknown = [];
+        var seenUsed = Object.create(null);
+        var seenUnknown = Object.create(null);
+        var match;
+        while ((match = re.exec(text)) !== null) {
+          if (match[1] === "$") continue;
+          var name = match[2];
+          if (PROFILE_TOKEN_NAMES.indexOf(name) !== -1) {
+            if (!seenUsed[name]) { seenUsed[name] = true; used.push(name); }
+          } else if (!seenUnknown[name]) {
+            seenUnknown[name] = true;
+            unknown.push(name);
+          }
+        }
+        return { used: used, unknown: unknown };
+      }
+`;
 }

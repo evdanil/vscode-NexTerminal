@@ -57,6 +57,7 @@ Jump hosts are set per server, and a jump host can have a jump host of its own �
 - **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH, serial, and Local Shell terminal output. 20+ built-in rules detect errors, warnings, status keywords, IP/MAC addresses, UUIDs, URLs, interface counters and more with inline ANSI colouring while respecting existing terminal colours. Includes a visual Rule Editor with live preview, staged Apply/Cancel, rule ordering, custom SGR foreground codes, regex safety checks, and one-click reset to defaults.
 - **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign any macro a custom keybinding from 108 combinations across three modifier groups: `Alt`, `Alt+Shift`, and `Ctrl+Shift` with A-Z or 0-9 keys. Macros without a keybinding are accessible via `Alt+S` quick-pick. Includes a Macro Editor panel with multiline editing, secret macro support, inline keybinding assignment, and Macros-view actions to copy or paste secret values via the system clipboard. Clipboard copies place the value in the OS clipboard as plain text. **Auto-trigger (expect/send)**: add a `triggerPattern` regex to any macro — when terminal output matches, the macro text is sent automatically. Existing macros default to all-terminal matching for compatibility; new macros can be scoped to the active terminal or a matching profile, which is recommended for secret prompts. `triggerCooldown` prevents echo loops, `triggerInterval` enables prompt-gated polling macros, and macros can optionally start with auto-trigger paused until you resume them from the Macros view. Pause/resume, interval ownership, and cooldown state all follow the macro itself, so reordering or deleting other macros never moves that state onto the wrong one. See the [macro guide](docs/macros.md) for step-by-step setup, trigger scopes, cooldowns, intervals, and regex examples.
 - **Macro Variables** — Declare named variables on a macro (label, default, mask-input, remember) in the Macro Editor and reference them in its text as `$name` or `${name}`; running the macro walks a step-by-step prompt (with Back) for each variable actually used, then sends the filled-in command to the terminal you invoked it from — even if you switch tabs while the prompts are open. A placeholder for a name you never declared is sent through unchanged rather than blocking the macro. Variables and auto-trigger can't be combined on the same macro — prompting needs a foreground input box, which a background pattern match can't safely open. See the [macro guide](docs/macros.md) for the full variable reference.
+- **Server profile tokens & IPMI/BMC macros** — Reference the server a macro runs against with `${profile.host}`, `${profile.port}`, `${profile.username}`, `${profile.name}`, and `${profile.ipmiHost}` (set **IPMI / BMC Host** under Advanced in the server form). Right-click a server in the Connectivity Hub → **Run Macro on Server…** to resolve them against that server; macros can target the session, a local terminal (ipmitool SOL), or the browser (BMC web console). Two starter templates ship in **Add Macro From Template**. See the [macro guide](docs/macros.md#profile-tokens).
 - **Keyboard Passthrough** — Optionally pass `Ctrl+` key combinations (e.g. `Ctrl+B`, `Ctrl+N`) directly to the terminal for applications like vim, nano, and htop. Configurable per-key with 10 supported combinations.
 - **Session Transcript Logging** — Automatically log clean terminal output (ANSI codes stripped) to files with configurable rotation. Per-profile toggle.
 - **Terminal Tab Commands** — Right-click any Nexus terminal tab for three PuTTY-style commands: *Reset Terminal* (clears the visible screen while preserving scrollback), *Clear Scrollback* (clears visible and captured transcript together), and *Copy All to Clipboard* (ANSI-stripped transcript of the session). After a session disconnects, Reset and Clear grey out; Copy All stays enabled so a run can always be captured for a ticket or chat.
@@ -158,14 +159,15 @@ Reference a declared variable in the macro's text as `$name` or `${name}` — bo
 
 Running the macro opens one input box per declared-and-used variable, in declaration order, with a **Back** button to return to the previous prompt (not shown on the first one). Pressing Esc or closing the box at any step cancels the whole run — nothing is sent. Once every prompt is answered, Nexus sends the filled-in text to the terminal you invoked the macro from, even if you've since switched to a different terminal tab.
 
-The **Prompted command** template (Add Macro From Template) builds this worked example — the feature's original use case:
+The **IPMI SOL console** template (Add Macro From Template) builds this worked example — the feature's original use case:
 
 ```
-Text:      ipmitool -I lanplus -H $host -U $username -P $password sol activate
-Variables: host (Host), username (Username), password (Password, masked)
+Text:      ipmitool -I lanplus -H ${profile.ipmiHost} -U $username -P $password sol activate
+Variables: username (Username), password (Password, masked)
+Run in:    Local terminal
 ```
 
-Running it prompts for the host, then the username, then the password (masked, never remembered), then sends the completed `ipmitool` command to your terminal.
+The BMC address isn't prompted for — `${profile.ipmiHost}` is filled in from the server profile you run the macro against. Right-click a server in the Connectivity Hub → **Run Macro on Server…**, pick this macro, answer the username and password prompts (masked, never remembered), and Nexus runs the completed `ipmitool` command in a fresh local terminal.
 
 A macro can prompt for input, or auto-trigger from terminal output — not both. If a macro somehow ends up with both, Nexus treats it as a plain, non-auto-triggering macro instead of running either behavior partially.
 
@@ -297,7 +299,7 @@ Add this to your PowerShell profile (`$PROFILE`) to make it permanent.
 
 - **Encrypted Backup**: Run `Nexus: Export Backup` to create a master-password-protected backup including all profiles, settings, saved credentials, the user `.ssh` folder, and the configured Nexus scripts folder
 - **Share Export**: Run `Nexus: Export Configuration` to create a sanitized export safe for sharing (credentials stripped, learned hardware identifiers removed, IDs remapped)
-- **Import**: Run `Nexus: Import…` — also reachable from the Command Center's `...` overflow menu, the Command Center welcome view, and the Data Management section of Settings. It asks what you're importing, then opens the matching picker:
+- **Import**: Run `Nexus: Import…` — also reachable from the Connectivity Hub's `...` overflow menu, the Connectivity Hub welcome view, and the Data Management section of Settings. It asks what you're importing, then opens the matching picker:
   - **Paste Host List from Clipboard** / **Host List File…** — a CSV export, a device inventory, or a plain hostname list
   - **MobaXterm INI File…** — sessions from a MobaXterm `.ini` bookmarks export
   - **SecureCRT XML Export…** / **SecureCRT Sessions Folder…** — sessions from SecureCRT

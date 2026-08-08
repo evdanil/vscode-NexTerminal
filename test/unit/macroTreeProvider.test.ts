@@ -127,6 +127,19 @@ describe("MacroTreeItem", () => {
     expect(item.tooltip).toBe("Test\necho test");
   });
 
+  it("names a non-session run target in the tooltip, and says nothing for a session macro (issue #48)", () => {
+    // Clicking this row opens a browser window; clicking the one below types
+    // into a terminal. The tooltip is the only place that distinction is visible.
+    const browser = new MacroTreeItem({ name: "BMC", text: "https://x/", runIn: "browser" }, 0);
+    expect(browser.tooltip).toContain("Runs in: Browser");
+
+    const local = new MacroTreeItem({ name: "SOL", text: "ipmitool\n", runIn: "localTerminal" }, 0);
+    expect(local.tooltip).toContain("Runs in: Local terminal");
+
+    const session = new MacroTreeItem({ name: "Plain", text: "show version\n" }, 0);
+    expect(session.tooltip).not.toContain("Runs in:");
+  });
+
   it("truncates description at ~40 chars and replaces newlines with ↵", () => {
     const shortMacro = { name: "Short", text: "echo hi" };
     const shortItem = new MacroTreeItem(shortMacro, 0);

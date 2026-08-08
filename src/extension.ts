@@ -457,7 +457,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     scriptCodeLensProvider
   );
 
-  // Script runtime status bar item — separate from the existing Nexus Command Center item.
+  // Script runtime status bar item — separate from the existing Nexus Connectivity Hub item.
   const scriptStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 9);
   scriptStatusBarItem.command = "nexus.script.openOutput";
   scriptStatusBarItem.name = "Nexus Scripts";

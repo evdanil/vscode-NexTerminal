@@ -226,7 +226,9 @@ describe("nexus.server.runMacro — dispatch", () => {
     // Nothing sent anywhere — not a literal token, not an empty -H argument.
     expect(createdTerminals).toHaveLength(0);
     expect(String(showErrorMessage.mock.calls[0][0])).toContain("IPMI / BMC Host");
-    expect(executeCommand).toHaveBeenCalledWith("nexus.server.edit", { server: target });
+    // `expandAdvanced` — "IPMI / BMC Host" lives behind the form's Advanced
+    // section, so the button must open it rather than land on a collapsed field.
+    expect(executeCommand).toHaveBeenCalledWith("nexus.server.edit", { server: target, expandAdvanced: true });
   });
 
   it("refuses a host that carries shell syntax before anything is run", async () => {
@@ -272,6 +274,72 @@ describe("nexus.server.runMacro — dispatch", () => {
     expect(String(showWarningMessage.mock.calls[0][0])).toContain("not connected");
     expect(connectServer).not.toHaveBeenCalled();
     expect(setStatusBarMessage).not.toHaveBeenCalled();
+  });
+
+  it("runs a preselected macro without ever showing the macro picker", async () => {
+    // The redirect from `nexus.macro.run` / a keybinding already knows WHICH
+    // macro — it only lacks a server. Re-asking would cost the user the
+    // selection they just made.
+    await setMacros([
+      { id: "a", name: "Other", text: "show version\n" },
+      { id: "b", name: "BMC", text: "https://${profile.ipmiHost}/", runIn: "browser" }
+    ]);
+
+    await runMacroOnServer(context(), { server: server({ ipmiHost: "10.0.0.9" }), macro: { id: "b" } });
+
+    expect(showQuickPick).not.toHaveBeenCalled();
+    expect(openExternal).toHaveBeenCalledTimes(1);
+    expect((openExternal.mock.calls[0][0] as { value: string }).value).toBe("https://10.0.0.9/");
+  });
+
+  it("prefers the STORED record over the macro object the caller was holding", async () => {
+    // The caller's copy can be stale — the store is the source of truth for what
+    // running this macro does.
+    await setMacros([{ id: "b", name: "BMC", text: "https://${profile.ipmiHost}/edited", runIn: "browser" }]);
+
+    await runMacroOnServer(context(), {
+      server: server({ ipmiHost: "10.0.0.9" }),
+      macro: { id: "b", name: "BMC", text: "https://stale.example.com/", runIn: "browser" }
+    });
+
+    expect((openExternal.mock.calls[0][0] as { value: string }).value).toBe("https://10.0.0.9/edited");
+  });
+
+  it("still opens the picker for a server argument that names no macro", async () => {
+    await setMacros([{ id: "a", name: "Version", text: "show version\n" }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showWarningMessage.mockResolvedValue(undefined);
+
+    await runMacroOnServer(context(), { server: server() });
+
+    expect(showQuickPick).toHaveBeenCalled();
+  });
+
+  it("points at the templates when there are no macros at all", async () => {
+    showInformationMessage.mockResolvedValue("Add From Template…");
+
+    await runMacroOnServer(context(), { server: server() });
+
+    expect(String(showInformationMessage.mock.calls[0][0])).toContain("IPMI templates");
+    // Both routes offered; the template one is what this command exists for.
+    expect(showInformationMessage.mock.calls[0].slice(1)).toEqual(["Add From Template…", "Add Blank Macro"]);
+    expect(executeCommand).toHaveBeenCalledWith("nexus.macro.addFromTemplate");
+  });
+
+  it("offers Edit Macro when a browser macro's text is not a URL", async () => {
+    await setMacros([{ id: "a", name: "Evil", text: "javascript:alert(1)", runIn: "browser" }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showErrorMessage.mockResolvedValue("Edit Macro");
+
+    await runMacroOnServer(context(), { server: server() });
+
+    // The fix is in the macro's text, so the repair button opens the macro —
+    // the mirror of the Edit Server button on a profile-token refusal.
+    expect(showErrorMessage.mock.calls[0][1]).toBe("Edit Macro");
+    expect(executeCommand).toHaveBeenCalledWith(
+      "nexus.macro.edit",
+      expect.objectContaining({ index: 0 })
+    );
   });
 
   it("falls back to the server picker when invoked from the palette", async () => {

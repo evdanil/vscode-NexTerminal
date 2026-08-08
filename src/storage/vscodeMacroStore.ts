@@ -5,6 +5,7 @@ import {
   assignIdsForAbsorbedMacros,
   assignMacroIds,
   canonicalMacroBinding,
+  canonicalMacroRunTarget,
   canonicalMacroSecret,
   canonicalMacroTriggerTerms,
   canonicalMacroVariableTerms,
@@ -895,7 +896,14 @@ function keyOfLegacy(m: TerminalMacro): string {
     // identical. Both sides of the comparison go through the same helper, so the migration
     // itself cannot desynchronize them.
     canonicalMacroBinding(m),
-    canonicalMacroVariableTerms(m)
+    canonicalMacroVariableTerms(m),
+    // Issue #48 — same reason as in `keyOf()`: `runIn` is not destroyed by the
+    // redaction boundary (it is persisted verbatim), and two absorbed records
+    // differing only in where they run are two macros. Leaving it out let
+    // `dedupeLegacyMacros()` discard one of the pair BEFORE persistence, after
+    // which `absorbLegacySettingsIfPresent()` clears the legacy key and the
+    // loser is gone for good.
+    canonicalMacroRunTarget(m)
   ]);
 }
 

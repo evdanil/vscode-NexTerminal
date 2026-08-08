@@ -1143,6 +1143,42 @@ describe("MacroAutoTrigger", () => {
       obs.dispose();
     });
 
+    it("a SESSION macro using ${profile.…} compiles no rule — the literal token would be sent", () => {
+      // The gap the `runIn` skip alone leaves open: this macro DOES run in the
+      // session, so nothing above stops it, but a rule fired by output has no
+      // server to resolve the token against. Without the profile-token skip the
+      // device receives `ping ${profile.host}` verbatim.
+      setConfig([
+        { name: "pingProfile", text: "ping ${profile.host}\n", triggerPattern: "router#" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    it("an ESCAPED profile token is just text, so that macro still auto-fires", () => {
+      // `$${profile.host}` resolves to the literal string in every path, so it
+      // constrains nothing — suppressing it would kill a working trigger.
+      setConfig([
+        { name: "literal", text: "echo $${profile.host}\n", triggerPattern: "router#" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual(["echo $${profile.host}\n"]);
+      obs.dispose();
+    });
+
     it("skip position: runIn + triggerInitiallyDisabled records no disabled-state entry either", () => {
       // Same ordering requirement as the §6.1 variables skip: the `continue`
       // must run BEFORE `defaultDisabledKeys.add(stateKey)`, or a macro that

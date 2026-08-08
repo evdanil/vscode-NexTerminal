@@ -3,7 +3,7 @@ import type { MacroTreeItem } from "../ui/macroTreeProvider";
 import { MacroEditorPanel } from "../ui/macroEditorPanel";
 import type { MacroProfileOptionInput } from "../ui/macroProfileOptions";
 import type { TerminalMacro } from "../models/terminalMacro";
-import { resolveMacroRunTarget } from "../models/terminalMacro";
+import { macroRunTargetBadge, resolveMacroRunTarget } from "../models/terminalMacro";
 import { hasProfileTokens } from "../services/profileTokens";
 import {
   bindingToContextKey,
@@ -111,7 +111,7 @@ export const MACRO_TEMPLATES: MacroTemplate[] = [
     // without an entry here the feature is discoverable only by opening the
     // editor and happening to notice the new Variables section.
     id: "prompted-command",
-    label: "Prompted command",
+    label: "IPMI SOL console",
     description: "Fill the BMC address in from the server profile, prompt for username and password, then run ipmitool (leading space keeps it out of shell history).",
     macro: {
       name: "IPMI SOL console",
@@ -188,7 +188,9 @@ async function runOrSendMacro(macro: TerminalMacro): Promise<void> {
       "Run Macro on Server…"
     );
     if (action) {
-      await vscode.commands.executeCommand("nexus.server.runMacro");
+      // The macro travels with the redirect: the user already chose it here,
+      // and the only thing the other command needs is the server.
+      await vscode.commands.executeCommand("nexus.server.runMacro", { macro });
     }
     return;
   }
@@ -796,9 +798,13 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           // sidebar: "click = sends immediately" and "click = opens prompts" are
           // different enough behaviors to flag here too.
           const marker = macroWillPrompt(m) ? VARIABLE_MARKER : "";
+          // Same badge, same helper, as the Run Macro on Server picker: "sends
+          // a line to this terminal" and "opens a browser window" must not look
+          // identical in a list.
+          const badge = macroRunTargetBadge(m);
           return {
             label: `${prefix}${m.name}`,
-            description: `${marker}${m.secret ? "***" : m.text.replace(/\n/g, "\\n")}`,
+            description: `${marker}${badge}${m.secret ? "***" : m.text.replace(/\n/g, "\\n")}`,
             detail: macroFolderDetail(m),
             index: i
           };

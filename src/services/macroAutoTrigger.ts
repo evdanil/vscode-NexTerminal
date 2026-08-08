@@ -4,6 +4,7 @@ import { clamp } from "../utils/helpers";
 import { validateRegexSafety } from "../utils/regexSafety";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
 import { resolveMacroRunTarget } from "../models/terminalMacro";
+import { hasProfileTokens } from "./profileTokens";
 import type { ScriptMacroFilter } from "./scripts/scriptMacroFilter";
 import { getMacros } from "../macroSettings";
 import {
@@ -206,6 +207,13 @@ export class MacroAutoTrigger implements vscode.Disposable {
       // Read through `resolveMacroRunTarget()`, which treats a corrupt value as
       // "session" rather than as a reason to suppress a working trigger.
       if (resolveMacroRunTarget(macro) !== "session") continue;
+      // Same skip, same position, for the other half of issue #48: a SESSION
+      // macro whose text names `${profile.…}`. A compiled rule fires from
+      // terminal output, which names no server, so there is nothing to resolve
+      // the token against — the rule would send the literal `${profile.host}`
+      // to the device. The editor refuses this combination too; this is the
+      // guard for records that never went through it.
+      if (hasProfileTokens(macro.text)) continue;
       if (macro.triggerScope !== undefined && !VALID_MACRO_TRIGGER_SCOPES.has(macro.triggerScope)) continue;
       const stateKey = macroStateKey(macro);
       // Ambiguous identity — two or more macros in this set resolve to `stateKey`, so

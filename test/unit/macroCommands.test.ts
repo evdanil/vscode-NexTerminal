@@ -232,15 +232,15 @@ describe("macroCommands template actions", () => {
       "Send password when prompted",
       "Wait and send confirmation",
       "Scoped auto-trigger example",
-      "Prompted command",
+      "IPMI SOL console",
       "Launch IPMI web console"
     ]);
   });
 
-  it("creates the Prompted command template with the BMC address from the profile and the password masked (§9.7, issue #48)", async () => {
+  it("creates the IPMI SOL console template with the BMC address from the profile and the password masked (§9.7, issue #48)", async () => {
     const macros: unknown[] = [];
     mockGetMacros.mockReturnValue(macros);
-    mockShowQuickPick.mockResolvedValue({ label: "Prompted command", templateId: "prompted-command" });
+    mockShowQuickPick.mockResolvedValue({ label: "IPMI SOL console", templateId: "prompted-command" });
 
     await registeredCommands.get("nexus.macro.addFromTemplate")!();
 
@@ -378,6 +378,33 @@ describe("macroCommands variable routing (§8.5)", () => {
     const items = mockShowQuickPick.mock.calls[0][0] as Array<{ label: string; description: string }>;
     expect(items[0].description).not.toContain(VARIABLE_MARKER.trim());
     expect(items[1].description).toContain(VARIABLE_MARKER.trim());
+  });
+
+  it("nexus.macro.run badges a macro that does not run in the session (issue #48)", async () => {
+    const browserMacro = { name: "BMC", text: "https://10.0.0.9/", runIn: "browser" as const };
+    mockGetMacros.mockReturnValue([plainMacro, browserMacro]);
+    mockShowQuickPick.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    const items = mockShowQuickPick.mock.calls[0][0] as Array<{ description: string }>;
+    // "sends a line to this terminal" and "opens a browser window" must not
+    // look identical in the list they are picked from.
+    expect(items[0].description).not.toContain("[");
+    expect(items[1].description).toContain("[Browser]");
+  });
+
+  it("nexus.macro.run hands the picked profile-token macro to Run Macro on Server, not just the command", async () => {
+    const profileMacro = { name: "SOL", text: "ipmitool -H ${profile.ipmiHost}\n" };
+    mockGetMacros.mockReturnValue([profileMacro]);
+    mockShowQuickPick.mockResolvedValue({ index: 0 });
+    mockShowInformationMessage.mockResolvedValue("Run Macro on Server…");
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    // Without the argument the redirect makes the user pick the macro a second
+    // time, having already picked it here.
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.server.runMacro", { macro: profileMacro });
   });
 
   it("nexus.macro.run: a cancelled resolve (runMacro resolves without sending) results in no sendMacroText call either", async () => {

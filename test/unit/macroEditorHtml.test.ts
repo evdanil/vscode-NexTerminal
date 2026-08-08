@@ -142,6 +142,26 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain('document.getElementById("error-runIn")');
   });
 
+  it("blocks the profile-token/trigger combination client-side, in its own warning slot", () => {
+    const html = render([], null);
+    // A dedicated slot: the variables/trigger conflict can apply to the same
+    // macro, and a shared element would let one handler erase the other.
+    expect(html).toContain('id="profile-trigger-conflict"');
+    expect(html).toContain("function updateProfileTriggerConflictWarning()");
+    expect(html).toContain("cannot auto-trigger");
+    expect(html).toContain("scanProfileTokens(text).used.length > 0");
+  });
+
+  it("teaches the profile-token vocabulary on the field where the text is written", () => {
+    const html = render([], null);
+    for (const token of ["${profile.host}", "${profile.ipmiHost}", "${profile.port}", "${profile.username}", "${profile.name}"]) {
+      expect(html).toContain(token);
+    }
+    // The sidebar's real name — "Command Center" is not a view this app has.
+    expect(html).toContain("Connectivity Hub");
+    expect(html).not.toContain("Command Center");
+  });
+
   it("renders binding input field", () => {
     const html = render([], null);
     expect(html).toContain("macro-binding");
@@ -433,6 +453,70 @@ describe("renderMacroEditorHtml", () => {
         }
       ];
       expect(() => render(macros, 0)).not.toThrow();
+    });
+  });
+
+  // Issue #48. Extracted and EXECUTED, not asserted as source text: a
+  // containment check on the hint wording would keep passing if the scan that
+  // produces it were deleted, as long as the literal string stayed somewhere in
+  // the file.
+  describe("Live diagnostics for profile tokens", () => {
+    interface DiagLine { className: string; textContent: string }
+
+    function runDiagnostics(text: string, declaredNames: string[] = []): DiagLine[] {
+      const html = render([], null);
+      const scan = /function scanMacroPlaceholders\(text, declaredNames\) \{[\s\S]*?\n      \}/.exec(html);
+      const profileScan = /var PROFILE_TOKEN_NAMES = [\s\S]*?function scanProfileTokens\(text\) \{[\s\S]*?\n      \}/.exec(html);
+      const compute = /function computeDiagnostics\(\) \{[\s\S]*?\n      \}/.exec(html);
+      if (!scan || !profileScan || !compute) {
+        throw new Error("the diagnostics functions were not found in the rendered script");
+      }
+      // Every element the function builds is captured here as it is created;
+      // the assertions read their class and text back off it.
+      const created: DiagLine[] = [];
+      const container = { innerHTML: "", appendChild: () => {} };
+      const doc = {
+        getElementById: (id: string) =>
+          id === "macro-text" ? { value: text } : id === "variables-diagnostics" ? container : undefined,
+        createElement: () => {
+          const line = { className: "", textContent: "", appendChild: () => {}, addEventListener: () => {} };
+          created.push(line as unknown as DiagLine);
+          return line;
+        }
+      };
+      const factory = new Function(
+        "document",
+        "collectDeclaredVariableNames",
+        "addVariableRow",
+        `${scan[0]}\n${profileScan[0]}\n${compute[0]}\nreturn computeDiagnostics;`
+      ) as (
+        doc: unknown,
+        collect: () => string[],
+        addVariableRow: (name: string) => void
+      ) => () => void;
+      factory(doc, () => declaredNames, () => {})();
+      return created;
+    }
+
+    it("names the tokens that will be filled in from the server profile", () => {
+      const lines = runDiagnostics("ipmitool -H ${profile.ipmiHost} -U ${profile.username}");
+      const positive = lines.find((l) => l.className === "diag-positive");
+      expect(positive?.textContent).toBe("Filled from the server profile at run time: ipmiHost, username");
+    });
+
+    it("warns about a misspelled token instead of blocking it", () => {
+      const lines = runDiagnostics("ipmitool -H ${profile.impiHost}");
+      const hint = lines.find((l) => l.className === "diag-hint");
+      expect(hint?.textContent).toBe(
+        "${profile.impiHost} is not a profile token and will be sent as-is. Tokens: host, port, username, name, ipmiHost."
+      );
+      // A typo is indistinguishable from text the user meant literally, so it
+      // must never produce a "will be filled in" claim.
+      expect(lines.some((l) => l.className === "diag-positive")).toBe(false);
+    });
+
+    it("says nothing about an escaped token, which is just literal text", () => {
+      expect(runDiagnostics("echo $${profile.host}")).toEqual([]);
     });
   });
 

@@ -118,6 +118,47 @@ describe("MacroStore legacy migration", () => {
     expect(names).toEqual(["dup", "g-only", "w-only", "wf-only"]);
   });
 
+  it("keeps two legacy macros that differ only in `runIn` — absorption must not collapse them (issue #48)", async () => {
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    // `dedupeLegacyMacros()` runs on `keyOfLegacy()` BEFORE anything is
+    // persisted, and `absorbLegacySettingsIfPresent()` then clears the legacy
+    // scope — so whichever of the pair loses is gone for good. These two are
+    // not near-duplicates: one types the URL into the session, the other opens
+    // a browser window.
+    vscode.__setConfig("nexus.terminal", {
+      global: [
+        { name: "BMC", text: "https://10.0.0.9/" },
+        { name: "BMC", text: "https://10.0.0.9/", runIn: "browser" }
+      ] as TerminalMacro[]
+    });
+    const { ctx } = makeCtx();
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    const all = store.getAll();
+    expect(all).toHaveLength(2);
+    expect(all.map((m) => m.runIn).sort()).toEqual(["browser", undefined]);
+  });
+
+  it("still collapses two legacy macros whose `runIn` differs only in spelling", async () => {
+    const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+    // The other half of the rule: absent, explicit "session" and a corrupt
+    // value all RUN in the session, so they are one macro and absorbing them
+    // twice would multiply it on every startup.
+    vscode.__setConfig("nexus.terminal", {
+      global: [
+        { name: "reload", text: "reload\n" },
+        { name: "reload", text: "reload\n", runIn: "session" },
+        { name: "reload", text: "reload\n", runIn: "nonsense" }
+      ] as unknown as TerminalMacro[]
+    });
+    const { ctx } = makeCtx();
+    const store = new VscodeMacroStore(ctx);
+    await store.initialize();
+
+    expect(store.getAll()).toHaveLength(1);
+  });
+
   it("re-absorbs when legacy settings reappear after first migration", async () => {
     const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void; __getConfig: (s: string) => unknown };
     vscode.__setConfig("nexus.terminal", { global: [{ name: "first", text: "a" }] });

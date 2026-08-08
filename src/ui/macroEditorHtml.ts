@@ -9,6 +9,7 @@ import { MACRO_RUN_TARGETS, MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE, resolveMa
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./macroProfileOptions";
 import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } from "../services/macroVariables";
+import { PROFILE_TOKEN_TRIGGER_CONFLICT_MESSAGE, profileTokensWebviewJs } from "../services/profileTokens";
 import { macroFolderField } from "../services/macroFolders";
 
 /**
@@ -290,7 +291,7 @@ export function renderMacroEditorHtml(
   <div class="form-group">
     <label for="macro-text">Text</label>
     <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">${TEXTAREA_LEADING_NEWLINE}${escapeHtml(textValue)}</textarea>
-    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline.</div>
+    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline. \${profile.host}, \${profile.ipmiHost}, \${profile.port}, \${profile.username} and \${profile.name} are filled in from the server the macro is run against (right-click a server in the Connectivity Hub → Run Macro on Server…).</div>
     <div class="field-error" id="error-text"></div>
     <div class="variables-diagnostics" id="variables-diagnostics" aria-live="polite"></div>
   </div>
@@ -314,7 +315,7 @@ export function renderMacroEditorHtml(
   </div>
 
   <div class="form-group">
-    <label for="macro-run-in-wrapper">Run In</label>
+    <label for="macro-run-in-wrapper">Run in</label>
     <div class="custom-select" id="macro-run-in-wrapper">
       <input type="hidden" id="macro-run-in" value="${escapeHtml(runIn)}" />
       <div class="custom-select-trigger" tabindex="0">
@@ -325,7 +326,7 @@ export function renderMacroEditorHtml(
       </div>
     </div>
     <div class="field-error" id="error-runIn"></div>
-    <div class="hint">Local terminal and Browser macros are run from a server profile (Command Center → right-click a server → Run Macro on Server…), where \${profile.host}, \${profile.ipmiHost} and friends resolve. Neither can auto-trigger.</div>
+    <div class="hint">Local terminal and Browser macros are run from a server profile (Connectivity Hub → right-click a server → Run Macro on Server…). Neither can auto-trigger.</div>
   </div>
 
   <div class="form-group">
@@ -333,6 +334,10 @@ export function renderMacroEditorHtml(
     <input type="text" id="macro-trigger" value="${escapeHtml(triggerValue)}" placeholder="e.g., [Pp]assword:\\s*$" />
     <div class="field-error" id="error-trigger"></div>
     <div class="variables-trigger-conflict" id="variables-trigger-conflict-2"></div>
+    <!-- Its own slot rather than a shared one: the variables/trigger conflict and the
+         profile-token/trigger conflict can both apply to the same macro, and a shared
+         element would let whichever handler ran last erase the other's message. -->
+    <div class="variables-trigger-conflict" id="profile-trigger-conflict"></div>
     <div class="hint">Enter the JavaScript regex pattern only, without surrounding /slashes/ or flags. Avoid risky shapes like (.*)+; use line-bounded text like [^\\n]*. When matched, this macro's text is sent automatically (expect/send).</div>
   </div>
 
@@ -435,6 +440,10 @@ ${folderOptionsHtml}
       // webview must never re-implement it (mirrors the regexSafetyWebviewJs()
       // precedent above).
       ${macroVariablesWebviewJs()}
+      // Issue #48 — same precedent, same reason: the token grammar and the
+      // whitelist are interpolated from services/profileTokens.ts so the live
+      // hints below say exactly what a run will do.
+      ${profileTokensWebviewJs()}
 
       function isValidBinding(value) {
         return VALID_PATTERN.test(value.trim().toLowerCase());
@@ -487,12 +496,24 @@ ${folderOptionsHtml}
       // (models/terminalMacro.ts); the message is interpolated from there so the
       // two cannot drift.
       var RUN_IN_CONFLICT_MESSAGE = ${serializeForInlineScript(MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE)};
+      // The host enforces this one in MacroEditorPanel's save handler, and
+      // MacroAutoTrigger.reload() refuses to compile such a rule regardless.
+      var PROFILE_TRIGGER_CONFLICT_MESSAGE = ${serializeForInlineScript(PROFILE_TOKEN_TRIGGER_CONFLICT_MESSAGE)};
 
       function updateRunInConflictWarning() {
         var triggerVal = document.getElementById("macro-trigger").value.trim();
         var runInVal = document.getElementById("macro-run-in").value;
         var errEl = document.getElementById("error-runIn");
         errEl.textContent = triggerVal && runInVal !== "session" ? RUN_IN_CONFLICT_MESSAGE : "";
+      }
+
+      function updateProfileTriggerConflictWarning() {
+        var triggerVal = document.getElementById("macro-trigger").value.trim();
+        var usesProfile = scanProfileTokens(document.getElementById("macro-text").value).used.length > 0;
+        var el = document.getElementById("profile-trigger-conflict");
+        var show = !!triggerVal && usesProfile;
+        el.textContent = show ? PROFILE_TRIGGER_CONFLICT_MESSAGE : "";
+        el.classList.toggle("visible", show);
       }
 
       // Row N's error slot is addressed by data-var-error="N" (§9.2). Renumbering
@@ -605,6 +626,26 @@ ${folderOptionsHtml}
           okLine.className = "diag-positive";
           okLine.textContent = "Will prompt for: " + scan.used.join(", ");
           lines.push(okLine);
+        }
+
+        // Issue #48 — the same three-shape treatment for profile tokens: what
+        // will be filled in from the server, and what looks like a token but is
+        // not one. A misspelled token is NOT an error (it is sent as-is, exactly
+        // like an undeclared placeholder), so it warns rather than blocks.
+        var profileScan = scanProfileTokens(text);
+        for (var pu = 0; pu < profileScan.unknown.length; pu++) {
+          var badLine = document.createElement("div");
+          badLine.className = "diag-hint";
+          badLine.textContent =
+            "\${profile." + profileScan.unknown[pu] + "} is not a profile token and will be sent as-is. Tokens: " +
+            PROFILE_TOKEN_NAMES.join(", ") + ".";
+          lines.push(badLine);
+        }
+        if (profileScan.used.length > 0) {
+          var profileLine = document.createElement("div");
+          profileLine.className = "diag-positive";
+          profileLine.textContent = "Filled from the server profile at run time: " + profileScan.used.join(", ");
+          lines.push(profileLine);
         }
 
         for (var li = 0; li < lines.length; li++) {
@@ -812,6 +853,7 @@ ${folderOptionsHtml}
       document.getElementById("macro-text").addEventListener("input", function() {
         markDirty();
         scheduleDiagnostics();
+        updateProfileTriggerConflictWarning();
       });
       document.getElementById("macro-secret").addEventListener("change", markDirty);
       document.getElementById("macro-trigger").addEventListener("input", function() {
@@ -821,6 +863,7 @@ ${folderOptionsHtml}
         errorEl.textContent = validateTriggerPattern(val);
         updateTriggerConflictWarning();
         updateRunInConflictWarning();
+        updateProfileTriggerConflictWarning();
       });
       document.getElementById("macro-run-in").addEventListener("change", function() {
         markDirty();
@@ -942,6 +985,15 @@ ${folderOptionsHtml}
           document.getElementById("error-runIn").textContent = "";
         }
 
+        if (triggerVal && scanProfileTokens(text).used.length > 0) {
+          valid = false;
+          // Same fallback discipline as the variables conflict below: never
+          // clobber a more specific regex error already sitting on the field.
+          if (!document.getElementById("error-trigger").textContent) {
+            document.getElementById("error-trigger").textContent = PROFILE_TRIGGER_CONFLICT_MESSAGE;
+          }
+        }
+
         var variablesForSave = collectVariablesForSave();
         if (!validateVariablesClientSide(variablesForSave)) {
           valid = false;
@@ -1030,6 +1082,7 @@ ${folderOptionsHtml}
       computeDiagnostics();
       updateTriggerConflictWarning();
       updateRunInConflictWarning();
+      updateProfileTriggerConflictWarning();
     })();`
   });
 }

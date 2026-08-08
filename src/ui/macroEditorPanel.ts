@@ -16,6 +16,7 @@ import { resolveMacroRunTarget, validateMacroRunTarget } from "../models/termina
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
 import { collectMacroFolders, macroFolderField } from "../services/macroFolders";
+import { hasProfileTokens, PROFILE_TOKEN_TRIGGER_CONFLICT_MESSAGE } from "../services/profileTokens";
 import {
   captureMacroRef,
   mutateMacro,
@@ -532,6 +533,21 @@ export class MacroEditorPanel {
             type: "saveError",
             field: "runIn",
             message: runInError
+          });
+          return;
+        }
+
+        // Issue #48 — the other half of the same exclusion, and the one the
+        // `runIn` check above does not cover: a SESSION macro that names
+        // `${profile.…}` and also carries a trigger pattern. A compiled rule
+        // has no server to resolve the token against, so `MacroAutoTrigger`
+        // refuses to compile it — saving the pair would produce a macro whose
+        // trigger silently never fires.
+        if (triggerPattern && hasProfileTokens(text)) {
+          void this.panel.webview.postMessage({
+            type: "saveError",
+            field: "trigger",
+            message: PROFILE_TOKEN_TRIGGER_CONFLICT_MESSAGE
           });
           return;
         }

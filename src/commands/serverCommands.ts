@@ -1231,6 +1231,12 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const snapshot = ctx.core.getSnapshot();
       const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
       const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
+      // Issue #48 — a caller that is sending the user here to fill in an
+      // advanced field (a `${profile.ipmiHost}` refusal) says so, and the
+      // section opens instead of hiding the field the error just named.
+      if (arg && typeof arg === "object" && (arg as { expandAdvanced?: unknown }).expandAdvanced === true) {
+        definition.expandAdvanced = true;
+      }
       const inlineAuthProfile = createInlineAuthProfileCreation(ctx);
       // REVIEW FINDING (P1) — the profile shape this form is currently showing
       // credentials from, checked against live state at Save by
@@ -1710,9 +1716,13 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!server) {
         return;
       }
-      const info = `${server.username}@${server.host}:${server.port}`;
+      // Issue #48 — the BMC address rides along when there is one: whoever is
+      // copying connection details to paste into a ticket or a shell wants it
+      // too, and it is otherwise only visible behind the form's Advanced section.
+      const ipmiHost = typeof server.ipmiHost === "string" ? server.ipmiHost.trim() : "";
+      const info = `${server.username}@${server.host}:${server.port}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
       await vscode.env.clipboard.writeText(info);
-      void vscode.window.showInformationMessage(`Copied: ${info}`);
+      void vscode.window.showInformationMessage(`Copied: ${info.replace(/\n/g, "  ")}`);
     }),
 
     vscode.commands.registerCommand("nexus.server.duplicate", async (arg?: unknown) => {

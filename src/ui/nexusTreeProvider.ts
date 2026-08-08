@@ -67,7 +67,10 @@ export class ServerTreeItem extends vscode.TreeItem {
     // entry in package.json, so introducing a distinct value here would silently
     // drop every one of those menu entries for synced servers.
     const syncedSuffix = server.origin ? (syncedSourceName ? `\nSynced from "${syncedSourceName}"` : "\nSynced from inventory") : "";
-    this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${syncedSuffix}`;
+    // Issue #48 — the out-of-band address is not part of the SSH connection, so
+    // it gets its own line rather than joining the `user@host:port` summary.
+    const ipmiSuffix = typeof server.ipmiHost === "string" && server.ipmiHost.trim() ? `\nIPMI/BMC: ${server.ipmiHost.trim()}` : "";
+    this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${syncedSuffix}`;
     const authDesc = authProfileName ? ` (${authProfileName})` : "";
     // m7 — "(synced)" suffix idiom (was "· synced").
     const syncedDesc = server.origin ? " (synced)" : "";

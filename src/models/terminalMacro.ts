@@ -108,6 +108,18 @@ export function macroRunTargetLabel(target: MacroRunTarget): string {
   }
 }
 
+/**
+ * The `[Local terminal] ` / `[Browser] ` prefix pickers put in front of a
+ * macro's description, and `""` for an ordinary session macro. One definition
+ * so every picker that lists macros badges them identically — a macro that will
+ * open a browser window instead of typing into the terminal is exactly the
+ * thing a list of macros must not hide.
+ */
+export function macroRunTargetBadge(macro: Pick<TerminalMacro, "runIn">): string {
+  const target = resolveMacroRunTarget(macro);
+  return target === "session" ? "" : `[${macroRunTargetLabel(target)}] `;
+}
+
 export const MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE =
   'A macro can auto-trigger or run outside its session, not both. Set "Run in" back to Session terminal, or clear the auto-trigger pattern.';
 

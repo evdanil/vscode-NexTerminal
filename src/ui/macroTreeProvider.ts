@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { bindingToDisplayLabel } from "../macroBindings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { TerminalMacro } from "../models/terminalMacro";
+import { macroRunTargetLabel, resolveMacroRunTarget } from "../models/terminalMacro";
 import { getMacroFolders, getMacros, saveMacros } from "../macroSettings";
 import { findAmbiguousMacroStateKeys, macroStateKey } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders } from "../services/macroVariables";
@@ -77,6 +78,14 @@ export class MacroTreeItem extends vscode.TreeItem {
       this.tooltip = `${macro.name}${bindingHint} (secret)`;
     } else {
       this.tooltip = `${macro.name}${bindingHint}\n${macro.text.replace(/\n/g, "\\n")}`;
+    }
+
+    // Issue #48 — where it runs, when that is not the session. A macro that
+    // opens a browser window or a local shell from a sidebar click is not the
+    // thing the rest of this row describes.
+    const runTarget = resolveMacroRunTarget(macro);
+    if (runTarget !== "session") {
+      this.tooltip += `\nRuns in: ${macroRunTargetLabel(runTarget)}`;
     }
 
     // \u00a79.6 \u2014 names only; values do not exist at this point. Only names whose

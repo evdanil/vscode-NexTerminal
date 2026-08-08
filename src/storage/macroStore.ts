@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { slotToBinding } from "../macroBindings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import { clamp } from "../utils/helpers";
-import type { MacroTriggerScope, MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import type { MacroRunTarget, MacroTriggerScope, MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import { resolveMacroRunTarget } from "../models/terminalMacro";
 
 export interface MacroStoreChangeListener {
   (): void;
@@ -275,6 +276,23 @@ export function withMigratedSlot<T extends { slot?: number; keybinding?: string 
  */
 export function canonicalMacroSecret(macro: TerminalMacro): boolean {
   return Boolean(macro.secret);
+}
+
+/**
+ * `runIn` as the RUNTIME reads it (issue #48). Two macros identical except for
+ * where they run are two different macros — one types a line into the session,
+ * another opens a browser window — so the content keys must be able to tell
+ * them apart, or merge-mode import and legacy-settings absorption drop one of
+ * the pair with no report.
+ *
+ * Read through `resolveMacroRunTarget()` rather than the raw field, for the
+ * collapse direction the rule above also requires: an absent `runIn`, a
+ * non-string, and an unknown string ALL run in the session, so all three must
+ * key identically to an explicit `"session"` — otherwise re-importing the same
+ * macro after a save that normalized the field would add a second copy.
+ */
+export function canonicalMacroRunTarget(macro: TerminalMacro): MacroRunTarget {
+  return resolveMacroRunTarget(macro);
 }
 
 /**
