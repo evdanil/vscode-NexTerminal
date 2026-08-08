@@ -557,12 +557,13 @@ async function addServerSanitizingOrigin(server: ServerConfig, add: (entity: Ser
 
 /**
  * REVIEW FINDING 2 (P2, imported managedFolders are untrusted) — strip
- * `managedFolders` from a backup-imported inventory source before it is ever
- * persisted. `managedFolders` is GC-ownership bookkeeping this extension
- * itself writes (see `applyInventorySyncPlan` in nexusCore.ts) — it is never
- * something a user or provider is meant to author. `validateInventorySource`
- * only checks its SHAPE (an array of strings), by design: that check also
- * guards the extension's OWN persisted state on ordinary storage-layer loads
+ * `managedFolders` from every backup-imported inventory source BEFORE the
+ * array is handed to `validateInventorySource`/`importPreservingIds`.
+ * `managedFolders` is GC-ownership bookkeeping this extension itself writes
+ * (see `applyInventorySyncPlan` in nexusCore.ts) — it is never something a
+ * user or provider is meant to author. `validateInventorySource` only checks
+ * its SHAPE (an array of strings), by design: that check also guards the
+ * extension's OWN persisted state on ordinary storage-layer loads
  * (VscodeConfigRepository), where the field genuinely is trusted, so it must
  * stay permissive there. A backup file is a different trust boundary — it can
  * be hand-edited, come from another machine's differently-shaped folder tree,
@@ -573,26 +574,46 @@ async function addServerSanitizingOrigin(server: ServerConfig, add: (entity: Ser
  * `applyInventorySyncPlan` trusts `managedFolders` completely once it's on
  * the record.
  *
- * Stripping it here (at the import boundary, not in `validateInventorySource`)
- * is the safe direction: an imported source simply starts with no bookkept
- * ownership, exactly like a legacy/never-synced record. Its very next sync
- * re-accumulates `managedFolders` normally from the folders THAT sync
- * actually creates (see `createdThisApply` in `applyInventorySyncPlan`) — any
- * folder that already existed before the import (including ones the ORIGINAL
- * machine's source once owned) simply stops being a GC candidate rather than
- * becoming a wrongly-trusted one; it is never deleted on the strength of
- * imported metadata alone.
+ * ROUND (validate-before-strip) FINDING — this must run BEFORE
+ * `validateInventorySource`, not after (the strip used to live in
+ * `importPreservingIds`'s `add` callback, which only runs once validation has
+ * already passed). `managedFolders` is untrusted precisely because a backup
+ * can carry it malformed (`null`, a mixed-type array, …) as well as
+ * well-shaped-but-wrong — and a malformed value fails
+ * `validateInventorySource`'s shape check, which rejects the ENTIRE source,
+ * not just the untrusted field. In replace mode the prior source and its
+ * vault secrets are already cleared by the time import runs (see the
+ * replace-mode wipe in `importMergeReplaceLocked`), so a validate-before-strip
+ * rejection permanently drops an otherwise-good source and its secrets are
+ * never restored (its id never lands in `importedIds`, so the secret-restore
+ * loop skips it too). Deleting the property unconditionally here — before
+ * validation ever sees it — means the shape check downstream only ever
+ * observes `managedFolders` in a shape it doesn't need to reject on.
+ *
+ * Stripping it (rather than trying to repair it) is the safe direction: an
+ * imported source simply starts with no bookkept ownership, exactly like a
+ * legacy/never-synced record. Its very next sync re-accumulates
+ * `managedFolders` normally from the folders THAT sync actually creates (see
+ * `createdThisApply` in `applyInventorySyncPlan`) — any folder that already
+ * existed before the import (including ones the ORIGINAL machine's source
+ * once owned) simply stops being a GC candidate rather than becoming a
+ * wrongly-trusted one; it is never deleted on the strength of imported
+ * metadata alone.
+ *
+ * Mutates each element in place (deleting the property outright, regardless
+ * of its type) and returns the same array reference: callers downstream of
+ * this (the secret-restore loop's `importedSourceById` lookup keyed off
+ * `data.inventorySources`) only ever read `id`/`secretFieldIds`, which this
+ * never touches.
  */
-async function stripImportedManagedFolders(
-  source: InventorySourceConfig,
-  add: (entity: InventorySourceConfig) => Promise<void>
-): Promise<void> {
-  if (source.managedFolders !== undefined) {
-    const { managedFolders: _managedFolders, ...rest } = source;
-    await add(rest as InventorySourceConfig);
-    return;
+function sanitizeImportedInventorySources(sources: InventorySourceConfig[] | undefined): InventorySourceConfig[] | undefined {
+  if (!sources) {
+    return sources;
   }
-  await add(source);
+  for (const source of sources) {
+    delete (source as unknown as Record<string, unknown>).managedFolders;
+  }
+  return sources;
 }
 
 /** Mechanical validate-then-add tail shared by the share-import remap loops; remap stays inline. */
@@ -1721,11 +1742,14 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
     // Kept in its own variable (not folded into the array below) because the inventory-secret
     // restore loop further down needs to know exactly which source ids this run imported — see
     // the comment there.
-    // REVIEW FINDING 2 (P2) — strip `managedFolders` at the import boundary;
-    // see `stripImportedManagedFolders`'s doc for why this can't live in
-    // `validateInventorySource` instead.
+    // REVIEW FINDING 2 (P2) / ROUND (validate-before-strip) FINDING — strip
+    // `managedFolders` from `data.inventorySources` BEFORE validation runs;
+    // see `sanitizeImportedInventorySources`'s doc for why the strip can't
+    // live inside `validateInventorySource`, nor after it (a malformed value
+    // must not be able to reject the whole source).
+    data.inventorySources = sanitizeImportedInventorySources(data.inventorySources);
     const inventorySourceTally = await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) =>
-      stripImportedManagedFolders(e, (s) => core.addOrUpdateInventorySource(s))
+      core.addOrUpdateInventorySource(e)
     );
     const localShellTally = await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e));
     const authProfileTally = await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));

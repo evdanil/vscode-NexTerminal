@@ -154,9 +154,11 @@ export function validateInventorySource(item: unknown): item is InventorySourceC
   // persisted state (VscodeConfigRepository), where `managedFolders` genuinely
   // IS trusted (this extension is the only writer), so it must stay
   // permissive. Backup-imported records are a DIFFERENT trust boundary — see
-  // `stripImportedManagedFolders` in configCommands.ts, which strips the
-  // field entirely at the import boundary, after this shape check passes but
-  // before the record is ever persisted — do NOT "fix" untrusted ownership
+  // `sanitizeImportedInventorySources` in configCommands.ts, which strips the
+  // field entirely from the backup payload BEFORE it ever reaches this
+  // function (not after — a malformed value, e.g. `null` or a mixed-type
+  // array, would otherwise fail this shape check and reject the entire
+  // source, not just the untrusted field) — do NOT "fix" untrusted ownership
   // metadata here; that would also strip it from legitimate storage-layer
   // loads, which must keep it.
   if (obj.managedFolders !== undefined && (!Array.isArray(obj.managedFolders) || !obj.managedFolders.every((v) => typeof v === "string"))) {

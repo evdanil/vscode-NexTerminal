@@ -5001,6 +5001,78 @@ describe("backup export round-trip", () => {
     expect(core.getInventorySource("src1")?.managedFolders).toEqual(["NetBox/RackA"]);
   });
 
+  it("ROUND (validate-before-strip) FINDING — a backup source with a malformed managedFolders (null) is sanitized BEFORE validation, not rejected by it, so replace mode still imports the source and restores its secret (kills validate-before-strip rejection)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // A local source "src1" already exists locally, with its own working vault secret —
+    // exactly the destructive replace-mode scenario: by the time importPreservingIds runs,
+    // this local record and its vault secret have ALREADY been cleared (see the replace-mode
+    // wipe in importMergeReplaceLocked), so if the backup's source is wrongly rejected, it is
+    // gone for good — nothing to fall back to.
+    await core.addOrUpdateInventorySource(makeInventorySource({ name: "Local NetBox" }));
+    await vault.store(inventorySecretKey("src1", "apiToken"), "local-token");
+    registerConfigCommands(core, vault);
+
+    // The backup's source is otherwise perfectly valid EXCEPT managedFolders is `null` — not
+    // the documented shape (absent, or string[]), but untrusted GC bookkeeping a hand-edited or
+    // version-skewed backup can carry in any shape. Under the wrong implementation (strip inside
+    // importPreservingIds's `add` callback, which only runs once validateInventorySource has
+    // already passed) this fails the shape check and importPreservingIds skips the ENTIRE
+    // source — id, config, defaultUsername and all — not just the untrusted field.
+    const malformedSource = {
+      ...makeInventorySource({ name: "Backup NetBox" }),
+      managedFolders: null
+    } as unknown as InventorySourceConfig;
+    const secrets = {
+      inventorySourceSecrets: {
+        src1: { apiToken: "backup-token" }
+      }
+    };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [malformedSource],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/malformed-managed-folders.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    // KILLS VALIDATE-BEFORE-STRIP: under the wrong implementation this source never lands —
+    // core.getInventorySource("src1") would be undefined (rejected by validateInventorySource,
+    // and the prior local record was already removed by the replace-mode wipe above it).
+    expect(core.getInventorySource("src1")?.name).toBe("Backup NetBox");
+    // The malformed field itself must not survive the sanitize — deleted regardless of its
+    // (invalid) type, not merely "left null" on the persisted record.
+    expect(core.getInventorySource("src1")?.managedFolders).toBeUndefined();
+    // The rest of the record is untouched by the sanitize.
+    expect(core.getInventorySource("src1")?.targetFolder).toBe("NetBox");
+    // The secret restore loop scopes to importedIds — under the wrong implementation src1 never
+    // lands in importedIds (validateInventorySource rejected it), so this would be undefined,
+    // and the destructive part: the OLD local secret ("local-token") is already gone too, since
+    // replace mode deletes it unconditionally before import runs. A validate-before-strip
+    // rejection here is a silent, permanent credential loss.
+    expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("backup-token");
+  });
+
   it("merge-mode import does not overwrite a retained source's vault secret with the backup's; a newly-imported source's secret still restores; replace mode restores everything", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
