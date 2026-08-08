@@ -216,6 +216,37 @@ describe("nexus.server.runMacro — dispatch", () => {
     expect(setStatusBarMessage).not.toHaveBeenCalled();
   });
 
+  it("reports a browser open the OS refused, and never claims it was sent", async () => {
+    // REVIEW FINDING (P2) — `openExternal` resolves to a BOOLEAN, and `false` is
+    // a real outcome (no handler for the scheme, or the user dismissed the
+    // "allow this extension to open a URI?" trust prompt). The pre-fix target
+    // returned a hardcoded `true`, so this run ended in `Macro "BMC" sent to the
+    // browser.` with nothing open anywhere.
+    await setMacros([{ id: "a", name: "BMC", text: "https://${profile.ipmiHost}/", runIn: "browser" }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    openExternal.mockResolvedValueOnce(false as unknown as true);
+
+    await runMacroOnServer(context(), { server: server({ ipmiHost: "10.0.0.9" }) });
+
+    expect(openExternal).toHaveBeenCalledTimes(1);
+    // No success claim — this is what the always-true return produced.
+    expect(setStatusBarMessage).not.toHaveBeenCalled();
+    // Reported EXACTLY ONCE: `runMacroWithTarget` treats a `false` send as
+    // "the target already said why" and stays silent, so the target must speak.
+    expect(showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(String(showWarningMessage.mock.calls[0][0])).toBe('Could not open "BMC" in the browser.');
+  });
+
+  it("says nothing extra when the browser open succeeds", async () => {
+    await setMacros([{ id: "a", name: "BMC", text: "https://${profile.ipmiHost}/", runIn: "browser" }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(context(), { server: server({ ipmiHost: "10.0.0.9" }) });
+
+    expect(showWarningMessage).not.toHaveBeenCalled();
+    expect(String(setStatusBarMessage.mock.calls[0][0])).toBe('Macro "BMC" sent to the browser.');
+  });
+
   it("runs a localTerminal macro in a fresh terminal, never through sendSequence", async () => {
     await setMacros([
       { id: "a", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} sol activate\n", runIn: "localTerminal" }
@@ -367,6 +398,94 @@ describe("nexus.server.runMacro — dispatch", () => {
 
     expect(pickServer).toHaveBeenCalled();
     expect(openExternal).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * REVIEW FINDING (P2) — an unknown `${profile.…}` token is a warning, never a
+ * failure, so the only question is WHEN it is said. It used to be said the
+ * instant the tokens resolved: before the prompt walk, before the "connect
+ * first?" confirmation and before the browser URL check — each of which can
+ * abort, leaving the user told about text that was never sent — and, when the
+ * send did happen, the success status replaced it in the same tick, so nobody
+ * ever read it. It now rides along with the delivery report.
+ */
+describe("nexus.server.runMacro — unknown profile tokens are reported WITH the delivery", () => {
+  /** `xyz` is not in the whitelist, so it is passed through verbatim and warned about. */
+  const UNKNOWN_TOKEN_MACRO: TerminalMacro = {
+    id: "u",
+    name: "Typo",
+    text: "ipmitool -H ${profile.xyz}\n",
+    runIn: "localTerminal"
+  };
+
+  function statusMessages(): string[] {
+    return setStatusBarMessage.mock.calls.map((call) => String(call[0]));
+  }
+
+  it("says it once, with the send confirmation, when the text is delivered", async () => {
+    await setMacros([UNKNOWN_TOKEN_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(context(), { server: server() });
+
+    // The token went out verbatim — that is the documented behaviour.
+    expect(createdTerminals[0].sent).toEqual(["ipmitool -H ${profile.xyz}\n"]);
+    // ONE message, combining outcome and caveat. The pre-fix implementation
+    // produced two, the caveat first and immediately overwritten.
+    expect(statusMessages()).toEqual([
+      'Macro "Typo" sent to a local terminal — unknown profile token ${profile.xyz} was sent as-is.'
+    ]);
+  });
+
+  it("pluralises, and lists each unknown token once", async () => {
+    await setMacros([
+      { id: "u2", name: "Typos", text: "${profile.xyz} ${profile.abc} ${profile.xyz}\n", runIn: "localTerminal" }
+    ]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(context(), { server: server() });
+
+    expect(statusMessages()).toEqual([
+      'Macro "Typos" sent to a local terminal — unknown profile tokens ${profile.xyz}, ${profile.abc} were sent as-is.'
+    ]);
+  });
+
+  it("says nothing when the run is abandoned before anything is sent", async () => {
+    // A session macro on a disconnected server: the "connect first?" prompt is
+    // declined, so nothing is delivered. The pre-fix implementation had already
+    // announced what "was sent as-is" by this point.
+    await setMacros([{ ...UNKNOWN_TOKEN_MACRO, runIn: "session" }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showWarningMessage.mockResolvedValue(undefined);
+
+    await runMacroOnServer(context(), { server: server() });
+
+    expect(connectServer).not.toHaveBeenCalled();
+    expect(createdTerminals).toHaveLength(0);
+    expect(statusMessages()).toEqual([]);
+  });
+
+  it("says nothing when the browser target refuses the text", async () => {
+    // The other post-resolution abort: a `browser` macro whose text is not an
+    // http(s) URL never opens anything.
+    await setMacros([{ id: "u3", name: "Typo", text: "javascript:alert(${profile.xyz})", runIn: "browser" }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showErrorMessage.mockResolvedValue(undefined);
+
+    await runMacroOnServer(context(), { server: server() });
+
+    expect(openExternal).not.toHaveBeenCalled();
+    expect(statusMessages()).toEqual([]);
+  });
+
+  it("leaves the confirmation alone when every token is known", async () => {
+    await setMacros([{ id: "k", name: "SOL", text: "ipmitool -H ${profile.host}\n", runIn: "localTerminal" }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(context(), { server: server() });
+
+    expect(statusMessages()).toEqual(['Macro "SOL" sent to a local terminal.']);
   });
 });
 

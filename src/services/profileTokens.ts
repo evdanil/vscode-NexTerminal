@@ -61,8 +61,8 @@ const PROFILE_TOKEN_CHARSET_GUIDANCE: Record<ProfileTokenName, string> = {
   port: "Use the port number only — digits, nothing else.",
   username: 'Use letters, digits, ".", "_", "-" and "@" only.',
   name:
-    'Remove $, `, quotes, ";", "|", "&", "<", ">", "\\", parentheses and braces from the name — spaces, ' +
-    'square brackets, "/" and accents are fine.'
+    'Remove $, `, %, "!", quotes, ";", "|", "&", "<", ">", "\\", parentheses and braces from the name — spaces, ' +
+    'square brackets, "/", "^" and accents are fine.'
 };
 
 /** The server-form label for a token, so pickers and errors name the same field. */
@@ -161,8 +161,41 @@ const USERNAME_CHARSET = /^[A-Za-z0-9._@\-]+$/;
  * glob pattern in a POSIX shell. Neither runs anything. "Rack A [Spare]" is as
  * ordinary a label as "Rack A - Spare", and `host`/`ipmiHost` keep `[]` for
  * bracketed IPv6, so the rules stay consistent about the same two characters.
+ *
+ * REVIEW FINDING (P1) — `%` IS REFUSED, because the third default shell had not
+ * been accounted for. `terminal.integrated.defaultProfile.windows` can be
+ * Command Prompt (it is on plenty of machines, and it was the VS Code default
+ * before PowerShell took over), and cmd.exe expands `%VAR%` while PARSING the
+ * line, before anything is executed: a name of `%COMSPEC% /c calc` becomes
+ * `C:\Windows\system32\cmd.exe /c calc` and runs, at command position, using no
+ * character this list refused. Same reachability as the rest — a name arrives
+ * from inventory sync and from backup import.
+ *
+ * THE STANDARD APPLIED to cmd.exe's other two active characters — "can this
+ * character ALONE cause execution or expansion in a DEFAULT-configuration
+ * shell?":
+ *
+ *   `!` IS REFUSED. Delayed expansion (`!VAR!`) is indeed off by default in
+ *   cmd, so cmd is not the reason. Bash is: history expansion is ON by default
+ *   in every INTERACTIVE bash, and an interactive shell is exactly what a macro
+ *   send lands in. `!` starts an event designator (`!!`, `!string`, `!-2`), and
+ *   what it splices in is a PREVIOUS COMMAND LINE — text that may itself carry
+ *   `;` or `|`, so a name of `DC1!!` can execute the tail of whatever the user
+ *   ran last. That is expansion into executable syntax from one character, so it
+ *   goes, on the same reasoning that took the parentheses. (`!` followed by a
+ *   space or by end-of-line is inert, but a blacklist cannot condition on what
+ *   follows the value in the macro's text.)
+ *
+ *   `^` IS NOT REFUSED. It is cmd's ESCAPE character, and escaping only ever
+ *   REMOVES a metacharacter's meaning — `^` cannot turn plain text into syntax,
+ *   and `^^` is a literal caret. Its other role, line continuation at end of
+ *   line, can only JOIN the macro's own next line onto this one, which turns a
+ *   second command into arguments of the first rather than introducing anything
+ *   new (and control characters, newlines included, are refused in the value
+ *   itself). In bash and PowerShell `^` is an ordinary character. Nothing it can
+ *   do meets the bar, and "Rack 4 ^ Spare" stays a legal label.
  */
-const NAME_FORBIDDEN_CHARS = /["'$`;|&<>\\(){}]/;
+const NAME_FORBIDDEN_CHARS = /["'$`;|&<>\\(){}%!]/;
 /**
  * Refused in EVERY token, no exceptions. `$` and a backtick are what turn a
  * substituted value into syntax rather than data — for the shell, and for this
@@ -188,9 +221,10 @@ const CONTROL_CHARS_GLOBAL = /[\u0000-\u001F\u007F-\u009F]/g;
  * then goes to a LOCAL shell (a `localTerminal` macro running `ipmitool`), where
  * a host of `1.2.3.4; rm -rf ~` is command execution on the user's own machine.
  * WHICH local shell is not ours to choose: a fresh `vscode.window.createTerminal()`
- * uses the platform default, which is PowerShell on Windows — so "reads as
- * syntax" means the union of what bash and PowerShell read as syntax, not what
- * bash alone does (see `NAME_FORBIDDEN_CHARS`).
+ * uses the configured default profile, which on Windows is PowerShell or
+ * Command Prompt and on a session terminal is an interactive remote shell — so
+ * "reads as syntax" means the UNION of what bash, PowerShell and cmd.exe read as
+ * syntax, not what bash alone does (see `NAME_FORBIDDEN_CHARS`).
  *
  * The answer is a charset, not quoting: quoting rules differ per shell, and a
  * half-implemented quoter creates confidence it cannot back. So a value that

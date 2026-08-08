@@ -159,10 +159,47 @@ function browserTarget(macro: TerminalMacro, macroIndex: number): MacroSendTarge
         }
         return false;
       }
-      await vscode.env.openExternal(vscode.Uri.parse(url));
+      // REVIEW FINDING (P2) — `openExternal` RESOLVES TO A BOOLEAN, and `false`
+      // is a real outcome: the OS handler declined, or the user dismissed the
+      // "allow this extension to open a URI?" trust prompt. Returning `true`
+      // regardless made `runMacroWithTarget` report "sent to the browser" for a
+      // run in which nothing opened. The result is now the send's result — and
+      // because a `false` return is deliberately SILENT there ("the target
+      // already said why"), saying why is this target's job.
+      const opened = await vscode.env.openExternal(vscode.Uri.parse(url));
+      if (!opened) {
+        void vscode.window.showWarningMessage(`Could not open "${macro.name}" in the browser.`);
+        return false;
+      }
       return true;
     }
   };
+}
+
+/**
+ * The "a token went out verbatim" caveat, phrased to be APPENDED to the send
+ * confirmation — `undefined` when there is nothing to say.
+ *
+ * REVIEW FINDING (P2) — this used to be its own `setStatusBarMessage` fired the
+ * instant the tokens resolved, which is before the run is committed to anything:
+ * the prompt walk, the "connect first?" confirmation and the browser URL check
+ * all come after it and all can abort, so the user could be told what "was sent
+ * as-is" in a run that sent nothing at all. And in the case where the send DID
+ * happen immediately, the success status replaced this one within the same tick,
+ * so it was never read anyway. Both failures are fixed by the same move: say it
+ * once, with the outcome, and only when there is an outcome to attach it to.
+ *
+ * Lowercase and unpunctuated — `runMacroWithTarget` appends it as a clause of
+ * `Macro "X" sent to Y — ….`
+ */
+export function unknownTokenNote(unknownTokens: readonly string[]): string | undefined {
+  if (unknownTokens.length === 0) {
+    return undefined;
+  }
+  const list = unknownTokens.map((token) => `\${profile.${token}}`).join(", ");
+  return unknownTokens.length === 1
+    ? `unknown profile token ${list} was sent as-is`
+    : `unknown profile tokens ${list} were sent as-is`;
 }
 
 /** Terminals of this server's live sessions, in session order, closed ones dropped. */
@@ -374,14 +411,9 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
     await reportProfileTokenError(resolution.error, server);
     return;
   }
-  if (resolution.unknownTokens.length > 0) {
-    void vscode.window.setStatusBarMessage(
-      `Unknown profile token${resolution.unknownTokens.length === 1 ? "" : "s"} sent as-is: ${resolution.unknownTokens
-        .map((token) => `\${profile.${token}}`)
-        .join(", ")}`,
-      6000
-    );
-  }
+  // NOT REPORTED HERE — see `unknownTokenNote`. The caveat rides along with the
+  // delivery report, because everything below can still abort.
+  const deliveryNote = unknownTokenNote(resolution.unknownTokens);
 
   const runTarget = resolveMacroRunTarget(macro);
   let target: MacroSendTarget | undefined;
@@ -403,7 +435,7 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
   // The prompt walk runs on the TOKEN-RESOLVED text, so a `$host` the user
   // declared is still prompted for while `${profile.host}` is already filled in
   // — the two are different placeholders and neither shadows the other.
-  await runMacroWithTarget({ ...macro, text: resolution.text }, target);
+  await runMacroWithTarget({ ...macro, text: resolution.text }, target, { deliveryNote });
 }
 
 export function registerServerMacroCommands(ctx: CommandContext): vscode.Disposable[] {

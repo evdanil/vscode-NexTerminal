@@ -237,6 +237,26 @@ export async function runMacro(macro: TerminalMacro): Promise<void> {
   await runMacroWithTarget(macro, terminalSendTarget(active));
 }
 
+export interface RunMacroOptions {
+  /**
+   * A caveat about the text that was delivered, appended to the SUCCESS status
+   * only — `nexus.server.runMacro` uses it for "an unknown `${profile.…}` token
+   * went out verbatim".
+   *
+   * REVIEW FINDING (P2) — it is an option here rather than a notice the caller
+   * shows itself because the caller cannot know, at the point it has the
+   * caveat, whether anything will be delivered at all: the prompt walk, the
+   * connect-first confirmation and the browser URL check all abort AFTER it,
+   * and a caveat about text that was never sent is noise. Tying it to the
+   * delivery report is also what keeps it on screen — a status message shown
+   * moments before the success one is simply replaced by it.
+   *
+   * Lowercase, no trailing period: it is appended as a clause. Never include
+   * the resolved text or any entered value.
+   */
+  readonly deliveryNote?: string;
+}
+
 /**
  * The prompt-and-send core `runMacro()` is built on, taking a target the CALLER
  * pinned (see `MacroSendTarget`). Everything §8.2-§8.4 promises — one reused
@@ -245,7 +265,11 @@ export async function runMacro(macro: TerminalMacro): Promise<void> {
  * destination differs. Exported for `nexus.server.runMacro`, whose targets are a
  * specific server's session terminal, a fresh local terminal, or the browser.
  */
-export async function runMacroWithTarget(macro: TerminalMacro, target: MacroSendTarget): Promise<void> {
+export async function runMacroWithTarget(
+  macro: TerminalMacro,
+  target: MacroSendTarget,
+  options: RunMacroOptions = {}
+): Promise<void> {
   const key = macroIdentityKey(macro);
 
   if (inFlight) {
@@ -289,7 +313,11 @@ export async function runMacroWithTarget(macro: TerminalMacro, target: MacroSend
       // successful send needs the same signal, or a send to a non-focused
       // terminal is completely silent after however long the prompts took.
       // Never include the resolved text or any entered value here.
-      vscode.window.setStatusBarMessage(`Macro "${macro.name}" sent to ${target.description}.`, 4000);
+      const caveat = options.deliveryNote ? ` — ${options.deliveryNote}` : "";
+      vscode.window.setStatusBarMessage(
+        `Macro "${macro.name}" sent to ${target.description}${caveat}.`,
+        4000
+      );
     } finally {
       // §8.4 — cleared in a finally wrapping the ENTIRE resolve-and-send, so a
       // throw anywhere above still releases the guard instead of locking every

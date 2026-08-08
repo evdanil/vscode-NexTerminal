@@ -264,7 +264,8 @@ Profile tokens are a different namespace from macro variables, so they never
 collide: a macro can declare a variable named `host` and use `$host` **and**
 `${profile.host}` in the same text; the first is still prompted for, the second
 is filled in from the profile. `$${profile.host}` escapes the token and sends
-the literal text. A token that is not in the table above is sent as-is.
+the literal text. A token that is not in the table above is sent as-is — a typo
+is never fatal, and the send confirmation says which token went out verbatim.
 
 ### Running a profile macro
 
@@ -286,7 +287,7 @@ checked:
 | `${profile.host}`, `${profile.ipmiHost}` | letters, digits, `.`, `-`, `_`, `:`, and `[]` for IPv6 — the address only, no `https://` and no path |
 | `${profile.port}` | digits |
 | `${profile.username}` | letters, digits, `.`, `_`, `-`, `@` |
-| `${profile.name}` | anything except `$`, a backtick, quotes, `;`, `|`, `&`, `<`, `>`, `\`, `(`, `)`, `{`, `}` — spaces, `[`, `]`, `/` and accents are fine |
+| `${profile.name}` | anything except `$`, a backtick, `%`, `!`, quotes, `;`, `\|`, `&`, `<`, `>`, `\`, `(`, `)`, `{`, `}` — spaces, `[`, `]`, `/`, `^` and accents are fine |
 
 No value may contain a `$` or a backtick, in any token. A profile carrying shell
 syntax — which can reach your config through an inventory sync or an imported
@@ -295,15 +296,26 @@ offending value and what the field accepts. This is a charset check, not
 quoting: the rest of the command line is still yours to quote (see **No
 automatic quoting**).
 
-The shell a **Local terminal** macro lands in is the platform default, which is
-PowerShell on Windows — so the accepted set is the intersection of what bash and
-PowerShell treat as plain text. That is why parentheses and braces are refused in
-a profile **name**: PowerShell evaluates `(…)` even in argument position, so a
-server named `(Start-Process calc)` would otherwise run it. Rename the profile —
-`Core Switch DC1` rather than `Core Switch (DC1)` — or escape the token
-(`$${profile.name}`) if you only want the literal text. Square brackets stay
-legal in every token: `Rack A [Spare]` is fine, and `${profile.host}` needs them
-for bracketed IPv6.
+The shell a **Local terminal** macro lands in is whichever default profile you
+have configured — PowerShell or Command Prompt on Windows — so the accepted set
+is the intersection of what bash, PowerShell and cmd.exe treat as plain text.
+That is why a profile **name** may not contain:
+
+- **parentheses or braces** — PowerShell evaluates `(…)` even in argument
+  position, so a server named `(Start-Process calc)` would otherwise run it, and
+  `.{…}` invokes a scriptblock out of characters that are otherwise legal;
+- **`%`** — cmd.exe expands `%VAR%` while parsing the line, so a name of
+  `%COMSPEC% /c calc` would run at command position;
+- **`!`** — interactive bash expands history references (`!!`, `!string`) by
+  default, and what they splice in is a previous command line, punctuation
+  included.
+
+Rename the profile — `Core Switch DC1` rather than `Core Switch (DC1)` — or
+escape the token (`$${profile.name}`) if you only want the literal text. Square
+brackets stay legal in every token: `Rack A [Spare]` is fine, and
+`${profile.host}` needs them for bracketed IPv6. A caret (`^`) is legal too: it
+is cmd's escape character, and escaping can only ever *remove* a
+metacharacter's meaning.
 
 A macro that uses profile tokens cannot auto-trigger, whichever **Run in** it
 has: a rule fired by terminal output has no server to resolve the tokens

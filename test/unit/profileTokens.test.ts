@@ -248,6 +248,61 @@ describe("resolveProfileTokens — injection defense", () => {
     expect(outcome.error.message).toContain("braces");
   });
 
+  it("refuses `%` in a display name — cmd.exe expands `%VAR%` at command position", () => {
+    // DELIBERATE FLIP of "% is just a character". The third default shell:
+    // `terminal.integrated.defaultProfile.windows` can be Command Prompt, and
+    // cmd expands `%COMSPEC%` while PARSING, before anything runs — so the
+    // resolved line below launches calc via cmd.exe, using no character the old
+    // blacklist refused. A name arrives from inventory sync and backup import.
+    const outcome = resolveProfileTokens("${profile.name}\n", server({ name: "%COMSPEC% /c calc" }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.kind).toBe("invalid");
+    expect(outcome.error.token).toBe("name");
+    // The exact executable line the pre-fix implementation produced.
+    expect(JSON.stringify(outcome)).not.toContain("%COMSPEC% /c calc\\n");
+    // The message names what to remove, or it is a dead end.
+    expect(outcome.error.message).toContain("%");
+    // An ordinary label is unaffected — this is not a new charset for `name`.
+    expect(resolved("# ${profile.name}", server({ name: "Rack 4 / Ünit 2" }))).toBe("# Rack 4 / Ünit 2");
+  });
+
+  it("refuses `!` — interactive bash expands `!!` into a previous command line, punctuation included", () => {
+    // Delayed expansion is off by default in cmd, so cmd is not the reason;
+    // bash is. History expansion is on in every interactive shell, and a macro
+    // send lands in one.
+    const outcome = resolveProfileTokens("echo ${profile.name}\n", server({ name: "DC1!!" }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.token).toBe("name");
+    expect(JSON.stringify(outcome)).not.toContain("echo DC1!!");
+    expect(outcome.error.message).toContain("!");
+  });
+
+  it("keeps `^` legal — cmd's escape character can only REMOVE meaning, never add it", () => {
+    // The other half of the cmd.exe decision, asserted so a later "refuse
+    // everything cmd looks at" sweep has to argue with it: `^` cannot turn
+    // plain text into syntax, and `^^` is a literal caret. In bash and
+    // PowerShell it is an ordinary character.
+    expect(resolved("# ${profile.name}", server({ name: "Rack 4 ^ Spare" }))).toBe("# Rack 4 ^ Spare");
+  });
+
+  it("refuses `%` and `!` one at a time, in `name` only — the address charsets already excluded them", () => {
+    for (const bad of ["a%b", "100%", "a!b", "Do not touch!"]) {
+      expect(resolveProfileTokens("x ${profile.name}", server({ name: bad })).ok, `name ${bad}`).toBe(false);
+    }
+    // `host`/`ipmiHost`/`username` are positive charsets and never admitted
+    // either character — asserted so the two rules cannot silently diverge.
+    for (const bad of ["10.0.0.1%2", "10.0.0.1!"]) {
+      expect(resolveProfileTokens("-H ${profile.host}", server({ host: bad })).ok, `host ${bad}`).toBe(false);
+      expect(resolveProfileTokens("-H ${profile.ipmiHost}", server({ ipmiHost: bad })).ok, `ipmiHost ${bad}`).toBe(false);
+    }
+    for (const bad of ["ad%min", "admin!"]) {
+      expect(resolveProfileTokens("-U ${profile.username}", server({ username: bad })).ok, `username ${bad}`).toBe(false);
+    }
+    expect(resolveProfileTokens("-p ${profile.port}", server({ port: "22%" as unknown as number })).ok).toBe(false);
+  });
+
   it("refuses parens and braces one at a time, and only in `name` — the address charsets are untouched", () => {
     for (const bad of ["a(b", "a)b", "a{b", "a}b", "(id)", "Core Switch (DC1)"]) {
       expect(resolveProfileTokens("x ${profile.name}", server({ name: bad })).ok, `name ${bad}`).toBe(false);
