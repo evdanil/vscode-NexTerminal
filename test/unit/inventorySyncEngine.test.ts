@@ -11,6 +11,7 @@ import { deterministicServerId } from "../../src/services/inventory/deterministi
 import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
+import { buildConnectConfig } from "../../src/services/ssh/ssh2Connector";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../src/models/inventory";
 
 function makeSource(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
@@ -53,6 +54,38 @@ function makeOwnedServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
     origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 },
     ...overrides
   };
+}
+
+/**
+ * Runs `server` through the REAL connect path with `profile` linked and returns
+ * the ServerConfig that reaches the connector — i.e. the record after
+ * `SilentAuthSshFactory.resolveServer` has applied the profile's owned fields.
+ *
+ * Callers that need the last hop pass the result to ssh2Connector's own
+ * `buildConnectConfig`, which is what decides what is actually handed to the SSH
+ * server and where a `key` resolution with no key path becomes `Missing keyPath
+ * for key auth on <name>`. Stopping at the plan — or even here — is exactly what
+ * let a keyless key profile be stamped onto every synced server: each layer was
+ * right by its own rule, and only the composition was unusable.
+ */
+async function resolveThroughConnect(server: ServerConfig, profile: AuthProfile): Promise<ServerConfig> {
+  const connection = {
+    openShell: () => undefined, openDirectTcp: () => undefined, openSftp: () => undefined, exec: () => undefined,
+    requestForwardIn: () => undefined, cancelForwardIn: () => undefined,
+    onTcpConnection: () => () => undefined, onClose: () => () => undefined,
+    getBanner: () => undefined, dispose: () => undefined
+  };
+  const connectCalls: ServerConfig[] = [];
+  const factory = new SilentAuthSshFactory(
+    { connect: async (resolvedServer: ServerConfig) => { connectCalls.push(resolvedServer); return connection; } } as never,
+    { get: async () => undefined, store: async () => undefined, delete: async () => undefined } as never,
+    { prompt: async () => ({ password: "typed", save: false }) } as never,
+    undefined,
+    (id: string) => (id === profile.id ? profile : undefined)
+  );
+
+  await factory.connect(server);
+  return connectCalls[0];
 }
 
 function makeManualServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
@@ -280,10 +313,14 @@ describe("computeSyncPlan — updates", () => {
 });
 
 describe("computeSyncPlan — auth profile link", () => {
-  // The resolved profile the caller passes in. `name` is unused by the engine
-  // (it exists for the plan-preview modal's copy) but is carried so the input
-  // shape here is the real one callers build.
-  const profile = { id: "p1", name: "Lab credentials" };
+  // The resolved profile the caller passes in — the WHOLE record, exactly what
+  // `resolveSourceAuthProfile` hands over. `name` is used only by the
+  // plan-preview modal's copy; `username` is never read by the engine at all
+  // (the "link, never copy" assertions below are what pin that); `authType` and
+  // `keyPath` are read by AUTH 1b, which is why the narrow `{ id, name }` pair
+  // this used to be is no longer enough.
+  const profile: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
+  const otherProfile: AuthProfile = { id: "p2", name: "Other", username: "otheruser", authType: "password" };
 
   // Pinned verbatim (UX report §6). This exact string is what the plan-preview
   // modal surfaces, so a reword is a user-visible copy change and must break a
@@ -554,7 +591,7 @@ describe("computeSyncPlan — auth profile link", () => {
     const source = makeSource({ authProfileId: "p2" });
     const before = makeOwnedServer({ authProfileId: "p1" });
     const tree = makeTree([makeDevice()]);
-    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: { id: "p2", name: "Other" } });
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: otherProfile });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.unchangedCount).toBe(1);
@@ -589,7 +626,7 @@ describe("computeSyncPlan — auth profile link", () => {
     const source = makeSource({ authProfileId: "p1" });
     const before = makeOwnedServer();
     const tree = makeTree([makeDevice(), makeDevice({ externalId: "device:2", name: "new-sw", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] })]);
-    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: { id: "OTHER", name: "X" } });
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: { ...otherProfile, id: "OTHER", name: "X" } });
 
     expect(plan.adds).toHaveLength(1);
     expect(plan.adds[0].authProfileId).toBeUndefined();
@@ -631,7 +668,7 @@ describe("computeSyncPlan — auth profile link", () => {
       tree: makeTree([makeDevice()]),
       currentServers: [first.adds[0]],
       now: 2000,
-      authProfile: { id: "p2", name: "Other" }
+      authProfile: otherProfile
     });
     expect(second.updates).toHaveLength(1);
     expect(second.updates[0].after.authProfileId).toBe("p2");
@@ -736,7 +773,7 @@ describe("computeSyncPlan — auth profile link", () => {
       authProfileId: undefined,
       origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" }
     });
-    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [before], now: 2000, authProfile: { id: "p2", name: "Other" } });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [before], now: 2000, authProfile: otherProfile });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.unchangedCount).toBe(1);
@@ -754,7 +791,7 @@ describe("computeSyncPlan — auth profile link", () => {
       authProfileId: "p1",
       origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin", syncedAuthProfileId: "p1" }
     });
-    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [before], now: 2000, authProfile: { id: "p2", name: "Other" } });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [before], now: 2000, authProfile: otherProfile });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.unchangedCount).toBe(1);
@@ -860,34 +897,134 @@ describe("computeSyncPlan — auth profile link", () => {
       tree: makeTree([makeDevice()]),
       currentServers: [],
       now: 1000,
-      authProfile: { id: blankProfile.id, name: blankProfile.name }
+      authProfile: blankProfile
     });
 
     const created = plan.adds[0];
     expect(created.username).toBe("labuser");
     expect(created.authProfileId).toBe("p1");
 
-    const connection = {
-      openShell: () => undefined, openDirectTcp: () => undefined, openSftp: () => undefined, exec: () => undefined,
-      requestForwardIn: () => undefined, cancelForwardIn: () => undefined,
-      onTcpConnection: () => () => undefined, onClose: () => () => undefined,
-      getBanner: () => undefined, dispose: () => undefined
-    };
-    const connectCalls: ServerConfig[] = [];
-    const factory = new SilentAuthSshFactory(
-      { connect: async (server: ServerConfig) => { connectCalls.push(server); return connection; } } as never,
-      { get: async () => undefined, store: async () => undefined, delete: async () => undefined } as never,
-      { prompt: async () => ({ password: "typed", save: false }) } as never,
-      undefined,
-      (id: string) => (id === "p1" ? blankProfile : undefined)
-    );
+    const resolved = await resolveThroughConnect(created, blankProfile);
 
-    await factory.connect(created);
-
-    expect(connectCalls[0].username).toBe("labuser");
+    expect(resolved.username).toBe("labuser");
     // The auth type IS supplied by the profile, so the link still does its job:
     // this is what stops synced servers landing on SSH agent auth.
-    expect(connectCalls[0].authType).toBe("password");
+    expect(resolved.authType).toBe("password");
+  });
+
+  /**
+   * REVIEW FINDING (P1) — AUTH 1b. The same END-TO-END discipline as the test
+   * above, for the other shape of profile the editor accepts: `key` auth with
+   * no key file.
+   *
+   * Why the plan alone proves nothing here, and why this is asserted through
+   * `buildConnectConfig`: the plan was right by its own rule (link the source's
+   * profile), the connect-time resolution was right by ITS own rule (a profile
+   * always owns `authType`; it owns no `keyPath`, so the server keeps its own —
+   * of which a synced server has none), and the two composed into a server that
+   * cannot open a connection at all. Only the function that builds what is
+   * actually sent to the SSH server sees it.
+   */
+  const KEYLESS_KEY_PROFILE: AuthProfile = { id: "p1", name: "Shared Key", username: "keyuser", authType: "key" };
+
+  // Pinned verbatim, same reason as DANGLING_WARNING: this is what the
+  // plan-preview modal shows. makeSource()'s name is "NetBox".
+  const KEYLESS_KEY_WARNING =
+    'The auth profile "Shared Key" for "NetBox" uses private key authentication but has no key file — synced servers have no key of their own, so they use the default username with SSH agent authentication instead. Add a key file to the profile, or choose another.';
+
+  it("AUTH 1b — a source linked to a key profile with no key file adds servers that can actually open a connection, and says why the link was not used (kills stamping a link whose authType every synced server is unable to satisfy)", async () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "labuser" });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice()]),
+      currentServers: [],
+      now: 1000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+
+    const created = plan.adds[0];
+    // Degraded to the pre-feature record, field for field — NOT a half-applied
+    // link. `authType`/`keyPath` were already these values; the link is what
+    // must be absent.
+    expect(created.authProfileId).toBeUndefined();
+    expect(created.origin?.syncedAuthProfileId).toBeUndefined();
+    expect(created.authType).toBe("agent");
+    expect(created.username).toBe("labuser");
+    expect(plan.warnings).toContain(KEYLESS_KEY_WARNING);
+
+    // THE ASSERTION THAT MATTERS. With the link stamped (the wrong
+    // implementation), resolveServer hands back `authType: "key"` with no
+    // `keyPath` and this rejects with "Missing keyPath for key auth on
+    // core-sw-1" — the fleet-wide unusability this whole feature exists to end,
+    // reintroduced through the Auth Profile select.
+    const resolved = await resolveThroughConnect(created, KEYLESS_KEY_PROFILE);
+    expect(resolved.authType).toBe("agent");
+    expect(resolved.keyPath).toBeUndefined();
+    const config = await buildConnectConfig(resolved);
+    expect(config).toMatchObject({ host: "10.0.0.1", port: 22, username: "labuser" });
+    expect(config.privateKey).toBeUndefined();
+  });
+
+  it("AUTH 1b — retro-apply leaves a WORKING agent-auth server alone when the source's key profile has no key file, and that server still connects (kills a check that covers only the add path)", async () => {
+    // Exactly the server retro-apply exists to adopt: no profile, agent auth,
+    // no key path, still on the username the sync stamped. Under the wrong
+    // implementation it is adopted — and a server that was connecting fine a
+    // moment ago stops being able to connect at all, which is strictly worse
+    // than the defect retro-apply was written to repair.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer();
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice()]),
+      currentServers: [before],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+    expect(plan.warnings).toContain(KEYLESS_KEY_WARNING);
+
+    const resolved = await resolveThroughConnect(before, KEYLESS_KEY_PROFILE);
+    expect(resolved.authType).toBe("agent");
+    expect((await buildConnectConfig(resolved)).privateKey).toBeUndefined();
+  });
+
+  it("AUTH 1b applies to the PROFILE's usable key path, not to the presence of the field: a whitespace-only key file is no key file (kills a `profile.keyPath !== undefined` shortcut that diverges from the ownership rule)", () => {
+    const source = makeSource({ authProfileId: "p1" });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice()]),
+      currentServers: [],
+      now: 1000,
+      authProfile: { ...KEYLESS_KEY_PROFILE, keyPath: "   " }
+    });
+
+    expect(plan.adds[0].authProfileId).toBeUndefined();
+    expect(plan.warnings).toContain(KEYLESS_KEY_WARNING);
+  });
+
+  it("a key profile that DOES carry a key file is stamped exactly as before, and the synced server connects with that key (kills over-broad rejection of every key profile)", async () => {
+    const keyProfile: AuthProfile = { ...KEYLESS_KEY_PROFILE, keyPath: "/keys/id_ed25519" };
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "labuser" });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice()]),
+      currentServers: [],
+      now: 1000,
+      authProfile: keyProfile
+    });
+
+    const created = plan.adds[0];
+    expect(created.authProfileId).toBe("p1");
+    expect(plan.warnings.some((w) => w.includes("auth profile"))).toBe(false);
+
+    // The link still does its job end to end: key auth, pointed at the
+    // profile's key. (`buildConnectConfig` would read that file, so the
+    // resolution is where this stops — the point is that `keyPath` is present.)
+    const resolved = await resolveThroughConnect(created, keyProfile);
+    expect(resolved.authType).toBe("key");
+    expect(resolved.keyPath).toBe("/keys/id_ed25519");
   });
 });
 

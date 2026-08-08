@@ -465,6 +465,59 @@ export function authProfileOwnedCredentials(profile: AuthProfile | undefined): A
   return owned;
 }
 
+/**
+ * REVIEW FINDING (P1) — the companion question THE ONE RULE above cannot
+ * answer on its own: "can a server that brings NO key path of its own connect
+ * through this profile?"
+ *
+ * `authType` is a closed enum and so is ALWAYS owned — deliberately, and that
+ * stays (see below). The consequence is that a `key` profile with no key path
+ * forces `authType: "key"` onto every server it is linked to while supplying
+ * nothing for `keyPath`; `buildConnectConfig` (services/ssh/ssh2Connector.ts)
+ * then throws `Missing keyPath for key auth on <server>` unless the SERVER
+ * carries one itself. Such a profile is perfectly legitimate — it is the
+ * shared-passphrase, per-server-key-file pattern the server form supports on
+ * purpose (`updateProfileManagedFields` in ui/formHtml.ts leaves the Private
+ * Key File control editable for exactly this profile, and
+ * `preserveLinkedServerCredentials` keeps what you type into it). It is only
+ * unusable where the server can have no key path of its own, which is every
+ * server an inventory sync creates: the add path stamps the LINK only, with
+ * `authType: "agent"` and no `keyPath`, and retro-apply targets precisely the
+ * servers that still carry that shape.
+ *
+ * WHY NOT FIX THIS IN THE OWNERSHIP RULE INSTEAD (i.e. make such a profile own
+ * no `authType` either) — three reasons, any one of them decisive:
+ *
+ *   * It would SILENTLY SUBSTITUTE the credentials the user did not choose.
+ *     A synced server whose profile no longer owns `authType` keeps its own
+ *     "agent", so the sync's servers go back to SSH-agent auth while the
+ *     source's form still says the profile is linked and the profile still
+ *     says key auth. Silently connecting with credentials nobody chose is the
+ *     defect class this whole feature exists to remove, not a fix for it.
+ *   * It would break the legitimate pattern above for every server whose own
+ *     `authType` is not already "key". Linking such a profile to a manual
+ *     password server plus a key file is a working, intended configuration
+ *     today; dropping `authType` ownership turns it into a password login.
+ *   * THE ONE RULE is per-field — "does the profile supply a usable value for
+ *     THIS field" — and stays answerable from the profile alone. The question
+ *     here is about a PAIRING (profile + a server that may or may not have a
+ *     key path), so it belongs to whoever decides that pairing, which is what
+ *     this predicate is for.
+ *
+ * Callers: the inventory source form's two persist helpers (reject the link at
+ * the moment the user chooses it) and `computeSyncPlan` (refuse to stamp such
+ * a link on adds OR through retro-apply, and warn) — see inventoryCommands.ts
+ * and services/inventory/syncEngine.ts.
+ *
+ * Read off `authProfileOwnedCredentials` rather than off `profile.keyPath`
+ * directly, so "supplies no usable key path" means exactly what it means
+ * everywhere else — a whitespace-only path included.
+ */
+export function authProfileNeedsServerKeyPath(profile: AuthProfile | undefined): boolean {
+  const owned = authProfileOwnedCredentials(profile);
+  return owned.authType === "key" && owned.keyPath === undefined;
+}
+
 export function resolveTunnelType(profile: TunnelProfile): TunnelType {
   return profile.tunnelType ?? "local";
 }

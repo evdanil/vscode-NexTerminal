@@ -10,6 +10,7 @@ import {
   type InventoryTree
 } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { ORPHAN_FOLDER_NAME, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
@@ -3848,6 +3849,134 @@ describe("inventoryCommands", () => {
     });
 
     /**
+     * REVIEW FINDING (P1) — the second reason a selected profile cannot be
+     * honoured, refused by the same persist-time re-resolve as the first.
+     *
+     * A `key` profile with no key file is a shape the profile editor accepts on
+     * purpose (it is the shared-passphrase, per-server-key-file pattern), but no
+     * server an inventory sync produces can supply the missing half: the add
+     * path writes `authType: "agent"` with no `keyPath`, and retro-apply adopts
+     * only servers still carrying exactly that. The profile forces
+     * `authType: "key"` at connect time, so `buildConnectConfig` rejects every
+     * one of them with "Missing keyPath" — the fleet-wide unusability the whole
+     * feature exists to end, arriving through the Auth Profile select.
+     */
+    const KEYLESS_KEY_PROFILE: AuthProfile = { id: "pk", name: "Shared Key", username: "keyuser", authType: "key" };
+    // Pinned verbatim — this is the "Save failed: …" banner text.
+    const KEYLESS_KEY_REJECTION =
+      'The auth profile "Shared Key" uses private key authentication but has no key file. Servers synced from this source have no key of their own, so none of them could connect. Add a key file to that profile, or choose another.';
+
+    it("addSource refuses to link a key profile that carries no key file, and rolls back its vault write (kills a persist-time check that only asks whether the profile still EXISTS)", async () => {
+      const { core, vault } = await makeHarness({ profiles: [LAB_PROFILE, KEYLESS_KEY_PROFILE] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await expect(
+        onSubmit({
+          name: "My NetBox",
+          targetFolder: "Infra",
+          authProfileId: "pk",
+          defaultUsername: "keyuser",
+          prunePolicy: "orphan",
+          cfg_host: "netbox.local",
+          cfg_apiToken: "secret-token"
+        })
+      ).rejects.toThrow(KEYLESS_KEY_REJECTION);
+
+      // The profile resolves perfectly well, so an existence-only check creates
+      // this source — and every device it ever syncs arrives unable to connect.
+      expect(core.getSnapshot().inventorySources).toEqual([]);
+      // Same vault-first rollback the missing-profile rejection owes.
+      const storedKey = vault.store.mock.calls.at(-1)?.[0] as string | undefined;
+      expect(storedKey).toBeDefined();
+      expect(await vault.get(storedKey!)).toBeUndefined();
+    });
+
+    it("editSource refuses to switch a source onto a key profile that carries no key file, leaving the record on its previous profile (kills covering only the add path)", async () => {
+      const { core, vault } = await makeHarness({
+        profiles: [LAB_PROFILE, KEYLESS_KEY_PROFILE],
+        source: { authProfileId: "p1" }
+      });
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          authProfileId: "pk",
+          defaultUsername: "keyuser",
+          prunePolicy: "orphan",
+          cfg_host: "netbox.local",
+          cfg_apiToken: "new-token"
+        })
+      ).rejects.toThrow(KEYLESS_KEY_REJECTION);
+
+      expect(core.getInventorySource("src-1")?.authProfileId).toBe("p1");
+      // This run's re-entered secret is restored, same as every other rejection
+      // inside that critical section.
+      expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBe("tok");
+    });
+
+    it("a key profile that DOES carry a key file links normally (kills rejecting every key profile rather than the keyless ones)", async () => {
+      const keyProfile: AuthProfile = { ...KEYLESS_KEY_PROFILE, keyPath: "/keys/id_ed25519" };
+      const { core } = await makeHarness({ profiles: [LAB_PROFILE, keyProfile] });
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        authProfileId: "pk",
+        defaultUsername: "keyuser",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      });
+
+      expect(core.getSnapshot().inventorySources[0].authProfileId).toBe("pk");
+    });
+
+    it("a source whose linked profile LOST its key file after linking syncs without stamping it — new servers connect, an already-working agent server is left alone, and the plan says why (kills relying on the form check alone, which no later profile edit passes through)", async () => {
+      // The form check cannot govern this: the pairing was legal when it was
+      // made. Only the engine sees the profile as it is at sync time.
+      const { core } = await makeHarness({
+        profiles: [KEYLESS_KEY_PROFILE],
+        source: { targetFolder: "", authProfileId: "pk" },
+        servers: [ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" })],
+        provider: {
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [
+              { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
+              { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] }
+            ]
+          }))
+        }
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined); // the post-apply "N warnings" toast
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const added = core.getServer(deterministicServerId("src-1", "device:2"));
+      expect(added?.authProfileId).toBeUndefined();
+      expect(added?.authType).toBe("agent");
+      // Retro-apply must not fire either: owned-1 is exactly the server the rule
+      // adopts, and adopting it here would take a server that connects today and
+      // make it unable to connect at all.
+      expect(core.getServer("owned-1")?.authProfileId).toBeUndefined();
+      expect(core.getServer("owned-1")?.authType).toBe("agent");
+
+      const detail = modalCalls()[0][1].detail;
+      expect(detail).not.toContain("will switch to auth profile");
+      expect(detail).toContain("1 warning");
+    });
+
+    /**
      * REVIEW FINDING (P2) — the mirror that fills Default SSH Username from the
      * selected profile is an async webview round trip (onAutofill). Save can win
      * that race, and then the form posts the NEW authProfileId next to the
@@ -4375,6 +4504,70 @@ describe("inventoryCommands", () => {
       expect(shown[0][1].detail).toContain('1 server will switch to auth profile "Lab credentials".');
       expect(shown[1][1].detail).toContain('1 server will switch to auth profile "Renamed".');
       expect(core.getServer("owned-1")?.authProfileId).toBe("p1");
+    });
+
+    it("REVIEW FINDING (P2) — a mid-modal swap of WHICH server is eligible for retro-apply re-confirms, even though both plans render byte-identical detail and delete nothing (kills a drift check that compares only the rendered text and the delete-id set)", async () => {
+      const otherProfile: AuthProfile = { id: "p2", name: "Other", username: "otheruser", authType: "password" };
+      const { core } = await makeHarness({
+        profiles: [LAB_PROFILE, otherProfile],
+        source: { targetFolder: "", authProfileId: "p1" },
+        servers: [
+          // sw1 is eligible right now: no profile, agent auth, no key path,
+          // still on the username the sync stamped.
+          ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" }),
+          // sw2 is not: it already carries a link, which is a DECIDED state.
+          ownedServer({ id: "owned-2", externalId: "device:2", name: "sw2", host: "10.0.0.2", authProfileId: "p2" })
+        ],
+        provider: {
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [
+              { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
+              { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] }
+            ]
+          }))
+        }
+      });
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage
+        // Both edits land WHILE the first modal is open, and they EXCHANGE the
+        // two servers' eligibility rather than changing how many are eligible:
+        // sw1 gains a hand-set link (decided — retro-apply must leave it), sw2
+        // has its link cleared (indistinguishable from never-configured —
+        // retro-apply adopts it). Every number describePlanDetail renders is
+        // untouched: 0 added, 1 updated, 1 switching, 1 unchanged, 0 pruned, 0
+        // warnings. Only the IDENTITY of the switching server moves — the very
+        // thing the modal's Show Warnings buffer discloses by name.
+        .mockImplementationOnce(async () => {
+          await core.addOrUpdateServer({ ...core.getServer("owned-1")!, authProfileId: "p2" });
+          await core.addOrUpdateServer({ ...core.getServer("owned-2")!, authProfileId: undefined });
+          return "Apply";
+        })
+        .mockResolvedValueOnce(undefined); // cancel the reconfirmation modal
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modalCalls();
+      expect(shown).toHaveLength(2);
+      // THE FIXTURE'S NON-VACUITY, asserted rather than assumed: the two modals
+      // are byte-identical, so nothing a text comparison can see has moved, and
+      // neither plan deletes anything, so the delete-id set has not moved
+      // either. Drift can only be detected from the switch-id set.
+      expect(shown[1][1].detail).toBe(shown[0][1].detail);
+      expect(shown[0][1].detail).toContain("1 server will be updated.");
+      expect(shown[0][1].detail).toContain('1 server will switch to auth profile "Lab credentials".');
+      expect(shown[0][1].detail).toContain("1 server is unchanged.");
+      expect(shown[0][1].detail).not.toContain("will be deleted");
+
+      // Without the switch-id comparison the fresh plan applies unseen and
+      // stamps "Lab credentials" onto owned-2 — a server that never appeared in
+      // the Show Warnings list behind the modal the user confirmed, which named
+      // owned-1 and only owned-1.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("owned-1")?.authProfileId).toBe("p2");
+      expect(core.getServer("owned-2")?.authProfileId).toBeUndefined();
     });
 
     it("a dangling authProfileId surfaces the exact dangling-profile warning through the modal's Show Warnings buffer (kills a caller that fabricates a resolution for an id nothing resolves)", async () => {

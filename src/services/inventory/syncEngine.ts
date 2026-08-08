@@ -1,5 +1,5 @@
-import type { ServerConfig, ServerOrigin } from "../../models/config";
-import { serverOriginStampsEqual } from "../../models/config";
+import type { AuthProfile, ServerConfig, ServerOrigin } from "../../models/config";
+import { authProfileNeedsServerKeyPath, serverOriginStampsEqual } from "../../models/config";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../models/inventory";
 import type { InventorySyncApplication } from "../../core/nexusCore";
 import { normalizeFolderPath } from "../../utils/folderPaths";
@@ -18,8 +18,17 @@ export interface ComputeSyncPlanInput {
    * names a live profile. Resolution lives in the caller for the same reason
    * `now` does: this function is pure and has no core access. The engine still
    * cross-checks the id (see AUTH 1) rather than trusting the pair blindly.
+   *
+   * REVIEW FINDING (P1) — the WHOLE profile, not the `{ id, name }` pair this
+   * used to be. AUTH 1b below has to ask whether the profile can actually be
+   * used by a server that carries no key path of its own, and a caller-computed
+   * flag would put a precondition the engine depends on outside the engine,
+   * where the next call site can forget it — which is exactly how the keyless
+   * key profile reached the stamp in the first place. Widening the input does
+   * not widen what the engine WRITES: the add/update paths stamp the link and
+   * nothing else, which the "link, never copy" assertions pin field by field.
    */
-  authProfile?: { id: string; name: string };
+  authProfile?: AuthProfile;
 }
 
 export interface InventorySyncPlan {
@@ -96,14 +105,49 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // same safe state as a deleted profile: no stamp, plus the warning below —
   // which is exactly what the source-changed-mid-sync abort in
   // inventoryCommands is there to catch a beat later anyway.
-  const resolvedProfileId =
-    source.authProfileId !== undefined && input.authProfile?.id === source.authProfileId ? source.authProfileId : undefined;
+  const matchedProfile =
+    source.authProfileId !== undefined && input.authProfile?.id === source.authProfileId ? input.authProfile : undefined;
+
+  // AUTH 1b (REVIEW FINDING, P1) — a `key` profile that supplies no key path
+  // is not usable BY THIS SOURCE, however live and well-formed it is.
+  //
+  // Every server this engine writes a link onto has no key path of its own —
+  // that is not an accident of the fixtures, it is the two paths' definition.
+  // The add path stamps `authType: "agent"` with no `keyPath`, and retro-apply
+  // adopts only servers still carrying exactly that (`ownedServer.keyPath ===
+  // undefined` is one of its six clauses). Since the profile forces
+  // `authType: "key"` at connect time and owns no path
+  // (`authProfileNeedsServerKeyPath`, models/config.ts, which also explains why
+  // the fix is NOT to weaken the ownership rule), `buildConnectConfig` throws
+  // `Missing keyPath for key auth on <server>` for every one of them. Stamping
+  // the link would therefore make every server this source syncs unusable —
+  // including, through retro-apply, servers that were connecting perfectly
+  // well on SSH agent auth a moment earlier.
+  //
+  // DEGRADE, don't abort: this lands in the SAME state as a dangling profile —
+  // no stamp anywhere, so adds keep the pre-feature agent-auth record and
+  // already-synced servers are left exactly as they are — plus a warning that
+  // says which repair to make. That keeps the two "the link cannot be honoured"
+  // cases behaving identically instead of inventing a third outcome, and it
+  // never takes a working fleet offline because a profile was edited.
+  //
+  // The source form rejects this pairing where the user chooses it (see
+  // `inventoryAuthProfileRejection` in commands/inventoryCommands.ts), so
+  // reaching here means the pairing was made somewhere the form does not
+  // govern: the profile had its key path removed AFTER being linked, a backup
+  // restored the pair, or the record was written by hand. The form check is the
+  // one that can explain itself at the right moment; this one is the one that
+  // cannot be bypassed.
+  const keylessKeyProfile = matchedProfile !== undefined && authProfileNeedsServerKeyPath(matchedProfile);
+  const resolvedProfileId = keylessKeyProfile ? undefined : matchedProfile?.id;
   if (source.authProfileId !== undefined && resolvedProfileId === undefined) {
     // Deliberately unconditional: even a sync with zero adds and zero updates
     // must say the link is dead, because the source form still shows a profile
     // selected and nothing else in the sync would contradict it.
     warnings.push(
-      `The auth profile for "${source.name}" no longer exists — synced servers use the default username with SSH agent authentication. Edit the source to choose another profile.`
+      keylessKeyProfile && matchedProfile !== undefined
+        ? `The auth profile "${matchedProfile.name}" for "${source.name}" uses private key authentication but has no key file — synced servers have no key of their own, so they use the default username with SSH agent authentication instead. Add a key file to the profile, or choose another.`
+        : `The auth profile for "${source.name}" no longer exists — synced servers use the default username with SSH agent authentication. Edit the source to choose another profile.`
     );
   }
 

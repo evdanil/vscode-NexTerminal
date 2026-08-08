@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
 import type { AuthProfile, ServerConfig } from "../models/config";
-import { authProfileOwnedCredentials } from "../models/config";
+import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials } from "../models/config";
 import {
   computeProviderFingerprint,
   InventoryProviderError,
@@ -567,6 +567,62 @@ async function parseSourceFormValues(
 const MISSING_AUTH_PROFILE_MESSAGE = "The selected auth profile no longer exists. Choose another, or clear the Auth Profile field.";
 
 /**
+ * REVIEW FINDING (P1) — the second reason a selected profile cannot be
+ * honoured, refused in the same breath and by the same two persist helpers as
+ * the first.
+ *
+ * A `key` profile that carries no key path forces `authType: "key"` onto every
+ * server linked to it while supplying no path, and NO server this source
+ * produces can supply one of its own: the add path writes `authType: "agent"`
+ * with no `keyPath`, and retro-apply adopts only servers still carrying exactly
+ * that. So `buildConnectConfig` throws `Missing keyPath for key auth on
+ * <server>` for every device the source has ever synced or will sync — the same
+ * fleet-wide unusability this feature was written to end, entered through the
+ * Auth Profile select instead of through the missing default. See
+ * `authProfileNeedsServerKeyPath` (models/config.ts) for why this is a property
+ * of the PAIRING rather than something the field-ownership rule should absorb,
+ * and why such a profile stays perfectly valid on a server form.
+ *
+ * WHY HERE AND NOT IN THE SELECT'S OPTION LIST: options are built once, when
+ * the form opens, so filtering them cannot govern a profile whose key path is
+ * removed while the form sits open — the same reason the missing-profile check
+ * above is a persist-time re-resolve rather than a render-time filter. It would
+ * also silently drop the currently-linked profile out of an Edit form's own
+ * select, turning "your source is misconfigured" into "your source is linked to
+ * nothing", which is the state this refusal exists to avoid persisting.
+ * Refusing at Save keeps the choice visible and says what to repair.
+ *
+ * NAMED here, unlike MISSING_AUTH_PROFILE_MESSAGE: the profile still exists, so
+ * there is a name to quote (m3 — a name, never the id), and the repair is to
+ * that profile rather than to this form.
+ */
+function keylessKeyAuthProfileMessage(profile: AuthProfile): string {
+  return `The auth profile "${profile.name}" uses private key authentication but has no key file. Servers synced from this source have no key of their own, so none of them could connect. Add a key file to that profile, or choose another.`;
+}
+
+/**
+ * The single answer to "may this source be saved carrying this auth profile?",
+ * shared by both persist helpers so the Add and Edit paths cannot diverge on
+ * it. Returns the message to reject with, or `undefined` to proceed.
+ *
+ * `profile` is what `authProfileId` resolved to against LIVE core state a
+ * statement earlier — the caller does the lookup because only it knows which
+ * rollback its own critical section owes on the way out.
+ */
+function inventoryAuthProfileRejection(authProfileId: string | undefined, profile: AuthProfile | undefined): string | undefined {
+  if (authProfileId === undefined) {
+    return undefined;
+  }
+  if (profile === undefined) {
+    return MISSING_AUTH_PROFILE_MESSAGE;
+  }
+  if (authProfileNeedsServerKeyPath(profile)) {
+    return keylessKeyAuthProfileMessage(profile);
+  }
+  return undefined;
+}
+
+/**
  * REVIEW FINDING (P2) — the fallback username a source records. Called by both
  * persist helpers with the profile they just re-resolved (above), i.e. at the
  * exact moment the record is written.
@@ -756,7 +812,8 @@ async function persistNewInventorySource(
     // record into the map before removeAuthProfile scans it, so the reference
     // is cleared off this source exactly as it would be off any other holder.
     const linkedProfile = authProfileId !== undefined ? core.getAuthProfile(authProfileId) : undefined;
-    if (authProfileId !== undefined && linkedProfile === undefined) {
+    const authProfileRejection = inventoryAuthProfileRejection(authProfileId, linkedProfile);
+    if (authProfileRejection !== undefined) {
       // Same best-effort rollback as FINDING B / FINDING 1 below: the source
       // is not created on this path either, so nothing would ever enumerate
       // these keys to clean them up.
@@ -767,7 +824,7 @@ async function persistNewInventorySource(
           // best-effort rollback — ignore
         }
       }
-      throw new Error(MISSING_AUTH_PROFILE_MESSAGE);
+      throw new Error(authProfileRejection);
     }
 
     // ITEM A — stamp the provider's fingerprint at creation time: the user
@@ -930,9 +987,10 @@ async function persistUpdatedInventorySource(
     // switched ONTO that profile keeps its revision, sails through ITEM 4
     // untouched, and is caught here.
     const linkedProfile = authProfileId !== undefined ? core.getAuthProfile(authProfileId) : undefined;
-    if (authProfileId !== undefined && linkedProfile === undefined) {
+    const authProfileRejection = inventoryAuthProfileRejection(authProfileId, linkedProfile);
+    if (authProfileRejection !== undefined) {
       await rollbackThisRunsVaultWrites();
-      throw new Error(MISSING_AUTH_PROFILE_MESSAGE);
+      throw new Error(authProfileRejection);
     }
 
     // ITEM A — restamp on every save: the user has the form open against
@@ -1187,6 +1245,30 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
   return new Set(plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id));
 }
 
+/**
+ * REVIEW FINDING (P2) — the set of server ids the plan would move onto a
+ * different auth profile, the identity behind `authProfileSwitches`' count.
+ * Read off `before.id` for the same reason `planWarningsBuffer` names
+ * `before.name`: it is the record as it exists right now, which is what the
+ * user is being asked to consent to.
+ */
+function authProfileSwitchIds(plan: InventorySyncPlan): Set<string> {
+  return new Set(authProfileSwitches(plan).map((u) => u.before.id));
+}
+
+/** Set equality over server ids — the shape both id-set drift comparisons below use. */
+function serverIdSetsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) {
+    return false;
+  }
+  for (const id of a) {
+    if (!b.has(id)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // FINDING 1 (P2, jump-host-dependents-drift review) — describePlanDetail IS
 // the modal's rendered text. Comparing its OUTPUT for the plan just shown
 // against a freshly recomputed plan subsumes every field this comparator
@@ -1216,6 +1298,20 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
 // string covers it; this is the one aggregate that isn't fully captured by
 // the text and so earns its own dedicated check for teardown-safety.
 //
+// REVIEW FINDING (P2) — the AUTH-SWITCH server-id set is compared the same
+// way and for the same reason. describePlanDetail renders only a COUNT of
+// switches ("5 servers will switch to auth profile X."), so a mid-modal
+// change that makes one server ineligible for retro-apply and another
+// eligible produces byte-identical text with an identical delete set: no
+// drift, and the fresh plan then stamps the profile onto a server that was
+// never disclosed. It is disclosed BY NAME — `planWarningsBuffer` lists every
+// switching server behind Show Warnings precisely so a fleet-wide credential
+// change is inspectable one click before Apply — so the consent the modal
+// collected is consent for THOSE servers, and an identity swap invalidates it
+// exactly as a delete-set swap invalidates the teardown. Same shape as
+// deleteIds (a captured set compared for equality) rather than a parallel
+// mechanism, so there is one discipline here, not two.
+//
 // `nextAuthProfileName` follows the same rule as `nextServers`: it is the
 // resolution taken FRESH alongside `nextPlan`, not the one the shown modal
 // rendered with. That is what makes a mid-modal profile rename (same plan,
@@ -1223,7 +1319,7 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
 // resolution → no switch line, plus a dangling-profile warning) both surface
 // as ordinary drift, with no dedicated comparison of their own.
 function planDetailDrift(
-  previous: { detail: string; deleteIds: ReadonlySet<string> },
+  previous: { detail: string; deleteIds: ReadonlySet<string>; authSwitchIds: ReadonlySet<string> },
   nextPlan: InventorySyncPlan,
   nextServers: ServerConfig[],
   nextAuthProfileName: string | undefined
@@ -1232,14 +1328,11 @@ function planDetailDrift(
   if (nextDetail !== previous.detail) {
     return { drift: true, detail: nextDetail };
   }
-  const nextDeleteIds = deletePruneIds(nextPlan);
-  if (nextDeleteIds.size !== previous.deleteIds.size) {
+  if (!serverIdSetsEqual(previous.deleteIds, deletePruneIds(nextPlan))) {
     return { drift: true, detail: nextDetail };
   }
-  for (const id of previous.deleteIds) {
-    if (!nextDeleteIds.has(id)) {
-      return { drift: true, detail: nextDetail };
-    }
+  if (!serverIdSetsEqual(previous.authSwitchIds, authProfileSwitchIds(nextPlan))) {
+    return { drift: true, detail: nextDetail };
   }
   return { drift: false, detail: nextDetail };
 }
@@ -1250,7 +1343,10 @@ function planDetailDrift(
  * the source has no profile AND when its id no longer names one (a profile
  * deleted by a build that predates removeAuthProfile's source-ref clearing, or
  * deleted in the window this sync is running in); the engine turns that second
- * case into its dangling-profile warning.
+ * case into its dangling-profile warning. The WHOLE profile is handed over, not
+ * a `{ id, name }` pair: the engine decides for itself whether the profile is
+ * usable by the servers it is about to stamp (AUTH 1b, syncEngine.ts) rather
+ * than trusting a caller to have asked that question first.
  *
  * THE PAIRING RULE (extends the FINDING 1 captured-vs-fresh discipline to the
  * profile): every computeSyncPlan call site calls this immediately before the
@@ -1261,12 +1357,11 @@ function planDetailDrift(
  * fresh plan against a stale name, so a profile renamed while the confirm modal
  * is open would be applied under the name the user did NOT consent to.
  */
-function resolveSourceAuthProfile(core: NexusCore, source: InventorySourceConfig): { id: string; name: string } | undefined {
+function resolveSourceAuthProfile(core: NexusCore, source: InventorySourceConfig): AuthProfile | undefined {
   if (source.authProfileId === undefined) {
     return undefined;
   }
-  const profile = core.getAuthProfile(source.authProfileId);
-  return profile ? { id: profile.id, name: profile.name } : undefined;
+  return core.getAuthProfile(source.authProfileId);
 }
 
 export function registerInventoryCommands(
@@ -2154,7 +2249,7 @@ export function registerInventoryCommands(
         // friendly error instead of an unhandled command rejection.
         type FastPathResult =
           | { kind: "done"; plan: InventorySyncPlan; removedEmptyFolderCount: number; source: InventorySourceConfig }
-          | { kind: "not-empty"; plan: InventorySyncPlan; authProfile: { id: string; name: string } | undefined }
+          | { kind: "not-empty"; plan: InventorySyncPlan; authProfile: AuthProfile | undefined }
           | { kind: "abort" };
         const fastPathResult: FastPathResult = await configMutationLock.runExclusive(async (): Promise<FastPathResult> => {
           const freshSource = core.getInventorySource(source.id);
@@ -2247,7 +2342,7 @@ export function registerInventoryCommands(
       // updated plan, "success" means applyInventorySyncPlan committed.
       type SyncAttempt =
         | { kind: "abort" }
-        | { kind: "retry"; plan: InventorySyncPlan; authProfile: { id: string; name: string } | undefined }
+        | { kind: "retry"; plan: InventorySyncPlan; authProfile: AuthProfile | undefined }
         | {
             kind: "success";
             finalPlan: InventorySyncPlan;
@@ -2268,6 +2363,9 @@ export function registerInventoryCommands(
         const shownServers = core.getSnapshot().servers;
         const shownDetail = describePlanDetail(plan, shownServers, planAuthProfile?.name);
         const shownDeleteIds = deletePruneIds(plan);
+        // Captured alongside the delete set, from the SAME plan this modal
+        // renders — these are the servers `shownWarnings` is about to name.
+        const shownAuthSwitchIds = authProfileSwitchIds(plan);
         // The button is keyed on the BUFFER, not on plan.warnings: a retro-apply
         // sync usually carries no engine warnings at all, and without this the
         // one place that names the servers about to switch would be unreachable
@@ -2331,7 +2429,7 @@ export function registerInventoryCommands(
             authProfile: freshAuthProfile
           });
           const recomputedDrift = planDetailDrift(
-            { detail: shownDetail, deleteIds: shownDeleteIds },
+            { detail: shownDetail, deleteIds: shownDeleteIds, authSwitchIds: shownAuthSwitchIds },
             recomputed,
             freshServersForRecompute,
             freshAuthProfile?.name
@@ -2439,7 +2537,7 @@ export function registerInventoryCommands(
           // (applyInventorySyncPlan hasn't been called), so re-declining on
           // the next confirmation leaves state untouched.
           const finalDrift = planDetailDrift(
-            { detail: recomputedDrift.detail, deleteIds: deletePruneIds(recomputed) },
+            { detail: recomputedDrift.detail, deleteIds: deletePruneIds(recomputed), authSwitchIds: authProfileSwitchIds(recomputed) },
             finalPlan,
             finalServersForRecompute,
             finalAuthProfile?.name

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { AuthProfile } from "../../src/models/config";
-import { authProfileOwnedCredentials } from "../../src/models/config";
+import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials } from "../../src/models/config";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { validateAuthProfile } from "../../src/utils/validation";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
@@ -95,6 +95,52 @@ describe("authProfileOwnedCredentials — the shared field-ownership rule", () =
 
   it("owns nothing for no profile — an unlinked server, or an id that resolves to nothing", () => {
     expect(authProfileOwnedCredentials(undefined)).toEqual({});
+  });
+});
+
+/**
+ * REVIEW FINDING (P1) — the companion predicate, and the boundary between the
+ * two. The rule above stays per-FIELD and unchanged: a keyless key profile
+ * still owns `authType`, because a server that brings its own key file is a
+ * legitimate, supported pairing (see the silentAuth test "keeps the server's
+ * own key path when a key profile carries none"). What is unusable is the
+ * PAIRING with a server that has no key path, which is every server an
+ * inventory sync produces — so the question is asked separately, by whoever
+ * decides such a pairing.
+ */
+describe("authProfileNeedsServerKeyPath — can a server with no key of its own use this profile?", () => {
+  it("true only for key auth with no usable key path", () => {
+    expect(authProfileNeedsServerKeyPath(makeAuthProfile({ authType: "key" }))).toBe(true);
+    // Blank and whitespace-only are "no key path" under THE ONE RULE, and this
+    // predicate must agree with it rather than testing the field's presence.
+    expect(authProfileNeedsServerKeyPath(makeAuthProfile({ authType: "key", keyPath: "" }))).toBe(true);
+    expect(authProfileNeedsServerKeyPath(makeAuthProfile({ authType: "key", keyPath: "   " }))).toBe(true);
+  });
+
+  it("false for a key profile that carries a key path — the pairing works, so nothing may reject it", () => {
+    expect(authProfileNeedsServerKeyPath(makeAuthProfile({ authType: "key", keyPath: "/keys/id" }))).toBe(false);
+    // Trimmed by THE ONE RULE, so a padded path is a real one.
+    expect(authProfileNeedsServerKeyPath(makeAuthProfile({ authType: "key", keyPath: " /keys/id " }))).toBe(false);
+  });
+
+  it("false for password and agent profiles, whether or not they happen to carry a stale key path", () => {
+    expect(authProfileNeedsServerKeyPath(makeAuthProfile({ authType: "password" }))).toBe(false);
+    expect(authProfileNeedsServerKeyPath(makeAuthProfile({ authType: "agent" }))).toBe(false);
+    // A key path left behind by an earlier edit is inert while authType is not
+    // "key" — this must key on the auth type, not on the leftover field.
+    expect(authProfileNeedsServerKeyPath(makeAuthProfile({ authType: "agent", keyPath: "/keys/id" }))).toBe(false);
+  });
+
+  it("false for no profile at all — nothing is being forced onto anything", () => {
+    expect(authProfileNeedsServerKeyPath(undefined)).toBe(false);
+  });
+
+  it("the ownership rule is deliberately UNCHANGED by this: a keyless key profile still owns authType (kills 'fixing' P1 by dropping authType ownership, which would silently drop every linked server back to its own auth type)", () => {
+    // Dropping `authType` here would send a synced server back to SSH agent
+    // auth under a profile that says key auth — a silent credential
+    // substitution — and would break the server-with-its-own-key pairing for
+    // every server whose own authType is not already "key".
+    expect(authProfileOwnedCredentials(makeAuthProfile({ authType: "key" })).authType).toBe("key");
   });
 });
 
