@@ -3,6 +3,7 @@ import { createAnsiRegex } from "../utils/ansi";
 import { clamp } from "../utils/helpers";
 import { validateRegexSafety } from "../utils/regexSafety";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
+import { resolveMacroRunTarget } from "../models/terminalMacro";
 import type { ScriptMacroFilter } from "./scripts/scriptMacroFilter";
 import { getMacros } from "../macroSettings";
 import {
@@ -194,6 +195,17 @@ export class MacroAutoTrigger implements vscode.Disposable {
       // ordering requirement above is about the mutual-exclusivity semantics, not
       // index integrity.
       if (Array.isArray(macro.variables) && macro.variables.length > 0) continue;
+      // A macro that runs somewhere other than its session never auto-fires.
+      // The editor already refuses the combination, but legacy-settings
+      // absorption persists `nexus.terminal.macros` entries VERBATIM and
+      // bypasses that validation entirely (§4.2) — and the failure mode here is
+      // a browser macro opening a URL, or a local shell command executing, on
+      // every line of matching terminal output. Same in-loop position and same
+      // reason as the variables skip above: before `defaultDisabledKeys` is
+      // populated, so nothing is recorded for a rule that will never compile.
+      // Read through `resolveMacroRunTarget()`, which treats a corrupt value as
+      // "session" rather than as a reason to suppress a working trigger.
+      if (resolveMacroRunTarget(macro) !== "session") continue;
       if (macro.triggerScope !== undefined && !VALID_MACRO_TRIGGER_SCOPES.has(macro.triggerScope)) continue;
       const stateKey = macroStateKey(macro);
       // Ambiguous identity — two or more macros in this set resolve to `stateKey`, so

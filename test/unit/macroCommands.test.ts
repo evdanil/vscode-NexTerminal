@@ -232,11 +232,12 @@ describe("macroCommands template actions", () => {
       "Send password when prompted",
       "Wait and send confirmation",
       "Scoped auto-trigger example",
-      "Prompted command"
+      "Prompted command",
+      "Launch IPMI web console"
     ]);
   });
 
-  it("creates the Prompted command template with host/username/password declared and the password masked (§9.7)", async () => {
+  it("creates the Prompted command template with the BMC address from the profile and the password masked (§9.7, issue #48)", async () => {
     const macros: unknown[] = [];
     mockGetMacros.mockReturnValue(macros);
     mockShowQuickPick.mockResolvedValue({ label: "Prompted command", templateId: "prompted-command" });
@@ -245,19 +246,44 @@ describe("macroCommands template actions", () => {
 
     expect(macros[0]).toMatchObject({
       text: expect.stringContaining("ipmitool"),
+      runIn: "localTerminal",
       variables: [
-        { name: "host", label: "Host" },
         { name: "username", label: "Username" },
         { name: "password", label: "Password", secret: true }
       ]
     });
     const created = macros[0] as { text: string; variables: Array<{ name: string; secret?: boolean; default?: string }> };
-    expect(created.text).toContain("$host");
+    // The address is a fact about the server profile, not something to retype
+    // on every run — and `$host` must NOT be declared any more, or the template
+    // would prompt for what the profile already knows.
+    expect(created.text).toContain("-H ${profile.ipmiHost}");
+    expect(created.variables.some((v) => v.name === "host")).toBe(false);
     expect(created.text).toContain("$username");
     expect(created.text).toContain("$password");
     // §7.1 — a masked variable must never carry a default (plaintext in the store).
     expect(created.variables.find((v) => v.secret)?.default).toBeUndefined();
+    // A shipped example must never demonstrate a literal password on the command
+    // line: argv is visible in `ps`, in the scrollback, and in the extension's own
+    // TerminalCaptureBuffer (which `nexus.terminal.copyAll` exports).
+    expect(created.text).not.toMatch(/-P\s+(?!\$password)\S/);
     expect(mockSaveMacros).toHaveBeenCalledWith(macros);
+  });
+
+  it("creates the IPMI web console template as a browser macro with no trailing newline", async () => {
+    const macros: unknown[] = [];
+    mockGetMacros.mockReturnValue(macros);
+    mockShowQuickPick.mockResolvedValue({ label: "Launch IPMI web console", templateId: "ipmi-web-console" });
+
+    await registeredCommands.get("nexus.macro.addFromTemplate")!();
+
+    expect(macros[0]).toMatchObject({
+      text: "https://${profile.ipmiHost}/",
+      runIn: "browser"
+    });
+    // No trailing newline, deliberately: a build that does not know `runIn`
+    // pastes the URL into a terminal instead of executing anything.
+    expect((macros[0] as { text: string }).text.endsWith("\n")).toBe(false);
+    expect((macros[0] as { triggerPattern?: string }).triggerPattern).toBeUndefined();
   });
 
   it("creates the selected macro through getMacros and saveMacros then opens it", async () => {

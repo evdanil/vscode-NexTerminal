@@ -159,14 +159,16 @@ sent this time.
 The **Prompted command** template starts from this macro:
 
 ```
-Text:      ipmitool -I lanplus -H $host -U $username -P $password sol activate
-Variables: host (Host), username (Username), password (Password, masked)
+Text:      ipmitool -I lanplus -H ${profile.ipmiHost} -U $username -P $password sol activate
+Run in:    Local terminal
+Variables: username (Username), password (Password, masked)
 ```
 
-Running it prompts for the host, then the username, then the password (masked,
-never remembered), in that order, then sends the filled-in command line to the
-terminal you invoked it from — even if you switch to a different terminal tab
-while the prompts are still open.
+The BMC address is not prompted for — it is read from the server profile you
+run the macro against (see **Profile tokens**, below). Running it prompts for
+the username, then the password (masked, never remembered), then sends the
+filled-in command line to a local terminal — even if you switch to a different
+terminal tab while the prompts are still open.
 
 ### Which terminal receives the macro
 
@@ -238,6 +240,70 @@ recorded in that shell's own history. In bash or zsh, set
 This only affects the remote shell's own history file. It does not change
 anything about how Nexus stores or remembers the macro or its variables — see
 **Not protected**, above.
+
+## Profile tokens
+
+A macro can pull facts out of the **server profile it is run against**, so you
+do not retype what Nexus already knows. Write them as `${profile.<field>}`:
+
+| Token | Resolves to |
+|---|---|
+| `${profile.name}` | the profile's name |
+| `${profile.host}` | its SSH host |
+| `${profile.port}` | its SSH port |
+| `${profile.username}` | its username |
+| `${profile.ipmiHost}` | its **IPMI / BMC Host** (Advanced section of the server form) |
+
+Nothing else is exposed — key paths, ids and inventory bookkeeping are
+deliberately not addressable.
+
+Profile tokens are a different namespace from macro variables, so they never
+collide: a macro can declare a variable named `host` and use `$host` **and**
+`${profile.host}` in the same text; the first is still prompted for, the second
+is filled in from the profile. `$${profile.host}` escapes the token and sends
+the literal text. A token that is not in the table above is sent as-is.
+
+### Running a profile macro
+
+Right-click a server in the Command Center and choose **Run Macro on Server…**
+(also available from **Profile Actions**). The picker lists every macro, with
+profile-token macros first. Tokens then resolve against **that server** — not
+against whatever terminal happens to be active.
+
+If the server has no value for a field the macro needs (typically **IPMI / BMC
+Host**), the run is refused with a message naming the server and the field, and
+an **Edit Server** button. Nexus never sends a command containing an unresolved
+token, and never one with the argument silently emptied.
+
+Values are also checked before they are substituted: a host or BMC address must
+look like an address (letters, digits, `.`, `-`, `_`, `:`, and `[]` for IPv6),
+and a port must be digits. A profile whose host contains shell syntax — which
+can reach your config through an inventory sync or an imported backup — refuses
+the run instead of executing it. This is a charset check, not quoting: the rest
+of the command line is still yours to quote (see **No automatic quoting**).
+
+## Where a macro runs
+
+**Run In**, in the macro editor, decides where the resolved text goes:
+
+- **Session terminal** (default, and what every existing macro does) — the
+  connected session. From **Run Macro on Server…** that means a session *of
+  that server*; if it is not connected, Nexus offers to connect first.
+- **Local terminal** — a new VS Code terminal on your own machine. This is
+  where `ipmitool` runs. As in a session, the macro's own trailing newline
+  decides whether the line executes.
+- **Browser** — the text is a URL, opened with your default browser. Only
+  `http://` and `https://` are accepted; anything else is refused.
+
+Local terminal and Browser macros need a server profile to resolve against, so
+run them from **Run Macro on Server…**. Neither can auto-trigger: firing a
+browser window, or a local command, on every matching line of terminal output
+is not something a pattern match should be able to do.
+
+An older Nexus build that does not know **Run In** treats such a macro as an
+ordinary session macro. The shipped **Launch IPMI web console** template
+therefore stores its URL without a trailing newline: on such a build it is
+pasted into a terminal rather than executed.
 
 ## Keybindings
 

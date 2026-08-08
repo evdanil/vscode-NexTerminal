@@ -145,6 +145,7 @@ const unsupportedCommands = [
   "nexus.script.openScriptsFolder",
   "nexus.script.revealInExplorer",
   "nexus.server.runWithScript",
+  "nexus.server.runMacro",
   "nexus.serial.runWithScript",
   "nexus.server.testConnection",
   "nexus.serial.testConnection",

@@ -12,6 +12,7 @@ import {
   saveMacros
 } from "../macroSettings";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import { resolveMacroRunTarget, validateMacroRunTarget } from "../models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
 import { collectMacroFolders, macroFolderField } from "../services/macroFolders";
@@ -520,6 +521,21 @@ export class MacroEditorPanel {
           return;
         }
 
+        // Issue #48 — `runIn`, read through the same tolerant resolver every
+        // other read site uses (an unknown value is "session", never a save
+        // failure), then checked against the trigger through the ONE shared
+        // rule the webview's live warning is also built from.
+        const runIn = resolveMacroRunTarget({ runIn: msg.runIn as TerminalMacro["runIn"] });
+        const runInError = validateMacroRunTarget(runIn, { triggerPattern: triggerPattern || undefined });
+        if (runInError) {
+          void this.panel.webview.postMessage({
+            type: "saveError",
+            field: "runIn",
+            message: runInError
+          });
+          return;
+        }
+
         const variableErrors = validateMacroVariables(variables, {
           triggerPattern: triggerPattern || undefined
         });
@@ -560,6 +576,13 @@ export class MacroEditorPanel {
         // in the UI (variables === []) would silently resurrect the old array
         // through the `{ ...existingMacro }` spread above.
         delete macro.variables;
+        // Same delete-then-conditionally-re-add shape as `variables` / `group`
+        // (§9.5): without the unconditional delete, switching a macro back to
+        // "Session terminal" would leave the old `runIn` alive through the
+        // `{ ...existingMacro }` spread above. Only a non-default value is
+        // stored — absent MEANS "session", so writing it explicitly would put a
+        // field on every macro that no build before this one understands.
+        delete macro.runIn;
         // §4.1 — "" canonicalizes to `undefined`; only a non-empty normalized
         // path is ever persisted. The untouched case re-attaches the stored
         // string byte-for-byte instead (see the Folder-field comment above);
@@ -571,6 +594,7 @@ export class MacroEditorPanel {
         } else if (normalizedGroup) {
           macro.group = normalizedGroup;
         }
+        if (runIn !== "session") macro.runIn = runIn;
         if (secret) macro.secret = true;
         else delete macro.secret;
         const triggerCooldown = msg.triggerCooldown as number | undefined;

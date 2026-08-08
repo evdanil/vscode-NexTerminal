@@ -105,6 +105,19 @@ export interface ServerConfig {
   logSession?: boolean;
   multiplexing?: boolean;  // undefined = follow global, false = always standalone
   legacyAlgorithms?: boolean;
+  /**
+   * Out-of-band management address (IPMI / BMC / Redfish), e.g. `10.0.0.1` or
+   * `bmc.example.com`. Nothing in the SSH connect path reads it — it exists so
+   * `${profile.ipmiHost}` resolves when a macro is run against this profile
+   * (services/profileTokens.ts, which is also where the value's SHAPE is
+   * enforced: it can arrive from a backup import, so save-time checks are not
+   * the reliable chokepoint).
+   *
+   * Optional and additive, like every other field added after 1.0 — records
+   * written by older builds have none, and older builds round-trip it
+   * untouched (servers are stored as whole objects under `nexus.servers`).
+   */
+  ipmiHost?: string;
   openFileExplorerOnFirstConnect?: boolean;
   proxy?: ProxyConfig;
   authProfileId?: string;  // references AuthProfile.id; credentials resolved at connection time
@@ -205,6 +218,7 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.logSession === b.logSession &&
     a.multiplexing === b.multiplexing &&
     a.legacyAlgorithms === b.legacyAlgorithms &&
+    a.ipmiHost === b.ipmiHost &&
     a.openFileExplorerOnFirstConnect === b.openFileExplorerOnFirstConnect &&
     a.authProfileId === b.authProfileId &&
     proxyConfigsEqual(a.proxy, b.proxy) &&
@@ -248,6 +262,7 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   if (current.logSession !== batchSnapshot.logSession) merged.logSession = current.logSession;
   if (current.multiplexing !== batchSnapshot.multiplexing) merged.multiplexing = current.multiplexing;
   if (current.legacyAlgorithms !== batchSnapshot.legacyAlgorithms) merged.legacyAlgorithms = current.legacyAlgorithms;
+  if (current.ipmiHost !== batchSnapshot.ipmiHost) merged.ipmiHost = current.ipmiHost;
   if (current.openFileExplorerOnFirstConnect !== batchSnapshot.openFileExplorerOnFirstConnect) {
     merged.openFileExplorerOnFirstConnect = current.openFileExplorerOnFirstConnect;
   }

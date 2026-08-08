@@ -1,5 +1,15 @@
 export type MacroTriggerScope = "all-terminals" | "active-session" | "profile";
 
+/**
+ * Where a macro run sends its resolved text.
+ *   - `"session"`        the terminal of a Nexus session (today's only behavior)
+ *   - `"localTerminal"`  a plain VS Code terminal on this machine (e.g. `ipmitool …`)
+ *   - `"browser"`        the text is a URL, opened with the OS default browser
+ */
+export type MacroRunTarget = "session" | "localTerminal" | "browser";
+
+export const MACRO_RUN_TARGETS: readonly MacroRunTarget[] = ["session", "localTerminal", "browser"];
+
 export interface MacroVariable {
   /** Placeholder name. /^[A-Za-z_][A-Za-z0-9_]{0,31}$/ */
   name: string;
@@ -52,4 +62,64 @@ export interface TerminalMacro {
    * directly; always go through `sanitizeMacroGroup()` / `macroGroup()`.
    */
   group?: string;
+  /**
+   * Where a run sends the resolved text. Additive and optional — ABSENT MEANS
+   * `"session"`, which is what every macro written before this field existed
+   * did, so no existing macro changes behavior and an older build reading a
+   * `runIn` macro simply treats it as a session macro.
+   *
+   * UNTRUSTED at every read site, like `group` and `variables`: legacy-settings
+   * absorption persists `nexus.terminal.macros` entries verbatim, so a
+   * non-string or an unknown string can reach the store without ever passing
+   * through the editor. Never compare this field directly — go through
+   * `resolveMacroRunTarget()`.
+   *
+   * Mutually exclusive with `triggerPattern` (auto-firing a browser open on
+   * terminal output is a popup bomb): the editor refuses the combination, and
+   * `MacroAutoTrigger.reload()` refuses to compile a rule for a non-session
+   * macro that got past it anyway.
+   */
+  runIn?: MacroRunTarget;
+}
+
+/**
+ * The run target a macro ACTUALLY has, applied at every read site (§4.2's
+ * untrusted-field discipline): absent, a non-string, or a string outside
+ * `MACRO_RUN_TARGETS` all resolve to `"session"` — the compatibility default —
+ * so a corrupt record behaves like the ordinary macro it was before, never like
+ * one that opens a browser.
+ */
+export function resolveMacroRunTarget(macro: Pick<TerminalMacro, "runIn">): MacroRunTarget {
+  const raw = macro.runIn as unknown;
+  return typeof raw === "string" && (MACRO_RUN_TARGETS as readonly string[]).includes(raw)
+    ? (raw as MacroRunTarget)
+    : "session";
+}
+
+/** Human-readable label for a run target, shared by the editor and the pickers. */
+export function macroRunTargetLabel(target: MacroRunTarget): string {
+  switch (target) {
+    case "localTerminal":
+      return "Local terminal";
+    case "browser":
+      return "Browser";
+    default:
+      return "Session terminal";
+  }
+}
+
+export const MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE =
+  'A macro can auto-trigger or run outside its session, not both. Set "Run in" back to Session terminal, or clear the auto-trigger pattern.';
+
+/**
+ * The `runIn`/`triggerPattern` exclusion, mirroring `validateMacroVariables()`'s
+ * variables/trigger exclusion (services/macroVariables.ts) — one shared rule so
+ * the webview's live check and the host's save-time enforcement cannot drift.
+ * Returns the message to show, or `undefined` when the combination is legal.
+ */
+export function validateMacroRunTarget(
+  runIn: MacroRunTarget,
+  options: { triggerPattern?: string } = {}
+): string | undefined {
+  return runIn !== "session" && options.triggerPattern ? MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE : undefined;
 }

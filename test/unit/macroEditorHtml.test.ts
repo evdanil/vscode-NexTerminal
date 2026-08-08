@@ -119,6 +119,29 @@ describe("renderMacroEditorHtml", () => {
     expect(html).not.toContain("<option ");
   });
 
+  it("renders the Run In select, defaulting to the session for a macro with no runIn", () => {
+    const html = render([{ name: "Plain", text: "show version\n" }], 0);
+    expect(html).toContain('id="macro-run-in-wrapper"');
+    expect(html).toContain('input type="hidden" id="macro-run-in" value="session"');
+    expect(html).toContain("Local terminal");
+    expect(html).toContain("Browser");
+  });
+
+  it("preselects a stored runIn, and falls back to session for a corrupt one", () => {
+    const browser = render([{ name: "BMC", text: "https://x/", runIn: "browser" }], 0);
+    expect(browser).toContain('id="macro-run-in" value="browser"');
+
+    const corrupt = render([{ name: "Odd", text: "x", runIn: "nonsense" as never }], 0);
+    expect(corrupt).toContain('id="macro-run-in" value="session"');
+  });
+
+  it("carries runIn in the save payload and blocks the runIn/trigger combination client-side", () => {
+    const html = render([], null);
+    expect(html).toContain("runIn: runInVal");
+    expect(html).toContain("RUN_IN_CONFLICT_MESSAGE");
+    expect(html).toContain('document.getElementById("error-runIn")');
+  });
+
   it("renders binding input field", () => {
     const html = render([], null);
     expect(html).toContain("macro-binding");

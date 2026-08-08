@@ -4652,6 +4652,23 @@ echo hi</textarea>
   </div>
 
   <div class="form-group">
+    <label for="macro-run-in-wrapper">Run In</label>
+    <div class="custom-select" id="macro-run-in-wrapper">
+      <input type="hidden" id="macro-run-in" value="session" />
+      <div class="custom-select-trigger" tabindex="0">
+        <span class="custom-select-text">Session terminal (default) - sends to the connected session</span>
+      </div>
+      <div class="custom-select-dropdown">
+        <div class="custom-select-option selected" data-value="session">Session terminal (default) - sends to the connected session</div>
+        <div class="custom-select-option" data-value="localTerminal">Local terminal - runs the text on this machine</div>
+        <div class="custom-select-option" data-value="browser">Browser - the text is a URL, opened externally</div>
+      </div>
+    </div>
+    <div class="field-error" id="error-runIn"></div>
+    <div class="hint">Local terminal and Browser macros are run from a server profile (Command Center → right-click a server → Run Macro on Server…), where \${profile.host}, \${profile.ipmiHost} and friends resolve. Neither can auto-trigger.</div>
+  </div>
+
+  <div class="form-group">
     <label for="macro-trigger">Auto-Trigger Pattern</label>
     <input type="text" id="macro-trigger" value="x" placeholder="e.g., [Pp]assword:\\s*$" />
     <div class="field-error" id="error-trigger"></div>
@@ -4995,6 +5012,17 @@ echo hi</textarea>
       var variablesList = document.getElementById("variables-list");
       var variableRowTemplate = document.getElementById("variable-row-template");
       var TRIGGER_CONFLICT_MESSAGE = "A macro can prompt for input or auto-trigger, not both. For prompts on an automated flow, use a Script with prompt().";
+      // The host enforces this same rule through validateMacroRunTarget()
+      // (models/terminalMacro.ts); the message is interpolated from there so the
+      // two cannot drift.
+      var RUN_IN_CONFLICT_MESSAGE = "A macro can auto-trigger or run outside its session, not both. Set \\"Run in\\" back to Session terminal, or clear the auto-trigger pattern.";
+
+      function updateRunInConflictWarning() {
+        var triggerVal = document.getElementById("macro-trigger").value.trim();
+        var runInVal = document.getElementById("macro-run-in").value;
+        var errEl = document.getElementById("error-runIn");
+        errEl.textContent = triggerVal && runInVal !== "session" ? RUN_IN_CONFLICT_MESSAGE : "";
+      }
 
       // Row N's error slot is addressed by data-var-error="N" (§9.2). Renumbering
       // on every add/remove keeps that index equal to the row's DOM position,
@@ -5321,6 +5349,11 @@ echo hi</textarea>
         var errorEl = document.getElementById("error-trigger");
         errorEl.textContent = validateTriggerPattern(val);
         updateTriggerConflictWarning();
+        updateRunInConflictWarning();
+      });
+      document.getElementById("macro-run-in").addEventListener("change", function() {
+        markDirty();
+        updateRunInConflictWarning();
       });
       document.getElementById("macro-trigger-scope").addEventListener("change", function() {
         markDirty();
@@ -5387,6 +5420,7 @@ echo hi</textarea>
         var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
         var triggerScope = document.getElementById("macro-trigger-scope").value;
         var triggerProfileId = document.getElementById("macro-trigger-profile").value.trim();
+        var runInVal = document.getElementById("macro-run-in").value;
         var folderVal = document.getElementById("macro-folder").value.trim();
 
         // Validate
@@ -5430,6 +5464,13 @@ echo hi</textarea>
           document.getElementById("error-trigger-profile").textContent = "";
         }
 
+        if (triggerVal && runInVal !== "session") {
+          document.getElementById("error-runIn").textContent = RUN_IN_CONFLICT_MESSAGE;
+          valid = false;
+        } else {
+          document.getElementById("error-runIn").textContent = "";
+        }
+
         var variablesForSave = collectVariablesForSave();
         if (!validateVariablesClientSide(variablesForSave)) {
           valid = false;
@@ -5471,6 +5512,7 @@ echo hi</textarea>
           triggerInitiallyDisabled: triggerInitiallyDisabled,
           triggerScope: triggerScope,
           triggerProfileId: triggerProfileId || null,
+          runIn: runInVal,
           variables: variablesForSave,
           group: folderVal || null
         });
@@ -5516,6 +5558,7 @@ echo hi</textarea>
       updateTriggerProfileState();
       computeDiagnostics();
       updateTriggerConflictWarning();
+      updateRunInConflictWarning();
     })();
   </script>
 </body>

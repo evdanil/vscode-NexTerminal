@@ -40,7 +40,7 @@ import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 import { configMutationLock } from "../services/configMutationLock";
 
-async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
+export async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
   if (servers.length === 0) {
     vscode.window.showWarningMessage("No Nexus servers configured");
@@ -60,7 +60,7 @@ async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<
   return pick?.server;
 }
 
-function toServerFromArg(
+export function toServerFromArg(
   core: import("../core/nexusCore").NexusCore,
   arg: unknown
 ): ServerConfig | undefined {
@@ -629,6 +629,10 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     username,
     authType: isAuthType(values.authType) ? values.authType : "password",
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
+    // Trimmed and blank-canonicalized like every other optional text field: an
+    // all-whitespace value would otherwise read as "set" here and as "not set"
+    // in `resolveProfileTokens`, which trims before it decides.
+    ipmiHost: typeof values.ipmiHost === "string" && values.ipmiHost.trim() ? values.ipmiHost.trim() : undefined,
     group: normalizedGroup,
     isHidden: preserveIsHidden,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
@@ -839,11 +843,11 @@ function hasActiveTunnelsForServer(ctx: CommandContext, serverId: string): boole
   return ctx.core.getSnapshot().activeTunnels.some((tunnel) => tunnel.serverId === serverId);
 }
 
-interface ConnectServerOptions {
+export interface ConnectServerOptions {
   allowAutoFileExplorer?: boolean;
 }
 
-async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
+export async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
     return;

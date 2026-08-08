@@ -5,6 +5,7 @@ import { serializeForInlineScript } from "./shared/inlineScriptData";
 import { renderWebviewDocument } from "./shared/webviewDocument";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import { MACRO_RUN_TARGETS, MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE, resolveMacroRunTarget } from "../models/terminalMacro";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./macroProfileOptions";
 import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } from "../services/macroVariables";
@@ -134,6 +135,24 @@ export function renderMacroEditorHtml(
     `<div class="custom-select-option${option.value === triggerScope ? " selected" : ""}" data-value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</div>`
   ).join("\n        ");
   const triggerProfileId = macro?.triggerProfileId ?? "";
+
+  // Issue #48 — where a run sends the resolved text. Read through
+  // `resolveMacroRunTarget()` so a corrupt stored value renders as the
+  // compatibility default instead of an empty select.
+  const runIn = macro ? resolveMacroRunTarget(macro) : "session";
+  const runInOptions = MACRO_RUN_TARGETS.map((target) => ({
+    value: target,
+    label:
+      target === "session"
+        ? "Session terminal (default) - sends to the connected session"
+        : target === "localTerminal"
+          ? "Local terminal - runs the text on this machine"
+          : "Browser - the text is a URL, opened externally"
+  }));
+  const selectedRunInLabel = runInOptions.find((option) => option.value === runIn)?.label ?? runInOptions[0].label;
+  const runInOptionsHtml = runInOptions.map((option) =>
+    `<div class="custom-select-option${option.value === runIn ? " selected" : ""}" data-value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</div>`
+  ).join("\n        ");
 
   const nameValue = macro?.name ?? "";
   const textValue = macro?.text ?? "";
@@ -295,6 +314,21 @@ export function renderMacroEditorHtml(
   </div>
 
   <div class="form-group">
+    <label for="macro-run-in-wrapper">Run In</label>
+    <div class="custom-select" id="macro-run-in-wrapper">
+      <input type="hidden" id="macro-run-in" value="${escapeHtml(runIn)}" />
+      <div class="custom-select-trigger" tabindex="0">
+        <span class="custom-select-text">${escapeHtml(selectedRunInLabel)}</span>
+      </div>
+      <div class="custom-select-dropdown">
+        ${runInOptionsHtml}
+      </div>
+    </div>
+    <div class="field-error" id="error-runIn"></div>
+    <div class="hint">Local terminal and Browser macros are run from a server profile (Command Center → right-click a server → Run Macro on Server…), where \${profile.host}, \${profile.ipmiHost} and friends resolve. Neither can auto-trigger.</div>
+  </div>
+
+  <div class="form-group">
     <label for="macro-trigger">Auto-Trigger Pattern</label>
     <input type="text" id="macro-trigger" value="${escapeHtml(triggerValue)}" placeholder="e.g., [Pp]assword:\\s*$" />
     <div class="field-error" id="error-trigger"></div>
@@ -449,6 +483,17 @@ ${folderOptionsHtml}
       var variablesList = document.getElementById("variables-list");
       var variableRowTemplate = document.getElementById("variable-row-template");
       var TRIGGER_CONFLICT_MESSAGE = "A macro can prompt for input or auto-trigger, not both. For prompts on an automated flow, use a Script with prompt().";
+      // The host enforces this same rule through validateMacroRunTarget()
+      // (models/terminalMacro.ts); the message is interpolated from there so the
+      // two cannot drift.
+      var RUN_IN_CONFLICT_MESSAGE = ${serializeForInlineScript(MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE)};
+
+      function updateRunInConflictWarning() {
+        var triggerVal = document.getElementById("macro-trigger").value.trim();
+        var runInVal = document.getElementById("macro-run-in").value;
+        var errEl = document.getElementById("error-runIn");
+        errEl.textContent = triggerVal && runInVal !== "session" ? RUN_IN_CONFLICT_MESSAGE : "";
+      }
 
       // Row N's error slot is addressed by data-var-error="N" (§9.2). Renumbering
       // on every add/remove keeps that index equal to the row's DOM position,
@@ -775,6 +820,11 @@ ${folderOptionsHtml}
         var errorEl = document.getElementById("error-trigger");
         errorEl.textContent = validateTriggerPattern(val);
         updateTriggerConflictWarning();
+        updateRunInConflictWarning();
+      });
+      document.getElementById("macro-run-in").addEventListener("change", function() {
+        markDirty();
+        updateRunInConflictWarning();
       });
       document.getElementById("macro-trigger-scope").addEventListener("change", function() {
         markDirty();
@@ -841,6 +891,7 @@ ${folderOptionsHtml}
         var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
         var triggerScope = document.getElementById("macro-trigger-scope").value;
         var triggerProfileId = document.getElementById("macro-trigger-profile").value.trim();
+        var runInVal = document.getElementById("macro-run-in").value;
         var folderVal = document.getElementById("macro-folder").value.trim();
 
         // Validate
@@ -884,6 +935,13 @@ ${folderOptionsHtml}
           document.getElementById("error-trigger-profile").textContent = "";
         }
 
+        if (triggerVal && runInVal !== "session") {
+          document.getElementById("error-runIn").textContent = RUN_IN_CONFLICT_MESSAGE;
+          valid = false;
+        } else {
+          document.getElementById("error-runIn").textContent = "";
+        }
+
         var variablesForSave = collectVariablesForSave();
         if (!validateVariablesClientSide(variablesForSave)) {
           valid = false;
@@ -925,6 +983,7 @@ ${folderOptionsHtml}
           triggerInitiallyDisabled: triggerInitiallyDisabled,
           triggerScope: triggerScope,
           triggerProfileId: triggerProfileId || null,
+          runIn: runInVal,
           variables: variablesForSave,
           group: folderVal || null
         });
@@ -970,6 +1029,7 @@ ${folderOptionsHtml}
       updateTriggerProfileState();
       computeDiagnostics();
       updateTriggerConflictWarning();
+      updateRunInConflictWarning();
     })();`
   });
 }

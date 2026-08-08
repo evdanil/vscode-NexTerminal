@@ -1088,6 +1088,80 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  describe("runIn (issue #48) — a macro that runs outside its session never auto-fires", () => {
+    it("a browser macro compiles no rule, even with an otherwise-valid trigger pattern", () => {
+      // Reachable despite the editor's refusal: `absorbLegacySettingsIfPresent()`
+      // persists `nexus.terminal.macros` entries verbatim on every activation.
+      // Without the reload() skip this opens a URL on every matching output line.
+      setConfig([
+        { name: "bmc", text: "https://10.0.0.9/", triggerPattern: "router#", runIn: "browser" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    it("a localTerminal macro compiles no rule", () => {
+      setConfig([
+        { name: "ipmi", text: " ipmitool power status\n", triggerPattern: "router#", runIn: "localTerminal" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    it('an explicit runIn: "session" and a corrupt runIn both keep a valid trigger working', () => {
+      // The other direction: reading the field as "anything truthy suppresses"
+      // would silently kill working auto-triggers on records carrying a
+      // meaningless value — so the resolver treats both as "session".
+      setConfig([
+        { name: "explicit", text: "yes\n", triggerPattern: "Continue\\?", runIn: "session" },
+        { name: "corrupt", text: "no\n", triggerPattern: "Abort\\?", runIn: 42 }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("Continue?");
+      flush();
+      obs.onOutput("Abort?");
+      flush();
+
+      expect(sent).toEqual(["yes\n", "no\n"]);
+      obs.dispose();
+    });
+
+    it("skip position: runIn + triggerInitiallyDisabled records no disabled-state entry either", () => {
+      // Same ordering requirement as the §6.1 variables skip: the `continue`
+      // must run BEFORE `defaultDisabledKeys.add(stateKey)`, or a macro that
+      // compiles no rule still claims a disabled-state entry — and whichever
+      // macro later owns that key inherits a toggle it never earned.
+      setConfig([
+        {
+          name: "bmcDisabled",
+          text: "https://10.0.0.9/",
+          triggerPattern: "router#",
+          runIn: "browser",
+          triggerInitiallyDisabled: true
+        }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      expect(trigger.isDisabled(macroAt(0))).toBe(false);
+    });
+  });
+
   describe("macro variables (§6.1) — variables and auto-trigger are mutually exclusive", () => {
     it("a macro with variables compiles no rule, even with an otherwise-valid trigger pattern", () => {
       setConfig([

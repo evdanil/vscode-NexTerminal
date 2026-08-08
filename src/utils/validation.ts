@@ -131,6 +131,16 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   if (obj.keyPath !== undefined && typeof obj.keyPath !== "string") {
     return false;
   }
+  // Same tolerant TYPE check, for the same reasons, as `keyPath` above: reject a
+  // shape no writer of ours produces, but never a merely untidy value. An empty
+  // or whitespace `ipmiHost` reads identically to absent at its one use site
+  // (`resolveProfileTokens` refuses both with the same "not set" error), and the
+  // CHARSET of a non-empty value is checked there rather than here — the value
+  // can arrive from a backup import written by anything, so the substitution
+  // site is the chokepoint that actually holds.
+  if (obj.ipmiHost !== undefined && typeof obj.ipmiHost !== "string") {
+    return false;
+  }
   // F13/FIX 5 — a malformed `origin` does not invalidate the whole server
   // row: the row is still accepted here. Stripping the malformed field is
   // NOT this function's job — a type guard must not mutate the value it is
