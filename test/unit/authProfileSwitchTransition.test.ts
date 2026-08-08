@@ -3,7 +3,7 @@ import { renderFormHtml } from "../../src/ui/formHtml";
 import { inventorySourceFormDefinition, serverFormDefinition } from "../../src/ui/formDefinitions";
 import type { ExtensionMessage, FormDefinition, FormMessage, FormValues } from "../../src/ui/formTypes";
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
-import { authProfileOwnedCredentials } from "../../src/models/config";
+import { authProfileOwnedCredentials, formOfferedServerCredentials } from "../../src/models/config";
 import type { InventoryProvider } from "../../src/models/inventory";
 import {
   authProfileCredentialMirror,
@@ -680,7 +680,21 @@ const PASSWORD_PROFILE: AuthProfile = {
   username: "labuser",
   authType: "password"
 };
-const PROFILES = [KEY_PROFILE, KEYLESS_PROFILE, PASSWORD_PROFILE];
+const AGENT_PROFILE: AuthProfile = {
+  id: "ap-agent",
+  name: "Bastion agent",
+  username: "agentuser",
+  authType: "agent"
+};
+/** Only reachable through an imported backup — the profile editor trims and
+ *  refuses a blank username — and the one profile that owns NO username. */
+const BLANK_USERNAME_PROFILE: AuthProfile = {
+  id: "ap-blank",
+  name: "Imported",
+  username: "   ",
+  authType: "password"
+};
+const PROFILES = [KEY_PROFILE, KEYLESS_PROFILE, PASSWORD_PROFILE, AGENT_PROFILE, BLANK_USERNAME_PROFILE];
 
 function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
   return {
@@ -890,6 +904,98 @@ describe("an auth-profile switch hands back the values the previous profile disp
       expect(persisted.authType).toBe("agent");
     });
 
+    /**
+     * REVIEW FINDING (P1) — THE MIRROR IMAGE of the scenario above, and the
+     * reason the fix is an invariant rather than a third conditional.
+     *
+     * The previous round taught the render to show the profile's EFFECTIVE
+     * auth type, which put the key field back on screen for a keyless `key`
+     * profile. It also meant a `password`/`agent` profile now hides that field
+     * on a server whose own `authType` is `key`: the control is hidden,
+     * therefore disabled, therefore absent from the submission — and the save
+     * declined to restore it because such a profile does not own `keyPath`.
+     * Saving a rename left `authType: "key"` (restored, since `authType` IS
+     * owned) over no key file at all, so unlinking the profile later produced a
+     * server that could not connect and had nothing left to say what it used to
+     * point at.
+     */
+    it("keeps the server's own key file when the linked profile HIDES the Private Key File control (THE REPORTED SCENARIO — kills restoring only the fields the profile owns: a password profile owns no keyPath, so the field the form never showed was written back as empty)", async () => {
+      const server = makeServer({
+        authType: "key",
+        keyPath: "/home/me/.ssh/my_own_key",
+        username: "my-own-account",
+        authProfileId: PASSWORD_PROFILE.id
+      });
+      const harness = openServerForm(server);
+
+      // The form shows what the profile imposes, so the key field is not on
+      // screen at all — and what is not on screen is not submitted.
+      expect(harness.value("authType")).toBe("password");
+      expect(harness.submit().keyPath).toBeUndefined();
+
+      // An edit with nothing to do with credentials — a rename.
+      harness.type("name", "Core switch (renamed)");
+      const persisted = saveServerEdit(server, harness.submit(), PROFILES);
+
+      expect(persisted.name).toBe("Core switch (renamed)");
+      expect(persisted.keyPath).toBe("/home/me/.ssh/my_own_key");
+      expect(persisted.authType).toBe("key");
+      expect(persisted.username).toBe("my-own-account");
+      expect(persisted.authProfileId).toBe(PASSWORD_PROFILE.id);
+
+      // The link is doing its job meanwhile — the profile's password auth is
+      // what the connection uses…
+      const resolved = await resolveForConnect(persisted, PROFILES);
+      expect(resolved.authType).toBe("password");
+      expect(resolved.username).toBe("labuser");
+
+      // …and the record underneath is still whole, so unlinking gives the
+      // server back exactly the key auth it had before the profile was chosen.
+      const unlinked = { ...persisted, authProfileId: undefined };
+      const resolvedUnlinked = await resolveForConnect(unlinked, PROFILES);
+      expect(resolvedUnlinked.authType).toBe("key");
+      expect(resolvedUnlinked.keyPath).toBe("/home/me/.ssh/my_own_key");
+    });
+
+    it("keeps it under an AGENT profile too, which hides the same control for the same reason (kills fixing only the profile type the report happened to name)", () => {
+      const server = makeServer({
+        authType: "key",
+        keyPath: "/home/me/.ssh/my_own_key",
+        authProfileId: AGENT_PROFILE.id
+      });
+      const harness = openServerForm(server);
+
+      expect(harness.value("authType")).toBe("agent");
+      harness.type("name", "Core switch (renamed)");
+
+      const persisted = saveServerEdit(server, harness.submit(), PROFILES);
+      expect(persisted.keyPath).toBe("/home/me/.ssh/my_own_key");
+      expect(persisted.authType).toBe("key");
+    });
+
+    it("still saves a key file the user supplies through a keyless key profile, which is the OPPOSITE direction of the same rule (kills closing the reported direction by restoring every field the profile does not own: this server has no stored key path, so the one the user just browsed to would be written back as empty)", () => {
+      const server = makeServer({
+        authType: "password",
+        keyPath: undefined,
+        username: "my-own-account",
+        authProfileId: KEYLESS_PROFILE.id
+      });
+      const harness = openServerForm(server);
+
+      // The profile forces key auth and supplies no file, so the control is on
+      // screen, unlocked and empty — the whole point of this pairing.
+      expect(harness.value("authType")).toBe("key");
+      expect(harness.value("keyPath")).toBe("");
+      expect(harness.locked("keyPath")).toBe(false);
+
+      harness.browseResult("keyPath", "/home/me/.ssh/brought_my_own");
+      const persisted = saveServerEdit(server, harness.submit(), PROFILES);
+
+      expect(persisted.keyPath).toBe("/home/me/.ssh/brought_my_own");
+      expect(persisted.authType).toBe("password");
+      expect(persisted.username).toBe("my-own-account");
+    });
+
     it("renders the record's own values for a link whose profile no longer resolves, exactly as the save path treats that id (kills overriding from a dangling id: the fields would lock onto nothing and the record's credentials would be dropped)", () => {
       const server = makeServer({
         authType: "password",
@@ -1030,6 +1136,118 @@ describe("an auth-profile switch hands back the values the previous profile disp
       harness.choose("authProfileId", "");
       expect(harness.value("keyPath")).toBe("/from/another/select");
       expect(harness.value("username")).toBe("my-own-account");
+    });
+  });
+
+  /**
+   * REVIEW FINDING (P1) — THE INVARIANT ITSELF, checked against the real form
+   * rather than restated.
+   *
+   * Every defect in this family has been the render and the save disagreeing
+   * about one question — "did the form actually OFFER this credential field?" —
+   * and each round closed one direction of that disagreement while opening its
+   * mirror. `formOfferedServerCredentials` (models/config.ts) is now the single
+   * answer the save path reads. This is what stops it drifting from the form
+   * that produced the submission: the form's answer is observable (a field is
+   * offered when it is submitted AND not locked), so the two are compared
+   * directly, over pairs chosen so that every field is on the wrong side of the
+   * rule in at least one of them.
+   */
+  describe("what the form offers and what the save keeps are one decision", () => {
+    /** The form's own answer: submitted (i.e. not hidden, since
+     *  updateVisibility disables what it hides and the submit loop skips
+     *  disabled controls) and not locked by the profile. */
+    function offeredByForm(harness: FormHarness, values: FormValues): Record<string, boolean> {
+      return {
+        username: values.username !== undefined && !harness.locked("username"),
+        authType: values.authType !== undefined && !harness.locked("authType"),
+        keyPath: values.keyPath !== undefined && !harness.locked("keyPath")
+      };
+    }
+
+    const cases: Array<{ what: string; server: ServerConfig; profileId: string | undefined }> = [
+      {
+        what: "a key server under a password profile — the reported direction: keyPath hidden by a profile that does not own it",
+        server: makeServer({ authType: "key", keyPath: "/home/me/.ssh/my_own_key" }),
+        profileId: PASSWORD_PROFILE.id
+      },
+      {
+        what: "a key server under an agent profile",
+        server: makeServer({ authType: "key", keyPath: "/home/me/.ssh/my_own_key" }),
+        profileId: AGENT_PROFILE.id
+      },
+      {
+        what: "a password server under a keyless key profile — the opposite direction: keyPath shown and unowned, so it IS the user's",
+        server: makeServer({ authType: "password", keyPath: undefined }),
+        profileId: KEYLESS_PROFILE.id
+      },
+      {
+        what: "an agent server under a key profile that carries its own file",
+        server: makeServer({ authType: "agent", keyPath: undefined }),
+        profileId: KEY_PROFILE.id
+      },
+      {
+        what: "a key server under a profile whose username is blank — the one profile that owns no username",
+        server: makeServer({ authType: "key", keyPath: "/home/me/.ssh/my_own_key" }),
+        profileId: BLANK_USERNAME_PROFILE.id
+      },
+      {
+        what: "a key server whose link resolves to nothing — every field is the user's own",
+        server: makeServer({ authType: "key", keyPath: "/home/me/.ssh/my_own_key" }),
+        profileId: "ap-deleted-while-the-form-sat-open"
+      },
+      {
+        what: "an unlinked key server",
+        server: makeServer({ authType: "key", keyPath: "/home/me/.ssh/my_own_key" }),
+        profileId: undefined
+      }
+    ];
+
+    for (const { what, server, profileId } of cases) {
+      it(`agrees for ${what}`, () => {
+        const linked = { ...server, authProfileId: profileId };
+        const harness = openServerForm(linked);
+        const values = harness.submit();
+        const candidate = formValuesToServer(values, linked.id, linked.isHidden);
+        if (!candidate) {
+          throw new Error("the form's values were refused by formValuesToServer");
+        }
+        const profile = PROFILES.find((p) => p.id === profileId);
+
+        expect(offeredByForm(harness, values)).toEqual({ ...formOfferedServerCredentials(candidate, profile) });
+      });
+    }
+
+    it("and the save keeps exactly the fields the form offered, for every one of those pairs (kills a rule that answers correctly while the save consults something else)", () => {
+      for (const { what, server, profileId } of cases) {
+        const linked = { ...server, authProfileId: profileId };
+        const harness = openServerForm(linked);
+        const values = harness.submit();
+        const candidate = formValuesToServer(values, linked.id, linked.isHidden);
+        if (!candidate) {
+          throw new Error("the form's values were refused by formValuesToServer");
+        }
+        const persisted = saveServerEdit(linked, values, PROFILES);
+        const profile = PROFILES.find((p) => p.id === profileId);
+        // The oracle is the SUBMISSION, never the record the save produced —
+        // reading `persisted.authType` here would ask the restored value
+        // whether the form showed the key field, which is the very confusion
+        // this whole family of defects is made of (and would make this
+        // assertion vacuous under the pre-fix save).
+        const offered = formOfferedServerCredentials(candidate, profile);
+
+        // A field the form did not offer must read back as the record's own,
+        // whatever the submission did or did not carry for it.
+        if (!offered.keyPath && profileId !== undefined) {
+          expect(persisted.keyPath, what).toBe(linked.keyPath);
+        }
+        if (!offered.username && profileId !== undefined) {
+          expect(persisted.username, what).toBe(linked.username);
+        }
+        if (!offered.authType && profileId !== undefined) {
+          expect(persisted.authType, what).toBe(linked.authType);
+        }
+      }
     });
   });
 

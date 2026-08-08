@@ -1163,6 +1163,36 @@ describe("computeSyncPlan — auth profile link", () => {
     expect(plan.updates[0].after.authProfileId).toBeUndefined();
   });
 
+  /**
+   * REVIEW FINDING (P2) — the use-site half of the malformed-`keyPath` fix
+   * (`validateServerConfig` is the boundary half). The cost of being wrong here
+   * is out of all proportion to the field: this branch is only reached while
+   * planning a sync whose key profile has lost its key file — i.e. when a fleet
+   * is already mis-authenticating and the plan is the repair — and a thrown
+   * TypeError takes the WHOLE run down after the inventory has been fetched,
+   * for one malformed row that may belong to a server this plan never touches.
+   */
+  it("AUTH 2b treats a NON-STRING key path on the server as no key file instead of throwing (kills (server.keyPath ?? \"\").trim(): one hand-edited backup row aborts the entire sync, including the repair every other server in it is waiting for)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const malformed = { ...previouslyLinkedServer(), keyPath: 12345 } as unknown as ServerConfig;
+
+    let plan!: ReturnType<typeof computeSyncPlan>;
+    expect(() => {
+      plan = computeSyncPlan({
+        source,
+        tree: makeTree([makeDevice()]),
+        currentServers: [malformed],
+        now: 2000,
+        authProfile: KEYLESS_KEY_PROFILE
+      });
+    }).not.toThrow();
+
+    // …and it lands in the bucket blank already occupies: a server that brings
+    // no key of its own, so the unusable link is taken back off it.
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.authProfileId).toBeUndefined();
+  });
+
   // Pinned verbatim in both grammatical numbers: this sentence is the finding.
   // The old text told the user that servers already linked to the profile were
   // using SSH agent authentication while they were in fact unable to connect,

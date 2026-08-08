@@ -80,9 +80,23 @@ function isValidPort(port: number): boolean {
  * would try to READ a whitespace path, so neither is a server that "brings its
  * own key" — and treating either as one would leave the very server this rule
  * exists to repair unrepaired.
+ *
+ * REVIEW FINDING (P2) — TYPE-CHECKED before it is trimmed, exactly as THE ONE
+ * RULE checks the profile's own `keyPath`. `validateServerConfig`
+ * (utils/validation.ts) now enforces `string | undefined` at both boundaries a
+ * foreign record can enter through, so a non-string reaching here should be
+ * impossible; it is guarded anyway because the cost of being wrong is
+ * disproportionate. This branch runs only while planning a sync whose key
+ * profile has lost its key file — i.e. exactly when a fleet is already
+ * mis-authenticating — and a bare `(server.keyPath ?? "").trim()` would throw
+ * a TypeError there, aborting the entire sync AFTER the inventory has been
+ * fetched, for one malformed row belonging to a server this plan may not even
+ * touch. A non-string is not a usable key file by any reading, so it lands in
+ * the same bucket blank already occupies: "this server brings no key of its
+ * own", which is survivable and semantically right.
  */
 function hasOwnKeyPath(server: ServerConfig): boolean {
-  return (server.keyPath ?? "").trim() !== "";
+  return typeof server.keyPath === "string" && server.keyPath.trim() !== "";
 }
 
 /** N1 — appends one summary warning for a category of non-owned device skips, naming up to 3 examples. No-op when the category is empty. */

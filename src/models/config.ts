@@ -533,6 +533,128 @@ export function authProfileNeedsServerKeyPath(profile: AuthProfile | undefined):
   return owned.authType === "key" && owned.keyPath === undefined;
 }
 
+/** Which credential fields a server form submission actually carries USER INPUT
+ *  for — see `formOfferedServerCredentials`. */
+export interface FormOfferedServerCredentials {
+  username: boolean;
+  authType: boolean;
+  keyPath: boolean;
+}
+
+/**
+ * REVIEW FINDING (P1) — THE SAVE-SIDE INVARIANT, and the reason this whole
+ * class of defect kept coming back one mirror image at a time.
+ *
+ *   A credential field on a LINKED server is user input only if the form
+ *   actually OFFERED it. Everything else comes from the stored record —
+ *   never from the submission, which may carry an echo of the profile, or
+ *   nothing at all, for reasons that have nothing to do with intent.
+ *
+ * There are exactly three ways a credential key reaches the save path, and the
+ * submission cannot tell them apart on its own:
+ *
+ *   * LOCKED — the profile supplies it (`authProfileOwnedCredentials`), so the
+ *     control renders read-only holding the profile's value. A read-only
+ *     control still submits, and writing that echo through would overwrite the
+ *     server's own stored credential with the profile's, so unlinking later
+ *     would leave the server on credentials it never had.
+ *   * HIDDEN — the control is not on screen at all. `keyPath` is
+ *     `visibleWhen: authType === "key"`, and `updateVisibility` (ui/formHtml.ts)
+ *     DISABLES what it hides while the submit loop skips every disabled
+ *     control, so the key simply is not in `values`. A hidden-and-disabled
+ *     control is not evidence the user cleared anything.
+ *   * OFFERED — visible and unlocked. Only this one is an answer.
+ *
+ * Deciding per-field on ownership ALONE closes one direction and opens its
+ * mirror, which is what happened twice: restoring every field a link existed
+ * for discarded the edits the form had legitimately permitted (a key path typed
+ * under a `key` profile that carries none), and restoring only the OWNED fields
+ * then erased the key path of a `key` server linked to a `password`/`agent`
+ * profile — that profile owns `authType`, so the form renders "Password", which
+ * hides the Private Key File control, which drops it from the submission, which
+ * this could not put back because the profile does not own it. An unrelated
+ * rename was enough to destroy the file, and the record's own `authType: "key"`
+ * (restored, because `authType` IS owned) then failed with `Missing keyPath for
+ * key auth` at the next connect.
+ *
+ * `submitted.authType` is the ORACLE for the hidden case, deliberately: it is
+ * the form's OWN live value for the control every visibility rule here keys
+ * off, so this reproduces what the form did rather than re-deriving what it
+ * should have done. Those agree whenever the form is in sync; where they can
+ * differ — a Save clicked in the round trip between choosing a profile and its
+ * mirror landing — the form's own value is the honest one, and re-deriving from
+ * the profile would resume erasing key paths in exactly that window.
+ * `formValuesToServer` has already normalised it to a real `AuthType`, so a
+ * malformed or absent submission degrades to "not offered", i.e. to keeping
+ * what is stored.
+ *
+ * Read together with THE ONE RULE (`authProfileOwnedCredentials`) — this
+ * answers a strictly wider question, so it consumes that rather than repeating
+ * it. Callers: `preserveLinkedServerCredentials` (commands/serverCommands.ts),
+ * the sole writer of a linked server's credentials from a form. The RENDER's
+ * half of the same statement lives in `applyLinkedAuthProfileValues` /
+ * `authProfileFilledKeys` (ui/formDefinitions.ts) plus the `visibleWhen` on the
+ * key path descriptor; the two are bound together by a test that opens the real
+ * form over a matrix of (record, profile) pairs and asserts the fields it
+ * leaves visible-and-unlocked are exactly the ones this returns `true` for
+ * (test/unit/authProfileSwitchTransition.test.ts).
+ */
+export function formOfferedServerCredentials(
+  submitted: Pick<ServerConfig, "authType">,
+  profile: AuthProfile | undefined
+): FormOfferedServerCredentials {
+  const owned = authProfileOwnedCredentials(profile);
+  return {
+    // Always rendered; only ownership can take it away.
+    username: owned.username === undefined,
+    // A closed enum is always owned, so this is `true` only where nothing
+    // resolved — no link, or an id that names no profile, which is the same
+    // state the form renders the record's own value unlocked for.
+    authType: owned.authType === undefined,
+    // The one field that can be taken away twice over.
+    keyPath: owned.keyPath === undefined && submitted.authType === "key"
+  };
+}
+
+/**
+ * REVIEW FINDING (P1) — the profile facts a server form's render committed to,
+ * reduced to exactly what the save path later re-reads, so a submission can be
+ * checked against the profile it was actually composed against.
+ *
+ * WHAT IS IN IT, and why nothing else is: `formOfferedServerCredentials` and
+ * `preserveLinkedServerCredentials` between them consume WHICH keys the profile
+ * owns plus the VALUE of the one owned key the form displays as the server's
+ * effective auth type. A profile edit that changes any of those changes what
+ * the open form would have shown and what this submission means:
+ *
+ *   * gaining a key file turns a key path the user typed into an unowned field
+ *     into a value the save now discards without a word;
+ *   * losing one turns the profile's own mirrored path, sitting locked in that
+ *     field, into "user input" that the save writes onto the server as its own;
+ *   * gaining or losing a username does the same to the username field;
+ *   * changing `authType` changes which credential control the form rendered at
+ *     all.
+ *
+ * A profile's VALUES are excluded on purpose. A linked server never stores the
+ * profile's username or key path — it keeps its own underneath the link — so a
+ * value that changes while the form sits open changes nothing this submission
+ * writes, and the link means the profile decides at connect time regardless of
+ * whether this Save happens. Rejecting on that would refuse saves that are
+ * correct.
+ *
+ * A string so the comparison is `===` and cannot itself drift; `undefined`
+ * (no profile) has its own signature, so "the profile was deleted" never reads
+ * as equal to any live shape.
+ */
+export function authProfileOwnershipSignature(profile: AuthProfile | undefined): string {
+  const owned = authProfileOwnedCredentials(profile);
+  return [
+    owned.authType ?? "no-profile",
+    owned.username !== undefined ? "username" : "-",
+    owned.keyPath !== undefined ? "keyPath" : "-"
+  ].join("|");
+}
+
 export function resolveTunnelType(profile: TunnelProfile): TunnelType {
   return profile.tunnelType ?? "local";
 }

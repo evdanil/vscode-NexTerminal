@@ -3843,6 +3843,30 @@ describe("validateServerConfig — origin handling (F13/FIX 5)", () => {
     expect(validateServerConfig(item)).toBe(true);
     expect((item as { origin?: unknown }).origin).toEqual({ sourceId: "src", externalId: "ext", syncedAt: 1000 });
   });
+
+  /**
+   * REVIEW FINDING (P2) — the same shape check `validateAuthProfile` already
+   * makes of a profile's `keyPath`, now made of a server's. Until this, the
+   * declared `string | undefined` was unchecked at both boundaries a foreign
+   * record can arrive through, and `hasOwnKeyPath` (syncEngine) trims it while
+   * planning a sync — where the TypeError does not cost one row, it aborts the
+   * whole run after the inventory has already been fetched.
+   */
+  it("rejects a keyPath that is not a string (kills leaving the declared optional unchecked: such a row loads typed as ServerConfig and the first string operation on it throws mid-sync)", () => {
+    const base = { id: "s1", name: "Server", host: "h", port: 22, username: "u", authType: "key", isHidden: false };
+    expect(validateServerConfig({ ...base, keyPath: 12345 })).toBe(false);
+    expect(validateServerConfig({ ...base, keyPath: { path: "/keys/id" } })).toBe(false);
+    expect(validateServerConfig({ ...base, keyPath: ["/keys/id"] })).toBe(false);
+    expect(validateServerConfig({ ...base, keyPath: null })).toBe(false);
+    expect(validateServerConfig({ ...base, keyPath: true })).toBe(false);
+  });
+
+  it("still accepts an absent or EMPTY keyPath (kills tightening this to isOptionalNonEmptyString: rejecting a server row is far more destructive than the untidy field it would be punishing — the record's group, proxy, jump-host target and sync ownership all go with it)", () => {
+    const base = { id: "s1", name: "Server", host: "h", port: 22, username: "u", authType: "key", isHidden: false };
+    expect(validateServerConfig(base)).toBe(true);
+    expect(validateServerConfig({ ...base, keyPath: "" })).toBe(true);
+    expect(validateServerConfig({ ...base, keyPath: "   " })).toBe(true);
+  });
 });
 
 describe("serverConfigsEqual / mergeServerConfigFields — origin.syncedUsername", () => {

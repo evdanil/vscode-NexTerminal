@@ -104,6 +104,33 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   if (obj.authProfileId !== undefined && (typeof obj.authProfileId !== "string" || obj.authProfileId === "")) {
     return false;
   }
+  // REVIEW FINDING (P2) — the same shape check `validateAuthProfile` now makes
+  // of `AuthProfile.keyPath`, for the same reason and with the same deliberate
+  // limits. `ServerConfig.keyPath` is declared `string | undefined`, but until
+  // this line nothing checked it, so a hand-edited backup or a version-skewed
+  // globalState row could carry a number/object/array here and still be handed
+  // out typed as `ServerConfig`. `hasOwnKeyPath` (services/inventory/syncEngine.ts)
+  // then trims it while planning a sync whose key profile has lost its key
+  // file, and the TypeError aborts the WHOLE sync after the inventory has
+  // already been fetched — not one bad row skipped, the entire run lost.
+  //
+  // A TYPE check, deliberately not `isOptionalNonEmptyString`: `""` reads
+  // identically to absent everywhere that matters (`buildConnectConfig` rejects
+  // both with the same message, `hasOwnKeyPath` counts neither as a key of the
+  // server's own), so rejecting it would discard a merely untidy record for
+  // nothing. And rejection is destructive out of proportion to a malformed
+  // bookkeeping field: a rejected server row is dropped by the import and by
+  // the globalState load, taking its group, proxy, tunnels' jump-host target
+  // and inventory-sync ownership with it. No version of Nexus has ever WRITTEN
+  // a non-string here (`formValuesToServer` stores `string | undefined`), so
+  // this line can only reject records that are already broken.
+  //
+  // The use site stays defensive too (see `hasOwnKeyPath`): this boundary is
+  // what should stop such a value existing, not the only thing standing
+  // between one and a thrown `.trim()`.
+  if (obj.keyPath !== undefined && typeof obj.keyPath !== "string") {
+    return false;
+  }
   // F13/FIX 5 — a malformed `origin` does not invalidate the whole server
   // row: the row is still accepted here. Stripping the malformed field is
   // NOT this function's job — a type guard must not mutate the value it is
