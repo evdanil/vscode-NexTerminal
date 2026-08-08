@@ -1766,6 +1766,23 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         await core.addOrUpdateServer({ ...server, authProfileId: undefined });
       }
     }
+    // Same clear for inventory sources, whose `authProfileId` links their synced
+    // servers to a profile the same way. Backup import preserves ids on BOTH sides
+    // (importPreservingIds above), so a surviving reference needs no remap — but it
+    // can still dangle: a payload can carry a source whose profile was never exported
+    // (or was skipped/rejected on import), and merge mode may keep a local profile-less
+    // record while importing nothing to satisfy it. Resolution is checked against the
+    // POST-import snapshot, not the payload, so a source that links to a profile this
+    // machine already has keeps its link. A dangling id left in place would survive
+    // every later resolution attempt as a permanent no-op — the sync engine degrades to
+    // the default username + SSH agent and warns on every run — so it is cleared here
+    // exactly as the server refs above are. `addOrUpdateInventorySource` re-revisions,
+    // which is correct: this is a new incarnation of the record.
+    for (const source of postImportSnapshot.inventorySources) {
+      if (source.authProfileId && !knownProfileIds.has(source.authProfileId)) {
+        await core.addOrUpdateInventorySource({ ...source, authProfileId: undefined });
+      }
+    }
 
     if (Array.isArray(data.groups)) {
       for (const group of data.groups) {

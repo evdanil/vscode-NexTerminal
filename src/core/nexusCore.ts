@@ -219,6 +219,35 @@ export class NexusCore {
     this.emitChanged();
   }
 
+  /**
+   * Deletes the profile and clears every reference to it, so nothing is left
+   * pointing at an id that no longer resolves. Two kinds of holder:
+   *
+   *   - servers (`ServerConfig.authProfileId`) — cleared in place, as before;
+   *   - inventory sources (`InventorySourceConfig.authProfileId`) — cleared
+   *     with a FRESH `revision`, because clearing one is a new INCARNATION of
+   *     the record in exactly the sense addOrUpdateInventorySource documents.
+   *     A sync in flight against the old incarnation must abort on
+   *     sourceConfigUnchanged (inventoryCommands' "configuration changed while
+   *     syncing" guard) rather than stamp a profile that was just deleted;
+   *     reusing the revision would let it through. Only referencing sources are
+   *     re-revisioned — churning an unrelated source's revision would abort ITS
+   *     in-flight sync for no reason.
+   *
+   * Persist order is authProfiles -> servers -> inventorySources, each written
+   * only when it actually changed, with a single emitChanged() on the way out
+   * whether the saves succeeded or threw: the profile record must be gone from
+   * disk before the cleared references are, so a rejection midway can never
+   * leave references cleared on disk while the profile they pointed at
+   * survives.
+   *
+   * FINDING A — same discipline as addOrUpdateInventorySource: the source map
+   * is mutated first (repo-wide in-memory-first pattern), but a rejected
+   * saveInventorySources must leave NO trace, or the half-cleared, already
+   * re-revisioned records would be silently committed by the next unrelated
+   * saveInventorySources call from some other command. Capture the previous
+   * entries before mutating and restore them on rejection.
+   */
   public async removeAuthProfile(profileId: string): Promise<void> {
     this.authProfiles.delete(profileId);
     let serversChanged = false;
@@ -228,11 +257,40 @@ export class NexusCore {
         serversChanged = true;
       }
     }
-    await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
-    if (serversChanged) {
-      await this.repository.saveServers([...this.servers.values()]);
+    const previousSources = new Map<string, InventorySourceConfig>();
+    for (const [id, source] of this.inventorySources.entries()) {
+      if (source.authProfileId === profileId) {
+        previousSources.set(id, source);
+        this.inventorySources.set(id, { ...source, authProfileId: undefined, revision: randomUUID() });
+      }
     }
-    this.emitChanged();
+    // The emission is in a `finally`, not on the success path: by the time any
+    // of these saves can reject, the profile is already gone from this.authProfiles
+    // and the server references are already cleared in memory (and, past the
+    // first await, on disk). Returning through a rejection without emitting
+    // would leave every observer rendering a profile that no longer exists and
+    // links that no longer resolve, until some unrelated change happened to fire
+    // an emission. Whatever the in-memory state ends up being — fully applied,
+    // or with the inventory-source clears rolled back below — observers are told
+    // about it exactly once.
+    try {
+      await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
+      if (serversChanged) {
+        await this.repository.saveServers([...this.servers.values()]);
+      }
+      if (previousSources.size > 0) {
+        try {
+          await this.repository.saveInventorySources([...this.inventorySources.values()]);
+        } catch (error) {
+          for (const [id, source] of previousSources) {
+            this.inventorySources.set(id, source);
+          }
+          throw error;
+        }
+      }
+    } finally {
+      this.emitChanged();
+    }
   }
 
   public getInventorySource(id: string): InventorySourceConfig | undefined {

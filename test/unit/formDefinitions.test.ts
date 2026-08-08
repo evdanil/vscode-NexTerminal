@@ -8,7 +8,9 @@ import {
   unifiedProfileFormId
 } from "../../src/ui/formDefinitions";
 import type { FormDefinition, FormFieldDescriptor } from "../../src/ui/formTypes";
-import type { InventoryProvider } from "../../src/models/inventory";
+import type { InventoryProvider, InventorySourceConfig } from "../../src/models/inventory";
+import type { AuthProfile } from "../../src/models/config";
+import { formatAuthProfileLabel } from "../../src/utils/authProfileLabel";
 
 function keyedField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { key: string }> {
   const field = definition.fields.find(
@@ -328,5 +330,107 @@ describe("inventorySourceFormDefinition", () => {
     const field = keyedField(definition, "cfg_pollInterval") as Extract<FormFieldDescriptor, { type: "number" }>;
     expect(field.value).toBe(0.5);
     expect(field.step).toBe("any");
+  });
+
+  const authProfiles: AuthProfile[] = [
+    { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" },
+    { id: "p2", name: "Prod key", username: "deploy", authType: "key", keyPath: "/keys/id_ed25519" }
+  ];
+
+  function sourceSeed(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
+    return {
+      id: "src1",
+      providerId: "fake",
+      name: "Fake",
+      targetFolder: "",
+      prunePolicy: "orphan",
+      defaultUsername: "seeded-user",
+      config: {},
+      secretFieldIds: [],
+      ...overrides
+    };
+  }
+
+  it("renders the Auth Profile select outside Advanced, directly above Default SSH Username", () => {
+    const definition = inventorySourceFormDefinition(fakeProvider, undefined, undefined, authProfiles);
+    const keys = definition.fields.map((field) => ("key" in field ? field.key : undefined));
+    const authProfileIndex = keys.indexOf("authProfileId");
+    const defaultUsernameIndex = keys.indexOf("defaultUsername");
+
+    expect(authProfileIndex).toBeGreaterThan(-1);
+    expect(defaultUsernameIndex).toBe(authProfileIndex + 1);
+
+    const field = keyedField(definition, "authProfileId");
+    // The whole point of the feature: on this form the select is the primary
+    // auth decision, not a power-user shortcut buried in Advanced (which is
+    // where the shared helper's default puts it, and where the server form
+    // keeps it).
+    expect(field.advanced).toBeFalsy();
+    expect(field.type).toBe("select");
+    expect(field.hint).toBe(
+      "Servers synced from this source connect with this profile's saved credentials. (None) uses the default username with SSH agent authentication."
+    );
+    if (field.type === "select") {
+      expect(field.autofill).toBe(true);
+      expect(field.value).toBe("");
+      expect(field.options).toEqual([
+        { label: "(None)", value: "" },
+        { label: formatAuthProfileLabel(authProfiles[0]), value: "p1" },
+        { label: formatAuthProfileLabel(authProfiles[1]), value: "p2" },
+        { label: "Create new auth profile…", value: "__create__authProfile" }
+      ]);
+    }
+  });
+
+  it("the Default SSH Username hint explains why the field stays visible but locked while a profile is selected", () => {
+    const definition = inventorySourceFormDefinition(fakeProvider, undefined, undefined, authProfiles);
+    const field = keyedField(definition, "defaultUsername");
+    // Selecting a profile mirrors its username in here and makes the field
+    // read-only and dimmed. A hint that stops at the first sentence leaves the
+    // user staring at a locked field with no explanation of where its value
+    // came from or why it is still worth having.
+    expect(field.hint).toBe(
+      "Used when the inventory source doesn't provide a username. With an auth profile selected it comes from that profile, and is the fallback if the profile is ever removed."
+    );
+  });
+
+  it("leaves the server and unified profile forms' Auth Profile select advanced with its original hint", () => {
+    for (const definition of [serverFormDefinition(), unifiedProfileFormDefinition()]) {
+      const field = keyedField(definition, "authProfileId");
+      expect(field.advanced).toBe(true);
+      expect(field.hint).toBe("Reuse saved SSH credentials instead of entering them here.");
+    }
+  });
+
+  it("sanitizes a dangling seeded auth profile id to the (None) value so the form cannot submit a dead id", () => {
+    const definition = inventorySourceFormDefinition(
+      fakeProvider,
+      sourceSeed({ authProfileId: "ghost" }),
+      undefined,
+      authProfiles
+    );
+    const field = keyedField(definition, "authProfileId");
+    expect(field.type).toBe("select");
+    if (field.type === "select") {
+      // Passing "ghost" straight through would render the (None) LABEL (the
+      // select renderer falls back to options[0] for the label) while the
+      // hidden input still carries "ghost" as its VALUE — displaying one thing
+      // and submitting another.
+      expect(field.value).toBe("");
+      expect(field.options.some((option) => option.value === "ghost")).toBe(false);
+    }
+  });
+
+  it("keeps a seeded auth profile id that still resolves", () => {
+    const definition = inventorySourceFormDefinition(
+      fakeProvider,
+      sourceSeed({ authProfileId: "p1" }),
+      undefined,
+      authProfiles
+    );
+    const field = keyedField(definition, "authProfileId");
+    if (field.type === "select") {
+      expect(field.value).toBe("p1");
+    }
   });
 });

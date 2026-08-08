@@ -177,14 +177,28 @@ export class AuthProfileEditorPanel {
           const profile = this.core.getAuthProfile(id);
           if (!profile) break;
 
-          const linkedCount = this.core.getSnapshot().servers.filter(
+          const snapshot = this.core.getSnapshot();
+          const linkedCount = snapshot.servers.filter(
             (s) => s.authProfileId === id
           ).length;
           const linkedNote = linkedCount > 0
             ? ` ${linkedCount} server(s) are linked and will revert to their own stored credentials.`
             : "";
+          // Inventory sources link a profile too, and this delete silently
+          // clears that link (NexusCore.removeAuthProfile). Afterwards nothing
+          // else says so: the sync engine sees a plain profile-less source, so
+          // its dangling-profile warning never fires either, and the next
+          // device synced arrives on the default username + SSH agent — broken
+          // on password/key infrastructure, with no signal anywhere. This
+          // sentence is the only disclosure, so it has to be here.
+          const linkedSourceCount = snapshot.inventorySources.filter(
+            (s) => s.authProfileId === id
+          ).length;
+          const sourceNote = linkedSourceCount > 0
+            ? ` ${linkedSourceCount} inventory source${linkedSourceCount === 1 ? " is" : "s are"} linked; servers ${linkedSourceCount === 1 ? "it syncs" : "they sync"} will use the default username with SSH agent authentication.`
+            : "";
           const confirm = await vscode.window.showWarningMessage(
-            `Delete auth profile "${profile.name}"?${linkedNote}`,
+            `Delete auth profile "${profile.name}"?${linkedNote}${sourceNote}`,
             { modal: true },
             "Delete"
           );

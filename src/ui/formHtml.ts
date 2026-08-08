@@ -354,7 +354,12 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         var profileInput = profileWrapper.querySelector('input[name="authProfileId"]');
         if (!profileInput) return;
         var isLinked = profileInput.value && profileInput.value !== "";
-        var managedKeys = ["username", "authType", "keyPath"];
+        // One list, shared by every form that renders an authProfileId select.
+        // The server/unified profile forms render username/authType/keyPath;
+        // the inventory source form renders defaultUsername. The loop below
+        // skips whatever a form doesn't render, so each locks exactly its own
+        // mirrored fields with no cross-contamination.
+        var managedKeys = ["username", "authType", "keyPath", "defaultUsername"];
         for (var mi = 0; mi < managedKeys.length; mi++) {
           var fieldId = "field-" + managedKeys[mi];
           var fieldEl = document.getElementById(fieldId);
@@ -438,6 +443,17 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             }
             selectCustomOption(wrapper, msg.value);
             wrapper.dataset.prev = msg.value;
+            // An option injected after inline creation is a selection like any
+            // other, so it must run the same two follow-ups the user-click
+            // path runs (see initCustomSelects below). Without them an
+            // inline-created auth profile is selected but never mirrors its
+            // username into the managed field, and never locks it.
+            if (wrapper.dataset.autofill === 'true' && msg.value) {
+              vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value });
+            }
+            if (wrapper.dataset.name === 'authProfileId') {
+              updateProfileManagedFields();
+            }
           }
         }
         if (msg.type === "fillFields") {

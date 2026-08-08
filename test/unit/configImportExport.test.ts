@@ -4791,6 +4791,60 @@ describe("backup export round-trip", () => {
     expect(snapshot.authProfiles).toHaveLength(1);
   });
 
+  it("backup export then import preserves authProfileId on inventory sources", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const sourceRepo = new InMemoryConfigRepository();
+    const sourceCore = new NexusCore(sourceRepo);
+    await sourceCore.initialize();
+    await sourceCore.addOrUpdateAuthProfile(makeAuthProfile({ id: "ap1" }));
+    await sourceCore.addOrUpdateInventorySource(makeInventorySource({ id: "src1", authProfileId: "ap1" }));
+
+    registerConfigCommands(sourceCore, vault);
+
+    mockShowInputBox
+      .mockResolvedValueOnce("masterpass1")
+      .mockResolvedValueOnce("masterpass1");
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+
+    await registeredCommands.get("nexus.config.export.backup")!();
+
+    // The link must survive the export leg on its own — a strip there would make the
+    // import-leg assertion below pass for the wrong reason (nothing to preserve).
+    const parsed = JSON.parse(exportedJson);
+    expect(parsed.inventorySources[0].authProfileId).toBe("ap1");
+
+    vault.clear();
+    configStore.clear();
+    registeredCommands.clear();
+
+    const destRepo = new InMemoryConfigRepository();
+    const destCore = new NexusCore(destRepo);
+    await destCore.initialize();
+    registerConfigCommands(destCore, vault);
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(exportedJson, "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowInputBox.mockResolvedValueOnce("masterpass1");
+
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = destCore.getSnapshot();
+    expect(snapshot.authProfiles).toHaveLength(1);
+    expect(snapshot.inventorySources).toHaveLength(1);
+    expect(snapshot.inventorySources[0].authProfileId).toBe("ap1");
+  });
+
   it("import clears dangling authProfileId when profile not imported", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
@@ -4824,6 +4878,82 @@ describe("backup export round-trip", () => {
     const snapshot = core.getSnapshot();
     expect(snapshot.servers).toHaveLength(1);
     expect(snapshot.servers[0].authProfileId).toBeUndefined();
+  });
+
+  it("import clears a dangling authProfileId on an inventory source when the profile is not imported", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // The source arrives linked to a profile that exists neither in the payload nor
+    // locally: the ref is non-undefined coming in, so a no-op import is visibly
+    // different from a correct clear.
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ id: "src1", name: "NetBox", authProfileId: "nonexistent-profile" })]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/import.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    // Assert the source actually landed FIRST: if validation had rejected it outright,
+    // `getInventorySource("src1")?.authProfileId` would also read `undefined` and the
+    // clear assertion below would pass vacuously.
+    expect(core.getInventorySource("src1")?.name).toBe("NetBox");
+    expect(core.getInventorySource("src1")?.authProfileId).toBeUndefined();
+  });
+
+  it("import keeps an inventory source's authProfileId when the profile exists locally but not in the payload", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // The profile lives locally only — the payload carries no authProfiles at all, so a
+    // clear keyed on "not in the payload" (rather than on the post-import snapshot)
+    // would wrongly break a link that resolves perfectly well after the import.
+    await core.addOrUpdateAuthProfile(makeAuthProfile({ id: "ap1" }));
+    registerConfigCommands(core, vault);
+
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ id: "src1", name: "NetBox", authProfileId: "ap1" })]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/import.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" }); // import mode
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")?.name).toBe("NetBox");
+    expect(core.getInventorySource("src1")?.authProfileId).toBe("ap1");
   });
 
   it("B6 — backup export then import round-trips inventory sources AND their vault secrets under exact keys", async () => {

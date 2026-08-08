@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderFormHtml } from "../../src/ui/formHtml";
 import type { FormDefinition } from "../../src/ui/formTypes";
-import { tunnelFormDefinition } from "../../src/ui/formDefinitions";
+import { inventorySourceFormDefinition, tunnelFormDefinition } from "../../src/ui/formDefinitions";
 
 describe("renderFormHtml", () => {
   it("renders text fields with labels", () => {
@@ -528,6 +528,66 @@ describe("renderFormHtml", () => {
     expect(html).toContain("input.readOnly = isLinked || input.dataset.baseReadonly === \"true\";");
     expect(html).toContain("button.disabled = isLinked || button.dataset.baseDisabled === \"true\";");
     expect(html).toContain("trigger.style.pointerEvents = \"none\"");
+  });
+
+  it("locks Default SSH Username alongside the server form's credential fields while a profile is linked", () => {
+    const html = renderFormHtml({ title: "Test", fields: [] });
+    // The loop skips keys a form doesn't render, so one shared list serves both
+    // the server form (username/authType/keyPath) and the inventory source form
+    // (defaultUsername). Without "defaultUsername" the source form's mirrored
+    // username would never lock or dim.
+    expect(html).toContain('var managedKeys = ["username", "authType", "keyPath", "defaultUsername"];');
+  });
+
+  it("makes an injected select option autofill and re-lock exactly like a user click", () => {
+    const html = renderFormHtml({ title: "Test", fields: [] });
+    const start = html.indexOf('if (msg.type === "addSelectOption")');
+    const end = html.indexOf('if (msg.type === "fillFields")');
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+
+    // Slice the handler out so the user-click path's own autofill/lock calls
+    // (in the initCustomSelects callback, earlier in the script) cannot satisfy
+    // these assertions.
+    const block = html.slice(start, end);
+    const selectIndex = block.indexOf("selectCustomOption(wrapper, msg.value);");
+    expect(selectIndex).toBeGreaterThan(-1);
+    expect(block).toContain("wrapper.dataset.autofill === 'true'");
+    expect(block).toContain("vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value });");
+    expect(block).toContain("if (wrapper.dataset.name === 'authProfileId') {");
+    expect(block).toContain("updateProfileManagedFields();");
+    expect(block.indexOf("type: 'autofill'")).toBeGreaterThan(selectIndex);
+    expect(block.indexOf("updateProfileManagedFields();")).toBeGreaterThan(selectIndex);
+  });
+
+  it("renders a dangling seeded auth profile id as an empty hidden value, not just an empty label", () => {
+    const definition = inventorySourceFormDefinition(
+      {
+        id: "fake",
+        label: "Fake Provider",
+        configFields: [],
+        testConnection: async () => undefined,
+        fetchInventory: async () => ({ nodes: [] }) as never
+      },
+      {
+        id: "src1",
+        providerId: "fake",
+        name: "Fake",
+        targetFolder: "",
+        prunePolicy: "orphan",
+        defaultUsername: "labuser",
+        config: {},
+        secretFieldIds: [],
+        authProfileId: "ghost"
+      },
+      undefined,
+      [{ id: "p1", name: "Lab credentials", username: "labuser", authType: "password" }]
+    );
+    const html = renderFormHtml(definition);
+    // Display and submit must agree. An unsanitized seed renders the (None)
+    // label (options[0] fallback) but keeps "ghost" as the posted value.
+    expect(html).toContain('<input type="hidden" name="authProfileId" value="" />');
+    expect(html).not.toContain("ghost");
   });
 
   it("guards visibleWhen JSON parsing to avoid script breakage", () => {

@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.8.83] — 2026-08-08
+
+### Added
+
+- **An inventory source can now carry an auth profile, so synced servers connect without hand-editing each one.** Servers created by a NetBox sync were always stamped with agent authentication, which meant that on password or key infrastructure every single one failed to connect with "All configured authentication methods failed" — and every device added at the source later arrived broken the same way. The Add and Edit Inventory Source forms now offer an Auth Profile alongside the default username, including creating a new profile inline without leaving the form, and servers the sync creates are linked to it. Choosing a profile fills in the default username from it and locks the field, so the two can never disagree.
+- **Servers already synced adopt the source's auth profile on the next sync.** Only servers still carrying exactly what the sync gave them are touched — no profile, agent authentication, no key path, and the username the sync itself last wrote onto them. Anything you have edited by hand keeps its own credentials. The switch is listed in the sync plan for review before it is applied, and Show Warnings names every affected server so you can check the whole list before choosing Apply. Servers synced by an earlier version carry no record of the username they were given, so for those the comparison falls back to the source's current default username as before; if the auth profile you pick uses a different username than the source's default did, use Apply Auth Profile on the folder for that first batch.
+- **Inventory sources are reachable from the Settings panel.** Previously the only way to edit or remove a source was the Command Palette. Settings now lists Inventory Sources alongside Macros and Auth Profiles, opening a hub that lists every configured source and offers Sync Now, Edit, and Remove for each — plus adding the first one when none exist yet.
+
+### Fixed
+
+- **Deleting an auth profile now clears it from inventory sources, not just servers.** The reference was already cleared from every server that used the profile, but a source still pointing at it would have handed a deleted profile to the next sync.
+- **The delete confirmation for an auth profile now counts linked inventory sources too.** It only ever mentioned linked servers, so deleting a profile a source depended on looked harmless — while every device that source synced afterwards would have arrived on the default username with SSH agent authentication, with nothing anywhere saying why.
+- **An auth profile created from inside a form now fills in and locks its fields immediately**, exactly as picking an existing one already did. This also affects the server form, where the same gap existed.
+
 ## [2.8.79] — 2026-08-06
 
 ### Security

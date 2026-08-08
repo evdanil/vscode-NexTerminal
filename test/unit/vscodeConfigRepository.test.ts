@@ -102,4 +102,47 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
 
     expect(servers[0].origin).toEqual(origin);
   });
+
+  it("getServers keeps an origin carrying syncedUsername, and keeps one that omits it (kills a shape check that rejects the new member, or that requires it and strips every pre-existing server's origin)", async () => {
+    const stamped = { sourceId: "src", externalId: "ext", syncedAt: 1000, syncedUsername: "admin" };
+    // The three-member shape every build before this release wrote. Stripping
+    // it here would cost those servers their sync ownership on the next read —
+    // the exact opposite of the backward compatibility the stamp is optional for.
+    const legacy = { sourceId: "src", externalId: "ext2", syncedAt: 1000 };
+    const repo = new VscodeConfigRepository(
+      makeContext({
+        "nexus.servers": [
+          { ...validServer, id: "s4", origin: stamped },
+          { ...validServer, id: "s5", origin: legacy }
+        ]
+      })
+    );
+
+    const servers = await repo.getServers();
+
+    expect(servers[0].origin).toEqual(stamped);
+    expect(servers[1].origin).toEqual(legacy);
+  });
+
+  it("getServers strips an origin whose syncedUsername is not a non-empty string (kills leaving the new member unchecked, which would feed the retro-apply comparison a value no sync could have written)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const repo = new VscodeConfigRepository(
+      makeContext({
+        "nexus.servers": [
+          { ...validServer, id: "s6", origin: { sourceId: "src", externalId: "ext", syncedAt: 1000, syncedUsername: 42 } },
+          { ...validServer, id: "s7", origin: { sourceId: "src", externalId: "ext2", syncedAt: 1000, syncedUsername: "" } }
+        ]
+      })
+    );
+
+    const servers = await repo.getServers();
+
+    // Rows survive (a malformed origin never rejects the whole server); the
+    // untrustworthy marker does not.
+    expect(servers.map((s) => s.id)).toEqual(["s6", "s7"]);
+    expect(servers[0].origin).toBeUndefined();
+    expect(servers[1].origin).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    warnSpy.mockRestore();
+  });
 });

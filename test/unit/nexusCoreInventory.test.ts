@@ -2,8 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import { InventorySourceRemovalMismatchError, NexusCore, type InventorySyncApplication } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { validateInventorySource, validateServerConfig } from "../../src/utils/validation";
+import { mergeServerConfigFields, serverConfigsEqual } from "../../src/models/config";
 import type { ServerConfig, SerialProfile, LocalShellProfile } from "../../src/models/config";
-import { computeProviderFingerprint, type InventoryProvider, type InventorySourceConfig } from "../../src/models/inventory";
+import { computeProviderFingerprint, sourceConfigUnchanged, type InventoryProvider, type InventorySourceConfig } from "../../src/models/inventory";
 
 function makeSourceConfig(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
   return {
@@ -1402,6 +1403,178 @@ describe("NexusCore inventory sources", () => {
     expect(rolledBack).toBeDefined();
     expect(rolledBack?.group).toBe("ConcurrentGroup");
     expect(rolledBack?.host).toBe("h");
+  });
+});
+
+describe("removeAuthProfile — dangling references on inventory sources (T2)", () => {
+  const authProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" as const };
+  const otherProfile = { id: "p2", name: "Other", username: "other", authType: "password" as const };
+
+  function makeCore(profiles = [authProfile, otherProfile]): { core: NexusCore; repository: InMemoryConfigRepository } {
+    const repository = new InMemoryConfigRepository([], [], [], [], profiles);
+    return { core: new NexusCore(repository), repository };
+  }
+
+  it("clears the reference from a linked source, persists it, and assigns a FRESH revision (kills leaving sources dangling, and kills clearing without re-revisioning)", async () => {
+    const { core, repository } = makeCore();
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", authProfileId: "p1" }));
+    await core.addOrUpdateServer({
+      id: "srv-1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, authProfileId: "p1"
+    });
+    const revisionBefore = core.getInventorySource("source-1")?.revision;
+    expect(revisionBefore).toBeDefined();
+
+    await core.removeAuthProfile("p1");
+
+    // Today's code only walks servers, so the source would still carry "p1"
+    // and the next sync would stamp a profile that no longer exists.
+    const cleared = core.getInventorySource("source-1");
+    expect(cleared?.authProfileId).toBeUndefined();
+    // The revision bump is load-bearing: an in-flight sync holding the old
+    // snapshot must fail sourceConfigUnchanged and abort rather than apply
+    // against a source that changed underneath it. Clearing the field while
+    // reusing the revision would let that sync through.
+    expect(cleared?.revision).toBeDefined();
+    expect(cleared?.revision).not.toBe(revisionBefore);
+    expect(sourceConfigUnchanged(cleared!, makeSourceConfig({ id: "source-1", authProfileId: "p1", revision: revisionBefore }))).toBe(false);
+
+    // Persisted, not just in-memory: a fresh read of the repository (and a
+    // second core over it) sees the cleared reference.
+    const persisted = await repository.getInventorySources();
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].authProfileId).toBeUndefined();
+    expect(persisted[0].revision).toBe(cleared?.revision);
+
+    // Existing server-side behavior is untouched.
+    expect(core.getServer("srv-1")?.authProfileId).toBeUndefined();
+    expect(core.getAuthProfile("p1")).toBeUndefined();
+    expect(core.getSnapshot().authProfiles.map((p) => p.id)).toEqual(["p2"]);
+  });
+
+  it("leaves sources referencing OTHER profiles (or none) byte-identical — same authProfileId AND same revision (kills a loop that re-revisions every source)", async () => {
+    const { core } = makeCore();
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", authProfileId: "p1" }));
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-2", authProfileId: "p2" }));
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-3" }));
+    const untouchedRevision = core.getInventorySource("source-2")?.revision;
+    const unlinkedRevision = core.getInventorySource("source-3")?.revision;
+
+    await core.removeAuthProfile("p1");
+
+    // Revision churn on an unrelated source would spuriously abort an
+    // in-flight sync against it, so "unchanged" here has to mean the revision
+    // too, not just the profile id.
+    expect(core.getInventorySource("source-2")?.authProfileId).toBe("p2");
+    expect(core.getInventorySource("source-2")?.revision).toBe(untouchedRevision);
+    expect(core.getInventorySource("source-3")?.authProfileId).toBeUndefined();
+    expect(core.getInventorySource("source-3")?.revision).toBe(unlinkedRevision);
+  });
+
+  it("clears EVERY linked source in a single saveInventorySources call and a single emission, after saveAuthProfiles/saveServers (kills a per-source addOrUpdateInventorySource loop and a sources-first save order)", async () => {
+    const { core, repository } = makeCore();
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", authProfileId: "p1" }));
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-2", authProfileId: "p1" }));
+    await core.addOrUpdateServer({
+      id: "srv-1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, authProfileId: "p1"
+    });
+
+    const order: string[] = [];
+    const saveAuthProfilesSpy = vi.spyOn(repository, "saveAuthProfiles").mockImplementation(async () => { order.push("authProfiles"); });
+    const saveServersSpy = vi.spyOn(repository, "saveServers").mockImplementation(async () => { order.push("servers"); });
+    const originalSaveSources = repository.saveInventorySources.bind(repository);
+    const saveSourcesSpy = vi.spyOn(repository, "saveInventorySources").mockImplementation(async (sources) => {
+      order.push("inventorySources");
+      await originalSaveSources(sources);
+    });
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    await core.removeAuthProfile("p1");
+
+    expect(core.getInventorySource("source-1")?.authProfileId).toBeUndefined();
+    expect(core.getInventorySource("source-2")?.authProfileId).toBeUndefined();
+    // A loop delegating to addOrUpdateInventorySource would persist and emit
+    // once per source (and would emit BEFORE the profile/servers were saved).
+    expect(saveSourcesSpy).toHaveBeenCalledTimes(1);
+    expect(saveSourcesSpy.mock.calls[0][0]).toHaveLength(2);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(saveAuthProfilesSpy).toHaveBeenCalledTimes(1);
+    expect(saveServersSpy).toHaveBeenCalledTimes(1);
+    // Sources are persisted last: a sources-first order would leave the
+    // references cleared on disk while the profile itself survived a rejected
+    // saveAuthProfiles.
+    expect(order).toEqual(["authProfiles", "servers", "inventorySources"]);
+  });
+
+  it("does not touch the inventory-source store at all when no source references the removed profile (kills an unconditional save)", async () => {
+    const { core, repository } = makeCore();
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-2", authProfileId: "p2" }));
+
+    const saveSourcesSpy = vi.spyOn(repository, "saveInventorySources");
+    await core.removeAuthProfile("p1");
+
+    expect(saveSourcesSpy).not.toHaveBeenCalled();
+  });
+
+  it("(FINDING A) restores the linked source in memory when saveInventorySources rejects, and rethrows (kills mutate-then-leak)", async () => {
+    const { core, repository } = makeCore();
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", authProfileId: "p1" }));
+    const revisionBefore = core.getInventorySource("source-1")?.revision;
+
+    vi.spyOn(repository, "saveInventorySources").mockRejectedValueOnce(new Error("disk full"));
+    await expect(core.removeAuthProfile("p1")).rejects.toThrow("disk full");
+
+    // Without the rollback, the map would hold a half-cleared, re-revisioned
+    // record that never reached disk — and the next unrelated
+    // saveInventorySources (from any other command) would silently commit it.
+    const current = core.getInventorySource("source-1");
+    expect(current?.authProfileId).toBe("p1");
+    expect(current?.revision).toBe(revisionBefore);
+
+    const persisted = await repository.getInventorySources();
+    expect(persisted[0].authProfileId).toBe("p1");
+    expect(persisted[0].revision).toBe(revisionBefore);
+  });
+
+  it("emits once even when saveInventorySources rejects, AFTER the rollback (kills observers left rendering a deleted profile and stale links until some unrelated change fires an emission)", async () => {
+    const { core, repository } = makeCore();
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", authProfileId: "p1" }));
+    await core.addOrUpdateServer({
+      id: "srv-1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, authProfileId: "p1"
+    });
+
+    vi.spyOn(repository, "saveInventorySources").mockRejectedValueOnce(new Error("disk full"));
+    // Sampled INSIDE the listener: what observers can actually read at the
+    // moment they are told to re-render.
+    const observed: Array<{ profile: unknown; serverRef: string | undefined; sourceRef: string | undefined }> = [];
+    core.onDidChange(() => {
+      observed.push({
+        profile: core.getAuthProfile("p1"),
+        serverRef: core.getServer("srv-1")?.authProfileId,
+        sourceRef: core.getInventorySource("source-1")?.authProfileId
+      });
+    });
+
+    await expect(core.removeAuthProfile("p1")).rejects.toThrow("disk full");
+
+    // Without the emission the profile deletion and the server-ref clear —
+    // both already committed to memory AND disk by the earlier awaits — stay
+    // invisible to every tree and panel.
+    expect(observed).toHaveLength(1);
+    expect(observed[0].profile).toBeUndefined();
+    expect(observed[0].serverRef).toBeUndefined();
+    // Ordering: the emission happens after the rollback, so observers never
+    // see (or re-persist) the half-cleared, re-revisioned source.
+    expect(observed[0].sourceRef).toBe("p1");
   });
 });
 
@@ -3406,6 +3579,47 @@ describe("validateInventorySource", () => {
     expect(validateInventorySource({ ...valid, managedFolders: [1, 2] })).toBe(false);
     expect(validateInventorySource({ ...valid, managedFolders: "NetBox/RackA" })).toBe(false);
   });
+
+  it("(auth profile) accepts a missing authProfileId and a non-empty string authProfileId", () => {
+    expect(validateInventorySource(valid)).toBe(true);
+    expect(validateInventorySource({ ...valid, authProfileId: "p1" })).toBe(true);
+  });
+
+  it("(auth profile) rejects a non-string / empty authProfileId (kills a missing type/emptiness check)", () => {
+    expect(validateInventorySource({ ...valid, authProfileId: "" })).toBe(false);
+    expect(validateInventorySource({ ...valid, authProfileId: 42 })).toBe(false);
+  });
+});
+
+describe("sourceConfigUnchanged", () => {
+  it("(auth profile) legacy fallback calls an authProfileId-only difference CHANGED (kills an un-extended structural branch)", () => {
+    // Neither side carries a revision, so identity falls through to the
+    // structural comparison — the only branch where a profile-only edit can
+    // hide. Everything else about the two records is identical, so a
+    // comparator that ignores authProfileId reports "unchanged" and lets a
+    // sync fetched under the old profile apply against the new record.
+    const linked = makeSourceConfig({ authProfileId: "p1" });
+    const unlinked = makeSourceConfig();
+    expect(linked.revision).toBeUndefined();
+    expect(unlinked.revision).toBeUndefined();
+
+    expect(sourceConfigUnchanged(linked, unlinked)).toBe(false);
+    expect(sourceConfigUnchanged(unlinked, linked)).toBe(false);
+  });
+
+  it("(auth profile) legacy fallback still calls two records with the SAME authProfileId unchanged (kills a comparator using the wrong property or object identity)", () => {
+    expect(sourceConfigUnchanged(makeSourceConfig({ authProfileId: "p1" }), makeSourceConfig({ authProfileId: "p1" }))).toBe(true);
+  });
+
+  it("(auth profile) equal revisions alone still decide identity even when authProfileId differs (kills hoisting the check above the revision short-circuit)", () => {
+    // Every write through addOrUpdateInventorySource re-revisions, so equal
+    // revisions already mean "same incarnation"; comparing authProfileId
+    // outside the fallback would make a revision-carrying pair disagree with
+    // the field doc's contract.
+    const a = makeSourceConfig({ revision: "rev-1", authProfileId: "p1" });
+    const b = makeSourceConfig({ revision: "rev-1" });
+    expect(sourceConfigUnchanged(a, b)).toBe(true);
+  });
 });
 
 describe("computeProviderFingerprint (ITEM A — provider trust fingerprint)", () => {
@@ -3530,5 +3744,56 @@ describe("validateServerConfig — origin handling (F13/FIX 5)", () => {
     };
     expect(validateServerConfig(item)).toBe(true);
     expect((item as { origin?: unknown }).origin).toEqual({ sourceId: "src", externalId: "ext", syncedAt: 1000 });
+  });
+});
+
+describe("serverConfigsEqual / mergeServerConfigFields — origin.syncedUsername", () => {
+  function server(overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id: "s1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" },
+      ...overrides
+    };
+  }
+
+  it("two servers differing ONLY in origin.syncedUsername are not equal (kills an origin comparator that ignores the new member)", () => {
+    const a = server();
+    const b = server({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "labuser" } });
+    // Identical in every other field, so a comparator that skips syncedUsername
+    // returns true here and the rollback merge below silently keeps the wrong
+    // origin.
+    expect(serverConfigsEqual(a, b)).toBe(false);
+    // A record whose stamp is absent is likewise not the same record as one
+    // carrying a stamp — that difference decides whether the retro-apply rule
+    // compares against the stamp or falls back to the source's default.
+    expect(serverConfigsEqual(a, server({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000 } }))).toBe(false);
+    expect(serverConfigsEqual(a, server())).toBe(true);
+  });
+
+  it("the rollback merge keeps a concurrently-written syncedUsername instead of reverting it to the pre-batch stamp (kills the same blind spot one layer up)", () => {
+    // prior: what the record looked like before the (now-rejected) batch write.
+    // batchSnapshot: what the batch wrote. current: what the live record holds
+    // now — a concurrent write re-stamped the username in place. `syncedAt` is
+    // deliberately IDENTICAL in batchSnapshot and current so `syncedUsername` is
+    // the only thing separating them: with any other member differing, the merge
+    // would take current's origin regardless and this fixture would prove nothing.
+    const prior = server({ origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" } });
+    const batchSnapshot = server({ name: "renamed", origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 2000, syncedUsername: "admin" } });
+    const current = server({ name: "renamed", origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 2000, syncedUsername: "svc-netbox" } });
+
+    const merged = mergeServerConfigFields(prior, batchSnapshot, current);
+
+    // Reverting to prior's origin would leave the record claiming the sync
+    // stamped "admin" when it actually stamped "svc-netbox" — after which the
+    // next sync reads that concurrent write as a hand-edit and never adopts it.
+    expect(merged.origin).toEqual({ sourceId: "src-1", externalId: "device:1", syncedAt: 2000, syncedUsername: "svc-netbox" });
+    // The rejected batch's own fields still fall back to prior.
+    expect(merged.name).toBe("core-sw");
   });
 });

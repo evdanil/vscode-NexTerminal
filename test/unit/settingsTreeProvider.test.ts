@@ -88,10 +88,10 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 11 root items", () => {
+    it("returns 12 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(11);
+      expect(roots).toHaveLength(12);
     });
 
     it("has 9 category items first with Security & Data after SSH", () => {
@@ -103,12 +103,32 @@ describe("SettingsTreeProvider", () => {
         .toEqual(["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"]);
     });
 
-    it("has 2 root link items for Macros and Auth Profiles", () => {
+    it("has 3 root link items for Macros, Auth Profiles, and Inventory Sources", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const links = roots.filter((r) => r instanceof SettingsLinkItem);
-      expect(links).toHaveLength(2);
-      expect(links.map((link) => link.label)).toEqual(["Macros", "Auth Profiles"]);
+      expect(links).toHaveLength(3);
+      expect(links.map((link) => link.label)).toEqual(["Macros", "Auth Profiles", "Inventory Sources"]);
+    });
+
+    // The owner's complaint this answers: inventory sources had no home in the
+    // extension's own Settings tree, so editing one was palette-only
+    // ("Nexus: Edit Inventory Source"). The link must point at the hub command
+    // nexus.inventory.manage — a link pointing at bare addSource (or at nothing)
+    // would not give edit/remove access.
+    it("points the Inventory Sources link at the nexus.inventory.manage hub", () => {
+      const provider = createProvider();
+      const roots = provider.getChildren();
+      const links = roots.filter((r) => r instanceof SettingsLinkItem) as SettingsLinkItem[];
+      const inventory = links[2];
+      expect(inventory.label).toBe("Inventory Sources");
+      expect(inventory.command).toEqual({
+        command: "nexus.inventory.manage",
+        title: "Inventory Sources"
+      });
+      expect((inventory.iconPath as { id: string }).id).toBe("server-environment");
+      expect(inventory.tooltip).toBe("Add, edit, sync, and remove inventory sources");
+      expect(inventory.id).toBe("settings-link:nexus.inventory.manage");
     });
 
     it("does not keep Data Management as a root group", () => {

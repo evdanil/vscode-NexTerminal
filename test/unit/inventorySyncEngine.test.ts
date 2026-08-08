@@ -81,7 +81,11 @@ describe("computeSyncPlan — adds", () => {
     // Dropping either half of the join (target-only or device-folder-only) fails this.
     expect(add.group).toBe("NetBox/Syd/R1");
     expect(add.isHidden).toBe(false);
-    expect(add.origin).toEqual({ sourceId: "source-1", externalId: "device:1", syncedAt: 1000 });
+    // `syncedUsername` records the username this add just wrote, so a later sync
+    // can compare against it instead of the source's current defaultUsername.
+    // Whole-object equality on the origin: it is the retro-apply rule's only
+    // input besides the auth fields, so a missing or extra member has to fail.
+    expect(add.origin).toEqual({ sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" });
   });
 
   it("maps the ssh endpoint even when a redfish endpoint appears first (kills first-endpoint-regardless-of-kind)", () => {
@@ -271,6 +275,326 @@ describe("computeSyncPlan — updates", () => {
     expect(plan.prunes).toHaveLength(0);
     expect(plan.updates).toHaveLength(1);
     expect(plan.updates[0].after.group).toBe("NetBox/Syd/R1");
+  });
+});
+
+describe("computeSyncPlan — auth profile link", () => {
+  // The resolved profile the caller passes in. `name` is unused by the engine
+  // (it exists for the plan-preview modal's copy) but is carried so the input
+  // shape here is the real one callers build.
+  const profile = { id: "p1", name: "Lab credentials" };
+
+  // Pinned verbatim (UX report §6). This exact string is what the plan-preview
+  // modal surfaces, so a reword is a user-visible copy change and must break a
+  // test. makeSource()'s name is "NetBox".
+  const DANGLING_WARNING =
+    'The auth profile for "NetBox" no longer exists — synced servers use the default username with SSH agent authentication. Edit the source to choose another profile.';
+
+  it("stamps the resolved profile id on adds, and links only — username/authType stay the source's own (kills copying the profile's credentials)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000, authProfile: profile });
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].authProfileId).toBe("p1");
+    // Link, never copy: the profile's own authType/username must NOT be
+    // snapshotted into the record (copies rot when the profile is edited).
+    expect(plan.adds[0].authType).toBe("agent");
+    expect(plan.adds[0].username).toBe("admin");
+    expect(plan.adds[0].keyPath).toBeUndefined();
+  });
+
+  it("a profile-less source produces the pre-feature add, credential fields untouched, plus the origin's own username stamp, and no auth warning", () => {
+    const source = makeSource({ targetFolder: "NetBox", defaultUsername: "admin" });
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
+
+    expect(plan.adds).toHaveLength(1);
+    // Whole-object equality: ANY new field or changed default on the
+    // profile-less path fails here, not just an accidental profile stamp.
+    // `origin.syncedUsername` is the one addition to the pre-feature record and
+    // it is bookkeeping, not a credential — it duplicates the `username` the
+    // add already wrote so a LATER sync can tell that value apart from a
+    // hand-edit. It is written whether or not the source has a profile today,
+    // because a source that gains one later must find the stamp already there.
+    expect(plan.adds[0]).toEqual({
+      id: deterministicServerId("source-1", "device:1"),
+      name: "core-sw-1",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+    expect(plan.warnings.some((w) => w.includes("auth profile"))).toBe(false);
+  });
+
+  it("the add path records the ENDPOINT's username when the provider supplies one, matching the username it wrote (kills recording source.defaultUsername unconditionally)", () => {
+    const source = makeSource({ defaultUsername: "admin" });
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1", username: "svc-netbox" }] })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000, authProfile: profile });
+
+    // The stamp must mirror what the add actually wrote. Recording "admin" here
+    // would make the very next sync read this server as hand-edited (its
+    // username is "svc-netbox") and refuse to ever adopt it.
+    expect(plan.adds[0].username).toBe("svc-netbox");
+    expect(plan.adds[0].origin?.syncedUsername).toBe("svc-netbox");
+  });
+
+  it("retro-apply: an owned server still on the never-configured agent default is updated with the profile — and surfaces as an update, not unchanged", () => {
+    // The owned server maps EXACTLY to what the device produces (same
+    // name/host/port/group), so the profile stamp is the ONLY difference the
+    // engine can introduce — that is what makes this fixture non-vacuous.
+    // makeOwnedServer's origin carries no `syncedUsername` (it models a server
+    // synced by a build before that field existed), so the rule's username
+    // clause resolves through the defaultUsername FALLBACK; its username
+    // "admin" is still makeSource's defaultUsername. See the dedicated
+    // fallback/stamp pair below for what each half is load-bearing for.
+    const source = makeSource({ authProfileId: "p1" });
+    const before = makeOwnedServer();
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.authProfileId).toBe("p1");
+    // Kills a `changed` comparison that was never extended: the stamp would be
+    // computed into `after` and then thrown away as "unchanged".
+    expect(plan.unchangedCount).toBe(0);
+    // Link, not copy — the record's own credential fields are untouched.
+    expect(plan.updates[0].after.username).toBe(before.username);
+    expect(plan.updates[0].after.authType).toBe(before.authType);
+    expect(plan.updates[0].after.keyPath).toBeUndefined();
+  });
+
+  it("retro-apply skips a server already linked to another profile (kills the source-always-wins overwrite)", () => {
+    const source = makeSource({ authProfileId: "p1" });
+    const before = makeOwnedServer({ authProfileId: "q" });
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("retro-apply skips a server hand-switched to password auth (kills dropping the authType === 'agent' clause)", () => {
+    const source = makeSource({ authProfileId: "p1" });
+    const before = makeOwnedServer({ authType: "password" });
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("retro-apply skips an agent server carrying an explicit key path (kills dropping the keyPath === undefined clause)", () => {
+    const source = makeSource({ authProfileId: "p1" });
+    const before = makeOwnedServer({ authType: "agent", keyPath: "/home/u/.ssh/id_ed25519" });
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("retro-apply skips a server whose username was hand-edited away from the source default (kills a rule that checks only the auth fields)", () => {
+    // The auth fields here are still EXACTLY the add path's output — no
+    // profile, agent auth, no key — so the three auth clauses all match. The
+    // username is the only trace of the hand-edit, and it survives every sync:
+    // the update path overwrites `username` only when the endpoint supplies
+    // one, and no shipped provider does (this device has none). Adopting this
+    // server would hand its connections the PROFILE's username instead of the
+    // one the user typed (silentAuth resolves the profile first) — a hand-edit
+    // silently undone by a sync.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer({ username: "netops" });
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("retro-apply adopts a server the source's CURRENT default no longer matches, because the stamp records what the sync wrote (kills comparing against source.defaultUsername, which the profile mirror rewrites)", () => {
+    // The feature's own main flow, and the reason the stamp exists. The source
+    // form mirrors a chosen profile's username into `defaultUsername` and saves
+    // it, so linking profile "Lab credentials" (username "labuser") rewrites
+    // the default from "admin" to "labuser". This server was synced under the
+    // OLD default and never touched since — exactly the fleet the feature is
+    // supposed to rescue. Comparing its username against the source's CURRENT
+    // default says "hand-edited", leaves it on broken agent auth, and says
+    // nothing in the plan preview about why it was skipped.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "labuser" });
+    const before = makeOwnedServer({
+      username: "admin",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.authProfileId).toBe("p1");
+    expect(plan.unchangedCount).toBe(0);
+    // Adopted, not rewritten: the record keeps the username it was stamped with.
+    expect(plan.updates[0].after.username).toBe("admin");
+  });
+
+  it("retro-apply skips a server whose username differs from its OWN recorded stamp even when the source's current default happens to match it (kills comparing against source.defaultUsername, which cannot see this hand-edit at all)", () => {
+    // The mirror image of the test above, and why the stamp cannot simply be
+    // dropped in favour of a looser rule. The user hand-edited this server's
+    // username to "labuser", and the source's default was LATER rewritten to
+    // "labuser" too (by linking a profile with that username). A
+    // current-default comparison reads "labuser" === "labuser" and adopts a
+    // server the user configured by hand. The recorded stamp still says the
+    // sync wrote "admin", so the edit is visible and the server escapes.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "labuser" });
+    const before = makeOwnedServer({
+      username: "labuser",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("a server synced before the stamp existed is adopted through the defaultUsername fallback, never excluded for lacking it (kills a strict `username === origin.syncedUsername` rule)", () => {
+    // Backward compatibility, stated as a test: `origin` here is the exact
+    // three-member shape older builds wrote. A rule that compared against
+    // `origin.syncedUsername` alone would read `undefined`, never match any
+    // real username, and quietly refuse to adopt every server that existed
+    // before this release — the whole population the feature was written for.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer({
+      username: "admin",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 }
+    });
+    expect(before.origin?.syncedUsername).toBeUndefined();
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.authProfileId).toBe("p1");
+    expect(plan.unchangedCount).toBe(0);
+  });
+
+  it("the update path carries an existing stamp forward instead of dropping it when it rebuilds origin (kills a rebuilt origin that silently forgets the recorded username)", () => {
+    // The device was RENAMED, so this update happens for a reason unrelated to
+    // auth and `origin` is rebuilt with a fresh syncedAt. If the rebuild drops
+    // `syncedUsername`, the server silently reverts to the defaultUsername
+    // fallback — and the next sync after a profile mirror would then fail to
+    // adopt it, which is the bug the stamp exists to prevent, reintroduced by a
+    // sync that changed nothing about authentication.
+    const source = makeSource({ authProfileId: undefined, defaultUsername: "labuser" });
+    const before = makeOwnedServer({
+      username: "admin",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+    const tree = makeTree([makeDevice({ name: "core-sw-1-renamed" })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000 });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.name).toBe("core-sw-1-renamed");
+    expect(plan.updates[0].after.origin).toEqual({
+      sourceId: "source-1",
+      externalId: "device:1",
+      syncedAt: 2000,
+      syncedUsername: "admin"
+    });
+  });
+
+  it("the update path never re-records the record's CURRENT username over the stamp (kills laundering a hand-edit into 'as stamped' on the next sync)", () => {
+    // This server's username was hand-edited to "netops"; the stamp still says
+    // the sync wrote "admin". The device was renamed, so an update is produced
+    // for an unrelated reason. An implementation that writes
+    // `syncedUsername: after.username` (or ownedServer.username) records
+    // "netops" here — and the sync AFTER this one then sees username ===
+    // stamp, calls the server never-configured, and hands its connections to
+    // the profile. The hand-edit would be undone one sync late, which is
+    // strictly worse than never having the field.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer({
+      username: "netops",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+    const tree = makeTree([makeDevice({ name: "core-sw-1-renamed" })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(1);
+    // Not adopted on this pass...
+    expect(plan.updates[0].after.authProfileId).toBeUndefined();
+    // ...and the stamp still remembers what the sync actually wrote, so it is
+    // not adopted on the next pass either.
+    expect(plan.updates[0].after.username).toBe("netops");
+    expect(plan.updates[0].after.origin?.syncedUsername).toBe("admin");
+  });
+
+  it("the update path refreshes the stamp exactly when it overwrites the username from the endpoint (kills a carry-forward that never refreshes)", () => {
+    // The one case where the sync itself writes `username` on an update: the
+    // provider supplied one. The stamp must follow it, or the very next sync
+    // would compare the endpoint-owned username against a stale stamp and read
+    // the engine's own write as a hand-edit.
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer({
+      username: "admin",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1", username: "svc-netbox" }] })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: profile });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.username).toBe("svc-netbox");
+    expect(plan.updates[0].after.origin?.syncedUsername).toBe("svc-netbox");
+  });
+
+  it("changing the source's profile A -> B never re-stamps servers already carrying A", () => {
+    const source = makeSource({ authProfileId: "p2" });
+    const before = makeOwnedServer({ authProfileId: "p1" });
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: { id: "p2", name: "Other" } });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("clearing the source's profile to (None) never strips the link from already-linked servers", () => {
+    const source = makeSource({ authProfileId: undefined });
+    const before = makeOwnedServer({ authProfileId: "p1" });
+    const tree = makeTree([makeDevice()]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000 });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("a dangling profile reference falls back to the pre-feature default on adds, retro-applies nothing, and warns verbatim", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = makeOwnedServer(); // bare agent default — a resolved profile WOULD stamp it
+    const tree = makeTree([makeDevice(), makeDevice({ externalId: "device:2", name: "new-sw", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000 }); // no authProfile resolved
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].authProfileId).toBeUndefined();
+    expect(plan.adds[0].authType).toBe("agent");
+    expect(plan.adds[0].username).toBe("admin");
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+    expect(plan.warnings).toContain(DANGLING_WARNING);
+  });
+
+  it("a resolution whose id does not match source.authProfileId is treated as dangling (kills trusting the caller's profile without the cross-check)", () => {
+    const source = makeSource({ authProfileId: "p1" });
+    const before = makeOwnedServer();
+    const tree = makeTree([makeDevice(), makeDevice({ externalId: "device:2", name: "new-sw", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000, authProfile: { id: "OTHER", name: "X" } });
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].authProfileId).toBeUndefined();
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+    expect(plan.warnings).toContain(DANGLING_WARNING);
   });
 });
 

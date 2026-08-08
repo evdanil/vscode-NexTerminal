@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { AuthProfile } from "../../src/models/config";
+import type { InventorySourceConfig } from "../../src/models/inventory";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 
@@ -63,6 +64,19 @@ function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
     name: "Prod Auth",
     username: "root",
     authType: "password",
+    ...overrides
+  };
+}
+
+function makeInventorySource(overrides: Partial<InventorySourceConfig> & { id: string }): InventorySourceConfig {
+  return {
+    providerId: "netbox",
+    name: "Lab NetBox",
+    targetFolder: "",
+    prunePolicy: "orphan",
+    defaultUsername: "admin",
+    config: {},
+    secretFieldIds: [],
     ...overrides
   };
 }
@@ -207,6 +221,55 @@ describe("AuthProfileEditorPanel", () => {
     expect(core.getAuthProfile("ap1")).toBeUndefined();
     expect(vault.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
     expect(vault.delete).toHaveBeenCalledWith(authProfilePassphraseSecretKey("ap1"));
+  });
+
+  it("delete confirmation discloses linked INVENTORY SOURCES, not only linked servers (kills a server-only count: the source's link is cleared silently, after which the engine sees a profile-less source and never warns either)", async () => {
+    const profile = makeAuthProfile({ id: "ap1" });
+    const { core, sendMessage } = await openPanel([profile]);
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1", authProfileId: "ap1" }));
+    // A source linked to a DIFFERENT profile must not be counted.
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-2", authProfileId: "other" }));
+
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    await sendMessage({ type: "delete", id: "ap1" });
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Delete auth profile "Prod Auth"? 1 inventory source is linked; servers it syncs will use the default username with SSH agent authentication.',
+      { modal: true },
+      "Delete"
+    );
+  });
+
+  it("delete confirmation pluralizes the inventory-source sentence correctly and keeps the server sentence before it", async () => {
+    const profile = makeAuthProfile({ id: "ap1" });
+    const { core, sendMessage } = await openPanel([profile]);
+    await core.addOrUpdateServer({
+      id: "srv-1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, authProfileId: "ap1"
+    });
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1", authProfileId: "ap1" }));
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-2", authProfileId: "ap1" }));
+
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    await sendMessage({ type: "delete", id: "ap1" });
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Delete auth profile "Prod Auth"? 1 server(s) are linked and will revert to their own stored credentials.' +
+        " 2 inventory sources are linked; servers they sync will use the default username with SSH agent authentication.",
+      { modal: true },
+      "Delete"
+    );
+  });
+
+  it("delete confirmation says nothing about inventory sources when none are linked", async () => {
+    const profile = makeAuthProfile({ id: "ap1" });
+    const { core, sendMessage } = await openPanel([profile]);
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "src-1" }));
+
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    await sendMessage({ type: "delete", id: "ap1" });
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith('Delete auth profile "Prod Auth"?', { modal: true }, "Delete");
   });
 
   it("delete profile does nothing if user cancels", async () => {

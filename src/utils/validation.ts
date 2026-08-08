@@ -52,7 +52,23 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     return false;
   }
   const obj = value as Record<string, unknown>;
-  return isNonEmptyString(obj.sourceId) && isNonEmptyString(obj.externalId) && typeof obj.syncedAt === "number";
+  // `syncedUsername` is optional (absent on every server synced before the field
+  // existed) but shape-checked like the rest: this guard is the ONLY thing
+  // standing between a hand-edited backup / version-skewed globalState and the
+  // retro-apply rule that reads it, and an origin member the engine did not write
+  // makes the whole marker untrustworthy. Empty is rejected as well as non-string:
+  // ServerConfig.username can never be empty, so an empty stamp could not have
+  // come from a sync. The disposition for a malformed origin is unchanged and
+  // deliberately loud — both callers of this guard strip the WHOLE origin (see
+  // VscodeConfigRepository.getServers and addServerSanitizingOrigin), which costs
+  // that server its sync ownership and makes the next sync report an id collision
+  // rather than silently mis-deciding whether it was ever hand-edited.
+  return (
+    isNonEmptyString(obj.sourceId) &&
+    isNonEmptyString(obj.externalId) &&
+    typeof obj.syncedAt === "number" &&
+    isOptionalNonEmptyString(obj.syncedUsername)
+  );
 }
 
 export function validateServerConfig(item: unknown): item is ServerConfig {
@@ -162,6 +178,22 @@ export function validateInventorySource(item: unknown): item is InventorySourceC
   // metadata here; that would also strip it from legitimate storage-layer
   // loads, which must keep it.
   if (obj.managedFolders !== undefined && (!Array.isArray(obj.managedFolders) || !obj.managedFolders.every((v) => typeof v === "string"))) {
+    return false;
+  }
+  // Optional for backward compat, same reasoning as `revision`/
+  // `providerFingerprint` above: a source saved before this field existed
+  // simply has none. When present it must be a non-empty string — an empty
+  // one would read downstream as a dangling profile reference rather than as
+  // "no profile", which is what absent means.
+  //
+  // Unlike `managedFolders`, this is user-authored config, not extension
+  // bookkeeping, so it is deliberately NOT stripped by
+  // `sanitizeImportedInventorySources` in configCommands.ts: a malformed
+  // value rejects the whole source here, exactly as a malformed `revision`
+  // does. (A reference that is well-formed but points at a profile the import
+  // didn't bring along is a different problem — resolution, not shape — and
+  // is handled by the post-import dangling clear, not here.)
+  if (obj.authProfileId !== undefined && !isNonEmptyString(obj.authProfileId)) {
     return false;
   }
   return true;

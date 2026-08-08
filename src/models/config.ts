@@ -40,6 +40,26 @@ export interface ServerOrigin {
   sourceId: string; // InventorySourceConfig.id
   externalId: string; // InventoryDevice.externalId within that source
   syncedAt: number;
+  /**
+   * The username the sync itself last WROTE onto this server — `endpoint.username`
+   * when the provider supplied one, otherwise the source's `defaultUsername` as of
+   * that write. Recorded so a later sync can tell "still exactly what I stamped"
+   * apart from "the user edited this", which comparing against the source's
+   * *current* `defaultUsername` cannot: linking an auth profile rewrites
+   * `defaultUsername` (the source form mirrors the profile's username into it), so
+   * that comparison would call every already-synced server hand-edited the moment a
+   * profile is chosen. See the AUTH 2 retro-apply rule in
+   * services/inventory/syncEngine.ts, which is its only reader.
+   *
+   * Written ONLY where the sync writes `username` — the add path always, the update
+   * path only when the endpoint supplied a username — and never inferred from the
+   * record's current value, which would launder a hand-edit into "as stamped".
+   *
+   * Optional for backward compat: servers synced by a build before this field
+   * existed have none, and the rule falls back to `defaultUsername` for them —
+   * exactly the pre-existing behavior. Absent must never mean "ineligible".
+   */
+  syncedUsername?: string;
 }
 
 export interface ServerConfig {
@@ -95,7 +115,13 @@ function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefine
 function serverOriginsEqual(a: ServerOrigin | undefined, b: ServerOrigin | undefined): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
-  return a.sourceId === b.sourceId && a.externalId === b.externalId && a.syncedAt === b.syncedAt;
+  // Every member of ServerOrigin is compared, `syncedUsername` included: it is
+  // what the retro-apply rule reads, so an origin that differs only there is a
+  // materially different record. Leaving it out would let the rollback merge in
+  // mergeServerConfigFields call two origins "equal" and drop a freshly written
+  // stamp back to the pre-batch one — after which the next sync would compare
+  // against a username the record no longer carries.
+  return a.sourceId === b.sourceId && a.externalId === b.externalId && a.syncedAt === b.syncedAt && a.syncedUsername === b.syncedUsername;
 }
 
 /**

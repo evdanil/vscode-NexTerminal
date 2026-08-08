@@ -6,7 +6,26 @@ import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
 
-function authProfileSelectField(authProfiles?: AuthProfile[], vw?: VisibleWhen, selectedId?: string): FormFieldDescriptor {
+/** Default placement/wording of the shared Auth Profile select — the profile
+ *  and serial/SSH profile forms treat it as a power-user shortcut tucked into
+ *  Advanced. The inventory source form overrides both (see
+ *  `INVENTORY_SOURCE_AUTH_PROFILE_HINT`): there the profile IS the answer to
+ *  "how will these servers authenticate", sibling to a basic field. */
+const AUTH_PROFILE_HINT = "Reuse saved SSH credentials instead of entering them here.";
+
+interface AuthProfileSelectOptions {
+  /** Defaults to `true` — keep the shared select inside Advanced. */
+  advanced?: boolean;
+  /** Defaults to `AUTH_PROFILE_HINT`. */
+  hint?: string;
+}
+
+function authProfileSelectField(
+  authProfiles?: AuthProfile[],
+  vw?: VisibleWhen,
+  selectedId?: string,
+  opts?: AuthProfileSelectOptions
+): FormFieldDescriptor {
   const options = [
     { label: "(None)", value: "" },
     ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id })),
@@ -18,8 +37,8 @@ function authProfileSelectField(authProfiles?: AuthProfile[], vw?: VisibleWhen, 
     label: "Auth Profile",
     options,
     value: selectedId ?? "",
-    hint: "Reuse saved SSH credentials instead of entering them here.",
-    advanced: true,
+    hint: opts?.hint ?? AUTH_PROFILE_HINT,
+    advanced: opts?.advanced ?? true,
     autofill: true,
     visibleWhen: vw
   };
@@ -587,8 +606,8 @@ export function unifiedProfileFormDefinition(
  * F2 — every provider-declared field's FORM key (never its `field.id`
  * itself — that stays the raw key used in InventorySourceValues/Secrets and
  * the vault) is prefixed so it can never collide with a reserved top-level
- * source field key ("name", "targetFolder", "defaultUsername",
- * "prunePolicy"). A provider whose configFields include e.g. `{ id: "name" }`
+ * source field key ("name", "targetFolder", "authProfileId",
+ * "defaultUsername", "prunePolicy"). A provider whose configFields include e.g. `{ id: "name" }`
  * previously clobbered whichever of the two — the source's own Name field or
  * the provider's "name" config value — happened to be assigned last into the
  * single flat FormValues object; there was no way for both to coexist.
@@ -667,6 +686,11 @@ function inventoryConfigFieldDescriptor(
   };
 }
 
+/** UX §6, verbatim. Explains both halves of the select in one breath: what a
+ *  linked profile does, and what `(None)` leaves in place. */
+const INVENTORY_SOURCE_AUTH_PROFILE_HINT =
+  "Servers synced from this source connect with this profile's saved credentials. (None) uses the default username with SSH agent authentication.";
+
 /**
  * Add/Edit Inventory Source form. Collection-only — every persistence
  * decision (vault-first secret storage, drift guards, stale-key cleanup,
@@ -677,15 +701,32 @@ function inventoryConfigFieldDescriptor(
  *
  * `defaultUsernameSeed` is only consulted on Add (mostCommonUsername from the
  * caller); Edit always prefills from `seed.defaultUsername`.
+ *
+ * `authProfiles` populates the Auth Profile select AND decides whether the
+ * seeded `authProfileId` still resolves — pass the live snapshot, never a
+ * cached list.
  */
 export function inventorySourceFormDefinition(
   provider: InventoryProvider,
   seed?: InventorySourceConfig,
-  defaultUsernameSeed?: string
+  defaultUsernameSeed?: string,
+  authProfiles?: AuthProfile[]
 ): FormDefinition {
   const isEdit = Boolean(seed);
   const existingSecretFieldIds = new Set(seed?.secretFieldIds ?? []);
   const existingConfig = seed?.config ?? {};
+
+  // A seeded id whose profile is gone must seed as `(None)`, not merely LOOK
+  // like it. `renderField`'s select case resolves the displayed LABEL by
+  // falling back to `options[0]` when nothing matches, but writes
+  // `field.value` verbatim into the hidden input — so an unsanitized dangling
+  // id displays "(None)" while submitting the dead id, and a plain Save would
+  // silently rewrite the source with a reference that resolves nowhere.
+  const seededAuthProfileId = seed?.authProfileId;
+  const sanitizedAuthProfileId =
+    seededAuthProfileId !== undefined && (authProfiles ?? []).some((profile) => profile.id === seededAuthProfileId)
+      ? seededAuthProfileId
+      : undefined;
 
   return {
     title: `${isEdit ? "Edit" : "Add"} Inventory Source (${provider.label})`,
@@ -700,13 +741,26 @@ export function inventorySourceFormDefinition(
         value: seed?.targetFolder ?? "",
         hint: "Servers synced from this source are placed under this folder. Leave empty for the top level."
       },
+      // Directly above Default SSH Username, and NOT advanced: selecting a
+      // profile mirrors its username into that field and locks it
+      // (updateProfileManagedFields in formHtml.ts), so the two must read as
+      // one decision with the cause above the effect.
+      authProfileSelectField(authProfiles, undefined, sanitizedAuthProfileId, {
+        advanced: false,
+        hint: INVENTORY_SOURCE_AUTH_PROFILE_HINT
+      }),
       {
         type: "text",
         key: "defaultUsername",
         label: "Default SSH Username",
         required: true,
         value: seed?.defaultUsername ?? defaultUsernameSeed ?? "",
-        hint: "Used when the inventory source doesn't provide a username."
+        // Second sentence explains why the field stays VISIBLE but locked once
+        // a profile is selected: it is not disabled decoration, it is the
+        // value the profile mirrored in, and the one synced servers fall back
+        // to if that profile is ever deleted (silentAuth reads the record's
+        // own username once the profile stops resolving).
+        hint: "Used when the inventory source doesn't provide a username. With an auth profile selected it comes from that profile, and is the fallback if the profile is ever removed."
       },
       {
         type: "select",

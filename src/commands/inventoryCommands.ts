@@ -32,6 +32,7 @@ import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { INVALID_FOLDER_PATH_MESSAGE, normalizeOptionalFolderPath } from "../utils/folderPaths";
 import { mostCommonUsername } from "./configCommands";
+import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 
 /**
  * F1 — server runtime teardown, injected from extension.ts (mirrors the
@@ -336,10 +337,11 @@ interface ProviderConfigFormResult {
  * writes it back into `config`/`secrets` under the field's own unprefixed
  * `id`, exactly as InventorySourceValues/Secrets and the vault expect —
  * without this split, a provider field id that collided with a reserved
- * top-level key ("name", "targetFolder", "defaultUsername", "prunePolicy")
- * would silently overwrite that source field's own value in the same flat
- * FormValues object (or be overwritten by it), whichever happened to be
- * assigned last.
+ * top-level key ("name", "targetFolder", "authProfileId", "defaultUsername",
+ * "prunePolicy") would silently overwrite that source field's own value in
+ * the same flat FormValues object (or be overwritten by it), whichever
+ * happened to be assigned last. ("authProfileId" is doubly reserved: it is
+ * also the key createInlineAuthProfileCreation hard-filters on.)
  *
  * `existingSecretFieldIds` (edit flow) marks which password fields already
  * have a saved vault value: a blank value for one of those is treated as
@@ -409,6 +411,8 @@ function formValuesToProviderConfig(
 interface ParsedSourceFormValues {
   name: string;
   targetFolder: string;
+  /** `undefined` for the select's `(None)` option, never the empty string. */
+  authProfileId?: string;
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
   config: InventorySourceValues;
@@ -459,6 +463,21 @@ async function parseSourceFormValues(
     }
   }
 
+  // The Auth Profile select submits "" for its `(None)` option; a source must
+  // never store that as an id — validateInventorySource rejects a non-empty
+  // string, sourceConfigUnchanged would see "" and undefined as different
+  // configurations, and the engine's resolution guard would treat "" as a
+  // dangling reference and warn on every sync. Normalized to `undefined`
+  // here, once, so nothing downstream has to know about the empty option.
+  //
+  // No existence check against core: the select only ever offers ids that
+  // exist, and every downstream consumer already degrades safely on a
+  // reference that stops resolving (form seed sanitization, the engine's
+  // dangling-profile warning, removeAuthProfile's ref clearing). This
+  // mirrors formValuesToServer, which likewise persists the posted id as-is.
+  const rawAuthProfileId = values.authProfileId;
+  const authProfileId = typeof rawAuthProfileId === "string" && rawAuthProfileId !== "" ? rawAuthProfileId : undefined;
+
   const defaultUsername = typeof values.defaultUsername === "string" ? values.defaultUsername.trim() : "";
   if (!defaultUsername) {
     throw new Error("Default SSH Username is required");
@@ -470,12 +489,13 @@ async function parseSourceFormValues(
 
   const { config, secrets } = formValuesToProviderConfig(provider.configFields, values, existingSecretFieldIds);
 
-  return { name, targetFolder, defaultUsername, prunePolicy, config, secrets };
+  return { name, targetFolder, authProfileId, defaultUsername, prunePolicy, config, secrets };
 }
 
 export interface NewInventorySourceInput {
   name: string;
   targetFolder: string;
+  authProfileId?: string;
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
   provider: InventoryProvider;
@@ -501,7 +521,7 @@ async function persistNewInventorySource(
   vault: SecretVault,
   input: NewInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, defaultUsername, prunePolicy, provider, config, secrets } = input;
+  const { name, targetFolder, authProfileId, defaultUsername, prunePolicy, provider, config, secrets } = input;
   const id = randomUUID();
   const passwordFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
 
@@ -553,6 +573,7 @@ async function persistNewInventorySource(
       name,
       targetFolder,
       prunePolicy,
+      authProfileId,
       defaultUsername,
       config,
       secretFieldIds,
@@ -584,6 +605,8 @@ async function persistNewInventorySource(
 export interface UpdatedInventorySourceInput {
   name: string;
   targetFolder: string;
+  /** `undefined` clears an existing link — the field is always written, never merged. */
+  authProfileId?: string;
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
   provider: InventoryProvider;
@@ -610,7 +633,7 @@ async function persistUpdatedInventorySource(
   source: InventorySourceConfig,
   input: UpdatedInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, defaultUsername, prunePolicy, provider, config, reenteredSecrets } = input;
+  const { name, targetFolder, authProfileId, defaultUsername, prunePolicy, provider, config, reenteredSecrets } = input;
   const existingSecretFieldIds = new Set(source.secretFieldIds);
 
   return configMutationLock.runExclusive(async (): Promise<InventorySourceConfig> => {
@@ -668,6 +691,10 @@ async function persistUpdatedInventorySource(
       name,
       targetFolder,
       prunePolicy,
+      // Assigned unconditionally (never spread-guarded): `undefined` is the
+      // form's `(None)` answer and MUST overwrite a previously linked id,
+      // which a conditional spread over `...source` would silently preserve.
+      authProfileId,
       defaultUsername,
       config,
       secretFieldIds: newSecretFieldIds,
@@ -743,8 +770,26 @@ function countJumpHostDependents(allServers: ServerConfig[], removedIds: Readonl
   return allServers.filter((s) => !removedIds.has(s.id) && s.proxy?.type === "ssh" && removedIds.has(s.proxy.jumpHostId)).length;
 }
 
-/** m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync plan for the confirm modal's `detail`. */
-function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[]): string {
+/** The updates whose auth profile actually changes — the retro-apply subset of `plan.updates`. */
+function authProfileSwitches(plan: InventorySyncPlan): Array<{ before: ServerConfig; after: ServerConfig }> {
+  return plan.updates.filter((u) => u.before.authProfileId !== u.after.authProfileId);
+}
+
+/**
+ * m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync
+ * plan for the confirm modal's `detail`.
+ *
+ * `authProfileName` is the name of the profile the plan was computed against —
+ * the caller's `resolveSourceAuthProfile` result for the SAME source snapshot
+ * that produced `plan` (see syncNow's pairing rule). It is a render-time
+ * argument rather than something derived from the plan because the plan carries
+ * only ids and this file's modal copy is names-never-UUIDs (m3).
+ *
+ * Exported for direct unit testing: the nameless-switch branch below is
+ * unreachable through syncNow (every call site pairs plan and resolution), and
+ * a guard that cannot be exercised is a guard nobody can prove still works.
+ */
+export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[], authProfileName?: string): string {
   const lines: string[] = [];
   if (plan.adds.length > 0) {
     const n = plan.adds.length;
@@ -761,6 +806,34 @@ function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[])
   if (plan.updates.length > 0) {
     const n = plan.updates.length;
     lines.push(`${n} server${n === 1 ? "" : "s"} will be updated.`);
+  }
+  // The retro-apply consent line (UX §4). Derived from the plan's own
+  // before/after pairs rather than a dedicated plan field, so it can never
+  // disagree with what `updates` will actually write. It annotates a SUBSET of
+  // the "will be updated" line it sits directly under — the same
+  // subset-annotation placement manualDuplicateCount uses after adds — because
+  // every auth switch is also counted there.
+  //
+  // A switch with no name is unreachable by construction: an update can only
+  // change authProfileId when computeSyncPlan resolved the source's profile,
+  // and every call site passes the resolution produced for the very same source
+  // snapshot as the plan (see resolveSourceAuthProfile's pairing rule in
+  // syncNow). It still renders, namelessly, because the alternative fails
+  // SILENTLY: a future caller that breaks the pairing CONSISTENTLY — no name to
+  // the modal render and none to either drift render — produces matching texts
+  // with no switch line anywhere, so planDetailDrift sees no drift and the
+  // stamps apply with zero disclosure. (Drift only catches the INCONSISTENT
+  // case, where one render has the name and another doesn't.) A line naming no
+  // profile is less useful than one that does, but it is still consent: the
+  // user is told how many servers change auth, and can cancel.
+  const authProfileSwitchCount = authProfileSwitches(plan).length;
+  if (authProfileSwitchCount > 0) {
+    const n = authProfileSwitchCount;
+    lines.push(
+      authProfileName !== undefined
+        ? `${n} server${n === 1 ? "" : "s"} will switch to auth profile "${authProfileName}".`
+        : `${n} server${n === 1 ? "" : "s"} will switch to a different auth profile.`
+    );
   }
   const orphaned = plan.prunes.filter((p) => p.policy === "orphan").length;
   const deleted = plan.prunes.filter((p) => p.policy === "delete").length;
@@ -822,6 +895,49 @@ function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[])
   return lines.join("\n");
 }
 
+/**
+ * The buffer behind the confirm modal's `Show Warnings` button: the plan's own
+ * warnings, plus — whenever the retro-apply rule would move servers onto the
+ * source's auth profile — one line NAMING them. The modal's own detail keeps
+ * the aggregate ("5 servers will switch to auth profile X."); this is where a
+ * fleet-wide switch becomes inspectable instead of merely countable, one click
+ * before Apply.
+ *
+ * EVERY switching server is listed, one per line under a counted heading — not
+ * the count-plus-three-examples of syncEngine.ts's pushSkipSummary. That idiom
+ * fits what it was written for: skipped devices are an aggregate the user acts
+ * on as a group, and the examples exist only to hint at the category. This list
+ * is the opposite — it is the audit of a credential change about to be applied
+ * to named, individually-owned records, and "e.g." is worthless to someone
+ * checking whether one particular server is in the set. The buffer opens as a
+ * scrollable text document (openInventoryIssuesText), so length costs nothing,
+ * and inspectability before Apply is the entire reason the names are here.
+ * Names come from `before`, i.e. what the servers are called in the tree right
+ * now, not what this same sync might rename them to.
+ *
+ * Deliberately NOT pushed into `plan.warnings` by the engine: that array is
+ * also surfaced after a successful apply ("N warnings during sync") and in the
+ * nothing-to-change toast, and a switch the user just consented to is not an
+ * issue to report back to them.
+ */
+function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: string): string[] {
+  const buffer = [...plan.warnings];
+  const switches = authProfileSwitches(plan);
+  if (switches.length > 0) {
+    const n = switches.length;
+    const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "a different auth profile";
+    // Heading keeps the count (the modal's own line is an aggregate too, and the
+    // two must agree at a glance); the colon marks the lines below as belonging
+    // to it, and the indent keeps them from reading as sibling warnings when the
+    // plan also carries engine warnings above.
+    buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
+    for (const u of switches) {
+      buffer.push(`  "${u.before.name}"`);
+    }
+  }
+  return buffer;
+}
+
 /** The set of server ids the plan would actually delete (prune policy "delete"). */
 function deletePruneIds(plan: InventorySyncPlan): Set<string> {
   return new Set(plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id));
@@ -855,12 +971,20 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
 // from the old comparator is dropped as redundant now that the rendered
 // string covers it; this is the one aggregate that isn't fully captured by
 // the text and so earns its own dedicated check for teardown-safety.
+//
+// `nextAuthProfileName` follows the same rule as `nextServers`: it is the
+// resolution taken FRESH alongside `nextPlan`, not the one the shown modal
+// rendered with. That is what makes a mid-modal profile rename (same plan,
+// different name → different text) and a mid-modal profile delete (no
+// resolution → no switch line, plus a dangling-profile warning) both surface
+// as ordinary drift, with no dedicated comparison of their own.
 function planDetailDrift(
   previous: { detail: string; deleteIds: ReadonlySet<string> },
   nextPlan: InventorySyncPlan,
-  nextServers: ServerConfig[]
+  nextServers: ServerConfig[],
+  nextAuthProfileName: string | undefined
 ): { drift: boolean; detail: string } {
-  const nextDetail = describePlanDetail(nextPlan, nextServers);
+  const nextDetail = describePlanDetail(nextPlan, nextServers, nextAuthProfileName);
   if (nextDetail !== previous.detail) {
     return { drift: true, detail: nextDetail };
   }
@@ -874,6 +998,31 @@ function planDetailDrift(
     }
   }
   return { drift: false, detail: nextDetail };
+}
+
+/**
+ * computeSyncPlan is pure and has no core access, so the source's auth profile
+ * is resolved here and handed in — exactly like `now`. Returns `undefined` when
+ * the source has no profile AND when its id no longer names one (a profile
+ * deleted by a build that predates removeAuthProfile's source-ref clearing, or
+ * deleted in the window this sync is running in); the engine turns that second
+ * case into its dangling-profile warning.
+ *
+ * THE PAIRING RULE (extends the FINDING 1 captured-vs-fresh discipline to the
+ * profile): every computeSyncPlan call site calls this immediately before the
+ * call, against the SAME source snapshot it passes as `source`, and the
+ * resulting (plan, resolution) pair travels together to whichever
+ * describePlanDetail / planDetailDrift render belongs to that plan. Resolving
+ * once at sync start and reusing the name for the drift render would compare a
+ * fresh plan against a stale name, so a profile renamed while the confirm modal
+ * is open would be applied under the name the user did NOT consent to.
+ */
+function resolveSourceAuthProfile(core: NexusCore, source: InventorySourceConfig): { id: string; name: string } | undefined {
+  if (source.authProfileId === undefined) {
+    return undefined;
+  }
+  const profile = core.getAuthProfile(source.authProfileId);
+  return profile ? { id: profile.id, name: profile.name } : undefined;
 }
 
 export function registerInventoryCommands(
@@ -961,13 +1110,25 @@ export function registerInventoryCommands(
     // (vault-first, delete-on-persist-failure) still runs to completion
     // exactly as if the panel were still open — the panel's lifecycle plays
     // no part in that sequencing. No closure-local tracking is needed here.
-    const definition = inventorySourceFormDefinition(provider, undefined, mostCommonUsername(core.getSnapshot().servers));
-    WebviewFormPanel.open(`inventory-source-add-${provider.id}`, definition, {
+    const snapshot = core.getSnapshot();
+    const definition = inventorySourceFormDefinition(
+      provider,
+      undefined,
+      mostCommonUsername(snapshot.servers),
+      snapshot.authProfiles
+    );
+    // Same controller/handler triple the server edit form uses
+    // (serverCommands.ts) — the only difference is onAutofill's payload: this
+    // form mirrors the profile's username into `defaultUsername`, not into
+    // `username`/`authType`/`keyPath` (fields it doesn't have).
+    const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
+    const panel = WebviewFormPanel.open(`inventory-source-add-${provider.id}`, definition, {
       onSubmit: async (values) => {
         const parsed = await parseSourceFormValues(values, provider);
         const created = await persistNewInventorySource(core, vault, {
           name: parsed.name,
           targetFolder: parsed.targetFolder,
+          authProfileId: parsed.authProfileId,
           defaultUsername: parsed.defaultUsername,
           prunePolicy: parsed.prunePolicy,
           provider,
@@ -990,13 +1151,27 @@ export function registerInventoryCommands(
           }
         })();
       },
-      onTest: (values) => handleFormTest(values, provider, provider.label)
+      onTest: (values) => handleFormTest(values, provider, provider.label),
+      onCreateInline: inlineAuthProfile.handleCreateInline,
+      onAutofill: async (_key, value) => {
+        const profile = core.getAuthProfile(value);
+        return profile ? { defaultUsername: profile.username } : undefined;
+      }
     });
+    inlineAuthProfile.attachPanel(panel);
   }
 
-  async function editSource(): Promise<void> {
-    const source = await pickInventorySource(core, registry);
-    if (!source) return;
+  // `sourceIdArg` mirrors syncNow's: the manage hub (and any future caller
+  // that already knows which source the user picked) passes the id so the
+  // picker is not shown a second time. Everything below — the busy claim, the
+  // provider-fingerprint gate, the form lifecycle — is downstream of source
+  // selection and is unchanged by this.
+  async function editSource(sourceIdArg?: string): Promise<void> {
+    const source = sourceIdArg ? core.getInventorySource(sourceIdArg) : await pickInventorySource(core, registry);
+    if (!source) {
+      if (sourceIdArg) void vscode.window.showErrorMessage("That inventory source no longer exists.");
+      return;
+    }
     if (inFlightSourceIds.has(source.id)) {
       void vscode.window.showWarningMessage(`"${source.name}" is currently syncing — try again once the sync finishes.`);
       return;
@@ -1103,7 +1278,16 @@ export function registerInventoryCommands(
     }
 
     const existingSecretFieldIds = new Set(source.secretFieldIds);
-    const definition = inventorySourceFormDefinition(provider, source);
+    // LIVE profiles, read here rather than reused from anything captured
+    // earlier: the list both populates the select and decides whether the
+    // seeded `source.authProfileId` survives sanitization, so a stale list
+    // would render a real link as `(None)` and quietly drop it on Save.
+    const definition = inventorySourceFormDefinition(provider, source, undefined, core.getSnapshot().authProfiles);
+    // Holding editSource's busy marker across inline profile creation is
+    // correct and deliberate: creating a profile never touches the source
+    // record, so nothing this controller does can race the edit it is nested
+    // in. The marker machinery below is untouched by this wiring.
+    const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
     let panel: ReturnType<typeof WebviewFormPanel.open>;
     try {
       // F6 — WebviewFormPanel.open can throw synchronously (or reject — see
@@ -1131,6 +1315,7 @@ export function registerInventoryCommands(
             const updated = await persistUpdatedInventorySource(core, vault, source, {
               name: parsed.name,
               targetFolder: parsed.targetFolder,
+              authProfileId: parsed.authProfileId,
               defaultUsername: parsed.defaultUsername,
               prunePolicy: parsed.prunePolicy,
               provider,
@@ -1139,7 +1324,39 @@ export function registerInventoryCommands(
             });
 
             const folderNote = updated.targetFolder !== source.targetFolder ? " Servers move to the new folder on the next sync." : "";
-            void vscode.window.showInformationMessage(`Inventory source "${updated.name}" updated.${folderNote}`);
+            // Only a SET-or-SWITCHED profile earns the suffix and the button.
+            // Clearing to `(None)` deliberately does not: the retro-apply rule
+            // never strips a profile from a server that already has one, so
+            // the next sync would change nothing and the sentence — plus the
+            // Sync Now button under it — would be advertising a no-op.
+            //
+            // The wording is "servers still on the sync default", not "synced
+            // servers", because the rule only adopts servers still carrying
+            // exactly what the sync gave them. On a first-set that is every
+            // untouched synced server; on an A -> B switch it is only the
+            // stragglers the earlier syncs never reached — and promising THOSE
+            // servers a switch would be contradicted by the very next sync's
+            // "nothing to change (N unchanged)". One sentence, true in both.
+            const authNote =
+              updated.authProfileId !== source.authProfileId && updated.authProfileId !== undefined
+                ? " Servers still on the sync default switch to it on the next sync."
+                : "";
+            if (authNote) {
+              // Same detached-toast idiom as addSource's (F1 above): awaiting
+              // a thenable VS Code may auto-hide without resolving would leave
+              // onSubmit pending forever and swallow every later Save.
+              void (async (): Promise<void> => {
+                const choice = await vscode.window.showInformationMessage(
+                  `Inventory source "${updated.name}" updated.${folderNote}${authNote}`,
+                  "Sync Now"
+                );
+                if (choice === "Sync Now") {
+                  await vscode.commands.executeCommand("nexus.inventory.syncNow", updated.id);
+                }
+              })();
+            } else {
+              void vscode.window.showInformationMessage(`Inventory source "${updated.name}" updated.${folderNote}`);
+            }
           })();
           currentSubmit = submitPromise;
           // This `.finally()`/`.catch()` pair is a SECOND, closure-local
@@ -1161,18 +1378,28 @@ export function registerInventoryCommands(
             });
           return submitPromise;
         },
-        onTest: (values) => handleFormTest(values, provider, source.name, source)
+        onTest: (values) => handleFormTest(values, provider, source.name, source),
+        onCreateInline: inlineAuthProfile.handleCreateInline,
+        onAutofill: async (_key, value) => {
+          const profile = core.getAuthProfile(value);
+          return profile ? { defaultUsername: profile.username } : undefined;
+        }
       });
     } catch (error) {
       releaseInFlight();
       throw error;
     }
     panel.onDidDispose(releaseInFlight);
+    inlineAuthProfile.attachPanel(panel);
   }
 
-  async function removeSource(): Promise<void> {
-    const source = await pickInventorySource(core, registry);
-    if (!source) return;
+  /** `sourceIdArg` as in editSource/syncNow — see editSource's note. */
+  async function removeSource(sourceIdArg?: string): Promise<void> {
+    const source = sourceIdArg ? core.getInventorySource(sourceIdArg) : await pickInventorySource(core, registry);
+    if (!source) {
+      if (sourceIdArg) void vscode.window.showErrorMessage("That inventory source no longer exists.");
+      return;
+    }
     if (inFlightSourceIds.has(source.id)) {
       void vscode.window.showWarningMessage(`"${source.name}" is currently syncing — try again once the sync finishes.`);
       return;
@@ -1640,7 +1867,12 @@ export function registerInventoryCommands(
         return;
       }
 
-      let plan = computeSyncPlan({ source, tree, currentServers: core.getSnapshot().servers, now: Date.now() });
+      // PAIRING RULE (see resolveSourceAuthProfile) — resolved immediately
+      // before the call it feeds, against `source`, and reassigned in lockstep
+      // with `plan` at every point below where `plan` itself is reassigned
+      // (the fast-path fall-through and the retry loop).
+      let planAuthProfile = resolveSourceAuthProfile(core, source);
+      let plan = computeSyncPlan({ source, tree, currentServers: core.getSnapshot().servers, now: Date.now(), authProfile: planAuthProfile });
 
       // Nothing to do: apply an empty application to bump lastSyncAt without a confirm modal.
       if (plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0) {
@@ -1666,7 +1898,7 @@ export function registerInventoryCommands(
         // friendly error instead of an unhandled command rejection.
         type FastPathResult =
           | { kind: "done"; plan: InventorySyncPlan; removedEmptyFolderCount: number; source: InventorySourceConfig }
-          | { kind: "not-empty"; plan: InventorySyncPlan }
+          | { kind: "not-empty"; plan: InventorySyncPlan; authProfile: { id: string; name: string } | undefined }
           | { kind: "abort" };
         const fastPathResult: FastPathResult = await configMutationLock.runExclusive(async (): Promise<FastPathResult> => {
           const freshSource = core.getInventorySource(source.id);
@@ -1680,9 +1912,16 @@ export function registerInventoryCommands(
             );
             return { kind: "abort" };
           }
-          const recomputed = computeSyncPlan({ source: freshSource, tree, currentServers: core.getSnapshot().servers, now: Date.now() });
+          const freshAuthProfile = resolveSourceAuthProfile(core, freshSource);
+          const recomputed = computeSyncPlan({
+            source: freshSource,
+            tree,
+            currentServers: core.getSnapshot().servers,
+            now: Date.now(),
+            authProfile: freshAuthProfile
+          });
           if (recomputed.adds.length > 0 || recomputed.updates.length > 0 || recomputed.prunes.length > 0) {
-            return { kind: "not-empty", plan: recomputed };
+            return { kind: "not-empty", plan: recomputed, authProfile: freshAuthProfile };
           }
           try {
             const applyResult = await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
@@ -1731,6 +1970,7 @@ export function registerInventoryCommands(
         // "not-empty" — lock already released above; fall through into the
         // normal confirmation flow below with the freshly recomputed plan.
         plan = fastPathResult.plan;
+        planAuthProfile = fastPathResult.authProfile;
       }
 
       // FINDING 1 — the post-teardown final recompute (below) can turn up a
@@ -1751,7 +1991,7 @@ export function registerInventoryCommands(
       // updated plan, "success" means applyInventorySyncPlan committed.
       type SyncAttempt =
         | { kind: "abort" }
-        | { kind: "retry"; plan: InventorySyncPlan }
+        | { kind: "retry"; plan: InventorySyncPlan; authProfile: { id: string; name: string } | undefined }
         | {
             kind: "success";
             finalPlan: InventorySyncPlan;
@@ -1770,16 +2010,23 @@ export function registerInventoryCommands(
         // plan and the same server snapshot describePlanDetail was called
         // with here, not a re-derived approximation of either.
         const shownServers = core.getSnapshot().servers;
-        const shownDetail = describePlanDetail(plan, shownServers);
+        const shownDetail = describePlanDetail(plan, shownServers, planAuthProfile?.name);
         const shownDeleteIds = deletePruneIds(plan);
-        const buttons = plan.warnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
+        // The button is keyed on the BUFFER, not on plan.warnings: a retro-apply
+        // sync usually carries no engine warnings at all, and without this the
+        // one place that names the servers about to switch would be unreachable
+        // in exactly the case it exists for. Nothing here feeds the drift
+        // comparison — choosing Show Warnings ends the command (below), so the
+        // names are never a consent artifact something later applies against.
+        const shownWarnings = planWarningsBuffer(plan, planAuthProfile?.name);
+        const buttons = shownWarnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
         const choice = await vscode.window.showInformationMessage(
           `Apply inventory sync from "${source.name}"?`,
           { modal: true, detail: shownDetail },
           ...buttons
         );
         if (choice === "Show Warnings") {
-          await openInventoryIssuesText(plan.warnings);
+          await openInventoryIssuesText(shownWarnings);
           return;
         }
         if (choice !== "Apply") return;
@@ -1815,14 +2062,26 @@ export function registerInventoryCommands(
           }
 
           const freshServersForRecompute = core.getSnapshot().servers;
-          const recomputed = computeSyncPlan({ source: freshSource, tree, currentServers: freshServersForRecompute, now: Date.now() });
+          // Resolved FRESH here, inside the lock, against `freshSource` — never
+          // the `planAuthProfile` the modal rendered with. That is the whole
+          // point of the pairing rule: a profile renamed or deleted while the
+          // modal was open changes this render and drifts.
+          const freshAuthProfile = resolveSourceAuthProfile(core, freshSource);
+          const recomputed = computeSyncPlan({
+            source: freshSource,
+            tree,
+            currentServers: freshServersForRecompute,
+            now: Date.now(),
+            authProfile: freshAuthProfile
+          });
           const recomputedDrift = planDetailDrift(
             { detail: shownDetail, deleteIds: shownDeleteIds },
             recomputed,
-            freshServersForRecompute
+            freshServersForRecompute,
+            freshAuthProfile?.name
           );
           if (recomputedDrift.drift) {
-            return { kind: "retry", plan: recomputed };
+            return { kind: "retry", plan: recomputed, authProfile: freshAuthProfile };
           }
 
           const application = planToApplication(recomputed, freshSource);
@@ -1903,7 +2162,16 @@ export function registerInventoryCommands(
           // check inside applyInventorySyncPlan is what still catches the
           // source record itself being replaced during this window.
           const finalServersForRecompute = core.getSnapshot().servers;
-          const finalPlan = computeSyncPlan({ source: freshSource, tree, currentServers: finalServersForRecompute, now: Date.now() });
+          // Resolved fresh again — the teardown loop and the FINDING D vault
+          // re-read above are awaits a profile rename/delete can land inside.
+          const finalAuthProfile = resolveSourceAuthProfile(core, freshSource);
+          const finalPlan = computeSyncPlan({
+            source: freshSource,
+            tree,
+            currentServers: finalServersForRecompute,
+            now: Date.now(),
+            authProfile: finalAuthProfile
+          });
           const finalApplication = planToApplication(finalPlan, freshSource);
 
           // FINDING 1 — compare the post-teardown final recompute's rendered
@@ -1917,7 +2185,8 @@ export function registerInventoryCommands(
           const finalDrift = planDetailDrift(
             { detail: recomputedDrift.detail, deleteIds: deletePruneIds(recomputed) },
             finalPlan,
-            finalServersForRecompute
+            finalServersForRecompute,
+            finalAuthProfile?.name
           );
           if (finalDrift.drift) {
             finalRecomputeMismatchCount++;
@@ -1927,7 +2196,7 @@ export function registerInventoryCommands(
               );
               return { kind: "abort" };
             }
-            return { kind: "retry", plan: finalPlan };
+            return { kind: "retry", plan: finalPlan, authProfile: finalAuthProfile };
           }
 
           // FINDING E — even after the checks above, the source record could
@@ -2048,6 +2317,9 @@ export function registerInventoryCommands(
         if (attempt.kind === "abort") return;
         if (attempt.kind === "retry") {
           plan = attempt.plan;
+          // Reassigned in lockstep with `plan` — the re-shown modal must render
+          // the resolution the retried plan was actually computed against.
+          planAuthProfile = attempt.authProfile;
           continue;
         }
 
@@ -2102,10 +2374,78 @@ export function registerInventoryCommands(
     }
   }
 
+  /**
+   * nexus.inventory.manage — the Settings-tree hub (Settings ▸ Inventory
+   * Sources). Two-level plain showQuickPick that ROUTES into the four
+   * existing, race-guarded commands rather than reimplementing any of them:
+   * no new persistence, no new webview, no new critical section. Level 2
+   * dispatches through vscode.commands.executeCommand (never the local
+   * function) so hub, palette and keybinding invocations share one path — and
+   * always with the source id, so the target command never re-opens a picker
+   * the user has already answered.
+   *
+   * Deliberately NOT here: a "Reapply auth to synced servers" row. Retro-apply
+   * belongs to the sync plan preview and its confirm modal; a second bulk
+   * mutation path bypassing that preview is exactly the rejected option C.
+   */
+  async function manageSources(): Promise<void> {
+    const sources = core.getSnapshot().inventorySources;
+
+    interface SourceHubItem extends vscode.QuickPickItem {
+      source?: InventorySourceConfig;
+      addSource?: boolean;
+    }
+    const rows: SourceHubItem[] = sources.map((source) => ({
+      label: source.name,
+      description: sourceDescription(source, registry),
+      source
+    }));
+    if (rows.length > 0) {
+      rows.push({ label: "", kind: vscode.QuickPickItemKind.Separator });
+    }
+    rows.push({ label: "$(add) Add Inventory Source…", addSource: true });
+
+    const picked = await vscode.window.showQuickPick(rows, {
+      title: "Inventory Sources",
+      // Empty state stays INSIDE the picker: the user is already mid-gesture,
+      // so the add row is the affordance and pickInventorySource's M2d warning
+      // toast ("No inventory sources configured. Add one first.") would be a
+      // dead-end interruption here. That toast still serves the direct
+      // command paths.
+      placeHolder:
+        sources.length === 0
+          ? "No inventory sources yet — add one to sync servers from your infrastructure"
+          : "Choose a source to sync, edit, or remove"
+    });
+    if (!picked) return;
+    if (picked.addSource) {
+      await vscode.commands.executeCommand("nexus.inventory.addSource");
+      return;
+    }
+    const source = picked.source;
+    if (!source) return;
+
+    interface SourceActionItem extends vscode.QuickPickItem {
+      commandId: string;
+    }
+    const actions: SourceActionItem[] = [
+      { label: "$(sync) Sync Now", description: "Fetch devices and preview changes", commandId: "nexus.inventory.syncNow" },
+      { label: "$(edit) Edit…", description: "Change settings, credentials, or the auth profile", commandId: "nexus.inventory.editSource" },
+      { label: "$(trash) Remove…", description: "Choose what happens to its synced servers", commandId: "nexus.inventory.removeSource" }
+    ];
+    const action = await vscode.window.showQuickPick(actions, { title: source.name });
+    if (!action) return;
+    await vscode.commands.executeCommand(action.commandId, source.id);
+  }
+
   return [
     vscode.commands.registerCommand("nexus.inventory.addSource", addSource),
-    vscode.commands.registerCommand("nexus.inventory.editSource", editSource),
-    vscode.commands.registerCommand("nexus.inventory.removeSource", removeSource),
-    vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(typeof arg === "string" ? arg : undefined))
+    // Same arg widening as syncNow's below: a menu/tree invocation hands the
+    // handler its context object, which must fall through to the picker
+    // rather than being read as a source id.
+    vscode.commands.registerCommand("nexus.inventory.editSource", (arg?: unknown) => editSource(typeof arg === "string" ? arg : undefined)),
+    vscode.commands.registerCommand("nexus.inventory.removeSource", (arg?: unknown) => removeSource(typeof arg === "string" ? arg : undefined)),
+    vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(typeof arg === "string" ? arg : undefined)),
+    vscode.commands.registerCommand("nexus.inventory.manage", manageSources)
   ];
 }

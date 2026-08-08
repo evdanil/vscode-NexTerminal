@@ -11,12 +11,20 @@ export interface ComputeSyncPlanInput {
   tree: InventoryTree;
   currentServers: ServerConfig[]; // ALL servers; engine filters by origin itself
   now: number;
+  /**
+   * The auth profile `source.authProfileId` resolves to, already looked up by
+   * the caller — undefined when the source has none, or when the id no longer
+   * names a live profile. Resolution lives in the caller for the same reason
+   * `now` does: this function is pure and has no core access. The engine still
+   * cross-checks the id (see AUTH 1) rather than trusting the pair blindly.
+   */
+  authProfile?: { id: string; name: string };
 }
 
 export interface InventorySyncPlan {
   sourceId: string;
   syncedAt: number;
-  adds: ServerConfig[]; // deterministic ids, authType "agent", origin set
+  adds: ServerConfig[]; // deterministic ids, authType "agent", origin set, source's auth profile linked when it resolves
   updates: Array<{ before: ServerConfig; after: ServerConfig }>; // full replacement objects
   prunes: Array<
     | { policy: "delete"; server: ServerConfig }
@@ -72,6 +80,32 @@ function pushSkipSummary(warnings: string[], reason: string, examples: string[])
 export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan {
   const { source, tree, currentServers, now } = input;
   const warnings: string[] = [...(tree.warnings ?? [])];
+
+  // AUTH 1 — the source names a profile by id; the caller supplies the profile
+  // it resolved to. The engine only accepts the pair when the two agree.
+  //
+  // The cross-check is not redundant. The caller resolves against LIVE core
+  // state, while the plan is computed against a source SNAPSHOT taken at fetch
+  // time (the same snapshot `planToApplication` later hands to
+  // applyInventorySyncPlan as `expectedSource`). If the source's profile was
+  // edited between those two reads, `input.authProfile` describes a profile
+  // this plan is not about, and `source.authProfileId` names one nobody has
+  // proven still exists. Stamping either would write an unverified id onto
+  // every server in the plan. Both mismatch shapes therefore degrade to the
+  // same safe state as a deleted profile: no stamp, plus the warning below —
+  // which is exactly what the source-changed-mid-sync abort in
+  // inventoryCommands is there to catch a beat later anyway.
+  const resolvedProfileId =
+    source.authProfileId !== undefined && input.authProfile?.id === source.authProfileId ? source.authProfileId : undefined;
+  if (source.authProfileId !== undefined && resolvedProfileId === undefined) {
+    // Deliberately unconditional: even a sync with zero adds and zero updates
+    // must say the link is dead, because the source form still shows a profile
+    // selected and nothing else in the sync would contradict it.
+    warnings.push(
+      `The auth profile for "${source.name}" no longer exists — synced servers use the default username with SSH agent authentication. Edit the source to choose another profile.`
+    );
+  }
+
   const adds: ServerConfig[] = [];
   const updates: Array<{ before: ServerConfig; after: ServerConfig }> = [];
   const prunes: InventorySyncPlan["prunes"] = [];
@@ -212,16 +246,149 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         host: endpoint.host,
         port,
         group,
-        origin: { sourceId: source.id, externalId: device.externalId, syncedAt: now }
+        origin: {
+          sourceId: source.id,
+          externalId: device.externalId,
+          syncedAt: now,
+          // AUTH 2a — `syncedUsername` records what the SYNC wrote, so it is
+          // refreshed exactly when this sync writes `username` (the line below:
+          // only when the endpoint supplies one) and otherwise carried forward
+          // from the previous stamp verbatim — including forward as `undefined`
+          // for a server synced before the field existed, which is what keeps
+          // that server on the defaultUsername fallback instead of excluding it.
+          //
+          // The two rejected alternatives, both of which break the rule this
+          // field exists to serve:
+          //   - `syncedUsername: after.username` (or ownedServer.username) —
+          //     records the record's CURRENT value, so the first sync after a
+          //     hand-edit would enshrine the hand-edited username as "what the
+          //     sync stamped" and the sync after that would adopt the server.
+          //     A hand-edit laundered into "untouched" is precisely the hole the
+          //     rule exists to close.
+          //   - `syncedUsername: source.defaultUsername` unconditionally —
+          //     records a value this sync did NOT write onto the record. On a
+          //     pre-existing server whose source default has since been rewritten
+          //     (the profile-mirroring case) it would backfill the NEW default
+          //     over a server still carrying the old one, permanently excluding a
+          //     server the fallback adopts correctly today.
+          // Nothing infers a stamp that was never taken: absent stays absent.
+          syncedUsername: endpoint.username ?? ownedServer.origin?.syncedUsername
+        }
       };
       if (endpoint.username !== undefined) {
         after.username = endpoint.username;
       }
+
+      // AUTH 2 — retro-apply. The single exception to the field-ownership rule
+      // above, and the only reason servers synced before the source had a
+      // profile ever become usable without hand-editing each one.
+      //
+      // The five clauses below admit exactly one state: a source profile that
+      // actually resolves, plus a server still carrying EXACTLY what the add
+      // path stamps (see the adds.push near the end of this loop) — agent auth,
+      // no key, no profile, and the username that sync wrote. That equality is
+      // the whole safety argument — it is what lets the condition mean "created
+      // by this source and never auth-configured since". Each clause carries its
+      // own weight:
+      //
+      //  - resolvedProfileId !== undefined: a source with no profile, or with a
+      //    dangling one, must behave exactly as it did before this feature.
+      //    Drop it and clearing the field to (None) — or deleting the profile —
+      //    would rewrite every synced server instead of leaving them alone.
+      //  - ownedServer.authProfileId === undefined: a server already carrying a
+      //    profile is in a DECIDED state, and a hand-link is indistinguishable
+      //    from one this source stamped. Drop it and the source wins every A->B
+      //    change, silently stomping per-server links (rejected option D).
+      //  - ownedServer.authType === "agent": password/key auth on a synced
+      //    server is a working hand-configuration. Drop it and those servers get
+      //    a profile bolted on that OVERRIDES their credentials at connect time
+      //    (SilentAuthSshFactory resolves the profile before the record's own
+      //    fields), i.e. the fix would break exactly the servers already fixed.
+      //  - ownedServer.keyPath === undefined: "agent" plus an explicit identity
+      //    file is a deliberate agent-with-key setup, not this engine's output.
+      //    Drop it and those get re-pointed at the profile too.
+      //  - ownedServer.username === stampedUsername: the one hand-edit the auth
+      //    clauses cannot see. No shipped provider emits endpoint usernames
+      //    (NetBox does not), so the update path above never overwrites
+      //    `username` and a manual username change survives every later sync
+      //    while leaving the auth fields untouched. Drop this clause and such a
+      //    server is adopted — after which the profile's username OVERRIDES the
+      //    one the user typed, at connect time and invisibly (silentAuth
+      //    resolves the profile before the record's own fields): a hand-edit
+      //    undone by a sync, which is precisely what the other three clauses
+      //    exist to prevent.
+      //
+      // So "every hand-edit escapes" holds only WITH the username clause; the
+      // three auth clauses alone do not detect a username edit.
+      //
+      // `stampedUsername` is what the LAST SYNC WROTE (origin.syncedUsername),
+      // not the source's current `defaultUsername`. Comparing against the
+      // current default was the obvious reading of "still the source's own
+      // default" and it was wrong in the feature's own main flow: choosing an
+      // auth profile on the source form MIRRORS that profile's username into
+      // `defaultUsername` and saves it. So linking a profile whose username
+      // differs from the previous default rewrites the default, and every
+      // already-synced server — untouched, still carrying the OLD default —
+      // stops matching, is not adopted, stays on broken agent auth, and nothing
+      // in the plan preview explains the absence. Recording the stamp moves the
+      // comparison onto a value the user's action cannot move underneath it.
+      //
+      // FALLBACK, and what it means for servers synced by an earlier build:
+      // they carry no `syncedUsername` (the field did not exist), so they fall
+      // back to `source.defaultUsername` — bit-for-bit the previous behavior,
+      // never an exclusion for lacking the field. They therefore keep the
+      // residual gap this change closes for everyone else: if the profile you
+      // link carries a different username than the source's default did, those
+      // specific servers are not adopted and need
+      // `nexus.authProfile.applyToFolder` (or one edit each). And the gap stays
+      // open for them — the update path only writes `syncedUsername` where it
+      // writes `username`, i.e. when the provider supplies an endpoint one, and
+      // no shipped provider does; every server ADDED from here on carries its
+      // stamp from birth, so the population that can hit this is finite and only
+      // ever shrinks.
+      //
+      // Nothing backfills the field for them, and the two obvious backfills are
+      // both worse than the gap. From the record's current username: that value
+      // is exactly what the clause is trying to audit, so trusting it turns
+      // "hand-edited" into "as stamped" on the next run and hands the fleet's
+      // credentials to the profile behind the user's back. From the source's
+      // current `defaultUsername`: on the very servers this is meant to help the
+      // default has ALREADY been rewritten by the profile mirror, so the
+      // backfill writes the new default over a server still carrying the old one
+      // and excludes it permanently — turning a gap that a folder-level
+      // Apply Auth Profile fixes into one nothing fixes.
+      //
+      // What none of this catches, by design: a WORKING agent-auth server whose
+      // username still matches — indistinguishable from a never-configured one.
+      // It is adopted, and the plan-preview modal disclosing the switch (plus
+      // the named list behind Show Warnings) is what makes that consented to
+      // rather than silent.
+      //
+      // If the add path's defaults ever change, this condition must change with
+      // it or retro-apply stops matching its own output.
+      const stampedUsername = ownedServer.origin?.syncedUsername ?? source.defaultUsername;
+      if (
+        resolvedProfileId !== undefined &&
+        ownedServer.authProfileId === undefined &&
+        ownedServer.authType === "agent" &&
+        ownedServer.keyPath === undefined &&
+        ownedServer.username === stampedUsername
+      ) {
+        after.authProfileId = resolvedProfileId;
+      }
+
+      // AUTH 3 — authProfileId joins the comparison because a retro-apply stamp
+      // can be the ONLY difference between `before` and `after` (the device
+      // itself is usually identical on the sync that first carries a profile).
+      // Without this clause the stamp above is computed and then discarded as
+      // "unchanged": the servers stay broken and unchangedCount lies to the
+      // plan-preview modal about what the sync is doing.
       const changed =
         ownedServer.name !== after.name ||
         ownedServer.host !== after.host ||
         ownedServer.port !== after.port ||
         ownedServer.group !== after.group ||
+        ownedServer.authProfileId !== after.authProfileId ||
         (endpoint.username !== undefined && ownedServer.username !== after.username);
       if (changed) {
         updates.push({ before: ownedServer, after });
@@ -258,9 +425,24 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       port,
       username: endpoint.username ?? source.defaultUsername,
       authType: "agent",
+      // The LINK only — never the profile's username/authType/keyPath. Those
+      // are resolved fresh at connect time, so a profile edit reaches every
+      // server it owns; a copy taken here would rot the moment the profile
+      // changed. `authType: "agent"` above stays inert while the link holds and
+      // is the exact fallback if the profile is later deleted, which is why it
+      // is still stamped unconditionally. Undefined when the source has no
+      // profile or its reference is dangling (AUTH 1) — the pre-feature record,
+      // field for field.
+      authProfileId: resolvedProfileId,
       isHidden: false,
       group,
-      origin: { sourceId: source.id, externalId: device.externalId, syncedAt: now }
+      // `syncedUsername` mirrors the `username` two lines above — the value this
+      // sync is writing onto the record, which is what makes a later
+      // "still exactly what I stamped" comparison possible (AUTH 2). Recorded
+      // UNCONDITIONALLY, whether or not the source has a profile today: a source
+      // that gains one later must find the stamp already there, and a source that
+      // never gains one pays nothing for carrying it.
+      origin: { sourceId: source.id, externalId: device.externalId, syncedAt: now, syncedUsername: endpoint.username ?? source.defaultUsername }
     });
     if (group !== undefined) {
       folderSet.add(group);
