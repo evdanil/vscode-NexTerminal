@@ -10,6 +10,7 @@ import {
 import type { FormDefinition, FormFieldDescriptor } from "../../src/ui/formTypes";
 import type { InventoryProvider, InventorySourceConfig } from "../../src/models/inventory";
 import type { AuthProfile } from "../../src/models/config";
+import { authProfileOwnedCredentials } from "../../src/models/config";
 import { formatAuthProfileLabel } from "../../src/utils/authProfileLabel";
 
 function keyedField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { key: string }> {
@@ -467,6 +468,54 @@ describe("inventorySourceFormDefinition", () => {
       expect(filledKeys(inventorySourceFormDefinition(fakeProvider, undefined, undefined, authProfiles))).toEqual([]);
       expect(filledKeys(inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: "ghost" }), undefined, authProfiles)))
         .toEqual([]);
+    });
+
+    /**
+     * REVIEW FINDING (P2) — the seed is a DERIVATION of the shared ownership
+     * rule (`authProfileOwnedCredentials`, models/config.ts), not a second
+     * opinion about it. The connect path and the save path read that same rule,
+     * so pinning the seed to it here is what stops the three drifting apart
+     * again — which is exactly how both findings on this branch arose.
+     */
+    it("is the shared ownership rule, key for key, on both forms that render the select", () => {
+      const cases: AuthProfile[] = [
+        { id: "c1", name: "Password", username: "root", authType: "password" },
+        { id: "c2", name: "Key", username: "root", authType: "key", keyPath: "/keys/id" },
+        { id: "c3", name: "Imported blank", username: "   ", authType: "password" },
+        { id: "c4", name: "Keyless key", username: "root", authType: "key" },
+        { id: "c5", name: "Padded", username: "  bob  ", authType: "key", keyPath: "   " }
+      ];
+
+      for (const profile of cases) {
+        const owned = authProfileOwnedCredentials(profile);
+        // The order is the webview lock loop's own managedKeys order, and
+        // `defaultUsername` is the inventory source form's name for the very
+        // username key the server form calls `username`.
+        const expected = [
+          ...(owned.username !== undefined ? ["username"] : []),
+          ...(owned.authType !== undefined ? ["authType"] : []),
+          ...(owned.keyPath !== undefined ? ["keyPath"] : []),
+          ...(owned.username !== undefined ? ["defaultUsername"] : [])
+        ];
+
+        expect(
+          filledKeys(inventorySourceFormDefinition(fakeProvider, sourceSeed({ authProfileId: profile.id }), undefined, [profile])),
+          `inventory source form seed for ${profile.name}`
+        ).toEqual(expected);
+
+        const serverDefinition = serverFormDefinition(
+          { id: "s1", name: "S", host: "h", port: 22, username: "stored", authType: "password", isHidden: false, authProfileId: profile.id },
+          [],
+          false,
+          [],
+          [profile]
+        );
+        const serverField = keyedField(serverDefinition, "authProfileId");
+        expect(
+          serverField.type === "select" ? serverField.autofillFilledKeys : undefined,
+          `server form seed for ${profile.name}`
+        ).toEqual(expected);
+      }
     });
   });
 });

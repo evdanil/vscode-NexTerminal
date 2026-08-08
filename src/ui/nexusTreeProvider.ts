@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
-import { resolveSerialProfileMode, type ActiveLocalShellSession, type ActiveSerialSession, type ActiveSession, type AuthProfile, type LocalShellProfile, type ProxyConfig, type SerialProfile, type SerialSessionStatus, type ServerConfig } from "../models/config";
+import { authProfileOwnedCredentials, resolveSerialProfileMode, type ActiveLocalShellSession, type ActiveSerialSession, type ActiveSession, type AuthProfile, type LocalShellProfile, type ProxyConfig, type SerialProfile, type SerialSessionStatus, type ServerConfig } from "../models/config";
 import { getAncestorPaths, folderDisplayName, isDescendantOrSelf, parentPath as folderParentPath } from "../utils/folderPaths";
 import { toParityCode } from "../utils/helpers";
 import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
@@ -587,7 +587,21 @@ export class NexusTreeProvider
     const syncedSourceName = server.origin
       ? this.snapshot.inventorySources.find((source) => source.id === server.origin!.sourceId)?.name
       : undefined;
-    return new ServerTreeItem(server, connected, lookup, showDesc, authProfile?.name, authProfile?.username, syncedSourceName);
+    // REVIEW FINDING (P2) — the username shown is the one a connection will
+    // actually use, resolved through the shared ownership rule
+    // (`authProfileOwnedCredentials`, models/config.ts). Reading
+    // `authProfile.username` directly showed an imported profile's
+    // whitespace-only username as the server's, rendering "@host:22" in the
+    // label and tooltip while the connection uses the server's own username.
+    return new ServerTreeItem(
+      server,
+      connected,
+      lookup,
+      showDesc,
+      authProfile?.name,
+      authProfileOwnedCredentials(authProfile).username,
+      syncedSourceName
+    );
   }
 
   private toSerialProfileItem(profile: SerialProfile): SerialProfileTreeItem {

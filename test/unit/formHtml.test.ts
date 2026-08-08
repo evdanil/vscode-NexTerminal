@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { renderFormHtml } from "../../src/ui/formHtml";
 import type { FormDefinition } from "../../src/ui/formTypes";
-import { inventorySourceFormDefinition, tunnelFormDefinition } from "../../src/ui/formDefinitions";
+import { inventorySourceFormDefinition, serverFormDefinition, tunnelFormDefinition } from "../../src/ui/formDefinitions";
+import type { AuthProfile } from "../../src/models/config";
+import { authProfileOwnedCredentials } from "../../src/models/config";
 
 describe("renderFormHtml", () => {
   it("renders text fields with labels", () => {
@@ -732,6 +734,53 @@ describe("renderFormHtml", () => {
     it("does not record a key whose supplied value is blank (kills trusting the payload verbatim: the server and unified profile forms' mirrors send profile.username unfiltered, so an imported whitespace-only username would lock a required field onto a value no login can use)", () => {
       const record = extractFilledKeysFromValues(run);
       expect(record({ username: "   ", authType: "password" })).toEqual({ authType: true });
+    });
+
+    /**
+     * REVIEW FINDING (P2) — the webview keeps its OWN copy of the ownership
+     * rule, because it cannot import the TypeScript one: `filledKeysFromValues`
+     * is a hand-written mirror of `authProfileOwnedCredentials`
+     * (models/config.ts). This is the explicit cross-check on that duplication:
+     * a payload built from the shared rule — which is exactly what the two
+     * mirrors send (`authProfileCredentialMirror` in serverCommands.ts,
+     * `authProfileUsernameMirror` in inventoryCommands.ts, each tested against
+     * the rule on their own side) — must produce the same record the render
+     * seeded from `authProfileFilledKeys` (ui/formDefinitions.ts). If either
+     * copy drifts, one of these profiles disagrees.
+     */
+    it("rebuilds exactly the ownership record the render seeded, for a payload shaped by the shared rule (the explicit cross-check on the webview's hand-written copy of it)", () => {
+      const record = extractFilledKeysFromValues(run);
+      const seed = extractSeededProfileFilledKeys(run);
+      const profiles: AuthProfile[] = [
+        { id: "c1", name: "Password", username: "root", authType: "password" },
+        { id: "c2", name: "Key", username: "root", authType: "key", keyPath: "/keys/id" },
+        { id: "c3", name: "Imported blank", username: "   ", authType: "password" },
+        { id: "c4", name: "Keyless key", username: "root", authType: "key" },
+        { id: "c5", name: "Padded", username: "  bob  ", authType: "key", keyPath: "   " }
+      ];
+
+      for (const profile of profiles) {
+        // The payload the mirrors send: the owned credentials, verbatim.
+        const owned = authProfileOwnedCredentials(profile);
+        // The seed the render emits for the same profile, via the server form's
+        // authProfileId select.
+        const definition = serverFormDefinition(
+          { id: "s1", name: "S", host: "h", port: 22, username: "stored", authType: "password", isHidden: false, authProfileId: profile.id },
+          [],
+          false,
+          [],
+          [profile]
+        );
+        const select = definition.fields.find(
+          (f): f is Extract<typeof f, { type: "select" }> => "key" in f && f.key === "authProfileId" && f.type === "select"
+        )!;
+        const seeded = seed(makeSeedDom(JSON.stringify(select.autofillFilledKeys)));
+        // `defaultUsername` is the inventory source form's alias for the same
+        // username key; the server form's payload never carries it.
+        delete seeded.defaultUsername;
+
+        expect(record(owned as Record<string, unknown>), `webview record for ${profile.name}`).toEqual(seeded);
+      }
     });
   });
 

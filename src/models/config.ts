@@ -408,6 +408,63 @@ export interface AuthProfile {
   // Key passphrase stored in SecretVault under "auth-profile-passphrase-{id}"
 }
 
+/**
+ * The credential fields a linked auth profile can take over on a server —
+ * every key present is one the profile SUPPLIES, carrying the exact value it
+ * supplies. A key that is absent is one the server keeps for itself.
+ */
+export type AuthProfileOwnedCredentials = Partial<Pick<ServerConfig, "username" | "authType" | "keyPath">>;
+
+/**
+ * REVIEW FINDING (P2) — THE ONE RULE for "which credential fields does this
+ * auth profile actually own?", shared verbatim by all three layers that had
+ * each been answering it their own way:
+ *
+ *   * the CONNECT path — `SilentAuthSshFactory.resolveServer` spreads this
+ *     over the server, so an unowned field keeps the server's own value
+ *     instead of being blanked by the profile;
+ *   * the SAVE path — `preserveLinkedServerCredentials` (serverCommands.ts)
+ *     restores ONLY the owned keys from the stored record, so an edit the form
+ *     legitimately permitted survives Save;
+ *   * the FORM path — `authProfileFilledKeys` (ui/formDefinitions.ts) seeds the
+ *     webview's `profileFilledKeys` from this, and the two `onAutofill` mirrors
+ *     (`authProfileCredentialMirror` in serverCommands.ts,
+ *     `authProfileUsernameMirror` in inventoryCommands.ts) send exactly these
+ *     keys, so the webview's own runtime record (`filledKeysFromValues`, which
+ *     independently drops blanks) lands on the same set by construction.
+ *
+ * THE RULE: a profile owns a field only when it supplies a USABLE value for
+ * it. Blank and whitespace-only are not usable values — a whitespace username
+ * is reachable through an imported backup (`validateAuthProfile` only checks
+ * length; the profile editor trims and refuses blanks), and a `key` profile
+ * with no `keyPath` is reachable through the editor itself. Owning such a
+ * field means overwriting a working credential with one no SSH login can use,
+ * locking the form control that could repair it, and reverting the repair if
+ * the control was unlocked anyway. `authType` is a closed enum that is never
+ * blank, so it is always owned.
+ *
+ * Values are returned TRIMMED, matching what the profile editor stores and
+ * what `authProfileUsernameMirror`/`fallbackUsernameForSource` already showed
+ * and saved — so what a form displays is bit-identical to what a connection
+ * uses. An `undefined` profile (no link, or an id that resolves to nothing)
+ * owns nothing; the caller's own value stands everywhere.
+ */
+export function authProfileOwnedCredentials(profile: AuthProfile | undefined): AuthProfileOwnedCredentials {
+  if (!profile) {
+    return {};
+  }
+  const owned: AuthProfileOwnedCredentials = { authType: profile.authType };
+  const username = profile.username.trim();
+  if (username !== "") {
+    owned.username = username;
+  }
+  const keyPath = (profile.keyPath ?? "").trim();
+  if (keyPath !== "") {
+    owned.keyPath = keyPath;
+  }
+  return owned;
+}
+
 export function resolveTunnelType(profile: TunnelProfile): TunnelType {
   return profile.tunnelType ?? "local";
 }

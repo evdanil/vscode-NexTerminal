@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { AuthProfile } from "../../src/models/config";
+import { authProfileOwnedCredentials } from "../../src/models/config";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { validateAuthProfile } from "../../src/utils/validation";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
@@ -46,6 +47,54 @@ describe("validateAuthProfile", () => {
 
   it("rejects non-object", () => {
     expect(validateAuthProfile("string")).toBe(false);
+  });
+});
+
+/**
+ * REVIEW FINDING (P2) — THE ONE RULE the connect path
+ * (`SilentAuthSshFactory.resolveServer`), the save path
+ * (`preserveLinkedServerCredentials`) and the form path
+ * (`authProfileFilledKeys` + the two `onAutofill` mirrors) all read. Before it
+ * existed each answered "which fields does this profile own?" separately, and
+ * the two P2 findings on this branch were two of those answers disagreeing.
+ */
+describe("authProfileOwnedCredentials — the shared field-ownership rule", () => {
+  it("owns every field it supplies a usable value for", () => {
+    expect(authProfileOwnedCredentials(makeAuthProfile({ authType: "key", keyPath: "/keys/id" }))).toEqual({
+      username: "root",
+      authType: "key",
+      keyPath: "/keys/id"
+    });
+  });
+
+  it("does NOT own a whitespace-only username — the imported-backup case validateAuthProfile lets through, which is why it accepts one two tests up", () => {
+    const profile = makeAuthProfile({ username: "   " });
+    expect(validateAuthProfile(profile)).toBe(true); // reachable, therefore load-bearing
+    expect(authProfileOwnedCredentials(profile)).toEqual({ authType: "password" });
+  });
+
+  it("does NOT own a key path a key profile does not carry — absent or blank alike", () => {
+    expect(authProfileOwnedCredentials(makeAuthProfile({ authType: "key" }))).toEqual({
+      username: "root",
+      authType: "key"
+    });
+    expect(authProfileOwnedCredentials(makeAuthProfile({ authType: "key", keyPath: "  " }))).toEqual({
+      username: "root",
+      authType: "key"
+    });
+  });
+
+  it("always owns authType — a closed enum that is never blank", () => {
+    expect(authProfileOwnedCredentials(makeAuthProfile({ username: " ", authType: "agent" })).authType).toBe("agent");
+  });
+
+  it("hands back trimmed values, so a form's display and a connection's config cannot differ", () => {
+    expect(authProfileOwnedCredentials(makeAuthProfile({ username: "  bob  ", authType: "key", keyPath: " /keys/id " })))
+      .toEqual({ username: "bob", authType: "key", keyPath: "/keys/id" });
+  });
+
+  it("owns nothing for no profile — an unlinked server, or an id that resolves to nothing", () => {
+    expect(authProfileOwnedCredentials(undefined)).toEqual({});
   });
 });
 

@@ -1,5 +1,5 @@
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
-import { resolveTunnelType } from "../models/config";
+import { authProfileOwnedCredentials, resolveTunnelType } from "../models/config";
 import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues } from "../models/inventory";
 import { ORPHAN_FOLDER_NAME } from "../services/inventory/syncEngine";
 import { formatAuthProfileLabel } from "../utils/authProfileLabel";
@@ -28,34 +28,34 @@ interface AuthProfileSelectOptions {
  * whether the linked profile put them there; it has to be told, and only this
  * side knows the profile.
  *
- * ONE RULE, shared with the two runtime mirrors this seeds for: a profile owns
- * a managed key only when it has a usable (non-blank) value for it.
- *   * `username` / `defaultUsername` \u2014 the server and unified profile forms'
- *     `onAutofill` sends `profile.username`, the inventory source form's
- *     `authProfileUsernameMirror` sends it as `defaultUsername` and answers
- *     `{}` when it is blank. The webview drops blank values on arrival, so
- *     both agree with the blank test below.
- *   * `authType` \u2014 always sent by the forms that render it, and never blank.
- *   * `keyPath` \u2014 sent only when the profile has one.
+ * Derived from THE ONE RULE (`authProfileOwnedCredentials`, models/config.ts),
+ * the same one the connect path and the save path read, so the three can never
+ * drift apart again. The runtime mirrors this seed stands in for until the
+ * first autofill answers \u2014 `authProfileCredentialMirror` (serverCommands.ts)
+ * and `authProfileUsernameMirror` (inventoryCommands.ts) \u2014 send exactly the
+ * owned keys, so the webview's own record (`filledKeysFromValues`, which
+ * independently drops blanks) rebuilds this same set.
+ *
+ * `defaultUsername` is the inventory source form's name for the username the
+ * profile supplies; the server and unified profile forms call it `username`.
  * Keys a form does not render are skipped by the lock loop, so one list serves
  * every form that renders this select (the same arrangement as its
- * `managedKeys`).
+ * `managedKeys`) \u2014 and the list is emitted in that loop's own order so the
+ * two read together.
  */
 function authProfileFilledKeys(profile: AuthProfile | undefined): string[] {
-  if (!profile) {
-    return [];
-  }
-  // Listed in the webview's own managedKeys order, so the two read together.
-  const hasUsername = profile.username.trim() !== "";
+  const owned = authProfileOwnedCredentials(profile);
   const keys: string[] = [];
-  if (hasUsername) {
+  if (owned.username !== undefined) {
     keys.push("username");
   }
-  keys.push("authType");
-  if ((profile.keyPath ?? "").trim() !== "") {
+  if (owned.authType !== undefined) {
+    keys.push("authType");
+  }
+  if (owned.keyPath !== undefined) {
     keys.push("keyPath");
   }
-  if (hasUsername) {
+  if (owned.username !== undefined) {
     keys.push("defaultUsername");
   }
   return keys;

@@ -805,6 +805,27 @@ describe("NexusTreeProvider description visibility", () => {
     expect(server!.tooltip).toContain("[auth: Production Auth]");
   });
 
+  // REVIEW FINDING (P2) — the sidebar reads a linked profile's username through
+  // the shared ownership rule, so it names the account a connection will
+  // actually use. Reading `authProfile.username` directly rendered an imported
+  // profile's whitespace-only username, i.e. "@example.com" with no account at
+  // all, over a server that connects perfectly well as its own user.
+  it("shows the server's own username when the linked profile supplies only whitespace (kills displaying the profile's username on the strength of the link alone)", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: (key: string) => key === "showTreeDescriptions" ? true : undefined
+    } as any);
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer({ authProfileId: "ap-blank", username: "stored-user" })],
+      authProfiles: [{ id: "ap-blank", name: "Imported", username: "   ", authType: "password" }]
+    });
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    const server = children.find((c) => c instanceof ServerTreeItem);
+    expect(server!.description).toBe("stored-user@example.com (Imported)");
+    expect(server!.tooltip).toContain("stored-user@example.com:22");
+  });
+
   it("m7 — resolves the synced tooltip's source name from snapshot.inventorySources by origin.sourceId, and falls back to the generic line when the source is gone (kills a hardcoded 'Synced from inventory' that never looks at the source record)", () => {
     vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
       get: (key: string) => (key === "showTreeDescriptions" ? true : undefined)

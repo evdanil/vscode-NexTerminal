@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
 import type { AuthProfile, ServerConfig } from "../models/config";
+import { authProfileOwnedCredentials } from "../models/config";
 import {
   computeProviderFingerprint,
   InventoryProviderError,
@@ -590,28 +591,34 @@ const MISSING_AUTH_PROFILE_MESSAGE = "The selected auth profile no longer exists
  * the invariant unconditional and enforceable rather than dependent on webview
  * timing.
  *
- * The trim mirrors parseSourceFormValues' own treatment of the field, so the
- * derived value is bit-identical to what a completed mirror would have posted.
- * A profile whose username is whitespace-only (reachable only through an
- * imported backup — the profile editor trims and rejects blanks) falls back to
- * the submitted username, which the parser already proved non-empty: a stored
- * empty `defaultUsername` fails validateInventorySource and would take the
- * whole source record down with it at the next load.
+ * WHICH username is derived is THE ONE RULE (`authProfileOwnedCredentials`,
+ * models/config.ts): the profile's, when it supplies a usable one — trimmed,
+ * exactly as parseSourceFormValues treats the field, so the derived value is
+ * bit-identical to what a completed mirror would have posted. A profile whose
+ * username is whitespace-only (reachable only through an imported backup — the
+ * profile editor trims and rejects blanks) supplies none, so the submitted
+ * username stands, which the parser already proved non-empty: a stored empty
+ * `defaultUsername` fails validateInventorySource and would take the whole
+ * source record down with it at the next load.
  *
  * REVIEW FINDING (P2) — that blank-profile branch is DEFENCE IN DEPTH, not the
- * primary handling. The mirror itself now declines to fill a blank username
+ * primary handling. The mirror itself declines to fill a blank username
  * (authProfileUsernameMirror), so the form always submits a username the user
  * can see and edit; this branch covers the submissions that reach here with no
  * completed mirror behind them — Save clicked before the round trip returned,
  * which is the same race the whole helper exists for. It is deliberately kept:
  * derivation must be total, because the alternative is storing a whitespace
  * (or empty) `defaultUsername` that no SSH login can use.
+ *
+ * REVIEW FINDING (P2) — and the fallback it stores is now HONOURED rather than
+ * quietly discarded. `SilentAuthSshFactory.resolveServer` used to overwrite
+ * every synced server's username with the profile's own whitespace, so this
+ * valid fallback reached the record and was then ignored at connect time; it
+ * reads the same rule now, so a profile that supplies no username leaves the
+ * username this helper chose in place.
  */
 function fallbackUsernameForSource(profile: AuthProfile | undefined, submittedUsername: string): string {
-  if (profile === undefined) {
-    return submittedUsername;
-  }
-  return profile.username.trim() || submittedUsername;
+  return authProfileOwnedCredentials(profile).username ?? submittedUsername;
 }
 
 /**
@@ -646,17 +653,19 @@ function fallbackUsernameForSource(profile: AuthProfile | undefined, submittedUs
  * to no profile at all (deleted while the form sat open), where touching the
  * form would be guessing.
  *
- * The username is trimmed, matching `parseSourceFormValues` and
- * `fallbackUsernameForSource`: what the mirror shows is then bit-identical to
- * what the save stores.
+ * Whether there is a username to mirror, and its trimmed form, both come from
+ * THE ONE RULE (`authProfileOwnedCredentials`, models/config.ts) — the same
+ * one `fallbackUsernameForSource` derives the stored value from and the same
+ * one `authProfileFilledKeys` seeds the lock from, so what the mirror shows,
+ * what the save stores, and what the form locks cannot disagree.
  */
 function authProfileUsernameMirror(core: NexusCore, profileId: string): Record<string, string> | undefined {
   const profile = core.getAuthProfile(profileId);
   if (!profile) {
     return undefined;
   }
-  const username = profile.username.trim();
-  return username ? { defaultUsername: username } : {};
+  const username = authProfileOwnedCredentials(profile).username;
+  return username !== undefined ? { defaultUsername: username } : {};
 }
 
 export interface NewInventorySourceInput {

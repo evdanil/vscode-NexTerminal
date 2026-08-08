@@ -9,7 +9,8 @@ import {
 } from "../../src/services/inventory/syncEngine";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
-import type { ServerConfig } from "../../src/models/config";
+import type { AuthProfile, ServerConfig } from "../../src/models/config";
+import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../src/models/inventory";
 
 function makeSource(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
@@ -838,6 +839,55 @@ describe("computeSyncPlan — auth profile link", () => {
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.unchangedCount).toBe(1);
+  });
+
+  /**
+   * REVIEW FINDING (P2) — the END-TO-END consequence, across the two layers
+   * that used to disagree. The sync deliberately writes the SOURCE's default
+   * username onto every server it creates and only LINKS the profile; the
+   * connect path then substituted the profile's username over the top. For a
+   * profile whose username is whitespace (imported backup — validateAuthProfile
+   * checks length, not content), that discarded the very fallback
+   * `fallbackUsernameForSource` had stored for exactly this profile and offered
+   * whitespace to the SSH server instead. Asserting the plan alone would not
+   * have caught it: the plan was always right.
+   */
+  it("a server this sync creates connects as the username the sync wrote, even when the linked profile's own username is whitespace", async () => {
+    const blankProfile: AuthProfile = { id: "p1", name: "Imported", username: "   ", authType: "password" };
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "labuser" });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice()]),
+      currentServers: [],
+      now: 1000,
+      authProfile: { id: blankProfile.id, name: blankProfile.name }
+    });
+
+    const created = plan.adds[0];
+    expect(created.username).toBe("labuser");
+    expect(created.authProfileId).toBe("p1");
+
+    const connection = {
+      openShell: () => undefined, openDirectTcp: () => undefined, openSftp: () => undefined, exec: () => undefined,
+      requestForwardIn: () => undefined, cancelForwardIn: () => undefined,
+      onTcpConnection: () => () => undefined, onClose: () => () => undefined,
+      getBanner: () => undefined, dispose: () => undefined
+    };
+    const connectCalls: ServerConfig[] = [];
+    const factory = new SilentAuthSshFactory(
+      { connect: async (server: ServerConfig) => { connectCalls.push(server); return connection; } } as never,
+      { get: async () => undefined, store: async () => undefined, delete: async () => undefined } as never,
+      { prompt: async () => ({ password: "typed", save: false }) } as never,
+      undefined,
+      (id: string) => (id === "p1" ? blankProfile : undefined)
+    );
+
+    await factory.connect(created);
+
+    expect(connectCalls[0].username).toBe("labuser");
+    // The auth type IS supplied by the profile, so the link still does its job:
+    // this is what stops synced servers landing on SSH agent auth.
+    expect(connectCalls[0].authType).toBe("password");
   });
 });
 
