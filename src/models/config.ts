@@ -334,6 +334,26 @@ export interface DetachedServerOrigin {
   detachedAt: number;
 }
 
+/** Scheme "Open BMC Web Console" opens a BMC's web UI with. See `ServerConfig.bmcWebProtocol`. */
+export type BmcWebProtocol = "https" | "http";
+
+export const BMC_WEB_PROTOCOLS: readonly BmcWebProtocol[] = ["https", "http"];
+
+/**
+ * The scheme a BMC web console open ACTUALLY uses, applied at every read site
+ * (the untrusted-field discipline `resolveMacroRunTarget` set): absent, a
+ * non-string, or anything outside the two literals resolves to `"https"` — the
+ * compatibility default, and the safe one. `"http"` is the only value that can
+ * downgrade the scheme, and only when it is spelled exactly.
+ *
+ * Interpolating the stored value into the URL instead would let an imported
+ * record choose the scheme string outright, which is a different (and much
+ * larger) question than "http or https".
+ */
+export function resolveBmcWebProtocol(server: Pick<ServerConfig, "bmcWebProtocol">): BmcWebProtocol {
+  return (server.bmcWebProtocol as unknown) === "http" ? "http" : "https";
+}
+
 export interface ServerConfig {
   id: string;
   name: string;
@@ -360,6 +380,42 @@ export interface ServerConfig {
    * untouched (servers are stored as whole objects under `nexus.servers`).
    */
   ipmiHost?: string;
+  /**
+   * The auth profile whose username and stored password are the BMC's
+   * credentials — the SAME `AuthProfile` store `authProfileId` uses, linked
+   * from a second field rather than modelled as a second concept (an IPMI
+   * credential IS a username + password pair, and the org-wide "one universal
+   * BMC credential" shape this exists for is one profile linked from many
+   * servers).
+   *
+   * Resolved at RUN time, never copied onto the server: `${profile.ipmiUsername}`
+   * reads the profile's `username`, and the password is read from the vault
+   * under `authProfilePasswordSecretKey(id)` at the moment a run needs it.
+   * Only those two are read — `authType` and `keyPath` mean nothing on this
+   * link, so a `key`/`agent` profile is accepted and simply supplies a username.
+   *
+   * Cleared alongside `authProfileId` wherever a profile is DELETED
+   * (`NexusCore.removeAuthProfile`, the backup-import dangling sweep in
+   * commands/configCommands.ts) — a link naming a profile that no longer exists
+   * resolves to nothing on every run, with nothing on screen to say why.
+   */
+  ipmiAuthProfileId?: string;
+  /**
+   * Scheme for "Open BMC Web Console". ABSENT MEANS `"https"` — the safe
+   * default, and what every record written before this field existed implies.
+   * Plenty of older iDRAC/iLO/IPMI cards serve their UI on plain HTTP and have
+   * no TLS listener at all, which is the whole reason this is a field rather
+   * than a hard-coded scheme.
+   *
+   * UNTRUSTED at every read site, like `TerminalMacro.runIn`: go through
+   * `resolveBmcWebProtocol()`, never a direct read, so a `"HTTPS"`/`"ftp"`/
+   * non-string from a hand-edited backup can neither choose the scheme nor
+   * reach a URL.
+   *
+   * Never written by inventory sync — there is no stamp and no matrix row for
+   * it; it is a fact about the hardware the user states once.
+   */
+  bmcWebProtocol?: BmcWebProtocol;
   openFileExplorerOnFirstConnect?: boolean;
   proxy?: ProxyConfig;
   authProfileId?: string;  // references AuthProfile.id; credentials resolved at connection time
@@ -534,6 +590,8 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.multiplexing === b.multiplexing &&
     a.legacyAlgorithms === b.legacyAlgorithms &&
     a.ipmiHost === b.ipmiHost &&
+    a.ipmiAuthProfileId === b.ipmiAuthProfileId &&
+    a.bmcWebProtocol === b.bmcWebProtocol &&
     a.openFileExplorerOnFirstConnect === b.openFileExplorerOnFirstConnect &&
     a.authProfileId === b.authProfileId &&
     proxyConfigsEqual(a.proxy, b.proxy) &&
@@ -579,6 +637,8 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   if (current.multiplexing !== batchSnapshot.multiplexing) merged.multiplexing = current.multiplexing;
   if (current.legacyAlgorithms !== batchSnapshot.legacyAlgorithms) merged.legacyAlgorithms = current.legacyAlgorithms;
   if (current.ipmiHost !== batchSnapshot.ipmiHost) merged.ipmiHost = current.ipmiHost;
+  if (current.ipmiAuthProfileId !== batchSnapshot.ipmiAuthProfileId) merged.ipmiAuthProfileId = current.ipmiAuthProfileId;
+  if (current.bmcWebProtocol !== batchSnapshot.bmcWebProtocol) merged.bmcWebProtocol = current.bmcWebProtocol;
   if (current.openFileExplorerOnFirstConnect !== batchSnapshot.openFileExplorerOnFirstConnect) {
     merged.openFileExplorerOnFirstConnect = current.openFileExplorerOnFirstConnect;
   }

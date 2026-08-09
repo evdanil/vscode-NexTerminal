@@ -3,7 +3,7 @@ import { InventorySourceRemovalMismatchError, NexusCore, type InventorySyncAppli
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { validateInventorySource, validateServerConfig } from "../../src/utils/validation";
-import { mergeServerConfigFields, serverConfigsEqual, serverOriginStampsEqual } from "../../src/models/config";
+import { mergeServerConfigFields, resolveBmcWebProtocol, serverConfigsEqual, serverOriginStampsEqual } from "../../src/models/config";
 import type { ServerConfig, SerialProfile, LocalShellProfile } from "../../src/models/config";
 import { computeProviderFingerprint, sourceConfigUnchanged, type InventoryProvider, type InventorySourceConfig } from "../../src/models/inventory";
 
@@ -3866,6 +3866,94 @@ describe("validateServerConfig — origin handling (F13/FIX 5)", () => {
     expect(validateServerConfig(base)).toBe(true);
     expect(validateServerConfig({ ...base, keyPath: "" })).toBe(true);
     expect(validateServerConfig({ ...base, keyPath: "   " })).toBe(true);
+  });
+});
+
+/**
+ * Issue #48 PR-B — the two new `ServerConfig` scalars pay the standard
+ * bookkeeping bill. Both fixtures differ in ONE field only, so a comparator or a
+ * merge that forgot the member reads the two records as identical.
+ */
+describe("serverConfigsEqual / mergeServerConfigFields — ipmiAuthProfileId + bmcWebProtocol", () => {
+  function server(overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id: "s1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      ...overrides
+    };
+  }
+
+  it("two servers differing ONLY in ipmiAuthProfileId are not equal", () => {
+    expect(serverConfigsEqual(server({ ipmiAuthProfileId: "ap-bmc" }), server())).toBe(false);
+    expect(serverConfigsEqual(server({ ipmiAuthProfileId: "ap-bmc" }), server({ ipmiAuthProfileId: "ap-other" }))).toBe(false);
+    expect(serverConfigsEqual(server({ ipmiAuthProfileId: "ap-bmc" }), server({ ipmiAuthProfileId: "ap-bmc" }))).toBe(true);
+  });
+
+  it("two servers differing ONLY in bmcWebProtocol are not equal", () => {
+    // "absent" and "https" MEAN the same scheme, but they are not the same
+    // record: one carries a user's explicit choice and one does not, and an
+    // equality that shrugged would let a rollback silently discard the choice.
+    expect(serverConfigsEqual(server({ bmcWebProtocol: "http" }), server())).toBe(false);
+    expect(serverConfigsEqual(server({ bmcWebProtocol: "http" }), server({ bmcWebProtocol: "https" }))).toBe(false);
+    expect(serverConfigsEqual(server({ bmcWebProtocol: "http" }), server({ bmcWebProtocol: "http" }))).toBe(true);
+  });
+
+  it("the rollback merge keeps a concurrently-written IPMI link and web protocol instead of reverting them", () => {
+    const prior = server();
+    const batchSnapshot = server({ name: "renamed" });
+    // A concurrent edit linked the BMC profile and flipped the scheme while the
+    // batch write was in flight.
+    const current = server({ name: "renamed", ipmiAuthProfileId: "ap-bmc", bmcWebProtocol: "http" });
+
+    const merged = mergeServerConfigFields(prior, batchSnapshot, current);
+
+    expect(merged.ipmiAuthProfileId).toBe("ap-bmc");
+    expect(merged.bmcWebProtocol).toBe("http");
+    // The rejected batch's own fields still fall back to prior.
+    expect(merged.name).toBe("core-sw");
+  });
+});
+
+describe("resolveBmcWebProtocol — the untrusted-field discipline", () => {
+  it.each([
+    [undefined, "https"],
+    ["https", "https"],
+    ["http", "http"],
+    ["HTTP", "https"],
+    ["HTTPS", "https"],
+    ["ftp", "https"],
+    ["", "https"],
+    [7, "https"],
+    [null, "https"],
+    [{}, "https"]
+  ])("reads %o as %s", (stored, expected) => {
+    expect(resolveBmcWebProtocol({ bmcWebProtocol: stored as "http" | undefined })).toBe(expected);
+  });
+});
+
+describe("validateServerConfig — PR-B fields", () => {
+  const base = { id: "s1", name: "Server", host: "h", port: 22, username: "u", authType: "password", isHidden: false };
+
+  it("accepts an absent link and a well-formed one, and rejects a shape no writer produces", () => {
+    expect(validateServerConfig(base)).toBe(true);
+    expect(validateServerConfig({ ...base, ipmiAuthProfileId: "ap-1" })).toBe(true);
+    expect(validateServerConfig({ ...base, ipmiAuthProfileId: "" })).toBe(false);
+    expect(validateServerConfig({ ...base, ipmiAuthProfileId: 7 })).toBe(false);
+  });
+
+  it("keeps a garbage bmcWebProtocol STRING rather than rejecting the whole server row", () => {
+    // Tolerant on purpose: the use site reads anything outside the two literals
+    // as https, and a rejected row costs the server its group, proxy, tunnels'
+    // jump-host target and sync ownership — out of all proportion to a
+    // bookkeeping field the runtime already neutralizes.
+    expect(validateServerConfig({ ...base, bmcWebProtocol: "https" })).toBe(true);
+    expect(validateServerConfig({ ...base, bmcWebProtocol: "ftp" })).toBe(true);
+    expect(validateServerConfig({ ...base, bmcWebProtocol: 7 })).toBe(false);
   });
 });
 

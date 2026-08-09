@@ -286,3 +286,119 @@ describe("NexusCore auth profile CRUD", () => {
     expect(core2.getAuthProfile("ap1")?.name).toBe("Production");
   });
 });
+
+/**
+ * Issue #48 PR-B — a profile can be linked twice from one server (SSH and BMC),
+ * and deleting it has to sweep both. A link left naming a deleted profile
+ * resolves to nothing on every run, silently, with the server form showing an
+ * empty select and no explanation anywhere.
+ */
+describe("removeAuthProfile — ipmiAuthProfileId links", () => {
+  function makeServer(overrides: Partial<import("../../src/models/config").ServerConfig> = {}) {
+    return {
+      id: "s1",
+      name: "Core Switch",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "password" as const,
+      isHidden: false,
+      ...overrides
+    };
+  }
+
+  it("clears a server whose ONLY link to the deleted profile is the IPMI one", async () => {
+    // `authProfileId` deliberately unset: with both links set, a sweep that
+    // handles only `authProfileId` still enters the loop and the fixture proves
+    // nothing about the new field.
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addOrUpdateAuthProfile(makeAuthProfile());
+    await core.addOrUpdateServer(makeServer({ ipmiAuthProfileId: "ap1" }));
+
+    await core.removeAuthProfile("ap1");
+
+    expect(core.getSnapshot().servers[0].ipmiAuthProfileId).toBeUndefined();
+  });
+
+  it("clears both links when one profile served as both credentials", async () => {
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addOrUpdateAuthProfile(makeAuthProfile());
+    await core.addOrUpdateServer(makeServer({ authProfileId: "ap1", ipmiAuthProfileId: "ap1" }));
+
+    await core.removeAuthProfile("ap1");
+
+    const server = core.getSnapshot().servers[0];
+    expect(server.authProfileId).toBeUndefined();
+    expect(server.ipmiAuthProfileId).toBeUndefined();
+  });
+
+  it("leaves the OTHER link alone when only one names the deleted profile", async () => {
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addOrUpdateAuthProfile(makeAuthProfile());
+    await core.addOrUpdateAuthProfile(makeAuthProfile({ id: "ap2", name: "BMC" }));
+    await core.addOrUpdateServer(makeServer({ authProfileId: "ap2", ipmiAuthProfileId: "ap1" }));
+
+    await core.removeAuthProfile("ap1");
+
+    const server = core.getSnapshot().servers[0];
+    expect(server.ipmiAuthProfileId).toBeUndefined();
+    expect(server.authProfileId).toBe("ap2");
+  });
+
+  it("does NOT drop a user-divergence stamp when the server is reached only through its BMC link", async () => {
+    // The scoping the new `||` condition could quietly break, and the ONLY
+    // fixture that observes it: the sync linked ap1 as this server's SSH
+    // credentials (the stamp says so) and the USER then moved the link to ap2 —
+    // which is precisely the per-server opt-out the stamp exists to record. The
+    // server now reaches this loop through its BMC link instead, and an
+    // unguarded stamp clear would erase that opt-out, after which the next sync
+    // re-attaches the source's profile to a server the user deliberately moved.
+    //
+    // Before this PR the server never entered the loop at all, so "the stamp
+    // survives" is also the pre-existing behaviour being preserved.
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addOrUpdateAuthProfile(makeAuthProfile());
+    await core.addOrUpdateAuthProfile(makeAuthProfile({ id: "ap2", name: "SSH" }));
+    await core.addOrUpdateServer(
+      makeServer({
+        authProfileId: "ap2",
+        ipmiAuthProfileId: "ap1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedAuthProfileId: "ap1" }
+      })
+    );
+
+    await core.removeAuthProfile("ap1");
+
+    const server = core.getSnapshot().servers[0];
+    expect(server.ipmiAuthProfileId).toBeUndefined();
+    expect(server.origin?.syncedAuthProfileId).toBe("ap1");
+    expect(server.authProfileId).toBe("ap2");
+  });
+
+  it("still drops the stamp when the SSH link itself is the one being cleared", async () => {
+    // The other side of the guard: this is the case the stamp clear exists for,
+    // and a guard written too tightly would break it.
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addOrUpdateAuthProfile(makeAuthProfile());
+    await core.addOrUpdateServer(
+      makeServer({
+        authProfileId: "ap1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedAuthProfileId: "ap1" }
+      })
+    );
+
+    await core.removeAuthProfile("ap1");
+
+    expect(core.getSnapshot().servers[0].origin?.syncedAuthProfileId).toBeUndefined();
+  });
+});

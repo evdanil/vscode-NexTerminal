@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox inventory sync with auth profiles, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.99",
+  "version": "2.8.102",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -194,6 +194,18 @@
         "title": "Run Macro on Server…",
         "category": "Nexus",
         "icon": "$(symbol-event)"
+      },
+      {
+        "command": "nexus.server.connectBmcSol",
+        "title": "Connect BMC Serial Console",
+        "category": "Nexus",
+        "icon": "$(vm-connect)"
+      },
+      {
+        "command": "nexus.server.openBmcWebConsole",
+        "title": "Open BMC Web Console",
+        "category": "Nexus",
+        "icon": "$(globe)"
       },
       {
         "command": "nexus.server.copyInfo",
@@ -1098,6 +1110,16 @@
           "command": "nexus.server.runMacro",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/ && nexus.hasMacros",
           "group": "0_connect@5"
+        },
+        {
+          "command": "nexus.server.connectBmcSol",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "group": "0_connect@6"
+        },
+        {
+          "command": "nexus.server.openBmcWebConsole",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "group": "0_connect@7"
         },
         {
           "command": "nexus.server.testConnection",

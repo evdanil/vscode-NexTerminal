@@ -233,11 +233,14 @@ describe("macroCommands template actions", () => {
       "Wait and send confirmation",
       "Scoped auto-trigger example",
       "IPMI SOL console",
+      "IPMI Power Status",
+      "IPMI Power On",
+      "IPMI Power Off (hard, no OS shutdown)",
       "Launch IPMI web console"
     ]);
   });
 
-  it("creates the IPMI SOL console template with the BMC address from the profile and the password masked (§9.7, issue #48)", async () => {
+  it("creates the IPMI SOL console template with the BMC address, username and password all off the profile (§9.7, issue #48 PR-B)", async () => {
     const macros: unknown[] = [];
     mockGetMacros.mockReturnValue(macros);
     mockShowQuickPick.mockResolvedValue({ label: "IPMI SOL console", templateId: "prompted-command" });
@@ -247,26 +250,64 @@ describe("macroCommands template actions", () => {
     expect(macros[0]).toMatchObject({
       text: expect.stringContaining("ipmitool"),
       runIn: "localTerminal",
-      variables: [
-        { name: "username", label: "Username" },
-        { name: "password", label: "Password", secret: true }
-      ]
+      // The template is the one place the extension itself vouches that the
+      // command is ipmitool, so it ships with the credential opt-in already set.
+      provideIpmiCredentials: true
     });
-    const created = macros[0] as { text: string; variables: Array<{ name: string; secret?: boolean; default?: string }> };
-    // The address is a fact about the server profile, not something to retype
-    // on every run — and `$host` must NOT be declared any more, or the template
-    // would prompt for what the profile already knows.
+    const created = macros[0] as { text: string; variables?: Array<{ name: string }> };
+    // Both facts come from the server profile, not from a prompt: the address,
+    // and — new in PR-B — the BMC username, off the linked IPMI auth profile.
     expect(created.text).toContain("-H ${profile.ipmiHost}");
-    expect(created.variables.some((v) => v.name === "host")).toBe(false);
-    expect(created.text).toContain("$username");
-    expect(created.text).toContain("$password");
-    // §7.1 — a masked variable must never carry a default (plaintext in the store).
-    expect(created.variables.find((v) => v.secret)?.default).toBeUndefined();
+    expect(created.text).toContain("-U ${profile.ipmiUsername}");
+    // No prompted variables at all any more: the password reaches ipmitool
+    // through the environment (`-E`), so there is nothing left to type.
+    expect(created.variables).toBeUndefined();
+    expect(created.text).toContain(" -E ");
     // A shipped example must never demonstrate a literal password on the command
     // line: argv is visible in `ps`, in the scrollback, and in the extension's own
     // TerminalCaptureBuffer (which `nexus.terminal.copyAll` exports).
-    expect(created.text).not.toMatch(/-P\s+(?!\$password)\S/);
+    expect(created.text).not.toContain("-P ");
     expect(mockSaveMacros).toHaveBeenCalledWith(macros);
+  });
+
+  it.each([
+    ["ipmi-power-status", "chassis power status"],
+    ["ipmi-power-on", "chassis power on"],
+    ["ipmi-power-off", "chassis power off"]
+  ])("ships the %s power template in the SOL template's shape", async (templateId, expectedVerb) => {
+    const macros: unknown[] = [];
+    mockGetMacros.mockReturnValue(macros);
+    mockShowQuickPick.mockResolvedValue({ templateId });
+
+    await registeredCommands.get("nexus.macro.addFromTemplate")!();
+
+    expect(macros[0]).toMatchObject({
+      runIn: "localTerminal",
+      provideIpmiCredentials: true
+    });
+    const created = macros[0] as { name: string; text: string };
+    expect(created.text).toContain(expectedVerb);
+    expect(created.text).toContain("-U ${profile.ipmiUsername}");
+    expect(created.text).toContain(" -E ");
+    expect(created.text).not.toContain("-P ");
+  });
+
+  it("names power-off as destructive where the user reads it — in the picker and in the macro list", async () => {
+    // The only warning this operation gets is its own name and description, so
+    // a rename that drops the qualifier is a real regression: `chassis power
+    // off` is an abrupt power cut, not a graceful shutdown.
+    const macros: unknown[] = [];
+    mockGetMacros.mockReturnValue(macros);
+    mockShowQuickPick.mockResolvedValue({ templateId: "ipmi-power-off" });
+
+    await registeredCommands.get("nexus.macro.addFromTemplate")!();
+
+    const offered = mockShowQuickPick.mock.calls[0][0].find(
+      (item: { templateId: string }) => item.templateId === "ipmi-power-off"
+    ) as { label: string; description: string };
+    expect(offered.label).toMatch(/hard, no OS shutdown/i);
+    expect(offered.description).toMatch(/not shut down cleanly/i);
+    expect((macros[0] as { name: string }).name).toMatch(/hard, no OS shutdown/i);
   });
 
   it("creates the IPMI web console template as a browser macro with no trailing newline", async () => {

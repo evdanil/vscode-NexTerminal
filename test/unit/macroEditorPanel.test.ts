@@ -840,6 +840,67 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       expect(getMacros()[0].runIn).toBeUndefined();
     });
 
+    it("persists the IPMI credential opt-in only for a local-terminal macro, and drops it on un-tick", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({
+        text: " ipmitool -H ${profile.ipmiHost} -E sol activate\n",
+        runIn: "localTerminal",
+        provideIpmiCredentials: true
+      }));
+      expect(getMacros()[0].provideIpmiCredentials).toBe(true);
+
+      const macroId = getMacros()[0].id!;
+      const { sendMessage: sendAgain } = await openPanel(0);
+      await sendAgain(baseSaveMsg({
+        index: 0,
+        id: macroId,
+        text: " ipmitool -H ${profile.ipmiHost} -E sol activate\n",
+        runIn: "localTerminal",
+        provideIpmiCredentials: false
+      }));
+
+      // ABSENT, not `false`: absent means false everywhere, and without the
+      // unconditional delete the old `true` survives the `{ ...existingMacro }`
+      // spread — so a macro the user just de-privileged would keep receiving the
+      // BMC password.
+      expect("provideIpmiCredentials" in getMacros()[0]).toBe(false);
+    });
+
+    it("refuses to store the flag on a session or browser macro, whatever the message says", async () => {
+      // The webview hides and unchecks the box off Local terminal, but the host
+      // is where the rule is enforced: a message is data, not a UI state, and a
+      // capability stranded on a record no UI renders is a capability nobody can
+      // see to revoke.
+      await harness([]);
+      const { sendMessage } = await openPanel();
+      await sendMessage(baseSaveMsg({ text: "show version\n", runIn: "session", provideIpmiCredentials: true }));
+      expect("provideIpmiCredentials" in getMacros()[0]).toBe(false);
+
+      const { sendMessage: sendBrowser } = await openPanel();
+      await sendBrowser(baseSaveMsg({
+        name: "Web",
+        text: "https://${profile.ipmiHost}/",
+        runIn: "browser",
+        provideIpmiCredentials: true
+      }));
+      expect("provideIpmiCredentials" in getMacros()[1]).toBe(false);
+    });
+
+    it.each([["true"], [1], [{}]])("treats a non-boolean flag (%o) in the save message as off", async (raw) => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({
+        text: " ipmitool\n",
+        runIn: "localTerminal",
+        provideIpmiCredentials: raw as unknown as boolean
+      }));
+
+      expect("provideIpmiCredentials" in getMacros()[0]).toBe(false);
+    });
+
     it("persists a valid variables array, dropping empty label/default fields", async () => {
       await harness([]);
       const { sendMessage } = await openPanel();

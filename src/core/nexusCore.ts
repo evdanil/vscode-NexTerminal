@@ -317,8 +317,20 @@ export class NexusCore {
     this.authProfiles.delete(profileId);
     let serversChanged = false;
     for (const [id, server] of this.servers.entries()) {
-      if (server.authProfileId === profileId) {
-        const cleared: ServerConfig = { ...server, authProfileId: undefined };
+      // Either link is enough to make this server a reference-holder: a server
+      // can name this profile as its SSH credentials, as its BMC credentials
+      // (`ipmiAuthProfileId`, issue #48 Phase 3), or as both, and a deletion
+      // that only swept the first would leave `${profile.ipmiUsername}` and the
+      // credential injection resolving against a profile that no longer exists —
+      // silently, on every run, with the server form showing an empty select.
+      if (server.authProfileId === profileId || server.ipmiAuthProfileId === profileId) {
+        const cleared: ServerConfig = { ...server };
+        if (server.authProfileId === profileId) {
+          cleared.authProfileId = undefined;
+        }
+        if (server.ipmiAuthProfileId === profileId) {
+          cleared.ipmiAuthProfileId = undefined;
+        }
         // The inventory sync's record that IT linked this profile goes with the
         // link. Without this, deleting a profile an inventory source applied
         // would leave every server it owned looking permanently opted OUT (no
@@ -332,7 +344,12 @@ export class NexusCore {
         // server whose link the USER already cleared (stamp names this profile,
         // `authProfileId` already undefined) is not touched, so its opt-out
         // survives the profile's deletion — which is the whole point of it.
-        if (server.origin?.syncedAuthProfileId === profileId) {
+        //
+        // The `authProfileId === profileId` term is what keeps that scoping true
+        // now that this loop can also be entered through `ipmiAuthProfileId`:
+        // the stamp records an SSH link, so a server reached here only by its
+        // BMC link has had no SSH link cleared and must keep its stamp.
+        if (server.authProfileId === profileId && server.origin?.syncedAuthProfileId === profileId) {
           cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
         }
         // REVIEW FINDING (P1, adoption auth provenance) — the DETACHED form of
@@ -343,7 +360,7 @@ export class NexusCore {
         // opt-out this clear exists to prevent, merely deferred until the marker
         // is cashed in. Scoped identically: only where the link being cleared is
         // the one the stamp names, so a user's own divergence survives.
-        if (server.formerlySynced?.syncedAuthProfileId === profileId) {
+        if (server.authProfileId === profileId && server.formerlySynced?.syncedAuthProfileId === profileId) {
           cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
         }
         this.servers.set(id, cleared);

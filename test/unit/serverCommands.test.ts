@@ -1003,6 +1003,26 @@ describe("formValuesToProxy", () => {
   });
 });
 
+describe("formValuesToServer — BMC fields (issue #48 PR-B)", () => {
+  const base = { name: "Test", host: "example.com", port: 22, username: "root", authType: "password" };
+
+  it("stores a chosen IPMI auth profile and treats a blank select as no link", () => {
+    expect(formValuesToServer({ ...base, ipmiAuthProfileId: "ap-bmc" })!.ipmiAuthProfileId).toBe("ap-bmc");
+    // Never an empty-string id: `""` would satisfy a truthiness check somewhere
+    // downstream and then resolve to no profile.
+    expect(formValuesToServer({ ...base, ipmiAuthProfileId: "" })!.ipmiAuthProfileId).toBeUndefined();
+    expect(formValuesToServer(base)!.ipmiAuthProfileId).toBeUndefined();
+  });
+
+  it("persists bmcWebProtocol ONLY for http — absent already means https", () => {
+    expect(formValuesToServer({ ...base, bmcWebProtocol: "http" })!.bmcWebProtocol).toBe("http");
+    // Writing "https" explicitly would put a member on every server record that
+    // no build before this one understands, for no change in behaviour.
+    expect(formValuesToServer({ ...base, bmcWebProtocol: "https" })!.bmcWebProtocol).toBeUndefined();
+    expect(formValuesToServer(base)!.bmcWebProtocol).toBeUndefined();
+  });
+});
+
 describe("formValuesToServer with proxy", () => {
   it("includes proxy config in server when present", () => {
     const server = formValuesToServer({
@@ -2457,6 +2477,98 @@ describe("nexus.server.edit — the auth profile a submission was composed again
     const panel = await openEdit(ctx);
     await expect(panel.onSubmit(renameUnder(other))).rejects.toThrow(/Other/);
     expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * REVIEW FINDING (P2) — the BMC-login twin of the SSH dangling-link guard,
+ * `ipmiAuthProfileId` (issue #48). Existence-only: the IPMI link mirrors no
+ * credentials into the form, so a vanished profile is the only hazard and the
+ * measure is the PERSISTED RECORD (getServer), never the webview.
+ */
+describe("nexus.server.edit — a dangling IPMI auth profile link (P2)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  interface EditPanel {
+    onSubmit: (v: Record<string, unknown>) => Promise<void>;
+  }
+
+  async function openEdit(ctx: CommandContext): Promise<EditPanel> {
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    return mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as EditPanel;
+  }
+
+  /** The submitted form for a rename that also carries an IPMI auth profile
+   *  selection. No SSH `authProfileId`, so only the IPMI guard is in play. */
+  function renameWithIpmi(ipmiAuthProfileId?: string): Record<string, unknown> {
+    return {
+      name: "Renamed Server",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      ...(ipmiAuthProfileId !== undefined ? { ipmiAuthProfileId } : {})
+    };
+  }
+
+  const BMC = makeAuthProfile({ id: "p-ipmi", name: "BMC login" });
+
+  it("refuses the save when the linked IPMI profile was deleted while the form sat open, and leaves the OLD ipmiAuthProfileId on the record (kills copying the stale select value onto the server — a dangling id that ${profile.ipmiUsername}/Connect BMC can no longer resolve)", async () => {
+    // The server already carries a VALID IPMI link ("p-old"); the user picks a
+    // different profile ("p-ipmi") in the open form and deletes it before saving.
+    const OLD = makeAuthProfile({ id: "p-old", name: "Old BMC" });
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ ipmiAuthProfileId: "p-old" })],
+      authProfiles: [OLD]
+    });
+
+    const panel = await openEdit(ctx);
+    // "p-ipmi" resolves to nothing (never in authProfiles / removed while open).
+    await expect(panel.onSubmit(renameWithIpmi("p-ipmi"))).rejects.toThrow(/IPMI auth profile no longer exists/);
+
+    // The kill: without the guard the write lands and the record keeps the
+    // dangling "p-ipmi". The old, still-valid link must survive untouched.
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+    expect(ctx.core.getServer("srv-1")!.ipmiAuthProfileId).toBe("p-old");
+  });
+
+  it("still saves when the linked IPMI profile exists (kills an over-broad reject that blocks a legitimate BMC link)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()],
+      authProfiles: [BMC]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(renameWithIpmi("p-ipmi"));
+
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    expect((addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig).ipmiAuthProfileId).toBe("p-ipmi");
+  });
+
+  it("still saves when there is no IPMI link at all — (None) (kills rejecting the empty case)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()],
+      authProfiles: []
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(renameWithIpmi());
+
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    expect((addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig).ipmiAuthProfileId).toBeUndefined();
   });
 });
 

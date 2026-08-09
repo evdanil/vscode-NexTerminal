@@ -142,6 +142,61 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain('document.getElementById("error-runIn")');
   });
 
+  /**
+   * Issue #48 §3.4 — the credential opt-in checkbox. It is the one control in
+   * the product that hands a stored secret to arbitrary user text, so its
+   * rendered state, its visibility rule and its hint are all load-bearing.
+   */
+  it("renders the IPMI credential checkbox, unchecked and hidden for a plain session macro", () => {
+    const html = render([{ name: "Plain", text: "show version\n" }], 0);
+    expect(html).toContain('id="macro-provide-ipmi"');
+    expect(html).toContain('id="provide-ipmi-group"');
+    expect(html).toContain('id="provide-ipmi-group" style="display:none;"');
+    expect(html).not.toContain('id="macro-provide-ipmi" checked');
+  });
+
+  it("shows it checked for a flagged local-terminal macro", () => {
+    const html = render(
+      [{ name: "SOL", text: "ipmitool\n", runIn: "localTerminal", provideIpmiCredentials: true }],
+      0
+    );
+    expect(html).toContain('id="macro-provide-ipmi" checked');
+    expect(html).not.toContain('id="provide-ipmi-group" style="display:none;"');
+  });
+
+  it("renders it UNCHECKED for a flag that is not exactly `true`, and for a flag on a non-local macro", () => {
+    // Both are the untrusted-field discipline made visible: a truthy-but-not-true
+    // value from legacy-settings absorption, and a flag stranded on a macro whose
+    // "Run in" was later moved. A run treats both as off, so the editor must too
+    // — a checked box would tell the user a capability is armed when it is not.
+    const truthy = render(
+      [{ name: "SOL", text: "x", runIn: "localTerminal", provideIpmiCredentials: "true" as unknown as boolean }],
+      0
+    );
+    expect(truthy).not.toContain('id="macro-provide-ipmi" checked');
+
+    const stranded = render([{ name: "SOL", text: "x", provideIpmiCredentials: true }], 0);
+    expect(stranded).not.toContain('id="macro-provide-ipmi" checked');
+  });
+
+  it("says exactly what the flag grants, and where it goes", () => {
+    const html = render([], null);
+    expect(html).toContain("IPMITOOL_PASSWORD/IPMI_PASSWORD");
+    // C3 — the hint now states the grant's real lifetime (the env belongs to the
+    // terminal, which outlives the macro).
+    expect(html).toContain("Every command run in that terminal — by this macro or typed later — can read it.");
+    expect(html).toContain("Leave this off unless the macro is an ipmitool command.");
+  });
+
+  it("carries the flag in the save payload and re-hides/unchecks it when Run in leaves Local terminal", () => {
+    const html = render([], null);
+    expect(html).toContain("provideIpmiCredentials: provideIpmiVal");
+    expect(html).toContain("function updateProvideIpmiState()");
+    // Un-ticking on hide, not just hiding: a checked-but-invisible box would
+    // submit a consent the user cannot see.
+    expect(html).toContain('document.getElementById("macro-provide-ipmi").checked = false;');
+  });
+
   it("blocks the profile-token/trigger combination client-side, in its own warning slot", () => {
     const html = render([], null);
     // A dedicated slot: the variables/trigger conflict can apply to the same
@@ -508,7 +563,7 @@ describe("renderMacroEditorHtml", () => {
       const lines = runDiagnostics("ipmitool -H ${profile.impiHost}");
       const hint = lines.find((l) => l.className === "diag-hint");
       expect(hint?.textContent).toBe(
-        "${profile.impiHost} is not a profile token and will be sent as-is. Tokens: host, port, username, name, ipmiHost."
+        "${profile.impiHost} is not a profile token and will be sent as-is. Tokens: host, port, username, name, ipmiHost, ipmiUsername."
       );
       // A typo is indistinguishable from text the user meant literally, so it
       // must never produce a "will be filled in" claim.

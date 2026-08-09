@@ -1,14 +1,14 @@
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
-import { effectiveServerUsername } from "../models/config";
 import type { TerminalMacro } from "../models/terminalMacro";
-import { macroRunTargetBadge, resolveMacroRunTarget } from "../models/terminalMacro";
+import { macroProvidesIpmiCredentials, macroRunTargetBadge, resolveMacroRunTarget } from "../models/terminalMacro";
 import { getMacros } from "../macroSettings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import { bindingToDisplayLabel } from "../macroBindings";
 import { sanitizeMacroGroup } from "../services/macroFolders";
-import { hasProfileTokens, profileTokenLabel, resolveProfileTokens } from "../services/profileTokens";
-import type { ProfileTokenError, ProfileTokenForm } from "../services/profileTokens";
+import { formatProfileTokenErrorForCommand, hasProfileTokens, profileTokenLabel, profileTokensUsed, resolveProfileTokens } from "../services/profileTokens";
+import type { ProfileTokenError, ProfileTokenErrorCommandSubject, ProfileTokenForm } from "../services/profileTokens";
+import { profileTokenServer, resolveIpmiTerminalEnv, type ProfileTokenServer } from "./ipmiCredentials";
 import { VARIABLE_MARKER } from "../ui/macroVariableMarker";
 import { macroWillPrompt } from "./macroCommands";
 import { connectServer, pickServer, toServerFromArg } from "./serverCommands";
@@ -71,13 +71,13 @@ function profileTokenForm(macro: TerminalMacro): ProfileTokenForm {
  * flag in the picker and the refusal on selection can never disagree; it stops
  * at the first unresolvable token, which is the one the run would refuse on.
  */
-function profileTokenIssue(macro: TerminalMacro, server: ServerConfig): ProfileTokenError | undefined {
+function profileTokenIssue(macro: TerminalMacro, server: ProfileTokenServer): ProfileTokenError | undefined {
   const outcome = resolveProfileTokens(macro.text, server, { form: profileTokenForm(macro) });
   return outcome.ok ? undefined : outcome.error;
 }
 
 /** The picker's one-line form of an issue; `error.message` is the full sentence shown on selection. */
-function issueSummary(issue: ProfileTokenError, server: ServerConfig): string {
+function issueSummary(issue: ProfileTokenError, server: ProfileTokenServer): string {
   return issue.kind === "missing"
     ? `$(warning) Needs ${profileTokenLabel(issue.token)} on "${server.name}"`
     : `$(warning) "${server.name}" ${profileTokenLabel(issue.token)} cannot be used in a command`;
@@ -94,7 +94,7 @@ function issueSummary(issue: ProfileTokenError, server: ServerConfig): string {
  * the run-target badge and the missing-field flag this command adds. Exported
  * for tests.
  */
-export function buildServerMacroPicks(macros: readonly TerminalMacro[], server: ServerConfig): ServerMacroPick[] {
+export function buildServerMacroPicks(macros: readonly TerminalMacro[], server: ProfileTokenServer): ServerMacroPick[] {
   const items = macros.map((macro): ServerMacroPick => {
     const binding = getAssignedBinding(macro);
     const prefix = binding ? `[${bindingToDisplayLabel(binding)}] ` : "";
@@ -136,15 +136,31 @@ export function resolveMacroBrowserUrl(text: string): string | undefined {
   return undefined;
 }
 
-/** A fresh VS Code terminal, created only once the prompts have resolved. */
-function localTerminalTarget(macro: TerminalMacro, server: ServerConfig): MacroSendTarget {
+/**
+ * A fresh VS Code terminal, created only once the prompts have resolved.
+ *
+ * `env` carries the IPMI credential pair for a macro that opted in
+ * (`macroProvidesIpmiCredentials`) — see `resolveIpmiTerminalEnv` for why the
+ * password travels this way and never in the text. `undefined` for every other
+ * macro, which is the shape every build before this one produced: the option
+ * bag is spread conditionally so an unflagged run passes literally
+ * `{ name }`, exactly as before.
+ */
+function localTerminalTarget(
+  macro: TerminalMacro,
+  server: ServerConfig,
+  env?: Record<string, string>
+): MacroSendTarget {
   return {
     description: "a local terminal",
     // Nothing to invalidate: the destination does not exist yet, so it cannot
     // have been closed while the prompts were up.
     isStillValid: () => true,
     send(text: string): boolean {
-      const terminal = vscode.window.createTerminal({ name: `Nexus Macro: ${macro.name} (${server.name})` });
+      const terminal = vscode.window.createTerminal({
+        name: `Nexus Macro: ${macro.name} (${server.name})`,
+        ...(env ? { env } : {})
+      });
       terminal.show();
       // `false` — the macro's own trailing newline decides whether the line
       // executes, exactly as it does for a session send.
@@ -216,6 +232,77 @@ export function unknownTokenNote(unknownTokens: readonly string[]): string | und
   return unknownTokens.length === 1
     ? `unknown profile token ${list} was sent as-is`
     : `unknown profile tokens ${list} were sent as-is`;
+}
+
+/**
+ * The IPMI tokens a text uses — the HINT half of the opt-in (issue #48 §3.3).
+ * Token usage keeps its hint role and has none of its old authorization role:
+ * what it grants is a sentence in the delivery report, never a credential.
+ */
+function usesIpmiTokens(text: string): boolean {
+  return profileTokensUsed(text).some((token) => token === "ipmiHost" || token === "ipmiUsername");
+}
+
+/**
+ * The caveat for a local-terminal macro that reaches for a BMC but was never
+ * ticked to receive its password — appended to the delivery report, exactly like
+ * the unknown-token note.
+ *
+ * DISCOVERABILITY, NOT SILENCE. Such a run is not broken: `ipmitool -E` with no
+ * variable in the environment fails with its own message, in the user's own
+ * visible terminal. What it cannot say is that Nexus has the password and was
+ * not asked to hand it over, which is the one thing the user needs in order to
+ * fix it — and where.
+ *
+ * Lowercase, unpunctuated: it is appended as a clause.
+ */
+export function ipmiCredentialsOffNote(macro: TerminalMacro): string | undefined {
+  if (resolveMacroRunTarget(macro) !== "localTerminal" || macroProvidesIpmiCredentials(macro)) {
+    return undefined;
+  }
+  // C4 — kept short so the actionable tail survives the 4s status bar clip; the
+  // fuller explanation now lives in the persistent macro-editor hint (B1). No
+  // trailing period: the status line (macroVariablePrompt.ts) adds its own.
+  return usesIpmiTokens(macro.text)
+    ? 'IPMI credentials were not provided — tick "Provide IPMI credentials" in the macro editor'
+    : undefined;
+}
+
+/** An `ipmitool …` invocation in a macro's text — at line start or after whitespace. */
+const IPMITOOL_COMMAND_RE = /(^|\s)ipmitool\b/;
+
+/**
+ * The caveat for a SESSION-target macro whose text reaches for a BMC — it uses an
+ * IPMI token or invokes ipmitool — but was typed into the connected SSH session,
+ * so it ran on the REMOTE host, not this machine (issue #48 PR-B, "Ogun's case":
+ * a legacy session macro running ipmitool got no IPMI messaging at all).
+ *
+ * A HINT, not a gate. Text/token inspection is sanctioned as a hint only (§3.3),
+ * so this never blocks or reroutes the run — it appends one clause pointing at
+ * "Run in" in the editor. Kept short because it shares the same 4s status bar the
+ * other delivery notes clip in (C4).
+ *
+ * Lowercase, unpunctuated: appended as a clause, like the sibling notes.
+ */
+export function sessionIpmiHintNote(macro: TerminalMacro): string | undefined {
+  if (resolveMacroRunTarget(macro) !== "session") {
+    return undefined;
+  }
+  return usesIpmiTokens(macro.text) || IPMITOOL_COMMAND_RE.test(macro.text)
+    ? 'ran in the SSH session on the remote host — set "Run in" to Local terminal to run ipmitool from this machine'
+    : undefined;
+}
+
+/**
+ * The one delivery note built from however many caveats a run collected. Joined
+ * with a semicolon rather than a second status message: `runMacroWithTarget`
+ * appends ONE clause to the success line, and a second `setStatusBarMessage`
+ * would simply replace the first within the same tick (the failure the
+ * unknown-token note was moved here to fix).
+ */
+export function combineDeliveryNotes(...notes: Array<string | undefined>): string | undefined {
+  const present = notes.filter((note): note is string => !!note);
+  return present.length > 0 ? present.join("; ") : undefined;
 }
 
 /** Terminals of this server's live sessions, in session order, closed ones dropped. */
@@ -348,42 +435,37 @@ async function resolveServerSessionTarget(
   return terminal ? terminalSendTarget(terminal) : undefined;
 }
 
-/** Reports a refused token substitution, offering the repair right where the failure is. */
-async function reportProfileTokenError(error: ProfileTokenError, server: ServerConfig): Promise<void> {
-  const action = await vscode.window.showErrorMessage(error.message, "Edit Server");
+/**
+ * Reports a refused token substitution, offering the repair right where the
+ * failure is. Exported because the direct BMC commands (`bmcCommands.ts`) refuse
+ * through the SAME pathway rather than inventing their own error copy — the
+ * fields they need are the fields a macro needs, and the repair is the same form.
+ *
+ * `subject` re-phrases the message for a menu-invoked command, where the default
+ * "…but this macro uses ${profile.X}" is wrong because there is no macro (C1). The
+ * macro path passes none and keeps the original copy verbatim.
+ */
+export async function reportProfileTokenError(
+  error: ProfileTokenError,
+  server: ServerConfig,
+  subject?: ProfileTokenErrorCommandSubject
+): Promise<void> {
+  const message = subject ? formatProfileTokenErrorForCommand(error, subject) : error.message;
+  const action = await vscode.window.showErrorMessage(message, "Edit Server");
   if (action === "Edit Server") {
-    // `expandAdvanced` — "IPMI / BMC Host" is an advanced field, so without it
-    // the button lands on a form with the field the error named collapsed out
-    // of sight.
-    await vscode.commands.executeCommand("nexus.server.edit", { server, expandAdvanced: true });
+    await openServerAdvancedEdit(server);
   }
 }
 
 /**
- * The server facts `${profile.*}` resolves against: `server`, with `username`
- * replaced by the one a CONNECTION would actually use.
- *
- * REVIEW FINDING (P2) — a server that links an auth profile keeps its own
- * `username` stored underneath the link, and the connect path
- * (`SilentAuthSshFactory.resolveServer`) logs in as the PROFILE's when the
- * profile supplies one. Reading `server.username` here therefore resolved
- * `${profile.username}` to an account the session is not using — silently wrong
- * in exactly the shipped case this token exists for, `ipmitool -U
- * ${profile.username}`, where the two credentials belong to the same appliance.
- * The precedence is not re-derived: `effectiveServerUsername` (models/config.ts)
- * is the same rule the connect path decides by.
- *
- * Only `username` moves. Every other token is the server's own field, and the
- * ORIGINAL `server` is what the refusal path hands to `nexus.server.edit` — the
- * record the user can actually edit. (A profile-supplied username that fails the
- * charset check is therefore reported against the server whose run it refused,
- * with the repair one hop further on, in the linked auth profile; the message
- * names the offending value, which is what identifies it.)
+ * The "Edit Server" repair route with Advanced options expanded — "IPMI / BMC
+ * Host" is an advanced field, so without `expandAdvanced` the button lands on a
+ * form with the field the error named collapsed out of sight. Shared by the token
+ * refusal above and the BMC web-address error (bmcCommands.ts, C5), so every
+ * missing-piece BMC error offers the identical repair (docs/macros.md).
  */
-function profileTokenServer(ctx: CommandContext, server: ServerConfig): ServerConfig {
-  const profile = server.authProfileId ? ctx.core.getAuthProfile(server.authProfileId) : undefined;
-  const username = effectiveServerUsername(server, profile);
-  return username === server.username ? server : { ...server, username };
+export async function openServerAdvancedEdit(server: ServerConfig): Promise<void> {
+  await vscode.commands.executeCommand("nexus.server.edit", { server, expandAdvanced: true });
 }
 
 /**
@@ -470,14 +552,38 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
     await reportProfileTokenError(resolution.error, server);
     return;
   }
-  // NOT REPORTED HERE — see `unknownTokenNote`. The caveat rides along with the
+  // NOT REPORTED HERE — see `unknownTokenNote`. The caveats ride along with the
   // delivery report, because everything below can still abort.
-  const deliveryNote = unknownTokenNote(resolution.unknownTokens);
+  const deliveryNote = combineDeliveryNotes(
+    unknownTokenNote(resolution.unknownTokens),
+    ipmiCredentialsOffNote(macro),
+    sessionIpmiHintNote(macro)
+  );
+
+  // THE CREDENTIAL GATE (issue #48 §3.3). Three conditions, all required, and
+  // token usage is not one of them in either direction: a flagged macro that
+  // uses no IPMI token still gets the environment (it may build the address
+  // itself), and an unflagged macro that uses every IPMI token gets nothing —
+  // and is never prompted, since prompting is the same disclosure decision moved
+  // one dialog later.
+  //
+  // Resolved BEFORE the target is built and before the prompt walk, so a
+  // cancelled credential prompt costs the user nothing: no terminal has been
+  // spawned and no variable has been asked for.
+  let ipmiEnv: Record<string, string> | undefined;
+  if (macroProvidesIpmiCredentials(macro)) {
+    const credential = await resolveIpmiTerminalEnv(ctx, server, { purpose: "IPMI" });
+    if (credential.kind === "cancelled") {
+      vscode.window.setStatusBarMessage(`Macro "${macro.name}" cancelled — nothing was sent.`, 4000);
+      return;
+    }
+    ipmiEnv = credential.env;
+  }
 
   let target: MacroSendTarget | undefined;
   switch (runTarget) {
     case "localTerminal":
-      target = localTerminalTarget(macro, server);
+      target = localTerminalTarget(macro, server, ipmiEnv);
       break;
     case "browser":
       target = browserTarget(macro, macros.indexOf(macro));

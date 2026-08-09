@@ -7,6 +7,7 @@ import type { AuthProfile, LocalShellProfile, ServerConfig, ServerOrigin, Tunnel
 import type { InventorySourceConfig } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import { stripImportedCapabilityFields } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
 import type { SecretVault } from "../services/ssh/contracts";
@@ -760,7 +761,15 @@ export function sanitizeForSharing(
   }
 
   // Build sanitized auth profiles (redact credentials, keep name)
-  const referencedProfileIds = new Set(servers.map((s) => s.authProfileId).filter(Boolean) as string[]);
+  //
+  // BOTH links are collected (issue #48 §3.1). A profile used ONLY as a server's
+  // IPMI credentials is referenced exactly as much as one used for SSH, and
+  // collecting only `authProfileId` would leave every such profile out of the
+  // bundle while the servers that name it still ship — a link the recipient
+  // cannot resolve, on the field the export exists to carry.
+  const referencedProfileIds = new Set(
+    servers.flatMap((s) => [s.authProfileId, s.ipmiAuthProfileId]).filter(Boolean) as string[]
+  );
   const newAuthProfiles = authProfiles
     .filter((p) => referencedProfileIds.has(p.id))
     .map((p) => ({
@@ -773,6 +782,12 @@ export function sanitizeForSharing(
   const newServers = servers.map((s) => {
     const newId = idMap.get(s.id)!;
     const newAuthProfileId = s.authProfileId ? idMap.get(s.authProfileId) : undefined;
+    // Remapped through the SAME idMap, and dropped to `undefined` when the
+    // target is not in the export — `remapProxy`'s rule for an out-of-export
+    // jump host, for the same reason: the spread below would otherwise carry the
+    // SENDER's id verbatim, which on the receiving side either resolves to
+    // nothing or (worse) to an unrelated local profile that happens to hold it.
+    const newIpmiAuthProfileId = s.ipmiAuthProfileId ? idMap.get(s.ipmiAuthProfileId) : undefined;
     // §B6 — a share export travels to another person/machine; a synced-server marker
     // (sourceId/externalId) names an inventory source that only exists locally and
     // would be meaningless (and misleading) on the receiving end.
@@ -792,6 +807,7 @@ export function sanitizeForSharing(
       keyPath: "",
       proxy: remapProxy(s.proxy, idMap),
       authProfileId: newAuthProfileId,
+      ipmiAuthProfileId: newIpmiAuthProfileId,
       origin: undefined,
       formerlySynced: undefined
     };
@@ -1027,7 +1043,15 @@ function sanitizeImportedMacroVariables(macro: TerminalMacro): boolean {
 }
 
 function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
-  const macro: TerminalMacro = { ...raw };
+  // CAPABILITY FLAGS are stripped on EVERY import path — this backup/share path
+  // and the legacy-settings absorb in `persistLegacyMigration`
+  // (storage/vscodeMacroStore.ts) — from one shared definition
+  // (`stripImportedCapabilityFields`, models/terminalMacro.ts). See that
+  // module's `IMPORTED_CAPABILITY_FIELDS` doc for why consent never survives an
+  // import and why a new flag must join the list as part of adding it. The strip
+  // deletes rather than normalizes to `false`, so a re-export carries no decision
+  // the importing user never made.
+  const macro: TerminalMacro = stripImportedCapabilityFields(raw);
   // A non-string keybinding is dropped for the same reason a malformed string one is: it is
   // not a binding. `normalizeBinding()` already refuses to resolve it, so this changes nothing
   // the app applies — it keeps an unusable value out of globalState, where it would sit in a
@@ -1780,6 +1804,9 @@ export function registerConfigCommands(
         id: idMap.get(server.id)!,
         proxy: remappedProxy,
         authProfileId: linkToImportedProfile(server.authProfileId),
+        // The BMC credential link goes through the same lens: it is a profile
+        // reference like any other, and a share bundle's ids are the sender's.
+        ipmiAuthProfileId: linkToImportedProfile(server.ipmiAuthProfileId),
         origin: remapOriginStamp(server.origin),
         formerlySynced: undefined
       };
@@ -1974,8 +2001,21 @@ export function registerConfigCommands(
     const postImportSnapshot = core.getSnapshot();
     const knownProfileIds = new Set(postImportSnapshot.authProfiles.map((p) => p.id));
     for (const server of postImportSnapshot.servers) {
-      if (server.authProfileId && !knownProfileIds.has(server.authProfileId)) {
-        const cleared: ServerConfig = { ...server, authProfileId: undefined };
+      // Captured as a local so the stamp comparisons below keep narrowing
+      // `origin`/`formerlySynced`: `x?.stamp === <string>` proves the container
+      // is present, which `x?.stamp === server.authProfileId` (type
+      // `string | undefined`) does not.
+      const danglingSshProfileId =
+        server.authProfileId && !knownProfileIds.has(server.authProfileId) ? server.authProfileId : undefined;
+      const sshDangles = danglingSshProfileId !== undefined;
+      // The BMC credential link dangles independently of the SSH one — a server
+      // can carry either, both, or two different profiles — so it is swept on
+      // its own terms rather than as a rider on the SSH clear.
+      const ipmiDangles = Boolean(server.ipmiAuthProfileId) && !knownProfileIds.has(server.ipmiAuthProfileId!);
+      if (sshDangles || ipmiDangles) {
+        const cleared: ServerConfig = { ...server };
+        if (sshDangles) cleared.authProfileId = undefined;
+        if (ipmiDangles) cleared.ipmiAuthProfileId = undefined;
         // Same rule as NexusCore.removeAuthProfile: the inventory sync's record
         // that IT applied this profile (origin.syncedAuthProfileId) dies with the
         // link it describes. Left behind, it would read as a per-server opt-out —
@@ -1983,7 +2023,12 @@ export function registerConfigCommands(
         // nobody hand-configured out of retro-apply for good. Only the stamp
         // naming the very profile being cleared is dropped; a stamp the user has
         // already diverged from is their decision and is left alone.
-        if (server.origin?.syncedAuthProfileId === server.authProfileId) {
+        //
+        // Gated on `sshDangles`: the stamp records an SSH link, so a server
+        // reached here only by a dangling BMC link still has a live, resolving
+        // `authProfileId` — and clearing its stamp would drop the sync's record
+        // of a link that is perfectly intact.
+        if (danglingSshProfileId !== undefined && server.origin?.syncedAuthProfileId === danglingSshProfileId) {
           cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
         }
         // REVIEW FINDING (P1, adoption auth provenance) — and the detached form
@@ -1992,7 +2037,7 @@ export function registerConfigCommands(
         // adoption restores it into a live origin. Left naming a profile this
         // import has just established does not exist, it would lock the record
         // out of retro-apply the moment it is reclaimed.
-        if (server.formerlySynced?.syncedAuthProfileId === server.authProfileId) {
+        if (danglingSshProfileId !== undefined && server.formerlySynced?.syncedAuthProfileId === danglingSshProfileId) {
           cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
         }
         await core.addOrUpdateServer(cleared);

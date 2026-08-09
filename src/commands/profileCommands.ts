@@ -35,6 +35,15 @@ interface ProfileActionPick extends vscode.QuickPickItem {
 const MISSING_AUTH_PROFILE_MESSAGE =
   "The selected auth profile no longer exists. Choose another, or clear the Auth Profile field.";
 
+/**
+ * The IPMI-link twin, duplicated here for the same reason the message above is
+ * (each form module owns its own refusal copy; no messages module to share it
+ * on). Byte-identical to `MISSING_IPMI_AUTH_PROFILE_MESSAGE` in
+ * commands/serverCommands.ts.
+ */
+const MISSING_IPMI_AUTH_PROFILE_MESSAGE =
+  "The selected IPMI auth profile no longer exists. Choose another, or clear the IPMI Auth Profile field.";
+
 function isUnifiedProfileSeed(arg: unknown): arg is UnifiedProfileSeed {
   if (!arg || typeof arg !== "object") {
     return false;
@@ -140,6 +149,18 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
           // exist, and it is the one outcome no save may leave behind.
           if (server.authProfileId !== undefined && ctx.core.getAuthProfile(server.authProfileId) === undefined) {
             throw new Error(MISSING_AUTH_PROFILE_MESSAGE);
+          }
+          // The IPMI-link twin of the check just above (`ipmiAuthProfileId`,
+          // issue #48). Same dangling-reference hazard — a BMC auth profile
+          // picked here and deleted while the form sat open would write a
+          // dangling id onto the brand-new server, which nothing revisits. Same
+          // existence-only test, for the same reason it is only the MISSING
+          // case above and not the server EDIT form's full signature check: the
+          // IPMI link mirrors no credentials into this form, it only supplies
+          // `${profile.ipmiUsername}` at macro-run time (resolved live then), so
+          // an id that resolves to nothing is the one and only thing to catch.
+          if (server.ipmiAuthProfileId !== undefined && ctx.core.getAuthProfile(server.ipmiAuthProfileId) === undefined) {
+            throw new Error(MISSING_IPMI_AUTH_PROFILE_MESSAGE);
           }
           // FINDINGS 2+3 (P2, create-rollback review, sibling) — same
           // single-owner displacement as the nexus.server.edit rollback

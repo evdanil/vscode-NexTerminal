@@ -472,6 +472,25 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(without.tooltip).not.toContain("IPMI/BMC");
   });
 
+  it("D3 — appends the linked IPMI Auth Profile name to the IPMI line, mirroring the SSH [auth: …] idiom", () => {
+    const withProfile = new ServerTreeItem(
+      makeServer({ id: "s1", ipmiHost: "10.0.0.99" }),
+      false,
+      undefined,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      "BMC accounts"
+    );
+    expect(withProfile.tooltip).toContain("\nIPMI/BMC: 10.0.0.99 [auth: BMC accounts]");
+
+    // No linked profile → no suffix, just the host.
+    const noProfile = new ServerTreeItem(makeServer({ id: "s2", ipmiHost: "10.0.0.99" }), false);
+    expect(noProfile.tooltip).toContain("\nIPMI/BMC: 10.0.0.99");
+    expect(noProfile.tooltip).not.toContain("[auth:");
+  });
+
   it("SerialProfileTreeItem ID does not change with connection state", () => {
     const profile = makeSerial({ id: "sp1" });
     const disconnected = new SerialProfileTreeItem(profile, "disconnected");

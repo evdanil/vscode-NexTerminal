@@ -7,6 +7,7 @@ import { registerSerialCommands } from "./commands/serialCommands";
 import { registerLocalShellCommands } from "./commands/localShellCommands";
 import { registerServerCommands, teardownServerRuntime } from "./commands/serverCommands";
 import { registerServerMacroCommands } from "./commands/serverMacroCommands";
+import { registerBmcCommands } from "./commands/bmcCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
 import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import { TerminalRegistry } from "./services/terminal/terminalRegistry";
@@ -1211,6 +1212,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
 
   const serverDisposables = registerServerCommands(ctx);
   const serverMacroDisposables = registerServerMacroCommands(ctx);
+  const bmcDisposables = registerBmcCommands(ctx);
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
   const localShellDisposables = registerLocalShellCommands(ctx);
@@ -1307,6 +1309,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     terminalActivityListener,
     ...serverDisposables,
     ...serverMacroDisposables,
+    ...bmcDisposables,
     ...tunnelDisposables,
     ...serialDisposables,
     ...localShellDisposables,

