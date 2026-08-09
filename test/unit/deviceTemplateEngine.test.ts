@@ -741,6 +741,48 @@ describe("device template cascade — filter, specificity, per-field ties (§3)"
     expect(p.warnings).toContain('1 server: Proxy ← "Switch defaults" (rule role=switch)');
   });
 
+  it("§3.4 provenance (Codex round 2 #3) — two DISTINCT provenance signatures whose `templateName`/`ruleFilter` collide under the old `::`/`|` join stay on SEPARATE lines with correct per-signature counts (kills the ambiguous key that merged server counts and mis-attributed writes)", () => {
+    // The collision: template `A::name=x` + filter `name=y` and template `A` +
+    // filter `name=x::name=y` both flatten to `proxy=A::name=x::name=y` under the
+    // former `${name}::${filter}` join, combining into one "2 servers" line naming a
+    // single (wrong) template. An unambiguous serialization keeps them distinct.
+    const tA1 = template({ proxy: { mode: "override", value: P_A } }, "t-a1", "A::name=x");
+    const tA = template({ proxy: { mode: "override", value: P_A } }, "t-a", "A");
+    const p = plan({
+      source: makeSource({
+        templateRules: [
+          { id: "r1", templateId: "t-a1", filter: "name=y" },
+          { id: "r2", templateId: "t-a", filter: "name=x::name=y" }
+        ]
+      }),
+      devices: [
+        makeDevice({ externalId: "device:1", name: "y" }),
+        makeDevice({ externalId: "device:2", name: "x::name=y" })
+      ],
+      servers: [],
+      templates: [tA1, tA]
+    });
+    // Two separate lines, each attributing ONE server to its own (template, rule).
+    expect(p.warnings).toContain('1 server: Proxy ← "A::name=x" (rule name=y)');
+    expect(p.warnings).toContain('1 server: Proxy ← "A" (rule name=x::name=y)');
+    // No combined line collapsing the two distinct signatures into one count.
+    expect(p.warnings.some((w) => w.startsWith("2 servers: Proxy"))).toBe(false);
+  });
+
+  it("§3.4 provenance — servers with a GENUINELY IDENTICAL signature still aggregate to one line (the unambiguous key must not over-split)", () => {
+    const t = template({ proxy: { mode: "override", value: P_A } }, "tmpl-sw", "Switch defaults");
+    const p = plan({
+      source: makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-sw", filter: "role=switch" }] }),
+      devices: [
+        makeDevice({ externalId: "device:1", name: "sw-1", attributes: { role: ["switch"] } }),
+        makeDevice({ externalId: "device:2", name: "sw-2", attributes: { role: ["switch"] } })
+      ],
+      servers: [],
+      templates: [t]
+    });
+    expect(p.warnings).toContain('2 servers: Proxy ← "Switch defaults" (rule role=switch)');
+  });
+
   it("Fixture 22b — zero-match info: a rule that matches no device this fetch produces exactly one plan info line naming the rule and source (kills silent dead rules)", () => {
     const t = template({ proxy: { mode: "override", value: P_A } }, "tmpl-1", "T");
     const p = plan({

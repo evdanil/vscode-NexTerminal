@@ -111,6 +111,21 @@ describe("deviceMatchesFilter — §2.3 semantics", () => {
     expect(deviceMatchesFilter(dev({ attributes: { Role: "switch" } }), parseTemplateFilter("tenant=acme"))).toBe(false);
   });
 
+  it("Codex round 2 #1 — a filter key colliding with an Object.prototype member (`constructor`/`__proto__`/`toString`) fails the condition instead of reading the inherited member and throwing in `.trim()` (kills the bare `attributes[key]` prototype read that aborts the whole sync)", () => {
+    // A normal object literal inherits `constructor` (a function), `toString` (a
+    // function) and `__proto__` (the prototype object). A bare `attributes[key]`
+    // returns those instead of undefined, and the next `.trim()` throws — aborting
+    // the entire sync. The lookup must be own-property-only: a non-own key fails the
+    // condition exactly as a genuinely-absent key does. No throw, returns false.
+    const d = dev({ attributes: { role: "switch" } });
+    for (const proto of ["constructor", "__proto__", "toString"]) {
+      expect(() => deviceMatchesFilter(d, parseTemplateFilter(`${proto}=x`))).not.toThrow();
+      expect(deviceMatchesFilter(d, parseTemplateFilter(`${proto}=x`))).toBe(false);
+    }
+    // An own attribute that happens to share the name still matches (own read intact).
+    expect(deviceMatchesFilter(dev({ attributes: { constructor: "x" } }), parseTemplateFilter("constructor=x"))).toBe(true);
+  });
+
   it("the reserved `name` key globs device.name — a `*` glob, anchored, no user regex", () => {
     expect(deviceMatchesFilter(dev({ name: "core-sw-1" }), parseTemplateFilter("name=core-*"))).toBe(true);
     expect(deviceMatchesFilter(dev({ name: "edge-sw-1" }), parseTemplateFilter("name=core-*"))).toBe(false);

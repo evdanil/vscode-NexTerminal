@@ -667,6 +667,17 @@ async function saveTemplateRules(
       diverged = true;
       return;
     }
+    // Codex round 2 #2 — resolve the rule's template UNDER THE LOCK before persisting
+    // (the T1b resolve-under-lock discipline). The template picked in this flow can be
+    // deleted (its deletion sweep run) between the picker closing and the filter prompt
+    // being accepted; persisting then leaves a rule pointing at a missing template that
+    // is silently skipped on every future sync. If the template is gone, refuse — treat
+    // it as the same "changed while you were editing" divergence, saving nothing. Only
+    // add/edit carries a template ref (`changedRule`); a removal has none.
+    if (changedRule !== undefined && ctx.core.getDeviceTemplate(changedRule.templateId) === undefined) {
+      diverged = true;
+      return;
+    }
     savedRules = next;
     await ctx.core.addOrUpdateInventorySource({ ...fresh, templateRules: next.length > 0 ? next : undefined });
   });

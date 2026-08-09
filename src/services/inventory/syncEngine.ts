@@ -3083,13 +3083,19 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       for (const field of fieldOrder) {
         const prov = entry.provenance[field];
         if (prov !== undefined) {
-          parts.push(`${field}=${prov.templateName}::${prov.ruleFilter ?? ""}`);
+          // Codex round 2 #3 — `templateName` and `ruleFilter` are user-controlled free
+          // text; the former `${field}=${name}::${filter}` join with `::`/`|` was
+          // ambiguous, so distinct signatures collided (template `A::x`+filter `y` vs
+          // `A`+`x::y`), merging server counts and mis-attributing writes. Serialize the
+          // per-field tuple with JSON.stringify so only genuinely identical provenance
+          // signatures collide (same class as round-1 Fix C's encoded tie-break key).
+          parts.push(JSON.stringify([field, prov.templateName, prov.ruleFilter ?? null]));
         }
       }
-      const key = parts.join("|");
-      if (key === "") {
+      if (parts.length === 0) {
         continue; // no written template field survived — nothing to report for this server
       }
+      const key = JSON.stringify(parts);
       const g = groups.get(key);
       if (g === undefined) {
         groups.set(key, { count: 1, provenance: entry.provenance });

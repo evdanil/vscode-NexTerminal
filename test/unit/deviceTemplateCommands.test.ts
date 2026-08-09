@@ -1266,4 +1266,51 @@ describe("Edit Template Rules… flow (§7.2)", () => {
     const warned = mockShowWarningMessage.mock.calls.map((c) => String(c[0]));
     expect(warned.some((w) => w.includes("changed in another window"))).toBe(false);
   });
+
+  it("M5 (Codex round 2 #2) — a template DELETED between the picker and the save is re-resolved UNDER THE LOCK: the dangling rule is NOT persisted and the flow diverges (kills the persist that leaves a rule pointing at a missing template, silently skipped on every future sync)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core);
+    registerWithRegistry(core, regWith(["role", "site", "name"]));
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    // list → add, template → t1, loop → exit.
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: Array<{ add?: boolean }>) => items.find((i) => i.add))
+      .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+      .mockResolvedValueOnce(undefined); // loop → exit
+    // During the filter InputBox, t1's deletion sweep runs. Existence-only save
+    // (553875d) persisted a rule pointing at the now-missing t1; the resolve-under-lock
+    // check must refuse and diverge instead.
+    mockShowInputBox.mockImplementationOnce(async () => {
+      await core.removeDeviceTemplate("t1");
+      return "role=switch";
+    });
+
+    await editRules();
+
+    // No dangling rule persisted.
+    expect(core.getInventorySource("src-1")!.templateRules).toBeUndefined();
+    // The house "changed in another window" divergence warning fired.
+    const warned = mockShowWarningMessage.mock.calls.map((c) => String(c[0]));
+    expect(warned.some((w) => w.includes("changed in another window"))).toBe(true);
+  });
+
+  it("M5b (Codex round 2 #2 sibling) — a template still present at save time persists the rule normally (the resolve-under-lock check does not over-refuse)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core);
+    registerWithRegistry(core, regWith(["role", "site", "name"]));
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: Array<{ add?: boolean }>) => items.find((i) => i.add))
+      .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+      .mockResolvedValueOnce(undefined); // loop → exit
+    mockShowInputBox.mockResolvedValueOnce("role=switch");
+
+    await editRules();
+
+    const rules = core.getInventorySource("src-1")!.templateRules!;
+    expect(rules).toHaveLength(1);
+    expect(rules[0]).toMatchObject({ templateId: "t1", filter: "role=switch" });
+  });
 });

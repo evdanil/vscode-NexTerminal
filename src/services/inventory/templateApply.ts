@@ -244,7 +244,15 @@ export function deviceMatchesFilter(device: Pick<InventoryDevice, "name" | "attr
     // accepted case-insensitively. Look the attribute up case-insensitively too so
     // it actually matches (Codex round 1 #2). NetBox already emits lowercase, so a
     // direct hit short-circuits the scan; only mixed-case providers pay for it.
-    const attr = device.attributes?.[key] ?? lookupAttributeCaseInsensitive(device.attributes, key);
+    // Codex round 2 #1 — the direct lookup must be OWN-property-only: a rule key that
+    // collides with an `Object.prototype` member (`constructor`, `__proto__`,
+    // `toString`, …) would otherwise read the inherited function/object, and the
+    // `.trim()` below would throw and abort the WHOLE sync. Unknown keys are
+    // non-blocking (§2.2), so a non-own key must fail the condition, not crash. The
+    // case-insensitive fallback already scans own keys only (`Object.keys`).
+    const direct =
+      device.attributes !== undefined && Object.hasOwn(device.attributes, key) ? device.attributes[key] : undefined;
+    const attr = direct ?? lookupAttributeCaseInsensitive(device.attributes, key);
     if (attr === undefined) {
       return false; // §2.3 — no attribute for this key ⇒ condition fails
     }
