@@ -155,6 +155,71 @@ export function baseWebviewCss(): string {
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
     }
+    /* Keyboard highlight while filtering — distinct from the persisted
+       .selected so the user can see which option Enter would pick. */
+    .custom-select-option.highlighted {
+      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+    }
+    /* A selected option that is ALSO the keyboard highlight keeps its
+       active-selection color (higher specificity than the .highlighted rule),
+       so the current value never loses its highlight when Enter would re-pick
+       it. */
+    .custom-select-option.selected.highlighted {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
+      color: var(--vscode-list-activeSelectionForeground, #fff);
+    }
+    /* The filter row pins the type-to-filter box to the top of a filterable
+       dropdown and hosts the leading search glyph. Sticky lives on the row so
+       both scroll-pin together. */
+    .custom-select-filter-row {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    /* Leading search glyph — a monochrome, theme-tinted magnifier (inline SVG
+       mask, no external asset), matching the trigger chevron's flat glyph style
+       so the box reads unmistakably as a filter, not a value field. */
+    .custom-select-filter-row::before {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 12px;
+      height: 12px;
+      pointer-events: none;
+      opacity: 0.6;
+      background-color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+    }
+    /* Higher specificity than the base input[type="text"] rule so its flat,
+       borderless look wins. Left padding clears the search glyph. */
+    .custom-select-dropdown .custom-select-filter {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 5px 8px 5px 26px;
+      margin: 0;
+      border: none;
+      border-bottom: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
+      border-radius: 0;
+      background: var(--vscode-input-background, var(--vscode-dropdown-background));
+      color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      font-family: inherit;
+      font-size: 13px;
+      outline: none;
+    }
+    .custom-select-dropdown .custom-select-filter:focus {
+      border-bottom-color: var(--vscode-focusBorder);
+    }
+    .custom-select-no-matches {
+      padding: 6px 8px;
+      font-size: 12px;
+      font-style: italic;
+      opacity: 0.7;
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+      cursor: default;
+    }
     .custom-select-option-desc {
       font-size: 11px;
       opacity: 0.75;

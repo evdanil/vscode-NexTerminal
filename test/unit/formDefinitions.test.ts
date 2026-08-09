@@ -4,6 +4,7 @@ import {
   localShellFormDefinition,
   serialFormDefinition,
   serverFormDefinition,
+  tunnelFormDefinition,
   unifiedProfileFormDefinition,
   unifiedProfileFormId
 } from "../../src/ui/formDefinitions";
@@ -713,5 +714,44 @@ describe("formDefinitions — IPMI auth profile and BMC web protocol", () => {
     const definition = unifiedProfileFormDefinition(undefined, [], true, [], profiles);
     expect(keyedField(definition, "ipmiAuthProfileId").visibleWhen).toEqual({ field: "profileType", value: "ssh" });
     expect(keyedField(definition, "bmcWebProtocol").visibleWhen).toEqual({ field: "profileType", value: "ssh" });
+  });
+});
+
+describe("PR-F1 — filterable adopters (backlog #4)", () => {
+  function selectField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { type: "select" }> {
+    const field = keyedField(definition, key);
+    expect(field.type, `field ${key} should be a select`).toBe("select");
+    return field as Extract<FormFieldDescriptor, { type: "select" }>;
+  }
+
+  it("makes the Jump Host Server select filterable (the headline fix — falsifies dropping the flag from proxyJumpHostId)", () => {
+    const definition = serverFormDefinition(undefined, [], true, [{ id: "s2", name: "Other", host: "h" } as never]);
+    expect(selectField(definition, "proxyJumpHostId").filterable).toBe(true);
+  });
+
+  it("makes the SSH Auth Profile select filterable", () => {
+    const definition = serverFormDefinition(undefined, [], true, [], [
+      { id: "p1", name: "Prod", username: "root", authType: "password" }
+    ]);
+    expect(selectField(definition, "authProfileId").filterable).toBe(true);
+  });
+
+  it("makes the IPMI Auth Profile select filterable", () => {
+    const definition = serverFormDefinition(undefined, [], true, [], [
+      { id: "p1", name: "Prod", username: "root", authType: "password" }
+    ]);
+    expect(selectField(definition, "ipmiAuthProfileId").filterable).toBe(true);
+  });
+
+  it("makes the tunnel's target-server select filterable", () => {
+    const definition = tunnelFormDefinition(undefined, {
+      servers: [{ id: "s1", name: "web-1" }]
+    } as never);
+    expect(selectField(definition, "defaultServerId").filterable).toBe(true);
+  });
+
+  it("leaves small fixed-domain selects alone — authType is NOT filterable (filtering a 3-option list is noise)", () => {
+    const definition = serverFormDefinition();
+    expect(selectField(definition, "authType").filterable).toBeFalsy();
   });
 });
