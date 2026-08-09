@@ -137,16 +137,33 @@ describe("fixture 23 — manual apply CLEARS the stamps it writes (value == stam
     expect((afterFor(p, applied.id) ?? applied).proxy).toEqual(P);
   });
 
-  it("auth sibling: writing the auth link clears syncedAuthProfileId, and a later override auth rule does not move it", () => {
-    const server = ownedServer({ authProfileId: undefined, username: "admin" }, { syncedUsername: "admin" });
+  it("auth sibling: overriding a SYNC-LINKED server clears syncedAuthProfileId, and a later override auth rule does not move it (B2 — non-vacuous)", () => {
+    // NON-VACUOUS shape (§10 #23, PR-T1b review B2): the server STARTS
+    // sync-linked — `authProfileId === origin.syncedAuthProfileId === "normal"`
+    // — so the auth stamp the manual apply must clear is ACTUALLY PRESENT. The
+    // prior fixture started with no link and no stamp, so `clearTemplatedStamps`
+    // clearing `syncedAuthProfileId` was a no-op and both assertions passed
+    // whether or not the code cleared it (empirically confirmed vacuous). Here,
+    // if the clear is forgotten the stamp stays "normal", (a) fails outright, and
+    // (b) the override sync then MOVES the link to "other" — both go red.
+    const server = ownedServer(
+      { authProfileId: "normal", username: "admin" },
+      { syncedUsername: "admin", syncedAuthProfileId: "normal" }
+    );
+    // Manually OVERRIDE-apply a template linking the same profile "normal": the
+    // override path writes the auth field (writtenFields includes authProfileId),
+    // which is what triggers the syncedAuthProfileId clear.
     const T = template({ authProfileId: { mode: "override", value: "normal" } });
     const plan = runPlan(T, [server], { authProfiles: [NORMAL] });
     const applied = applyManual(server, plan);
+
+    // (a) the auth stamp is now ABSENT — the write took ownership (row 7).
     expect(applied.authProfileId).toBe("normal");
     expect(applied.origin?.syncedAuthProfileId).toBeUndefined();
 
-    // Next sync: an override auth rule naming a different profile does NOT move
-    // the now-hand-owned link (row 7 for auth — stamp absent).
+    // (b) a later sync whose winner is an OVERRIDE auth rule naming a DIFFERENT
+    // profile "other" does NOT move the now-hand-owned link (stamp absent, so the
+    // override-move gate `authProfileId === syncedAuthProfileId` cannot fire).
     const T2 = template({ authProfileId: { mode: "override", value: "other" } }, "tmpl-2");
     const p = secondSync(
       makeSource({ templateRules: [{ id: "r", templateId: "tmpl-2" }] }),
@@ -256,6 +273,44 @@ describe("fixture 24c — manual auth-OVERRIDE is deliberately unconstrained", (
     expect(plan.auth?.linked).toBe(2);
     expect(plan.auth?.replacingHandConfigured).toBe(2);
     expect(plan.auth?.skippedNeedsKey).toBe(0);
+  });
+});
+
+describe("P1 — 'replacing N hand-configured logins' counts only GENUINE hand logins that CHANGE", () => {
+  it("override excludes a sync-linked target and an already-same-profile target from the replacing count", () => {
+    // A: sync-owned link to "normal" (authProfileId === syncedAuthProfileId).
+    //    Override to "other" MOVES a sync link — not replacing a hand login.
+    const syncLinked = ownedServer(
+      { id: "srv-sync", authProfileId: "normal", username: "admin" },
+      { syncedUsername: "admin", syncedAuthProfileId: "normal" }
+    );
+    // B: already linked to the SAME profile the override names — no change at all.
+    const alreadySame = ownedServer(
+      { id: "srv-same", authProfileId: "other", username: "admin" },
+      { syncedUsername: "admin" } // hand link (no syncedAuthProfileId), but already "other"
+    );
+    // C: a genuine hand login to a DIFFERENT profile that DOES change → counts.
+    const genuineHand: ServerConfig = {
+      id: "srv-hand",
+      name: "hand",
+      host: "h",
+      port: 22,
+      username: "operator",
+      authType: "key",
+      keyPath: "~/.ssh/id_prod",
+      authProfileId: "normal", // hand-chosen link, moving to "other" replaces it
+      isHidden: false
+    };
+    const plan = runPlan(
+      template({ authProfileId: { mode: "override", value: "other" } }),
+      [syncLinked, alreadySame, genuineHand],
+      { authProfiles: [NORMAL, authProfile("other")] }
+    );
+    // All three are usable and linked (override is unconstrained except usability).
+    expect(plan.auth?.linked).toBe(3);
+    // But only C genuinely replaces a hand-configured login that changes.
+    // The pre-fix code counted every non-fill-eligible link → would report 3.
+    expect(plan.auth?.replacingHandConfigured).toBe(1);
   });
 });
 

@@ -53,7 +53,7 @@ export const TEMPLATE_FIELD_SHORT_LABELS: Record<TemplatableField, string> = {
   authProfileId: "Auth Profile",
   multiplexing: "Multiplexing",
   legacyAlgorithms: "Legacy Algorithms",
-  logSession: "Log Session"
+  logSession: "Session Logging"
 };
 
 /** The four non-auth stamp fields, in the order the tooltip lists them. */
@@ -891,8 +891,19 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
           w.authProfileId = profile.id;
           w.writtenFields.push("authProfileId");
           stats.linked++;
-          // A never-configured (fill-eligible) target is not "replacing" anything.
-          if (!fillEligible) {
+          // P1 (adversarial minor 2) — "replacing N hand-configured logins" must
+          // count ONLY targets whose current effective login is genuinely
+          // hand-configured AND actually changes. Excluded:
+          //   - a never-configured (fill-eligible) target — nothing to replace;
+          //   - a SYNC-OWNED link (`authProfileId === origin.syncedAuthProfileId`)
+          //     — the sync put it there, not the hand, so override is moving a
+          //     sync link, not replacing a hand one;
+          //   - a target ALREADY linked to this same profile — the write is a
+          //     no-op, so it "replaces" nothing.
+          const current = server.authProfileId;
+          const syncOwned = current !== undefined && current === server.origin?.syncedAuthProfileId;
+          const alreadySameProfile = current === profile.id;
+          if (!fillEligible && !syncOwned && !alreadySameProfile) {
             stats.replacingHandConfigured++;
           }
         }

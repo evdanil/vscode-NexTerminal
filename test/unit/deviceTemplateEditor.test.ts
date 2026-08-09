@@ -110,6 +110,23 @@ describe("builder parameter extensions (UX-M4/m13)", () => {
     const serverAuth = field(server, "authProfileId") as Extract<FormFieldDescriptor, { type: "select" }>;
     expect(serverAuth.autofill).toBe(true);
   });
+
+  it("P2 — the editor's auth select SUPPRESSES the dead 'Create new auth profile…' option; the server form keeps it", () => {
+    const editor = deviceTemplateFormDefinition();
+    const editorAuth = field(editor, "authProfileId") as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(editorAuth.options.some((o) => o.value === "__create__authProfile")).toBe(false);
+
+    const server = serverFormDefinition({ id: "s1", name: "s", host: "h", port: 22, username: "u", authType: "agent" });
+    const serverAuth = field(server, "authProfileId") as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(serverAuth.options.some((o) => o.value === "__create__authProfile")).toBe(true);
+  });
+
+  it("P8 — the auth-select hint drops the rung-3 'matching' cascade leak", () => {
+    const editor = deviceTemplateFormDefinition();
+    const editorAuth = field(editor, "authProfileId") as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(editorAuth.hint).not.toContain("matching servers");
+    expect(editorAuth.hint).toContain("the servers it applies to");
+  });
 });
 
 describe("shared short-label map (§7.3/§7.4)", () => {
@@ -119,7 +136,7 @@ describe("shared short-label map (§7.3/§7.4)", () => {
       authProfileId: "Auth Profile",
       multiplexing: "Multiplexing",
       legacyAlgorithms: "Legacy Algorithms",
-      logSession: "Log Session"
+      logSession: "Session Logging"
     });
     // templateAppliedFields returns the fields still carrying a template value,
     // and the tooltip renders them through the SAME map (proved by the labels).

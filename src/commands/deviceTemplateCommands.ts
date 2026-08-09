@@ -27,8 +27,18 @@ import type { CommandContext } from "./types";
  * Adopted copy is reproduced verbatim.
  */
 
-/** Reads one field's `{mode, value}` off the submitted form, or `undefined` when
- *  the mode select is "Not set" (or the value control produced nothing usable). */
+/**
+ * Reads one field's `{mode, value}` off the submitted form, or `undefined` when
+ * the mode select is "Not set".
+ *
+ * P3 (adversarial minor 4) — when the mode IS `fill`/`override` but the value
+ * control resolves to nothing usable (proxyType "none"/invalid host, no auth
+ * profile picked), the field is NOT silently dropped: that discards a choice the
+ * user deliberately made and re-opens showing "Not set" where they chose a mode.
+ * Instead throw, routing the message through the form framework's validation
+ * channel (`webviewFormPanel`'s submit try/catch surfaces it and keeps the form
+ * open), exactly like the "Name is required" reject below.
+ */
 function readTemplateField<T>(
   values: FormValues,
   field: TemplatableField,
@@ -40,7 +50,12 @@ function readTemplateField<T>(
   }
   const value = readValue();
   if (value === undefined) {
-    return undefined;
+    const label = TEMPLATE_FIELD_SHORT_LABELS[field];
+    const modeName = rawMode === "override" ? "Override" : "Fill";
+    throw new Error(
+      `${label} mode is set to ${modeName} but no value is configured. ` +
+        `Choose a value for ${label}, or set its mode to "Not set".`
+    );
   }
   return { mode: rawMode as TemplateFieldMode, value };
 }
@@ -82,6 +97,14 @@ function serverListEntries(ctx: CommandContext): ServerListEntry[] {
   return ctx.core.getSnapshot().servers.map((s) => ({ id: s.id, name: s.name }));
 }
 
+/** The inventory sources whose `templateRules` reference this template id. */
+function sourcesReferencingTemplate(ctx: CommandContext, templateId: string): { id: string; name: string }[] {
+  return ctx.core
+    .getSnapshot()
+    .inventorySources.filter((source) => (source.templateRules ?? []).some((rule) => rule.templateId === templateId))
+    .map((source) => ({ id: source.id, name: source.name }));
+}
+
 /** Opens the editor (Add when `seed` is undefined, Edit otherwise). */
 function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProfile): void {
   const snapshot = ctx.core.getSnapshot();
@@ -91,9 +114,25 @@ function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProf
     onSubmit: async (values) => {
       const template = parseDeviceTemplateFormValues(values, seed?.id);
       await ctx.core.addOrUpdateDeviceTemplate(template);
-      void vscode.window.showInformationMessage(
-        seed?.id ? `Device template "${template.name}" updated.` : `Device template "${template.name}" created.`
-      );
+      // U1 (§6.1 UX-S8) — the VERBATIM save toast (single "saved." wording, not a
+      // created/updated split), telling the user the edit takes effect on each
+      // source's next sync. The `Sync Affected Sources` button is offered only
+      // when at least one source's rules reference this template — a just-created
+      // template referenced by nothing shows the toast without the button.
+      const affected = sourcesReferencingTemplate(ctx, template.id);
+      const SYNC = "Sync Affected Sources";
+      const message = `Device template "${template.name}" saved. Changes apply on each source's next sync.`;
+      const choice =
+        affected.length > 0
+          ? await vscode.window.showInformationMessage(message, SYNC)
+          : (void vscode.window.showInformationMessage(message), undefined);
+      if (choice === SYNC) {
+        // Reuse the existing sync-now flow (with its plan preview) for every
+        // referencing source — never a second, previewless write path (§6.1).
+        for (const source of affected) {
+          await vscode.commands.executeCommand("nexus.inventory.syncNow", source.id);
+        }
+      }
     }
   });
 }
@@ -101,6 +140,45 @@ function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProf
 /** UX-M5 empty-state placeholder for the manage hub (never the legacy dead-end). */
 const EMPTY_STATE_PLACEHOLDER =
   "No device templates yet. A device template applies shared settings — proxy, auth profile, and more — to servers synced from inventory.";
+
+/**
+ * U3 (§7.1 CRUD, §6.2) — the confirm modal + `removeDeviceTemplate` wiring, using
+ * the auth-profile delete idiom (a modal naming the template). Per §6.2 the record
+ * is removed and every referencing `templateRules` entry cleared, but applied
+ * VALUES and STAMPS already on servers are KEPT (reclaimable) — the modal says so.
+ */
+async function deleteDeviceTemplateFlow(ctx: CommandContext): Promise<void> {
+  const templates = ctx.core.getSnapshot().deviceTemplates;
+  if (templates.length === 0) {
+    return;
+  }
+  const pick = await vscode.window.showQuickPick(
+    templates
+      .slice()
+      .sort((a, b) => naturalCompare(a.name, b.name))
+      .map((t) => ({ label: t.name, description: describeTemplateFields(t), template: t })),
+    { title: "Delete Device Template", placeHolder: "Select a device template to delete" }
+  );
+  if (!pick) {
+    return;
+  }
+  const referencing = sourcesReferencingTemplate(ctx, pick.template.id);
+  const sourceNote =
+    referencing.length > 0
+      ? ` It is cleared from ${referencing.length === 1 ? "1 inventory source's rules" : `${referencing.length} inventory sources' rules`}.`
+      : "";
+  const detail = `Values and stamps already applied to servers are kept — deleting removes only the template and its rules.${sourceNote}`;
+  const confirm = await vscode.window.showWarningMessage(
+    `Delete device template "${pick.template.name}"?`,
+    { modal: true, detail },
+    "Delete"
+  );
+  if (confirm !== "Delete") {
+    return;
+  }
+  await ctx.core.removeDeviceTemplate(pick.template.id);
+  void vscode.window.showInformationMessage(`Device template "${pick.template.name}" deleted.`);
+}
 
 async function manageDeviceTemplates(ctx: CommandContext): Promise<void> {
   const templates = ctx.core.getSnapshot().deviceTemplates;
@@ -113,17 +191,26 @@ async function manageDeviceTemplates(ctx: CommandContext): Promise<void> {
     return;
   }
   const NEW = "$(add) New Device Template";
+  const DELETE = "$(trash) Delete a Device Template…";
+  type ManageAction = "new" | "delete" | "edit";
   const pick = await vscode.window.showQuickPick(
     [
-      { label: NEW, template: undefined as DeviceTemplateProfile | undefined },
+      { label: NEW, action: "new" as ManageAction, template: undefined as DeviceTemplateProfile | undefined },
       ...templates
         .slice()
         .sort((a, b) => naturalCompare(a.name, b.name))
-        .map((t) => ({ label: t.name, description: describeTemplateFields(t), template: t }))
+        .map((t) => ({ label: t.name, description: describeTemplateFields(t), action: "edit" as ManageAction, template: t as DeviceTemplateProfile | undefined })),
+      // U3 — a dedicated delete entry, so selecting a template row keeps its
+      // meaning (edit) and delete is an explicit, separately-confirmed choice.
+      { label: DELETE, action: "delete" as ManageAction, template: undefined as DeviceTemplateProfile | undefined }
     ],
-    { title: "Manage Device Templates", placeHolder: "Select a device template to edit, or create a new one" }
+    { title: "Manage Device Templates", placeHolder: "Select a device template to edit, create a new one, or delete one" }
   );
   if (!pick) {
+    return;
+  }
+  if (pick.action === "delete") {
+    await deleteDeviceTemplateFlow(ctx);
     return;
   }
   openDeviceTemplateEditor(ctx, pick.template);
@@ -144,11 +231,21 @@ function serversInFolder(ctx: CommandContext, folderPath: string): ServerConfig[
   return ctx.core.getSnapshot().servers.filter((s) => s.group && isDescendantOrSelf(s.group, folderPath));
 }
 
+/** B1 — do two server lists name the exact same set of ids? (order-independent). */
+function sameServerIds(a: readonly ServerConfig[], b: readonly ServerConfig[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const ids = new Set(a.map((s) => s.id));
+  return b.every((s) => ids.has(s.id));
+}
+
 async function pickTemplate(ctx: CommandContext): Promise<DeviceTemplateProfile | undefined> {
   const templates = ctx.core.getSnapshot().deviceTemplates;
   if (templates.length === 0) {
-    // Zero-template state (UX-M5) — offer New instead of a dead-end warning.
-    const choice = await vscode.window.showInformationMessage(EMPTY_STATE_PLACEHOLDER, "New Device Template");
+    // Zero-template state (UX-M5) — a MODAL (P6, §7.4 UX-M5 "shows a modal") so
+    // it cannot be missed, offering New instead of a dead-end warning.
+    const choice = await vscode.window.showInformationMessage(EMPTY_STATE_PLACEHOLDER, { modal: true }, "New Device Template");
     if (choice === "New Device Template") {
       openDeviceTemplateEditor(ctx);
     }
@@ -169,18 +266,31 @@ function serverCountPhrase(count: number): string {
   return count === 1 ? "1 server" : `${count} servers`;
 }
 
+/** "1 hand-configured login" / "9 hand-configured logins" (P5 pluralization). */
+function loginCountPhrase(count: number): string {
+  return `${count} hand-configured ${count === 1 ? "login" : "logins"}`;
+}
+
 /**
- * The §7.4 (UX-S7) consent modal: per-field dry-run lines with the auth link's
- * skips split by reason, closing with the verbatim ownership sentence.
+ * The §7.4 (UX-S7) consent-modal BODY — the per-field dry-run lines with the
+ * auth link's skips split by reason, the plan's reference-validation warnings
+ * (U2 — dangling jump host / auth profile / self-proxy: every dropped-for-
+ * reference field must be visible before the user confirms), and the verbatim
+ * ownership sentence. Rendered into the modal's `detail` slot (P7); the headline
+ * that names the template + folder is the modal `message`.
+ *
+ * P5 — the per-line counts go through `serverCountPhrase` / `loginCountPhrase`,
+ * so "1 server will be set" and "replacing 1 hand-configured login" read
+ * correctly, not "1 servers"/"1 logins".
  */
-function buildConsentModal(plan: ManualApplyPlan): string {
+function buildConsentModalDetail(plan: ManualApplyPlan): string {
   const lines: string[] = [];
   const valueLine = (field: TemplatableField, stats: { mode: TemplateFieldMode; willSet: number; skipped: number } | undefined): void => {
     if (!stats) {
       return;
     }
     const mode = stats.mode === "override" ? "Override" : "Fill";
-    lines.push(`${TEMPLATE_FIELD_SHORT_LABELS[field]} (${mode}): ${stats.willSet} servers will be set, ${stats.skipped} skipped`);
+    lines.push(`${TEMPLATE_FIELD_SHORT_LABELS[field]} (${mode}): ${serverCountPhrase(stats.willSet)} will be set, ${stats.skipped} skipped`);
   };
   valueLine("proxy", plan.proxy);
   valueLine("multiplexing", plan.multiplexing);
@@ -189,18 +299,24 @@ function buildConsentModal(plan: ManualApplyPlan): string {
   if (plan.auth) {
     const a = plan.auth;
     if (a.mode === "fill") {
-      let line = `Auth Profile (Fill): ${a.linked} servers will be linked; ${a.skippedAlreadyLinked} skipped (already linked); ${a.skippedLoginConfigured} skipped (SSH login already configured)`;
+      let line = `Auth Profile (Fill): ${serverCountPhrase(a.linked)} will be linked; ${a.skippedAlreadyLinked} skipped (already linked); ${a.skippedLoginConfigured} skipped (SSH login already configured)`;
       if (a.skippedNeedsKey > 0) {
         line += `; ${a.skippedNeedsKey} skipped (profile needs a key file the server doesn't have)`;
       }
       lines.push(line);
     } else {
-      let line = `Auth Profile (Override): ${a.linked} servers will be linked, replacing ${a.replacingHandConfigured} hand-configured logins`;
+      let line = `Auth Profile (Override): ${serverCountPhrase(a.linked)} will be linked, replacing ${loginCountPhrase(a.replacingHandConfigured)}`;
       if (a.skippedNeedsKey > 0) {
         line += `; ${a.skippedNeedsKey} skipped (profile needs a key file the server doesn't have)`;
       }
       lines.push(line);
     }
+  }
+  // U2 — surface every reference-validation warning (a field silently dropped
+  // because its jump host / auth profile is gone, or a per-device self-proxy
+  // skip) so the user never consents to a plan that quietly discarded a field.
+  for (const warning of plan.warnings) {
+    lines.push(warning);
   }
   lines.push("");
   lines.push("Values applied here count as your own edits — future inventory syncs will not change them.");
@@ -286,13 +402,30 @@ export function registerDeviceTemplateCommands(ctx: CommandContext): vscode.Disp
         return;
       }
       const previewPlan = planFor(ctx, template, servers);
-      const confirm = await vscode.window.showWarningMessage(buildConsentModal(previewPlan), { modal: true }, "Apply");
+      // P7 — a headline naming the template + folder in `message`, the per-field
+      // plan lines + `plan.warnings` (U2) in `detail`. `shownDetail` is captured
+      // as the disclosure the user consents to, and is the B1 comparator below.
+      const shownDetail = buildConsentModalDetail(previewPlan);
+      const confirm = await vscode.window.showWarningMessage(
+        `Apply device template "${template.name}" to "${folderPath}"?`,
+        { modal: true, detail: shownDetail },
+        "Apply"
+      );
       if (confirm !== "Apply") {
         return;
       }
-      // Re-derive under the lock from live state, then write once per server —
-      // the same "abort nothing, recompute from scratch" shape the auth-profile
-      // apply command uses.
+      // B1 (correctness M1) — the modal above was rendered from `previewPlan`,
+      // sampled BEFORE the modal and BEFORE this lock, and both waits are
+      // unbounded: a concurrent sync/add/edit can change the folder's server set
+      // or the template's fields while the modal sits open. Applying the
+      // recomputed plan UNCONDITIONALLY would link/replace/stamp servers the user
+      // never saw disclosed (e.g. override auth linking 32 servers after the
+      // modal said 2). Mirror `authProfileCommands.ts:193-212` exactly: re-derive
+      // under the lock and REFUSE on any divergence — the target server SET (it
+      // subsumes the count) AND the full per-field disclosure (`shownDetail`,
+      // which encodes every count and warning line). Only apply when the
+      // recomputed plan matches what was consented to.
+      let refusal: string | undefined;
       let applied = 0;
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: `Applying device template "${template.name}"...` },
@@ -300,13 +433,39 @@ export function registerDeviceTemplateCommands(ctx: CommandContext): vscode.Disp
           configMutationLock.runExclusive(async () => {
             const live = ctx.core.getDeviceTemplate(template.id);
             if (!live) {
+              // Lesser sibling — template deleted mid-modal: name the deletion
+              // rather than silently report "Applied … to 0 servers."
+              refusal =
+                `The template was deleted while the confirmation was open — nothing was applied. ` +
+                "Run Apply Device Template again to review what it would apply now.";
               return;
             }
             const current = serversInFolder(ctx, folderPath);
+            // The set first, because it subsumes the count the disclosure renders:
+            // two servers leaving and two arriving keeps the number the user
+            // agreed to while changing every record this would write.
+            if (!sameServerIds(current, servers)) {
+              refusal =
+                `The servers in "${folderPath}" changed while the confirmation was open — nothing was applied. ` +
+                "Run Apply Device Template again to see what it would apply now.";
+              return;
+            }
             const plan = planFor(ctx, live, current);
+            // Everything else the disclosure is built from — the template's fields
+            // and each target's current values, all folded into the plan lines.
+            if (buildConsentModalDetail(plan) !== shownDetail) {
+              refusal =
+                `What this template would apply to "${folderPath}" changed while the confirmation was open — nothing was applied. ` +
+                "Run Apply Device Template again to review the current plan.";
+              return;
+            }
             applied = await applyPlanWrites(ctx, plan);
           })
       );
+      if (refusal !== undefined) {
+        void vscode.window.showWarningMessage(refusal);
+        return;
+      }
       void vscode.window.showInformationMessage(
         `Applied device template "${template.name}" to ${serverCountPhrase(applied)}.`
       );

@@ -39,6 +39,15 @@ interface AuthProfileSelectOptions {
    *  a profile already selected (the unified Add Profile form), where there is
    *  nothing for a render to have displaced. */
   displacedValues?: Record<string, string>;
+  /**
+   * P2 (adversarial minor 3) — drop the "Create new auth profile…" sentinel
+   * option. The template editor sets this: `openDeviceTemplateEditor` wires NO
+   * inline-create handler for its auth select, so offering the sentinel there
+   * makes the auth field silently vanish on submit (the sentinel is not a real
+   * profile id). Suppressing the option removes the dead capability rather than
+   * leaving a dangling one. Every OTHER caller keeps it (defaults to `false`).
+   */
+  suppressCreate?: boolean;
 }
 
 /**
@@ -183,7 +192,9 @@ function authProfileSelectField(
   const options = [
     { label: "(None)", value: "" },
     ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id })),
-    { label: "Create new auth profile\u2026", value: "__create__authProfile" }
+    // P2 \u2014 suppressed in the device-template editor, whose auth select has no
+    // inline-create handler wired (choosing it would silently drop the field).
+    ...(opts?.suppressCreate ? [] : [{ label: "Create new auth profile\u2026", value: "__create__authProfile" }])
   ];
   const selectedProfile = selectedId ? (authProfiles ?? []).find((p) => p.id === selectedId) : undefined;
   const autofill = opts?.autofill ?? true;
@@ -641,7 +652,7 @@ function templateModeSelect(field: TemplatableFormField, seededMode: string): Fo
   return {
     type: "select",
     key: deviceTemplateModeKey(field),
-    label: `${field === "authProfileId" ? "Auth Profile" : field === "proxy" ? "Proxy" : field === "multiplexing" ? "Connection multiplexing" : field === "legacyAlgorithms" ? "Legacy SSH algorithms" : "Session transcript logging"} — Template mode`,
+    label: `${field === "authProfileId" ? "Auth Profile" : field === "proxy" ? "Proxy" : field === "multiplexing" ? "Connection multiplexing" : field === "legacyAlgorithms" ? "Legacy SSH algorithms" : "Session Logging"} — Template mode`,
     options: TEMPLATE_MODE_OPTIONS,
     value: seededMode,
     hint: field === "authProfileId" ? TEMPLATE_AUTH_MODE_HINT : TEMPLATE_MODE_SHARED_HINT
@@ -695,7 +706,13 @@ export function deviceTemplateFormDefinition(
       authProfileSelectField(authProfiles, authVw, seed?.fields.authProfileId?.value, {
         advanced: false,
         autofill: false,
-        hint: "The saved SSH credentials this template links onto matching servers."
+        // P2 — no inline-create handler is wired for this select, so drop the
+        // "Create new auth profile…" option rather than let it silently vanish
+        // the field on submit.
+        suppressCreate: true,
+        // P8 (UX polish 5) — rung-3 cascade vocabulary leak: nothing in T1b
+        // "matches" (catch-all only), so name what actually happens.
+        hint: "The saved SSH credentials this template links onto the servers it applies to."
       }),
       templateOverridePreemption("authProfileId"),
 
@@ -1129,10 +1146,12 @@ export function deviceTemplateSelectRepresentable(rules: readonly TemplateRule[]
  * `type: "html"` fallback that submits NO template key (so Save cannot mutate
  * `templateRules`, UX-M3). Fallback copy pluralized on the rule count, VERBATIM.
  *
- * NOTE (PR-T1b): the fallback names "Edit Template Rules…", which is a PR-T2
- * command that does not exist yet. The string is doc-adopted (§7.2), so it is
- * kept verbatim as INFORMATIONAL text — no command is registered or pointed at.
- * The T2 command lands later and makes the phrase actionable.
+ * NOTE (PR-T1b, U4): the fallback names "Edit Template Rules…", which is a PR-T2
+ * command that does not exist yet. So the sentence appends the engine's companion
+ * repair idiom — "(requires a newer version of Nexus)" — staying true in a T1b
+ * build (where there is no such menu item) and still correct in T2 (where the
+ * command lands). The string is doc-adopted (§7.2, kept in sync with the design
+ * doc) — no command is registered or pointed at here.
  */
 function deviceTemplateSourceField(
   deviceTemplates: DeviceTemplateProfile[] | undefined,
@@ -1142,8 +1161,8 @@ function deviceTemplateSourceField(
   if (!deviceTemplateSelectRepresentable(list)) {
     const content =
       list.length === 1
-        ? "A filtered template rule is configured for this source. Manage it with <strong>Edit Template Rules…</strong>"
-        : `${list.length} template rules are configured for this source. Manage them with <strong>Edit Template Rules…</strong>`;
+        ? "A filtered template rule is configured for this source. Manage it with <strong>Edit Template Rules…</strong> (requires a newer version of Nexus)."
+        : `${list.length} template rules are configured for this source. Manage them with <strong>Edit Template Rules…</strong> (requires a newer version of Nexus).`;
     return {
       type: "html",
       content: `<div style="padding: 12px; border-left: 4px solid var(--vscode-inputValidation-infoBorder, #3794ff); background: var(--vscode-inputValidation-infoBackground, rgba(55,148,255,0.1)); border-radius: 6px; line-height: 1.5;">${content}</div>`

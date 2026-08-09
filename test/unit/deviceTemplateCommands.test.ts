@@ -11,6 +11,7 @@ const mockShowQuickPick = vi.fn();
 const mockShowWarningMessage = vi.fn();
 const mockShowInformationMessage = vi.fn();
 const mockWithProgress = vi.fn();
+const mockExecuteCommand = vi.fn();
 const formPanelOpens: Array<{ formId: string; options: { onSubmit: (v: FormValues) => Promise<void> | void } }> = [];
 
 vi.mock("vscode", () => ({
@@ -19,7 +20,7 @@ vi.mock("vscode", () => ({
       registeredCommands.set(id, handler);
       return { dispose: vi.fn() };
     }),
-    executeCommand: vi.fn()
+    executeCommand: (...args: unknown[]) => mockExecuteCommand(...args)
   },
   window: {
     showQuickPick: (...args: unknown[]) => mockShowQuickPick(...args),
@@ -85,6 +86,7 @@ beforeEach(() => {
   mockShowWarningMessage.mockReset();
   mockShowInformationMessage.mockReset();
   mockWithProgress.mockReset();
+  mockExecuteCommand.mockReset();
   mockWithProgress.mockImplementation((_opts: unknown, task: () => Promise<void>) => task());
 });
 
@@ -113,10 +115,20 @@ describe("parseDeviceTemplateFormValues (§7.1 tri-state → model)", () => {
     expect(t.fields.logSession).toBeUndefined();
   });
 
-  it("rejects an empty name and drops an auth field left on (None)/create sentinel", () => {
+  it("rejects an empty name", () => {
     expect(() => parseDeviceTemplateFormValues({ name: "  " })).toThrow(/Name is required/);
-    const t = parseDeviceTemplateFormValues({ name: "T", mode_authProfileId: "fill", authProfileId: "" });
-    expect(t.fields.authProfileId).toBeUndefined();
+  });
+
+  it("P3 — a field whose mode is fill/override but has no usable value is REJECTED, not silently dropped", () => {
+    // Auth mode set but left on (None)/create sentinel → reject (the pre-fix code
+    // returned a template with the auth field silently dropped).
+    expect(() => parseDeviceTemplateFormValues({ name: "T", mode_authProfileId: "fill", authProfileId: "" })).toThrow(
+      /Auth Profile mode is set to Fill but no value is configured/
+    );
+    // Override proxy with proxyType "none" → the value resolves to undefined → reject.
+    expect(() =>
+      parseDeviceTemplateFormValues({ name: "T", mode_proxy: "override", proxyType: "none" })
+    ).toThrow(/Proxy mode is set to Override but no value is configured/);
   });
 });
 
@@ -155,11 +167,104 @@ describe("device template CRUD commands", () => {
     const seed: DeviceTemplateProfile = { id: "t1", name: "Core", fields: { multiplexing: { mode: "override", value: true } } };
     await core.addOrUpdateDeviceTemplate(seed);
     register(core);
-    mockShowQuickPick.mockResolvedValue({ label: "Core", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowQuickPick.mockResolvedValue({ label: "Core", action: "edit", template: core.getSnapshot().deviceTemplates[0] });
     await registeredCommands.get("nexus.deviceTemplate.manage")!();
     expect(mockShowQuickPick).toHaveBeenCalled();
     const editOpen = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"));
     expect(editOpen).toBeDefined();
+  });
+
+  it("U3 — the manage hub can DELETE a template: confirm modal (values kept), then removeDeviceTemplate", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: { multiplexing: { mode: "override", value: true } } });
+    // A source that references the template — its rule must be cleared on delete.
+    await core.addOrUpdateInventorySource({
+      id: "src-1",
+      providerId: "netbox",
+      name: "NetBox",
+      targetFolder: "NetBox",
+      prunePolicy: "orphan",
+      defaultUsername: "admin",
+      config: {},
+      secretFieldIds: [],
+      templateRules: [{ id: "r", templateId: "t1" }]
+    });
+    register(core);
+    // First pick: the delete entry. Second pick: the template to delete.
+    mockShowQuickPick
+      .mockResolvedValueOnce({ label: "$(trash) Delete a Device Template…", action: "delete", template: undefined })
+      .mockResolvedValueOnce({ label: "Core", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowWarningMessage.mockResolvedValue("Delete");
+
+    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Delete device template "Core"?',
+      expect.objectContaining({ modal: true, detail: expect.stringContaining("Values and stamps already applied to servers are kept") }),
+      "Delete"
+    );
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(0);
+    // The referencing rule was cleared (§6.2).
+    expect(core.getInventorySource("src-1")!.templateRules).toEqual([]);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith('Device template "Core" deleted.');
+  });
+
+  it("U3 — cancelling the delete confirm keeps the template", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: {} });
+    register(core);
+    mockShowQuickPick
+      .mockResolvedValueOnce({ label: "$(trash) Delete a Device Template…", action: "delete", template: undefined })
+      .mockResolvedValueOnce({ label: "Core", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowWarningMessage.mockResolvedValue(undefined); // dismissed
+
+    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(1);
+  });
+});
+
+describe("U1 — save toast + Sync Affected Sources (§6.1 UX-S8)", () => {
+  it("shows the verbatim saved toast with a Sync button when a source references the template, and syncing runs syncNow per source", async () => {
+    const core = makeCore();
+    await core.addOrUpdateInventorySource({
+      id: "src-1",
+      providerId: "netbox",
+      name: "NetBox",
+      targetFolder: "NetBox",
+      prunePolicy: "orphan",
+      defaultUsername: "admin",
+      config: {},
+      secretFieldIds: [],
+      templateRules: [{ id: "r", templateId: "t1" }]
+    });
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Switch defaults", fields: { logSession: { mode: "fill", value: true } } });
+    register(core);
+    // Edit the referenced template.
+    mockShowQuickPick.mockResolvedValue({ label: "Switch defaults", action: "edit", template: core.getSnapshot().deviceTemplates[0] });
+    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    const editOpen = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"))!;
+
+    mockShowInformationMessage.mockResolvedValue("Sync Affected Sources");
+    await editOpen.options.onSubmit({ name: "Switch defaults", mode_logSession: "fill", logSession: true });
+
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(
+      'Device template "Switch defaults" saved. Changes apply on each source\'s next sync.',
+      "Sync Affected Sources"
+    );
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.syncNow", "src-1");
+  });
+
+  it("a template referenced by NOTHING shows the saved toast without the Sync button", async () => {
+    const core = makeCore();
+    register(core);
+    await registeredCommands.get("nexus.deviceTemplate.add")!();
+    mockShowInformationMessage.mockResolvedValue(undefined);
+    await formPanelOpens[0].options.onSubmit({ name: "Lonely", mode_logSession: "fill", logSession: true });
+
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(
+      'Device template "Lonely" saved. Changes apply on each source\'s next sync.'
+    );
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.syncNow", expect.anything());
   });
 });
 
@@ -188,16 +293,102 @@ describe("nexus.deviceTemplate.applyToFolder (§7.4)", () => {
 
     await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
 
-    // The consent modal was shown, modal: true, with the verbatim ownership sentence.
+    // P7 — the headline names the template + folder in `message`; the per-field
+    // plan lines + the verbatim ownership sentence go into `detail` (U2 slot).
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
-      expect.stringContaining("Values applied here count as your own edits — future inventory syncs will not change them."),
-      { modal: true },
+      'Apply device template "Reproxy" to "DC"?',
+      {
+        modal: true,
+        detail: expect.stringContaining("Values applied here count as your own edits — future inventory syncs will not change them.")
+      },
       "Apply"
     );
     // The write landed and the stamp was cleared (§7.4 ownership rule).
     const after = core.getServer("srv-1")!;
     expect(after.proxy).toEqual({ type: "socks5", host: "10.0.0.2", port: 1080 });
     expect(after.origin?.templated?.proxy).toBeUndefined();
+  });
+
+  it("B1 — ABORTS without writing when folder membership changes under the lock (re-derived plan diverges)", async () => {
+    const core = makeCore();
+    const s1: ServerConfig = { id: "srv-1", name: "a", host: "h", port: 22, username: "admin", authType: "agent", group: "DC" };
+    await core.addOrUpdateServer(s1);
+    const template: DeviceTemplateProfile = {
+      id: "t1",
+      name: "Mpx",
+      fields: { multiplexing: { mode: "override", value: true } }
+    };
+    await core.addOrUpdateDeviceTemplate(template);
+    register(core);
+
+    mockShowQuickPick.mockResolvedValue({ label: "Mpx", template: core.getSnapshot().deviceTemplates[0] });
+    // While the modal is "open" (before the caller returns "Apply"), a second
+    // server joins the folder — so the set the user consented to (1 server)
+    // diverges from what the lock re-derives (2 servers).
+    mockShowWarningMessage.mockImplementation(async () => {
+      await core.addOrUpdateServer({ id: "srv-2", name: "b", host: "h2", port: 22, username: "admin", authType: "agent", group: "DC" });
+      return "Apply";
+    });
+
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+
+    // NOTHING was written — neither the disclosed server nor the newcomer.
+    expect(core.getServer("srv-1")!.multiplexing).toBeUndefined();
+    expect(core.getServer("srv-2")!.multiplexing).toBeUndefined();
+    // The user is told nothing changed and to re-run.
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(
+      expect.stringContaining('The servers in "DC" changed while the confirmation was open — nothing was applied.')
+    );
+    // The success toast never fired.
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("Applied device template"));
+  });
+
+  it("B1 — a MATCHING re-derived plan still applies (the guard does not over-refuse)", async () => {
+    const core = makeCore();
+    const s1: ServerConfig = { id: "srv-1", name: "a", host: "h", port: 22, username: "admin", authType: "agent", group: "DC" };
+    await core.addOrUpdateServer(s1);
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Mpx", fields: { multiplexing: { mode: "override", value: true } } });
+    register(core);
+    mockShowQuickPick.mockResolvedValue({ label: "Mpx", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowWarningMessage.mockResolvedValue("Apply"); // no concurrent change
+
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+
+    expect(core.getServer("srv-1")!.multiplexing).toBe(true);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith('Applied device template "Mpx" to 1 server.');
+  });
+
+  it("B1 lesser sibling — template deleted mid-modal names the deletion, does not report '0 servers'", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "srv-1", name: "a", host: "h", port: 22, username: "admin", authType: "agent", group: "DC" });
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Mpx", fields: { multiplexing: { mode: "override", value: true } } });
+    register(core);
+    const picked = core.getSnapshot().deviceTemplates[0];
+    mockShowQuickPick.mockResolvedValue({ label: "Mpx", template: picked });
+    mockShowWarningMessage.mockImplementation(async () => {
+      await core.removeDeviceTemplate("t1"); // deleted while the modal is open
+      return "Apply";
+    });
+
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+
+    expect(core.getServer("srv-1")!.multiplexing).toBeUndefined();
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(
+      expect.stringContaining("The template was deleted while the confirmation was open — nothing was applied.")
+    );
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("Applied device template"));
+  });
+
+  it("P6 — the zero-template apply state is a MODAL offering New Device Template", async () => {
+    const core = makeCore();
+    register(core);
+    mockShowInformationMessage.mockResolvedValue(undefined);
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(
+      expect.stringContaining("No device templates yet."),
+      { modal: true },
+      "New Device Template"
+    );
   });
 
   it("does nothing when the folder has no matching servers", async () => {
