@@ -8,6 +8,7 @@ import type { FormValues } from "../../src/ui/formTypes";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
+const mockShowInputBox = vi.fn();
 const mockShowWarningMessage = vi.fn();
 const mockShowInformationMessage = vi.fn();
 const mockWithProgress = vi.fn();
@@ -24,10 +25,13 @@ vi.mock("vscode", () => ({
   },
   window: {
     showQuickPick: (...args: unknown[]) => mockShowQuickPick(...args),
+    showInputBox: (...args: unknown[]) => mockShowInputBox(...args),
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
     withProgress: (...args: unknown[]) => mockWithProgress(...args)
   },
+  QuickPickItemKind: { Separator: -1, Default: 0 },
+  InputBoxValidationSeverity: { Info: 1, Warning: 2, Error: 3 },
   TreeItem: class {
     public id?: string;
     public tooltip?: string;
@@ -75,9 +79,11 @@ function ctxFor(core: NexusCore): CommandContext {
   return { core } as unknown as CommandContext;
 }
 
+const stubRegistry = { get: () => undefined } as unknown as Parameters<typeof registerDeviceTemplateCommands>[1];
+
 function register(core: NexusCore): void {
   registeredCommands.clear();
-  registerDeviceTemplateCommands(ctxFor(core));
+  registerDeviceTemplateCommands(ctxFor(core), stubRegistry);
 }
 
 /**
@@ -120,13 +126,14 @@ function makeVault(
 
 function registerWithVault(core: NexusCore, vault: unknown): void {
   registeredCommands.clear();
-  registerDeviceTemplateCommands({ core, secretVault: vault } as unknown as CommandContext);
+  registerDeviceTemplateCommands({ core, secretVault: vault } as unknown as CommandContext, stubRegistry);
 }
 
 beforeEach(() => {
   registeredCommands.clear();
   formPanelOpens.length = 0;
   mockShowQuickPick.mockReset();
+  mockShowInputBox.mockReset();
   mockShowWarningMessage.mockReset();
   mockShowInformationMessage.mockReset();
   mockWithProgress.mockReset();
@@ -1023,5 +1030,88 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
       /deleted while the editor was open/i
     );
     expect(core.getSnapshot().deviceTemplates).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §7.2 (PR-T2) — "Edit Template Rules…" QuickPick flow orchestration. The pure
+// list/feedback/overlap logic lives in templateRulesView.test.ts; these lock the
+// vscode wiring: three-slot rows, the floor row routing to editSource, and
+// add/remove persistence.
+// ---------------------------------------------------------------------------
+describe("Edit Template Rules… flow (§7.2)", () => {
+  const PROXY: ProxyConfig = { type: "socks5", host: "10.9.9.1", port: 1080 };
+  const regWith = (keys?: string[]) =>
+    ({ get: () => (keys ? { attributeKeys: keys } : undefined) }) as unknown as Parameters<typeof registerDeviceTemplateCommands>[1];
+  function registerWithRegistry(core: NexusCore, registry: Parameters<typeof registerDeviceTemplateCommands>[1]): void {
+    registeredCommands.clear();
+    registerDeviceTemplateCommands(ctxFor(core), registry);
+  }
+  async function seedSource(core: NexusCore, overrides: Record<string, unknown> = {}): Promise<void> {
+    await core.addOrUpdateInventorySource({
+      id: "src-1",
+      providerId: "netbox",
+      name: "NetBox",
+      targetFolder: "",
+      prunePolicy: "orphan",
+      defaultUsername: "admin",
+      config: {},
+      secretFieldIds: [],
+      ...overrides
+    } as never);
+  }
+  const editRules = () => registeredCommands.get("nexus.deviceTemplate.editRules")!("src-1");
+
+  it("the implicit floor row routes to editSource (UX-S4)", async () => {
+    const core = makeCore();
+    await seedSource(core, { authProfileId: "A" });
+    registerWithRegistry(core, regWith());
+    mockShowQuickPick.mockImplementationOnce(async (items: Array<{ floor?: boolean }>) => items.find((i) => i.floor));
+
+    await editRules();
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.editSource", "src-1");
+  });
+
+  it("Add rule… picks a template, takes a filter, and persists ONE rule (list → add → template → filter → exit)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core);
+    registerWithRegistry(core, regWith(["role", "site", "name"]));
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: Array<{ add?: boolean }>) => items.find((i) => i.add))
+      .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+      .mockResolvedValueOnce(undefined);
+    mockShowInputBox.mockResolvedValueOnce("role=switch");
+
+    await editRules();
+
+    const rules = core.getInventorySource("src-1")!.templateRules!;
+    expect(rules).toHaveLength(1);
+    expect(rules[0]).toMatchObject({ templateId: "t1", filter: "role=switch" });
+  });
+
+  it("renders three-slot rows for an existing rule and REMOVES it (list → pick rule → remove → exit)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core, { templateRules: [{ id: "r1", templateId: "t1", filter: "role=switch" }] });
+    registerWithRegistry(core, regWith());
+    let listItems: Array<{ label: string; description?: string; detail?: string; ruleId?: string }> = [];
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: typeof listItems) => {
+        listItems = items;
+        return items.find((i) => i.ruleId === "r1");
+      })
+      .mockImplementationOnce(async (items: Array<{ act?: string }>) => items.find((i) => i.act === "remove"))
+      .mockResolvedValueOnce(undefined);
+
+    await editRules();
+
+    const row = listItems.find((i) => i.ruleId === "r1")!;
+    expect(row.label).toBe("role=switch"); // slot 1 — filter
+    expect(row.description).toBe("→ T"); // slot 2 — → template
+    expect(row.detail).toContain("Specificity 1"); // slot 3 — specificity + sets
+    expect(row.detail).toContain("Sets: Proxy");
+    expect(core.getInventorySource("src-1")!.templateRules).toBeUndefined(); // removed
   });
 });

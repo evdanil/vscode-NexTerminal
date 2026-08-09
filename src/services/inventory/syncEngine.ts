@@ -11,9 +11,15 @@ import {
   composeDesiredFields,
   computeProfilesNeedingServerKey,
   decideTemplateAuthWrite,
+  filterLabel,
+  prepareTemplateRules,
   selectFieldWinners,
+  TEMPLATE_FIELD_SHORT_LABELS,
   type DesiredNonAuthFields,
-  type ProfilesNeedingServerKey
+  type FieldProvenance,
+  type PreparedRule,
+  type ProfilesNeedingServerKey,
+  type TemplatableField
 } from "./templateApply";
 
 export const ORPHAN_FOLDER_NAME = "_orphaned";
@@ -654,15 +660,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const authWarningIndex = warnings.length;
   const emitAuthWarning = source.authProfileId !== undefined && resolvedProfileId === undefined;
 
-  // DEVICE TEMPLATES (issue #48 PR-T1) — the per-field cascade, resolved ONCE.
-  // In T1 it is degenerate on filters (no matcher), so every catch-all rule
-  // matches every device and the winners are device-independent; the filtered
-  // -rule fail-closed skip and dangling-template warnings are emitted here, once
-  // per rule. `source.authProfileId` enters as the implicit specificity −1 fill
-  // candidate, so PR #53's behaviour falls out unchanged when no explicit rule
-  // sets the field.
-  const cascade = selectFieldWinners(source.templateRules ?? [], source.authProfileId, input.templatesById, source.name);
-  for (const w of cascade.warnings) {
+  // DEVICE TEMPLATES (issue #48 PR-T2) — the per-field cascade is now PER DEVICE.
+  // Rules are PREPARED once (template resolve + filter parse + dangling-template
+  // warnings — all device-independent); the winners are resolved inside the
+  // device loop, because `deviceMatchesFilter` makes candidacy per-device (PR-T1's
+  // fail-closed filtered-rule skip LIFTS here — a filtered rule now applies to the
+  // devices it matches). `source.authProfileId` enters each device's cascade as
+  // the implicit specificity −1 fill candidate, so PR #53's behaviour falls out
+  // unchanged when no explicit rule sets the field.
+  const preparedRules = prepareTemplateRules(source.templateRules ?? [], input.templatesById, source.name);
+  const prepared: PreparedRule[] = preparedRules.prepared;
+  for (const w of preparedRules.warnings) {
     warnings.push(w);
   }
   // §5.3 proxy jump-host resolution set — the OPTIMISTIC first pass (FIX 2, PR
@@ -687,42 +695,48 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   for (const device of tree.devices) {
     liveServerIds.add(deterministicServerId(source.id, device.externalId));
   }
-  // Compose the non-auth desired fields (§4.2 layer 2) once; applied by the
-  // §4.3 matrix on both the add and update paths. A never-resolvable jump-host
-  // proxy is dropped to "desired none" here (device-independent) with one plan
-  // warning; a merely non-surviving one is caught by the post-plan pass instead.
+  // Resolve an auth-profile id against the WHOLE profile store (falling back to
+  // the source's own `matchedProfile` for legacy callers that pass no map, so
+  // the implicit rule always resolves). Consumed per device below.
+  const resolveAuthProfileById = (id: string): AuthProfile | undefined =>
+    input.authProfilesById?.get(id) ?? (matchedProfile?.id === id ? matchedProfile : undefined);
+
+  // The BASELINE cascade — the catch-all-only winners a device carrying NO
+  // attributes resolves (only catch-all / name=* rules match it). Used ONLY by
+  // the post-loop jump-host SURVIVOR pass (part 1), which restores/drops THIS
+  // run's catch-all-derived proxy against the definitive survivor set, and by its
+  // warning (`cascade.proxyTemplateName`). Per-device writes use the per-device
+  // cascade computed inside the loop; a per-device proxy that only a FILTERED rule
+  // set is still caught by the survivor pass's general PART 2 (drop). Its
+  // warnings / provenance / matches are DISCARDED here — they are re-emitted per
+  // device — so nothing is double-counted.
+  const baselineDevice: Pick<InventoryDevice, "name" | "attributes"> = { name: "", attributes: undefined };
+  const cascade = selectFieldWinners(baselineDevice, prepared, source.authProfileId);
   const composed = composeDesiredFields(cascade.winners, {
     hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
     proxyTemplateName: cascade.proxyTemplateName,
     sourceName: source.name
   });
   const desiredNonAuth: DesiredNonAuthFields = composed.desired;
-  for (const w of composed.warnings) {
-    warnings.push(w);
-  }
-  // Resolve the auth winner against the WHOLE profile store (falling back to
-  // the source's own `matchedProfile` for legacy callers that pass no map, so
-  // the implicit rule always resolves). A dangling winner drops the field:
-  // the implicit-source dangle is already covered by `emitAuthWarning`; an
-  // explicit-rule dangle gets its own skip warning.
-  const resolveAuthProfileById = (id: string): AuthProfile | undefined =>
-    input.authProfilesById?.get(id) ?? (matchedProfile?.id === id ? matchedProfile : undefined);
-  const authWinnerField = cascade.winners.authProfileId;
-  const winnerProfile = authWinnerField !== undefined ? resolveAuthProfileById(authWinnerField.value) : undefined;
-  if (authWinnerField !== undefined && winnerProfile === undefined && !cascade.authFromImplicit) {
-    warnings.push(
-      `A device template rule on "${source.name}" links an auth profile that no longer exists — the auth field was skipped.`
-    );
-  }
-  // The winner used for WRITES: dropped when it dangles. The add/fill row-1
-  // write additionally drops a keyless winner (blanket per-profile refusal),
-  // exactly like the source path zeroes a keyless key profile.
-  const effectiveAuthWinner =
-    authWinnerField !== undefined && winnerProfile !== undefined
-      ? { mode: authWinnerField.mode, profileId: authWinnerField.value }
-      : undefined;
-  const winnerKeyless = winnerProfile !== undefined && authProfileNeedsServerKeyPath(winnerProfile);
-  const winnerResolvedId = effectiveAuthWinner !== undefined && !winnerKeyless ? effectiveAuthWinner.profileId : undefined;
+
+  // DEVICE TEMPLATES (PR-T2) — per-device warning dedupe. The dangling-jump-host
+  // and dangling-auth-profile warnings name the TEMPLATE/source, not the device,
+  // so they are byte-identical across every device the winner touches; emitting
+  // one per device would flood the plan. Device-named warnings (per-field ties,
+  // self-reference) are naturally distinct and never routed through this set.
+  const templateWarningsSeen = new Set<string>();
+  const pushDedupTemplateWarning = (msg: string): void => {
+    if (!templateWarningsSeen.has(msg)) {
+      templateWarningsSeen.add(msg);
+      warnings.push(msg);
+    }
+  };
+  // Zero-match tracking (§2.3): the union of rule ids that matched ANY device this
+  // fetch; the complement of `prepared` gets a plan info line after the loop.
+  const matchedRuleIds = new Set<string>();
+  // §3.4 provenance — per server that received a templated field this run, which
+  // rule/template supplied each field. Aggregated into report lines after the loop.
+  const provenanceByServer: Array<{ serverName: string; provenance: Partial<Record<TemplatableField, FieldProvenance>> }> = [];
 
   const adds: ServerConfig[] = [];
   const updates: Array<{ before: ServerConfig; after: ServerConfig }> = [];
@@ -1020,6 +1034,57 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
 
     const id = deterministicServerId(source.id, device.externalId);
 
+    // DEVICE TEMPLATES (PR-T2) — the PER-DEVICE cascade. Candidacy is decided by
+    // `deviceMatchesFilter` (inside `selectFieldWinners`), so a filtered rule
+    // contributes to THIS device only when it matches; the winners, the composed
+    // non-auth desired fields, and the resolved auth winner are all device-scoped
+    // from here. Emitted here (not once per source) is what lifts the T1
+    // fail-closed skip. The per-field tie warnings name the device and are the
+    // authoritative tie signal; the dangling-template/jump-host/auth warnings name
+    // the template and are deduped (identical across devices).
+    const deviceCascade = selectFieldWinners(device, prepared, source.authProfileId);
+    for (const w of deviceCascade.warnings) {
+      warnings.push(w); // per-field tie warnings — device-named, each distinct
+    }
+    for (const rid of deviceCascade.matchedRuleIds) {
+      matchedRuleIds.add(rid);
+    }
+    const deviceComposed = composeDesiredFields(deviceCascade.winners, {
+      hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
+      proxyTemplateName: deviceCascade.proxyTemplateName,
+      sourceName: source.name
+    });
+    const deviceDesiredNonAuth = deviceComposed.desired;
+    for (const w of deviceComposed.warnings) {
+      pushDedupTemplateWarning(w); // dangling jump host — names the template, identical across devices
+    }
+    const deviceProxyTemplateName = deviceCascade.proxyTemplateName;
+    const deviceAuthWinnerField = deviceCascade.winners.authProfileId;
+    const deviceWinnerProfile =
+      deviceAuthWinnerField !== undefined ? resolveAuthProfileById(deviceAuthWinnerField.value) : undefined;
+    if (deviceAuthWinnerField !== undefined && deviceWinnerProfile === undefined && !deviceCascade.authFromImplicit) {
+      pushDedupTemplateWarning(
+        `A device template rule on "${source.name}" links an auth profile that no longer exists — the auth field was skipped.`
+      );
+    }
+    // The winner used for WRITES: dropped when it dangles. The add/fill row-1
+    // write additionally drops a keyless winner (blanket per-profile refusal),
+    // exactly like the source path zeroes a keyless key profile.
+    const deviceEffectiveAuthWinner =
+      deviceAuthWinnerField !== undefined && deviceWinnerProfile !== undefined
+        ? { mode: deviceAuthWinnerField.mode, profileId: deviceAuthWinnerField.value }
+        : undefined;
+    const deviceWinnerKeyless = deviceWinnerProfile !== undefined && authProfileNeedsServerKeyPath(deviceWinnerProfile);
+    const deviceWinnerResolvedId =
+      deviceEffectiveAuthWinner !== undefined && !deviceWinnerKeyless ? deviceEffectiveAuthWinner.profileId : undefined;
+    // §3.4 provenance — collected for any device the cascade resolved a field for;
+    // aggregated into report lines after the loop. Records the winners, which is
+    // the "where did this value come from" answer regardless of the matrix's
+    // per-row write decision.
+    if (Object.keys(deviceCascade.provenance).length > 0) {
+      provenanceByServer.push({ serverName: device.name, provenance: deviceCascade.provenance });
+    }
+
     const ownedServer = ownedByExternalId.get(device.externalId);
     if (ownedServer) {
       // This owned server is being decided HERE, with a mapped endpoint in hand;
@@ -1056,10 +1121,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // ownedServer.id` route the server through itself and go uncaught. The add
       // path (~2018) is correct with `id` because a fresh record's id IS the
       // computed `id`; the adoption path uses `adoptee.id`, same reasoning.
-      const templateMatrix = applyTemplateMatrix(ownedServer, desiredNonAuth, {
+      const templateMatrix = applyTemplateMatrix(ownedServer, deviceDesiredNonAuth, {
         targetServerId: ownedServer.id,
         targetServerName: device.name,
-        proxyTemplateName: cascade.proxyTemplateName
+        proxyTemplateName: deviceProxyTemplateName
       });
       for (const w of templateMatrix.warnings) {
         warnings.push(w);
@@ -1313,7 +1378,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // behaviour. `decideTemplateAuthWrite` folds in the override MOVE (rows 3/4,
       // per-target usability) and the fill write-once mode gate; the six-clause
       // fill eligibility is the `authFillEligible` predicate it delegates to.
-      const authDecision = decideTemplateAuthWrite(ownedServer, effectiveAuthWinner, winnerProfile, source.defaultUsername);
+      const authDecision = decideTemplateAuthWrite(ownedServer, deviceEffectiveAuthWinner, deviceWinnerProfile, source.defaultUsername);
       if (authDecision.kind === "write") {
         after.authProfileId = authDecision.profileId;
         // The stamp is written HERE, in the same breath as the link itself —
@@ -1752,10 +1817,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           restoredTemplated !== undefined
             ? { ...adoptee, origin: { sourceId: source.id, externalId: device.externalId, syncedAt: now, templated: restoredTemplated } }
             : adoptee;
-        const templateMatrix = applyTemplateMatrix(adopteeForMatrix, desiredNonAuth, {
+        const templateMatrix = applyTemplateMatrix(adopteeForMatrix, deviceDesiredNonAuth, {
           targetServerId: adoptee.id,
           targetServerName: device.name,
-          proxyTemplateName: cascade.proxyTemplateName
+          proxyTemplateName: deviceProxyTemplateName
         });
         for (const w of templateMatrix.warnings) {
           warnings.push(w);
@@ -1983,7 +2048,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // its one-sync deferral is UNCHANGED and still correct — that deferral note now
         // governs only the rollback, never this override move, which fires THIS run.
         const adoptionAuthView: ServerConfig = { ...adoptee, origin: adoptionOrigin };
-        const authDecision = decideTemplateAuthWrite(adoptionAuthView, effectiveAuthWinner, winnerProfile, source.defaultUsername);
+        const authDecision = decideTemplateAuthWrite(adoptionAuthView, deviceEffectiveAuthWinner, deviceWinnerProfile, source.defaultUsername);
         if (authDecision.kind === "write") {
           after.authProfileId = authDecision.profileId;
           after.origin = { ...adoptionOrigin, syncedAuthProfileId: authDecision.profileId };
@@ -2131,10 +2196,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // T + stamp, there is nothing to override yet). `winnerResolvedId` equals the
     // source's own `resolvedProfileId` when no explicit rule sets auth, so a
     // template-less sync adds exactly the record it did before.
-    const addMatrix = applyTemplateMatrix(undefined, desiredNonAuth, {
+    const addMatrix = applyTemplateMatrix(undefined, deviceDesiredNonAuth, {
       targetServerId: id,
       targetServerName: device.name,
-      proxyTemplateName: cascade.proxyTemplateName
+      proxyTemplateName: deviceProxyTemplateName
     });
     for (const w of addMatrix.warnings) {
       warnings.push(w);
@@ -2154,7 +2219,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // is still stamped unconditionally. Undefined when the source/winner has no
       // profile or its reference is dangling/keyless — the pre-feature record,
       // field for field.
-      authProfileId: winnerResolvedId,
+      authProfileId: deviceWinnerResolvedId,
       isHidden: false,
       group,
       // DEVICE TEMPLATES (PR-T1) — the non-auth template field VALUES (proxy,
@@ -2194,7 +2259,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // detach copies THIS value into the marker rather than re-deriving one.
         syncedInstanceKey: providerInstanceKey,
         syncedUsername: endpoint.username ?? source.defaultUsername,
-        syncedAuthProfileId: winnerResolvedId,
+        syncedAuthProfileId: deviceWinnerResolvedId,
         // Mirrors the `ipmiHost` written above, and recorded UNCONDITIONALLY —
         // `undefined` included — on the same "a source whose devices gain an
         // address later must find the stamps already there" argument the two
@@ -2854,6 +2919,62 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
   }
 
+  // DEVICE TEMPLATES (§2.3 A-M4) — ZERO-MATCH info: a rule that matched no device
+  // this fetch (a typo that passed every save check) gets one plan info line, the
+  // honest surface for a filter that is quietly dead. Catch-all rules match every
+  // device, so they only appear here when the tree is empty / all-skipped.
+  for (const p of prepared) {
+    if (!matchedRuleIds.has(p.rule.id)) {
+      warnings.push(`Rule "${filterLabel(p.rule.filter)}" on "${source.name}" matched no devices this sync.`);
+    }
+  }
+
+  // DEVICE TEMPLATES (§3.4) — plan-report PROVENANCE lines: per (field, rule),
+  // aggregated so the plan stays readable at fleet scale. Servers with an
+  // identical provenance signature (same fields ← same rules) collapse to one
+  // line naming the count and each field's origin. Report-only, inferred here for
+  // free from the winners the cascade already held while composing.
+  if (provenanceByServer.length > 0) {
+    const groups = new Map<string, { count: number; provenance: Partial<Record<TemplatableField, FieldProvenance>> }>();
+    const fieldOrder: TemplatableField[] = ["proxy", "authProfileId", "multiplexing", "legacyAlgorithms", "logSession"];
+    for (const entry of provenanceByServer) {
+      const parts: string[] = [];
+      for (const field of fieldOrder) {
+        const prov = entry.provenance[field];
+        if (prov !== undefined) {
+          parts.push(`${field}=${prov.implicit ? "@source" : `${prov.templateName}::${prov.ruleFilter ?? ""}`}`);
+        }
+      }
+      const key = parts.join("|");
+      const g = groups.get(key);
+      if (g === undefined) {
+        groups.set(key, { count: 1, provenance: entry.provenance });
+      } else {
+        g.count++;
+      }
+    }
+    for (const key of [...groups.keys()].sort()) {
+      const g = groups.get(key)!;
+      const segments: string[] = [];
+      for (const field of fieldOrder) {
+        const prov = g.provenance[field];
+        if (prov === undefined) {
+          continue;
+        }
+        const origin = prov.implicit
+          ? "(source default)"
+          : prov.ruleFilter !== undefined && prov.ruleFilter.trim() !== ""
+            ? `(rule ${prov.ruleFilter})`
+            : "(catch-all rule)";
+        const from = prov.implicit ? "the source auth profile" : `"${prov.templateName}"`;
+        segments.push(`${TEMPLATE_FIELD_SHORT_LABELS[field]} ← ${from} ${origin}`);
+      }
+      if (segments.length > 0) {
+        warnings.push(`${g.count} server${g.count === 1 ? "" : "s"}: ${segments.join("; ")}`);
+      }
+    }
+  }
+
   const hiddenPruneCount = prunes.filter((p) => p.server.isHidden).length;
 
   return {
@@ -2953,6 +3074,23 @@ export function validateInventoryTree(tree: unknown): asserts tree is InventoryT
         throw new Error(`devices[${i}].endpoints[${j}].username is not a string`);
       }
     });
+    // DEVICE TEMPLATES (§2.2 A-M4) — the device-level `attributes` member: an
+    // object whose values are each a string or a string-array; anything else
+    // rejects the tree at the provider boundary, consistent with the field checks
+    // above. Deliberately scoped to the DEVICE member — the endpoint-level
+    // `attributes` (a different member, different value shape) keeps its
+    // "preserved, otherwise unused" disposition and is not validated here.
+    if (d.attributes !== undefined) {
+      if (typeof d.attributes !== "object" || d.attributes === null || Array.isArray(d.attributes)) {
+        throw new Error(`devices[${i}].attributes is not an object`);
+      }
+      for (const [key, value] of Object.entries(d.attributes as Record<string, unknown>)) {
+        const ok = typeof value === "string" || (Array.isArray(value) && value.every((v) => typeof v === "string"));
+        if (!ok) {
+          throw new Error(`devices[${i}].attributes["${key}"] is not a string or string array`);
+        }
+      }
+    }
   });
   if (obj.warnings !== undefined && (!Array.isArray(obj.warnings) || !obj.warnings.every((w: unknown) => typeof w === "string"))) {
     throw new Error("warnings is not a string array");

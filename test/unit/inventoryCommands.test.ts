@@ -7998,7 +7998,7 @@ describe("inventoryCommands", () => {
       expect(mockExecuteCommand).not.toHaveBeenCalled();
     });
 
-    it("picking a source shows the three action rows titled with the source name", async () => {
+    it("picking a source shows the action rows titled with the source name", async () => {
       await setupHub([makeSource({ id: "src-1", name: "Alpha" }), makeSource({ id: "src-2", name: "Beta" })]);
       mockShowQuickPick
         .mockImplementationOnce(async (items: HubItem[]) => items.find((item) => item.label === "Beta"))
@@ -8012,6 +8012,7 @@ describe("inventoryCommands", () => {
       expect(items.map((item) => [item.label, item.description])).toEqual([
         ["$(sync) Sync Now", "Fetch devices and preview changes"],
         ["$(edit) Edit…", "Change settings, credentials, or the auth profile"],
+        ["$(list-tree) Edit Template Rules…", "Attach device templates to filtered subsets of devices"],
         ["$(trash) Remove…", "Choose what happens to its synced servers"]
       ]);
     });
@@ -8019,6 +8020,7 @@ describe("inventoryCommands", () => {
     it.each([
       ["$(sync) Sync Now", "nexus.inventory.syncNow"],
       ["$(edit) Edit…", "nexus.inventory.editSource"],
+      ["$(list-tree) Edit Template Rules…", "nexus.deviceTemplate.editRules"],
       ["$(trash) Remove…", "nexus.inventory.removeSource"]
     ])("routing %s executes %s with the picked source id (kills a hub that drops the id and re-picks downstream)", async (rowLabel, commandId) => {
       await setupHub([makeSource({ id: "src-1", name: "Alpha" }), makeSource({ id: "src-2", name: "Beta" })]);

@@ -450,6 +450,81 @@ function vmVars(raw: Record<string, unknown>): Record<string, string> {
   };
 }
 
+/** NetBox nested objects carry both `name` (display) and `slug` (the URL dialect). */
+function slugOf(value: unknown): string {
+  if (value && typeof value === "object" && typeof (value as { slug?: unknown }).slug === "string") {
+    return (value as { slug: string }).slug;
+  }
+  return "";
+}
+
+function dedupeNonEmpty(values: string[]): string[] {
+  return [...new Set(values.filter((v) => v !== ""))];
+}
+
+/** DEVICE TEMPLATES (§2.2 A-M4) — a nested `{name, slug}` object as its `[displayName, slug]` set. */
+function pairValues(raw: unknown): string[] {
+  return dedupeNonEmpty([nameOf(raw), slugOf(raw)]);
+}
+
+/** NetBox `status` is `{ value, label }`; `.value` is the slug-like one, `.label` the display. */
+function statusValues(raw: unknown): string[] {
+  if (!raw || typeof raw !== "object") {
+    return [];
+  }
+  const value = (raw as { value?: unknown }).value;
+  const label = (raw as { label?: unknown }).label;
+  return dedupeNonEmpty([typeof value === "string" ? value : "", typeof label === "string" ? label : ""]);
+}
+
+/** `tags` is an array of `{name, slug}` — flattened to every tag's name and slug. */
+function tagValues(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const tag of raw) {
+    out.push(nameOf(tag), slugOf(tag));
+  }
+  return dedupeNonEmpty(out);
+}
+
+/**
+ * DEVICE TEMPLATES (§2.2 A-M4) — the per-device MATCHING metadata for template
+ * rule filters, from the SAME rows pagination already fetched (no new API call,
+ * same argument as `oob_ip`). Each of `role/site/location/rack/tenant/platform`
+ * emits a set-valued `[displayName, slug]` (deduped, empties omitted — m9c) so
+ * a filter copied from a NetBox URL (which speaks slugs) and one typed with a
+ * display name both match; `status` emits `[value, label]`; `tags` emits every
+ * tag's name and slug. Set-valued matching (any element) then gives name-OR-slug
+ * for free, with zero special cases in the matcher. VMs get the same MINUS
+ * rack/location, mirroring `vmVars`' documented asymmetry. Keys are the lowercase
+ * attribute names; `tag`→`tags` aliasing happens in the matcher's parser, not
+ * here (the attribute is plural because it holds a set). Returns `undefined` when
+ * nothing survived, so the device carries no `attributes` at all.
+ */
+function deviceAttributes(obj: Record<string, unknown>, kind: "device" | "vm"): Record<string, string | string[]> | undefined {
+  const attrs: Record<string, string[]> = {};
+  const put = (key: string, values: string[]): void => {
+    if (values.length > 0) {
+      attrs[key] = values;
+    }
+  };
+  // NetBox >=3.6 renamed device_role -> role; prefer whichever object carries data.
+  const roleRaw = nameOf(obj.role) || slugOf(obj.role) ? obj.role : obj.device_role;
+  put("role", pairValues(roleRaw));
+  put("site", pairValues(obj.site));
+  put("tenant", pairValues(obj.tenant));
+  put("platform", pairValues(obj.platform));
+  if (kind === "device") {
+    put("location", pairValues(obj.location));
+    put("rack", pairValues(obj.rack));
+  }
+  put("status", statusValues(obj.status));
+  put("tags", tagValues(obj.tags));
+  return Object.keys(attrs).length > 0 ? attrs : undefined;
+}
+
 /**
  * FIX 1 — a device/VM missing a name or a usable primary IP is still emitted
  * into the tree (with an empty `endpoints` array) rather than dropped
@@ -528,7 +603,10 @@ function mapEntry(raw: unknown, endpointPath: string, index: number, template: s
     externalId: `${kind}:${String(obj.id)}`,
     name,
     folderPath: folderPath || undefined,
-    endpoints
+    endpoints,
+    // DEVICE TEMPLATES (§2.2 A-M4) — matching metadata for template rule filters,
+    // names AND slugs, from the same rows. Absent when the device carries none.
+    attributes: deviceAttributes(obj, kind)
   };
 }
 
@@ -644,6 +722,10 @@ export function createNetboxProvider(fetchImpl: typeof fetch = fetch): Inventory
     id: NETBOX_PROVIDER_ID,
     label: "NetBox",
     configFields: NETBOX_CONFIG_FIELDS,
+    // DEVICE TEMPLATES (§2.2 A-M4) — the filter keys this provider's device
+    // `attributes` can carry. `tag` is the filter key; the attribute is `tags`
+    // (the parser aliases them). `name` is the provider-agnostic reserved key.
+    attributeKeys: ["role", "site", "location", "rack", "tenant", "status", "platform", "tag", "name"],
     instanceKey(config: InventorySourceValues): string | undefined {
       return netboxInstanceKey(config);
     },

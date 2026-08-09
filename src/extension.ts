@@ -1249,7 +1249,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);
-  const deviceTemplateDisposables = registerDeviceTemplateCommands(ctx);
+  const deviceTemplateDisposables = registerDeviceTemplateCommands(ctx, inventoryProviderRegistry);
   // F1 — same objects nexus.server.remove tears down with (ctx carries core/tunnelManager/sshPool).
   const inventoryTeardown: InventoryRuntimeTeardown = {
     teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
