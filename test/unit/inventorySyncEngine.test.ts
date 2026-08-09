@@ -3106,6 +3106,75 @@ describe("computeSyncPlan — adopt-on-add", () => {
       expect(next.updates[0].after.ipmiHost).toBe("10.9.9.50");
       expect(next.updates[0].after.origin?.syncedIpmiHost).toBe("10.9.9.50");
     });
+
+    it("OOB (CODEX ROUND-2 FINDING) — a BMC re-addressed WHILE THE SOURCE WAS DETACHED is applied BY the adoption, not one sync later (kills the restore-only adoption, which put the receipt back and left the record pointing at the dead address for the whole run the user actually approved)", () => {
+      const source = makeSource();
+
+      // The receipt matches the record: the removed source's sync wrote
+      // 10.1.1.1 and the detach preserved the proof. Matrix row 3 — the sync
+      // still owns this field — and the device now says something else.
+      const withReceipt = makeKeptServer({
+        ipmiHost: "10.1.1.1",
+        formerlySynced: keptMarker({ syncedIpmiHost: "10.1.1.1" })
+      });
+
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithOob("10.2.2.2")]),
+        currentServers: [withReceipt],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.ipmiHost).toBe("10.2.2.2");
+      expect(adopted.origin?.syncedIpmiHost).toBe("10.2.2.2");
+    });
+
+    it("OOB (CODEX ROUND-2 FINDING) — a hand-typed address with NO receipt survives the adoption untouched and unstamped (kills the over-broad fix `takesIpmiHost = mgmtHost !== undefined`, which would let adoption clobber the one value the whole matrix exists to protect)", () => {
+      const source = makeSource();
+
+      // No `syncedIpmiHost` on the marker: nothing ever proved a sync wrote
+      // this, so it is a hand entry (matrix row 5) and the device's own address
+      // being on offer changes nothing.
+      const handTyped = makeKeptServer({
+        ipmiHost: "192.168.0.9",
+        formerlySynced: keptMarker()
+      });
+
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithOob("10.2.2.2")]),
+        currentServers: [handTyped],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.ipmiHost).toBe("192.168.0.9");
+      expect(adopted.origin?.syncedIpmiHost).toBeUndefined();
+    });
+
+    it("OOB (CODEX ROUND-2 FINDING) — a device offering NO out-of-band endpoint leaves the field alone AND still carries the receipt (matrix row 6; kills the half-fix `syncedIpmiHost: takesIpmiHost ? mgmtHost : undefined`, which drops the restore on every row the matrix answers no for and re-strands the very server the receipt was added to rescue)", () => {
+      const source = makeSource();
+      const withReceipt = makeKeptServer({
+        ipmiHost: "10.1.1.1",
+        formerlySynced: keptMarker({ syncedIpmiHost: "10.1.1.1" })
+      });
+
+      // `keptDevice()` — SSH endpoint only, no redfish/ipmi-sol beside it.
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDevice()]),
+        currentServers: [withReceipt],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.ipmiHost).toBe("10.1.1.1");
+      expect(adopted.origin?.syncedIpmiHost).toBe("10.1.1.1");
+    });
   });
 
   /**
