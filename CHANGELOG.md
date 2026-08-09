@@ -1,6 +1,17 @@
 # Changelog
 
-## [2.8.83] — 2026-08-08
+## [2.8.84] — 2026-08-09
+
+### Added
+
+- **Re-adding an inventory source can reclaim the servers it made before, instead of duplicating them.** Removing a source and choosing **Keep Servers** used to sever the connection completely: the servers stayed, but nothing recorded where they came from, so adding the same source back created a second copy of every device beside the one already there — with no way to say they were the same machines. Each kept server now remembers the device it was synced from, and a sync that finds them asks once: **Adopt Existing** re-links them, so each keeps its saved credentials and settings while the source takes over its name, address and folder from now on; **Add Separately** leaves them alone and adds the devices as new servers. Nothing happens until you approve the sync plan, which counts the adoptions and names every server under **Show Warnings**.
+- **A server you made by hand is never adopted.** Only servers a source actually synced and that you kept when it was removed are eligible — a server you created yourself is never taken over, even if it sits at exactly the address a device reports. Adoption additionally requires the same provider and the same address as the device, so a marker left by one NetBox instance cannot be claimed by a device of the same id on another. A device that moved to a different address while detached is added as a new server rather than adopted, and the sync says so instead of leaving you to wonder.
+
+### Fixed
+
+- **A confirmation that goes stale no longer acts on what it can no longer promise.** Removing a tunnel, a serial profile or a local shell profile sampled what it told you before the confirmation opened and then deleted by id — so anything that changed while you were reading it (a rename, a tunnel starting in another window, the record disappearing) was neither noticed nor mentioned. Each now re-checks under the same lock the rest of the app writes through and refuses if what it would tell you has changed, rather than proceeding on consent you gave to a different situation. **Apply Auth Profile** on a server or folder had the same gap with a worse ending: it wrote whole records captured before the modal, so a concurrent rename was silently overwritten and a profile deleted meanwhile was linked anyway. It now writes only the field it owns, onto records read fresh.
+- **Creating a server no longer stores a link to an auth profile that has just been deleted.** The Add form has always mirrored the chosen profile's credentials into its fields, which is what gets saved — but if the profile disappeared while the form was open, the save still recorded a reference to it that nothing would ever resolve.
+- **Editing a kept server no longer erases what makes it reclaimable**, and duplicating one no longer copies that record onto the copy — which would have left two candidates for one device and, with no way to tell which was meant, adopted neither.
 
 ### Added
 

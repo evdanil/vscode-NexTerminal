@@ -29,6 +29,26 @@ export interface ComputeSyncPlanInput {
    * nothing else, which the "link, never copy" assertions pin field by field.
    */
   authProfile?: AuthProfile;
+  /**
+   * ADOPT 1 — when true, a planned add whose device matches EXACTLY ONE server
+   * KEPT from a previous sync of this provider becomes an UPDATE of that server
+   * (adoption) instead of a second server beside it. See the eligibility rule in
+   * the device loop; `ServerConfig.formerlySynced` (models/config.ts) is the
+   * marker it reads.
+   *
+   * Default false is today's behavior BIT-FOR-BIT: every host:port collision
+   * renders the existing duplicate warning and increments
+   * `manualDuplicateCount`, and the plan is identical field for field.
+   *
+   * The engine NEVER decides this for itself. Adoption hands an existing
+   * record's whole lifecycle — its name, address, folder, and the source's
+   * prune policy, `delete` included — to the source, which is a decision only
+   * the user can make. The caller asks once per sync run and feeds the answer to
+   * every recompute; that is also why `adoptionCandidateNames` is computed
+   * regardless of this flag, since the plan the caller asks FROM is one computed
+   * with it off.
+   */
+  adoptKeptServers?: boolean;
 }
 
 export interface InventorySyncPlan {
@@ -45,7 +65,28 @@ export interface InventorySyncPlan {
   folders: string[]; // every folder any add/update/orphan lands in, plus targetFolder itself
   warnings: string[]; // duplicate externalIds, invalid folders, id collisions, provider warnings
   hiddenPruneCount: number; // F22: how many entries in `prunes` are hidden servers
-  manualDuplicateCount: number; // FIX 3: how many planned adds collided by host:port with a manual server
+  /**
+   * FIX 3: how many planned adds collided by host:port with a manual server.
+   *
+   * ADOPT 1 — with `adoptKeptServers` on this NARROWS to the collisions adoption
+   * did not take. An adopted server sits at the device's own endpoint by
+   * construction (that is the corroboration rule), so without this narrowing
+   * every adoption would ALSO be reported as a duplicate about to be added —
+   * describing an add that is not happening.
+   */
+  manualDuplicateCount: number;
+  /**
+   * ADOPT 1 — device names, in tree order, of every adoption CANDIDATE: a
+   * device that matches exactly one eligible kept server.
+   *
+   * Computed REGARDLESS of `adoptKeptServers`, because the caller decides
+   * whether to put the question to the user from a plan computed with the flag
+   * OFF — that is the only plan it has when the question arises. `.length` is
+   * the candidate count; the names exist so the question can name examples
+   * (callers cap the render at 3, per `pushSkipSummary`'s precedent). With the
+   * flag ON these are exactly the devices that became adoptions.
+   */
+  adoptionCandidateNames: string[];
 }
 
 function joinTargetAndRel(targetFolder: string, rel: string | undefined): string | undefined {
@@ -97,6 +138,43 @@ function isValidPort(port: number): boolean {
  */
 function hasOwnKeyPath(server: ServerConfig): boolean {
   return typeof server.keyPath === "string" && server.keyPath.trim() !== "";
+}
+
+/**
+ * AUTH 2 — "is this server still EXACTLY what the add path stamps, so the
+ * source's profile may be retro-applied to it?". The six clauses and the whole
+ * safety argument behind each one live at the update path's call site inside
+ * `computeSyncPlan`; that comment block is the authority and is not repeated
+ * here.
+ *
+ * EXTRACTED (ADOPT 1) because the adoption branch asks the same question of an
+ * adoptee, and the one thing this rule cannot survive is its two halves
+ * drifting — the exact precedent `decideSourceAuthRollback` sets for AUTH 2b,
+ * and the reason `hasOwnKeyPath` is already shared between them. Two copies of
+ * six clauses is two answers to one question, and a server admitted by one and
+ * refused by the other is a server whose link nobody can explain.
+ *
+ * `defaultUsername` is a parameter rather than a source field read inside, so
+ * the FALLBACK stays visible at both call sites: a server carrying no
+ * `syncedUsername` stamp — a legacy synced server, or a kept server, which by
+ * definition carries no origin at all — is compared against the source's
+ * current default, which is the pre-stamp behavior and must never read as
+ * "ineligible".
+ */
+function qualifiesForSourceProfileRetroApply(
+  server: ServerConfig,
+  resolvedProfileId: string | undefined,
+  defaultUsername: string
+): boolean {
+  const stampedUsername = server.origin?.syncedUsername ?? defaultUsername;
+  return (
+    resolvedProfileId !== undefined &&
+    server.authProfileId === undefined &&
+    server.origin?.syncedAuthProfileId === undefined &&
+    server.authType === "agent" &&
+    !hasOwnKeyPath(server) &&
+    server.username === stampedUsername
+  );
 }
 
 /**
@@ -189,7 +267,7 @@ function pushSkipSummary(warnings: string[], reason: string, examples: string[])
  * timestamp (and tests get determinism).
  */
 export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan {
-  const { source, tree, currentServers, now } = input;
+  const { source, tree, currentServers, now, adoptKeptServers = false } = input;
   const warnings: string[] = [...(tree.warnings ?? [])];
 
   // AUTH 1 — the source names a profile by id; the caller supplies the profile
@@ -308,6 +386,46 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
     manualByHostPort.set(`${server.host.toLowerCase()}:${server.port}`, server);
   }
+
+  /**
+   * ADOPT 1 — the servers this provider's sources have KEPT: records a previous
+   * source created and left behind when it was removed with "Keep Servers",
+   * indexed by the device each was mapped to (`formerlySynced.externalId`).
+   *
+   * This index — NOT `manualByHostPort` — is what adoption matches on. The two
+   * exist for different questions and must not be conflated: an address
+   * collision means "something else already lives here", which is worth a
+   * warning; adoption means "this IS the record this device used to be", which
+   * only the marker can establish. A hand-made server has no marker and is
+   * therefore never adoptable, however exactly its address matches — that is the
+   * whole rule, and the reason the index is keyed by device rather than address.
+   *
+   * Two clauses scope it:
+   *  - `origin === undefined`: a server owned by ANY source (this one, another
+   *    live one, or a dangling reference) is never adopted. Two sources tugging
+   *    at one record is what the ownership model (F6, first-owner-wins) exists
+   *    to prevent, and it also makes a record carrying BOTH `origin` and a stale
+   *    marker inert rather than dangerous.
+   *  - `providerId`: only a source of the same provider may claim a marker.
+   *    `externalId` is provider-scoped and nothing more — two NetBox instances
+   *    both emit "device:1" — so without this a marker left by one provider's
+   *    source could be claimed by an entirely different kind of source.
+   */
+  const keptByExternalId = new Map<string, ServerConfig[]>();
+  for (const server of currentServers) {
+    const kept = server.formerlySynced;
+    if (server.origin !== undefined || kept === undefined || kept.providerId !== source.providerId) {
+      continue;
+    }
+    const bucket = keptByExternalId.get(kept.externalId);
+    if (bucket) {
+      bucket.push(server);
+    } else {
+      keptByExternalId.set(kept.externalId, [server]);
+    }
+  }
+  /** ADOPT 1 — see `InventorySyncPlan.adoptionCandidateNames`. Filled in BOTH modes. */
+  const adoptionCandidateNames: string[] = [];
 
   // m10 — maps externalId -> the first-seen device's name, so a later
   // duplicate's warning can name which device was kept, not just its id.
@@ -614,15 +732,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       //
       // If the add path's defaults ever change, this condition must change with
       // it or retro-apply stops matching its own output.
-      const stampedUsername = ownedServer.origin?.syncedUsername ?? source.defaultUsername;
-      if (
-        resolvedProfileId !== undefined &&
-        ownedServer.authProfileId === undefined &&
-        ownedServer.origin?.syncedAuthProfileId === undefined &&
-        ownedServer.authType === "agent" &&
-        !hasOwnKeyPath(ownedServer) &&
-        ownedServer.username === stampedUsername
-      ) {
+      //
+      // The six clauses (and the `stampedUsername` fallback the paragraphs above
+      // argue for) live in `qualifiesForSourceProfileRetroApply` at the top of
+      // this file, because the ADOPT 1 branch below asks the same question of a
+      // kept server and the two must not be able to answer it differently. The
+      // reasoning stays HERE, where the rule is applied to the population it was
+      // written about; the function carries only a pointer back to it.
+      if (qualifiesForSourceProfileRetroApply(ownedServer, resolvedProfileId, source.defaultUsername)) {
         after.authProfileId = resolvedProfileId;
         // The stamp is written HERE and only here on the update path, in the same
         // breath as the link itself — that is what makes a LATER clear of this
@@ -743,6 +860,147 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     if (collidingServer) {
       warnings.push(`Device "${device.name}" (${device.externalId}) maps to an id already used by unrelated server "${collidingServer.name}" — skipped.`);
       continue;
+    }
+
+    // ADOPT 1 — the kept-server match, and the adoption it can produce.
+    //
+    // PLACEMENT IS LOAD-BEARING: strictly AFTER the id-collision guard above. A
+    // device whose deterministic id is already taken by an unrelated server is
+    // skipped today, and it stays skipped even when an adoptable server is
+    // waiting for it — reordering these two would change a corner nobody asked
+    // to change, on the strength of a feature about a different problem.
+    //
+    // ELIGIBILITY, all of it: the server carries this provider's "Keep Servers"
+    // marker naming THIS device (the index above), AND its CURRENT address is
+    // still the device's address. The marker establishes identity; the address
+    // corroborates it.
+    //
+    // WHY CORROBORATE AT ALL. `externalId` is unique only within one provider
+    // INSTANCE: two NetBox deployments both emit "device:1", so a marker left by
+    // one could otherwise be claimed by a device from the other — silently
+    // handing a server to a source that has never seen that machine. With the
+    // address check, a false match needs the same externalId AND the same
+    // address across two instances of one provider, which effectively means the
+    // same machine.
+    //
+    // WHAT THIS DELIBERATELY GIVES UP, so nobody "fixes" it by dropping the
+    // clause: a device that legitimately CHANGED ADDRESS while the source was
+    // removed is NOT reclaimed, and neither is one whose kept server had its
+    // host or port hand-edited. Those fall through to a duplicate add — today's
+    // behavior — plus the mismatch warning below saying exactly why. That is a
+    // deliberate trade of convenience for safety: the owner's rule is that
+    // servers the user controls must never be quietly taken over by a source,
+    // and a wrong adoption is silent while a refused one is visible and
+    // repairable.
+    //
+    // The CURRENT address is compared, not one recorded at detach time: if the
+    // box moved and both the source and the user's record moved with it,
+    // adoption should still fire. A recorded address would refuse exactly that
+    // case.
+    const keptMatches = keptByExternalId.get(device.externalId) ?? [];
+    const eligibleForAdoption = keptMatches.filter((s) => s.host.toLowerCase() === endpoint.host.toLowerCase() && s.port === port);
+    if (eligibleForAdoption.length === 1) {
+      const adoptee = eligibleForAdoption[0];
+      // Recorded in BOTH modes — the flag changes what the plan DOES with a
+      // candidate, never whether it is one. Nothing claims/locks the adoptee
+      // here: `device.externalId` is the index key, and the duplicate-externalId
+      // guard earlier in this loop already skips any second device carrying the
+      // same id, so one kept server can never be reached twice in one plan.
+      adoptionCandidateNames.push(device.name);
+      if (adoptKeptServers) {
+        // The adopted record: re-stamping plus ordinary source ownership, NEVER
+        // a credential copy. `...adoptee` first is the whole field-ownership
+        // rule in one line — id, username, authType, keyPath, authProfileId,
+        // proxy, multiplexing, isHidden, logSession and the rest survive
+        // byte-for-byte, and only the four fields the source owns on every later
+        // sync are taken from the device. The id surviving is what keeps
+        // SecretStorage keys (`password-{id}`, passphrase, proxy password),
+        // tunnel defaults and other servers' `proxy.jumpHostId` references
+        // pointing at this record; mint a new one and the user's saved password
+        // is orphaned by a sync that claimed to change nothing but a name.
+        const adoptionOrigin: ServerOrigin = {
+          sourceId: source.id,
+          externalId: device.externalId,
+          syncedAt: now,
+          // AUTH 2a, applied to a record this sync did not create: the stamps
+          // record what THIS sync WROTE. It writes `username` only when the
+          // endpoint supplies one, so otherwise it stamps none — never
+          // `adoptee.username` (which launders the user's hand-picked username
+          // into "as stamped", after which the NEXT sync would retro-apply the
+          // source's profile over it) and never `source.defaultUsername` (a
+          // value this sync did not write onto the record).
+          syncedUsername: endpoint.username,
+          // Overwritten below if — and only if — retro-apply fires in this same
+          // plan, i.e. where this sync actually writes the link. Never
+          // `adoptee.authProfileId`: a kept server's surviving link is history's
+          // doing, not this sync's, and recording it would read as an opt-out
+          // the user never made.
+          syncedAuthProfileId: undefined
+        };
+        const after: ServerConfig = {
+          ...adoptee,
+          name: device.name,
+          // Equal to the adoptee's host up to case (the corroboration above),
+          // so this only ever re-cases it — the source owns the field.
+          host: endpoint.host,
+          port,
+          group,
+          origin: adoptionOrigin,
+          // MUTUALLY EXCLUSIVE WITH `origin` — and EXPLICIT, because the spread
+          // above would otherwise carry the marker onto a now-owned server. A
+          // record holding both says two contradictory things about who manages
+          // it, and the marker would go on advertising this server for adoption
+          // by the next source of the same provider.
+          formerlySynced: undefined
+        };
+        if (endpoint.username !== undefined) {
+          after.username = endpoint.username;
+        }
+        // AUTH 2 on an adoptee, deliberately allowed. Blocking it for one sync
+        // would only move the same disclosed switch to the next run — the server
+        // is owned from here on, so the ordinary update path would fire the
+        // identical retro-apply next time. Both origin reads inside the
+        // predicate are `undefined` for a kept server, so it degrades to exactly
+        // the legacy-server case: agent auth, no key of its own, no link, and a
+        // username still equal to the source's default.
+        if (qualifiesForSourceProfileRetroApply(adoptee, resolvedProfileId, source.defaultUsername)) {
+          after.authProfileId = resolvedProfileId;
+          after.origin = { ...adoptionOrigin, syncedAuthProfileId: resolvedProfileId };
+        }
+        // No `changed` comparison, unlike the owned-update path above: gaining
+        // `origin` guarantees before !== after, so an adoption is ALWAYS an
+        // update and never lands in `unchangedCount`. AUTH 2b/rollback likewise
+        // never sees a kept server — `decideSourceAuthRollback` requires
+        // `origin.syncedAuthProfileId === unusableProfileId` and a kept server
+        // has no origin to carry one, so its verdict is "none" by construction.
+        updates.push({ before: adoptee, after });
+        if (group !== undefined) {
+          folderSet.add(group);
+        }
+        // Deliberately BEFORE the duplicate warning below: an adopted server is
+        // at the device's own endpoint by construction, so it would otherwise
+        // warn (and count) that this device "will be added as a duplicate" —
+        // describing an add that is not happening.
+        continue;
+      }
+    } else if (adoptKeptServers && eligibleForAdoption.length >= 2) {
+      // AMBIGUITY — adopt NEITHER. Records at one endpoint can differ in every
+      // credential the endpoint does not show, so picking "the first in array
+      // order" would be a guess about which one the user considers canonical.
+      // A duplicate add plus an explanation is the safe floor, and the warning
+      // says which repair makes adoption possible.
+      warnings.push(
+        `Device "${device.name}" matches ${eligibleForAdoption.length} servers kept from a previous sync of this source at ${endpoint.host}:${port} — Nexus cannot tell which to adopt, so it will be added as a duplicate. Remove the extra copies and sync again to adopt.`
+      );
+    } else if (adoptKeptServers && keptMatches.length > 0) {
+      // Identity matched, address did not. Without this the user sees a silent
+      // duplicate and concludes adoption is broken; with it, the refusal states
+      // its own reason and the repair is obvious (the addresses are both named).
+      warnings.push(
+        keptMatches.length === 1
+          ? `Device "${device.name}" was previously synced onto server "${keptMatches[0].name}", but that server is now at ${keptMatches[0].host}:${keptMatches[0].port} and the device is at ${endpoint.host}:${port} — it will be added as a new server instead.`
+          : `Device "${device.name}" was previously synced onto ${keptMatches.length} servers in your list, none of which is still at ${endpoint.host}:${port} — it will be added as a new server instead.`
+      );
     }
 
     const hostPortKey = `${endpoint.host.toLowerCase()}:${port}`;
@@ -976,7 +1234,8 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     folders: [...folderSet],
     warnings,
     hiddenPruneCount,
-    manualDuplicateCount
+    manualDuplicateCount,
+    adoptionCandidateNames
   };
 }
 

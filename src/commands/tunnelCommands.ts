@@ -10,6 +10,7 @@ import type {
   TunnelType
 } from "../models/config";
 import { resolveTunnelType } from "../models/config";
+import { configMutationLock } from "../services/configMutationLock";
 import type { SshFactory } from "../services/ssh/contracts";
 import type { TunnelManager } from "../services/tunnel/tunnelManager";
 import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
@@ -215,6 +216,35 @@ async function pickTunnel(core: NexusCore): Promise<TunnelProfile | undefined> {
     { title: "Select Tunnel Profile" }
   );
   return pick?.profile;
+}
+
+/**
+ * Whether this profile's tunnel is currently running in ANOTHER VS Code window.
+ * The one fact besides the name that the removal confirmation discloses, and the
+ * one most able to move while that modal sits open: `remoteTunnels` is refreshed
+ * by TunnelRegistrySync (window focus, and its own poll), which holds no lock and
+ * asks nobody's permission.
+ */
+function isTunnelRunningElsewhere(core: NexusCore, profileId: string): boolean {
+  return core.getSnapshot().remoteTunnels.some((entry) => entry.profileId === profileId);
+}
+
+/**
+ * The Remove Tunnel confirmation text, built in ONE place so what the modal
+ * discloses and what the removal is later re-checked against cannot drift apart
+ * — the same "re-render the disclosure and compare" shape the auth profile
+ * editor's delete handler (ui/authProfileEditorPanel.ts) and
+ * nexus.authProfile.applyToFolder (commands/authProfileCommands.ts) use.
+ *
+ * Its inputs are exactly two: the profile's NAME and whether the tunnel is
+ * running in another window. Both are re-derived under the lock and compared, so
+ * a third input added here is covered by that comparison for free — which is the
+ * whole reason the check re-renders the text instead of comparing named fields.
+ */
+function tunnelRemovalDisclosure(profileName: string, runningElsewhere: boolean): string {
+  return runningElsewhere
+    ? `Tunnel "${profileName}" is running in another window. Removing the profile won't stop the running tunnel. Remove anyway?`
+    : `Remove tunnel "${profileName}"?`;
 }
 
 function toTunnelFromArg(core: NexusCore, arg: unknown): TunnelProfile | undefined {
@@ -455,20 +485,92 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       if (!profile) {
         return;
       }
-      const isRemote = ctx.core.getSnapshot().remoteTunnels.some((r) => r.profileId === profile.id);
-      const confirmMsg = isRemote
-        ? `Tunnel "${profile.name}" is running in another window. Removing the profile won't stop the running tunnel. Remove anyway?`
-        : `Remove tunnel "${profile.name}"?`;
+      // Sampled BEFORE the first await, and captured as TEXT rather than as a
+      // record. `profile` is usually the LIVE object (core.getTunnel returns the
+      // map's own record, and a tree item carries that same object out of
+      // getSnapshot); nexus.server.remove has to clone its subject precisely
+      // because comparing a live record against itself is a no-op once something
+      // mutates it in place — which NexusCore's folder rename and folder cascade
+      // do, rewriting `.group` on the map's own server, serial and local shell
+      // records. A rendered string cannot be mutated behind this flow's back, so
+      // the disclosure is inherently the detached comparand and no clone helper is
+      // needed here — a property that keeps holding if this text ever grows an
+      // input that IS rewritten in place.
+      const profileId = profile.id;
+      const confirmedName = profile.name;
+      const shownDisclosure = tunnelRemovalDisclosure(
+        confirmedName,
+        isTunnelRunningElsewhere(ctx.core, profileId)
+      );
       const confirm = await vscode.window.showWarningMessage(
-        confirmMsg,
+        shownDisclosure,
         { modal: true },
         "Remove"
       );
       if (confirm !== "Remove") {
         return;
       }
-      await stopTunnelByProfile(ctx.core, ctx.tunnelManager, profile.id);
-      await ctx.core.removeTunnel(profile.id);
+      // REMOVE-MUTATION-RACE FAMILY (same finding as nexus.server.remove's own
+      // section in commands/serverCommands.ts) — the confirmation above describes
+      // state sampled BEFORE the modal, and the modal's wait is unbounded. Both
+      // facts it discloses can move while it sits open: another window can start
+      // or stop this tunnel (the "running in another window" clause flips, so the
+      // user is told the running tunnel survives — or is not told), and any writer
+      // can rename or delete the profile. This span used to run lock-free against
+      // that stale sample, so a replace-mode import or a complete reset (both of
+      // which do their whole mutation phase inside this SAME lock) could interleave
+      // with the stop+delete: each write persists a snapshot captured synchronously
+      // at call time and then awaits, so whichever commits last silently wins, and
+      // a removal can land on — or be undone by — a config the user never saw.
+      //
+      // Hold the lock across the whole mutation, re-check presence as the first
+      // thing inside it, and re-render the disclosure from live state; if it no
+      // longer reads the same, refuse. ABORT, NOT RECONFIRM: re-asking would mean
+      // releasing the lock to show a modal, re-acquiring and re-checking, which is
+      // syncNow's bounded retry loop (commands/inventoryCommands.ts). syncNow earns
+      // that machinery because it has a fetched tree and completed teardowns to
+      // protect; re-running this command is one click and rebuilds every fact from
+      // scratch, so saying so and doing nothing is the conservative answer — the
+      // same one the auth profile editor's delete handler reaches.
+      //
+      // NO CALLER HOLDS THIS LOCK ALREADY, so acquiring it here cannot deadlock the
+      // non-re-entrant AsyncMutex: nexus.tunnel.remove is reachable only from VS
+      // Code's command dispatcher (package.json `commands` + the nexusTunnels
+      // view/item/context menu), no `executeCommand` in src/ targets it, and
+      // webExtension.ts only registers an unavailable stub for it in the web host.
+      // Nothing reached from inside the section acquires it either — TunnelManager,
+      // TunnelRegistrySync and NexusCore are all lock-free, by the same rule that
+      // keeps it out of NexusCore.removeAuthProfile (see that method's doc comment).
+      //
+      // Acquired AFTER the last prompt, as the lock's contract requires, and
+      // nothing inside shows UI: both notices below are deferred out of the section.
+      let alreadyRemoved: string | undefined;
+      let refusal: string | undefined;
+      await configMutationLock.runExclusive(async () => {
+        const current = ctx.core.getTunnel(profileId);
+        if (!current) {
+          alreadyRemoved = `Tunnel "${confirmedName}" was already removed.`;
+          return;
+        }
+        if (
+          tunnelRemovalDisclosure(current.name, isTunnelRunningElsewhere(ctx.core, profileId)) !==
+          shownDisclosure
+        ) {
+          // Quoted by the name the MODAL used, not the current one: that is the
+          // tunnel the user acted on, and a rename is one of the things this catches.
+          refusal = `Tunnel "${confirmedName}" changed since the removal was confirmed — try again.`;
+          return;
+        }
+        await stopTunnelByProfile(ctx.core, ctx.tunnelManager, profileId);
+        await ctx.core.removeTunnel(profileId);
+      });
+      if (alreadyRemoved !== undefined) {
+        void vscode.window.showInformationMessage(alreadyRemoved);
+        return;
+      }
+      if (refusal !== undefined) {
+        void vscode.window.showWarningMessage(refusal);
+      }
     }),
 
     vscode.commands.registerCommand("nexus.tunnel.start", (arg?: unknown) => startTunnelCommand(ctx, arg)),

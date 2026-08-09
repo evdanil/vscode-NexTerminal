@@ -1,4 +1,13 @@
-import type { AuthProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile, ProxyConfig, LocalShellProfile } from "../models/config";
+import type {
+  AuthProfile,
+  DetachedServerOrigin,
+  ServerConfig,
+  ServerOrigin,
+  TunnelProfile,
+  SerialProfile,
+  ProxyConfig,
+  LocalShellProfile
+} from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import { normalizeFolderPath } from "./folderPaths";
 
@@ -73,6 +82,41 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
   );
 }
 
+/**
+ * ADOPT 1 — the shape guard for `ServerConfig.formerlySynced`, the receipt
+ * "Keep Servers" leaves behind (see DetachedServerOrigin in models/config.ts).
+ *
+ * Same trust boundary and the same deliberately strict disposition as
+ * `isValidServerOrigin` above: this guard is the only thing standing between a
+ * hand-edited backup or a version-skewed globalState row and the sync engine's
+ * adoption rule, which hands an existing record's whole lifecycle — name,
+ * address, folder, and the source's prune policy, `delete` included — to a
+ * source. EVERY member is required and every string non-empty, because the
+ * engine's only writer (`removeSource`'s Keep Servers branch) writes all five
+ * unconditionally: an absent one cannot have come from this extension, and a
+ * partially-trusted marker is one whose `externalId` decides an adoption while
+ * its `providerId` is missing to scope it.
+ *
+ * Callers strip the WHOLE marker rather than the offending member (the same
+ * F13/FIX 5 disposition `origin` gets, at the same two boundaries). The cost of
+ * a stripped marker is proportionate and self-repairing in the safe direction:
+ * the server simply stops being adoptable, so the next sync adds a duplicate and
+ * says so, instead of re-homing a record on the strength of a field nobody wrote.
+ */
+export function isValidDetachedServerOrigin(value: unknown): value is DetachedServerOrigin {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  return (
+    isNonEmptyString(obj.sourceId) &&
+    isNonEmptyString(obj.sourceName) &&
+    isNonEmptyString(obj.providerId) &&
+    isNonEmptyString(obj.externalId) &&
+    typeof obj.detachedAt === "number"
+  );
+}
+
 export function validateServerConfig(item: unknown): item is ServerConfig {
   if (typeof item !== "object" || item === null) {
     return false;
@@ -138,6 +182,10 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   // a `boolean`-returning predicate). The actual strip-and-warn happens one
   // layer up, in VscodeConfigRepository.getServers(), which owns producing
   // the final, storage-clean ServerConfig list.
+  //
+  // ADOPT 1 — `formerlySynced` is governed by exactly the same rule, for
+  // exactly the same reason: see `isValidDetachedServerOrigin` above, which the
+  // same two boundaries call to strip it.
   return true;
 }
 

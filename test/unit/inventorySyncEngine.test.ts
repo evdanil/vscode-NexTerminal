@@ -1785,6 +1785,465 @@ describe("computeSyncPlan — amendments F5/F6", () => {
   });
 });
 
+/**
+ * ADOPT-ON-ADD — re-adding a source that was removed with "Keep Servers" may
+ * RE-LINK (adopt) the kept records instead of adding duplicates beside them.
+ *
+ * THE RULE THIS BLOCK EXISTS TO DEFEND: only a server carrying this provider's
+ * "Keep Servers" marker (`formerlySynced`) is adoptable, and only while its
+ * current address is still the device's. A hand-made server is never adopted,
+ * however exactly its address matches — see the headline test (E-7). Address
+ * alone was the rejected design: it would let a source take over records the
+ * user created, which is the one thing this feature must never do.
+ *
+ * THE OTHER TRAP: an adopted server and a duplicate-added server look almost
+ * identical field by field, so a fixture whose kept server already matches the
+ * device's name/username/settings proves nothing. Every "adopted" assertion
+ * below pins the server COUNT (`adds.length === 0`, `updates.length === 1`) and
+ * the surviving ID (`kept-1`, explicitly NOT the deterministic add-path id),
+ * and the canonical fixture is deliberately skewed away from anything the add
+ * path could produce: a hand-chosen id, a stale name, an upper-case host, a
+ * hand-picked username, password auth, hidden, proxied, in a hand-made folder.
+ */
+describe("computeSyncPlan — adopt-on-add", () => {
+  /** What the ADD path would mint for makeDevice()'s externalId — the id an adoption must NOT produce. */
+  const ADD_PATH_ID = deterministicServerId("source-1", "device:1");
+
+  /** The receipt "Keep Servers" leaves behind: this device, this provider, a source that no longer exists. */
+  function keptMarker(overrides: Partial<ServerConfig["formerlySynced"] & object> = {}) {
+    return {
+      sourceId: "removed-source",
+      sourceName: "NetBox (removed)",
+      providerId: "netbox",
+      externalId: "device:1",
+      detachedAt: 900,
+      ...overrides
+    };
+  }
+
+  function makeKeptServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return makeManualServer({
+      id: "kept-1",
+      name: "old-name",
+      host: "LAB-SW-01",
+      port: 22,
+      username: "handpicked",
+      authType: "password",
+      isHidden: true,
+      proxy: { type: "socks5", host: "127.0.0.1", port: 1080 },
+      group: "Hand/Made",
+      formerlySynced: keptMarker(),
+      ...overrides
+    });
+  }
+
+  /** The device the marker names, at the kept server's address in the OTHER case, port omitted (must default to 22). */
+  function keptDevice(overrides: Partial<InventoryDevice> = {}): InventoryDevice {
+    return makeDevice({ endpoints: [{ kind: "ssh", host: "lab-sw-01" }], ...overrides });
+  }
+
+  const profile: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
+
+  it("(E-7) HEADLINE — a hand-made server at the device's exact address is NEVER adopted: no marker, no adoption (kills matching on address, the rejected design)", () => {
+    const source = makeSource();
+    // Identical to the canonical fixture in every respect EXCEPT the marker.
+    const handMade = makeKeptServer({ formerlySynced: undefined });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [handMade], now: 5000, adoptKeptServers: true });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].id).toBe(ADD_PATH_ID);
+    // The user's record is untouched and the collision is disclosed exactly as
+    // it is today — no new copy, no new behavior, flag or no flag.
+    expect(plan.manualDuplicateCount).toBe(1);
+    expect(plan.warnings).toContain('Device "core-sw-1" matches existing server "old-name" (lab-sw-01:22) — will be added as a duplicate.');
+    // And no question is ever raised about it.
+    expect(plan.adoptionCandidateNames).toHaveLength(0);
+  });
+
+  it("(E-1) flag on: the kept server is UPDATED in place — same id, credentials byte-for-byte, name/host/port/folder from the device, marker cleared (kills the duplicate add, the minted id, and the rebuilt-from-the-add-path record)", () => {
+    const source = makeSource();
+    const kept = makeKeptServer();
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([keptDevice({ folderPath: "Syd/R1" })]),
+      currentServers: [kept],
+      now: 5000,
+      adoptKeptServers: true
+    });
+
+    // The count+id pair IS the test. A duplicate-add implementation leaves the
+    // kept server untouched and adds a second one: every "looks adopted" field
+    // check below would then pass on the WRONG record.
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].before.id).toBe("kept-1");
+    expect(plan.updates[0].after.id).toBe("kept-1");
+    expect(plan.updates[0].after.id).not.toBe(ADD_PATH_ID);
+
+    const after = plan.updates[0].after;
+    // Gains: ownership by this source. Stamps record only what THIS sync wrote —
+    // it wrote no username (the endpoint supplies none) and no profile link.
+    expect(after.origin).toEqual({ sourceId: "source-1", externalId: "device:1", syncedAt: 5000 });
+    expect(after.origin?.syncedUsername).toBeUndefined();
+    expect(after.origin?.syncedAuthProfileId).toBeUndefined();
+    // Loses: the marker. A now-owned server must not go on advertising itself
+    // for adoption — and the spread would carry it if nothing cleared it.
+    expect(after.formerlySynced).toBeUndefined();
+    // Keeps: everything the field-ownership rule refuses to touch.
+    expect(after.username).toBe("handpicked");
+    expect(after.authType).toBe("password");
+    expect(after.proxy).toEqual({ type: "socks5", host: "127.0.0.1", port: 1080 });
+    expect(after.isHidden).toBe(true);
+    // Takes from the device: name, address, folder.
+    expect(after.name).toBe("core-sw-1");
+    expect(after.host).toBe("lab-sw-01");
+    expect(after.port).toBe(22);
+    expect(after.group).toBe("NetBox/Syd/R1");
+    expect(plan.folders).toContain("NetBox/Syd/R1");
+    // An adoption is never a duplicate and never "unchanged".
+    expect(plan.manualDuplicateCount).toBe(0);
+    expect(plan.unchangedCount).toBe(0);
+    expect(plan.warnings.some((w) => w.includes("duplicate"))).toBe(false);
+    expect(plan.adoptionCandidateNames).toEqual(["core-sw-1"]);
+  });
+
+  it("(E-1b) a kept server ALREADY identical to the device in every source-owned field is still an update — gaining `origin` is the change (kills mirroring the owned path's AUTH 3 `changed` comparison, which would compute the adoption and discard it as 'unchanged')", () => {
+    // The one fixture where "adopted" and "did nothing" look the same on every
+    // field the update path compares. Only ownership moves, and if that is
+    // dropped the plan reports a no-op while the duplicate the user was trying
+    // to avoid is neither added nor resolved.
+    const source = makeSource();
+    const kept = makeKeptServer({ name: "core-sw-1", host: "lab-sw-01", port: 22, group: "NetBox" });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+
+    expect(plan.unchangedCount).toBe(0);
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.id).toBe("kept-1");
+    expect(plan.updates[0].after.origin?.sourceId).toBe("source-1");
+  });
+
+  it("(E-2) flag omitted: today's behavior bit-for-bit — a duplicate add with the verbatim warning — yet the candidate list is still populated (kills a default-true flag, and a candidate list computed only when the flag is on)", () => {
+    const source = makeSource();
+    const kept = makeKeptServer();
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000 });
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].id).toBe(ADD_PATH_ID);
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.manualDuplicateCount).toBe(1);
+    expect(plan.warnings).toContain('Device "core-sw-1" matches existing server "old-name" (lab-sw-01:22) — will be added as a duplicate.');
+    // No mismatch/ambiguity copy leaks into a flag-off run.
+    expect(plan.warnings.some((w) => w.includes("previously synced onto"))).toBe(false);
+    // The caller decides whether to ASK from this list, so it must be computed
+    // whichever way the plan was computed — otherwise the question could never
+    // be raised on a flag-off plan, which is the only kind the caller has when
+    // it needs to decide.
+    expect(plan.adoptionCandidateNames).toHaveLength(1);
+  });
+
+  it("(E-2b) flag off: NEITHER new warning is emitted, for a re-addressed kept server or an ambiguous one — a run that never asked the question says nothing about adoption (kills the new copy leaking into a no-question run, where it would also drift the preview text against the recompute)", () => {
+    const source = makeSource();
+
+    // Same fixture as E-3's refusal, flag off: the mismatch note explains a
+    // refusal that was never on the table.
+    const moved = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [makeKeptServer({ host: "10.9.9.9" })], now: 1000 });
+    expect(moved.warnings.some((w) => w.includes("previously synced onto"))).toBe(false);
+    // Bit-for-bit: the endpoint no longer collides, so there is nothing to say at all.
+    expect(moved.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([]);
+
+    // Same fixture as E-6, flag off: the ambiguity note likewise describes a
+    // decision this run never made.
+    const ambiguous = computeSyncPlan({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [makeKeptServer({ id: "kept-a", name: "copy-a" }), makeKeptServer({ id: "kept-b", name: "copy-b" })],
+      now: 1000
+    });
+    expect(ambiguous.warnings.some((w) => w.includes("cannot tell which to adopt"))).toBe(false);
+    // Only today's duplicate warning, naming the server the single-valued index names.
+    expect(ambiguous.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([
+      'Device "core-sw-1" matches existing server "copy-b" (lab-sw-01:22) — will be added as a duplicate.'
+    ]);
+    expect(ambiguous.manualDuplicateCount).toBe(1);
+  });
+
+  it("(E-3) corroboration: the address must still match, host case-insensitively — a re-addressed kept server is not adopted, and the refusal says why (kills dropping the address check, and a one-sided lowercase)", () => {
+    const source = makeSource();
+
+    // Device host upper, kept server host lower — the mirror of E-1's fixture.
+    const lowerServer = makeKeptServer({ host: "lab-sw-01" });
+    const upperDevice = makeDevice({ endpoints: [{ kind: "ssh", host: "LAB-SW-01" }] });
+    const matched = computeSyncPlan({ source, tree: makeTree([upperDevice]), currentServers: [lowerServer], now: 1000, adoptKeptServers: true });
+    expect(matched.adds).toHaveLength(0);
+    expect(matched.updates).toHaveLength(1);
+    expect(matched.updates[0].before.id).toBe("kept-1");
+
+    // Same marker, same device — but the server has moved. Identity is not
+    // enough: this is the clause that stops one provider instance's "device:1"
+    // from claiming another instance's kept server.
+    const moved = makeKeptServer({ host: "10.9.9.9" });
+    const refused = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [moved], now: 1000, adoptKeptServers: true });
+    expect(refused.updates).toHaveLength(0);
+    expect(refused.adds).toHaveLength(1);
+    expect(refused.adoptionCandidateNames).toHaveLength(0);
+    expect(refused.warnings).toContain(
+      'Device "core-sw-1" was previously synced onto server "old-name", but that server is now at 10.9.9.9:22 and the device is at lab-sw-01:22 — it will be added as a new server instead.'
+    );
+    // The address no longer collides, so today's duplicate warning correctly stays away.
+    expect(refused.manualDuplicateCount).toBe(0);
+  });
+
+  it("(E-3b) the device's port participates in corroboration, and a multi-server mismatch is reported without naming one of them (kills a port-blind address check)", () => {
+    const source = makeSource();
+
+    // The device's omitted port defaults to 22 and must not match a kept server on 2222.
+    const otherPort = makeKeptServer({ port: 2222 });
+    const refused = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [otherPort], now: 1000, adoptKeptServers: true });
+    expect(refused.updates).toHaveLength(0);
+    expect(refused.adds).toHaveLength(1);
+    expect(refused.adoptionCandidateNames).toHaveLength(0);
+
+    const twoMoved = [makeKeptServer({ id: "kept-a", name: "copy-a", host: "10.9.9.9" }), makeKeptServer({ id: "kept-b", name: "copy-b", host: "10.9.9.8" })];
+    const plural = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: twoMoved, now: 1000, adoptKeptServers: true });
+    expect(plural.updates).toHaveLength(0);
+    expect(plural.warnings).toContain(
+      'Device "core-sw-1" was previously synced onto 2 servers in your list, none of which is still at lab-sw-01:22 — it will be added as a new server instead.'
+    );
+  });
+
+  it("(E-8) a marker from a DIFFERENT provider is never claimed (kills matching on externalId alone across provider kinds)", () => {
+    const source = makeSource({ providerId: "netbox" });
+    const kept = makeKeptServer({ formerlySynced: keptMarker({ providerId: "some-other-provider" }) });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    // Not even the mismatch note — this marker is not this source's business at all.
+    expect(plan.warnings.some((w) => w.includes("previously synced onto"))).toBe(false);
+  });
+
+  it("(E-8b) a marker naming a DIFFERENT device is never claimed (kills falling back to address matching when the externalId does not match)", () => {
+    const source = makeSource();
+    const kept = makeKeptServer({ formerlySynced: keptMarker({ externalId: "device:999" }) });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    // It IS still an address collision, so today's duplicate warning fires.
+    expect(plan.manualDuplicateCount).toBe(1);
+  });
+
+  it("(E-7b) a server carrying BOTH an origin and a marker is never adopted — an owned record is owned (kills eligibility that reads the marker without checking origin)", () => {
+    const source = makeSource();
+    const foreignWithMarker = makeKeptServer({
+      id: "foreign-1",
+      origin: { sourceId: "other-source", externalId: "device:1", syncedAt: 1 }
+    });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [foreignWithMarker], now: 5000, adoptKeptServers: true });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adoptionCandidateNames).toHaveLength(0);
+  });
+
+  it("(E-6) two kept servers naming the same device at its address: NEITHER is adopted, the device is added as a duplicate, and the warning names the count (kills adopt-the-first-in-array-order, and counting an ambiguous device as a candidate)", () => {
+    const source = makeSource();
+    const first = makeKeptServer({ id: "kept-a", name: "copy-a" });
+    const second = makeKeptServer({ id: "kept-b", name: "copy-b" });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [first, second], now: 5000, adoptKeptServers: true });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].id).toBe(ADD_PATH_ID);
+    expect(plan.manualDuplicateCount).toBe(1);
+    expect(plan.warnings.some((w) => w.includes("matches 2 servers kept from a previous sync") && w.includes("cannot tell which to adopt"))).toBe(true);
+    // An all-ambiguous plan must not make the caller ask a question adoption
+    // could not act on.
+    expect(plan.adoptionCandidateNames).toHaveLength(0);
+  });
+
+  it("(E-9) two devices cannot share one kept server: the duplicate-externalId guard skips the second before it ever reaches the match (kills adopting one server twice)", () => {
+    const source = makeSource();
+    const kept = makeKeptServer();
+    // Same externalId — the marker names exactly one device, so this is the ONLY
+    // shape in which two devices could contend for one kept server.
+    const tree = makeTree([keptDevice(), keptDevice({ name: "core-sw-2" })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [kept], now: 5000, adoptKeptServers: true });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].before.id).toBe("kept-1");
+    expect(plan.updates[0].after.origin?.externalId).toBe("device:1");
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.adoptionCandidateNames).toEqual(["core-sw-1"]);
+    expect(plan.warnings.some((w) => w.includes("Duplicate device ID"))).toBe(true);
+  });
+
+  it("(E-4) the stamps record what THIS sync wrote, so a hand-picked username is not laundered into 'as stamped' — and the next sync still refuses to retro-apply (kills stamping before.username, and stamping source.defaultUsername)", () => {
+    // Everything except the username clause is satisfied, so that clause is the
+    // ONLY thing between this server and the source's profile — which is what
+    // makes sync 2 a real probe.
+    const source = makeSource({ authProfileId: "p1" });
+    const kept = makeKeptServer({ username: "handpicked", authType: "agent", isHidden: false, proxy: undefined, keyPath: undefined });
+
+    const first = computeSyncPlan({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [kept],
+      now: 5000,
+      authProfile: profile,
+      adoptKeptServers: true
+    });
+    expect(first.updates).toHaveLength(1);
+    const adopted = first.updates[0].after;
+    expect(adopted.origin?.syncedUsername).toBeUndefined();
+    expect(adopted.origin?.syncedAuthProfileId).toBeUndefined();
+    expect(adopted.authProfileId).toBeUndefined();
+    expect(adopted.username).toBe("handpicked");
+
+    // Sync 2, against the record sync 1 would have written: the server is owned
+    // now, so it takes the ordinary update path. `syncedUsername` is absent, so
+    // the retro-apply comparison falls back to defaultUsername ("admin") and the
+    // hand-picked username still reads as a hand-edit — nothing happens.
+    const second = computeSyncPlan({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [adopted],
+      now: 6000,
+      authProfile: profile
+    });
+    expect(second.updates).toHaveLength(0);
+    expect(second.unchangedCount).toBe(1);
+  });
+
+  it("(E-5) same-plan retro-apply: a kept server in the add path's exact shape gains the source's profile AND the stamp that records it (kills blocking retro-apply on adoption, and linking without stamping — the opt-out hole)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const kept = makeKeptServer({ username: "admin", authType: "agent", isHidden: false, proxy: undefined });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [kept],
+      now: 5000,
+      authProfile: profile,
+      adoptKeptServers: true
+    });
+
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.id).toBe("kept-1");
+    expect(after.origin?.sourceId).toBe("source-1");
+    expect(after.authProfileId).toBe("p1");
+    // The stamp is what makes a LATER hand-clear of this link visible as an
+    // opt-out instead of reading as "never linked" and being reattached forever.
+    expect(after.origin?.syncedAuthProfileId).toBe("p1");
+    // Still no username written by this sync, so still no username stamp.
+    expect(after.origin?.syncedUsername).toBeUndefined();
+    expect(after.username).toBe("admin");
+    expect(after.authType).toBe("agent");
+  });
+
+  it("(E-5b) a password-auth kept server gains the origin but NOT the profile link (kills 'adoption always links the source profile')", () => {
+    const source = makeSource({ authProfileId: "p1" });
+    const kept = makeKeptServer({ username: "admin" }); // authType "password" — the clause that must refuse
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [kept],
+      now: 5000,
+      authProfile: profile,
+      adoptKeptServers: true
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.origin?.sourceId).toBe("source-1");
+    expect(plan.updates[0].after.authProfileId).toBeUndefined();
+    expect(plan.updates[0].after.origin?.syncedAuthProfileId).toBeUndefined();
+    expect(plan.updates[0].after.authType).toBe("password");
+  });
+
+  it("(E-10) a hidden kept server is eligible and stays hidden — isHidden is tree visibility, not identity (kills excluding hidden servers, and un-hiding on adoption)", () => {
+    const source = makeSource();
+    const kept = makeKeptServer({ isHidden: true });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.id).toBe("kept-1");
+    expect(plan.updates[0].after.isHidden).toBe(true);
+  });
+
+  it("(E-11) the id-collision guard still runs FIRST: a collided device is skipped even when its kept server is waiting (kills moving the match check ahead of the guard)", () => {
+    const source = makeSource();
+    // Unrelated server occupying the id this device would mint, at a DIFFERENT
+    // address so it is not itself involved in the match.
+    const collider = makeManualServer({ id: ADD_PATH_ID, name: "hand-imported", host: "10.9.9.9" });
+    const kept = makeKeptServer();
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [collider, kept],
+      now: 5000,
+      adoptKeptServers: true
+    });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.warnings.some((w) => w.includes("already used"))).toBe(true);
+    // The candidate bookkeeping sits behind the guard too — a skipped device is
+    // not a candidate.
+    expect(plan.adoptionCandidateNames).toHaveLength(0);
+  });
+
+  it("(E-12) a keyless key profile (AUTH 1b) is not linked onto a kept server either — adoption reads the RESOLVED id, not the matched profile (kills linking an unusable profile through the new branch)", () => {
+    const keyProfile: AuthProfile = { id: "p1", name: "Key profile", username: "admin", authType: "key" };
+    const source = makeSource({ authProfileId: "p1" });
+    // In the add path's exact shape, so ONLY the AUTH 1b degrade can stop the link.
+    const kept = makeKeptServer({ username: "admin", authType: "agent", isHidden: false, proxy: undefined });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [kept],
+      now: 5000,
+      authProfile: keyProfile,
+      adoptKeptServers: true
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.id).toBe("kept-1");
+    expect(plan.updates[0].after.origin?.sourceId).toBe("source-1");
+    expect(plan.updates[0].after.authProfileId).toBeUndefined();
+    expect(plan.updates[0].after.origin?.syncedAuthProfileId).toBeUndefined();
+    expect(plan.warnings.some((w) => w.includes("uses private key authentication but has no key file"))).toBe(true);
+  });
+
+  it("(E-13) planToApplication carries an adoption as an ordinary upsert under the SURVIVING id, and removes nothing (kills any 'adoptions need their own application channel' regression)", () => {
+    const source = makeSource();
+    const kept = makeKeptServer();
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+    const application = planToApplication(plan, source);
+
+    expect(application.upsertServers.map((s) => s.id)).toEqual(["kept-1"]);
+    expect(application.upsertServers[0].origin?.sourceId).toBe("source-1");
+    expect(application.upsertServers[0].formerlySynced).toBeUndefined();
+    expect(application.upsertServers[0].username).toBe("handpicked");
+    expect(application.removeServerIds).toEqual([]);
+  });
+
+  it("(E-14) a kept server whose device is absent from the fetch is NOT pruned — it is nobody's to prune until it is adopted (kills treating markers as ownership)", () => {
+    const source = makeSource({ prunePolicy: "delete" });
+    const kept = makeKeptServer();
+    const plan = computeSyncPlan({ source, tree: makeTree([]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+
+    expect(plan.prunes).toHaveLength(0);
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.adoptionCandidateNames).toHaveLength(0);
+  });
+});
+
 describe("validateInventoryTree", () => {
   it("accepts a minimal valid tree", () => {
     expect(() => validateInventoryTree({ contractVersion: 1, devices: [] })).not.toThrow();
@@ -1856,7 +2315,8 @@ describe("planToApplication (F19 — no targetFolder parameter)", () => {
       folders: ["X", "Y"],
       warnings: [],
       hiddenPruneCount: 0,
-      manualDuplicateCount: 0
+      manualDuplicateCount: 0,
+      adoptionCandidateNames: []
     };
 
     const expectedSource = makeSource({ id: "source-1" });
@@ -1887,7 +2347,8 @@ describe("prunedServerIdsForSecretCleanup", () => {
       folders: [],
       warnings: [],
       hiddenPruneCount: 0,
-      manualDuplicateCount: 0
+      manualDuplicateCount: 0,
+      adoptionCandidateNames: []
     };
     expect(prunedServerIdsForSecretCleanup(plan)).toEqual(["d1"]);
   });

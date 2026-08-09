@@ -92,6 +92,49 @@ export interface ServerOrigin {
   syncedAuthProfileId?: string;
 }
 
+/**
+ * ADOPT 1 — the receipt left on a server when the inventory source that
+ * created it is removed with "Keep Servers". It records WHICH DEVICE the
+ * server was mapped to, so that re-adding the same source can OFFER to
+ * re-link (adopt) the kept record instead of adding a duplicate beside it.
+ *
+ * WHY A SEPARATE FIELD AND NOT A REDUCED `origin`. Three things depend on a
+ * kept server having no `origin` at all, and each breaks if the marker is
+ * folded into it:
+ *  - the tree badges any `origin`-bearing server "(synced)" and tooltips
+ *    "Synced from …" (ui/nexusTreeProvider.ts) — a kept server is NOT synced
+ *    by anything, and there is no truthful "formerly synced" rendering today;
+ *  - ownership resolution and the prune loop in
+ *    services/inventory/syncEngine.ts key on `origin.sourceId`, and a dangling
+ *    origin must never let any sync act on a record its source no longer
+ *    manages (which is exactly why "Keep Servers" strips it);
+ *  - the command layer derives which plan updates are adoptions from
+ *    `before.origin === undefined`, which is exact only while a kept server
+ *    carries no origin.
+ *
+ * MUTUALLY EXCLUSIVE WITH `origin`: adoption sets `origin` and clears this in
+ * the same write. A record carrying both is malformed; the engine ignores the
+ * marker on any server that has an `origin`, so such a record is inert rather
+ * than dangerous.
+ *
+ * `sourceId`/`sourceName`/`detachedAt` are receipts — for copy and diagnosis,
+ * never matching inputs (the whole problem is that a re-added source mints a
+ * NEW id). `providerId` and `externalId` ARE the matching inputs; see the
+ * ADOPT 1 eligibility rule in the sync engine for the endpoint corroboration
+ * that goes with them.
+ */
+export interface DetachedServerOrigin {
+  /** The removed source's id. A re-added source never matches it — receipt only. */
+  sourceId: string;
+  /** The removed source's name, so the UI can say which source kept this server. */
+  sourceName: string;
+  /** MATCHING INPUT — only a source of the same provider may adopt this record. */
+  providerId: string;
+  /** MATCHING INPUT — the device this server was mapped to. */
+  externalId: string;
+  detachedAt: number;
+}
+
 export interface ServerConfig {
   id: string;
   name: string;
@@ -109,12 +152,14 @@ export interface ServerConfig {
   proxy?: ProxyConfig;
   authProfileId?: string;  // references AuthProfile.id; credentials resolved at connection time
   origin?: ServerOrigin;
+  /** ADOPT 1 — see DetachedServerOrigin. Never set at the same time as `origin`. */
+  formerlySynced?: DetachedServerOrigin;
 }
 
 /**
  * Shallow-plus-one-level clone: ServerConfig's own fields are primitives, but
- * `proxy` and `origin` are nested objects, so a plain `{...server}` would
- * still share those two references with the source. Used by
+ * `proxy`, `origin` and `formerlySynced` are nested objects, so a plain
+ * `{...server}` would still share those references with the source. Used by
  * NexusCore.applyInventorySyncPlan to capture a structural snapshot of each
  * batch-written server AT WRITE TIME, before any later in-place mutation
  * (e.g. _renameFolderPath rewriting `server.group` on the very same object)
@@ -124,7 +169,8 @@ export function cloneServerConfig(server: ServerConfig): ServerConfig {
   return {
     ...server,
     proxy: server.proxy ? { ...server.proxy } : server.proxy,
-    origin: server.origin ? { ...server.origin } : server.origin
+    origin: server.origin ? { ...server.origin } : server.origin,
+    formerlySynced: server.formerlySynced ? { ...server.formerlySynced } : server.formerlySynced
   };
 }
 
@@ -182,6 +228,39 @@ function serverOriginsEqual(a: ServerOrigin | undefined, b: ServerOrigin | undef
 }
 
 /**
+ * ADOPT 1 — `serverOriginsEqual`'s counterpart for `formerlySynced`, and a
+ * named helper for the same reason that one is: both `serverConfigsEqual` and
+ * `mergeServerConfigFields` need the comparison, so a member added to
+ * DetachedServerOrigin can only be forgotten in a single place.
+ *
+ * Every member is compared, not just the two adoption MATCHING inputs
+ * (`providerId` / `externalId` — see DetachedServerOrigin). `sourceId`,
+ * `sourceName` and `detachedAt` are receipts, but a record whose receipt
+ * changed is still a materially different record: they are what the UI tells
+ * the user this server came from, and telling the two apart is exactly what
+ * the rollback merge below needs in order to keep a freshly written marker
+ * instead of reverting to a pre-batch one.
+ *
+ * The `!a || !b` line carries the load this whole feature turns on: present vs
+ * absent must read as a DIFFERENCE. A marker is what makes a kept server
+ * adoptable at all, so a comparator that shrugged at "one has it, the other
+ * doesn't" would let a set-marker or clear-marker write compare as "unchanged"
+ * — after which a rollback would discard it and the server would either stay
+ * unadoptable forever or become adoptable again after the user detached it.
+ */
+function detachedOriginsEqual(a: DetachedServerOrigin | undefined, b: DetachedServerOrigin | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.sourceId === b.sourceId &&
+    a.sourceName === b.sourceName &&
+    a.providerId === b.providerId &&
+    a.externalId === b.externalId &&
+    a.detachedAt === b.detachedAt
+  );
+}
+
+/**
  * Field-wise structural comparison — the ServerConfig counterpart of
  * inventory.ts's sourceConfigUnchanged. Used (instead of `===`) wherever a
  * rollback needs to tell "still exactly what we wrote" apart from "changed
@@ -208,7 +287,8 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.openFileExplorerOnFirstConnect === b.openFileExplorerOnFirstConnect &&
     a.authProfileId === b.authProfileId &&
     proxyConfigsEqual(a.proxy, b.proxy) &&
-    serverOriginsEqual(a.origin, b.origin)
+    serverOriginsEqual(a.origin, b.origin) &&
+    detachedOriginsEqual(a.formerlySynced, b.formerlySynced)
   );
 }
 
@@ -257,6 +337,18 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   }
   if (!serverOriginsEqual(current.origin, batchSnapshot.origin)) {
     merged.origin = current.origin ? { ...current.origin } : current.origin;
+  }
+  // ADOPT 1 — `formerlySynced` merges on exactly the same terms as `origin`
+  // above, and needs to for the same reason: a concurrent Remove Source → Keep
+  // Servers (which STAMPS the marker) or a concurrent adoption (which CLEARS
+  // it) is the very kind of write this merge exists to protect. Falling back to
+  // `prior`'s marker would either strip a marker the user just earned — the
+  // server silently stops being adoptable, with nothing on screen to say so —
+  // or re-stamp one an adoption just consumed, leaving a record carrying both
+  // an `origin` and a stale marker (inert by the engine's own first clause, but
+  // a lie about the record's history either way).
+  if (!detachedOriginsEqual(current.formerlySynced, batchSnapshot.formerlySynced)) {
+    merged.formerlySynced = current.formerlySynced ? { ...current.formerlySynced } : current.formerlySynced;
   }
   // id never changes across a rollback merge — always prior's (== current's,
   // == batchSnapshot's; the map key this is stored under is invariant).
