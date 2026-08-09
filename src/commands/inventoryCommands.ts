@@ -1594,6 +1594,49 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
 }
 
 /**
+ * ADOPT 1 / REVIEW FINDING (P1, the adoption question behind the no-op fast
+ * path) — "is there NOTHING for this sync to do AND nothing to ask the user
+ * about?", the one condition syncNow's empty-plan fast path is allowed to
+ * short-circuit on.
+ *
+ * THE COUNTS ALONE ARE NOT THAT CONDITION. An adoption candidate is normally
+ * also a planned ADD (the device would be added beside the record it came from),
+ * so a plan with candidates is non-empty by the counts and the question is
+ * reached. There is exactly one shape where it is not: restore an ID-preserving
+ * backup taken while a source was live, remove that source with Keep Servers and
+ * add it back, and the kept server still holds
+ * `deterministicServerId(source.id, externalId)` — the id THIS device's add
+ * would need. The engine records the candidate, refuses to mint a second record
+ * under an occupied id, and produces an entirely empty plan (syncEngine.ts, the
+ * collision skip after the adoption block). The counts then say "nothing to do"
+ * about the one run whose whole purpose is to ask a question, so the fast path
+ * applied a no-op and returned, and a restored source could never reclaim its
+ * servers — closing by the back door the exact path the collision guard's
+ * adoptee exemption was written to open.
+ *
+ * WHY THIS PREDICATE AND NOT AN EARLIER QUESTION. Moving the question above the
+ * fast path would ask it from the PRE-LOCK plan, before the in-lock recompute
+ * that exists precisely because that plan can be stale, and would then have to
+ * thread the answer into that recompute and re-derive the candidate list there —
+ * two places deciding when to ask, for a question whose entire contract is that
+ * it is asked once per run. It would also risk raising a modal for a sync that
+ * the fresh snapshot proves has nothing left to ask about (another window
+ * adopted or deleted the kept server first), which is the one thing this fast
+ * path exists to prevent. Naming what "empty" means, and asking BOTH gates the
+ * same question, fixes the predicate that was wrong instead of relocating the
+ * user interaction that was not.
+ *
+ * A GENUINELY EMPTY SYNC STILL SHOWS NO MODAL: no candidates means no question,
+ * so `adoptionCandidateNames` is empty and this reads exactly as the count
+ * check did.
+ */
+function planHasNothingToDo(plan: InventorySyncPlan): boolean {
+  return (
+    plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0 && plan.adoptionCandidateNames.length === 0
+  );
+}
+
+/**
  * REVIEW FINDING (P2) — the set of server ids the plan would move onto a
  * different auth profile, the identity behind `authProfileSwitches`' count.
  * Read off `before.id` for the same reason `planWarningsBuffer` names
@@ -2789,8 +2832,12 @@ export function registerInventoryCommands(
         providerInstanceKey: planInstanceKey
       });
 
-      // Nothing to do: apply an empty application to bump lastSyncAt without a confirm modal.
-      if (plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0) {
+      // Nothing to do AND nothing to ask: apply an empty application to bump
+      // lastSyncAt without a confirm modal. `planHasNothingToDo` is the whole of
+      // that condition and is shared with the in-lock recompute below — see its
+      // doc for why an adoption candidate makes a count-empty plan non-empty
+      // here, and why both gates have to ask the same question.
+      if (planHasNothingToDo(plan)) {
         // FINDING 2 (P2, fast-path-stale-recompute review) — `plan` above was
         // computed BEFORE this lock acquisition; a queued mutation elsewhere
         // (e.g. a locked nexus.server.remove deleting a server this source
@@ -2849,7 +2896,15 @@ export function registerInventoryCommands(
             authProfile: freshAuthProfile,
             providerInstanceKey: freshInstanceKey
           });
-          if (recomputed.adds.length > 0 || recomputed.updates.length > 0 || recomputed.prunes.length > 0) {
+          // THE SAME PREDICATE AS THE OUTER GATE, deliberately — a second gate
+          // asking a narrower question is the first one's blindness moved rather
+          // than fixed (REVIEW FINDING, P1). This one is reachable with a
+          // candidate the outer plan did not have: the queued mutation this
+          // recompute exists to catch can be the very write that CREATES the
+          // adoptee (an ID-preserving config import landing while the fetch was
+          // in flight), which leaves the fresh plan count-empty and carrying a
+          // question nobody would ever be asked.
+          if (!planHasNothingToDo(recomputed)) {
             return { kind: "not-empty", plan: recomputed, authProfile: freshAuthProfile, instanceKey: freshInstanceKey };
           }
           try {
@@ -2925,9 +2980,14 @@ export function registerInventoryCommands(
       // released it by the time control reaches here, in both of its
       // fall-through paths.
       //
-      // The fast path can never need this question: it only proceeds on an
-      // empty plan, and a candidate is by definition a device that would
-      // otherwise be ADDED. If a candidate exists, the plan is not empty.
+      // REACHED FROM EVERY PATH ABOVE, which is what `planHasNothingToDo` is
+      // for. The fast path used to swallow this question whenever the counts came
+      // back empty, and a candidate is NOT always a planned add: the restored
+      // ID-preserving backup produces a candidate the engine cannot add (its id
+      // is held by the adoptee) and therefore an empty-by-the-counts plan. That
+      // run is the one that most needs asking — it is the only way a restored
+      // source can ever reclaim its own servers — so "empty" now means "nothing
+      // to do and nothing to ask", at both of the fast path's gates.
       let adoptionChoice: InventoryAdoptionChoice | undefined;
       if (plan.adoptionCandidateNames.length > 0) {
         const n = plan.adoptionCandidateNames.length;
@@ -3002,14 +3062,16 @@ export function registerInventoryCommands(
           // the same `source` snapshot the initial computation used.
           planAuthProfile = resolveSourceAuthProfile(core, source);
           planInstanceKey = resolveProviderInstanceKey(provider, source.config);
-          // RECOMPUTED ON BOTH ANSWERS, not just on Adopt. `plan` above was
-          // computed with no answer at all, and the answer changes the engine's
-          // WARNINGS as well as its updates: a declined run says nothing about
-          // the matches it refused, a never-asked one explains them (see
-          // `InventoryAdoptionChoice`). Reusing the unanswered plan for the
-          // preview would render warnings the in-lock recompute then drops,
-          // which is drift — the modal would re-show on every pass until the
-          // mismatch cap aborted a sync nothing was actually wrong with.
+          // RECOMPUTED ON BOTH ANSWERS, not just on Adopt. The rule this run
+          // follows from here is that the answer is threaded by name into EVERY
+          // computeSyncPlan call, and the preview is the first of them: a plan
+          // the modal renders that was computed under different inputs from the
+          // in-lock recompute under it is drift by construction — the modal
+          // re-shows on every pass until the mismatch cap aborts a sync nothing
+          // was actually wrong with. `"decline"` happens to produce the same plan
+          // as no answer today (see `InventoryAdoptionChoice`); making the
+          // preview depend on that staying true is how the next behaviour keyed
+          // on the answer would arrive already broken.
           plan = computeSyncPlan({
             source,
             tree,
@@ -3019,10 +3081,20 @@ export function registerInventoryCommands(
             providerInstanceKey: planInstanceKey,
             adoptionChoice
           });
-          // No fast-path re-entry after this recompute, and none is needed: a
-          // candidate implies a planned add, so this plan carries at least that
-          // device either as an adoption (the candidate survived) or as an add
-          // (it did not) — it cannot come back empty because of the answer.
+          // NO FAST-PATH RE-ENTRY after this recompute, deliberately. On Adopt
+          // the plan carries the adoption, so there is nothing to re-enter for.
+          // On Add Separately it CAN come back empty — the restored-backup shape
+          // above is exactly that: the device cannot be added under an id its own
+          // adoptee still holds, so the answer produces a skip and a warning
+          // rather than a record. That run falls through into the preview below
+          // with an empty plan, which is where it belongs: the modal states the
+          // (nil) effect and Show Warnings carries the engine's sentence saying
+          // the device was skipped rather than added separately, and how to
+          // reclaim it. A silent return would drop the one explanation the user
+          // has, and re-entering the fast path would collect a second consent for
+          // a run they have already answered. An empty plan reaching this modal
+          // is not a new shape — the drift/retry loop below can produce one
+          // whenever a concurrent change empties a confirmed plan.
         } else {
           // Esc/dismiss ABORTS the sync. The answer governs the apply, and none
           // was given: defaulting an unanswered question to either side is the

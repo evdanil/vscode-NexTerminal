@@ -2101,35 +2101,75 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(ambiguous.manualDuplicateCount).toBe(1);
   });
 
-  it("(E-2c) DECLINED — the user was asked and chose Add Separately: the same two fixtures say NOTHING about adoption (kills emitting the refusals unconditionally, which would explain a refusal to the one user who has just decided on it, on this sync and every sync after it)", () => {
+  it("(E-2c) DECLINED — the answer covers the devices the question NAMED and nothing else: the clean candidate is duplicated in silence while the moved and the ambiguous matches beside it still explain themselves (kills suppressing the refusals per-PLAN on `decline`, which answers a question about one device by going quiet about two others the user was never told existed)", () => {
+    // THE SHAPE THE FINDING IS ABOUT, and the reason a per-plan flag can never
+    // be right: ONE run carrying a clean candidate (device:1 — this is what
+    // raises the question at all, so `"decline"` is only reachable here) beside
+    // two devices the question never counted or named. A clean candidate takes
+    // the adoption branch, so the branches below it are, by construction, about
+    // devices the user was told nothing about.
     const source = makeSource();
+    const movedDevice = makeDevice({ externalId: "device:2", name: "dist-rtr-1", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] });
+    const ambiguousDevice = makeDevice({ externalId: "device:3", name: "acc-sw-1", endpoints: [{ kind: "ssh", host: "10.0.0.3" }] });
 
-    const moved = planFor({
+    const plan = planFor({
       source,
-      tree: makeTree([keptDevice()]),
-      currentServers: [makeKeptServer({ host: "10.9.9.9" })],
+      tree: makeTree([keptDevice(), movedDevice, ambiguousDevice]),
+      currentServers: [
+        // The candidate the question was about.
+        makeKeptServer(),
+        // Identity matches, address does not — re-IP'd while detached.
+        makeKeptServer({ id: "kept-2", name: "moved-rtr", host: "10.9.9.9", formerlySynced: keptMarker({ externalId: "device:2" }) }),
+        // Two markers naming one device at one address: Nexus refuses to guess.
+        makeKeptServer({ id: "kept-3a", name: "copy-a", host: "10.0.0.3", formerlySynced: keptMarker({ externalId: "device:3" }) }),
+        makeKeptServer({ id: "kept-3b", name: "copy-b", host: "10.0.0.3", formerlySynced: keptMarker({ externalId: "device:3" }) })
+      ],
       now: 1000,
       adoptionChoice: "decline"
     });
-    expect(moved.warnings.some((w) => w.includes("previously synced onto"))).toBe(false);
-    expect(moved.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([]);
 
-    const ambiguous = planFor({
-      source,
-      tree: makeTree([keptDevice()]),
-      currentServers: [makeKeptServer({ id: "kept-a", name: "copy-a" }), makeKeptServer({ id: "kept-b", name: "copy-b" })],
-      now: 1000,
-      adoptionChoice: "decline"
-    });
-    expect(ambiguous.warnings.some((w) => w.includes("cannot tell which to adopt"))).toBe(false);
-    // Only today's duplicate warning survives — declining changes what is SAID,
-    // never what is planned.
-    expect(ambiguous.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([
-      'Device "core-sw-1" matches existing server "copy-b" (lab-sw-01:22) — will be added as a duplicate.'
+    // The question named exactly one device, and it is the only one the answer
+    // speaks for: it is duplicated with no adoption commentary of its own.
+    expect(plan.adoptionCandidateNames).toEqual(["core-sw-1"]);
+    expect(plan.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([
+      'Device "core-sw-1" matches existing server "old-name" (lab-sw-01:22) — will be added as a duplicate.'
     ]);
-    expect(ambiguous.adds).toHaveLength(1);
-    expect(ambiguous.updates).toHaveLength(0);
-    expect(ambiguous.manualDuplicateCount).toBe(1);
+
+    // THE TWO ASSERTIONS THE FINDING TURNS ON. Pre-fix both of these were absent
+    // and both devices were added as duplicates with nothing anywhere saying
+    // why — the same silence the never-asked case was fixed for, reached by
+    // answering a question about a different device.
+    expect(plan.warnings).toContain(
+      'Device "dist-rtr-1" was previously synced onto server "moved-rtr", but that server is now at 10.9.9.9:22 and the device is at 10.0.0.2:22 — it will be added as a new server instead.'
+    );
+    expect(plan.warnings).toContain(
+      'Device "acc-sw-1" matches 2 servers kept from a removed inventory source at 10.0.0.3:22 — Nexus cannot tell which to adopt, so it will be added as a duplicate. Cancel, remove the extra copies, then sync again to adopt.'
+    );
+
+    // Declining changes what is SAID about the candidate, never what is planned:
+    // all three devices are added, no record changes ownership.
+    expect(plan.adds).toHaveLength(3);
+    expect(plan.updates).toHaveLength(0);
+    // Two of the three collide by address (the candidate's own record, and the
+    // ambiguous pair's); the re-addressed one does not, which is exactly why its
+    // refusal sentence is the only thing that can explain its duplicate.
+    expect(plan.manualDuplicateCount).toBe(2);
+  });
+
+  it("(E-2d) DECLINED and NEVER ASKED produce byte-identical warnings for the non-candidates (kills a partial suppression that merely narrows the per-plan flag: the two states differ to the CALLER, never to a device the question could not have been about)", () => {
+    const source = makeSource();
+    const movedDevice = makeDevice({ externalId: "device:2", name: "dist-rtr-1", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] });
+    const currentServers = [
+      makeKeptServer(),
+      makeKeptServer({ id: "kept-2", name: "moved-rtr", host: "10.9.9.9", formerlySynced: keptMarker({ externalId: "device:2" }) })
+    ];
+    const args = { source, tree: makeTree([keptDevice(), movedDevice]), currentServers, now: 1000 };
+
+    const declined = planFor({ ...args, adoptionChoice: "decline" });
+    const neverAsked = planFor(args);
+
+    expect(declined.warnings).toEqual(neverAsked.warnings);
+    expect(declined.warnings.some((w) => w.includes("dist-rtr-1"))).toBe(true);
   });
 
   it("(E-3) corroboration: the address must still match, host case-insensitively — a re-addressed kept server is not adopted, and the refusal says why (kills dropping the address check, and a one-sided lowercase)", () => {
@@ -2410,23 +2450,37 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(adopted.warnings.some((w) => w.includes("rather than this source's"))).toBe(false);
   });
 
-  it("(E-15h) DECLINED silences the instance refusals too, exactly like the other two (kills explaining adoption to the one user who has just decided against it)", () => {
+  it("(E-15h) DECLINED does NOT silence the instance refusals, exactly like the other two (kills suppressing them on the answer: a foreign-instance device is never a candidate, so the question the user answered could not have mentioned it)", () => {
     const source = makeSource({ providerId: "netbox" });
-    const kept = makeKeptServer({ formerlySynced: keptMarker({ instanceKey: INSTANCE_B }) });
+    // The run has to CONTAIN a candidate for `"decline"` to be reachable at all
+    // — the caller only asks when the plan reports one — so device:1 is a clean
+    // candidate and device:2's only marker is from the other deployment.
+    const foreignDevice = makeDevice({ externalId: "device:2", name: "dist-rtr-1", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] });
     const plan = planFor({
       source,
-      tree: makeTree([keptDevice()]),
-      currentServers: [kept],
+      tree: makeTree([keptDevice(), foreignDevice]),
+      currentServers: [
+        makeKeptServer(),
+        makeKeptServer({
+          id: "kept-2",
+          name: "theirs",
+          host: "10.0.0.2",
+          formerlySynced: keptMarker({ externalId: "device:2", instanceKey: INSTANCE_B })
+        })
+      ],
       now: 5000,
       providerInstanceKey: INSTANCE_A,
       adoptionChoice: "decline"
     });
 
-    expect(plan.warnings.some((w) => w.includes("rather than this source's"))).toBe(false);
+    expect(plan.adoptionCandidateNames).toEqual(["core-sw-1"]);
+    expect(plan.warnings).toContain(
+      `1 device matches a server kept from a removed inventory source of this provider, but that server was synced from "${INSTANCE_B}" rather than this source's "${INSTANCE_A}" — it will be added as a new server instead (e.g. "dist-rtr-1").`
+    );
     // Today's duplicate notice is unaffected — declining changes what is SAID
-    // about adoption, never what the sync plans.
+    // about the device it was asked about, never what the sync plans.
     expect(plan.warnings).toContain('Device "core-sw-1" matches existing server "old-name" (lab-sw-01:22) — will be added as a duplicate.');
-    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds).toHaveLength(2);
   });
 
   it("(E-8b) a marker naming a DIFFERENT device is never claimed (kills falling back to address matching when the externalId does not match)", () => {
@@ -2794,6 +2848,113 @@ describe("computeSyncPlan — adopt-on-add", () => {
       expect(rescuePlan.updates.every((u) => u.after.authProfileId === "p1")).toBe(true);
       expect(rescuePlan.warnings.some((w) => w.includes("uses private key authentication but has no key file"))).toBe(true);
       expect(rescuePlan.warnings.some((w) => w.includes("unlinked here so it can connect again"))).toBe(false);
+    });
+
+    it("REVIEW FINDING (P2) — a link the user cleared BEFORE the source was removed is still an opt-out after the adoption: the profile is not re-attached, and the record keeps the receipt that goes on refusing it (kills a retro-apply predicate that reads only `origin`, which sees an origin-less record with no link and calls it never-configured — the same clear made one step later is honoured forever)", () => {
+      const source = makeSource({ authProfileId: "p1" });
+      const passwordProfile: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
+
+      // THE RECORD "Keep Servers" LEAVES when the user cleared the link first:
+      // no `authProfileId`, and a marker still naming the profile the removed
+      // source's sync had applied. `username: "admin"` is makeSource()'s
+      // defaultUsername and is what makes this non-vacuous — every OTHER clause
+      // of retro-apply passes, so the marker is the only thing that can refuse
+      // it. With the record's own "labuser" the username clause would refuse on
+      // its own and this would go green against the unfixed predicate.
+      const optedOutBeforeRemoval = keptWithSourceAppliedProfile({
+        username: "admin",
+        authProfileId: undefined,
+        formerlySynced: keptMarker({ syncedAuthProfileId: "p1" })
+      });
+
+      const plan = planFor({
+        source,
+        tree: makeTree([keptDevice()]),
+        currentServers: [optedOutBeforeRemoval],
+        now: 5000,
+        authProfile: passwordProfile,
+        adoptionChoice: "adopt"
+      });
+
+      // The adoption itself still happens — the opt-out is about a credential,
+      // not about ownership.
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.id).toBe("kept-1");
+      expect(after.origin?.sourceId).toBe("source-1");
+
+      // THE ASSERTION THE FINDING TURNS ON: the profile is NOT put back.
+      expect(after.authProfileId).toBeUndefined();
+      // And the receipt survives into the origin, so the ordinary update path
+      // reads the same opt-out on every later run without the marker adoption
+      // has just spent.
+      expect(after.origin?.syncedAuthProfileId).toBe("p1");
+
+      // Proven, not assumed: feed the record this plan would persist back into
+      // the next sync and the link stays off.
+      const nextPlan = planFor({
+        source,
+        tree: makeTree([keptDevice()]),
+        currentServers: [after],
+        now: 6000,
+        authProfile: passwordProfile
+      });
+      expect(nextPlan.updates.every((u) => u.after.authProfileId === undefined)).toBe(true);
+    });
+
+    it("CONTROL — a kept server whose former source never applied a profile is NOT opted out: the adoption links the new source's profile as it always did (kills a 'fix' that refuses retro-apply on the mere presence of a marker, which would lock every ordinary kept server out of the credential the source exists to supply)", () => {
+      const source = makeSource({ authProfileId: "p1" });
+      const passwordProfile: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
+
+      // Identical to the fixture above in every respect except the one that
+      // matters: the marker carries no receipt, i.e. no sync ever put a profile
+      // on this record. Absent stamp and absent marker-stamp must keep reading
+      // the same way — "the sync never linked one here" — or backward compat
+      // with pre-field records breaks with it.
+      const neverLinked = keptWithSourceAppliedProfile({
+        username: "admin",
+        authProfileId: undefined,
+        formerlySynced: keptMarker()
+      });
+
+      const plan = planFor({
+        source,
+        tree: makeTree([keptDevice()]),
+        currentServers: [neverLinked],
+        now: 5000,
+        authProfile: passwordProfile,
+        adoptionChoice: "adopt"
+      });
+
+      expect(plan.updates).toHaveLength(1);
+      expect(plan.updates[0].after.authProfileId).toBe("p1");
+      expect(plan.updates[0].after.origin?.syncedAuthProfileId).toBe("p1");
+    });
+
+    it("CONTROL — an OWNED server's verdict is unchanged by a stray marker beside its origin (kills reading the marker as a fallback rather than only in the absence of an origin: a record carrying both is documented as inert, and a stale marker must not lock an owned server out of retro-apply)", () => {
+      const source = makeSource({ authProfileId: "p1" });
+      const passwordProfile: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
+
+      const ownedWithStrayMarker = makeOwnedServer({
+        username: "admin",
+        authType: "agent",
+        authProfileId: undefined,
+        // The origin says no sync ever linked a profile here...
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedInstanceKey: INSTANCE_A },
+        // ...while a leftover marker names one. The origin is the authority.
+        formerlySynced: keptMarker({ syncedAuthProfileId: "p1" })
+      });
+
+      const plan = planFor({
+        source,
+        tree: makeTree([makeDevice()]),
+        currentServers: [ownedWithStrayMarker],
+        now: 5000,
+        authProfile: passwordProfile
+      });
+
+      expect(plan.updates).toHaveLength(1);
+      expect(plan.updates[0].after.authProfileId).toBe("p1");
     });
 
     it("a cleared link on an ADOPTED server reads as the per-server opt-out it is, so the next sync does not reattach the profile (kills the stampless adoption's other consequence: the user's only workaround for the stranded server was undone on the following run)", () => {

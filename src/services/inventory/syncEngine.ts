@@ -37,12 +37,13 @@ export interface ComputeSyncPlanInput {
    * were keyed on the old boolean, so the two cases the CHANGELOG promises an
    * explanation for were exactly the two that got silence).
    *
-   * Undefined — nobody asked — is today's behavior field for field on the PLAN:
-   * every host:port collision renders the existing duplicate warning and
-   * increments `manualDuplicateCount`, and no record changes ownership. It is
-   * NOT bit-for-bit on `warnings`, deliberately: a marker that matched and could
-   * not be acted on is reported in that state (see the warnings at the end of
-   * the adoption block).
+   * Anything but `"adopt"` — declined, or nobody asked — is today's behavior
+   * field for field on the PLAN: every host:port collision renders the existing
+   * duplicate warning and increments `manualDuplicateCount`, and no record
+   * changes ownership. It is NOT bit-for-bit on `warnings`, deliberately: a
+   * marker that matched and could not be acted on is reported in every state
+   * (see the warnings at the end of the adoption block, and the REVIEW FINDING
+   * on `InventoryAdoptionChoice` for why declining does not silence them).
    *
    * The engine NEVER decides this for itself. Adoption hands an existing
    * record's whole lifecycle — its name, address, folder, and the source's
@@ -86,15 +87,26 @@ export interface ComputeSyncPlanInput {
  *    server beside it. See the eligibility rule in the device loop;
  *    `ServerConfig.formerlySynced` (models/config.ts) is the marker it reads.
  *  - `"decline"` — the user was asked and chose to add the devices separately.
- *  - `undefined` — the question was never put. Not a synonym for `"decline"`:
- *    the caller only asks when the plan reports at least one CANDIDATE (a
- *    device matching exactly one eligible kept server), so a run whose only
- *    marker matches are ambiguous or re-addressed never raises the question at
- *    all, and those are precisely the matches whose refusal has to explain
- *    itself. `"decline"` therefore suppresses that explanation and `undefined`
- *    does not — the user who has just answered the question does not need to be
- *    told what they answered it about, and the user who was never asked has no
- *    other way to find out why they got a duplicate.
+ *  - `undefined` — the question was never put.
+ *
+ * THE ENGINE ACTS ON `"adopt"` AND ONLY ON IT: `"decline"` and `undefined`
+ * produce identical plans, warnings included. Both values are still carried
+ * because the CALLER's states are genuinely different (dismissing the question
+ * aborts the run; declining proceeds to the preview), and a plan computed from
+ * the answer the user actually gave is the one the preview is allowed to render.
+ *
+ * REVIEW FINDING (P2, refusal warnings for non-candidates) — `"decline"` used to
+ * silence the ambiguity and moved-address refusals as well, on the reasoning
+ * that a user who has just answered the question does not need it explained back
+ * to them. That reasoning does not survive contact with the branch structure it
+ * was written for: the question counts and names CLEAN CANDIDATES ONLY, and a
+ * clean candidate takes the adoption branch, so the only devices those warnings
+ * were ever about are the ones the question never mentioned. A run carrying one
+ * clean candidate and one ambiguous or re-addressed match therefore turned an
+ * answer about the first into silence about the second, which is the same
+ * unexplained duplicate the never-asked case was fixed for. Declining is consent
+ * to duplicate the devices that were named; it is not consent to say nothing
+ * about the ones that were not.
  */
 export type InventoryAdoptionChoice = "adopt" | "decline";
 
@@ -188,6 +200,40 @@ function hasOwnKeyPath(server: ServerConfig): boolean {
 }
 
 /**
+ * AUTH 2 / REVIEW FINDING (P2, detached auth opt-outs) — "which profile did a
+ * SYNC last apply to this server?", asked of an owned server and of a kept one
+ * by the one function that can answer for both.
+ *
+ * WHAT THE ANSWER DECIDES. Beside a cleared `authProfileId`, a defined answer
+ * means the sync linked that profile and the USER took it off — the per-server
+ * opt-out — while `undefined` means no sync ever put a profile there, which is
+ * precisely the state retro-apply exists to fill. Nothing else can tell those
+ * two apart: both records carry no link at all.
+ *
+ * ONE FIELD PER RECORD SHAPE, AND NEVER BOTH. An owned server answers from its
+ * `origin` stamp; a kept server — which by definition has no origin — answers
+ * from the copy the detach preserved for exactly this reader
+ * (`DetachedServerOrigin.syncedAuthProfileId`, models/config.ts). The marker is
+ * consulted ONLY in the absence of an origin, which keeps the documented rule
+ * that a record carrying both is inert rather than dangerous: an origin-bearing
+ * server with a stale marker beside it answers from its origin, exactly as it
+ * did before this function existed.
+ *
+ * THE FINDING THIS CLOSES. Without the marker half, the opt-out survived the
+ * detach as data and died as behaviour. A user who cleared a sync-applied
+ * profile and THEN removed the source with Keep Servers had it silently
+ * re-attached by the adoption — the predicate saw an origin-less record with no
+ * link and read it as "never configured" — while the identical clear made after
+ * the adoption is respected on every later run. One decision, opposite outcomes,
+ * settled by which side of a source removal it happened to fall on. Preserving
+ * a receipt and then not reading it is the worst of both: the data says the user
+ * opted out and the code overwrites anyway.
+ */
+function lastSyncAppliedProfileId(server: ServerConfig): string | undefined {
+  return server.origin !== undefined ? server.origin.syncedAuthProfileId : server.formerlySynced?.syncedAuthProfileId;
+}
+
+/**
  * AUTH 2 — "is this server still EXACTLY what the add path stamps, so the
  * source's profile may be retro-applied to it?". The six clauses and the whole
  * safety argument behind each one live at the update path's call site inside
@@ -207,6 +253,15 @@ function hasOwnKeyPath(server: ServerConfig): boolean {
  * definition carries no origin at all — is compared against the source's
  * current default, which is the pre-stamp behavior and must never read as
  * "ineligible".
+ *
+ * REVIEW FINDING (P2, detached auth opt-outs) — the "did a sync link one here"
+ * clause reads `lastSyncAppliedProfileId`, not the origin stamp directly, so a
+ * kept server's answer comes from the receipt the detach preserved rather than
+ * from the origin it no longer has. That is the ONE clause an adoptee could
+ * previously never fail, and failing it is what makes an opt-out made before the
+ * source was removed mean the same thing as one made after. See that function
+ * for why absent-marker and absent-stamp must keep reading identically, and the
+ * adoption call site for what the restored stamp then does on the NEXT sync.
  */
 function qualifiesForSourceProfileRetroApply(
   server: ServerConfig,
@@ -217,7 +272,7 @@ function qualifiesForSourceProfileRetroApply(
   return (
     resolvedProfileId !== undefined &&
     server.authProfileId === undefined &&
-    server.origin?.syncedAuthProfileId === undefined &&
+    lastSyncAppliedProfileId(server) === undefined &&
     server.authType === "agent" &&
     !hasOwnKeyPath(server) &&
     server.username === stampedUsername
@@ -359,11 +414,10 @@ function pushSkipSummary(warnings: string[], reason: string, examples: string[])
  */
 export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan {
   const { source, tree, currentServers, now } = input;
-  // ADOPT 1 — the tri-state answer, split into the two questions the loop below
-  // actually asks of it. `adoptionDeclined` is NOT `!adoptKeptServers`: the
-  // third state (never asked) is false for both.
+  // ADOPT 1 — the one question the loop below asks of the answer. Declining and
+  // never having been asked are deliberately the same thing HERE (see
+  // `InventoryAdoptionChoice`): the two differ only to the caller.
   const adoptKeptServers = input.adoptionChoice === "adopt";
-  const adoptionDeclined = input.adoptionChoice === "decline";
   /** REVIEW FINDING (P1) — see `ComputeSyncPlanInput.providerInstanceKey` and `sameProviderInstance`. */
   const providerInstanceKey = input.providerInstanceKey;
   const warnings: string[] = [...(tree.warnings ?? [])];
@@ -1048,16 +1102,21 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // case.
     //
     // THE TWO REFUSAL WARNINGS at the end of this block (ambiguous, and moved
-    // address) fire in EVERY state except `"decline"` — REVIEW FINDING, and the
-    // reason `adoptionChoice` is a tri-state at all. They used to require the
-    // adopt flag, which cannot be set unless the question was asked, which the
-    // caller only asks when the plan reports a CANDIDATE — and neither refusal
-    // is a candidate. So the exact two shapes this copy was written for (the
-    // re-IP'd lab, the accidental second marker) were the two that produced a
-    // silent duplicate set. The two-marker state is reachable through this
-    // feature's own happy path: Keep Servers → re-add → Add Separately → apply →
-    // remove that source with Keep Servers again leaves two markers naming one
-    // device at one address.
+    // address) fire in EVERY state, whatever the answer — REVIEW FINDING, twice
+    // over. They first required the adopt flag, which cannot be set unless the
+    // question was asked, which the caller only asks when the plan reports a
+    // CANDIDATE — and neither refusal is a candidate. So the exact two shapes
+    // this copy was written for (the re-IP'd lab, the accidental second marker)
+    // were the two that produced a silent duplicate set. The narrower repair
+    // that followed — fire unless the user DECLINED — kept the same defect for
+    // the same reason one layer down (REVIEW FINDING, P2): the question names
+    // clean candidates only, and a clean candidate never reaches these branches,
+    // so declining could only ever silence devices the user was told nothing
+    // about. A run with one clean candidate beside one ambiguous match is the
+    // whole of it, and it is ordinary. The two-marker state is reachable through
+    // this feature's own happy path: Keep Servers → re-add → Add Separately →
+    // apply → remove that source with Keep Servers again leaves two markers
+    // naming one device at one address.
     const keptMatches = keptByExternalId.get(device.externalId) ?? [];
     const eligibleForAdoption = keptMatches.filter((s) => s.host.toLowerCase() === endpoint.host.toLowerCase() && s.port === port);
 
@@ -1220,10 +1279,25 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // AUTH 2 on an adoptee, deliberately allowed. Blocking it for one sync
         // would only move the same disclosed switch to the next run — the server
         // is owned from here on, so the ordinary update path would fire the
-        // identical retro-apply next time. Both origin reads inside the
-        // predicate are `undefined` for a kept server, so it degrades to exactly
-        // the legacy-server case: agent auth, no key of its own, no link, and a
-        // username still equal to the source's default.
+        // identical retro-apply next time. A kept server has no origin, so the
+        // username clause falls back to the source's current default and the
+        // record degrades to the legacy-server case: agent auth, no key of its
+        // own, no link, and a username the source still recognises.
+        //
+        // REVIEW FINDING (P2, detached auth opt-outs) — WITH ONE CLAUSE THAT AN
+        // ADOPTEE CAN NOW FAIL. `lastSyncAppliedProfileId` reads the marker when
+        // there is no origin, so a kept server whose sync-applied profile the
+        // user CLEARED before the source was removed is refused here, exactly as
+        // the same record would be refused on every run after an adoption. The
+        // preview's disclosure is not a substitute for that: it says a profile is
+        // being applied, never that applying it reverses a choice the user made
+        // months ago and has not been reminded of.
+        //
+        // A record refused here is left in the shape that keeps refusing it: the
+        // link stays off, and `adoptionOrigin.syncedAuthProfileId` above has
+        // already restored the receipt, so the ordinary update path reads the
+        // opt-out from the origin on the next sync without needing the marker
+        // that adoption spends.
         if (qualifiesForSourceProfileRetroApply(adoptee, resolvedProfileId, source.defaultUsername)) {
           after.authProfileId = resolvedProfileId;
           after.origin = { ...adoptionOrigin, syncedAuthProfileId: resolvedProfileId };
@@ -1258,7 +1332,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // describing an add that is not happening.
         continue;
       }
-    } else if (!adoptionDeclined && eligibleForAdoption.length >= 2) {
+    } else if (eligibleForAdoption.length >= 2) {
       // AMBIGUITY — adopt NEITHER. Records at one endpoint can differ in every
       // credential the endpoint does not show, so picking "the first in array
       // order" would be a guess about which one the user considers canonical.
@@ -1274,7 +1348,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       warnings.push(
         `Device "${device.name}" matches ${eligibleForAdoption.length} servers kept from a removed inventory source at ${endpoint.host}:${port} — Nexus cannot tell which to adopt, so it will be added as a duplicate. Cancel, remove the extra copies, then sync again to adopt.`
       );
-    } else if (!adoptionDeclined && keptMatches.length > 0) {
+    } else if (keptMatches.length > 0) {
       // Identity matched, address did not. Without this the user sees a silent
       // duplicate and concludes adoption is broken; with it, the refusal states
       // its own reason and the repair is obvious (the addresses are both named).
@@ -1283,7 +1357,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           ? `Device "${device.name}" was previously synced onto server "${keptMatches[0].name}", but that server is now at ${keptMatches[0].host}:${keptMatches[0].port} and the device is at ${endpoint.host}:${port} — it will be added as a new server instead.`
           : `Device "${device.name}" was previously synced onto ${keptMatches.length} servers in your list, none of which is still at ${endpoint.host}:${port} — it will be added as a new server instead.`
       );
-    } else if (!adoptionDeclined) {
+    } else {
       // REVIEW FINDING (P1, cross-instance adoption) — LAST in the chain, and
       // that position is the rule: a device with an eligible marker (adopted,
       // ambiguous, or re-addressed) has already been decided and explained by
@@ -1340,9 +1414,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // the very record the device came from, and the user reaching it has just
     // asked for a separate add and is not going to get one. Saying "unrelated"
     // here would be false about the server AND useless about the outcome. Fired
-    // regardless of `adoptionDeclined`, unlike the adoption REFUSAL warnings
-    // above: this is not an explanation of adoption, it is the only notice that
-    // this device produced nothing at all.
+    // whatever the answer, like every other refusal in this block: this one is
+    // not even an explanation of adoption, it is the only notice that this device
+    // produced nothing at all.
     if (collidingServer !== undefined) {
       warnings.push(
         `Device "${device.name}" (${device.externalId}) was previously synced onto server "${collidingServer.name}", which still uses the id a new server for this device would need — so it is skipped rather than added separately. Sync again and choose Adopt Existing to reclaim that server.`
@@ -1514,9 +1588,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // REVIEW FINDING (P1, cross-instance adoption) — the refusals, aggregated.
   // Placed with the other summaries, and BEFORE them so the sentence about
   // records that already exist precedes the ones about devices that were
-  // skipped. Both are silent when nothing was refused, and both stay silent on a
-  // `"decline"` run for the reason the other adoption refusals do: the user who
-  // has just chosen Add Separately does not need adoption explained to them.
+  // skipped. Both are silent when nothing was refused, and both speak whatever
+  // the adoption answer was, for the reason the other refusals in that block do
+  // (REVIEW FINDING, P2): a device refused on instance identity is never a
+  // candidate, so the question the user answered never mentioned it.
   if (instanceMismatchDeviceNames.length > 0) {
     const n = instanceMismatchDeviceNames.length;
     // Distinct recorded instances, capped like every other example list here.
