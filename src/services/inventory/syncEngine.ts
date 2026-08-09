@@ -1,10 +1,20 @@
 import type { AuthProfile, DetachedServerOrigin, ServerConfig, ServerOrigin } from "../../models/config";
-import { authProfileNeedsServerKeyPath, serverOriginStampsEqual } from "../../models/config";
+import { authProfileNeedsServerKeyPath, proxyConfigsEqual, serverOriginStampsEqual } from "../../models/config";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../models/inventory";
+import type { DeviceTemplateProfile } from "../../models/deviceTemplate";
 import type { InventorySyncApplication } from "../../core/nexusCore";
 import { normalizeFolderPath } from "../../utils/folderPaths";
 import { isAddressValue } from "../profileTokens";
 import { deterministicServerId } from "./deterministicId";
+import {
+  applyTemplateMatrix,
+  composeDesiredFields,
+  computeProfilesNeedingServerKey,
+  decideTemplateAuthWrite,
+  selectFieldWinners,
+  type DesiredNonAuthFields,
+  type ProfilesNeedingServerKey
+} from "./templateApply";
 
 export const ORPHAN_FOLDER_NAME = "_orphaned";
 
@@ -77,6 +87,26 @@ export interface ComputeSyncPlanInput {
    * the provider id — is the defect this input exists to remove.
    */
   providerInstanceKey?: string;
+  /**
+   * DEVICE TEMPLATES (issue #48 PR-T1) — every `DeviceTemplateProfile` this
+   * source's rules might reference, resolved by the caller (the engine is pure
+   * and has no core access, same as `authProfile`). Optional: a caller with no
+   * templates, or a source with no rules, passes none and the engine behaves
+   * bit-for-bit as before.
+   */
+  templatesById?: Map<string, DeviceTemplateProfile>;
+  /**
+   * DEVICE TEMPLATES (PR-T1) — the WHOLE auth-profile store (rev3), a superset
+   * of `authProfile` (which stays for the source-level slot). The unusable
+   * -profile scan can name a profile reachable only through a RETAINED link on
+   * an owned server (§4.4), and a profile missing from this map would read as
+   * "usable" by omission. The store is a handful of records; passing all of it
+   * is cheaper and safer than passing exactly enough. Optional for legacy
+   * callers — term (a) of the scan still names the source keyless profile from
+   * `authProfile`, so the shipped single-id behaviour is preserved when this is
+   * absent.
+   */
+  authProfilesById?: Map<string, AuthProfile>;
 }
 
 /**
@@ -407,52 +437,6 @@ function lastSyncAppliedProfileId(server: ServerConfig): string | undefined {
 }
 
 /**
- * AUTH 2 — "is this server still EXACTLY what the add path stamps, so the
- * source's profile may be retro-applied to it?". The six clauses and the whole
- * safety argument behind each one live at the update path's call site inside
- * `computeSyncPlan`; that comment block is the authority and is not repeated
- * here.
- *
- * EXTRACTED (ADOPT 1) because the adoption branch asks the same question of an
- * adoptee, and the one thing this rule cannot survive is its two halves
- * drifting — the exact precedent `decideSourceAuthRollback` sets for AUTH 2b,
- * and the reason `hasOwnKeyPath` is already shared between them. Two copies of
- * six clauses is two answers to one question, and a server admitted by one and
- * refused by the other is a server whose link nobody can explain.
- *
- * `defaultUsername` is a parameter rather than a source field read inside, so
- * the FALLBACK stays visible at both call sites: a server carrying no
- * `syncedUsername` stamp — a legacy synced server, or a kept server, which by
- * definition carries no origin at all — is compared against the source's
- * current default, which is the pre-stamp behavior and must never read as
- * "ineligible".
- *
- * REVIEW FINDING (P2, detached auth opt-outs) — the "did a sync link one here"
- * clause reads `lastSyncAppliedProfileId`, not the origin stamp directly, so a
- * kept server's answer comes from the receipt the detach preserved rather than
- * from the origin it no longer has. That is the ONE clause an adoptee could
- * previously never fail, and failing it is what makes an opt-out made before the
- * source was removed mean the same thing as one made after. See that function
- * for why absent-marker and absent-stamp must keep reading identically, and the
- * adoption call site for what the restored stamp then does on the NEXT sync.
- */
-function qualifiesForSourceProfileRetroApply(
-  server: ServerConfig,
-  resolvedProfileId: string | undefined,
-  defaultUsername: string
-): boolean {
-  const stampedUsername = server.origin?.syncedUsername ?? defaultUsername;
-  return (
-    resolvedProfileId !== undefined &&
-    server.authProfileId === undefined &&
-    lastSyncAppliedProfileId(server) === undefined &&
-    server.authType === "agent" &&
-    !hasOwnKeyPath(server) &&
-    server.username === stampedUsername
-  );
-}
-
-/**
  * AUTH 2b — what this sync must do about ONE owned server's link to a profile
  * that can no longer honour it. Three outcomes, and the two that are not "none"
  * are both reportable: `unlink` is what the sync DID, `retain-own-key` is what
@@ -470,10 +454,16 @@ function qualifiesForSourceProfileRetroApply(
  * shared with retro-apply for exactly that reason (a server unlinked by one rule
  * and refused a re-link by another is unlinked forever).
  *
+ * DEVICE TEMPLATES (PR-T1 / A-M2) — the single `unusableProfileId` widened to a
+ * SET (`unusableProfileIds`), so a link applied by a RULE TEMPLATE or by a
+ * RETAINED link (whose rule is gone) is rolled back too, not only the
+ * source-level profile. Membership selects which servers are examined; the
+ * per-server `hasOwnKeyPath` split (`retain-own-key` vs `unlink`) is unchanged.
+ *
  * The clauses, and what each refuses to touch:
- *  - `unusableProfileId !== undefined`: only the keyless-key case. A DELETED
- *    profile never reaches here — NexusCore.removeAuthProfile already clears link
- *    and stamp together — and a healthy profile has nothing to undo.
+ *  - `unusableProfileIds.has(server.authProfileId)`: only the keyless-key case.
+ *    A DELETED profile never reaches here — NexusCore.removeAuthProfile already
+ *    clears link and stamp together — and a healthy profile is not in the set.
  *  - `authProfileId === id && origin.syncedAuthProfileId === id`: the link is
  *    THIS SYNC'S OWN, still exactly as it wrote it. A hand-set link carries no
  *    matching stamp and is not the sync's to clear (the same opt-out rule
@@ -493,12 +483,9 @@ function qualifiesForSourceProfileRetroApply(
  */
 type SourceAuthRollback = "unlink" | "retain-own-key" | "none";
 
-function decideSourceAuthRollback(server: ServerConfig, unusableProfileId: string | undefined): SourceAuthRollback {
-  if (
-    unusableProfileId === undefined ||
-    server.authProfileId !== unusableProfileId ||
-    server.origin?.syncedAuthProfileId !== unusableProfileId
-  ) {
+function decideSourceAuthRollback(server: ServerConfig, unusableProfileIds: ReadonlySet<string>): SourceAuthRollback {
+  const id = server.authProfileId;
+  if (id === undefined || !unusableProfileIds.has(id) || server.origin?.syncedAuthProfileId !== id) {
     return "none";
   }
   return hasOwnKeyPath(server) ? "retain-own-key" : "unlink";
@@ -653,10 +640,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const keylessKeyProfile = matchedProfile !== undefined && authProfileNeedsServerKeyPath(matchedProfile);
   const resolvedProfileId = keylessKeyProfile ? undefined : matchedProfile?.id;
   // AUTH 1c (REVIEW FINDING, P1) — the id whose SOURCE-APPLIED links this plan
-  // must UNDO, and `undefined` whenever there is nothing to undo. See
-  // `decideSourceAuthRollback` for the per-server rule and why it is scoped this
-  // narrowly.
-  const unusableProfileId = keylessKeyProfile ? matchedProfile?.id : undefined;
+  // must UNDO. DEVICE TEMPLATES (PR-T1 / A-M2): this single id is now one term of
+  // the widened `profilesNeedingServerKey` set (built by the pre-pass below,
+  // term (a)), which both rollback passes consume; the source keyless id is
+  // recovered for the source-level warning as `sourceUnusableId` at composition
+  // time. See `decideSourceAuthRollback` for the per-server rule.
   // The warning below is composed here (where the reason is known) but pushed
   // AFTER both rollback passes, because its closing sentences have to state how
   // many servers this sync actually unlinked and how many it deliberately left
@@ -666,19 +654,106 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const authWarningIndex = warnings.length;
   const emitAuthWarning = source.authProfileId !== undefined && resolvedProfileId === undefined;
 
+  // DEVICE TEMPLATES (issue #48 PR-T1) — the per-field cascade, resolved ONCE.
+  // In T1 it is degenerate on filters (no matcher), so every catch-all rule
+  // matches every device and the winners are device-independent; the filtered
+  // -rule fail-closed skip and dangling-template warnings are emitted here, once
+  // per rule. `source.authProfileId` enters as the implicit specificity −1 fill
+  // candidate, so PR #53's behaviour falls out unchanged when no explicit rule
+  // sets the field.
+  const cascade = selectFieldWinners(source.templateRules ?? [], source.authProfileId, input.templatesById, source.name);
+  for (const w of cascade.warnings) {
+    warnings.push(w);
+  }
+  // §5.3 proxy jump-host resolution set — the OPTIMISTIC first pass (FIX 2, PR
+  // #61 Codex review). This set names every id that COULD exist after the sync:
+  // the current servers plus the deterministic ids of every device this fetch
+  // carries. It admits a reference that WON'T actually survive — an owned jump
+  // host this plan prunes under `delete`, or a device row skipped below for an
+  // invalid endpoint / port / id collision — so it is NOT the authoritative
+  // dangling check. Its job is narrower and still needed: a `jumpHostId` outside
+  // even this optimistic set can NEVER resolve (it names nothing this sync knows
+  // about), so composition drops such a proxy to "desired none" HERE, which is
+  // what gives §4.3 row-5 carry — an existing sync-owned proxy is kept instead of
+  // being clobbered by a never-resolvable one (fixture 32). The AUTHORITATIVE
+  // check against the definitive post-plan SURVIVOR set (current minus prunes,
+  // plus adds, plus adopted ids) runs after the device loop, because prune and
+  // per-device skip decisions are only known once the loop has run; it drops the
+  // references this optimistic set over-admitted. The two are mutually exclusive
+  // by construction — a ref this set rejects never reaches the survivor pass
+  // (its desired is already none), and a ref this set admits is the only kind the
+  // survivor pass re-examines — so no proxy is warned about twice.
+  const liveServerIds = new Set(currentServers.map((s) => s.id));
+  for (const device of tree.devices) {
+    liveServerIds.add(deterministicServerId(source.id, device.externalId));
+  }
+  // Compose the non-auth desired fields (§4.2 layer 2) once; applied by the
+  // §4.3 matrix on both the add and update paths. A never-resolvable jump-host
+  // proxy is dropped to "desired none" here (device-independent) with one plan
+  // warning; a merely non-surviving one is caught by the post-plan pass instead.
+  const composed = composeDesiredFields(cascade.winners, {
+    hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
+    proxyTemplateName: cascade.proxyTemplateName,
+    sourceName: source.name
+  });
+  const desiredNonAuth: DesiredNonAuthFields = composed.desired;
+  for (const w of composed.warnings) {
+    warnings.push(w);
+  }
+  // Resolve the auth winner against the WHOLE profile store (falling back to
+  // the source's own `matchedProfile` for legacy callers that pass no map, so
+  // the implicit rule always resolves). A dangling winner drops the field:
+  // the implicit-source dangle is already covered by `emitAuthWarning`; an
+  // explicit-rule dangle gets its own skip warning.
+  const resolveAuthProfileById = (id: string): AuthProfile | undefined =>
+    input.authProfilesById?.get(id) ?? (matchedProfile?.id === id ? matchedProfile : undefined);
+  const authWinnerField = cascade.winners.authProfileId;
+  const winnerProfile = authWinnerField !== undefined ? resolveAuthProfileById(authWinnerField.value) : undefined;
+  if (authWinnerField !== undefined && winnerProfile === undefined && !cascade.authFromImplicit) {
+    warnings.push(
+      `A device template rule on "${source.name}" links an auth profile that no longer exists — the auth field was skipped.`
+    );
+  }
+  // The winner used for WRITES: dropped when it dangles. The add/fill row-1
+  // write additionally drops a keyless winner (blanket per-profile refusal),
+  // exactly like the source path zeroes a keyless key profile.
+  const effectiveAuthWinner =
+    authWinnerField !== undefined && winnerProfile !== undefined
+      ? { mode: authWinnerField.mode, profileId: authWinnerField.value }
+      : undefined;
+  const winnerKeyless = winnerProfile !== undefined && authProfileNeedsServerKeyPath(winnerProfile);
+  const winnerResolvedId = effectiveAuthWinner !== undefined && !winnerKeyless ? effectiveAuthWinner.profileId : undefined;
+
   const adds: ServerConfig[] = [];
   const updates: Array<{ before: ServerConfig; after: ServerConfig }> = [];
   const prunes: InventorySyncPlan["prunes"] = [];
   let unchangedCount = 0;
-  /** AUTH 2b — how many source-applied links this plan UNDOES (see `decideSourceAuthRollback`). */
-  let clearedLinkCount = 0;
   /**
-   * AUTH 2b — how many source-applied links this plan deliberately LEAVES IN
-   * PLACE because the server brings its own key file (REVIEW FINDING, P2). Those
-   * servers go on using the profile, so the warning must not describe them as
-   * having no key and falling back to SSH agent authentication.
+   * Codex round 4 (P2) — the ids of owned servers that actually reached the
+   * `unchangedCount++` site (the mapped-update no-change branch, the sole
+   * incrementer — adoption is always an update, never counted). The
+   * survivor-cleanup promotion loop below reaches ANY owned server not already
+   * planned — including one whose device was SKIPPED before that branch (no
+   * usable endpoint / invalid port) and so was never counted — and must
+   * decrement `unchangedCount` ONLY for servers this set records as counted;
+   * an unconditional decrement understates the count or drives it negative.
    */
-  let retainedOwnKeyLinkCount = 0;
+  const unchangedServerIds = new Set<string>();
+  /**
+   * AUTH 2b — per-profile counts of the links this plan UNDOES / deliberately
+   * LEAVES in place (the server brings its own key file). Keyed by profile id so
+   * the source-level warning and the referrer-specific template/retained-link
+   * warnings each report only their own profile's servers (§4.4). The warning
+   * must not describe a retained server as having no key and falling back to SSH
+   * agent authentication.
+   */
+  const unlinkedByProfile = new Map<string, number>();
+  const retainedByProfile = new Map<string, number>();
+  /** §4.4 rev7 — servers whose OVERRIDE MOVE onto a keyless profile was refused per target (no own key), by profile id → names. */
+  const overrideRefusedByProfile = new Map<string, string[]>();
+  const bump = (map: Map<string, number>, id: string): void => {
+    map.set(id, (map.get(id) ?? 0) + 1);
+  };
   const folderSet = new Set<string>();
 
   const serversById = new Map(currentServers.map((s) => [s.id, s] as const));
@@ -700,6 +775,23 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
     ownedByExternalId.set(externalId, server);
   }
+
+  // DEVICE TEMPLATES (PR-T1 / §4.4) — the widened unusable-profile set, built by
+  // a PRE-PASS over the owned servers BEFORE the device loop (never during it:
+  // the mapped rollback runs inside the loop and would read a half-built,
+  // order-dependent set). Supersedes the single source-derived id: it also names
+  // every rule-template-referenced keyless profile and every keyless profile
+  // reachable only through a RETAINED sync-owned link. `matchedProfile` is passed
+  // as term (a)'s source profile PRE-1b-zeroing, so a keyless source profile is
+  // named here even though it is refused a fresh stamp above.
+  const profilesNeedingServerKey: ProfilesNeedingServerKey = computeProfilesNeedingServerKey({
+    source,
+    ownedServers: [...ownedByExternalId.values()],
+    sourceProfile: matchedProfile,
+    templatesById: input.templatesById,
+    authProfilesById: input.authProfilesById
+  });
+  const unusableProfileIds = profilesNeedingServerKey.ids;
 
   // F5: manual (non-owned-by-this-source) servers indexed by host:port, so a
   // planned add that collides with a hand-added server is flagged — Phase 1
@@ -948,6 +1040,30 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // `syncOwnsIpmiHost` for the write rule and the whole matrix.
       const takesIpmiHost =
         mgmtHost !== undefined && syncOwnsIpmiHost(ownedServer.ipmiHost, ownedServer.origin?.syncedIpmiHost, mgmtHost);
+      // DEVICE TEMPLATES (PR-T1) — the §4.3 matrix for the four non-auth fields.
+      // `templateMatrix.templated` is the carried-forward stamp record with the
+      // written fields updated (the one-line `templated:` carry-forward
+      // load-bearing §5.2 regression lives here — it must go INTO the origin
+      // literal, like every other stamp, since the auth branches below rebuild
+      // the origin). `templateMatrix.values` are the field writes for `after`.
+      //
+      // FIX 3 (PR #61 Codex review) — the §5.3 self-reference check inside the
+      // matrix compares `proxy.jumpHostId` against `targetServerId`, which must be
+      // the id the RECORD carries — `ownedServer.id` — NOT the computed
+      // deterministic `id`. The two DIVERGE for an owned server that entered with
+      // a preserved id (an adoptee kept its id, or an ID-preserving imported
+      // record): passing `id` would let a template proxy whose `jumpHostId ===
+      // ownedServer.id` route the server through itself and go uncaught. The add
+      // path (~2018) is correct with `id` because a fresh record's id IS the
+      // computed `id`; the adoption path uses `adoptee.id`, same reasoning.
+      const templateMatrix = applyTemplateMatrix(ownedServer, desiredNonAuth, {
+        targetServerId: ownedServer.id,
+        targetServerName: device.name,
+        proxyTemplateName: cascade.proxyTemplateName
+      });
+      for (const w of templateMatrix.warnings) {
+        warnings.push(w);
+      }
       const afterOrigin: ServerOrigin = {
         sourceId: source.id,
         externalId: device.externalId,
@@ -1011,7 +1127,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // erase the user's cleared-value opt-out (matrix row 2) and let the very
         // next sync refill the field they emptied. Carried forward as
         // `undefined` too, which is what keeps a Phase-1 hand entry hands-off.
-        syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedServer.origin?.syncedIpmiHost
+        syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedServer.origin?.syncedIpmiHost,
+        // DEVICE TEMPLATES (PR-T1) — the per-field template stamps, carried
+        // forward with this run's writes already folded in by the matrix above.
+        // The one-line carry-forward the whole feature turns on (§5.2 / fixture
+        // 11): an update fired for an unrelated reason rebuilds this literal from
+        // scratch, and a rebuild that dropped this member would erase the fleet's
+        // template ownership.
+        templated: templateMatrix.templated
       };
       const after: ServerConfig = {
         ...ownedServer,
@@ -1019,8 +1142,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         host: endpoint.host,
         port,
         group,
+        ...templateMatrix.values,
         origin: afterOrigin
       };
+      // §5.3 REPAIR — the matrix found a TEMPLATE-OWNED self-proxy already on the
+      // record and asks for its removal (a value the connect-time circular guard
+      // refuses, cleared rather than carried, mirroring the survivor cleanup).
+      // The stamp is already dropped (matrix omitted `templated.proxy`), so the
+      // `changed` comparison sees both the proxy removal and the stamp change.
+      if (templateMatrix.clearProxy) {
+        delete after.proxy;
+      }
       if (endpoint.username !== undefined) {
         after.username = endpoint.username;
       }
@@ -1168,18 +1300,34 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // it or retro-apply stops matching its own output.
       //
       // The six clauses (and the `stampedUsername` fallback the paragraphs above
-      // argue for) live in `qualifiesForSourceProfileRetroApply` at the top of
-      // this file, because the ADOPT 1 branch below asks the same question of a
-      // kept server and the two must not be able to answer it differently. The
-      // reasoning stays HERE, where the rule is applied to the population it was
-      // written about; the function carries only a pointer back to it.
-      if (qualifiesForSourceProfileRetroApply(ownedServer, resolvedProfileId, source.defaultUsername)) {
-        after.authProfileId = resolvedProfileId;
-        // The stamp is written HERE and only here on the update path, in the same
-        // breath as the link itself — that is what makes a LATER clear of this
-        // link visible to the next sync as an opt-out instead of reading as
-        // "never linked" and being reattached forever.
-        after.origin = { ...afterOrigin, syncedAuthProfileId: resolvedProfileId };
+      // argue for) live in `authFillEligible` (services/inventory/templateApply.ts),
+      // because the ADOPT 1 branch below asks the same question of a kept server —
+      // it runs the SAME `decideTemplateAuthWrite` as of round 3 — and the two must
+      // not be able to answer it differently. The reasoning stays HERE, where the
+      // rule is applied to the population it was written about.
+      //
+      // DEVICE TEMPLATES (PR-T1) — this retro-apply is now the FILL branch of the
+      // general cascade auth write: the winning candidate is the implicit
+      // source-level rule (fill) when no explicit rule sets `authProfileId`, so
+      // when there are no template rules this is bit-for-bit the shipped
+      // behaviour. `decideTemplateAuthWrite` folds in the override MOVE (rows 3/4,
+      // per-target usability) and the fill write-once mode gate; the six-clause
+      // fill eligibility is the `authFillEligible` predicate it delegates to.
+      const authDecision = decideTemplateAuthWrite(ownedServer, effectiveAuthWinner, winnerProfile, source.defaultUsername);
+      if (authDecision.kind === "write") {
+        after.authProfileId = authDecision.profileId;
+        // The stamp is written HERE, in the same breath as the link itself —
+        // that is what makes a LATER clear of this link visible to the next sync
+        // as an opt-out instead of reading as "never linked" and being
+        // reattached forever. `{ ...afterOrigin }` preserves the template stamps.
+        after.origin = { ...afterOrigin, syncedAuthProfileId: authDecision.profileId };
+      } else if (authDecision.kind === "skip-usability") {
+        // §4.4 rev7 — an OVERRIDE move onto a keyless key profile the target
+        // cannot satisfy (no own key). The link stays put and un-re-stamped; the
+        // plan names the profile and the reason after both rollback passes.
+        const names = overrideRefusedByProfile.get(authDecision.profileId) ?? [];
+        names.push(ownedServer.name);
+        overrideRefusedByProfile.set(authDecision.profileId, names);
       }
 
       // AUTH 2b (REVIEW FINDING, P1) — RETRO-UNAPPLY, for the servers this run
@@ -1233,17 +1381,26 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // PRUNED is out of the sync's active set by the policy the user chose —
       // "keep in place" and "move to _orphaned" both mean stop reconfiguring it —
       // and a "delete" prune removes it outright.
-      const mappedRollback = decideSourceAuthRollback(ownedServer, unusableProfileId);
-      if (mappedRollback === "unlink") {
+      //
+      // DEVICE TEMPLATES (PR-T1) — decided on `after` (the post-template-write
+      // link), not `ownedServer`: an override rule that just moved this server's
+      // link to a USABLE profile must not then be second-guessed by a rollback
+      // reading the pre-move link. `after` and `ownedServer` differ here only
+      // when a template auth write fired, and that write only lands a usable
+      // link, so the two agree in every shipped-behaviour case. The set is the
+      // widened `profilesNeedingServerKey` (source + template + retained links).
+      const rolledBackProfileId = after.authProfileId;
+      const mappedRollback = decideSourceAuthRollback(after, unusableProfileIds);
+      if (mappedRollback === "unlink" && rolledBackProfileId !== undefined) {
         after.authProfileId = undefined;
         // The stamp goes with the link it describes — leaving it behind would
         // read as a per-server opt-out nobody chose and lock the server out of
         // retro-apply forever, which is exactly the reasoning removeAuthProfile
         // applies when a deleted profile's links are cleared.
         after.origin = { ...afterOrigin, syncedAuthProfileId: undefined };
-        clearedLinkCount++;
-      } else if (mappedRollback === "retain-own-key") {
-        retainedOwnKeyLinkCount++;
+        bump(unlinkedByProfile, rolledBackProfileId);
+      } else if (mappedRollback === "retain-own-key" && rolledBackProfileId !== undefined) {
+        bump(retainedByProfile, rolledBackProfileId);
       }
 
       // AUTH 3 — authProfileId joins the comparison because a retro-apply stamp
@@ -1281,6 +1438,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // The value clause is kept beside it because it states the plainly-visible
       // half of the change (rows 1 and 3) and does not depend on the stamp
       // comparator's membership list staying correct.
+      //
+      // DEVICE TEMPLATES (PR-T1) — the four non-auth template value fields join
+      // the comparison, because the matrix can now change any of them on an
+      // otherwise-unchanged device; the origin half (the `templated` stamps)
+      // rides in on the `serverOriginStampsEqual` line, which — like the AUTH 3a
+      // shape — can be the ONLY difference between `before` and `after` (a
+      // template first attaching, or a stamp-only re-record).
       const changed =
         ownedServer.name !== after.name ||
         ownedServer.host !== after.host ||
@@ -1288,6 +1452,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.group !== after.group ||
         ownedServer.authProfileId !== after.authProfileId ||
         ownedServer.ipmiHost !== after.ipmiHost ||
+        !proxyConfigsEqual(ownedServer.proxy, after.proxy) ||
+        ownedServer.multiplexing !== after.multiplexing ||
+        ownedServer.legacyAlgorithms !== after.legacyAlgorithms ||
+        ownedServer.logSession !== after.logSession ||
         !serverOriginStampsEqual(ownedServer.origin, after.origin) ||
         (endpoint.username !== undefined && ownedServer.username !== after.username);
       if (changed) {
@@ -1297,6 +1465,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         }
       } else {
         unchangedCount++;
+        unchangedServerIds.add(ownedServer.id);
       }
       continue;
     }
@@ -1545,6 +1714,52 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const takesIpmiHost =
           mgmtHost !== undefined &&
           syncOwnsIpmiHost(adoptee.ipmiHost, adoptee.formerlySynced?.syncedIpmiHost, mgmtHost);
+        // FIX 1 (PR #61 Codex review) — APPLY THE TEMPLATE MATRIX ON ADOPTION,
+        // mirroring the update path (~1071). An adopted server is OWNED from this
+        // point (the same principle the `endpoint.username` and OOB writes below
+        // invoke, and the design's "implicit source rule IS the lowest template
+        // rule" — source-auth already retro-applies at adoption, so the rest of
+        // the cascade must too). Deferring the non-auth writes would leave the
+        // adopted server usable with stale proxy/booleans for one whole sync until
+        // the next run's update path applies the identical write.
+        //
+        // `targetServerId: adoptee.id` — the adoptee keeps its own id through
+        // adoption, so the §5.3 self-reference check judges the proxy against the
+        // record's real id (this is Fix 3's rule on the adoption path). The stamp
+        // (`matrix.templated`) goes INTO `adoptionOrigin` below, because the auth
+        // branch rebuilds the origin as `{ ...adoptionOrigin, syncedAuthProfileId }`
+        // and would silently discard anything stamped onto `after.origin` after the
+        // literal — exactly the discipline the OOB/AUTH stamps already follow here.
+        // FIX A (PR #61 Codex review round 2) — RESTORE `origin.templated` from
+        // the marker BEFORE the matrix runs. The matrix reads ownership off
+        // `ownedServer.origin?.templated` (the `carried` baseline), but a kept
+        // server has no `origin` at all, so without this every template-managed
+        // field would read as `cur set, stamp absent` → row 7 (hand-owned) and an
+        // override template could never reclaim or re-stamp it — the auth/OOB
+        // receipts closed that failure for their fields, `templated` reopens it
+        // for the non-auth ones unless restored here. Feed a synthetic origin
+        // carrying only the receipt's `templated` (the sole member the matrix
+        // reads from `origin`); the matrix then composes its this-run writes ON
+        // TOP of this restored baseline, carrying forward the fields it does not
+        // write (a fill winner leaves a configured field; a field the template no
+        // longer sets keeps its old stamp). Restored VERBATIM — a marker carrying
+        // none yields the unchanged adoptee, bit-identical to a server no template
+        // ever touched. No clone needed on this READ-ONLY input: the matrix
+        // deep-copies `carried` into its own result, so the receipt is never
+        // aliased into `adoptionOrigin.templated`.
+        const restoredTemplated = adoptee.formerlySynced?.templated;
+        const adopteeForMatrix: ServerConfig =
+          restoredTemplated !== undefined
+            ? { ...adoptee, origin: { sourceId: source.id, externalId: device.externalId, syncedAt: now, templated: restoredTemplated } }
+            : adoptee;
+        const templateMatrix = applyTemplateMatrix(adopteeForMatrix, desiredNonAuth, {
+          targetServerId: adoptee.id,
+          targetServerName: device.name,
+          proxyTemplateName: cascade.proxyTemplateName
+        });
+        for (const w of templateMatrix.warnings) {
+          warnings.push(w);
+        }
         const adoptionOrigin: ServerOrigin = {
           sourceId: source.id,
           externalId: device.externalId,
@@ -1632,7 +1847,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // brought with it is left alone (row 5) with no stamp invented for it,
           // and a device offering no OOB endpoint at all touches neither (row 6,
           // the `mgmtHost !== undefined` guard) — the receipt simply carries.
-          syncedIpmiHost: takesIpmiHost ? mgmtHost : adoptee.formerlySynced?.syncedIpmiHost
+          syncedIpmiHost: takesIpmiHost ? mgmtHost : adoptee.formerlySynced?.syncedIpmiHost,
+          // FIX 1 — the per-field template stamps for the non-auth fields the
+          // matrix above wrote onto this adoptee, folded into the origin literal
+          // so the auth-branch rebuild (`{ ...adoptionOrigin, syncedAuthProfileId }`)
+          // preserves them, exactly as the update path folds `templateMatrix.templated`
+          // into `afterOrigin`. Undefined when the source has no proxy/boolean
+          // template winner (the shipped no-template case), which `toEqual` reads
+          // as absent.
+          templated: templateMatrix.templated
         };
         const after: ServerConfig = {
           ...adoptee,
@@ -1642,6 +1865,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           host: endpoint.host,
           port,
           group,
+          // FIX 1 — the non-auth template field VALUES (proxy / multiplexing /
+          // legacyAlgorithms / logSession) the matrix resolved for this adoptee.
+          // AFTER `...adoptee` so a template write overrides the spread; a field
+          // the matrix left alone (rows 2/4/5/6/7) is absent here and the spread's
+          // value stands.
+          ...templateMatrix.values,
           origin: adoptionOrigin,
           // MUTUALLY EXCLUSIVE WITH `origin` — and EXPLICIT, because the spread
           // above would otherwise carry the marker onto a now-owned server. A
@@ -1650,6 +1879,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // by the next source of the same provider.
           formerlySynced: undefined
         };
+        // §5.3 REPAIR — an adopted server whose restored receipt carried a
+        // template-owned self-proxy is repaired at adoption, same as the update
+        // path: the matrix dropped the stamp and asks the caller to remove the
+        // record's `proxy` field (a value the connect-time circular guard refuses).
+        if (templateMatrix.clearProxy) {
+          delete after.proxy;
+        }
         // The ONE field outside the source's four that adoption may overwrite,
         // and the only place the "it keeps its saved credentials" copy could
         // ever fall short (REVIEW FINDING). Kept as-is deliberately, for the
@@ -1703,9 +1939,62 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // already restored the receipt, so the ordinary update path reads the
         // opt-out from the origin on the next sync without needing the marker
         // that adoption spends.
-        if (qualifiesForSourceProfileRetroApply(adoptee, resolvedProfileId, source.defaultUsername)) {
-          after.authProfileId = resolvedProfileId;
-          after.origin = { ...adoptionOrigin, syncedAuthProfileId: resolvedProfileId };
+        //
+        // FIX 1 (PR #61 Codex review) / FIX A (round 3) — adoption now runs the
+        // FULL auth matrix (FILL + the OVERRIDE MOVE), through the very same
+        // `decideTemplateAuthWrite` the update path uses (~1344), instead of the
+        // fill-only `qualifiesForSourceProfileRetroApply`. Round 2's restore of the
+        // receipt into `adoptionOrigin.syncedAuthProfileId` (above) is what makes
+        // the override move REACHABLE here: an adoptee that arrives still carrying
+        // the link A a removed source applied is now PROVABLY sync-owned
+        // (`authProfileId === origin.syncedAuthProfileId`, both naming A once the
+        // stamp is restored), so an OVERRIDE template winner naming a different
+        // profile B MOVES A→B at adoption (rows 3/4) exactly as the update path
+        // does — no longer left at A until the next sync. This is the auth twin of
+        // round 2's non-auth restore, which already lets an override winner reclaim
+        // proxy/booleans on adoption; the auth link was simply the one still on the
+        // fill-only path. An earlier revision of this comment asserted the move was
+        // "structurally unreachable because the adoptee has NO origin" — that
+        // premise was true BEFORE the round-2 restore and is now FALSE.
+        //
+        // The decision reads its ownership fields off an adoption VIEW, `{ ...adoptee,
+        // origin: adoptionOrigin }` — the retained link plus the restored stamps — so
+        // both the override move's `origin.syncedAuthProfileId === authProfileId`
+        // check and the FILL baseline (`origin.syncedUsername ?? source.defaultUsername`,
+        // which for every shipped provider — no endpoint username — is exactly the
+        // `defaultUsername` the fill-only call passed before) read the receipt rather
+        // than a missing origin. `winnerProfile` / `effectiveAuthWinner` are the same
+        // inputs the update path consumes, so the gates match it exactly: the FILL
+        // write drops a keyless winner per profile (blanket), while the OVERRIDE move
+        // gates PER TARGET via `authLinkUsableForTarget` (§4.4 rev7) — a keyless B
+        // still links an adoptee bringing its own key, and is refused (with the plan
+        // warning) for one that cannot. Semantics that fall out (verify, don't
+        // reimplement): override B over a sync-owned link A → move + re-stamp (THE
+        // FIX); fill winner over a never-configured server → link (six clauses); fill
+        // winner over a configured link → left (write-once); a hand link (stamp absent
+        // or ≠ cur) → left even by override (rows 6/7); a user-cleared link (row-2
+        // opt-out) → not re-linked by fill, override the deliberate way past.
+        //
+        // The write + re-stamp land in `after.origin`, rebuilt from `adoptionOrigin`
+        // so the round-2 non-auth `templated` stamp folded into it is preserved (not
+        // clobbered); a `leave`/`skip-usability` keeps `after.origin === adoptionOrigin`,
+        // which already carries the restored auth stamp. This is the ONLY change to
+        // the adoption auth path: the AUTH 2b rollback below is still NOT run here and
+        // its one-sync deferral is UNCHANGED and still correct — that deferral note now
+        // governs only the rollback, never this override move, which fires THIS run.
+        const adoptionAuthView: ServerConfig = { ...adoptee, origin: adoptionOrigin };
+        const authDecision = decideTemplateAuthWrite(adoptionAuthView, effectiveAuthWinner, winnerProfile, source.defaultUsername);
+        if (authDecision.kind === "write") {
+          after.authProfileId = authDecision.profileId;
+          after.origin = { ...adoptionOrigin, syncedAuthProfileId: authDecision.profileId };
+        } else if (authDecision.kind === "skip-usability") {
+          // §4.4 rev7 — an OVERRIDE move onto a keyless key profile this adoptee
+          // cannot satisfy (no own key). The link stays at A and the restored stamp
+          // stands; the same post-loop pass (`overrideRefusedByProfile`) names the
+          // profile and the reason, exactly as it does for the update path.
+          const names = overrideRefusedByProfile.get(authDecision.profileId) ?? [];
+          names.push(device.name);
+          overrideRefusedByProfile.set(authDecision.profileId, names);
         }
         // No `changed` comparison, unlike the owned-update path above: gaining
         // `origin` guarantees before !== after, so an adoption is ALWAYS an
@@ -1836,6 +2125,20 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       manualDuplicateCount++;
     }
 
+    // DEVICE TEMPLATES (PR-T1) — a fresh record is unset in every field, so every
+    // desired non-auth field is matrix row 1 (write + stamp, both modes); the
+    // link is the cascade winner's keyless-dropped id (§4.5: fresh device → write
+    // T + stamp, there is nothing to override yet). `winnerResolvedId` equals the
+    // source's own `resolvedProfileId` when no explicit rule sets auth, so a
+    // template-less sync adds exactly the record it did before.
+    const addMatrix = applyTemplateMatrix(undefined, desiredNonAuth, {
+      targetServerId: id,
+      targetServerName: device.name,
+      proxyTemplateName: cascade.proxyTemplateName
+    });
+    for (const w of addMatrix.warnings) {
+      warnings.push(w);
+    }
     adds.push({
       id,
       name: device.name,
@@ -1848,12 +2151,16 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // server it owns; a copy taken here would rot the moment the profile
       // changed. `authType: "agent"` above stays inert while the link holds and
       // is the exact fallback if the profile is later deleted, which is why it
-      // is still stamped unconditionally. Undefined when the source has no
-      // profile or its reference is dangling (AUTH 1) — the pre-feature record,
+      // is still stamped unconditionally. Undefined when the source/winner has no
+      // profile or its reference is dangling/keyless — the pre-feature record,
       // field for field.
-      authProfileId: resolvedProfileId,
+      authProfileId: winnerResolvedId,
       isHidden: false,
       group,
+      // DEVICE TEMPLATES (PR-T1) — the non-auth template field VALUES (proxy,
+      // multiplexing, legacyAlgorithms, logSession) this fresh record starts
+      // with; absent when the template sets none of them.
+      ...addMatrix.values,
       // OOB — the device's out-of-band address, or `undefined` when it supplies
       // none. A new record has nothing to protect, so there is no matrix here:
       // whatever this fetch offers is what the field starts as, and the stamp
@@ -1887,7 +2194,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // detach copies THIS value into the marker rather than re-deriving one.
         syncedInstanceKey: providerInstanceKey,
         syncedUsername: endpoint.username ?? source.defaultUsername,
-        syncedAuthProfileId: resolvedProfileId,
+        syncedAuthProfileId: winnerResolvedId,
         // Mirrors the `ipmiHost` written above, and recorded UNCONDITIONALLY —
         // `undefined` included — on the same "a source whose devices gain an
         // address later must find the stamps already there" argument the two
@@ -1895,7 +2202,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // stamp is matrix row 1 (fill it in) rather than row 5 (hands off),
         // which is the right state for a server the user has never typed into:
         // an add that supplies no address must not be mistaken for a hand entry.
-        syncedIpmiHost: mgmtHost
+        syncedIpmiHost: mgmtHost,
+        // DEVICE TEMPLATES (PR-T1) — the template stamps for the non-auth fields
+        // written above (row 1), so every LATER sync has the ownership question
+        // already answered. Absent when the template set none of them.
+        templated: addMatrix.templated
       }
     });
     if (group !== undefined) {
@@ -1941,12 +2252,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     if (decidedOwnedExternalIds.has(externalId) || !presentExternalIds.has(externalId)) {
       continue;
     }
-    const unmappedRollback = decideSourceAuthRollback(ownedServer, unusableProfileId);
+    const unmappedRollback = decideSourceAuthRollback(ownedServer, unusableProfileIds);
+    const unmappedProfileId = ownedServer.authProfileId;
     if (unmappedRollback === "retain-own-key") {
-      retainedOwnKeyLinkCount++;
+      if (unmappedProfileId !== undefined) {
+        bump(retainedByProfile, unmappedProfileId);
+      }
       continue;
     }
-    if (unmappedRollback !== "unlink") {
+    if (unmappedRollback !== "unlink" || unmappedProfileId === undefined) {
       continue;
     }
     // Straight into `updates`, so this unlink is disclosed by the same machinery
@@ -1961,7 +2275,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // ignores it), and the unlink does not repeat next sync — the link it keys on
     // is gone.
     updates.push({ before: ownedServer, after: withSourceLinkCleared(ownedServer) });
-    clearedLinkCount++;
+    bump(unlinkedByProfile, unmappedProfileId);
   }
 
   if (emitAuthWarning) {
@@ -1977,6 +2291,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // fact unable to connect at all. Spliced (not pushed) so the position among
     // the other warnings is exactly what it was before the count made the text
     // depend on the loop.
+    // DEVICE TEMPLATES (PR-T1) — the counts are now PER PROFILE: the source
+    // warning reports only servers unlinked from / retained on the SOURCE
+    // profile, so a template- or retained-link-referenced keyless profile does
+    // not inflate this sentence (those get their own referrer-specific warnings
+    // below). When the source profile is the only unusable one — the shipped
+    // case — these equal the totals and the wording is bit-for-bit unchanged.
+    const sourceUnusableId = keylessKeyProfile ? matchedProfile?.id : undefined;
+    const clearedLinkCount = sourceUnusableId !== undefined ? (unlinkedByProfile.get(sourceUnusableId) ?? 0) : 0;
+    const retainedOwnKeyLinkCount = sourceUnusableId !== undefined ? (retainedByProfile.get(sourceUnusableId) ?? 0) : 0;
     const clearedNote =
       clearedLinkCount > 0
         ? ` ${clearedLinkCount} server${clearedLinkCount === 1 ? "" : "s"} this sync had already linked to it ${clearedLinkCount === 1 ? "is" : "are"} unlinked here so ${clearedLinkCount === 1 ? "it can connect" : "they can connect"} again; a later sync re-links ${clearedLinkCount === 1 ? "it" : "them"} once the profile has a key file.`
@@ -2001,6 +2324,53 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       keylessKeyProfile && matchedProfile !== undefined
         ? `The auth profile "${matchedProfile.name}" for "${source.name}" uses private key authentication but has no key file — servers this source creates have no key of their own, so the sync does not apply it: they use the default username with SSH agent authentication instead. Add a key file to the profile, or choose another.${clearedNote}${retainedNote}`
         : `The auth profile for "${source.name}" no longer exists — synced servers use the default username with SSH agent authentication. Edit the source to choose another profile.`
+    );
+  }
+
+  // DEVICE TEMPLATES (PR-T1, §4.4 rev7) — referrer-specific AUTH 2b warnings for
+  // every keyless profile OTHER than the source's own (which the block above
+  // covers). Each names its referrer — a device TEMPLATE, or a RETAINED link an
+  // earlier sync applied whose rule is now gone (the case where nothing in the
+  // current config explains why the server was linked) — so the repair points at
+  // the right editor. Silent unless this sync actually unlinked or retained on
+  // that profile.
+  const linkNote = (unlinked: number, retained: number): string => {
+    const cleared =
+      unlinked > 0
+        ? ` ${unlinked} server${unlinked === 1 ? "" : "s"} this sync had already linked to it ${unlinked === 1 ? "is" : "are"} unlinked here so ${unlinked === 1 ? "it can connect" : "they can connect"} again; a later sync re-links ${unlinked === 1 ? "it" : "them"} once the profile has a key file.`
+        : "";
+    const retain =
+      retained > 0
+        ? ` ${retained} server${retained === 1 ? "" : "s"} this sync had already linked to it ${retained === 1 ? "keeps" : "keep"} the link, because ${retained === 1 ? "it carries a key file of its own" : "they carry key files of their own"} and still ${retained === 1 ? "connects" : "connect"} through the profile.`
+        : "";
+    return `${cleared}${retain}`;
+  };
+  for (const [id, ref] of profilesNeedingServerKey.referrer.entries()) {
+    if (ref.kind === "source") {
+      continue; // handled by the emitAuthWarning block above
+    }
+    const unlinked = unlinkedByProfile.get(id) ?? 0;
+    const retained = retainedByProfile.get(id) ?? 0;
+    if (unlinked === 0 && retained === 0) {
+      continue;
+    }
+    const profileName = resolveAuthProfileById(id)?.name ?? id;
+    if (ref.kind === "template") {
+      warnings.push(
+        `The auth profile "${profileName}" applied by a device template rule on "${source.name}" uses private key authentication but has no key file.${linkNote(unlinked, retained)}`
+      );
+    } else {
+      warnings.push(
+        `The auth profile "${profileName}" — linked to one or more servers by an earlier sync whose device template rule is no longer configured — uses private key authentication but has no key file.${linkNote(unlinked, retained)}`
+      );
+    }
+  }
+  // §4.4 rev7 — an OVERRIDE move refused per target (the profile needs a key file
+  // the server does not have). Names the profile and the servers left unchanged.
+  for (const [id, names] of overrideRefusedByProfile.entries()) {
+    const profileName = resolveAuthProfileById(id)?.name ?? id;
+    warnings.push(
+      `A device template would apply the auth profile "${profileName}" to ${namedExamples(names)}, but it uses private key authentication and has no key file while ${names.length === 1 ? "that server brings" : "those servers bring"} no key of their own — ${names.length === 1 ? "its link was" : "their links were"} left unchanged.`
     );
   }
 
@@ -2097,6 +2467,391 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
 
   if (source.targetFolder) {
     folderSet.add(source.targetFolder);
+  }
+
+  // FIX 2 (PR #61 Codex review) — POST-PLAN jump-host survivor validation. The
+  // §5.3 dangling check that ran during composition used the OPTIMISTIC
+  // `liveServerIds`, which admits a jump host this plan prunes under `delete`
+  // policy or a device the loop skipped — so the plan could write a template
+  // proxy pointing at a server that will NOT exist after apply. The definitive
+  // survivor set is only knowable HERE, once prune and per-device skip decisions
+  // are all made.
+  //
+  // SURVIVORS — the ids that exist after apply, read off the plan structures
+  // `planToApplication` itself consumes: `prunes` with `policy: "delete"` are the
+  // only servers actually removed (orphan/keep survive in place, and are re-added
+  // to `upsertServers`), so a current server survives unless it is a delete-prune;
+  // every `adds[].id` is a fresh survivor; and an ADOPTED server is a kept server
+  // already in `currentServers` that this run turned into an update, never a
+  // prune, so its id is already covered by "current minus deletes" — listed in
+  // the comment for completeness, needing no separate collection.
+  const deletedServerIds = new Set(prunes.filter((p) => p.policy === "delete").map((p) => p.server.id));
+  const survivorIds = new Set<string>();
+  for (const s of currentServers) {
+    if (!deletedServerIds.has(s.id)) {
+      survivorIds.add(s.id);
+    }
+  }
+  for (const a of adds) {
+    survivorIds.add(a.id);
+  }
+  // Only THIS run's template proxy is re-validated. `desiredNonAuth.proxy` is the
+  // single (device-independent, T1) proxy winner this run's cascade produced; if
+  // there is none, no field the template wrote this run can dangle, so a proxy an
+  // earlier run's template left behind (§6.3 retained, row-5 carry) is left
+  // entirely alone. When it IS an ssh reference whose jump host is not a survivor,
+  // walk `adds` and the `updates` afters and drop it from every record the
+  // template actually OWNS this run — guarded on the record's `origin.templated.proxy`
+  // stamp matching the written proxy, so a hand-set or previously-stamped proxy
+  // the template did not touch is never disturbed. Dropping means the field goes
+  // ABSENT (never a written `undefined`), and the stamp goes with it so the record
+  // and its ownership receipt stay consistent. The self-reference case is handled
+  // inline per-device (the jump host is the record itself, hence a survivor).
+  const desiredProxy = desiredNonAuth.proxy;
+  if (desiredProxy !== undefined && desiredProxy.value.type === "ssh" && !survivorIds.has(desiredProxy.value.jumpHostId)) {
+    const danglingJumpHostId = desiredProxy.value.jumpHostId;
+    let droppedAny = false;
+    // Codex round 6 (P1) — REJECT the late-discovered-invalid winner the way the
+    // composition-time rejection does (§5.3 / §4.3 row 5, "desired none → keep
+    // existing"): RESTORE the pre-matrix proxy + stamp, NOT delete to absent. The
+    // composition dangling check ran against the OPTIMISTIC `liveServerIds`, which
+    // admitted a jump host B this plan later prunes or skips; the matrix then
+    // performed a row-3 override MOVE of a working template-owned proxy A → B and
+    // stamped B. Deleting B to absent here (the round-2 code) would strip a
+    // previously-working proxy from EVERY matching server — a fleet-wide
+    // regression. So mirror composition: on a dangling winner `composeDesiredFields`
+    // leaves `desired.proxy` unset, and the matrix then carries the EXISTING
+    // sync-owned proxy A forward (row 5). The pre-matrix state is `before` — A on an
+    // override move (updates), and NOTHING on a row-1 write (adds). An add therefore
+    // still drops to absent (nothing to restore); an update restores A + A's stamp.
+    const rejectTemplateProxy = (after: ServerConfig, before: ServerConfig | undefined): boolean => {
+      const p = after.proxy;
+      const stampedProxy = after.origin?.templated?.proxy;
+      if (
+        p === undefined ||
+        p.type !== "ssh" ||
+        p.jumpHostId !== danglingJumpHostId ||
+        stampedProxy === undefined ||
+        !proxyConfigsEqual(p, stampedProxy)
+      ) {
+        return false; // not a proxy THIS run's template wrote/owns on this record — leave alone
+      }
+      const priorProxy = before?.proxy; // pre-matrix value: A on a row-3 override move, undefined on a row-1 add
+      const priorStamp = before?.origin?.templated?.proxy;
+      if (priorProxy !== undefined) {
+        after.proxy = { ...priorProxy }; // restore A (row 5 carry) — never delete a previously-working proxy
+      } else {
+        delete after.proxy; // row-1 write had nothing prior → absent (never a written `undefined`)
+      }
+      // The stamp follows the restored value: A's stamp on restore, cleared on
+      // delete — so the record and its ownership receipt stay consistent either way.
+      const origin = after.origin;
+      if (origin?.templated !== undefined) {
+        const templated = { ...origin.templated };
+        if (priorStamp !== undefined) {
+          templated.proxy = { ...priorStamp };
+        } else {
+          delete templated.proxy;
+        }
+        // `templated.proxy` joins the presence test now that this pass can RESTORE
+        // it: on a restore the stamp record must survive (it carries A's proxy
+        // stamp), where the round-2 delete-only path could omit it (proxy always
+        // gone). On the delete branch `templated.proxy` is undefined and drops out.
+        const stillStamped =
+          templated.proxy !== undefined ||
+          templated.multiplexing !== undefined ||
+          templated.legacyAlgorithms !== undefined ||
+          templated.logSession !== undefined;
+        after.origin = { ...origin, templated: stillStamped ? templated : undefined };
+      }
+      return true;
+    };
+    for (const a of adds) {
+      if (rejectTemplateProxy(a, undefined)) {
+        droppedAny = true;
+      }
+    }
+    // Codex round 4/6 — NO-OP COLLAPSE (keep the plan counts exact). Restoring A can
+    // revert an update whose ONLY change was the proxy A→B, making `after`
+    // byte-equal to `before`. That update is now a genuine no-op: remove it from
+    // `updates` and count the server UNCHANGED — the same count bookkeeping as the
+    // round-4 promotion decrement, run in the other direction. If OTHER fields also
+    // changed this run the update is KEPT (proxy restored to A, other changes
+    // intact) and the count is left alone. `unchangedServerIds` is updated so the
+    // later promotion loop's decrement gate stays coherent for a collapsed server.
+    const updateStillChanged = (before: ServerConfig, after: ServerConfig): boolean =>
+      before.name !== after.name ||
+      before.host !== after.host ||
+      before.port !== after.port ||
+      before.group !== after.group ||
+      before.authProfileId !== after.authProfileId ||
+      before.ipmiHost !== after.ipmiHost ||
+      !proxyConfigsEqual(before.proxy, after.proxy) ||
+      before.multiplexing !== after.multiplexing ||
+      before.legacyAlgorithms !== after.legacyAlgorithms ||
+      before.logSession !== after.logSession ||
+      !serverOriginStampsEqual(before.origin, after.origin) ||
+      before.username !== after.username;
+    const collapsedIds = new Set<string>();
+    for (const u of updates) {
+      if (rejectTemplateProxy(u.after, u.before)) {
+        droppedAny = true;
+        if (!updateStillChanged(u.before, u.after)) {
+          collapsedIds.add(u.before.id);
+        }
+      }
+    }
+    if (collapsedIds.size > 0) {
+      for (let i = updates.length - 1; i >= 0; i--) {
+        if (collapsedIds.has(updates[i].before.id)) {
+          const [removed] = updates.splice(i, 1);
+          unchangedCount++;
+          unchangedServerIds.add(removed.before.id);
+        }
+      }
+    }
+    if (droppedAny) {
+      // Wording covers both dispositions honestly: an add loses the proxy, while an
+      // update may KEEP its previous proxy A (only the template's NEW proxy B was
+      // rejected). "The template's new proxy was not applied" is true for both.
+      warnings.push(
+        `Device template "${cascade.proxyTemplateName ?? "?"}" on "${source.name}" sets a jump-host proxy whose jump host will not survive this sync (it is being pruned, or its device was skipped) — the template's new proxy was not applied.`
+      );
+    }
+  }
+
+  // FIX B (PR #61 Codex review round 2) — the survivor pass above (round 6's
+  // part 1) only ever inspects THIS RUN's desired proxy on `adds` + `updates`
+  // afters, so it misses two template-owned dangling proxies whose jump host is
+  // delete-pruned in the SAME plan:
+  //  - an UNCHANGED server (round 2): desired proxy equals its current value and
+  //    no other field changes, so it is counted UNCHANGED and is absent from both
+  //    arrays; and
+  //  - the ROUND 7 GAP: an ALREADY-UPDATED server that RETAINS a template-owned
+  //    proxy (§6.3 row-5 carry — its rule was removed, so value + stamp are kept)
+  //    while also getting an UNRELATED change this run (a rename, an endpoint
+  //    move). Part 1 never looked at the retained proxy (it is not this run's
+  //    desired proxy, and may name a different jump host).
+  //  - the ROUND 9 GAP: an ADOPTION update carrying the same retained dangling or
+  //    self proxy. An adoption is built from `keptByExternalId` and pushed to
+  //    `updates`, never entering `ownedByExternalId` — so a prior iteration over
+  //    the owned map skipped it and the adopted server shipped a broken proxy.
+  //
+  // ROUND 9 UNIFICATION — rather than patch the iteration source a 5th time, this
+  // pass now iterates the plan's EFFECTIVE post-apply records directly (see the
+  // PART 2a / PART 2b blocks below): every `updates` entry's `after` (the union
+  // that already holds owned AND adoption updates), plus every owned/kept server
+  // in none of adds/updates/prunes (the unplanned set). Any future record source
+  // is covered by construction. It cleans the dangling/self retained proxy on the
+  // EFFECTIVE record: the `updates` entry's `after` when the server is already
+  // being updated (cleaned IN PLACE), else the unplanned owned/kept server
+  // (promoted to a new update). Either way the proxy field goes ABSENT and its
+  // `templated.proxy` stamp is cleared, so record and ownership receipt stay
+  // consistent.
+  //
+  // WHY A DROP, NOT A ROUND-6 RESTORE. Round 6 (part 1) RESTORES the pre-matrix
+  // proxy A because a row-3 override MOVE clobbered a still-working proxy and A is
+  // the value to fall back to. A RETAINED proxy has no such fallback: its rule is
+  // gone, the stamped value IS the dangling jump host, and there is no prior
+  // working value beneath it — so absent is the repair, identical to the
+  // unchanged-server promotion and to composition-time §4.3 handling.
+  //
+  // SCOPE, strictly (§8.4): a TEMPLATE-STAMPED proxy only — `cur.proxy` present,
+  // `type:"ssh"`, and `proxyConfigsEqual(cur.proxy, record.origin.templated.proxy)`
+  // so the sync still OWNS it (`cur === stamp`). A HAND-SET proxy (stamp absent or
+  // ≠) pointing at a pruned jump host — or at itself — is LEFT ALONE — §8.4's
+  // deliberate "no sweep on prune" posture — even on a server this run renames.
+  //
+  // INVALID = jump host is a NON-SURVIVOR **or** the jump host is the record's OWN
+  // id (ROUND 8). The record's own id IS a survivor (it is owned, not a delete
+  // -prune), so a plain survivor test would treat a self-proxy as valid and retain
+  // it forever — but a RETAINED self-proxy no current rule wins is exactly the
+  // §5.3 circular reference the connect-time guard refuses. Round 5's MATRIX repair
+  // (composition time, `clearProxy`) only fires when there IS a desired proxy this
+  // run; this pass additionally cleans the NO-winner retained self case, on both
+  // dispositions below. The self-ref case is ALWAYS a drop (a self-proxy has no
+  // valid value to restore, the same as a dangling one).
+  //
+  // DISPOSITION, realized by the two iterations below (no double-handling):
+  //  - UPDATE (part 2a, iterate `updates`): clean the proxy on that `after` IN
+  //    PLACE — no promotion, no new update. Do NOT touch `unchangedCount`: the
+  //    server was already an update, and the round-4 decrement gate only concerns
+  //    promotions of servers that were counted unchanged. Adoption updates are
+  //    caught HERE (round 9), since they live in `updates`.
+  //  - PRUNE / ADD: skipped by the unplanned set's `plannedServerIds` filter — a
+  //    delete-prune must never be resurrected as an update (keep/orphan handled in
+  //    its own branch), and a fresh add has no retained proxy (its this-run proxy
+  //    was validated by round 6 / part 1).
+  //  - NOT PLANNED (part 2b): promote to a NEW update dropping the proxy, with the
+  //    round-4 `unchangedServerIds` decrement gate (a device SKIPPED this fetch
+  //    reaches here without ever hitting `unchangedCount++`, so an unconditional
+  //    decrement would understate the count or drive it negative).
+  //
+  // COMPOSITION WITH ROUND 6 (no double-handling, no double-warning): part 1 runs
+  // FIRST and only when `desiredNonAuth.proxy` is itself the dangling reference;
+  // after it, an update's `after.proxy` for the this-run-desired case is either a
+  // survivor (row-5 carry) or absent, so this pass sees no dangling proxy there
+  // and skips. It only catches proxies part 1 didn't look at (retained ones, a
+  // different jump host). If a round-6 restore left a STILL-dangling prior proxy A
+  // (A itself pruned), this pass correctly drops it — belt-and-suspenders — and
+  // warnings are deduped by server + jump host so a single drop is never announced
+  // twice.
+  //
+  // COMPOSITION WITH ROUND 5 (the with-winner self case, no double-handling): the
+  // matrix's `clearProxy` (composition time) has already deleted `after.proxy` and
+  // dropped its stamp for a server whose DESIRED proxy self-references, so this
+  // pass sees `cur === undefined` on that record and skips. Part 2 only reaches a
+  // self-proxy that NO current rule sets (a retained §6.3 carry). Together the two
+  // now cover the whole proxy-cleanup surface: {dangling, self} × {this-run
+  // -written, retained} × {add, update-in-place, unplanned-promote, unchanged} —
+  // write-time round 6 + with-winner round-5 self repair for the this-run-written
+  // column, this survivor pass (post-plan dangling + retained-self repair) for the
+  // retained column.
+  const prunedServerIds = new Set<string>();
+  for (const pr of prunes) {
+    prunedServerIds.add(pr.server.id);
+  }
+  const addedServerIds = new Set<string>();
+  for (const a of adds) {
+    addedServerIds.add(a.id);
+  }
+  // Drops the template-owned proxy off a record: the field goes ABSENT (never a
+  // written `undefined`) and the `templated.proxy` stamp is cleared, so the record
+  // and its ownership receipt stay consistent. The remaining templated stamps
+  // decide whether `templated` survives at all.
+  const dropTemplateProxy = (record: ServerConfig): ServerConfig => {
+    const origin = record.origin!;
+    const templated = origin.templated !== undefined ? { ...origin.templated } : {};
+    delete templated.proxy;
+    const stillStamped =
+      templated.multiplexing !== undefined || templated.legacyAlgorithms !== undefined || templated.logSession !== undefined;
+    const { proxy: _droppedProxy, ...withoutProxy } = record;
+    return { ...withoutProxy, origin: { ...origin, templated: stillStamped ? templated : undefined } };
+  };
+  // ROUND 9 (UNIFICATION) — the single predicate every record source now shares:
+  // is a record's EFFECTIVE proxy an INVALID template-OWNED ssh proxy this pass
+  // must clean? Both the §8.4 scope (template-STAMPED only —
+  // `proxyConfigsEqual(cur, stamp)`, so `cur === stamp` and the sync still OWNS
+  // it; a hand-set proxy is left alone) and the §5.3 self-ref-is-a-drop rule live
+  // here so no iteration source can diverge. INVALID = the jump host is a
+  // NON-survivor OR the jump host is the record's OWN id (a retained self-proxy
+  // no rule now sets — the circular reference the connect-time guard refuses).
+  // The record's own id is itself a survivor (owned/kept, not a delete-prune), so
+  // `!==` excludes self from the survivor skip; without it a self-proxy would read
+  // as valid and be retained forever. Returns the self flag for the warning
+  // wording, or undefined when there is nothing to clean.
+  const invalidTemplateProxy = (record: ServerConfig): { self: boolean; jumpHostId: string } | undefined => {
+    const cur = record.proxy;
+    const stampedProxy = record.origin?.templated?.proxy;
+    if (
+      cur === undefined ||
+      cur.type !== "ssh" ||
+      stampedProxy === undefined ||
+      !proxyConfigsEqual(cur, stampedProxy) || // §8.4 — template-stamped proxies only; a hand proxy is left alone
+      (cur.jumpHostId !== record.id && survivorIds.has(cur.jumpHostId))
+    ) {
+      return undefined;
+    }
+    return { self: cur.jumpHostId === record.id, jumpHostId: cur.jumpHostId };
+  };
+  const warnedRetainedProxyKeys = new Set<string>();
+  const warnRetainedProxy = (record: ServerConfig, self: boolean, jumpHostId: string): void => {
+    // Dedupe by server + jump host so a single drop is never announced twice,
+    // including across composition with part 1 / round 6.
+    const warnKey = `${record.id}::${jumpHostId}`;
+    if (warnedRetainedProxyKeys.has(warnKey)) {
+      return;
+    }
+    warnedRetainedProxyKeys.add(warnKey);
+    warnings.push(
+      self
+        ? `Server "${record.name}" on "${source.name}" carries a device-template jump-host proxy that points at itself (a circular proxy no rule now sets) — the proxy field was removed.`
+        : `Server "${record.name}" on "${source.name}" carries a device-template jump-host proxy whose jump host will not survive this sync (it is being pruned) — the proxy field was removed.`
+    );
+  };
+
+  // PART 2 (round 9 UNIFICATION) — iterate the plan's EFFECTIVE post-apply
+  // records directly rather than `ownedByExternalId`. The prior code walked the
+  // owned-server map, which never contains an ADOPTION update — those are built
+  // from `keptByExternalId` and pushed straight to `updates`, so a retained
+  // template-owned dangling/self proxy on a freshly-adopted server was never
+  // inspected and shipped broken. That was the 5th record-class gap in this
+  // cleanup; stop patching the iteration source and unify on the records that
+  // actually exist after apply.
+  //
+  // The effective records that can carry a proxy post-apply are:
+  //  - every `updates` entry's `after` — the union that ALREADY holds owned
+  //    updates AND adoption updates (part 2a, cleaned IN PLACE); and
+  //  - every owned/kept server that is in NONE of adds/updates/prunes — the
+  //    UNPLANNED set (an unchanged server, or a device skipped this fetch), still
+  //    needing promotion (part 2b).
+  // Adds are skipped: a fresh add has no retained proxy, its this-run proxy was
+  // validated by part 1 / round 6, and the matrix's round-5 skip means an add
+  // can't carry a self-proxy.
+  //
+  // COMPOSITION WITH PART 1 / ROUND 6 (no double-clean, no double-warn): part 1
+  // runs FIRST and RESTORES the pre-matrix proxy for THIS run's rejected desired
+  // winner; after it, such an update's `after.proxy` is a survivor (row-5 carry)
+  // or absent, so `invalidTemplateProxy` returns undefined and part 2a skips it.
+  // Part 2 only drops retained/self proxies part 1 never examined. If a round-6
+  // restore left a STILL-dangling prior proxy (the restored value is itself
+  // pruned), part 2a correctly drops it — belt-and-suspenders — and warnings
+  // dedupe by `server::jumpHost`.
+
+  // PART 2a — every planned update's `after`, cleaned IN PLACE. This is where an
+  // ALREADY-UPDATED owned server (round 7 gap) AND an ADOPTION update (round 9
+  // gap) are both caught: both live in `updates`. No promotion and no
+  // `unchangedCount` change — the server was already an update, and the round-4
+  // decrement gate only concerns promotions of counted-unchanged servers.
+  for (const u of updates) {
+    const invalid = invalidTemplateProxy(u.after);
+    if (invalid === undefined) {
+      continue;
+    }
+    warnRetainedProxy(u.after, invalid.self, invalid.jumpHostId);
+    u.after = dropTemplateProxy(u.after); // a DROP (retained value IS the dangling/self host — nothing beneath to restore)
+  }
+
+  // PART 2b — the UNPLANNED set. Snapshot the planned ids (adds ∪ updates-before
+  // ∪ prunes) BEFORE promoting, so an update already handled by part 2a is never
+  // re-examined here (its before-id is in the set) and servers promoted below are
+  // never revisited. Iterate owned AND kept servers for record-source
+  // completeness: a kept (un-adopted) server carries no `origin`, so
+  // `invalidTemplateProxy`'s stamp guard makes it a no-op — which keeps the
+  // adoption-declined case matching prior behavior (a declined adoptee is never
+  // touched) while closing the gap by construction for any future record source.
+  const plannedServerIds = new Set<string>();
+  for (const id of addedServerIds) {
+    plannedServerIds.add(id);
+  }
+  for (const u of updates) {
+    plannedServerIds.add(u.before.id);
+  }
+  for (const id of prunedServerIds) {
+    plannedServerIds.add(id);
+  }
+  const unplannedCandidates: ServerConfig[] = [
+    ...ownedByExternalId.values(),
+    ...Array.from(keptByExternalId.values()).flat()
+  ];
+  for (const candidate of unplannedCandidates) {
+    if (plannedServerIds.has(candidate.id)) {
+      continue; // already an add / update / prune — handled by part 2a or its own branch
+    }
+    const invalid = invalidTemplateProxy(candidate);
+    if (invalid === undefined) {
+      continue;
+    }
+    warnRetainedProxy(candidate, invalid.self, invalid.jumpHostId);
+    // NOT PLANNED — promote to a new proxy-dropping update.
+    updates.push({ before: candidate, after: dropTemplateProxy(candidate) });
+    // Codex round 4 (P2) — gate the decrement on actually-counted-unchanged. A
+    // server whose device was SKIPPED this fetch reaches here without ever having
+    // hit `unchangedCount++`, so decrementing for it would understate the count or
+    // drive it negative. Only servers this set records left the bucket.
+    if (unchangedServerIds.has(candidate.id)) {
+      unchangedCount--; // this device was counted unchanged in the loop; it is now an update
+    }
   }
 
   const hiddenPruneCount = prunes.filter((p) => p.server.isHidden).length;

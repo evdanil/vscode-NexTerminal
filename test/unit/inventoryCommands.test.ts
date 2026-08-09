@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   adoptionCandidateKeys,
   adoptionPairKeys,
+  authProfileSwitchIds,
   describePlanDetail,
   planDetailDrift,
   planWarningsBuffer,
@@ -2432,6 +2433,632 @@ describe("inventoryCommands", () => {
       expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
     });
 
+    // -------- Codex round 9 (P1, SECURITY) — the inventory apply clears a stale
+    // per-server proxy-password when a template moves the proxy identity AWAY from
+    // the SOCKS5/HTTP endpoint that secret belongs to. Otherwise ProxySshFactory
+    // would send the old proxy's password to the NEW endpoint (a credential leak
+    // to the wrong host). --------
+
+    // A template-OWNED socks5 proxy → X on the owned server (stamp === value, so an
+    // override can MOVE it — a truly hand-set/unstamped proxy is row-7 protected).
+    // The stored proxy-password was saved on-connect for endpoint X.
+    function ownedWithTemplateProxyX(): ServerConfig {
+      return makeServer({
+        id: "owned-1",
+        host: "10.0.0.1",
+        origin: {
+          sourceId: "src-1",
+          externalId: "device:1",
+          syncedAt: 1,
+          templated: { proxy: { type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" } }
+        },
+        proxy: { type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" }
+      });
+    }
+    const deviceMappingOwned1 = () => ({
+      contractVersion: 1 as const,
+      devices: [{ externalId: "device:1", name: "old-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+    });
+
+    it("(round 9, SECURITY) an applied template override that MOVES a server's SOCKS5 proxy to a DIFFERENT socks5 endpoint clears the stale proxy-password-{id} — otherwise ProxySshFactory sends the old proxy's password to the new host (kills retaining the secret across a proxy-identity change)", async () => {
+      const repo = new InMemoryConfigRepository([ownedWithTemplateProxyX()]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      // The template edit: move the proxy to a DIFFERENT socks5 endpoint (host Y).
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+      const vault = makeVault({
+        [proxyPasswordSecretKey("owned-1")]: "old-proxy-pw",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The record's proxy moved X → Y...
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" });
+      // ...so the password saved for X is stale and MUST be cleared. Against
+      // e2553fe the apply never touched the secret → the old X password would be
+      // sent to Y.
+      expect(vault.delete).toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1"));
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+    });
+
+    it("(round 9, SECURITY) an applied template override that changes a SOCKS5 proxy to an SSH jump-host proxy clears the stale proxy-password-{id} (the ssh proxy never uses it)", async () => {
+      const bastion = makeServer({ id: "bastion-1", name: "bastion", host: "10.0.0.9", port: 22 }); // hand-added → a survivor
+      const repo = new InMemoryConfigRepository([ownedWithTemplateProxyX(), bastion]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "ssh", jumpHostId: "bastion-1" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+      const vault = makeVault({
+        [proxyPasswordSecretKey("owned-1")]: "old-proxy-pw",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "ssh", jumpHostId: "bastion-1" });
+      expect(vault.delete).toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1"));
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+    });
+
+    it("(round 9, SECURITY — over-clear guard) an update that KEEPS the SAME socks5 host+port+username (a rename, proxy unchanged) does NOT clear the still-valid proxy-password-{id}", async () => {
+      // Hand-set socks5 X, no template moving it; a device rename forces an update
+      // whose proxy is carried unchanged → same endpoint → secret KEPT.
+      const owned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 },
+        proxy: { type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" }
+      });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+          }))
+        })
+      );
+      const vault = makeVault({
+        [proxyPasswordSecretKey("owned-1")]: "still-valid-pw",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer("owned-1")?.name).toBe("renamed-sw"); // the update landed
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" }); // proxy unchanged
+      expect(vault.delete).not.toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1")); // secret KEPT
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("still-valid-pw");
+    });
+
+    it("(round 9, SECURITY — no-op guard) an update on an SSH-proxied server (ssh↔ssh, no socks5/http before) performs no proxy-secret operation", async () => {
+      const bastion = makeServer({ id: "bastion-1", name: "bastion", host: "10.0.0.9", port: 22 });
+      const owned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 },
+        proxy: { type: "ssh", jumpHostId: "bastion-1" } // ssh proxy — carries no password
+      });
+      const repo = new InMemoryConfigRepository([owned, bastion]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+          }))
+        })
+      );
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer("owned-1")?.name).toBe("renamed-sw"); // update landed
+      expect(vault.delete).not.toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1")); // no proxy-secret op
+    });
+
+    // -------- Codex round 10 (P1, SECURITY) — the stale proxy-password clear must
+    // run BEFORE applyInventorySyncPlan publishes the new proxy (nexus.server.connect
+    // does NOT take configMutationLock, so an after-apply clear leaves a leak window),
+    // must FAIL CLOSED on a delete error (abort the sync, don't swallow), and must
+    // RESTORE the captured secret if the apply throws (old proxy still live). --------
+
+    // Sets up the standard "template moves owned-1's socks5 proxy X→Y" scenario the
+    // round-9 tests use, then returns the wired-up pieces so each round-10 test can
+    // vary the vault / apply behaviour. A confirm-modal ("Apply") run drives the
+    // in-lock confirmed apply site (the one that actually carries a proxy update).
+    async function setupProxyMoveScenario(): Promise<{ core: NexusCore; registry: InventoryProviderRegistry }> {
+      const repo = new InMemoryConfigRepository([ownedWithTemplateProxyX()]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+      return { core, registry };
+    }
+
+    it("(round 10, SECURITY — ordering) the stale proxy-password DELETE happens BEFORE applyInventorySyncPlan publishes the new proxy — falsifies the round-9 after-apply clear (connect never takes the lock, so an after-apply clear leaks the old password to the new endpoint)", async () => {
+      const { core, registry } = await setupProxyMoveScenario();
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+
+      const callOrder: string[] = [];
+      const store = new Map<string, string>([
+        [proxyKey, "old-proxy-pw"],
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          if (k === proxyKey) callOrder.push("delete");
+          store.delete(k);
+        })
+      };
+      // Log the apply relative to the delete, then call the real method through.
+      const applyReal = core.applyInventorySyncPlan.bind(core);
+      vi.spyOn(core, "applyInventorySyncPlan").mockImplementation(async (application) => {
+        callOrder.push("apply");
+        return applyReal(application);
+      });
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The new proxy IS published (Y)...
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" });
+      // ...but only AFTER the stale secret was deleted. Against bc4df87 the clear ran
+      // after apply → order would be ["apply", "delete"].
+      expect(callOrder).toEqual(["delete", "apply"]);
+      expect(await vault.get(proxyKey)).toBeUndefined();
+    });
+
+    it("(round 10, SECURITY — delete fails CLOSED) a vault.delete throw for the stale proxy key ABORTS the sync (applyInventorySyncPlan never called, new proxy never published) and RESTORES the captured secret — falsifies the round-9 best-effort swallow", async () => {
+      const { core, registry } = await setupProxyMoveScenario();
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+
+      const store = new Map<string, string>([
+        [proxyKey, "old-proxy-pw"],
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          if (k === proxyKey) throw new Error("vault delete failed"); // throws WITHOUT mutating the store
+          store.delete(k);
+        })
+      };
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // Fail closed: the proxy change was never published — the record still points
+      // at the OLD endpoint X. Against bc4df87 the delete ran (and swallowed) AFTER a
+      // committed apply, so the proxy would already be Y here.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" });
+      // The captured secret is restored — the still-live old proxy keeps its password.
+      expect(vault.store).toHaveBeenCalledWith(proxyKey, "old-proxy-pw");
+      expect(await vault.get(proxyKey)).toBe("old-proxy-pw");
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+    });
+
+    it("(round 10, SECURITY — apply fails, restore) delete succeeds but applyInventorySyncPlan throws → the captured secret is RESTORED (old proxy config is still live and needs its password) and the failure surfaces", async () => {
+      const { core, registry } = await setupProxyMoveScenario();
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+
+      const store = new Map<string, string>([
+        [proxyKey, "old-proxy-pw"],
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          store.delete(k);
+        })
+      };
+      vi.spyOn(core, "applyInventorySyncPlan").mockRejectedValue(new Error("apply boom"));
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The secret was deleted before the (failing) apply, then put back on failure.
+      expect(vault.delete).toHaveBeenCalledWith(proxyKey);
+      expect(vault.store).toHaveBeenCalledWith(proxyKey, "old-proxy-pw");
+      expect(await vault.get(proxyKey)).toBe("old-proxy-pw");
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+    });
+
+    it("(round 10, SECURITY — happy path) delete succeeds and apply succeeds → the stale secret is gone, the new proxy is live, and nothing is restored", async () => {
+      const { core, registry } = await setupProxyMoveScenario();
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const vault = makeVault({
+        [proxyKey]: "old-proxy-pw",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" });
+      expect(vault.delete).toHaveBeenCalledWith(proxyKey);
+      expect(await vault.get(proxyKey)).toBeUndefined();
+      // No restore on the success path.
+      expect(vault.store).not.toHaveBeenCalledWith(proxyKey, expect.anything());
+    });
+
+    // -------- Codex round 11 (P1, SECURITY) — the WHICH-secrets predicate must
+    // trigger on EITHER side being a password-bearing (socks5/http) endpoint, not
+    // just `before`. A legacy backup restores an exported proxy-password-{id}
+    // WITHOUT requiring the server to currently carry a socks5/http proxy
+    // (configCommands.ts), so an ORPHANED entry can sit under an undefined/ssh
+    // proxy; a template assigning a NEW authenticated endpoint would otherwise skip
+    // the clear (before isn't password-bearing) and send the orphan to it. --------
+
+    // Owned server whose proxy is UNSET and unstamped — an override template writes
+    // it (matrix row 1). The orphaned proxy-password-{id} is a legacy-backup relic.
+    function ownedWithNoProxy(): ServerConfig {
+      return makeServer({
+        id: "owned-1",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+    }
+
+    it("(round 11, SECURITY — orphan) a template assigning a NEW socks5 proxy to a server whose before.proxy is UNDEFINED clears an ORPHANED proxy-password-{id} BEFORE the apply publishes — otherwise the orphan is sent to the new endpoint (kills the before-only predicate)", async () => {
+      const repo = new InMemoryConfigRepository([ownedWithNoProxy()]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      // The template assigns an authenticated socks5 endpoint Y to a server that
+      // had NO proxy before — before.proxy is undefined, after.proxy is bearing.
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const callOrder: string[] = [];
+      const store = new Map<string, string>([
+        [proxyKey, "orphan-pw"], // legacy-backup orphan, no current socks5/http proxy behind it
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          if (k === proxyKey) callOrder.push("delete");
+          store.delete(k);
+        })
+      };
+      const applyReal = core.applyInventorySyncPlan.bind(core);
+      vi.spyOn(core, "applyInventorySyncPlan").mockImplementation(async (application) => {
+        callOrder.push("apply");
+        return applyReal(application);
+      });
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The new authenticated proxy IS published (Y)...
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" });
+      // ...but only AFTER the orphaned secret was deleted. Against 2c9d009 the
+      // before-only predicate early-returns (before.proxy is undefined) → no
+      // delete → order would be ["apply"] and the orphan "orphan-pw" would survive
+      // to be sent to Y on the next connect.
+      expect(callOrder).toEqual(["delete", "apply"]);
+      expect(vault.delete).toHaveBeenCalledWith(proxyKey);
+      expect(await vault.get(proxyKey)).toBeUndefined();
+    });
+
+    it("(round 11, SECURITY — orphan, delete fails CLOSED) a vault.delete throw for the orphaned proxy key ABORTS the sync (applyInventorySyncPlan never called, new proxy never published) and RESTORES the orphan", async () => {
+      const repo = new InMemoryConfigRepository([ownedWithNoProxy()]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const store = new Map<string, string>([
+        [proxyKey, "orphan-pw"],
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          if (k === proxyKey) throw new Error("vault delete failed"); // throws WITHOUT mutating the store
+          store.delete(k);
+        })
+      };
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // Fail closed: the new proxy was never published — the record still has no proxy.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("owned-1")?.proxy).toBeUndefined();
+      // The captured orphan is restored (best-effort) so the pass is atomic.
+      expect(vault.store).toHaveBeenCalledWith(proxyKey, "orphan-pw");
+      expect(await vault.get(proxyKey)).toBe("orphan-pw");
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+    });
+
+    it("(round 11, SECURITY — over-clear guard) an ssh↔ssh update (device renamed, jump host unchanged) leaves an orphaned proxy-password-{id} ALONE — neither side is password-bearing, so an ssh proxy never sends it (kills clearing on any stored secret regardless of proxy kind)", async () => {
+      const bastion = makeServer({ id: "bastion-1", name: "bastion", host: "10.0.0.9", port: 22 });
+      const owned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 },
+        proxy: { type: "ssh", jumpHostId: "bastion-1" } // ssh proxy — carries no password
+      });
+      const repo = new InMemoryConfigRepository([owned, bastion]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          // Rename forces an UPDATE (before.proxy ssh, after.proxy ssh carried unchanged).
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+          }))
+        })
+      );
+      const vault = makeVault({
+        [proxyPasswordSecretKey("owned-1")]: "orphan-pw", // orphan under an ssh proxy
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer("owned-1")?.name).toBe("renamed-sw"); // the update landed
+      expect(vault.delete).not.toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1")); // orphan KEPT
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("orphan-pw");
+    });
+
+    // -------- Codex round 12 (P1, SECURITY) — the fail-closed pre-apply clear must
+    // scan the plan's ADDS as well as its updates. Deterministic server ids are
+    // REUSED; a device delete-pruned with a FAILED best-effort proxy-password delete
+    // can reappear as an ADD under the SAME id with the orphaned password still in
+    // the vault. A template can add it with a NEW authenticated socks5/http endpoint,
+    // and the first connect would send the orphan there. An add has no prior proxy,
+    // so its `before` is treated as undefined → the round-11 EITHER-side rule fires
+    // exactly when the add's proxy is password-bearing. --------
+
+    // The id the ADD path mints for device:1 under src-1 — the same deterministic id
+    // a prior delete-prune would have used, so an orphaned secret can sit under it.
+    const addId = () => deterministicServerId("src-1", "device:1");
+
+    it("(round 12, SECURITY — orphan on ADD) a sync that ADDS device:1 (empty repo) with a template socks5 proxy Y clears an ORPHANED proxy-password-{addId} BEFORE the apply publishes — otherwise the orphan (from an earlier delete-prune whose best-effort delete failed) is sent to Y (kills scanning only updates, never adds)", async () => {
+      const repo = new InMemoryConfigRepository([]); // no owned server → device:1 is an ADD
+      const core = new NexusCore(repo);
+      await core.initialize();
+      // The template assigns an authenticated socks5 endpoint Y to the fresh add.
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+
+      const proxyKey = proxyPasswordSecretKey(addId());
+      const callOrder: string[] = [];
+      const store = new Map<string, string>([
+        [proxyKey, "orphan-pw"], // relic of an earlier delete-prune whose best-effort delete failed
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          if (k === proxyKey) callOrder.push("delete");
+          store.delete(k);
+        })
+      };
+      const applyReal = core.applyInventorySyncPlan.bind(core);
+      vi.spyOn(core, "applyInventorySyncPlan").mockImplementation(async (application) => {
+        callOrder.push("apply");
+        return applyReal(application);
+      });
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The add IS published with proxy Y...
+      expect(core.getServer(addId())?.proxy).toEqual({ type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" });
+      // ...but only AFTER the orphaned secret was deleted. Against 64ea893 the helper
+      // scanned only updates → the add's orphan was never touched → order would be
+      // ["apply"] and "orphan-pw" would survive to be sent to Y on the next connect.
+      expect(callOrder).toEqual(["delete", "apply"]);
+      expect(vault.delete).toHaveBeenCalledWith(proxyKey);
+      expect(await vault.get(proxyKey)).toBeUndefined();
+    });
+
+    it("(round 12, SECURITY — orphan on ADD, delete fails CLOSED) a vault.delete throw for the add's orphaned proxy key ABORTS the sync (applyInventorySyncPlan never called, the add never published) and RESTORES the orphan", async () => {
+      const repo = new InMemoryConfigRepository([]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+
+      const proxyKey = proxyPasswordSecretKey(addId());
+      const store = new Map<string, string>([
+        [proxyKey, "orphan-pw"],
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          if (k === proxyKey) throw new Error("vault delete failed"); // throws WITHOUT mutating the store
+          store.delete(k);
+        })
+      };
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // Fail closed: the add was never published — no server exists under the id.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer(addId())).toBeUndefined();
+      // The captured orphan is restored (best-effort) so the pass is atomic.
+      expect(vault.store).toHaveBeenCalledWith(proxyKey, "orphan-pw");
+      expect(await vault.get(proxyKey)).toBe("orphan-pw");
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+    });
+
+    it("(round 12, SECURITY — no-op guard) an ADD with a socks5 proxy but NO stored secret under its id captures nothing (delete of the empty key is harmless, nothing is ever restored)", async () => {
+      const repo = new InMemoryConfigRepository([]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+
+      const proxyKey = proxyPasswordSecretKey(addId());
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" }); // no proxy secret
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The add landed with proxy Y, and since there was no orphan to capture,
+      // nothing was ever stored back into the proxy key.
+      expect(core.getServer(addId())?.proxy).toEqual({ type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" });
+      expect(vault.store).not.toHaveBeenCalledWith(proxyKey, expect.anything());
+    });
+
+    it("(round 12, SECURITY — over-clear guard) an ADD with an SSH jump-host proxy leaves an orphaned proxy-password-{addId} ALONE — neither side is password-bearing, so an ssh proxy never sends it (a later template→socks change is the update path's job)", async () => {
+      const bastion = makeServer({ id: "bastion-1", name: "bastion", host: "10.0.0.9", port: 22 }); // hand-added survivor
+      const repo = new InMemoryConfigRepository([bastion]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "ssh", jumpHostId: "bastion-1" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+
+      const proxyKey = proxyPasswordSecretKey(addId());
+      const vault = makeVault({
+        [proxyKey]: "orphan-pw", // orphan under what becomes an ssh-proxied add
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer(addId())?.proxy).toEqual({ type: "ssh", jumpHostId: "bastion-1" }); // the add landed
+      expect(vault.delete).not.toHaveBeenCalledWith(proxyKey); // orphan KEPT — ssh never sends it
+      expect(await vault.get(proxyKey)).toBe("orphan-pw");
+    });
+
     it("(ITEM B) a rack rename that empties its old folder appends the empty-folder count to the completion toast", async () => {
       const owned = makeServer({
         id: "owned-1",
@@ -4854,6 +5481,140 @@ describe("inventoryCommands", () => {
       // An unlink must never be rendered by the switch branch — that line claims
       // the opposite of what the plan does.
       expect(describePlanDetail(planWithClears(2), [], "Lab credentials")).not.toContain("will switch to");
+    });
+
+    // ROUND 8 (P1) — the switch/clear lines and the drift signature must name
+    // the ACTUAL target each planned update writes (`after.authProfileId`), not
+    // the single source-level profile. A catch-all template can set a profile B
+    // that differs from the source's A, and the engine writes B.
+    describe("Codex round 8 (P1) — the auth-switch line names each update's REAL target profile, not the source-level one", () => {
+      const B_PROFILE: AuthProfile = { id: "p2", name: "Datacenter creds", username: "dcuser", authType: "password" };
+      const C_PROFILE: AuthProfile = { id: "p3", name: "Edge creds", username: "edgeuser", authType: "password" };
+      // Two distinct profile ids that resolve to the SAME display name — the case
+      // only the target-id-in-signature guard can tell apart, not the text.
+      const B_TWIN: AuthProfile = { id: "p2b", name: "Datacenter creds", username: "dcuser2", authType: "password" };
+      const profilesById = new Map<string, AuthProfile>([
+        ["p1", LAB_PROFILE],
+        ["p2", B_PROFILE],
+        ["p2b", B_TWIN],
+        ["p3", C_PROFILE]
+      ]);
+
+      function switchTo(profileId: string | undefined, count: number): InventorySyncPlan {
+        const updates = Array.from({ length: count }, (_, i) => {
+          const before = ownedServer({ id: `owned-${i}`, externalId: `device:${i}`, name: `sw${i}` });
+          return { before, after: { ...before, authProfileId: profileId } };
+        });
+        return makeSyncPlan({ updates });
+      }
+
+      it("names the template's target B, not the source-level A, when the plan writes B onto every switch (kills rendering the source's profile name)", () => {
+        const detail = describePlanDetail(switchTo("p2", 2), [], undefined, profilesById);
+        expect(detail).toContain('2 servers will switch to auth profile "Datacenter creds".');
+        expect(detail).not.toContain("Lab credentials");
+      });
+
+      it("regression: source-level A with no template (every switch writes A) still names A", () => {
+        expect(describePlanDetail(switchTo("p1", 1), [], undefined, profilesById)).toContain(
+          '1 server will switch to auth profile "Lab credentials".'
+        );
+      });
+
+      it("a target id that resolves to no profile renders the nameless fallback, and a mixed plan renders one line per distinct target", () => {
+        expect(describePlanDetail(switchTo("gone", 1), [], undefined, profilesById)).toContain(
+          "1 server will switch to a different auth profile."
+        );
+        // One switch to B, one to a dangling id → two lines: the named target and
+        // the nameless fallback, one per distinct target.
+        const before0 = ownedServer({ id: "owned-0", externalId: "device:0", name: "sw0" });
+        const before1 = ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1" });
+        const mixed = makeSyncPlan({
+          updates: [
+            { before: before0, after: { ...before0, authProfileId: "p2" } },
+            { before: before1, after: { ...before1, authProfileId: "gone" } }
+          ]
+        });
+        const mixedDetail = describePlanDetail(mixed, [], undefined, profilesById);
+        expect(mixedDetail).toContain('1 server will switch to auth profile "Datacenter creds".');
+        expect(mixedDetail).toContain("1 server will switch to a different auth profile.");
+      });
+
+      it("the confirm modal (through syncNow) names the TEMPLATE'S target B, not the source's A — a catch-all override template on a source linked to A (kills the modal claiming 'switch to A' while the plan applies B)", async () => {
+        const { core } = await makeHarness({
+          profiles: [LAB_PROFILE, B_PROFILE],
+          source: {
+            targetFolder: "",
+            authProfileId: "p1",
+            templateRules: [{ id: "rule-1", templateId: "tmpl-1" }]
+          },
+          servers: [
+            ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" }),
+            ownedServer({ id: "owned-2", externalId: "device:2", name: "sw2", host: "10.0.0.2" })
+          ],
+          provider: {
+            fetchInventory: vi.fn(async () => ({
+              contractVersion: 1,
+              devices: [
+                { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
+                { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] }
+              ]
+            }))
+          }
+        });
+        // A catch-all template that OVERRIDES the auth link to B (p2), beating the
+        // source-level A (p1) the servers would otherwise retro-apply.
+        await core.addOrUpdateDeviceTemplate({
+          id: "tmpl-1",
+          name: "DC override",
+          fields: { authProfileId: { mode: "override", value: "p2" } }
+        });
+
+        await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+        const [, options] = modalCalls()[0];
+        expect(options.detail).toContain('2 servers will switch to auth profile "Datacenter creds".');
+        // The now-wrong source-level name must NOT appear.
+        expect(options.detail).not.toContain("Lab credentials");
+      });
+
+      it("planDetailDrift reports drift when the target changes B→C between renders, same count and same server ids (kills a signature that ignores the actual target — a B→C template change while the modal is open would evade drift)", () => {
+        const planB = switchTo("p2", 2);
+        const planC = switchTo("p3", 2); // same server ids, different target
+        const shownDetail = describePlanDetail(planB, [], undefined, profilesById);
+        const shown = {
+          detail: shownDetail,
+          deleteIds: new Set<string>(),
+          authSwitchIds: authProfileSwitchIds(planB),
+          adoptionPairs: adoptionPairKeys(planB)
+        };
+        expect(planDetailDrift(shown, planC, [], undefined, profilesById).drift).toBe(true);
+        // Control: the SAME captured tuple re-based on planC's own signature does
+        // not drift, so the assertion above is about the target change and nothing
+        // incidental.
+        const rebased = {
+          detail: describePlanDetail(planC, [], undefined, profilesById),
+          deleteIds: new Set<string>(),
+          authSwitchIds: authProfileSwitchIds(planC),
+          adoptionPairs: adoptionPairKeys(planC)
+        };
+        expect(planDetailDrift(rebased, planC, [], undefined, profilesById).drift).toBe(false);
+      });
+
+      it("planDetailDrift still catches a target change when the two profiles share a NAME (kills relying on the rendered text alone — the target ids are in the signature)", () => {
+        const planB = switchTo("p2", 2);
+        const planTwin = switchTo("p2b", 2); // distinct id, SAME name "Datacenter creds"
+        // The rendered text is byte-identical — the non-vacuity check.
+        expect(describePlanDetail(planTwin, [], undefined, profilesById)).toBe(
+          describePlanDetail(planB, [], undefined, profilesById)
+        );
+        const shown = {
+          detail: describePlanDetail(planB, [], undefined, profilesById),
+          deleteIds: new Set<string>(),
+          authSwitchIds: authProfileSwitchIds(planB),
+          adoptionPairs: adoptionPairKeys(planB)
+        };
+        expect(planDetailDrift(shown, planTwin, [], undefined, profilesById).drift).toBe(true);
+      });
     });
 
     it("syncNow retro-applies the source's profile to a server still on the bare agent default: the confirm modal appears (not the nothing-to-change fast path) and Apply stamps the link (kills a caller that never resolves/passes authProfile into computeSyncPlan)", async () => {

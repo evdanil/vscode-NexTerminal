@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
-import type { AuthProfile, ServerConfig } from "../models/config";
-import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials } from "../models/config";
+import type { AuthProfile, HttpConnectProxy, ProxyConfig, ServerConfig, Socks5Proxy } from "../models/config";
+import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps } from "../models/config";
+import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
   computeProviderFingerprint,
   InventoryProviderError,
@@ -165,6 +166,196 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
     await vault.delete(key);
   } catch (error) {
     console.warn(`[Nexus] Failed to delete secret key "${key}":`, error);
+  }
+}
+
+/**
+ * FIX B (issue #48 PR-T1 / PR #61 Codex review rounds 9+10, SECURITY) — clear the
+ * stale per-server `proxy-password-{id}` when an inventory update moves the
+ * server's proxy identity AWAY from the authenticated SOCKS5/HTTP endpoint that
+ * secret was entered for, BEFORE the apply publishes the new proxy.
+ *
+ * `ProxySshFactory` reads `proxy-password-{serverId}` by server id and sends it
+ * to whatever proxy the record now names whenever that proxy carries a username.
+ * A device template that repoints a server's proxy from one authenticated
+ * socks5/http endpoint to a DIFFERENT one — or to an ssh/none proxy — leaves the
+ * OLD password in the vault, so the factory would send the old proxy's password
+ * to the NEW endpoint: a credential leak to the wrong host.
+ *
+ * ROUND 10 — WHY BEFORE THE APPLY, NOT AFTER. `nexus.server.connect` deliberately
+ * does NOT take `configMutationLock` (out of scope to change — a much larger
+ * refactor). Round 9 cleared the secret AFTER `applyInventorySyncPlan` had already
+ * published the new proxy into the core map: a connect landing in the awaited
+ * apply/save/cleanup window would read the NEW proxy config with the OLD
+ * `proxy-password-{id}` still in the vault and send it to the new endpoint — the
+ * exact leak, only now through a race instead of a persistent stale key. Because
+ * connect can't be serialized against the apply, the ONLY way to close the window
+ * is to delete the stale secret BEFORE the new proxy becomes reachable. Moving the
+ * delete before publish shrinks the worst case from a credential leak to at most a
+ * transient "old proxy can't authenticate until the next connect prompt" window —
+ * the fail-SAFE direction.
+ *
+ * FAIL CLOSED ON DELETE, RESTORE ON APPLY FAILURE. The delete is security-critical,
+ * so it must NOT be best-effort: if `vault.delete` throws we cannot secure the
+ * proxy change, so we restore any secret already deleted in this pass and rethrow
+ * to ABORT the whole sync (the new proxy is never published) — fail closed, not
+ * open. Conversely, when the delete succeeds but `applyInventorySyncPlan` then
+ * throws, the plan did NOT commit: the OLD proxy config is still live and still
+ * needs its password, so the caller restores the captured values (best-effort).
+ * Ordering is therefore: capture+delete → publish → restore-on-failure.
+ *
+ * §5.3 of the device-template design: templates never carry proxy SECRETS — a
+ * template-set socks5/http proxy relies on the per-connect prompt — so clearing
+ * the stale secret is exactly right: the new proxy prompts per-connect rather
+ * than reusing a password meant for a different endpoint.
+ *
+ * STALE (must be cleared) iff EITHER `before.proxy` OR `after.proxy` is a
+ * password-bearing (`socks5`|`http`) endpoint AND the two are NOT the SAME
+ * authenticated endpoint (same `type`+`host`+`port`+`username` — the identity
+ * the password was entered for). The SAME-endpoint case KEEPS the secret — it
+ * still applies. An ssh proxy never carries a password, so ssh↔ssh (and any
+ * neither-side-bearing update, e.g. undefined↔ssh) needs no handling; a change
+ * FROM socks5/http TO ssh/none clears the stale secret.
+ *
+ * ROUND 11 — WHY THE `after`-SIDE TRIGGER, not just `before`. A non-password-bearing
+ * `before.proxy` (undefined or ssh) does NOT prove no `proxy-password-{id}` secret
+ * exists: `configCommands.ts` restores every exported proxy password for an imported
+ * server id WITHOUT requiring that server to currently carry a socks5/http proxy, so
+ * a legacy backup can leave an ORPHANED entry sitting under an undefined/ssh proxy.
+ * If a template then assigns that server a NEW authenticated socks5/http endpoint, a
+ * `before`-only rule would early-return (before isn't password-bearing) and SKIP the
+ * clear — sending the orphaned password to the new proxy. Triggering on EITHER side
+ * closes that leak. It is a strict SUPERSET of the round-9 rule (every case it
+ * cleared, this clears), and because the capture step reads the vault value first,
+ * an update that newly matches but has no stored secret captures nothing and deletes
+ * nothing — broadening the trigger costs nothing where there is no orphan.
+ *
+ * ROUND 12 — ALSO covers the plan's ADDS, not just its updates. A delete-pruned
+ * device whose best-effort `proxy-password-{id}` delete FAILED can reappear as an
+ * ADD under the same reused deterministic id; treating an add's `before` as "no
+ * proxy" (undefined) makes the EITHER-side rule fire exactly when the add's proxy
+ * is a password-bearing socks5/http endpoint, clearing the orphan before the add
+ * is published. See the inline note on the helper for the reuse mechanism.
+ *
+ * Centralized so EVERY inventory apply site shares one rule (invoked before BOTH
+ * the fast-path recompute apply AND the in-lock confirmed apply, passing BOTH the
+ * plan's updates and its adds). Deliberately NOT
+ * the server-form `syncProxyPasswordSecret` path — that governs hand-edited
+ * proxies and bypasses this apply flow entirely.
+ *
+ * Returns the `{key,value}` pairs it captured+deleted so the caller can restore
+ * them if the subsequent apply throws. On any delete error it restores what it
+ * already deleted in this pass (capture-delete atomicity — a mid-loop failure
+ * must not strip a password with no publish and no restore) and rethrows.
+ */
+/**
+ * A `proxy-password-{id}` secret only ever belongs to a `socks5`/`http` proxy —
+ * the only kinds `ProxySshFactory` sends it to (an ssh jump proxy carries no
+ * password). Narrows to that authenticated shape so both sides of an update can
+ * be compared by identity below.
+ */
+function isPasswordBearingProxy(proxy: ProxyConfig | undefined): proxy is Socks5Proxy | HttpConnectProxy {
+  return proxy !== undefined && (proxy.type === "socks5" || proxy.type === "http");
+}
+
+/**
+ * Whether `before` and `after` are the SAME authenticated (socks5/http) endpoint —
+ * same `type`+`host`+`port`+`username`, the identity the stored password was
+ * entered for. This is the ONE case a proxy update KEEPS the secret: it still
+ * applies. Both sides must be password-bearing to be "the same endpoint"; an
+ * ssh/none on either side is never equal to a socks5/http one.
+ */
+function isSameAuthenticatedEndpoint(before: ProxyConfig | undefined, after: ProxyConfig | undefined): boolean {
+  return (
+    isPasswordBearingProxy(before) &&
+    isPasswordBearingProxy(after) &&
+    before.type === after.type &&
+    before.host === after.host &&
+    before.port === after.port &&
+    before.username === after.username
+  );
+}
+
+async function clearStaleProxyPasswordSecretsBeforeApply(
+  vault: SecretVault,
+  updates: ReadonlyArray<{ before: ServerConfig; after: ServerConfig }>,
+  adds: ReadonlyArray<ServerConfig> = []
+): Promise<Array<{ key: string; value: string }>> {
+  // ROUND 12 — ADDS are scanned too, not just updates. Deterministic server ids
+  // are REUSED, and the delete-prune path clears `proxy-password-{id}` only
+  // best-effort — so a device delete-pruned with a FAILED secret delete can
+  // reappear as an ADD under the same id with the orphaned password still in the
+  // vault. A template can add it with a NEW authenticated socks5/http endpoint,
+  // and the first connect would send the orphan there. An add has no prior
+  // proxy, so its `before` is "no proxy" (undefined): the round-11 EITHER-side
+  // rule then fires exactly when the add's proxy is password-bearing. A fresh
+  // sync-added server never legitimately stores a proxy password (templates
+  // prompt per-connect, §5.3), so any secret under its id is an orphan — clearing
+  // it is correct.
+  const entries: Array<{ id: string; beforeProxy: ProxyConfig | undefined; afterProxy: ProxyConfig | undefined }> = [];
+  for (const { before, after } of updates) {
+    // before.id === after.id (same record through an update); use after.id.
+    entries.push({ id: after.id, beforeProxy: before.proxy, afterProxy: after.proxy });
+  }
+  for (const add of adds) {
+    entries.push({ id: add.id, beforeProxy: undefined, afterProxy: add.proxy });
+  }
+  const captured: Array<{ key: string; value: string }> = [];
+  for (const { id, beforeProxy: bp, afterProxy: ap } of entries) {
+    // ROUND 11 — trigger on EITHER side being a password-bearing endpoint. A
+    // non-password-bearing `before.proxy` does NOT prove no secret exists (an
+    // orphaned legacy-backup entry can sit under an undefined/ssh proxy, and an
+    // add's `before` is always undefined), so an `after`-side authenticated
+    // endpoint must trigger the clear too — see the function doc for why.
+    if (!isPasswordBearingProxy(bp) && !isPasswordBearingProxy(ap)) {
+      continue; // neither side carries a proxy password — nothing to leak (ssh proxies never send one)
+    }
+    if (isSameAuthenticatedEndpoint(bp, ap)) {
+      continue; // still the same authenticated endpoint — the stored password still applies
+    }
+    const key = proxyPasswordSecretKey(id);
+    let existing: string | undefined;
+    try {
+      existing = await vault.get(key);
+    } catch (error) {
+      // Cannot even read the secret — restore what we've deleted so far, abort.
+      await restoreProxyPasswordSecrets(vault, captured);
+      throw error;
+    }
+    // Capture BEFORE the delete so an aborting delete restores this key too (the
+    // delete may have partially applied; restoring the old value is fail-safe).
+    if (existing !== undefined) {
+      captured.push({ key, value: existing });
+    }
+    try {
+      await vault.delete(key);
+    } catch (error) {
+      // FAIL CLOSED — a proxy change we cannot secure must not be published.
+      await restoreProxyPasswordSecrets(vault, captured);
+      throw error;
+    }
+  }
+  return captured;
+}
+
+/**
+ * ROUND 10 — put back the proxy-password secrets captured by
+ * `clearStaleProxyPasswordSecretsBeforeApply` when the apply they preceded did
+ * NOT commit (or a mid-pass delete aborted). The old proxy config is still live
+ * and still needs its password, so restoring is the fail-safe recovery. Best
+ * effort per key: a failed restore here costs at most a re-prompt on the next
+ * connect, and must not mask the original failure that triggered the restore.
+ */
+async function restoreProxyPasswordSecrets(
+  vault: SecretVault,
+  captured: ReadonlyArray<{ key: string; value: string }>
+): Promise<void> {
+  for (const { key, value } of captured) {
+    try {
+      await vault.store(key, value);
+    } catch (error) {
+      console.warn(`[Nexus] Failed to restore proxy password secret "${key}":`, error);
+    }
   }
 }
 
@@ -1285,20 +1476,62 @@ function adoptionUpdates(plan: InventorySyncPlan): Array<{ before: ServerConfig;
 }
 
 /**
+ * ROUND 8 (P1) — group auth-profile switches / clears by the profile id each one
+ * ACTUALLY targets, preserving first-seen order. A catch-all device template can
+ * set a profile B that differs from the source-level profile A, and the engine
+ * writes B onto the update's `after`; the consent line and the drift signature
+ * must therefore name what the plan WRITES, not the source's profile. For a
+ * switch the target is `after.authProfileId` (the profile adopted); for a clear
+ * it is `before.authProfileId` (the profile stopped). Returned as arrays, not
+ * just counts, so `planWarningsBuffer` can list the servers under each distinct
+ * target heading.
+ */
+function groupByAuthTarget(
+  switches: Array<{ before: ServerConfig; after: ServerConfig }>,
+  targetOf: (u: { before: ServerConfig; after: ServerConfig }) => string | undefined
+): Map<string | undefined, Array<{ before: ServerConfig; after: ServerConfig }>> {
+  const groups = new Map<string | undefined, Array<{ before: ServerConfig; after: ServerConfig }>>();
+  for (const u of switches) {
+    const id = targetOf(u);
+    const existing = groups.get(id);
+    if (existing !== undefined) {
+      existing.push(u);
+    } else {
+      groups.set(id, [u]);
+    }
+  }
+  return groups;
+}
+
+/**
  * m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync
  * plan for the confirm modal's `detail`.
  *
- * `authProfileName` is the name of the profile the plan was computed against —
- * the caller's `resolveSourceAuthProfile` result for the SAME source snapshot
- * that produced `plan` (see syncNow's pairing rule). It is a render-time
- * argument rather than something derived from the plan because the plan carries
- * only ids and this file's modal copy is names-never-UUIDs (m3).
+ * `authProfilesById` is the WHOLE profile store (the caller's
+ * `resolveAuthProfilesById(core)` — the same map `computeSyncPlan` consumed),
+ * used to resolve each planned update's ACTUAL target auth profile to a name
+ * (ROUND 8 P1): the switch/clear lines are grouped by the real target id
+ * (`after.authProfileId` / `before.authProfileId`), NOT by the single
+ * source-level profile, because a template can make the two differ. It is a
+ * render-time argument rather than something derived from the plan because the
+ * plan carries only ids and this file's modal copy is names-never-UUIDs (m3).
+ *
+ * `authProfileName` is the legacy single-profile fallback, retained for the
+ * direct unit tests that build synthetic plans with no profile map: when
+ * `authProfilesById` is absent the switch/clear lines fall back to this single
+ * name (or the nameless branch when it too is absent). Production always passes
+ * the map.
  *
  * Exported for direct unit testing: the nameless-switch branch below is
  * unreachable through syncNow (every call site pairs plan and resolution), and
  * a guard that cannot be exercised is a guard nobody can prove still works.
  */
-export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[], authProfileName?: string): string {
+export function describePlanDetail(
+  plan: InventorySyncPlan,
+  allServers: ServerConfig[],
+  authProfileName?: string,
+  authProfilesById?: ReadonlyMap<string, AuthProfile>
+): string {
   const lines: string[] = [];
   if (plan.adds.length > 0) {
     const n = plan.adds.length;
@@ -1390,26 +1623,43 @@ export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerCo
   // subset-annotation placement manualDuplicateCount uses after adds — because
   // every auth switch is also counted there.
   //
-  // A switch with no name is unreachable by construction: an update can only
-  // change authProfileId when computeSyncPlan resolved the source's profile,
-  // and every call site passes the resolution produced for the very same source
-  // snapshot as the plan (see resolveSourceAuthProfile's pairing rule in
-  // syncNow). It still renders, namelessly, because the alternative fails
-  // SILENTLY: a future caller that breaks the pairing CONSISTENTLY — no name to
-  // the modal render and none to either drift render — produces matching texts
-  // with no switch line anywhere, so planDetailDrift sees no drift and the
-  // stamps apply with zero disclosure. (Drift only catches the INCONSISTENT
-  // case, where one render has the name and another doesn't.) A line naming no
-  // profile is less useful than one that does, but it is still consent: the
-  // user is told how many servers change auth, and can cancel.
-  const authProfileSwitchCount = authProfileAdoptions(plan).length;
-  if (authProfileSwitchCount > 0) {
-    const n = authProfileSwitchCount;
-    lines.push(
-      authProfileName !== undefined
-        ? `${n} server${n === 1 ? "" : "s"} will switch to auth profile "${authProfileName}".`
-        : `${n} server${n === 1 ? "" : "s"} will switch to a different auth profile.`
-    );
+  // ROUND 8 (P1) — the TARGET each switch names is that update's OWN
+  // `after.authProfileId`, resolved through `authProfilesById`, NOT the single
+  // source-level profile. A catch-all device template can set a profile B that
+  // differs from the source's A, and the engine writes B; naming A here would
+  // tell the user "switch to A" while the plan applies B (and a B→C template
+  // change while the modal is open would evade drift, since the count and the
+  // wrong name A would both be unchanged). Grouped by real target id — normally
+  // one line in the T1 single-winner cascade, but correct if a plan ever writes
+  // more than one target.
+  //
+  // A switch with no name is still reachable — a dangling target id that
+  // resolves to no profile — and still honest consent: the user is told how many
+  // servers change auth, and can cancel. The nameless branch also protects the
+  // legacy single-name fallback used by the synthetic-plan unit tests (no map):
+  // a caller that lost the name renders namelessly rather than dropping the line
+  // SILENTLY, which would let the stamps apply past the modal with no disclosure
+  // and no drift to catch it.
+  const switches = authProfileAdoptions(plan);
+  if (switches.length > 0) {
+    if (authProfilesById !== undefined) {
+      for (const [targetId, group] of groupByAuthTarget(switches, (u) => u.after.authProfileId)) {
+        const name = targetId !== undefined ? authProfilesById.get(targetId)?.name : undefined;
+        const n = group.length;
+        lines.push(
+          name !== undefined
+            ? `${n} server${n === 1 ? "" : "s"} will switch to auth profile "${name}".`
+            : `${n} server${n === 1 ? "" : "s"} will switch to a different auth profile.`
+        );
+      }
+    } else {
+      const n = switches.length;
+      lines.push(
+        authProfileName !== undefined
+          ? `${n} server${n === 1 ? "" : "s"} will switch to auth profile "${authProfileName}".`
+          : `${n} server${n === 1 ? "" : "s"} will switch to a different auth profile.`
+      );
+    }
   }
   // REVIEW FINDING (P1) — the other direction, on its own line and in the same
   // place: unlinking a server the source had linked is a credential change to an
@@ -1419,14 +1669,31 @@ export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerCo
   // server's point of view, and the reason the line does not promise SSH agent
   // authentication specifically: what a server falls back to is whatever its own
   // record holds.
-  const authProfileClearCount = authProfileClears(plan).length;
-  if (authProfileClearCount > 0) {
-    const n = authProfileClearCount;
-    lines.push(
-      authProfileName !== undefined
-        ? `${n} server${n === 1 ? "" : "s"} will stop using auth profile "${authProfileName}" and revert to their own stored credentials.`
-        : `${n} server${n === 1 ? "" : "s"} will stop using their auth profile and revert to their own stored credentials.`
-    );
+  //
+  // ROUND 8 (P1) — the profile named here is the one each server STOPS using,
+  // i.e. that clear's own `before.authProfileId`, resolved through
+  // `authProfilesById` and grouped per real target — never the source-level
+  // profile, for the same reason the switch line groups by its target.
+  const clears = authProfileClears(plan);
+  if (clears.length > 0) {
+    if (authProfilesById !== undefined) {
+      for (const [targetId, group] of groupByAuthTarget(clears, (u) => u.before.authProfileId)) {
+        const name = targetId !== undefined ? authProfilesById.get(targetId)?.name : undefined;
+        const n = group.length;
+        lines.push(
+          name !== undefined
+            ? `${n} server${n === 1 ? "" : "s"} will stop using auth profile "${name}" and revert to their own stored credentials.`
+            : `${n} server${n === 1 ? "" : "s"} will stop using their auth profile and revert to their own stored credentials.`
+        );
+      }
+    } else {
+      const n = clears.length;
+      lines.push(
+        authProfileName !== undefined
+          ? `${n} server${n === 1 ? "" : "s"} will stop using auth profile "${authProfileName}" and revert to their own stored credentials.`
+          : `${n} server${n === 1 ? "" : "s"} will stop using their auth profile and revert to their own stored credentials.`
+      );
+    }
   }
   const orphaned = plan.prunes.filter((p) => p.policy === "orphan").length;
   const deleted = plan.prunes.filter((p) => p.policy === "delete").length;
@@ -1519,7 +1786,11 @@ export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerCo
  * call it on synthetic plans rather than to reconstruct every plan shape through
  * a provider fetch.
  */
-export function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: string): string[] {
+export function planWarningsBuffer(
+  plan: InventorySyncPlan,
+  authProfileName?: string,
+  authProfilesById?: ReadonlyMap<string, AuthProfile>
+): string[] {
   const buffer = [...plan.warnings];
   // The adoption pair list, in the established heading-plus-indented-names
   // shape and for the same reason the switch list exists: adoption changes WHICH
@@ -1557,17 +1828,35 @@ export function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: st
       buffer.push(`  "${u.before.name}" — device "${u.after.name}" (${u.after.host}:${u.after.port})${hiddenSuffix}`);
     }
   }
+  // ROUND 8 (P1) — one heading per DISTINCT target profile the plan actually
+  // writes (`after.authProfileId`), resolved through `authProfilesById`, so the
+  // Show Warnings audit names the same real target the modal now does rather than
+  // the source-level profile. Grouped by real target — one heading in the T1
+  // single-winner cascade, but truthful if a plan ever switches to more than one.
+  // Heading keeps the count (the modal's own line is an aggregate too, and the
+  // two must agree at a glance); the colon marks the lines below as belonging to
+  // it, and the indent keeps them from reading as sibling warnings when the plan
+  // also carries engine warnings above. `authProfileName` is the legacy
+  // single-name fallback for the synthetic-plan unit tests (no map).
   const switches = authProfileAdoptions(plan);
   if (switches.length > 0) {
-    const n = switches.length;
-    const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "a different auth profile";
-    // Heading keeps the count (the modal's own line is an aggregate too, and the
-    // two must agree at a glance); the colon marks the lines below as belonging
-    // to it, and the indent keeps them from reading as sibling warnings when the
-    // plan also carries engine warnings above.
-    buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
-    for (const u of switches) {
-      buffer.push(`  "${u.before.name}"`);
+    if (authProfilesById !== undefined) {
+      for (const [targetId, group] of groupByAuthTarget(switches, (u) => u.after.authProfileId)) {
+        const name = targetId !== undefined ? authProfilesById.get(targetId)?.name : undefined;
+        const target = name !== undefined ? `auth profile "${name}"` : "a different auth profile";
+        const n = group.length;
+        buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
+        for (const u of group) {
+          buffer.push(`  "${u.before.name}"`);
+        }
+      }
+    } else {
+      const n = switches.length;
+      const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "a different auth profile";
+      buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
+      for (const u of switches) {
+        buffer.push(`  "${u.before.name}"`);
+      }
     }
   }
   // REVIEW FINDING (P1) — the unlink list, in the same shape and for the same
@@ -1575,14 +1864,27 @@ export function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: st
   // answerable one click before Apply. Its own heading rather than a shared one,
   // because a plan can in principle carry both (the engine's two rules are
   // mutually exclusive per sync today, but the render must not depend on that to
-  // stay truthful).
+  // stay truthful). ROUND 8 (P1) — grouped by each clear's own
+  // `before.authProfileId` (the profile stopped), for the same reason.
   const clears = authProfileClears(plan);
   if (clears.length > 0) {
-    const n = clears.length;
-    const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "their auth profile";
-    buffer.push(`${n} server${n === 1 ? "" : "s"} will stop using ${target} and revert to their own stored credentials:`);
-    for (const u of clears) {
-      buffer.push(`  "${u.before.name}"`);
+    if (authProfilesById !== undefined) {
+      for (const [targetId, group] of groupByAuthTarget(clears, (u) => u.before.authProfileId)) {
+        const name = targetId !== undefined ? authProfilesById.get(targetId)?.name : undefined;
+        const target = name !== undefined ? `auth profile "${name}"` : "their auth profile";
+        const n = group.length;
+        buffer.push(`${n} server${n === 1 ? "" : "s"} will stop using ${target} and revert to their own stored credentials:`);
+        for (const u of group) {
+          buffer.push(`  "${u.before.name}"`);
+        }
+      }
+    } else {
+      const n = clears.length;
+      const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "their auth profile";
+      buffer.push(`${n} server${n === 1 ? "" : "s"} will stop using ${target} and revert to their own stored credentials:`);
+      for (const u of clears) {
+        buffer.push(`  "${u.before.name}"`);
+      }
     }
   }
   return buffer;
@@ -1635,19 +1937,37 @@ function planHasNothingToDo(plan: InventorySyncPlan): boolean {
 }
 
 /**
- * REVIEW FINDING (P2) — the set of server ids the plan would move onto a
- * different auth profile, the identity behind `authProfileSwitches`' count.
- * Read off `before.id` for the same reason `planWarningsBuffer` names
- * `before.name`: it is the record as it exists right now, which is what the
- * user is being asked to consent to.
+ * REVIEW FINDING (P2) — the captured signature of the plan's auth switches, the
+ * identity behind `authProfileSwitches`' count. One key per switch, carrying the
+ * record (`before.id` — the server as it exists right now, what the user
+ * consents to) AND both ends of the credential move (`before.authProfileId` →
+ * `after.authProfileId`).
+ *
+ * ROUND 8 (P1) — the from/to profile ids are in the key, not just the server id.
+ * `describePlanDetail` now names the ACTUAL target (`after.authProfileId`, a
+ * catch-all template can make it differ from the source-level profile), so a
+ * B→C change of that target between the shown render and the fresh recompute
+ * MUST drift and re-prompt. The rendered text catches it whenever the two
+ * targets resolve to different NAMES; encoding the target ids here catches it
+ * even when two distinct profiles happen to share a name.
  *
  * Deliberately the UNION of both directions (`authProfileSwitches`, not just the
  * adoptions): an unlink is a credential change to a named, disclosed server too,
- * so a mid-modal swap of WHICH server gets unlinked has to drift exactly as an
- * adoption swap does.
+ * so a mid-modal swap of WHICH server gets unlinked — or of WHICH profile it
+ * stops using — has to drift exactly as an adoption swap does. Space-joined, and
+ * the empty string stands in for `undefined` (a clear's `after`, a bare
+ * `before`), unambiguous because server and profile ids are uuids / deterministic
+ * hashes that contain no space and are never empty.
+ *
+ * Exported for direct unit testing alongside `planDetailDrift`: the target-id
+ * swap it now catches renders identical text whenever two profiles share a name,
+ * so the derivation has to be assertable — and buildable into a captured tuple —
+ * on its own.
  */
-function authProfileSwitchIds(plan: InventorySyncPlan): Set<string> {
-  return new Set(authProfileSwitches(plan).map((u) => u.before.id));
+export function authProfileSwitchIds(plan: InventorySyncPlan): Set<string> {
+  return new Set(
+    authProfileSwitches(plan).map((u) => `${u.before.id} ${u.before.authProfileId ?? ""} ${u.after.authProfileId ?? ""}`)
+  );
 }
 
 /**
@@ -1807,12 +2127,15 @@ function capturedSetsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): bool
 // device: same record, different claimant, same counts, same text, same ids (see
 // `adoptionPairKeys`).
 //
-// `nextAuthProfileName` follows the same rule as `nextServers`: it is the
-// resolution taken FRESH alongside `nextPlan`, not the one the shown modal
-// rendered with. That is what makes a mid-modal profile rename (same plan,
-// different name → different text) and a mid-modal profile delete (no
-// resolution → no switch line, plus a dangling-profile warning) both surface
-// as ordinary drift, with no dedicated comparison of their own.
+// `nextAuthProfilesById` (and the legacy `nextAuthProfileName`) follow the same
+// rule as `nextServers`: they are the resolution taken FRESH alongside
+// `nextPlan`, not the one the shown modal rendered with. That is what makes a
+// mid-modal profile rename (same plan, different name → different text), a
+// mid-modal profile delete (no resolution → nameless switch line + a
+// dangling-profile warning) and — ROUND 8 (P1) — a mid-modal TEMPLATE change of
+// the actual target (A/B→C, caught by the fresh render naming the new target and
+// by the target ids `authProfileSwitchIds` now carries) all surface as ordinary
+// drift, with no dedicated comparison of their own.
 //
 // Exported for direct unit testing: an identity swap is by definition the case
 // where every rendered artifact is identical, so the only way to prove the
@@ -1823,9 +2146,10 @@ export function planDetailDrift(
   previous: { detail: string; deleteIds: ReadonlySet<string>; authSwitchIds: ReadonlySet<string>; adoptionPairs: ReadonlySet<string> },
   nextPlan: InventorySyncPlan,
   nextServers: ServerConfig[],
-  nextAuthProfileName: string | undefined
+  nextAuthProfileName: string | undefined,
+  nextAuthProfilesById?: ReadonlyMap<string, AuthProfile>
 ): { drift: boolean; detail: string } {
-  const nextDetail = describePlanDetail(nextPlan, nextServers, nextAuthProfileName);
+  const nextDetail = describePlanDetail(nextPlan, nextServers, nextAuthProfileName, nextAuthProfilesById);
   if (nextDetail !== previous.detail) {
     return { drift: true, detail: nextDetail };
   }
@@ -1866,6 +2190,23 @@ function resolveSourceAuthProfile(core: NexusCore, source: InventorySourceConfig
     return undefined;
   }
   return core.getAuthProfile(source.authProfileId);
+}
+
+/**
+ * DEVICE TEMPLATES (issue #48 PR-T1) — the two maps `computeSyncPlan` consumes,
+ * resolved from the current core snapshot alongside `resolveSourceAuthProfile`
+ * (the engine is pure and has no core access). `authProfilesById` is the WHOLE
+ * store (rev3), a superset of `authProfile`, so the engine's unusable-profile
+ * scan can name a profile reachable only through a retained link. Re-derived at
+ * every recompute site, exactly like `planAuthProfile`, so a plan always sees
+ * the templates/profiles that were live when it was computed.
+ */
+function resolveTemplatesById(core: NexusCore): Map<string, DeviceTemplateProfile> {
+  return new Map(core.getSnapshot().deviceTemplates.map((t) => [t.id, t] as const));
+}
+
+function resolveAuthProfilesById(core: NexusCore): Map<string, AuthProfile> {
+  return new Map(core.getSnapshot().authProfiles.map((p) => [p.id, p] as const));
 }
 
 export function registerInventoryCommands(
@@ -2694,6 +3035,20 @@ export function registerInventoryCommands(
                     // rather than written as `undefined` for the reason
                     // `instanceKey` is.
                     ...(origin.syncedIpmiHost !== undefined ? { syncedIpmiHost: origin.syncedIpmiHost } : {}),
+                    // DEVICE TEMPLATES (issue #48 PR-T1) — the third part of the
+                    // origin that has to SURVIVE the strip, on exactly the terms
+                    // of the auth/OOB provenance above. It says whether the
+                    // proxy/booleans this server keeps were the SYNC'S doing or
+                    // the USER'S, which is the whole of the §4.3 template write
+                    // matrix. Dropped here, a re-adopted server's
+                    // template-managed fields arrived looking hand-owned (row 7)
+                    // and an override template could never reclaim them. Unlike
+                    // the two scalar siblings this holds a NESTED object, so it is
+                    // DEEP-COPIED (`cloneTemplatedStamps`) rather than shared by
+                    // reference — the receipt is persisted verbatim and must not
+                    // alias the live origin's `templated`. Omitted rather than
+                    // written as `undefined` for the reason `instanceKey` is.
+                    ...(origin.templated !== undefined ? { templated: cloneTemplatedStamps(origin.templated) } : {}),
                     detachedAt
                   }
                 } as ServerConfig)
@@ -2878,7 +3233,9 @@ export function registerInventoryCommands(
         currentServers: core.getSnapshot().servers,
         now: Date.now(),
         authProfile: planAuthProfile,
-        providerInstanceKey: planInstanceKey
+        providerInstanceKey: planInstanceKey,
+        templatesById: resolveTemplatesById(core),
+        authProfilesById: resolveAuthProfilesById(core)
       });
 
       // Nothing to do AND nothing to ask: apply an empty application to bump
@@ -2943,7 +3300,9 @@ export function registerInventoryCommands(
             currentServers: core.getSnapshot().servers,
             now: Date.now(),
             authProfile: freshAuthProfile,
-            providerInstanceKey: freshInstanceKey
+            providerInstanceKey: freshInstanceKey,
+            templatesById: resolveTemplatesById(core),
+            authProfilesById: resolveAuthProfilesById(core)
           });
           // THE SAME PREDICATE AS THE OUTER GATE, deliberately — a second gate
           // asking a narrower question is the first one's blindness moved rather
@@ -2956,7 +3315,18 @@ export function registerInventoryCommands(
           if (!planHasNothingToDo(recomputed)) {
             return { kind: "not-empty", plan: recomputed, authProfile: freshAuthProfile, instanceKey: freshInstanceKey };
           }
+          // FIX B (round 10, SECURITY) — capture+delete any stale proxy-password
+          // secret BEFORE the apply publishes the new proxy (see the helper's doc:
+          // connect doesn't take the lock, so an after-apply clear leaks). A delete
+          // failure throws out of the helper (fail closed) → the shared catch below
+          // restores + aborts; an apply failure likewise restores `cleared` so the
+          // still-live old proxy keeps its password. This fast-path only fires on a
+          // nothing-to-do plan (no updates), so `cleared` is empty here — routed for
+          // uniform coverage. `cleared` stays `[]` if the helper itself throws (it
+          // restores internally), so the catch's restore is then a harmless no-op.
+          let cleared: Array<{ key: string; value: string }> = [];
           try {
+            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, recomputed.updates, recomputed.adds);
             const applyResult = await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
             // F5 — `freshSource` (the exact incarnation this apply just ran
             // against), not the outer `source` captured before this sync
@@ -2964,6 +3334,10 @@ export function registerInventoryCommands(
             // against.
             return { kind: "done", plan: recomputed, removedEmptyFolderCount: applyResult.removedEmptyFolderCount, source: freshSource };
           } catch (error) {
+            // The apply did NOT commit (or a stale-secret delete failed) — the old
+            // proxy config is still live and needs its password; put back what we
+            // deleted before surfacing the failure.
+            await restoreProxyPasswordSecrets(vault, cleared);
             // m4 — a source-record replacement race surfaces the same
             // friendly, name-bearing wording as the pre-apply fast-fail check
             // just above, never core's raw "...uuid..." message.
@@ -3284,6 +3658,8 @@ export function registerInventoryCommands(
             now: Date.now(),
             authProfile: planAuthProfile,
             providerInstanceKey: planInstanceKey,
+            templatesById: resolveTemplatesById(core),
+            authProfilesById: resolveAuthProfilesById(core),
             adoptionChoice
           });
           // GUARD SITE 1 of 3 (REVIEW FINDING, P1) — this recompute is the first
@@ -3384,7 +3760,12 @@ export function registerInventoryCommands(
         // plan and the same server snapshot describePlanDetail was called
         // with here, not a re-derived approximation of either.
         const shownServers = core.getSnapshot().servers;
-        const shownDetail = describePlanDetail(plan, shownServers, planAuthProfile?.name);
+        // ROUND 8 (P1) — the whole-profile map is captured HERE, at shown time,
+        // alongside `shownServers`, so `shownDetail` names each switch's real
+        // target (`after.authProfileId`) as it stood when the modal opened; the
+        // in-lock drift render below uses a FRESH map, so a template retarget or
+        // a profile rename between the two surfaces as ordinary drift.
+        const shownDetail = describePlanDetail(plan, shownServers, planAuthProfile?.name, resolveAuthProfilesById(core));
         const shownDeleteIds = deletePruneIds(plan);
         // Captured alongside the delete set, from the SAME plan this modal
         // renders — these are the servers `shownWarnings` is about to name.
@@ -3400,7 +3781,7 @@ export function registerInventoryCommands(
         // in exactly the case it exists for. Nothing here feeds the drift
         // comparison — choosing Show Warnings ends the command (below), so the
         // names are never a consent artifact something later applies against.
-        const shownWarnings = planWarningsBuffer(plan, planAuthProfile?.name);
+        const shownWarnings = planWarningsBuffer(plan, planAuthProfile?.name, resolveAuthProfilesById(core));
         const buttons = shownWarnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
         const choice = await vscode.window.showInformationMessage(
           `Apply inventory sync from "${source.name}"?`,
@@ -3464,6 +3845,8 @@ export function registerInventoryCommands(
             now: Date.now(),
             authProfile: freshAuthProfile,
             providerInstanceKey: freshInstanceKey,
+            templatesById: resolveTemplatesById(core),
+            authProfilesById: resolveAuthProfilesById(core),
             // ADOPT 1 — the answer given once above governs EVERY recompute of
             // this run. Omitted here, this plan would render adds where the
             // preview rendered adoptions and drift on every pass, looping the
@@ -3489,7 +3872,11 @@ export function registerInventoryCommands(
             { detail: shownDetail, deleteIds: shownDeleteIds, authSwitchIds: shownAuthSwitchIds, adoptionPairs: shownAdoptionPairs },
             recomputed,
             freshServersForRecompute,
-            freshAuthProfile?.name
+            freshAuthProfile?.name,
+            // ROUND 8 (P1) — fresh map, so a template retarget or profile rename
+            // landing while the modal was open renders a different target here
+            // than `shownDetail` captured and drifts.
+            resolveAuthProfilesById(core)
           );
           if (recomputedDrift.drift) {
             return { kind: "retry", plan: recomputed, authProfile: freshAuthProfile };
@@ -3587,6 +3974,8 @@ export function registerInventoryCommands(
             // adoptions must be the one derived from the source it applies
             // against.
             providerInstanceKey: freshInstanceKey,
+            templatesById: resolveTemplatesById(core),
+            authProfilesById: resolveAuthProfilesById(core),
             // ADOPT 1 — same answer, same run. This is the plan that is actually
             // APPLIED, so an answer missed here would not merely loop: it would
             // apply duplicate adds against consent collected for adoptions
@@ -3628,7 +4017,10 @@ export function registerInventoryCommands(
             },
             finalPlan,
             finalServersForRecompute,
-            finalAuthProfile?.name
+            finalAuthProfile?.name,
+            // ROUND 8 (P1) — fresh map again; the awaited teardown / vault re-read
+            // above are a window a template retarget or profile rename can land in.
+            resolveAuthProfilesById(core)
           );
           if (finalDrift.drift) {
             finalRecomputeMismatchCount++;
@@ -3648,10 +4040,26 @@ export function registerInventoryCommands(
           // is the only thing that can still catch that — surface its rejection
           // the same way as the fast-fail check above rather than letting it
           // propagate as an unhandled command rejection.
+          // FIX B (round 10, SECURITY) — capture+delete any stale proxy-password
+          // secret BEFORE the apply publishes the new proxy. connect doesn't take
+          // configMutationLock, so clearing after the apply (round 9) left a leak
+          // window where a connect reads the new proxy config while the old
+          // proxy-password-{id} is still in the vault; see the helper's doc. A
+          // delete failure throws out of the helper (fail closed) → the catch below
+          // restores + aborts; an apply failure restores `cleared` so the still-live
+          // old proxy keeps its password.
           let applyResult: { skippedCount: number; removedServerIds: string[]; removedEmptyFolderCount: number };
+          let cleared: Array<{ key: string; value: string }> = [];
           try {
+            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, finalPlan.updates, finalPlan.adds);
             applyResult = await core.applyInventorySyncPlan(finalApplication);
           } catch (error) {
+            // The apply did NOT commit (or a stale-secret delete failed) — the old
+            // proxy config is still live and needs its password. `cleared` stays
+            // `[]` when the helper itself throws (it restores internally), so this
+            // restore is a no-op in that case and puts the captured values back
+            // when the apply is what threw.
+            await restoreProxyPasswordSecrets(vault, cleared);
             // m4 — same friendly rewording as the fast-path apply above.
             void vscode.window.showErrorMessage(
               isSourceConfigMismatchError(error)
@@ -3660,6 +4068,7 @@ export function registerInventoryCommands(
             );
             return { kind: "abort" };
           }
+          // (stale proxy secrets were already cleared BEFORE the apply above)
 
           // FINDING 1 (P2, reconnect-during-prune review) — nexus.server.connect
           // deliberately doesn't (and shouldn't) take configMutationLock, so a

@@ -15,6 +15,7 @@ import {
   type TunnelRegistryEntry
 } from "../models/config";
 import { sourceConfigUnchanged, type InventorySourceConfig } from "../models/inventory";
+import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
@@ -107,6 +108,7 @@ export class NexusCore {
   private readonly explicitGroups = new Set<string>();
   private readonly authProfiles = new Map<string, AuthProfile>();
   private readonly inventorySources = new Map<string, InventorySourceConfig>();
+  private readonly deviceTemplates = new Map<string, DeviceTemplateProfile>();
   // TOMBSTONE (rollback-vs-live-close race) — set while applyInventorySyncPlan
   // has captured pre-batch session state and is awaiting its persist. Session
   // lifecycle callbacks (onSessionClosed -> unregisterSession) are NOT
@@ -125,15 +127,17 @@ export class NexusCore {
   public constructor(private readonly repository: ConfigRepository) {}
 
   public async initialize(): Promise<void> {
-    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles, inventorySources] = await Promise.all([
-      this.repository.getServers(),
-      this.repository.getTunnels(),
-      this.repository.getSerialProfiles(),
-      this.repository.getLocalShellProfiles(),
-      this.repository.getGroups(),
-      this.repository.getAuthProfiles(),
-      this.repository.getInventorySources()
-    ]);
+    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles, inventorySources, deviceTemplates] =
+      await Promise.all([
+        this.repository.getServers(),
+        this.repository.getTunnels(),
+        this.repository.getSerialProfiles(),
+        this.repository.getLocalShellProfiles(),
+        this.repository.getGroups(),
+        this.repository.getAuthProfiles(),
+        this.repository.getInventorySources(),
+        this.repository.getDeviceTemplates()
+      ]);
     this.servers.clear();
     this.tunnels.clear();
     this.serialProfiles.clear();
@@ -141,6 +145,7 @@ export class NexusCore {
     this.explicitGroups.clear();
     this.authProfiles.clear();
     this.inventorySources.clear();
+    this.deviceTemplates.clear();
     const normalizedServers = normalizeFileExplorerAutoOpenOwner(servers);
     for (const server of normalizedServers.servers) {
       this.servers.set(server.id, server);
@@ -163,6 +168,9 @@ export class NexusCore {
     for (const source of inventorySources) {
       this.inventorySources.set(source.id, source);
     }
+    for (const template of deviceTemplates) {
+      this.deviceTemplates.set(template.id, template);
+    }
     if (normalizedServers.changed) {
       await this.repository.saveServers(normalizedServers.servers);
     }
@@ -184,7 +192,8 @@ export class NexusCore {
       authProfiles: [...this.authProfiles.values()],
       activitySessionIds: new Set(this.activitySessionIds),
       focusedSessionId: this.focusedSessionId,
-      inventorySources: [...this.inventorySources.values()]
+      inventorySources: [...this.inventorySources.values()],
+      deviceTemplates: [...this.deviceTemplates.values()]
     };
   }
 
@@ -374,6 +383,38 @@ export class NexusCore {
         this.inventorySources.set(id, { ...source, authProfileId: undefined, revision: randomUUID() });
       }
     }
+    // DEVICE TEMPLATES (PR-T1, §8.4) — a template's `fields.authProfileId` names
+    // this same AuthProfile store, so a deletion must clear it there too: a link
+    // naming a profile that no longer exists resolves to nothing on every sync,
+    // with nothing on screen to say why. The template is re-revisioned like the
+    // sources — but note what that does and does NOT buy in T1. The full mid-sync
+    // template-revision drift fast-fail (capturing each referenced template's
+    // revision at fetch time and comparing it before apply) is DEFERRED TO T1b,
+    // and NOT because no T1 path mutates a template: THIS method re-revisions
+    // every template that links the deleted profile, and `removeDeviceTemplate`
+    // re-revisions the sources that reference the deleted template — both are
+    // reachable in T1. It is deferred because (i) the window is narrow (a
+    // `removeAuthProfile` landing mid-apply of an already-in-flight plan),
+    // (ii) the worst outcome is a dangling `authProfileId` that degrades to SSH
+    // agent auth at connect time — not data loss or a security hole — and
+    // (iii) the fuller guard belongs with T1b's template-authoring UI, which is
+    // when templates first become user-mutable at all (in T1 they arrive only by
+    // import). KNOWN RESIDUAL the T1b guard closes: when a profile is referenced
+    // ONLY by a template (never by a `source.authProfileId`), deleting it
+    // re-revisions the template but NOT any source, so the shipped
+    // `sourceConfigUnchanged` pre-apply guard does not catch it, and it does not
+    // self-heal — the profile is not in `profilesNeedingServerKey`, so no AUTH 2b
+    // rollback fires; only an override rule or a manual edit reclaims the link.
+    // The server-side stamp (`syncedAuthProfileId`) is already handled above via
+    // the shared stamp; this is the SOURCE of the link, not the record of it.
+    const previousTemplates = new Map<string, DeviceTemplateProfile>();
+    for (const [id, template] of this.deviceTemplates.entries()) {
+      if (template.fields.authProfileId?.value === profileId) {
+        previousTemplates.set(id, template);
+        const { authProfileId: _authProfileId, ...restFields } = template.fields;
+        this.deviceTemplates.set(id, { ...template, fields: restFields, revision: randomUUID() });
+      }
+    }
     // The emission is in a `finally`, not on the success path: by the time any
     // of these saves can reject, the profile is already gone from this.authProfiles
     // and the server references are already cleared in memory (and, past the
@@ -397,6 +438,13 @@ export class NexusCore {
         if (previousSources.size > 0) {
           await this.repository.saveInventorySources([...this.inventorySources.values()]);
         }
+        // DEVICE TEMPLATES (PR-T1, §8.4) — last in the ordered persist chain
+        // (authProfiles gate -> servers -> inventorySources -> deviceTemplates),
+        // written only when it actually changed, on the same "the profile record
+        // must leave disk before its references do" argument the sources follow.
+        if (previousTemplates.size > 0) {
+          await this.repository.saveDeviceTemplates([...this.deviceTemplates.values()]);
+        }
       } catch (error) {
         // FINDING A / FINDING 2 — restore the sources for a rejection that
         // happened BEFORE the profile record left disk, then rethrow. A no-op
@@ -412,6 +460,14 @@ export class NexusCore {
         if (!deletionCommitted) {
           for (const [id, source] of previousSources) {
             this.inventorySources.set(id, source);
+          }
+          // DEVICE TEMPLATES (PR-T1, §8.4) — restored on the same pre-commit
+          // terms as the sources, and skipped once the deletion has committed
+          // for the same reason (re-linking a template to a profile that no
+          // longer exists, and can no longer be deleted, is worse than leaving
+          // the field cleared).
+          for (const [id, template] of previousTemplates) {
+            this.deviceTemplates.set(id, template);
           }
         }
         throw error;
@@ -511,6 +567,94 @@ export class NexusCore {
       throw error;
     }
     this.emitChanged();
+  }
+
+  public getDeviceTemplate(id: string): DeviceTemplateProfile | undefined {
+    return this.deviceTemplates.get(id);
+  }
+
+  /**
+   * DEVICE TEMPLATES (PR-T1) — the map mutation happens first (repo-wide
+   * in-memory-first pattern), with a rejected persist leaving NO trace, exactly
+   * like `addOrUpdateInventorySource`. Every write is a new INCARNATION: a fresh
+   * `revision` is assigned here, unconditionally (even if `template` already
+   * carries one), so the mid-sync template-revision drift fast-fail can tell an
+   * old incarnation from a new one. That comparison itself is DEFERRED TO T1b
+   * (see `removeAuthProfile` for why, and for the residual it leaves): T1 mints
+   * the revision but does not yet compare it, so this write does not by itself
+   * abort an in-flight sync today.
+   */
+  public async addOrUpdateDeviceTemplate(template: DeviceTemplateProfile): Promise<void> {
+    const hadPrevious = this.deviceTemplates.has(template.id);
+    const previous = this.deviceTemplates.get(template.id);
+    const withRevision: DeviceTemplateProfile = { ...template, revision: randomUUID() };
+    this.deviceTemplates.set(template.id, withRevision);
+    try {
+      await this.repository.saveDeviceTemplates([...this.deviceTemplates.values()]);
+    } catch (error) {
+      if (hadPrevious) {
+        this.deviceTemplates.set(template.id, previous!);
+      } else {
+        this.deviceTemplates.delete(template.id);
+      }
+      throw error;
+    }
+    this.emitChanged();
+  }
+
+  /**
+   * DEVICE TEMPLATES (PR-T1, §6.2) — remove the template record and clear every
+   * `templateRules` entry referencing it on every source (re-revisioned so an
+   * in-flight sync aborts). Applied values and stamps on servers are KEPT (row
+   * 5: sync-owned, reclaimable) — there is NO server write at delete time, so
+   * deletion is O(sources), not O(fleet).
+   *
+   * PERSIST ORDER (m11) — the `removeAuthProfile` in-memory-first + ordered
+   * persist + rollback discipline with `saveDeviceTemplates` in the commit-gate
+   * position: capture previous sources -> mutate maps -> saveDeviceTemplates
+   * (deletionCommitted flips true here) -> saveInventorySources. A rejection
+   * BEFORE the gate restores the captured sources in memory (map matches disk,
+   * delete stays retryable); a rejection AFTER it keeps the source clears (the
+   * "next foreign saveInventorySources heals disk" property). Emission in a
+   * `finally`, once.
+   */
+  public async removeDeviceTemplate(id: string): Promise<void> {
+    const hadPrevious = this.deviceTemplates.has(id);
+    const previousTemplate = this.deviceTemplates.get(id);
+    this.deviceTemplates.delete(id);
+    const previousSources = new Map<string, InventorySourceConfig>();
+    for (const [sourceId, source] of this.inventorySources.entries()) {
+      const rules = source.templateRules;
+      if (rules && rules.some((rule) => rule.templateId === id)) {
+        previousSources.set(sourceId, source);
+        const remaining = rules.filter((rule) => rule.templateId !== id);
+        this.inventorySources.set(sourceId, { ...source, templateRules: remaining, revision: randomUUID() });
+      }
+    }
+    let deletionCommitted = false;
+    try {
+      try {
+        if (hadPrevious) {
+          await this.repository.saveDeviceTemplates([...this.deviceTemplates.values()]);
+        }
+        deletionCommitted = true;
+        if (previousSources.size > 0) {
+          await this.repository.saveInventorySources([...this.inventorySources.values()]);
+        }
+      } catch (error) {
+        if (!deletionCommitted) {
+          if (hadPrevious && previousTemplate !== undefined) {
+            this.deviceTemplates.set(id, previousTemplate);
+          }
+          for (const [sourceId, source] of previousSources) {
+            this.inventorySources.set(sourceId, source);
+          }
+        }
+        throw error;
+      }
+    } finally {
+      this.emitChanged();
+    }
   }
 
   /**

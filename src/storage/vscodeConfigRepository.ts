@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
 import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
+import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { ConfigRepository } from "../core/contracts";
 import {
   validateServerConfig,
@@ -9,6 +10,7 @@ import {
   validateAuthProfile,
   validateLocalShellProfile,
   validateInventorySource,
+  validateDeviceTemplate,
   isValidServerOrigin,
   isValidDetachedServerOrigin
 } from "../utils/validation";
@@ -20,6 +22,7 @@ const LOCAL_SHELL_PROFILES_KEY = "nexus.localShellProfiles";
 const GROUPS_KEY = "nexus.groups";
 const AUTH_PROFILES_KEY = "nexus.authProfiles";
 const INVENTORY_SOURCES_KEY = "nexus.inventorySources";
+const DEVICE_TEMPLATES_KEY = "nexus.deviceTemplates";
 
 /**
  * `globalState.get(key, [])` only substitutes the default when the key is ABSENT.
@@ -194,5 +197,26 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async saveInventorySources(sources: InventorySourceConfig[]): Promise<void> {
     await this.context.globalState.update(INVENTORY_SOURCES_KEY, sources);
+  }
+
+  public async getDeviceTemplates(): Promise<DeviceTemplateProfile[]> {
+    // DEVICE TEMPLATES (PR-T1) — same load-time backfill as inventory sources:
+    // a template persisted before the `revision` field existed is given one
+    // here, so every in-memory record this process hands out has one. Does not
+    // rewrite disk (the next saveDeviceTemplates does, incidentally).
+    const raw = asArray<DeviceTemplateProfile>(this.context.globalState.get(DEVICE_TEMPLATES_KEY, []));
+    return raw
+      .filter((item) => {
+        if (validateDeviceTemplate(item)) {
+          return true;
+        }
+        console.warn("[Nexus] Skipping invalid device template entry:", JSON.stringify(item));
+        return false;
+      })
+      .map(ensureDeviceTemplateRevision);
+  }
+
+  public async saveDeviceTemplates(templates: DeviceTemplateProfile[]): Promise<void> {
+    await this.context.globalState.update(DEVICE_TEMPLATES_KEY, templates);
   }
 }

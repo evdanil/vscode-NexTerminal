@@ -65,7 +65,8 @@ export class TunnelTreeProvider
     authProfiles: [],
     activitySessionIds: new Set(),
     focusedSessionId: undefined,
-    inventorySources: []
+    inventorySources: [],
+    deviceTemplates: []
   };
 
   public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, "text/plain"];

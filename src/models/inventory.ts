@@ -198,6 +198,31 @@ export class InventoryProviderError extends Error {
 
 export type InventoryPrunePolicy = "delete" | "orphan" | "keep";
 
+/**
+ * DEVICE TEMPLATES (issue #48 PR-T1) — one filter-scoped rule attaching a
+ * `DeviceTemplateProfile` to some subset of a source's synced devices.
+ *
+ * Lives on the SOURCE (not the template) because *which devices get a template*
+ * is source vocabulary (`role=switch` is NetBox's dialect), while the template
+ * is a provider-agnostic bundle of values two sources can apply under different
+ * filters. Rides the source record's existing persistence, `revision`
+ * semantics, and backup round-trip.
+ */
+export interface TemplateRule {
+  id: string; // randomUUID — stable identity for warnings/UI, survives reorder
+  /**
+   * Same query-string syntax as the NetBox Device Filter field
+   * ("role=switch&site=syd"). Absent, "", or whitespace-only = catch-all
+   * (matches every device). Matched CLIENT-SIDE against device attributes — but
+   * the matcher (`deviceMatchesFilter`) and device attributes are PR-T2, so a
+   * PR-T1 engine has no way to EVALUATE a real filter and FAILS CLOSED on one
+   * (skips the rule with a plan warning; see services/inventory/templateApply.ts
+   * and §7.2). Only catch-all rules are honoured until the matcher ships.
+   */
+  filter?: string;
+  templateId: string; // DeviceTemplateProfile.id
+}
+
 export interface InventorySourceConfig {
   id: string; // randomUUID at creation
   providerId: string;
@@ -313,6 +338,30 @@ export interface InventorySourceConfig {
   // warning rather than failing the sync. See computeSyncPlan in
   // services/inventory/syncEngine.ts for both rules.
   authProfileId?: string;
+  /**
+   * DEVICE TEMPLATES (issue #48 PR-T1) — filter-scoped device-template rules.
+   * Optional for backward compat like every post-1.0 source field: absent means
+   * "no rules", bit-identical to today. See `TemplateRule` above and
+   * `validateInventorySource` (utils/validation.ts) for the tolerant shape
+   * clause. The `revision` path already covers live records in
+   * `sourceConfigUnchanged`; the structural fallback below gains rule comparison
+   * so a legacy-record comparison cannot call a rule-only change "unchanged".
+   */
+  templateRules?: TemplateRule[];
+}
+
+/**
+ * DEVICE TEMPLATES (PR-T1) — structural comparison of two `templateRules`
+ * lists, used only by `sourceConfigUnchanged`'s legacy-record fallback (live
+ * records are decided by revision). Order-sensitive and field-wise: a reorder,
+ * an added/removed rule, or a changed filter/templateId is a difference. Absent
+ * and `[]` compare equal (both "no rules").
+ */
+function templateRulesEqual(a: TemplateRule[] | undefined, b: TemplateRule[] | undefined): boolean {
+  const ar = a ?? [];
+  const br = b ?? [];
+  if (ar.length !== br.length) return false;
+  return ar.every((rule, i) => rule.id === br[i].id && rule.filter === br[i].filter && rule.templateId === br[i].templateId);
 }
 
 /**
@@ -448,6 +497,13 @@ export function sourceConfigUnchanged(a: InventorySourceConfig, b: InventorySour
     a.defaultUsername === b.defaultUsername &&
     a.authProfileId === b.authProfileId &&
     inventorySourceValuesEqual(a.config, b.config) &&
-    secretFieldIdsEqual(a.secretFieldIds, b.secretFieldIds)
+    secretFieldIdsEqual(a.secretFieldIds, b.secretFieldIds) &&
+    // DEVICE TEMPLATES (PR-T1) — compared in the structural fallback ONLY, like
+    // every other field here: once both sides carry a revision, the revision
+    // already decides (every write through addOrUpdateInventorySource mints a
+    // fresh one, so a rule edit on a live record is caught there). The fallback
+    // needs it so a legacy-record comparison cannot call a rule-only change
+    // "unchanged" and let a tree fetched under the old rules apply.
+    templateRulesEqual(a.templateRules, b.templateRules)
   );
 }
