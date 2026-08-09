@@ -286,6 +286,7 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
           ? [{ label: "Browse Files", command: "nexus.files.browse" }]
           : []),
         { label: "Connect and Run Script", command: "nexus.server.runWithScript" },
+        { label: "Run Macro on Server…", command: "nexus.server.runMacro" },
         { label: "Edit", command: "nexus.server.edit" },
         { label: "Duplicate", command: "nexus.server.duplicate" },
         { label: "Copy Connection Info", command: "nexus.server.copyInfo" },

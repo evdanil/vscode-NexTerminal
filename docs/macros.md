@@ -19,7 +19,7 @@ presses Enter.
 
 If you want a macro that asks you for input every time it runs — a host, a
 username, a password — skip ahead to **Variables**, below, and start from the
-**Prompted command** template instead of **Send command**.
+**IPMI SOL console** template instead of **Send command**.
 
 ## Blank Macros vs Template Macros
 
@@ -41,9 +41,12 @@ Built-in templates include:
   appears.
 - **Scoped auto-trigger example**: shows a prompt-triggered command that starts
   paused until you resume it.
-- **Prompted command**: prompts for host, username, and password, then sends a
-  templated `ipmitool` command — a complete worked example of **Variables**
-  (below).
+- **IPMI SOL console**: prompts for a username and password, fills the BMC
+  address in from the server profile, and runs a templated `ipmitool` command in
+  a local terminal — a complete worked example of **Variables** (below) and of
+  **Profile tokens**.
+- **Launch IPMI web console**: opens a server's BMC web interface in the
+  browser, using the profile's IPMI / BMC Host.
 
 ## Sending Text and Newlines
 
@@ -108,7 +111,7 @@ the Text field in the Macro Editor to catch that.
 ### Declaring a variable
 
 Open a macro in the Macro Editor and use the new **Variables** section, or
-start from the **Prompted command** template (see Quick Start, above). Each
+start from the **IPMI SOL console** template (see Quick Start, above). Each
 variable has:
 
 - **Name** — must match `/^[A-Za-z_][A-Za-z0-9_]{0,31}$/` (letters, digits, and
@@ -156,17 +159,19 @@ sent this time.
 
 ### Worked example: IPMI SOL console
 
-The **Prompted command** template starts from this macro:
+The **IPMI SOL console** template starts from this macro:
 
 ```
-Text:      ipmitool -I lanplus -H $host -U $username -P $password sol activate
-Variables: host (Host), username (Username), password (Password, masked)
+Text:      ipmitool -I lanplus -H ${profile.ipmiHost} -U $username -P $password sol activate
+Run in:    Local terminal
+Variables: username (Username), password (Password, masked)
 ```
 
-Running it prompts for the host, then the username, then the password (masked,
-never remembered), in that order, then sends the filled-in command line to the
-terminal you invoked it from — even if you switch to a different terminal tab
-while the prompts are still open.
+The BMC address is not prompted for — it is read from the server profile you
+run the macro against (see **Profile tokens**, below). Running it prompts for
+the username, then the password (masked, never remembered), then sends the
+filled-in command line to a local terminal — even if you switch to a different
+terminal tab while the prompts are still open.
 
 ### Which terminal receives the macro
 
@@ -238,6 +243,174 @@ recorded in that shell's own history. In bash or zsh, set
 This only affects the remote shell's own history file. It does not change
 anything about how Nexus stores or remembers the macro or its variables — see
 **Not protected**, above.
+
+## Profile tokens
+
+A macro can pull facts out of the **server profile it is run against**, so you
+do not retype what Nexus already knows. Write them as `${profile.<field>}`:
+
+| Token | Resolves to |
+|---|---|
+| `${profile.name}` | the profile's name |
+| `${profile.host}` | its SSH host |
+| `${profile.port}` | its SSH port |
+| `${profile.username}` | the username it connects as — the linked **auth profile**'s where one supplies it, the server's own otherwise |
+| `${profile.ipmiHost}` | its **IPMI / BMC Host** (Advanced section of the server form) |
+
+Nothing else is exposed — key paths, ids and inventory bookkeeping are
+deliberately not addressable.
+
+Profile tokens are a different namespace from macro variables, so they never
+collide: a macro can declare a variable named `host` and use `$host` **and**
+`${profile.host}` in the same text; the first is still prompted for, the second
+is filled in from the profile. `$${profile.host}` escapes the token and sends
+the literal text. A token that is not in the table above is sent as-is — a typo
+is never fatal, and the send confirmation says which token went out verbatim.
+
+### Running a profile macro
+
+Right-click a server in the Connectivity Hub and choose **Run Macro on Server…**
+(also available from **Profile Actions**). The picker lists every macro, with
+profile-token macros first. Tokens then resolve against **that server** — not
+against whatever terminal happens to be active.
+
+If the server has no value for a field the macro needs (typically **IPMI / BMC
+Host**), the run is refused with a message naming the server and the field, and
+an **Edit Server** button. Nexus never sends a command containing an unresolved
+token, and never one with the argument silently emptied.
+
+Values are also checked before they are substituted, and every token is
+checked:
+
+| Token | Accepted |
+|---|---|
+| `${profile.host}`, `${profile.ipmiHost}` | letters, digits, `.`, `-`, `_`, `:` — the address only, no `https://` and no path. `[` and `]` only as a whole bracketed IPv6 literal, with an optional port: `[fe80::1]`, `[::ffff:10.0.0.1]`, `[fe80::1]:623` |
+| `${profile.port}` | digits |
+| `${profile.username}` | letters, digits, `.`, `_`, `-`, and at most one `@` *between* the name and the realm — `admin`, `first.last`, `user@REALM.EXAMPLE.COM`. A leading, trailing or repeated `@` is refused |
+| `${profile.name}` | letters, digits (any language — accents included), spaces, and `.`, `-`, `_`, `/`, `:`, `,`, `+`. Everything else is refused |
+
+No value may contain a `$` or a backtick, in any token. A profile carrying shell
+syntax — which can reach your config through an inventory sync or an imported
+backup — refuses the run instead of executing it, and the message names the
+offending value and what the field accepts. This is a charset check, not
+quoting: the rest of the command line is still yours to quote (see **No
+automatic quoting**).
+
+The shell a **Local terminal** macro lands in is whichever default profile you
+have configured — PowerShell or Command Prompt on Windows, zsh on macOS, usually
+bash on Linux — so a profile **name** is checked against an *allowed* set rather
+than a list of banned characters. A character is on that list only if it does
+nothing in *any* of those four shells: it cannot make one execute something,
+expand something, or throw away the rest of your command line.
+
+That allowed set is: letters, digits and accents in any language, a space, and
+the eight punctuation marks `.`, `-`, `_`, `/`, `:`, `,`, `+`. Anything else —
+`(`, `)`, `{`, `}`, `%`, `!`, `*`, `?`, `[`, `]`, `~`, `#`, `^`, `=`, `@`,
+quotes, `;`, `\|`, `&`, `<`, `>`, `\`, `$`, a backtick, and symbols such as `°`
+or an emoji — is refused, and the message tells you what *is* accepted.
+
+**Why an allowed set and not a banned one.** Earlier versions of Nexus banned a
+list of shell metacharacters in a profile name, and that list needed widening
+four times, each time because one more character turned out to have a role
+somebody had not enumerated: PowerShell evaluates `(…)` even in argument
+position; cmd.exe expands `%VAR%` while it parses the line; bash expands `!!`
+into a previous command, and `*`, `?`, `[`, `]` and `~` into filenames and home
+directories, before anything runs; `#` starts a comment, so it silently *deletes*
+the rest of the command your macro was written to send. The fifth was the one
+that settled it: a `^` at the start of a line is bash **quick substitution**
+(`^old^new^`, shorthand for `!!:s/old/new/`), which rewrites your previous
+command and runs the result — and the old list had explicitly reasoned that `^`
+was harmless because it is only an escape character in cmd.exe.
+
+Meanwhile the *address*, *port* and *username* fields, which have always used an
+allowed set, needed no such widening. An allowed set refuses a character nobody
+has thought about yet; a banned list waves it through. `=` and `@` show what that
+buys: `=ls` at the start of a word is a zsh path expansion (on by default, and
+zsh is the default shell on macOS), and `@name` in PowerShell splices the
+contents of a session variable into a command's arguments. Neither was on any
+banned list; both are simply absent from the allowed one. (`@` stays legal in
+**Username**, where `user@REALM` is a real account name — but only *between* the
+name and the realm. A username of `@args` is a single word beginning with `@`,
+which is the splatting form itself, so a leading, trailing or repeated `@` is
+refused there too.)
+
+Rename the profile — `Core Switch DC1` rather than `Core Switch (DC1)`,
+`Rack A - Spare` rather than `Rack A [Spare]`, `Device 4` rather than
+`Device #4`, `Rack 4 - Spare` rather than `Rack 4 ^ Spare` — or escape the token
+(`$${profile.name}`) if you only want the literal text. Ordinary labels are
+unaffected: `Rack 4 / Ünit 2`, `dc1.rack4.unit2`, `DC1: Core Switch` and
+`Ærø-Süd Ünit 2` all resolve.
+
+`${profile.host}` and `${profile.ipmiHost}` still accept square brackets, but
+only as a **whole bracketed IPv6 literal** — `[fe80::1]` or `[fe80::1]:623`, and
+the part inside the brackets has to parse as an IPv6 address. A value with a
+bracket anywhere else (`a[b]c`) or a bracket expression dressed up as an address
+(`[abc]`) is refused: unquoted in a local command it is a glob, not an address.
+
+### IPv6 in a browser macro
+
+Store the address the way you would type it anywhere else — `fe80::1`, no
+brackets. In a **Browser** macro the whole text is a URL, and a URL needs an
+IPv6 address bracketed *where the address is the host*, so Nexus adds the
+brackets there: `https://${profile.ipmiHost}/` on a server whose IPMI / BMC Host
+is `fe80::1` opens `https://[fe80::1]/`. Nothing else changes shape — a value you
+already stored bracketed (`[fe80::1]`, `[fe80::1]:623`) is used as written and
+never double-bracketed, and a host:port that merely contains a colon
+(`bmc.example.com:8443`) is left exactly as it is.
+
+The brackets are added **only in the host part of the URL** — between `://` and
+the next `/`, `?` or `#`. A token anywhere else is a value, not a host, and gets
+the address exactly as you stored it:
+
+```
+https://${profile.host}/status           →  https://[fe80::1]/status
+https://gateway/connect?to=${profile.host}  →  https://gateway/connect?to=fe80::1
+https://gateway/host/${profile.host}     →  https://gateway/host/fe80::1
+```
+
+Each token in a macro is decided on its own, so a macro that uses one in the host
+and one in the query gets brackets on the first and not the second. The scheme
+may itself come from a prompted variable — `${scheme}://${profile.ipmiHost}/` is
+recognised as a URL and its host bracketed, exactly as a literal `https://` one
+is (an *escaped* `$${scheme}` is literal text, so it is not a scheme). If the
+macro text has no `scheme://` at all, nothing is bracketed — the text is not a
+URL, and Nexus refuses it with that message instead.
+
+**Session terminal** and **Local terminal** macros get the raw value, with no
+brackets added: `-H fe80::1` is what `ipmitool` expects. If you need the
+bracketed form on a command line, store it bracketed — it is accepted for both
+address fields.
+
+A macro that uses profile tokens cannot auto-trigger, whichever **Run in** it
+has: a rule fired by terminal output has no server to resolve the tokens
+against. The macro editor refuses the combination, and a macro that reaches the
+store some other way (a hand-edited settings file, an import) simply never
+compiles a trigger rule.
+
+## Where a macro runs
+
+**Run in**, in the macro editor, decides where the resolved text goes:
+
+- **Session terminal** (default, and what every existing macro does) — the
+  connected session. From **Run Macro on Server…** that means a session *of
+  that server*; if it is not connected, Nexus offers to connect first.
+- **Local terminal** — a new VS Code terminal on your own machine. This is
+  where `ipmitool` runs. As in a session, the macro's own trailing newline
+  decides whether the line executes.
+- **Browser** — the text is a URL, opened with your default browser. Only
+  `http://` and `https://` are accepted; anything else is refused. A profile
+  address that is a bare IPv6 literal is bracketed for you (see **IPv6 in a
+  browser macro**).
+
+Local terminal and Browser macros need a server profile to resolve against, so
+run them from **Run Macro on Server…**. Neither can auto-trigger: firing a
+browser window, or a local command, on every matching line of terminal output
+is not something a pattern match should be able to do.
+
+An older Nexus build that does not know **Run in** treats such a macro as an
+ordinary session macro. The shipped **Launch IPMI web console** template
+therefore stores its URL without a trailing newline: on such a build it is
+pasted into a terminal rather than executed.
 
 ## Keybindings
 

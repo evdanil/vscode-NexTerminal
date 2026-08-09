@@ -204,6 +204,11 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDes
       visibleWhen: vw
     },
     { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, hint: "Private key used when Authentication is Private Key.", visibleWhen: vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "authType", value: "key" }] : { field: "authType", value: "key" } },
+    // Not part of the SSH connection at all — it is the out-of-band address
+    // `${profile.ipmiHost}` resolves to when a macro is run against this
+    // profile (services/profileTokens.ts). Advanced, because a server that has
+    // no BMC should not be asked about one.
+    { type: "text", key: "ipmiHost", label: "IPMI / BMC Host", placeholder: "10.0.0.1 or bmc.example.com", value: seed?.ipmiHost, hint: "Optional out-of-band management address — the address only, no https:// or path (e.g. 10.0.0.1, not https://10.0.0.1/). Used by macros through ${profile.ipmiHost}; never used to connect over SSH.", advanced: true, visibleWhen: vw },
     { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, hint: "Overrides the global multiplexing setting for this server.", advanced: true, visibleWhen: vw },
     { type: "checkbox", key: "legacyAlgorithms", label: "Enable legacy SSH algorithms", value: seed?.legacyAlgorithms ?? false, hint: "Use only for older devices that reject modern SSH algorithms.", advanced: true, visibleWhen: vw }
   ];

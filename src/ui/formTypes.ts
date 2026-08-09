@@ -47,6 +47,13 @@ export interface FormDefinition {
   testable?: boolean;
   /** Optional visibility rule for the "Test Connection" button. */
   testableWhen?: VisibleWhen;
+  /**
+   * Renders the "Advanced options" section already open. Set by a caller that
+   * is sending the user to a field living inside it — an error naming
+   * "IPMI / BMC Host" is a dead end if the form opens with that field
+   * collapsed out of sight.
+   */
+  expandAdvanced?: boolean;
 }
 
 export type FormValues = Record<string, string | number | boolean | undefined>;

@@ -8,6 +8,7 @@ import {
   authProfileOwnedCredentials,
   authProfileOwnershipSignature,
   cloneServerConfig,
+  effectiveServerUsername,
   formOfferedServerCredentials,
   mergeServerConfigFields,
   serverConfigsEqual
@@ -40,7 +41,7 @@ import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 import { configMutationLock } from "../services/configMutationLock";
 
-async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
+export async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
   if (servers.length === 0) {
     vscode.window.showWarningMessage("No Nexus servers configured");
@@ -60,7 +61,7 @@ async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<
   return pick?.server;
 }
 
-function toServerFromArg(
+export function toServerFromArg(
   core: import("../core/nexusCore").NexusCore,
   arg: unknown
 ): ServerConfig | undefined {
@@ -356,7 +357,7 @@ function resolveEffectiveUsername(core: import("../core/nexusCore").NexusCore, s
   if (!server.authProfileId) {
     return server.username;
   }
-  return authProfileOwnedCredentials(core.getAuthProfile(server.authProfileId)).username ?? server.username;
+  return effectiveServerUsername(server, core.getAuthProfile(server.authProfileId));
 }
 
 function buildStandaloneKeyServer(server: ServerConfig, username: string, privateKeyPath: string): ServerConfig {
@@ -629,6 +630,10 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     username,
     authType: isAuthType(values.authType) ? values.authType : "password",
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
+    // Trimmed and blank-canonicalized like every other optional text field: an
+    // all-whitespace value would otherwise read as "set" here and as "not set"
+    // in `resolveProfileTokens`, which trims before it decides.
+    ipmiHost: typeof values.ipmiHost === "string" && values.ipmiHost.trim() ? values.ipmiHost.trim() : undefined,
     group: normalizedGroup,
     isHidden: preserveIsHidden,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
@@ -839,11 +844,24 @@ function hasActiveTunnelsForServer(ctx: CommandContext, serverId: string): boole
   return ctx.core.getSnapshot().activeTunnels.some((tunnel) => tunnel.serverId === serverId);
 }
 
-interface ConnectServerOptions {
+export interface ConnectServerOptions {
   allowAutoFileExplorer?: boolean;
+  /**
+   * REVIEW FINDING (P2) — the session this call created never came up: its
+   * initial SSH connect failed (`SshPtyCallbacks.onConnectFailed`,
+   * services/ssh/sshPty.ts). `connectServer` itself RESOLVES in that case —
+   * it resolves once the terminal exists, and the connect runs inside the pty
+   * afterwards — so a caller that waits for the session to register needs this
+   * to know the wait is over. It fires after `connectServer`'s own promise has
+   * settled, hence a callback rather than a return value or a rejection.
+   *
+   * The SSH layer has already reported the CAUSE to the user by the time this
+   * fires; a handler should say only what it adds (what did not happen next).
+   */
+  onConnectFailed?: (message: string) => void;
 }
 
-async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
+export async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
     return;
@@ -965,6 +983,9 @@ async function connectServer(ctx: CommandContext, arg?: unknown, options: Connec
             // alive for reconnect) and do NOT stop auto-stop tunnels — they
             // will be cleaned up when the terminal is fully closed via
             // onSessionClosed.
+          },
+          onConnectFailed: (_sessionId, message) => {
+            options.onConnectFailed?.(message);
           },
           onDataReceived: (sessionId) => {
             if (terminalRef && ctx.focusedTerminal !== terminalRef) {
@@ -1227,6 +1248,12 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const snapshot = ctx.core.getSnapshot();
       const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
       const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
+      // Issue #48 — a caller that is sending the user here to fill in an
+      // advanced field (a `${profile.ipmiHost}` refusal) says so, and the
+      // section opens instead of hiding the field the error just named.
+      if (arg && typeof arg === "object" && (arg as { expandAdvanced?: unknown }).expandAdvanced === true) {
+        definition.expandAdvanced = true;
+      }
       const inlineAuthProfile = createInlineAuthProfileCreation(ctx);
       // REVIEW FINDING (P1) — the profile shape this form is currently showing
       // credentials from, checked against live state at Save by
@@ -1748,9 +1775,13 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!server) {
         return;
       }
-      const info = `${server.username}@${server.host}:${server.port}`;
+      // Issue #48 — the BMC address rides along when there is one: whoever is
+      // copying connection details to paste into a ticket or a shell wants it
+      // too, and it is otherwise only visible behind the form's Advanced section.
+      const ipmiHost = typeof server.ipmiHost === "string" ? server.ipmiHost.trim() : "";
+      const info = `${server.username}@${server.host}:${server.port}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
       await vscode.env.clipboard.writeText(info);
-      void vscode.window.showInformationMessage(`Copied: ${info}`);
+      void vscode.window.showInformationMessage(`Copied: ${info.replace(/\n/g, "  ")}`);
     }),
 
     vscode.commands.registerCommand("nexus.server.duplicate", async (arg?: unknown) => {

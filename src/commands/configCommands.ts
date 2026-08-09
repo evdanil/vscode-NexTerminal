@@ -45,6 +45,7 @@ import { isValidBinding } from "../macroBindings";
 import {
   VALID_MACRO_TRIGGER_SCOPES,
   canonicalMacroBinding,
+  canonicalMacroRunTarget,
   canonicalMacroSecret,
   canonicalMacroTriggerTerms,
   canonicalMacroVariableTerms,
@@ -930,7 +931,11 @@ export function keyOf(m: TerminalMacro): string {
     m.text ?? "",
     ...canonicalMacroTriggerTerms(m),
     canonicalMacroBinding(m),
-    canonicalMacroVariableTerms(m)
+    canonicalMacroVariableTerms(m),
+    // Issue #48 — where the macro RUNS is something the runtime can see (a
+    // session send versus a local terminal versus a browser window), so two
+    // records differing only in `runIn` are two macros and must not collide.
+    canonicalMacroRunTarget(m)
   ]);
 }
 

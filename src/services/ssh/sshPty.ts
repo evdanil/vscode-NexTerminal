@@ -26,6 +26,22 @@ export interface SshPtyCallbacks {
   onSessionClosed(sessionId: string): void;
   onDisconnected?(sessionId: string): void;
   onDataReceived?(sessionId: string): void;
+  /**
+   * REVIEW FINDING (P2) — the INITIAL connect attempt failed (auth refused,
+   * host unreachable, proxy error). Optional and purely additive: the
+   * error-handling contract around it is unchanged — the failure is still
+   * swallowed here, the terminal is still left open holding the "Press any key
+   * to close" notice, and `showErrorMessage` below still names the cause. This
+   * exists because that is ALL that happens: no session is ever registered, the
+   * pty is not disposed, and `closeEmitter` never fires, so a caller waiting on
+   * "a session for this server appeared" has nothing else to observe and sits
+   * out its whole watchdog (see `connectAndAwaitSessionTerminal`,
+   * commands/serverMacroCommands.ts).
+   *
+   * Fires at most once per pty, and NEVER for a failed *reconnect* — that path
+   * rethrows to `reconnect()` above, which owns its own reporting.
+   */
+  onConnectFailed?(sessionId: string, message: string): void;
 }
 
 export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
@@ -338,6 +354,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.connectFailed = true;
       this.writeEmitter.fire(`\r\n[Nexus SSH] Connection failed: ${message}\r\n`);
       this.writeEmitter.fire("\r\n[Nexus SSH] Press any key to close this terminal.\r\n");
+      this.callbacks.onConnectFailed?.(this.sessionId, message);
       void vscode.window.showErrorMessage(`Nexus SSH connection failed for ${this.serverConfig.name}: ${message}`);
     }
   }

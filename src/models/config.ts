@@ -176,6 +176,19 @@ export interface ServerConfig {
   logSession?: boolean;
   multiplexing?: boolean;  // undefined = follow global, false = always standalone
   legacyAlgorithms?: boolean;
+  /**
+   * Out-of-band management address (IPMI / BMC / Redfish), e.g. `10.0.0.1` or
+   * `bmc.example.com`. Nothing in the SSH connect path reads it — it exists so
+   * `${profile.ipmiHost}` resolves when a macro is run against this profile
+   * (services/profileTokens.ts, which is also where the value's SHAPE is
+   * enforced: it can arrive from a backup import, so save-time checks are not
+   * the reliable chokepoint).
+   *
+   * Optional and additive, like every other field added after 1.0 — records
+   * written by older builds have none, and older builds round-trip it
+   * untouched (servers are stored as whole objects under `nexus.servers`).
+   */
+  ipmiHost?: string;
   openFileExplorerOnFirstConnect?: boolean;
   proxy?: ProxyConfig;
   authProfileId?: string;  // references AuthProfile.id; credentials resolved at connection time
@@ -319,6 +332,7 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.logSession === b.logSession &&
     a.multiplexing === b.multiplexing &&
     a.legacyAlgorithms === b.legacyAlgorithms &&
+    a.ipmiHost === b.ipmiHost &&
     a.openFileExplorerOnFirstConnect === b.openFileExplorerOnFirstConnect &&
     a.authProfileId === b.authProfileId &&
     proxyConfigsEqual(a.proxy, b.proxy) &&
@@ -363,6 +377,7 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   if (current.logSession !== batchSnapshot.logSession) merged.logSession = current.logSession;
   if (current.multiplexing !== batchSnapshot.multiplexing) merged.multiplexing = current.multiplexing;
   if (current.legacyAlgorithms !== batchSnapshot.legacyAlgorithms) merged.legacyAlgorithms = current.legacyAlgorithms;
+  if (current.ipmiHost !== batchSnapshot.ipmiHost) merged.ipmiHost = current.ipmiHost;
   if (current.openFileExplorerOnFirstConnect !== batchSnapshot.openFileExplorerOnFirstConnect) {
     merged.openFileExplorerOnFirstConnect = current.openFileExplorerOnFirstConnect;
   }
@@ -605,6 +620,29 @@ export function authProfileOwnedCredentials(profile: AuthProfile | undefined): A
     owned.keyPath = keyPath;
   }
   return owned;
+}
+
+/**
+ * The username a connection to `server` will ACTUALLY log in as, given the auth
+ * profile it links to (`undefined` for no link, or a link that resolves to
+ * nothing). One line, but it is the one line the CONNECT path decides by —
+ * `SilentAuthSshFactory.resolveServer` spreads `authProfileOwnedCredentials`
+ * over the server, so an owned username replaces the server's and an unowned one
+ * leaves it standing — and a linked server keeps its own `username` stored
+ * UNDERNEATH the link, so `server.username` and this can legitimately differ.
+ *
+ * REVIEW FINDING (P2) — anything that tells the user, or a command line, which
+ * account is in play must ask THIS rather than read `server.username`, or it
+ * describes a login that will not happen. Callers: the deploy-key flow
+ * (`resolveEffectiveUsername`, commands/serverCommands.ts) and `${profile.username}`
+ * (commands/serverMacroCommands.ts), whose whole contract is "resolves to what
+ * this server connects with".
+ */
+export function effectiveServerUsername(
+  server: Pick<ServerConfig, "username">,
+  profile: AuthProfile | undefined
+): string {
+  return authProfileOwnedCredentials(profile).username ?? server.username;
 }
 
 /**

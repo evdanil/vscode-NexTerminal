@@ -58,6 +58,38 @@ function isTerminalStillValid(target: vscode.Terminal): boolean {
   return vscode.window.terminals.includes(target) && target.exitStatus === undefined;
 }
 
+/**
+ * §8.1's "the send target is pinned at invocation" made explicit, so every
+ * caller keeps the invariant instead of each one re-deriving a destination
+ * after the prompts have resolved.
+ *
+ * The prompt walk can take arbitrarily long — the user is typing into a modal
+ * input box — and "the terminal that is active when it finishes" is a different
+ * question from "the terminal the user aimed this macro at". A target is
+ * therefore CHOSEN before the first await, re-checked for validity after the
+ * last one, and only then asked to deliver.
+ */
+export interface MacroSendTarget {
+  /** Named in the status-bar confirmation. Never contains the resolved text. */
+  readonly description: string;
+  /** False once the destination can no longer receive (e.g. its terminal was closed). */
+  isStillValid(): boolean;
+  /** Delivers the resolved text. `false` means it was NOT delivered and the target already said why. */
+  send(text: string): boolean | Promise<boolean>;
+}
+
+/** The ordinary target: an existing terminal, pinned by reference. */
+export function terminalSendTarget(terminal: vscode.Terminal): MacroSendTarget {
+  return {
+    description: terminal.name,
+    isStillValid: () => isTerminalStillValid(terminal),
+    send(text: string): boolean {
+      terminal.sendText(text, false);
+      return true;
+    }
+  };
+}
+
 type StepOutcome = { kind: "accept"; value: string } | { kind: "back" } | { kind: "cancel" };
 
 function waitForInputBoxStep(box: vscode.InputBox): Promise<StepOutcome> {
@@ -196,6 +228,48 @@ export async function resolveMacroText(macro: TerminalMacro): Promise<string | u
  * macros never reach this module.
  */
 export async function runMacro(macro: TerminalMacro): Promise<void> {
+  // §8.1 — captured BEFORE the first await, and never re-derived afterward.
+  const active = vscode.window.activeTerminal;
+  if (!active) {
+    vscode.window.setStatusBarMessage("No active terminal — nothing was sent.", 4000);
+    return;
+  }
+  await runMacroWithTarget(macro, terminalSendTarget(active));
+}
+
+export interface RunMacroOptions {
+  /**
+   * A caveat about the text that was delivered, appended to the SUCCESS status
+   * only — `nexus.server.runMacro` uses it for "an unknown `${profile.…}` token
+   * went out verbatim".
+   *
+   * REVIEW FINDING (P2) — it is an option here rather than a notice the caller
+   * shows itself because the caller cannot know, at the point it has the
+   * caveat, whether anything will be delivered at all: the prompt walk, the
+   * connect-first confirmation and the browser URL check all abort AFTER it,
+   * and a caveat about text that was never sent is noise. Tying it to the
+   * delivery report is also what keeps it on screen — a status message shown
+   * moments before the success one is simply replaced by it.
+   *
+   * Lowercase, no trailing period: it is appended as a clause. Never include
+   * the resolved text or any entered value.
+   */
+  readonly deliveryNote?: string;
+}
+
+/**
+ * The prompt-and-send core `runMacro()` is built on, taking a target the CALLER
+ * pinned (see `MacroSendTarget`). Everything §8.2-§8.4 promises — one reused
+ * input box, cancel aborts everything, status-bar reporting on every path, one
+ * run in flight at a time — is identical whichever target is supplied; only the
+ * destination differs. Exported for `nexus.server.runMacro`, whose targets are a
+ * specific server's session terminal, a fresh local terminal, or the browser.
+ */
+export async function runMacroWithTarget(
+  macro: TerminalMacro,
+  target: MacroSendTarget,
+  options: RunMacroOptions = {}
+): Promise<void> {
   const key = macroIdentityKey(macro);
 
   if (inFlight) {
@@ -207,13 +281,6 @@ export async function runMacro(macro: TerminalMacro): Promise<void> {
       `A macro is already waiting for input ("${inFlight.macroName}").`,
       4000
     );
-    return;
-  }
-
-  // §8.1 — captured BEFORE the first await, and never re-derived afterward.
-  const target = vscode.window.activeTerminal;
-  if (!target) {
-    vscode.window.setStatusBarMessage("No active terminal — nothing was sent.", 4000);
     return;
   }
 
@@ -233,16 +300,24 @@ export async function runMacro(macro: TerminalMacro): Promise<void> {
         vscode.window.setStatusBarMessage(`Macro "${macro.name}" cancelled — nothing was sent.`, 4000);
         return;
       }
-      if (!isTerminalStillValid(target)) {
+      if (!target.isStillValid()) {
         vscode.window.setStatusBarMessage("Target terminal closed — nothing was sent.", 4000);
         return;
       }
-      target.sendText(resolved, false);
+      if (!(await target.send(resolved))) {
+        // The target refused (e.g. a browser macro whose resolved text is not an
+        // http/https URL) and has already reported why — never claim a send.
+        return;
+      }
       // Every abort path above reports through the status bar (§8.3) — a
       // successful send needs the same signal, or a send to a non-focused
       // terminal is completely silent after however long the prompts took.
       // Never include the resolved text or any entered value here.
-      vscode.window.setStatusBarMessage(`Macro "${macro.name}" sent to ${target.name}.`, 4000);
+      const caveat = options.deliveryNote ? ` — ${options.deliveryNote}` : "";
+      vscode.window.setStatusBarMessage(
+        `Macro "${macro.name}" sent to ${target.description}${caveat}.`,
+        4000
+      );
     } finally {
       // §8.4 — cleared in a finally wrapping the ENTIRE resolve-and-send, so a
       // throw anywhere above still releases the guard instead of locking every

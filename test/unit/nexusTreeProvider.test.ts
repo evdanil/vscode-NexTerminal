@@ -462,6 +462,16 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(disconnected.id).toBe(connected.id);
   });
 
+  it("ServerTreeItem shows the IPMI/BMC address on its own tooltip line, only when set (issue #48)", () => {
+    // Not part of the SSH connection, so it must not be folded into the
+    // `user@host:port` summary — and a server with no BMC gets no line at all.
+    const withBmc = new ServerTreeItem(makeServer({ id: "s1", ipmiHost: "10.0.0.99" }), false);
+    expect(withBmc.tooltip).toContain("\nIPMI/BMC: 10.0.0.99");
+
+    const without = new ServerTreeItem(makeServer({ id: "s2" }), false);
+    expect(without.tooltip).not.toContain("IPMI/BMC");
+  });
+
   it("SerialProfileTreeItem ID does not change with connection state", () => {
     const profile = makeSerial({ id: "sp1" });
     const disconnected = new SerialProfileTreeItem(profile, "disconnected");

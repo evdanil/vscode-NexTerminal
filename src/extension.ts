@@ -6,6 +6,7 @@ import { registerScriptCommands } from "./commands/scriptCommands";
 import { registerSerialCommands } from "./commands/serialCommands";
 import { registerLocalShellCommands } from "./commands/localShellCommands";
 import { registerServerCommands, teardownServerRuntime } from "./commands/serverCommands";
+import { registerServerMacroCommands } from "./commands/serverMacroCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
 import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import { TerminalRegistry } from "./services/terminal/terminalRegistry";
@@ -456,7 +457,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     scriptCodeLensProvider
   );
 
-  // Script runtime status bar item — separate from the existing Nexus Command Center item.
+  // Script runtime status bar item — separate from the existing Nexus Connectivity Hub item.
   const scriptStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 9);
   scriptStatusBarItem.command = "nexus.script.openOutput";
   scriptStatusBarItem.name = "Nexus Scripts";
@@ -1209,6 +1210,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   });
 
   const serverDisposables = registerServerCommands(ctx);
+  const serverMacroDisposables = registerServerMacroCommands(ctx);
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
   const localShellDisposables = registerLocalShellCommands(ctx);
@@ -1304,6 +1306,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     editorFocusListener,
     terminalActivityListener,
     ...serverDisposables,
+    ...serverMacroDisposables,
     ...tunnelDisposables,
     ...serialDisposables,
     ...localShellDisposables,

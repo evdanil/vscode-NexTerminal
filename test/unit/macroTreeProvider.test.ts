@@ -127,6 +127,19 @@ describe("MacroTreeItem", () => {
     expect(item.tooltip).toBe("Test\necho test");
   });
 
+  it("names a non-session run target in the tooltip, and says nothing for a session macro (issue #48)", () => {
+    // Clicking this row opens a browser window; clicking the one below types
+    // into a terminal. The tooltip is the only place that distinction is visible.
+    const browser = new MacroTreeItem({ name: "BMC", text: "https://x/", runIn: "browser" }, 0);
+    expect(browser.tooltip).toContain("Runs in: Browser");
+
+    const local = new MacroTreeItem({ name: "SOL", text: "ipmitool\n", runIn: "localTerminal" }, 0);
+    expect(local.tooltip).toContain("Runs in: Local terminal");
+
+    const session = new MacroTreeItem({ name: "Plain", text: "show version\n" }, 0);
+    expect(session.tooltip).not.toContain("Runs in:");
+  });
+
   it("truncates description at ~40 chars and replaces newlines with ↵", () => {
     const shortMacro = { name: "Short", text: "echo hi" };
     const shortItem = new MacroTreeItem(shortMacro, 0);
@@ -320,6 +333,90 @@ describe("MacroTreeItem", () => {
       expect((item.iconPath as { id: string }).id).toBe("zap");
       expect(item.contextValue).toBe("nexus.macro.triggered");
       expect(item.tooltip).not.toContain("suppressed");
+    });
+  });
+
+  // PR #55 review — the §6.3 predicate used to mirror only ONE of the compiler's
+  // per-macro skips (variables). `MacroAutoTrigger.reload()` also refuses a macro
+  // whose run target is not the session, and a session macro whose text names
+  // `${profile.…}`. Both combinations are unreachable through the macro editor but
+  // arrive verbatim via legacy-settings absorption and backup import (§4.2), and
+  // both rendered a zap icon, an "active" tooltip and live Pause/Resume items for a
+  // rule that had never compiled.
+  describe("suppressions the compiler applies but the tree used to ignore (§6.3)", () => {
+    it("a browser macro with a triggerPattern is not a live trigger, and says why", () => {
+      const macro = { name: "BMC", text: "https://bmc.example/", triggerPattern: "Continue\\?", runIn: "browser" as const };
+      const item = new MacroTreeItem(macro, 0, undefined, false);
+
+      // The dead controls: `.triggered` is what the Pause/Resume `when` clauses match.
+      expect(item.contextValue).toBe("nexus.macro");
+      expect((item.iconPath as { id: string }).id).not.toBe("zap");
+      expect(item.tooltip).not.toContain("Auto-trigger:");
+      expect(item.tooltip).not.toContain("(active)");
+      expect(item.tooltip).toContain("Auto-trigger suppressed: the macro runs outside its session");
+    });
+
+    it("a localTerminal macro with a triggerPattern is suppressed the same way", () => {
+      const macro = { name: "SOL", text: "ipmitool sol activate\n", triggerPattern: "router#", runIn: "localTerminal" as const };
+      const item = new MacroTreeItem(macro, 0, undefined, false);
+      expect(item.contextValue).toBe("nexus.macro");
+      expect((item.iconPath as { id: string }).id).not.toBe("zap");
+      expect(item.tooltip).toContain("Auto-trigger suppressed: the macro runs outside its session");
+    });
+
+    it("a SESSION macro whose text names ${profile...} is not a live trigger, and says why", () => {
+      // No `runIn` at all — the run-target skip does not cover this one, so a fix
+      // that only added `resolveMacroRunTarget(...) === "session"` still fails here.
+      const macro = { name: "Ping", text: "ping ${profile.host}\n", triggerPattern: "router#" };
+      const item = new MacroTreeItem(macro, 0, undefined, false);
+
+      expect(item.contextValue).toBe("nexus.macro");
+      expect((item.iconPath as { id: string }).id).not.toBe("zap");
+      expect(item.tooltip).not.toContain("Auto-trigger:");
+      expect(item.tooltip).not.toContain("(active)");
+      expect(item.tooltip).toContain("Auto-trigger suppressed: ${profile...} tokens need a chosen server");
+    });
+
+    it("an ESCAPED profile token is not a profile token — the trigger stays live", () => {
+      // Guards over-suppression by a `text.includes("${profile.")` shortcut:
+      // `$${profile.host}` resolves to the literal text and never needs a server,
+      // so `resolveProfileTokens` leaves it alone and so must the compiler.
+      const macro = { name: "Docs", text: "echo $${profile.host}\n", triggerPattern: "router#" };
+      const item = new MacroTreeItem(macro, 0, undefined, false);
+      expect(item.contextValue).toBe("nexus.macro.triggered");
+      expect((item.iconPath as { id: string }).id).toBe("zap");
+      expect(item.tooltip).not.toContain("suppressed");
+    });
+
+    it("a plain session trigger macro is still a live trigger — the predicate did not over-tighten", () => {
+      const macro = { name: "Auto", text: "yes\n", triggerPattern: "Continue\\?", runIn: "session" as const };
+      const item = new MacroTreeItem(macro, 0, undefined, false);
+      expect(item.contextValue).toBe("nexus.macro.triggered");
+      expect((item.iconPath as { id: string }).id).toBe("zap");
+      expect(item.tooltip).toContain("Auto-trigger: /Continue\\?/ (active)");
+      expect(item.tooltip).not.toContain("suppressed");
+    });
+
+    it("an identity conflict still outranks both new notes — one line, and it is the actionable one", () => {
+      const macro = {
+        id: "dup",
+        name: "BMC",
+        text: "https://bmc.example/",
+        triggerPattern: "Continue\\?",
+        runIn: "browser" as const
+      };
+      const item = new MacroTreeItem(macro, 0, undefined, false, true);
+      expect(item.tooltip).toContain("another macro has the same internal id");
+      expect(item.tooltip).not.toContain("runs outside its session");
+    });
+
+    it("a non-session macro with NO triggerPattern says nothing about auto-triggers", () => {
+      // The suppression note must attach to a trigger that was actually configured;
+      // every browser/local macro ever made would otherwise be annotated as broken.
+      const item = new MacroTreeItem({ name: "BMC", text: "https://x/", runIn: "browser" as const }, 0);
+      expect(item.contextValue).toBe("nexus.macro");
+      expect(item.tooltip).not.toContain("suppressed");
+      expect(item.tooltip).toContain("Runs in: Browser");
     });
   });
 

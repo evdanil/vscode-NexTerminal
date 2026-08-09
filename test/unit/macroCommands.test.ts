@@ -232,32 +232,58 @@ describe("macroCommands template actions", () => {
       "Send password when prompted",
       "Wait and send confirmation",
       "Scoped auto-trigger example",
-      "Prompted command"
+      "IPMI SOL console",
+      "Launch IPMI web console"
     ]);
   });
 
-  it("creates the Prompted command template with host/username/password declared and the password masked (§9.7)", async () => {
+  it("creates the IPMI SOL console template with the BMC address from the profile and the password masked (§9.7, issue #48)", async () => {
     const macros: unknown[] = [];
     mockGetMacros.mockReturnValue(macros);
-    mockShowQuickPick.mockResolvedValue({ label: "Prompted command", templateId: "prompted-command" });
+    mockShowQuickPick.mockResolvedValue({ label: "IPMI SOL console", templateId: "prompted-command" });
 
     await registeredCommands.get("nexus.macro.addFromTemplate")!();
 
     expect(macros[0]).toMatchObject({
       text: expect.stringContaining("ipmitool"),
+      runIn: "localTerminal",
       variables: [
-        { name: "host", label: "Host" },
         { name: "username", label: "Username" },
         { name: "password", label: "Password", secret: true }
       ]
     });
     const created = macros[0] as { text: string; variables: Array<{ name: string; secret?: boolean; default?: string }> };
-    expect(created.text).toContain("$host");
+    // The address is a fact about the server profile, not something to retype
+    // on every run — and `$host` must NOT be declared any more, or the template
+    // would prompt for what the profile already knows.
+    expect(created.text).toContain("-H ${profile.ipmiHost}");
+    expect(created.variables.some((v) => v.name === "host")).toBe(false);
     expect(created.text).toContain("$username");
     expect(created.text).toContain("$password");
     // §7.1 — a masked variable must never carry a default (plaintext in the store).
     expect(created.variables.find((v) => v.secret)?.default).toBeUndefined();
+    // A shipped example must never demonstrate a literal password on the command
+    // line: argv is visible in `ps`, in the scrollback, and in the extension's own
+    // TerminalCaptureBuffer (which `nexus.terminal.copyAll` exports).
+    expect(created.text).not.toMatch(/-P\s+(?!\$password)\S/);
     expect(mockSaveMacros).toHaveBeenCalledWith(macros);
+  });
+
+  it("creates the IPMI web console template as a browser macro with no trailing newline", async () => {
+    const macros: unknown[] = [];
+    mockGetMacros.mockReturnValue(macros);
+    mockShowQuickPick.mockResolvedValue({ label: "Launch IPMI web console", templateId: "ipmi-web-console" });
+
+    await registeredCommands.get("nexus.macro.addFromTemplate")!();
+
+    expect(macros[0]).toMatchObject({
+      text: "https://${profile.ipmiHost}/",
+      runIn: "browser"
+    });
+    // No trailing newline, deliberately: a build that does not know `runIn`
+    // pastes the URL into a terminal instead of executing anything.
+    expect((macros[0] as { text: string }).text.endsWith("\n")).toBe(false);
+    expect((macros[0] as { triggerPattern?: string }).triggerPattern).toBeUndefined();
   });
 
   it("creates the selected macro through getMacros and saveMacros then opens it", async () => {
@@ -354,6 +380,33 @@ describe("macroCommands variable routing (§8.5)", () => {
     expect(items[1].description).toContain(VARIABLE_MARKER.trim());
   });
 
+  it("nexus.macro.run badges a macro that does not run in the session (issue #48)", async () => {
+    const browserMacro = { name: "BMC", text: "https://10.0.0.9/", runIn: "browser" as const };
+    mockGetMacros.mockReturnValue([plainMacro, browserMacro]);
+    mockShowQuickPick.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    const items = mockShowQuickPick.mock.calls[0][0] as Array<{ description: string }>;
+    // "sends a line to this terminal" and "opens a browser window" must not
+    // look identical in the list they are picked from.
+    expect(items[0].description).not.toContain("[");
+    expect(items[1].description).toContain("[Browser]");
+  });
+
+  it("nexus.macro.run hands the picked profile-token macro to Run Macro on Server, not just the command", async () => {
+    const profileMacro = { name: "SOL", text: "ipmitool -H ${profile.ipmiHost}\n" };
+    mockGetMacros.mockReturnValue([profileMacro]);
+    mockShowQuickPick.mockResolvedValue({ index: 0 });
+    mockShowInformationMessage.mockResolvedValue("Run Macro on Server…");
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    // Without the argument the redirect makes the user pick the macro a second
+    // time, having already picked it here.
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.server.runMacro", { macro: profileMacro });
+  });
+
   it("nexus.macro.run: a cancelled resolve (runMacro resolves without sending) results in no sendMacroText call either", async () => {
     mockGetMacros.mockReturnValue([variableMacro]);
     mockShowQuickPick.mockResolvedValue({ index: 0 });
@@ -417,5 +470,113 @@ describe("macroCommands variable routing (§8.5)", () => {
 
     expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.terminal.sendSequence", { text: "show version\n" });
     expect(mockRunMacro).not.toHaveBeenCalled();
+  });
+});
+
+describe("macroCommands — escaped profile tokens on the ordinary send paths (PR #55 review, P2)", () => {
+  // `$${profile.host}` is documented to send the literal `${profile.host}`. That
+  // unescape used to live ONLY in `resolveProfileTokens()`, which only
+  // `nexus.server.runMacro` calls — and an escaped-only macro is (correctly) not
+  // redirected there, because an escaped token names no field and so constrains
+  // nothing about which server the macro can run on. Both dollars went out.
+  const escapedOnlyMacro = { name: "Docs", text: "echo $${profile.host}\n" };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockGetMacros.mockReturnValue([]);
+    mockRunMacro.mockResolvedValue(undefined);
+    registerMacroCommands();
+  });
+
+  it("nexus.macro.run sends the UNESCAPED text on the variable-free path", async () => {
+    mockGetMacros.mockReturnValue([escapedOnlyMacro]);
+    mockShowQuickPick.mockResolvedValue({ index: 0 });
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.terminal.sendSequence", {
+      text: "echo ${profile.host}\n"
+    });
+  });
+
+  it("an escaped-only macro is NOT redirected to Run Macro on Server", async () => {
+    // Pins `hasProfileTokens()`'s semantics from the caller's side: redirecting
+    // would make a documentation macro unrunnable without picking a server it
+    // does not need.
+    mockGetMacros.mockReturnValue([escapedOnlyMacro]);
+    mockShowQuickPick.mockResolvedValue({ index: 0 });
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.server.runMacro", expect.anything());
+  });
+
+  it("nexus.macro.run hands runMacro the UNESCAPED text, and still prompts for the declared variable", async () => {
+    // The prompt-walk route. Order is profile-unescape FIRST, then the variable
+    // engine — safe in both directions because a macro variable's name has no
+    // dots, so the variable engine can never match `${profile.…}` and this pass
+    // can never manufacture a dotless placeholder for it.
+    const mixed = {
+      name: "Mixed",
+      text: "echo $${profile.host} $target\n",
+      variables: [{ name: "target" }]
+    };
+    mockGetMacros.mockReturnValue([mixed]);
+    mockShowQuickPick.mockResolvedValue({ index: 0 });
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    expect(mockRunMacro).toHaveBeenCalledWith({
+      ...mixed,
+      text: "echo ${profile.host} $target\n"
+    });
+    // The variable declaration rides along untouched, so the prompt walk inside
+    // `runMacro` still asks for it.
+    const handed = mockRunMacro.mock.calls[0][0] as { variables: Array<{ name: string }> };
+    expect(handed.variables).toEqual([{ name: "target" }]);
+  });
+
+  it("nexus.macro.runBinding, nexus.macro.slot and nexus.macro.runItem unescape too", async () => {
+    // Every entry point funnels through `runOrSendMacro`, so this is a
+    // route-coverage assertion rather than three separate behaviors.
+    mockGetMacros.mockReturnValue([escapedOnlyMacro]);
+    vi.mocked(getAssignedBinding).mockImplementation((m) => (m === escapedOnlyMacro ? "alt+1" : undefined));
+    await registeredCommands.get("nexus.macro.runBinding")!({ binding: "alt+1" });
+    expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.terminal.sendSequence", {
+      text: "echo ${profile.host}\n"
+    });
+
+    mockExecuteCommand.mockClear();
+    vi.mocked(getAssignedBinding).mockReturnValue(undefined);
+    mockGetMacros.mockReturnValue([{ ...escapedOnlyMacro, slot: 1 }]);
+    await registeredCommands.get("nexus.macro.slot")!({ index: 0 });
+    expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.terminal.sendSequence", {
+      text: "echo ${profile.host}\n"
+    });
+
+    mockExecuteCommand.mockClear();
+    await registeredCommands.get("nexus.macro.runItem")!({ index: 0, macro: escapedOnlyMacro });
+    expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.terminal.sendSequence", {
+      text: "echo ${profile.host}\n"
+    });
+  });
+
+  it("an UNESCAPED token still redirects, and nothing is sent to a terminal", async () => {
+    // The other half of the routing rule, so "unescape everywhere" cannot be
+    // mistaken for "resolve everywhere": a real token has no server here.
+    const profileMacro = { name: "SOL", text: "ipmitool -H ${profile.ipmiHost}\n" };
+    mockGetMacros.mockReturnValue([profileMacro]);
+    mockShowQuickPick.mockResolvedValue({ index: 0 });
+    mockShowInformationMessage.mockResolvedValue("Run Macro on Server…");
+
+    await registeredCommands.get("nexus.macro.run")!();
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.server.runMacro", { macro: profileMacro });
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith(
+      "workbench.action.terminal.sendSequence",
+      expect.anything()
+    );
   });
 });

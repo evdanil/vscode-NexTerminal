@@ -347,3 +347,28 @@ describe("§7 — keyOf() deliberately excludes `group` (assert the decision)", 
     expect(keyOf(inCisco)).toBe(keyOf(inJuniper));
   });
 });
+
+describe("keyOf() separates macros by where they RUN (issue #48)", () => {
+  it("two macros identical except for `runIn` are different macros", () => {
+    // Merge-mode import keys incoming records against the existing ones, so a
+    // collision here silently drops one of the pair — and these two do
+    // observably different things: one types the URL into the session, the
+    // other opens a browser window.
+    const inSession: TerminalMacro = { name: "BMC", text: "https://10.0.0.9/" };
+    const inBrowser: TerminalMacro = { name: "BMC", text: "https://10.0.0.9/", runIn: "browser" };
+    const inLocalTerminal: TerminalMacro = { name: "BMC", text: "https://10.0.0.9/", runIn: "localTerminal" };
+    expect(keyOf(inSession)).not.toBe(keyOf(inBrowser));
+    expect(keyOf(inBrowser)).not.toBe(keyOf(inLocalTerminal));
+  });
+
+  it("absent, explicit \"session\", and a corrupt value all key identically", () => {
+    // The collapse direction the same rule requires: all three RUN in the
+    // session (`resolveMacroRunTarget`), so re-importing a macro after a save
+    // that normalized the field must not add a second copy.
+    const absent: TerminalMacro = { name: "reload", text: "reload\n" };
+    const explicit: TerminalMacro = { name: "reload", text: "reload\n", runIn: "session" };
+    const corrupt = { name: "reload", text: "reload\n", runIn: 42 } as unknown as TerminalMacro;
+    expect(keyOf(explicit)).toBe(keyOf(absent));
+    expect(keyOf(corrupt)).toBe(keyOf(absent));
+  });
+});
