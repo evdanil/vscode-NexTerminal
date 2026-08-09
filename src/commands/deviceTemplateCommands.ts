@@ -112,6 +112,15 @@ function sourcesReferencingTemplate(ctx: CommandContext, templateId: string): { 
     .map((source) => ({ id: source.id, name: source.name }));
 }
 
+/** Do two referencing-source lists name the exact same set of ids? (order-independent). */
+function sameSourceIdSet(a: readonly { id: string }[], b: readonly { id: string }[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const ids = new Set(a.map((s) => s.id));
+  return b.every((s) => ids.has(s.id));
+}
+
 /** Opens the editor (Add when `seed` is undefined, Edit otherwise). */
 function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProfile): void {
   const snapshot = ctx.core.getSnapshot();
@@ -127,58 +136,79 @@ function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProf
   WebviewFormPanel.open(formId, definition, {
     onSubmit: async (values) => {
       const template = parseDeviceTemplateFormValues(values, seed?.id);
-      // FIX B (PR #62 Codex round 2) — an Edit whose template was DELETED while the
-      // editor sat open must not resurrect it, and one edited ELSEWHERE must not be
-      // silently clobbered. `addOrUpdateDeviceTemplate` treats a now-missing id as a
-      // brand-new template (it upserts by id), so without this guard a Save re-creates
-      // the deleted record — detached from the source rules the deletion swept. Extend
-      // the round-1 revision mechanism to the edit save: re-resolve the seeded id
-      // against LIVE core immediately before persisting and reject a missing record
-      // (deleted) or a changed revision (stale edit), keeping the form open with the
-      // reason. This resolve-and-compare has NO `await` before `addOrUpdateDeviceTemplate`
-      // below (getDeviceTemplate/getAuthProfile are synchronous), so on the extension
-      // host's single thread nothing interleaves between the check and the write — the
-      // same synchronous-check-then-persist atomicity the round-1 resolve-under-lock
-      // fixes use. Add-mode (no `seed?.id`) is unaffected: there is no prior record.
-      if (seed?.id !== undefined) {
-        const liveTemplate = ctx.core.getDeviceTemplate(seed.id);
-        if (liveTemplate === undefined) {
+      // FIX C (issue #48 PR-T1b / PR #62 Codex review round 5) — serialize the
+      // whole revalidate-then-persist under `configMutationLock`. The round-2/round-1
+      // guards below are SYNCHRONOUS-check-then-persist: they close the CHECK
+      // interleaving on the single-threaded host, but NOT two concurrent async
+      // PERSISTS. `addOrUpdateDeviceTemplate` installs the record then `await`s a
+      // whole-array `saveDeviceTemplates`; a delete of the same id, running lock-free,
+      // could sweep the record and its source rules while this Save's persist is still
+      // in flight — and if this Save's whole-array persist commits LAST, it resurrects
+      // the deleted record on disk (last-writer-wins) while its rules are already gone:
+      // a torn state. Holding the lock across the revalidation AND the write makes this
+      // Save mutually exclusive with the delete flow (and with sync-apply / manual-apply
+      // / source persistence, which hold the same lock), so no other template mutation
+      // can be mid-persist here. Moving the revision check INSIDE the lock is the point:
+      // it now covers "a Save that passed the check and already entered persistence."
+      //
+      // NO REENTRANCY: this is the codebase's command-layer discipline — the command
+      // holds the lock, the core methods (`addOrUpdateDeviceTemplate`,
+      // `getDeviceTemplate`, `getAuthProfile`) stay lock-free primitives and never
+      // acquire it themselves, so wrapping here cannot deadlock against them.
+      // `runExclusive` propagates the callback's thrown error out unchanged (it returns
+      // the callback's promise), so the throw-to-keep-form-open behavior is preserved:
+      // a rejected revalidation still surfaces through WebviewFormPanel's submit
+      // try/catch. The `Sync Affected Sources` dispatch below stays OUTSIDE the lock —
+      // it runs after the save and itself dispatches `nexus.inventory.syncNow`, which
+      // takes this same lock, and must not nest.
+      await configMutationLock.runExclusive(async () => {
+        // FIX B (PR #62 Codex round 2) — an Edit whose template was DELETED while the
+        // editor sat open must not resurrect it, and one edited ELSEWHERE must not be
+        // silently clobbered. `addOrUpdateDeviceTemplate` treats a now-missing id as a
+        // brand-new template (it upserts by id), so without this guard a Save re-creates
+        // the deleted record — detached from the source rules the deletion swept.
+        // Re-resolve the seeded id against LIVE core (now under the lock) and reject a
+        // missing record (deleted) or a changed revision (stale edit), keeping the form
+        // open with the reason. Add-mode (no `seed?.id`) is unaffected: there is no
+        // prior record.
+        if (seed?.id !== undefined) {
+          const liveTemplate = ctx.core.getDeviceTemplate(seed.id);
+          if (liveTemplate === undefined) {
+            throw new Error(
+              "This device template was deleted while the editor was open — nothing was saved. " +
+                "Reopen Manage Device Templates to create it again if you still need it."
+            );
+          }
+          if (liveTemplate.revision !== seedRevision) {
+            throw new Error(
+              "This device template was changed elsewhere while the editor was open — nothing was saved. " +
+                "Reopen it to pick up the current version, then redo your edit."
+            );
+          }
+        }
+        // MECHANISM 2 (P2 #4, PR #62 Codex round 1) — resolve a submitted
+        // `authProfileId` against LIVE core immediately before persisting. The
+        // profile-deletion sweep (`removeAuthProfile`) only clears the link off
+        // templates that ALREADY reference the profile — it cannot reach the link
+        // this Save is about to write for the FIRST time (or newly point at a
+        // different profile). So a profile deleted while this editor sat open
+        // would otherwise be persisted as a dangling `fields.authProfileId` that
+        // §5.3 reference-validation later drops with a warning at apply time —
+        // silent to the author. `authProfileId` is the only templatable field that
+        // carries a cross-record reference resolved here; `proxy.jumpHostId` is
+        // validated at apply time (§5.3) against the target fleet, not against a
+        // single form. Throwing routes through WebviewFormPanel's submit try/catch,
+        // which keeps the editor open with the message — exactly like
+        // `readTemplateField`'s "no value" reject.
+        const linkedAuthProfileId = template.fields.authProfileId?.value;
+        if (linkedAuthProfileId !== undefined && ctx.core.getAuthProfile(linkedAuthProfileId) === undefined) {
           throw new Error(
-            "This device template was deleted while the editor was open — nothing was saved. " +
-              "Reopen Manage Device Templates to create it again if you still need it."
+            "The selected auth profile no longer exists — it was deleted while this editor was open. " +
+              'Choose another auth profile, or set the Auth Profile field\'s mode to "Not set".'
           );
         }
-        if (liveTemplate.revision !== seedRevision) {
-          throw new Error(
-            "This device template was changed elsewhere while the editor was open — nothing was saved. " +
-              "Reopen it to pick up the current version, then redo your edit."
-          );
-        }
-      }
-      // MECHANISM 2 (P2 #4, PR #62 Codex round 1) — resolve a submitted
-      // `authProfileId` against LIVE core immediately before persisting. The
-      // profile-deletion sweep (`removeAuthProfile`) only clears the link off
-      // templates that ALREADY reference the profile — it cannot reach the link
-      // this Save is about to write for the FIRST time (or newly point at a
-      // different profile). So a profile deleted while this editor sat open
-      // would otherwise be persisted as a dangling `fields.authProfileId` that
-      // §5.3 reference-validation later drops with a warning at apply time —
-      // silent to the author. No `await` separates this resolve from the
-      // `addOrUpdateDeviceTemplate` below, so on the extension host's single
-      // thread nothing can interleave between them. `authProfileId` is the only
-      // templatable field that carries a cross-record reference resolved here;
-      // `proxy.jumpHostId` is validated at apply time (§5.3) against the target
-      // fleet, not against a single form. Throwing routes through
-      // WebviewFormPanel's submit try/catch, which keeps the editor open with
-      // the message — exactly like `readTemplateField`'s "no value" reject.
-      const linkedAuthProfileId = template.fields.authProfileId?.value;
-      if (linkedAuthProfileId !== undefined && ctx.core.getAuthProfile(linkedAuthProfileId) === undefined) {
-        throw new Error(
-          "The selected auth profile no longer exists — it was deleted while this editor was open. " +
-            'Choose another auth profile, or set the Auth Profile field\'s mode to "Not set".'
-        );
-      }
-      await ctx.core.addOrUpdateDeviceTemplate(template);
+        await ctx.core.addOrUpdateDeviceTemplate(template);
+      });
       // U1 (§6.1 UX-S8) — the VERBATIM save toast (single "saved." wording, not a
       // created/updated split), telling the user the edit takes effect on each
       // source's next sync. The `Sync Affected Sources` button is offered only
@@ -241,7 +271,47 @@ async function deleteDeviceTemplateFlow(ctx: CommandContext): Promise<void> {
   if (confirm !== "Delete") {
     return;
   }
-  await ctx.core.removeDeviceTemplate(pick.template.id);
+  // FIX C (issue #48 PR-T1b / PR #62 Codex review round 5) — serialize the removal
+  // under `configMutationLock` and REVALIDATE inside the exclusive section, mirroring
+  // the manual-apply (`applyToFolder`) and auth-profile-delete divergence guards. The
+  // confirm modal above is an unbounded wait; a concurrent editor Save, sync-apply, or
+  // another delete can run while it sits open. Two lock-free whole-array persists
+  // completing out of order tear disk state (a Save's late persist resurrects a record
+  // this delete already swept). Holding the lock across the revalidation AND
+  // `removeDeviceTemplate` makes this mutually exclusive with those flows (which hold
+  // the same lock), so no other template persist can be mid-flight. NO REENTRANCY:
+  // `removeDeviceTemplate` is a lock-free core primitive (command-layer discipline).
+  // The modal already resolved, and nothing below shows UI while the lock is held
+  // (the deferred `refusal` toast fires after release), honoring the lock's
+  // "never hold across interactive UI" rule.
+  let refusal: string | undefined;
+  await configMutationLock.runExclusive(async () => {
+    // The picked template must still exist — a concurrent delete/reset could have
+    // removed it while the confirm sat open. Name the change rather than silently
+    // reporting a deletion of nothing.
+    if (ctx.core.getDeviceTemplate(pick.template.id) === undefined) {
+      refusal =
+        `The device template "${pick.template.name}" was changed while the confirmation was open — nothing was deleted. ` +
+        "Reopen Manage Device Templates to review the current templates.";
+      return;
+    }
+    // The disclosed referencing-source set must still match what the confirm modal
+    // showed. A rule added/removed under the open modal would make the "cleared from
+    // N sources' rules" disclosure untruthful — refuse and ask the user to re-run so
+    // the disclosure is accurate (same divergence-refusal shape as the manual-apply
+    // and auth-profile-delete guards).
+    if (!sameSourceIdSet(sourcesReferencingTemplate(ctx, pick.template.id), referencing)) {
+      refusal =
+        `What deleting "${pick.template.name}" would clear changed while the confirmation was open — nothing was deleted. ` +
+        "Delete it again to review what it is referenced by now.";
+      return;
+    }
+    await ctx.core.removeDeviceTemplate(pick.template.id);
+  });
+  if (refusal !== undefined) {
+    void vscode.window.showWarningMessage(refusal);
+    return;
+  }
   void vscode.window.showInformationMessage(`Device template "${pick.template.name}" deleted.`);
 }
 
