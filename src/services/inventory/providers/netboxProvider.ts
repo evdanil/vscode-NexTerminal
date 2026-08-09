@@ -491,13 +491,36 @@ function mapEntry(raw: unknown, endpointPath: string, index: number, template: s
   const usable = Boolean(name) && typeof address === "string" && address.length > 0;
   const vars = kind === "device" ? deviceVars(obj) : vmVars(obj);
   const folderPath = renderFolderTemplate(template, vars);
+  const endpoints: InventoryDevice["endpoints"] = usable
+    ? [{ kind: "ssh", host: stripCidr(address as string), port: 22 }]
+    : [];
+  // Out-of-band management address, read with the same defensive shape as
+  // `primary_ip` and from the same rows the pagination already fetches (no new
+  // API call, no new config field). DEVICES ONLY — NetBox VMs have no `oob_ip`,
+  // the same field asymmetry `vmVars` above already documents.
+  //
+  // `kind: "redfish"` rather than `"ipmi-sol"`: `oob_ip` is a generic OOB
+  // address and `ServerConfig.ipmiHost` calls itself "IPMI / BMC / Redfish". The
+  // sync engine selects on EITHER kind, so the choice is cosmetic and a
+  // third-party provider emitting `ipmi-sol` maps identically.
+  //
+  // Emitted independently of `usable`: a device with an `oob_ip` and no primary
+  // IP still carries this endpoint (and is still counted in the no-SSH warning
+  // below — see the `skippedCount` predicate).
+  if (kind === "device") {
+    const oobIp = obj.oob_ip as { address?: unknown } | null | undefined;
+    const oobAddress = oobIp && typeof oobIp === "object" ? oobIp.address : undefined;
+    if (typeof oobAddress === "string" && oobAddress.length > 0) {
+      endpoints.push({ kind: "redfish", host: stripCidr(oobAddress) });
+    }
+  }
   return {
     // Prefixed and coexisting on purpose: a device and a VM can share the same
     // numeric NetBox id, and an unprefixed `String(id)` would silently merge them.
     externalId: `${kind}:${String(obj.id)}`,
     name,
     folderPath: folderPath || undefined,
-    endpoints: usable ? [{ kind: "ssh", host: stripCidr(address as string), port: 22 }] : []
+    endpoints
   };
 }
 
@@ -571,16 +594,22 @@ async function fetchInventoryImpl(
   // FIX 1 — "skipped" now means "mapped with no endpoints" (unmappable name or
   // IP), not "dropped from the tree" — mapEntry throws (FINDING 1) rather
   // than returning undefined for a row with no usable id.
+  //
+  // Keyed on "has no SSH endpoint", NOT on `endpoints.length === 0`: since
+  // `oob_ip` can put an endpoint on a device that has no primary IP, the length
+  // test would silently drop exactly those devices out of this warning while
+  // they remain just as unmappable to SSH as before.
+  const hasNoSshEndpoint = (mapped: InventoryDevice): boolean => !mapped.endpoints.some((e) => e.kind === "ssh");
   let skippedCount = 0;
   rawDevices.forEach((raw, index) => {
     const mapped = mapEntry(raw, "/api/dcim/devices/", index, template, "device");
     devices.push(mapped);
-    if (mapped.endpoints.length === 0) skippedCount++;
+    if (hasNoSshEndpoint(mapped)) skippedCount++;
   });
   rawVms.forEach((raw, index) => {
     const mapped = mapEntry(raw, "/api/virtualization/virtual-machines/", index, template, "vm");
     devices.push(mapped);
-    if (mapped.endpoints.length === 0) skippedCount++;
+    if (hasNoSshEndpoint(mapped)) skippedCount++;
   });
   if (skippedCount > 0) {
     warnings.push(`${skippedCount} device${skippedCount === 1 ? "" : "s"} without a primary IP were skipped.`);

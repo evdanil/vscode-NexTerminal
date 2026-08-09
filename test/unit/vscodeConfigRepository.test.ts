@@ -184,6 +184,47 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
     warnSpy.mockRestore();
   });
 
+  it("getServers keeps an origin carrying syncedIpmiHost, and keeps one that omits it (kills a shape check that rejects the OOB stamp, or that requires it and strips every pre-existing server's origin)", async () => {
+    const stamped = { sourceId: "src", externalId: "ext", syncedAt: 1000, syncedUsername: "admin", syncedIpmiHost: "10.9.9.9" };
+    const legacy = { sourceId: "src", externalId: "ext2", syncedAt: 1000, syncedUsername: "admin" };
+    const repo = new VscodeConfigRepository(
+      makeContext({
+        "nexus.servers": [
+          { ...validServer, id: "s12", origin: stamped },
+          { ...validServer, id: "s13", origin: legacy }
+        ]
+      })
+    );
+
+    const servers = await repo.getServers();
+
+    expect(servers[0].origin).toEqual(stamped);
+    expect(servers[1].origin).toEqual(legacy);
+  });
+
+  it("getServers strips an origin whose syncedIpmiHost is not a non-empty string (kills leaving the OOB stamp unchecked, which would feed the write rule a value no sync could have written)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const repo = new VscodeConfigRepository(
+      makeContext({
+        "nexus.servers": [
+          { ...validServer, id: "s14", origin: { sourceId: "src", externalId: "ext", syncedAt: 1000, syncedIpmiHost: 42 } },
+          // An EMPTY stamp is the dangerous one: it would compare equal to a
+          // server whose ipmiHost is likewise empty and hand the field to the
+          // source on a record nothing synced.
+          { ...validServer, id: "s15", origin: { sourceId: "src", externalId: "ext2", syncedAt: 1000, syncedIpmiHost: "" } }
+        ]
+      })
+    );
+
+    const servers = await repo.getServers();
+
+    expect(servers.map((s) => s.id)).toEqual(["s14", "s15"]);
+    expect(servers[0].origin).toBeUndefined();
+    expect(servers[1].origin).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    warnSpy.mockRestore();
+  });
+
   /**
    * ADOPT 1 — the same F13/FIX 5 disposition for `formerlySynced`, the "Keep
    * Servers" receipt the sync engine's adoption rule matches on. A restored or

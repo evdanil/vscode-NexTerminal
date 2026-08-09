@@ -61,7 +61,8 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     return false;
   }
   const obj = value as Record<string, unknown>;
-  // `syncedInstanceKey`, `syncedUsername` and `syncedAuthProfileId` are optional
+  // `syncedInstanceKey`, `syncedUsername`, `syncedAuthProfileId` and
+  // `syncedIpmiHost` are optional
   // (absent on every server synced before each field existed) but shape-checked
   // like the rest:
   // this guard is the ONLY thing standing between a hand-edited backup /
@@ -83,7 +84,13 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     typeof obj.syncedAt === "number" &&
     isOptionalNonEmptyString(obj.syncedInstanceKey) &&
     isOptionalNonEmptyString(obj.syncedUsername) &&
-    isOptionalNonEmptyString(obj.syncedAuthProfileId)
+    isOptionalNonEmptyString(obj.syncedAuthProfileId) &&
+    // Empty is rejected here for the same reason it is above: the sync writes
+    // this stamp only in the same breath as a non-empty `ipmiHost` (an endpoint
+    // with an empty host is not selected at all), and the server form stores a
+    // cleared address as `undefined`, so an empty string could not have come
+    // from either — it can only be a hand-edited backup or a version-skewed row.
+    isOptionalNonEmptyString(obj.syncedIpmiHost)
   );
 }
 

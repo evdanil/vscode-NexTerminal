@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.97] — 2026-08-09
+
+### Added
+
+- **A NetBox device's out-of-band IP now fills its server's IPMI / BMC Host.** The address was already in NetBox on most fleets — as a device's `oob_ip` — and Nexus was already able to use it, through `${profile.ipmiHost}` in the shipped IPMI SOL console and BMC web console macros; the two just never met, so every synced server needed the same address typed into it by hand a second time. A sync now maps it across, and keeps it current when the BMC is re-addressed at the source. What it will not do is touch an address you typed yourself. Nexus records the address each sync writes, and only updates a field that still holds exactly that: a value you entered by hand is left alone permanently, whether you typed it before this version existed or edited over a synced one afterwards, and clearing the field on one server is a per-server opt-out that later syncs respect rather than refilling on the next run. A device that stops reporting an out-of-band IP does not have its address erased either — a missing value at the source is routine data maintenance, not a decision to delete something, so the last known address stays until you clear it. An address NetBox reports that cannot be used as a host at all — a URL, or anything else the macro layer would refuse when the command is actually run — is named in the sync plan's warnings and skipped, at the one moment the value can still be traced back to the device it came from; the device's SSH mapping is unaffected. One caveat if you move between versions: syncing on a build older than this one drops the record of which addresses the sync owns. The addresses themselves survive, but those servers are treated as hand-typed from then on and stop following the source — clearing a server's IPMI / BMC Host hands it back to the sync.
+
 ## [2.8.96] — 2026-08-09
 
 ### Added

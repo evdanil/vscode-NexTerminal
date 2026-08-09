@@ -136,6 +136,37 @@ export interface ServerOrigin {
    * the USER moved.
    */
   syncedAuthProfileId?: string;
+  /**
+   * The out-of-band address the sync itself last WROTE into `ipmiHost` — the
+   * management endpoint the provider supplied as of that write (NetBox's
+   * `oob_ip`), and `undefined` when the sync wrote none.
+   *
+   * Follows the `syncedAuthProfileId` discipline, NOT the `host`/`port` "the
+   * device always wins" one, and that choice is the whole design: `ipmiHost`
+   * shipped as a HAND-EDITED field before any sync could write it, so "device
+   * always wins" would clobber every early adopter's manual entry on the first
+   * post-upgrade sync — and a device that has no OOB endpoint at all would read
+   * as "this field should be empty". The stamp records what the sync put there,
+   * so the sync only ever fills an untouched field or overwrites one still
+   * carrying exactly its own last value; a hand-typed value (no stamp, or a
+   * stamp the value no longer equals) is left alone, and so is a value whose
+   * device merely stopped reporting an address this fetch.
+   *
+   * Written ONLY where the sync writes `ipmiHost` — the add path always
+   * (`undefined` included, so a source whose devices gain an `oob_ip` later
+   * finds the stamps already there), the update path only when the write rule
+   * fires — and never inferred from the record's current value, which would
+   * launder a hand-edit into "as stamped" one sync later.
+   *
+   * Optional for backward compat, exactly like the two stamps above: servers
+   * synced by a build before this field existed have none. Absent means
+   * HANDS-OFF rather than "eligible", which is the one asymmetry against
+   * `syncedUsername`: there is no source-level default IPMI host to fall back
+   * to, so a record carrying an `ipmiHost` with NO stamp is a hand entry and is
+   * never overwritten. (A record carrying neither is the never-configured state
+   * the sync is free to fill.)
+   */
+  syncedIpmiHost?: string;
 }
 
 /**
@@ -323,8 +354,8 @@ function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefine
 
 /**
  * Every member of ServerOrigin EXCEPT `syncedAt` — i.e. the ownership key plus
- * the two stamps the sync writes as decision INPUTS for its own next run
- * (`syncedUsername`, `syncedAuthProfileId`).
+ * the stamps the sync writes as decision INPUTS for its own next run
+ * (`syncedUsername`, `syncedAuthProfileId`, `syncedIpmiHost`).
  *
  * Exists for computeSyncPlan's `changed` check, which must be able to ask "did
  * this sync compute a stamp the record does not already carry?" without asking
@@ -352,7 +383,15 @@ export function serverOriginStampsEqual(a: ServerOrigin | undefined, b: ServerOr
     // stamps it owns on the very sync that first reads from the new one.
     a.syncedInstanceKey === b.syncedInstanceKey &&
     a.syncedUsername === b.syncedUsername &&
-    a.syncedAuthProfileId === b.syncedAuthProfileId
+    a.syncedAuthProfileId === b.syncedAuthProfileId &&
+    // The `ipmiHost` stamp joins for the same reason the two above it do, and
+    // AUTH 3a's shape reaches it too: a server whose device supplies an
+    // `oob_ip` EQUAL to the value the record already carries computes this
+    // stamp for the first time and changes nothing else, and an `after`
+    // discarded as "unchanged" there would throw the new stamp away — leaving
+    // that server permanently stampless, i.e. read as a hand entry by every
+    // later sync and never updated when the BMC is re-addressed.
+    a.syncedIpmiHost === b.syncedIpmiHost
   );
 }
 
@@ -360,12 +399,13 @@ function serverOriginsEqual(a: ServerOrigin | undefined, b: ServerOrigin | undef
   if (a === b) return true;
   if (!a || !b) return false;
   // Every member of ServerOrigin is compared, the `syncedUsername` /
-  // `syncedAuthProfileId` stamps included: they are what the retro-apply rule
-  // reads, so an origin that differs only there is a materially different
-  // record. Leaving either out would let the rollback merge in
-  // mergeServerConfigFields call two origins "equal" and drop a freshly written
-  // stamp back to the pre-batch one — after which the next sync would compare
-  // against a username, or a profile link, the record no longer carries.
+  // `syncedAuthProfileId` / `syncedIpmiHost` stamps included: they are what the
+  // retro-apply and OOB write rules read, so an origin that differs only there
+  // is a materially different record. Leaving any of them out would let the
+  // rollback merge in mergeServerConfigFields call two origins "equal" and drop
+  // a freshly written stamp back to the pre-batch one — after which the next
+  // sync would compare against a username, a profile link, or a BMC address the
+  // record no longer carries.
   return serverOriginStampsEqual(a, b) && a.syncedAt === b.syncedAt;
 }
 

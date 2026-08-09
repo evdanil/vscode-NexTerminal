@@ -247,8 +247,16 @@ function isIpv6Literal(value: string): boolean {
  * `host` / `ipmiHost`: the plain charset, plus bracketed IPv6 as a whole-value
  * exception. A value carrying a bracket ANYWHERE has to be that exception in
  * full — there is no "mostly a hostname with brackets in it" form to allow.
+ *
+ * EXPORTED so the inventory sync engine can ask the SAME question of an
+ * out-of-band address before it writes one into `ipmiHost` (a value the
+ * substitution chokepoint below would then refuse on every single run, with
+ * nothing on screen connecting it to the NetBox device it came from). Use time
+ * remains the enforcement point — this is a warn-and-skip, not a second source
+ * of truth, which is exactly why the engine calls THIS function rather than
+ * carrying a stricter rule of its own.
  */
-function isAddressValue(value: string): boolean {
+export function isAddressValue(value: string): boolean {
   if (value.includes("[") || value.includes("]")) {
     const match = BRACKETED_ADDRESS.exec(value);
     return match !== null && isIpv6Literal(match[1]);
