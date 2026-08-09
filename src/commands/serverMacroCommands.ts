@@ -8,7 +8,7 @@ import { getAssignedBinding } from "../macroBindingHelpers";
 import { bindingToDisplayLabel } from "../macroBindings";
 import { sanitizeMacroGroup } from "../services/macroFolders";
 import { hasProfileTokens, profileTokenLabel, resolveProfileTokens } from "../services/profileTokens";
-import type { ProfileTokenError } from "../services/profileTokens";
+import type { ProfileTokenError, ProfileTokenForm } from "../services/profileTokens";
 import { VARIABLE_MARKER } from "../ui/macroVariableMarker";
 import { macroWillPrompt } from "./macroCommands";
 import { connectServer, pickServer, toServerFromArg } from "./serverCommands";
@@ -50,13 +50,29 @@ function folderDetail(macro: TerminalMacro): string | undefined {
 }
 
 /**
+ * WHAT THE RESOLVED TEXT WILL BE, derived from where this macro runs — the ONE
+ * definition, shared by the picker's flag and the run itself.
+ *
+ * A `browser` macro's text is parsed as a URL, so an address token is written in
+ * URL-authority form there (a bare IPv6 literal gets bracketed); everything else
+ * is a command line and keeps the raw value. Both call sites read the form from
+ * here rather than each deciding: `profileTokenIssue()` and `runMacroOnServer()`
+ * already share the token SERVER for the same reason (see `profileTokenServer`),
+ * and a form that disagreed would let the picker flag a macro the run accepts,
+ * or the reverse.
+ */
+function profileTokenForm(macro: TerminalMacro): ProfileTokenForm {
+  return resolveMacroRunTarget(macro) === "browser" ? "url" : "command";
+}
+
+/**
  * Why this macro cannot run against this server, if it cannot. Asked through
  * `resolveProfileTokens` itself rather than a second, parallel rule, so the
  * flag in the picker and the refusal on selection can never disagree; it stops
  * at the first unresolvable token, which is the one the run would refuse on.
  */
 function profileTokenIssue(macro: TerminalMacro, server: ServerConfig): ProfileTokenError | undefined {
-  const outcome = resolveProfileTokens(macro.text, server);
+  const outcome = resolveProfileTokens(macro.text, server, { form: profileTokenForm(macro) });
   return outcome.ok ? undefined : outcome.error;
 }
 
@@ -440,10 +456,16 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
     macro = picked.macro;
   }
 
+  // Read BEFORE the tokens resolve, because it decides how they resolve: a
+  // browser macro's text is a URL, and an address token is written in URL form
+  // there. `profileTokenForm` is the same function the picker's flag used, so
+  // the two cannot answer differently for the same macro.
+  const runTarget = resolveMacroRunTarget(macro);
+
   // Profile tokens are resolved FIRST and synchronously: a macro that cannot be
   // resolved against this server must fail before anything is connected, any
   // terminal is created, and any prompt is shown.
-  const resolution = resolveProfileTokens(macro.text, tokenServer);
+  const resolution = resolveProfileTokens(macro.text, tokenServer, { form: profileTokenForm(macro) });
   if (!resolution.ok) {
     await reportProfileTokenError(resolution.error, server);
     return;
@@ -452,7 +474,6 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
   // delivery report, because everything below can still abort.
   const deliveryNote = unknownTokenNote(resolution.unknownTokens);
 
-  const runTarget = resolveMacroRunTarget(macro);
   let target: MacroSendTarget | undefined;
   switch (runTarget) {
     case "localTerminal":

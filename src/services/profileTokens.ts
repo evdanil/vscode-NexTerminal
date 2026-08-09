@@ -114,6 +114,28 @@ export type ProfileTokenOutcome =
   | ({ ok: true } & ProfileTokenResolution)
   | { ok: false; error: ProfileTokenError };
 
+/**
+ * WHAT THE RESOLVED TEXT IS, so a value can be written in the form that
+ * destination requires.
+ *
+ *   `"command"` — a shell command line (a session send or a `localTerminal`
+ *                 macro). The default, and byte-for-byte what every build before
+ *                 this context existed produced.
+ *   `"url"`     — the whole text is parsed as a URL (`runIn: "browser"`).
+ *
+ * The ONLY difference is IPv6 bracketing — see `substitutionValue()`. The
+ * charset checks are identical in both forms: what a value is ALLOWED to be
+ * does not depend on where it is going (an address that carries shell syntax is
+ * refused for a URL too, since `${profile.host}` in a URL's path lands in a
+ * command line the moment someone changes `runIn`).
+ */
+export type ProfileTokenForm = "command" | "url";
+
+export interface ProfileTokenContext {
+  /** Defaults to `"command"` — the pre-existing behaviour, unchanged. */
+  form?: ProfileTokenForm;
+}
+
 function isProfileTokenName(name: string): name is ProfileTokenName {
   return (PROFILE_TOKEN_WHITELIST as readonly string[]).includes(name);
 }
@@ -396,6 +418,54 @@ function validateTokenValue(token: ProfileTokenName, value: string): boolean {
   }
 }
 
+/**
+ * REVIEW FINDING (P2) — A BARE IPv6 HOST BROKE EVERY BROWSER MACRO. `host` and
+ * `ipmiHost` accept an UNBRACKETED IPv6 literal (`fe80::1`) — they have to: that
+ * is the form an SSH host takes, the form inventory sync writes, and the form
+ * `-H fe80::1` needs on an `ipmitool` command line. But the shipped "Launch IPMI
+ * web console" macro is `https://${profile.ipmiHost}/` with `runIn: "browser"`,
+ * and substituting the bare literal there yields `https://fe80::1/`, which is
+ * not a URL: the colons parse as a port, `new URL()` throws, and
+ * `resolveMacroBrowserUrl()` refuses the run with "its text is not an http://
+ * or https:// URL — Edit Macro". That points at the wrong repair entirely. The
+ * macro text is correct, the server record is correct; only the FORM of the
+ * value is wrong for the destination, and the destination is the one thing the
+ * substitution site knows.
+ *
+ * So the bracketing happens HERE rather than as a post-hoc patch of the finished
+ * URL. A post-hoc fix would have to re-find which span of the resolved text came
+ * from which token — the information this function has for free, and the reason
+ * `${profile.host}` in a URL's PATH or query is (correctly) left alone by a
+ * command-form run and bracketed by a URL-form one.
+ *
+ * WHAT IS AND IS NOT BRACKETED, and why the test is `isIpv6Literal()` on the raw
+ * value rather than "contains a colon":
+ *
+ *   `fe80::1`            → `[fe80::1]`             a bare literal; the bug.
+ *   `[fe80::1]`          → unchanged                already bracketed — bracketing
+ *                                                   again gives `[[fe80::1]]`.
+ *   `[fe80::1]:623`      → unchanged                already a valid authority.
+ *   `bmc.example.com:8443` → unchanged              HAS A COLON and is not IPv6:
+ *                                                   it is host:port, and
+ *                                                   `[bmc.example.com:8443]`
+ *                                                   would break a URL that works
+ *                                                   today.
+ *   `10.0.0.9`, any name → unchanged                not IPv6 at all.
+ *
+ * `isIpv6Literal()` is the same structural parse the bracketed-value check uses,
+ * so "what counts as IPv6" has exactly one definition in this file.
+ *
+ * COMMAND FORM IS UNTOUCHED — `-H fe80::1` is what ipmitool wants, and adding
+ * brackets there would break the shipped SOL template. That is why this takes a
+ * form rather than always bracketing.
+ */
+function substitutionValue(token: ProfileTokenName, value: string, form: ProfileTokenForm): string {
+  if (form !== "url" || (token !== "host" && token !== "ipmiHost")) {
+    return value;
+  }
+  return isIpv6Literal(value) ? `[${value}]` : value;
+}
+
 /** The offending value, made safe and short enough to show inside a notification. */
 function displayValue(value: string): string {
   // Control characters are why some values are refused; printing them raw would
@@ -578,11 +648,17 @@ export function unescapeProfileTokens(text: string): string {
  * Refusals are checked only for tokens that actually appear UNESCAPED: a macro
  * documenting `$${profile.ipmiHost}` must not be unrunnable on a server that
  * has no IPMI host.
+ *
+ * `context.form` decides how an accepted value is WRITTEN, never whether it is
+ * accepted — see `substitutionValue()`. It defaults to `"command"`, so every
+ * existing call site keeps its exact previous output.
  */
 export function resolveProfileTokens(
   text: string,
-  server: Pick<ServerConfig, ProfileTokenName>
+  server: Pick<ServerConfig, ProfileTokenName>,
+  context: ProfileTokenContext = {}
 ): ProfileTokenOutcome {
+  const form: ProfileTokenForm = context.form ?? "command";
   const serverName = typeof server.name === "string" && server.name.trim() !== "" ? server.name : "this server";
   const unknownTokens: string[] = [];
   const seenUnknown = new Set<string>();
@@ -610,7 +686,7 @@ export function resolveProfileTokens(
     if (!validateTokenValue(match.token, value)) {
       return { refuse: invalidError(match.token, serverName, value) };
     }
-    return value;
+    return substitutionValue(match.token, value, form);
   });
 
   return rewritten.ok

@@ -333,6 +333,22 @@ the part inside the brackets has to parse as an IPv6 address. A value with a
 bracket anywhere else (`a[b]c`) or a bracket expression dressed up as an address
 (`[abc]`) is refused: unquoted in a local command it is a glob, not an address.
 
+### IPv6 in a browser macro
+
+Store the address the way you would type it anywhere else — `fe80::1`, no
+brackets. In a **Browser** macro the whole text is a URL, and a URL needs an
+IPv6 address bracketed, so Nexus adds the brackets when it substitutes:
+`https://${profile.ipmiHost}/` on a server whose IPMI / BMC Host is `fe80::1`
+opens `https://[fe80::1]/`. Nothing else changes shape — a value you already
+stored bracketed (`[fe80::1]`, `[fe80::1]:623`) is used as written and never
+double-bracketed, and a host:port that merely contains a colon
+(`bmc.example.com:8443`) is left exactly as it is.
+
+**Session terminal** and **Local terminal** macros get the raw value, with no
+brackets added: `-H fe80::1` is what `ipmitool` expects. If you need the
+bracketed form on a command line, store it bracketed — it is accepted for both
+address fields.
+
 A macro that uses profile tokens cannot auto-trigger, whichever **Run in** it
 has: a rule fired by terminal output has no server to resolve the tokens
 against. The macro editor refuses the combination, and a macro that reaches the
@@ -350,7 +366,9 @@ compiles a trigger rule.
   where `ipmitool` runs. As in a session, the macro's own trailing newline
   decides whether the line executes.
 - **Browser** — the text is a URL, opened with your default browser. Only
-  `http://` and `https://` are accepted; anything else is refused.
+  `http://` and `https://` are accepted; anything else is refused. A profile
+  address that is a bare IPv6 literal is bracketed for you (see **IPv6 in a
+  browser macro**).
 
 Local terminal and Browser macros need a server profile to resolve against, so
 run them from **Run Macro on Server…**. Neither can auto-trigger: firing a

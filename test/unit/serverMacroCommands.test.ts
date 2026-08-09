@@ -422,6 +422,134 @@ describe("nexus.server.runMacro — dispatch", () => {
 });
 
 /**
+ * REVIEW FINDING (P2) — A BARE IPv6 HOST BROKE EVERY BROWSER MACRO. `fe80::1` is
+ * a legal, unbracketed value for `host` / `ipmiHost` — the form an SSH host
+ * takes and the form `ipmitool -H` needs — but substituted into the shipped
+ * `https://${profile.ipmiHost}/` it produced `https://fe80::1/`, which
+ * `new URL()` rejects. `resolveMacroBrowserUrl()` then refused the run with "its
+ * text is not an http:// or https:// URL", pointing the user at the macro text,
+ * which was never the problem. Substitution is now told what the resolved text
+ * IS, so a browser macro writes the address in URL-authority form.
+ */
+describe("nexus.server.runMacro — IPv6 addresses in a browser macro", () => {
+  const BMC_MACRO: TerminalMacro = { id: "a", name: "BMC", text: "https://${profile.ipmiHost}/", runIn: "browser" };
+
+  /** The URL the run actually handed to `openExternal`, or `undefined`. */
+  function openedUrl(): string | undefined {
+    const call = openExternal.mock.calls[0];
+    return call ? (call[0] as { value: string }).value : undefined;
+  }
+
+  async function runBrowserMacro(ipmiHost: string): Promise<void> {
+    await setMacros([BMC_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    await runMacroOnServer(context(), { server: server({ ipmiHost }) });
+  }
+
+  it("brackets a bare IPv6 literal, and the browser is actually opened", async () => {
+    await runBrowserMacro("fe80::1");
+
+    expect(openedUrl()).toBe("https://[fe80::1]/");
+    expect(openExternal).toHaveBeenCalledTimes(1);
+    // The pre-fix outcome, asserted as its absence: nothing opened and the user
+    // sent to Edit Macro over text that was correct all along.
+    expect(showErrorMessage).not.toHaveBeenCalled();
+    expect(String(setStatusBarMessage.mock.calls[0][0])).toBe('Macro "BMC" sent to the browser.');
+  });
+
+  it("does not double-bracket a value already stored bracketed", async () => {
+    await runBrowserMacro("[fe80::1]");
+    expect(openedUrl()).toBe("https://[fe80::1]/");
+  });
+
+  it("keeps a bracketed IPv6 with a port exactly as stored", async () => {
+    await runBrowserMacro("[fe80::1]:623");
+    expect(openedUrl()).toBe("https://[fe80::1]:623/");
+  });
+
+  it("does not treat a host:port colon as IPv6", async () => {
+    // `bmc.example.com:8443` contains a colon and is not an address literal —
+    // bracketing it would break a macro that works today.
+    await runBrowserMacro("bmc.example.com:8443");
+    expect(openedUrl()).toBe("https://bmc.example.com:8443/");
+  });
+
+  it("leaves a localTerminal macro's address alone — no brackets on a command line", async () => {
+    // The context-blind fix (always bracket) breaks exactly this: the shipped
+    // IPMI SOL template is a localTerminal macro and `ipmitool -H [fe80::1]` is
+    // not what it wants.
+    await setMacros([
+      { id: "s", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} sol activate\n", runIn: "localTerminal" }
+    ]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(context(), { server: server({ ipmiHost: "fe80::1" }) });
+
+    expect(createdTerminals[0].sent).toEqual([" ipmitool -H fe80::1 sol activate\n"]);
+  });
+
+  it("leaves a session macro's address alone too", async () => {
+    await setMacros([{ id: "s", name: "Ping", text: "ping ${profile.host}\n", runIn: "session" }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    const sent: string[] = [];
+    const sessionTerminal = { name: "Nexus SSH: Core Switch", sendText: (text: string) => sent.push(text) };
+    openTerminals = [sessionTerminal];
+    const ctx = context({
+      core: {
+        getSnapshot: () => ({ activeSessions: [{ id: "sess-1", serverId: "srv-1" }], servers: [] }),
+        getAuthProfile: () => undefined,
+        onDidChange: () => () => {}
+      },
+      sessionTerminals: new Map([["sess-1", sessionTerminal]])
+    } as unknown as Partial<CommandContext>);
+
+    await runMacroOnServer(ctx, { server: server({ host: "fe80::1" }) });
+
+    expect(sent).toEqual(["ping fe80::1\n"]);
+  });
+
+  it("agrees between the picker's flag and the run — an IPv6 server flags nothing and opens", async () => {
+    // The flag and the outcome are both `resolveProfileTokens` on the same
+    // server AND the same form, so they cannot disagree. A picker built in
+    // command form while the run resolves in URL form (or the reverse) is the
+    // drift this pins.
+    await setMacros([BMC_MACRO]);
+    let listed: Array<{ issue?: { token: string } }> = [];
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro; issue?: { token: string } }>) => {
+      listed = items;
+      return items[0];
+    });
+
+    await runMacroOnServer(context(), { server: server({ ipmiHost: "fe80::1" }) });
+
+    // No warning in the picker…
+    expect(listed[0].issue).toBeUndefined();
+    // …and the run backs that up: it opened, rather than erroring out.
+    expect(openedUrl()).toBe("https://[fe80::1]/");
+    expect(showErrorMessage).not.toHaveBeenCalled();
+  });
+
+  it("still flags and refuses an IPv6-shaped value that is not an address", async () => {
+    // URL form is a rendering decision, never a permission one: `[abc]` is a
+    // bracket expression, refused in both forms, and the picker says so.
+    await setMacros([BMC_MACRO]);
+    let listed: Array<{ issue?: { token: string } }> = [];
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro; issue?: { token: string } }>) => {
+      listed = items;
+      return items[0];
+    });
+    showErrorMessage.mockResolvedValue(undefined);
+
+    await runMacroOnServer(context(), { server: server({ ipmiHost: "[abc]" }) });
+
+    expect(listed[0].issue?.token).toBe("ipmiHost");
+    expect(openExternal).not.toHaveBeenCalled();
+    expect(showErrorMessage).toHaveBeenCalled();
+  });
+});
+
+/**
  * REVIEW FINDING (P2) — an unknown `${profile.…}` token is a warning, never a
  * failure, so the only question is WHEN it is said. It used to be said the
  * instant the tokens resolved: before the prompt walk, before the "connect

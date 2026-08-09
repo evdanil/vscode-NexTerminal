@@ -7,6 +7,7 @@ import {
   unescapeProfileTokens,
   PROFILE_TOKEN_WHITELIST
 } from "../../src/services/profileTokens";
+import type { ProfileTokenContext } from "../../src/services/profileTokens";
 import { scanPlaceholders, substituteMacroVariables } from "../../src/services/macroVariables";
 import type { ServerConfig } from "../../src/models/config";
 
@@ -24,8 +25,8 @@ function server(overrides: Partial<ServerConfig> = {}): ServerConfig {
 }
 
 /** Every outcome the tests assert on is a success — narrows without `as`. */
-function resolved(text: string, cfg: ServerConfig): string {
-  const outcome = resolveProfileTokens(text, cfg);
+function resolved(text: string, cfg: ServerConfig, context?: ProfileTokenContext): string {
+  const outcome = resolveProfileTokens(text, cfg, context);
   if (!outcome.ok) {
     throw new Error(`expected a resolution, got ${outcome.error.kind} for ${outcome.error.token}`);
   }
@@ -468,6 +469,106 @@ describe("resolveProfileTokens — injection defense", () => {
     if (outcome.ok) return;
     expect(outcome.error.message).toContain("…");
     expect(outcome.error.message.length).toBeLessThan(400);
+  });
+});
+
+/**
+ * REVIEW FINDING (P2) — a bare IPv6 host is legal in an address field, correct
+ * on a command line (`-H fe80::1`), and NOT a URL: `https://fe80::1/` fails
+ * `new URL()`, so the shipped browser macro opened nothing and blamed the macro
+ * text. The value's form is what depends on the destination, so the destination
+ * is passed in.
+ */
+describe("resolveProfileTokens — URL form brackets a bare IPv6 address", () => {
+  const URL_FORM: ProfileTokenContext = { form: "url" };
+
+  it("brackets a bare IPv6 literal so the result parses as a URL", () => {
+    const text = resolved("https://${profile.ipmiHost}/", server({ ipmiHost: "fe80::1" }), URL_FORM);
+    expect(text).toBe("https://[fe80::1]/");
+    // The property that actually matters — the pre-fix `https://fe80::1/` throws.
+    expect(new URL(text).protocol).toBe("https:");
+  });
+
+  it("does the same for ${profile.host}, and for every IPv6 shape the field accepts", () => {
+    for (const [stored, expected] of [
+      ["::1", "[::1]"],
+      ["fe80::1", "[fe80::1]"],
+      ["2001:db8:0:0:0:0:0:1", "[2001:db8:0:0:0:0:0:1]"],
+      ["2001:0db8:85a3:0000:0000:8a2e:0370:7334", "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]"],
+      ["::ffff:10.0.0.1", "[::ffff:10.0.0.1]"]
+    ] as const) {
+      expect(resolved("https://${profile.host}/", server({ host: stored }), URL_FORM)).toBe(`https://${expected}/`);
+    }
+  });
+
+  it("never double-brackets a value that is already bracketed, with or without a port", () => {
+    expect(resolved("https://${profile.ipmiHost}/", server({ ipmiHost: "[fe80::1]" }), URL_FORM)).toBe(
+      "https://[fe80::1]/"
+    );
+    // `[fe80::1]:623` is already a valid URL authority — bracketing it again
+    // would produce `[[fe80::1]:623]`, which is not.
+    expect(resolved("https://${profile.ipmiHost}/", server({ ipmiHost: "[fe80::1]:623" }), URL_FORM)).toBe(
+      "https://[fe80::1]:623/"
+    );
+    expect(new URL(resolved("https://${profile.ipmiHost}/", server({ ipmiHost: "[fe80::1]:623" }), URL_FORM)).port).toBe(
+      "623"
+    );
+  });
+
+  it("does NOT bracket a host:port that merely contains a colon", () => {
+    // The trap a "contains a colon" test would fall into: this value works in a
+    // URL today, and `[bmc.example.com:8443]` would break it.
+    expect(resolved("https://${profile.ipmiHost}/", server({ ipmiHost: "bmc.example.com:8443" }), URL_FORM)).toBe(
+      "https://bmc.example.com:8443/"
+    );
+    expect(resolved("https://${profile.host}/", server({ host: "10.0.0.9:8443" }), URL_FORM)).toBe(
+      "https://10.0.0.9:8443/"
+    );
+  });
+
+  it("leaves every non-IPv6 address untouched", () => {
+    for (const stored of ["10.0.0.9", "bmc.example.com", "bmc-1_dc4", "192.168.1.1"]) {
+      expect(resolved("https://${profile.host}/", server({ host: stored }), URL_FORM)).toBe(`https://${stored}/`);
+    }
+  });
+
+  it("brackets NOTHING but the two address tokens", () => {
+    // `name`, `port` and `username` have no URL-authority form to fix, and a
+    // form-blind "bracket anything that looks like IPv6" would reach them.
+    expect(resolved("https://x/?u=${profile.username}&n=${profile.name}", server({ username: "a.b", name: "Core Switch" }), URL_FORM)).toBe(
+      "https://x/?u=a.b&n=Core Switch"
+    );
+    expect(resolved("https://x:${profile.port}/", server({ port: 8443 }), URL_FORM)).toBe("https://x:8443/");
+  });
+
+  it("COMMAND FORM IS UNCHANGED — `-H fe80::1` is what ipmitool wants", () => {
+    // The other half of the fix, and the one a context-blind always-bracket
+    // implementation breaks: the shipped SOL template is a localTerminal macro.
+    expect(resolved(" ipmitool -H ${profile.ipmiHost} sol activate\n", server({ ipmiHost: "fe80::1" }))).toBe(
+      " ipmitool -H fe80::1 sol activate\n"
+    );
+    expect(resolved("-H ${profile.host}", server({ host: "fe80::1" }), { form: "command" })).toBe("-H fe80::1");
+    // Explicit default: omitting the context is command form.
+    expect(resolved("-H ${profile.host}", server({ host: "::1" }))).toBe("-H ::1");
+  });
+
+  it("does not change what is ACCEPTED — the charset is the same in both forms", () => {
+    // Bracketing is a rendering decision, never a permission one: a value that
+    // carries shell syntax is refused for a URL too (the same text is one
+    // `runIn` change away from a command line).
+    for (const bad of ["1.2.3.4; rm -rf ~", "[abc]", "a[b]c", "https://10.0.0.1/"]) {
+      expect(resolveProfileTokens("https://${profile.ipmiHost}/", server({ ipmiHost: bad }), URL_FORM).ok, bad).toBe(
+        false
+      );
+    }
+    // …and a missing field still refuses rather than substituting empty brackets.
+    expect(resolveProfileTokens("https://${profile.ipmiHost}/", server(), URL_FORM).ok).toBe(false);
+  });
+
+  it("leaves an ESCAPED token literal in URL form too", () => {
+    expect(resolved("https://$${profile.ipmiHost}/", server({ ipmiHost: "fe80::1" }), URL_FORM)).toBe(
+      "https://${profile.ipmiHost}/"
+    );
   });
 });
 
