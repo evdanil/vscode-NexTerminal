@@ -49,10 +49,10 @@ export function validateProxyConfig(proxy: unknown): proxy is ProxyConfig {
     return isNonEmptyString(obj.jumpHostId);
   }
   if (obj.type === "socks5") {
-    return isNonEmptyString(obj.host) && isValidPort(obj.port);
+    return isNonEmptyString(obj.host) && isValidPort(obj.port) && (obj.username === undefined || typeof obj.username === "string");
   }
   if (obj.type === "http") {
-    return isNonEmptyString(obj.host) && isValidPort(obj.port);
+    return isNonEmptyString(obj.host) && isValidPort(obj.port) && (obj.username === undefined || typeof obj.username === "string");
   }
   return false;
 }

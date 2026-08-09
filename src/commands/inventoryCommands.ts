@@ -230,8 +230,16 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
  * an update that newly matches but has no stored secret captures nothing and deletes
  * nothing — broadening the trigger costs nothing where there is no orphan.
  *
+ * ROUND 12 — ALSO covers the plan's ADDS, not just its updates. A delete-pruned
+ * device whose best-effort `proxy-password-{id}` delete FAILED can reappear as an
+ * ADD under the same reused deterministic id; treating an add's `before` as "no
+ * proxy" (undefined) makes the EITHER-side rule fire exactly when the add's proxy
+ * is a password-bearing socks5/http endpoint, clearing the orphan before the add
+ * is published. See the inline note on the helper for the reuse mechanism.
+ *
  * Centralized so EVERY inventory apply site shares one rule (invoked before BOTH
- * the fast-path recompute apply AND the in-lock confirmed apply). Deliberately NOT
+ * the fast-path recompute apply AND the in-lock confirmed apply, passing BOTH the
+ * plan's updates and its adds). Deliberately NOT
  * the server-form `syncProxyPasswordSecret` path — that governs hand-edited
  * proxies and bypasses this apply flow entirely.
  *
@@ -270,25 +278,42 @@ function isSameAuthenticatedEndpoint(before: ProxyConfig | undefined, after: Pro
 
 async function clearStaleProxyPasswordSecretsBeforeApply(
   vault: SecretVault,
-  updates: ReadonlyArray<{ before: ServerConfig; after: ServerConfig }>
+  updates: ReadonlyArray<{ before: ServerConfig; after: ServerConfig }>,
+  adds: ReadonlyArray<ServerConfig> = []
 ): Promise<Array<{ key: string; value: string }>> {
-  const captured: Array<{ key: string; value: string }> = [];
+  // ROUND 12 — ADDS are scanned too, not just updates. Deterministic server ids
+  // are REUSED, and the delete-prune path clears `proxy-password-{id}` only
+  // best-effort — so a device delete-pruned with a FAILED secret delete can
+  // reappear as an ADD under the same id with the orphaned password still in the
+  // vault. A template can add it with a NEW authenticated socks5/http endpoint,
+  // and the first connect would send the orphan there. An add has no prior
+  // proxy, so its `before` is "no proxy" (undefined): the round-11 EITHER-side
+  // rule then fires exactly when the add's proxy is password-bearing. A fresh
+  // sync-added server never legitimately stores a proxy password (templates
+  // prompt per-connect, §5.3), so any secret under its id is an orphan — clearing
+  // it is correct.
+  const entries: Array<{ id: string; beforeProxy: ProxyConfig | undefined; afterProxy: ProxyConfig | undefined }> = [];
   for (const { before, after } of updates) {
-    const bp = before.proxy;
-    const ap = after.proxy;
+    // before.id === after.id (same record through an update); use after.id.
+    entries.push({ id: after.id, beforeProxy: before.proxy, afterProxy: after.proxy });
+  }
+  for (const add of adds) {
+    entries.push({ id: add.id, beforeProxy: undefined, afterProxy: add.proxy });
+  }
+  const captured: Array<{ key: string; value: string }> = [];
+  for (const { id, beforeProxy: bp, afterProxy: ap } of entries) {
     // ROUND 11 — trigger on EITHER side being a password-bearing endpoint. A
     // non-password-bearing `before.proxy` does NOT prove no secret exists (an
-    // orphaned legacy-backup entry can sit under an undefined/ssh proxy), so an
-    // `after`-side authenticated endpoint must trigger the clear too — see the
-    // function doc for why.
+    // orphaned legacy-backup entry can sit under an undefined/ssh proxy, and an
+    // add's `before` is always undefined), so an `after`-side authenticated
+    // endpoint must trigger the clear too — see the function doc for why.
     if (!isPasswordBearingProxy(bp) && !isPasswordBearingProxy(ap)) {
       continue; // neither side carries a proxy password — nothing to leak (ssh proxies never send one)
     }
     if (isSameAuthenticatedEndpoint(bp, ap)) {
       continue; // still the same authenticated endpoint — the stored password still applies
     }
-    // before.id === after.id (same record through an update); use after.id.
-    const key = proxyPasswordSecretKey(after.id);
+    const key = proxyPasswordSecretKey(id);
     let existing: string | undefined;
     try {
       existing = await vault.get(key);
@@ -3301,7 +3326,7 @@ export function registerInventoryCommands(
           // restores internally), so the catch's restore is then a harmless no-op.
           let cleared: Array<{ key: string; value: string }> = [];
           try {
-            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, recomputed.updates);
+            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, recomputed.updates, recomputed.adds);
             const applyResult = await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
             // F5 — `freshSource` (the exact incarnation this apply just ran
             // against), not the outer `source` captured before this sync
@@ -4026,7 +4051,7 @@ export function registerInventoryCommands(
           let applyResult: { skippedCount: number; removedServerIds: string[]; removedEmptyFolderCount: number };
           let cleared: Array<{ key: string; value: string }> = [];
           try {
-            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, finalPlan.updates);
+            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, finalPlan.updates, finalPlan.adds);
             applyResult = await core.applyInventorySyncPlan(finalApplication);
           } catch (error) {
             // The apply did NOT commit (or a stale-secret delete failed) — the old
