@@ -3113,6 +3113,77 @@ export function registerInventoryCommands(
           .slice(0, 3)
           .map((candidate) => `"${candidate.deviceName}"`)
           .join(", ");
+        // REVIEW FINDING (P2) — THE DECLINE LINE, which is the only line here
+        // that can be false. `separateAddBlocked` is the engine's own record of
+        // the collision exemption that let the candidate exist at all (see
+        // `InventoryAdoptionCandidate`): the adoptee already holds the id an add
+        // for this device would need, so choosing Add Separately reaches the
+        // engine's collision fall-through, which skips the device and adds
+        // nothing. Read off the candidate rather than recomputed from
+        // `deterministicServerId` here — a second derivation of the same fact is
+        // a second thing that can drift from the plan the answer is spent on.
+        //
+        // WHY THIS IS NOW REACHABLE AT ALL: the fast path used to return before
+        // the question whenever a plan's add/update/prune counts were empty, and
+        // a restored ID-preserving backup produces exactly such a plan. Fixing
+        // that made this the ordinary shape of the restored-backup run, not a
+        // corner of it — the copy promising a separate add went live with it.
+        //
+        // THE MIXED CASE IS NAMED, NOT AVERAGED. With one blocked device among
+        // three, neither "adds each device" nor "adds nothing" is true, and a
+        // sentence hedged into vagueness would leave the user unable to tell
+        // which of the three they are about to lose. Same cap and the same "e.g."
+        // discipline as the count line above (`pushSkipSummary`'s precedent), and
+        // the same singular/plural rule: one name is the whole list, so it is not
+        // an example.
+        //
+        // The reason given is the engine's own words for it ("still uses the id a
+        // new server ... would need" — one name for one concept), so the sentence
+        // the user reads before choosing and the warning they find afterwards
+        // behind Show Warnings describe one situation rather than two.
+        const blocked = plan.adoptionCandidates.filter((candidate) => candidate.separateAddBlocked);
+        const blockedExamples = blocked
+          .slice(0, 3)
+          .map((candidate) => `"${candidate.deviceName}"`)
+          .join(", ");
+        /**
+         * AND THE BUTTON ITSELF, in the one case where its name is the false
+         * promise. "Add Separately" is an ACTION label — it says what pressing it
+         * does — so when nothing can be added separately it is wrong in exactly
+         * the way the detail line was, and a dialog whose button says "Add
+         * Separately" above a body reading "adds nothing" makes the user
+         * reconcile a contradiction the code could simply not have written.
+         *
+         * ONLY when EVERY candidate is blocked. In the mixed case the label is
+         * true of at least one device and the detail names the exceptions, so a
+         * third label there would buy nothing and cost the same.
+         *
+         * THE COST, stated plainly: a label that varies between runs is a real
+         * cost — people learn a button by its name as well as its position. It is
+         * paid here because the two runs are not the same question (their bodies
+         * already differ), the button keeps its POSITION as the second, non-
+         * adopting choice, and the name changes precisely when the old one would
+         * have described something that does not happen. A fixed label bought
+         * consistency by being false in a state the user can reach by restoring a
+         * backup, which is the defect this finding is about.
+         *
+         * "Don't Adopt" rather than "Keep Servers": that phrase is already spent
+         * on the removal dialog's opposite-of-delete fork, and reusing it for the
+         * opposite-of-adopt fork would make one label mean two things.
+         */
+        const declineLabel = blocked.length === n ? "Don't Adopt" : "Add Separately";
+        const separateLine =
+          blocked.length === 0
+            ? n === 1
+              ? "Add Separately leaves that server untouched and adds the device as a separate new server."
+              : "Add Separately leaves those servers untouched and adds each device as a separate new server."
+            : blocked.length === n
+              ? n === 1
+                ? "Don't Adopt leaves that server untouched and adds nothing: it still uses the id a new server for this device would need, so the device is skipped rather than added separately."
+                : "Don't Adopt leaves those servers untouched and adds nothing: each still uses the id a new server for its device would need, so every one of these devices is skipped rather than added separately."
+              : blocked.length === 1
+                ? `Add Separately leaves those servers untouched and adds each device as a separate new server — except 1 device (${blockedExamples}), whose kept server still uses the id a new server for it would need, so that device is skipped rather than added separately.`
+                : `Add Separately leaves those servers untouched and adds each device as a separate new server — except ${blocked.length} devices (e.g. ${blockedExamples}), whose kept servers still use the ids new servers for them would need, so those devices are skipped rather than added separately.`;
         // m1/m2 — full sentences, per-count verbs, no bare counts. The first
         // line states the FACT that makes these servers eligible, in the same
         // words the preview and the pair list use ("kept from a removed
@@ -3141,13 +3212,13 @@ export function registerInventoryCommands(
             ? [
                 `1 device (${examples}) was previously synced onto a server you kept from a removed inventory source.`,
                 `Adopt Existing re-links that server to "${source.name}" instead of adding a copy — it keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source's Removed-Device Policy applies to it too, so a source set to Delete removes it, and its saved credentials, if the device later disappears from the source.`,
-                "Add Separately leaves that server untouched and adds the device as a separate new server.",
+                separateLine,
                 "Nothing changes until you choose Apply on the sync preview."
               ].join("\n")
             : [
                 `${n} devices (e.g. ${examples}) were previously synced onto servers you kept from a removed inventory source.`,
                 `Adopt Existing re-links those servers to "${source.name}" instead of adding copies — each keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source's Removed-Device Policy applies to them too, so a source set to Delete removes any one of them, and its saved credentials, if its device later disappears from the source.`,
-                "Add Separately leaves those servers untouched and adds each device as a separate new server.",
+                separateLine,
                 "Nothing changes until you choose Apply on the sync preview."
               ].join("\n");
         // REVIEW FINDING (P1) — WHAT THE QUESTION IS ABOUT, captured BEFORE the
@@ -3173,9 +3244,13 @@ export function registerInventoryCommands(
             : `Adopt ${n} servers kept from a removed inventory source into "${source.name}"?`,
           { modal: true, detail },
           "Adopt Existing",
-          "Add Separately"
+          declineLabel
         );
-        if (answer === "Adopt Existing" || answer === "Add Separately") {
+        // Compared against the label that was actually RENDERED, never against
+        // the string literal: the decline button is named for what it does in
+        // this run, so a hard-coded "Add Separately" here would silently drop the
+        // answer on every all-blocked run and fall through to "dismissed".
+        if (answer === "Adopt Existing" || answer === declineLabel) {
           adoptionChoice = answer === "Adopt Existing" ? "adopt" : "decline";
           // PAIRING RULE (see resolveSourceAuthProfile) — re-resolved in
           // lockstep with `plan`, immediately before the call it feeds, against

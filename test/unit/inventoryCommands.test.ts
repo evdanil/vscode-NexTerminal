@@ -5328,7 +5328,7 @@ describe("inventoryCommands", () => {
     });
 
     it("the captured CANDIDATE keys name a pairing exactly as the adopted-pair keys do — same key, same halves — so the question's captured consent and the preview's drift comparison can never disagree about what a pairing IS (kills a candidate capture keyed on the device name or on the adoptee alone, and kills reusing adoptionPairKeys for the question: an unanswered plan adopts nothing)", () => {
-      const candidate = { deviceName: "core-sw-01", externalId: "device:1", serverId: "kept-1" };
+      const candidate = { deviceName: "core-sw-01", externalId: "device:1", serverId: "kept-1", separateAddBlocked: false };
 
       // An "adopt" run's plan carries BOTH shapes of the same fact: the
       // candidate the question was put about, and the update it became. Where
@@ -6147,11 +6147,174 @@ describe("inventoryCommands", () => {
       expect(applySpy).toHaveBeenCalledTimes(1);
     });
 
-    it("RESTORED BACKUP, declined — the run reaches the preview and Show Warnings carries the engine's explanation, instead of ending in silence (kills a fix that only unblocks the Adopt branch: Add Separately cannot add this device either, so the sentence saying why is the only thing the user gets)", async () => {
+    // REVIEW FINDING (P2, "avoid promising a separate add when the ID is
+    // occupied") — the three shapes of the decline line. The fast-path fix above
+    // is what made this copy reachable: a restored ID-preserving backup now DOES
+    // reach the question, and the sentence it read there ("adds the device as a
+    // separate new server") described something the engine cannot do — its
+    // collision fall-through skips the device, so the user chose an add, got
+    // nothing, and had one line behind Show Warnings to work out why.
+    //
+    // Each test below asserts the WHOLE detail, line by line, plus the buttons.
+    // Asserting a substring of the changed line would let the other three lines
+    // rot silently, and asserting "a modal was shown" would pass against the very
+    // copy this finding is about.
+    it("ALL BLOCKED — the question promises no add at all and names the button for what it does, and choosing it really does leave the kept server untouched and add nothing (kills the blanket 'adds the device as a separate new server': that is exactly what does NOT happen when the adoptee already holds the id, and it is the state a restored ID-preserving backup lands in)", async () => {
       const { core } = await harness({ servers: [keptServer({ id: ADD_PATH_ID })] });
       const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
 
-      mockShowInformationMessage.mockResolvedValueOnce("Add Separately").mockResolvedValueOnce("Show Warnings");
+      mockShowInformationMessage.mockResolvedValueOnce("Don't Adopt").mockResolvedValueOnce("Apply");
+      // The blocked device's own warning survives the apply, so the post-apply
+      // warnings toast fires.
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      expect(shown[0][0]).toBe(QUESTION);
+      expect(shown[0][1].detail.split("\n")).toEqual([
+        '1 device ("core-sw-01") was previously synced onto a server you kept from a removed inventory source.',
+        'Adopt Existing re-links that server to "My Source" instead of adding a copy — it keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source\'s Removed-Device Policy applies to it too, so a source set to Delete removes it, and its saved credentials, if the device later disappears from the source.',
+        // THE FINDING, in one line. It states the outcome (adds nothing), the
+        // reason, and it does so in the engine's own words — the sentence found
+        // later behind Show Warnings describes the same situation, not a second
+        // one.
+        "Don't Adopt leaves that server untouched and adds nothing: it still uses the id a new server for this device would need, so the device is skipped rather than added separately.",
+        "Nothing changes until you choose Apply on the sync preview."
+      ]);
+      // And the BUTTON, which is an action label: "Add Separately" over a body
+      // reading "adds nothing" is the same false promise one line higher up.
+      expect(shown[0].slice(2)).toEqual(["Adopt Existing", "Don't Adopt"]);
+
+      // THE OUTCOME THE COPY NOW DESCRIBES, applied for real rather than
+      // abandoned at Show Warnings: one server, the one that was already there,
+      // still un-owned and still advertising itself for adoption next run. A
+      // second record here would mean the old copy had been true and the fix
+      // aimed at the wrong half.
+      expect(applySpy).toHaveBeenCalledTimes(1);
+      const servers = core.getSnapshot().servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0].id).toBe(ADD_PATH_ID);
+      expect(servers[0].name).toBe("old-lab-switch");
+      expect(servers[0].username).toBe("handpicked");
+      expect(servers[0].origin).toBeUndefined();
+      expect(servers[0].formerlySynced?.externalId).toBe("device:1");
+    });
+
+    it("ALL BLOCKED, plural — the same promise withdrawn for a whole set (kills reusing the singular sentence, whose 'it still uses the id' names no server when there are two of them)", async () => {
+      const { core } = await harness({
+        devices: [DEVICE_1, DEVICE_2],
+        servers: [
+          keptServer({ id: ADD_PATH_ID }),
+          keptServer({
+            id: deterministicServerId("src-1", "device:2"),
+            name: "spare-rtr",
+            host: "10.0.0.12",
+            formerlySynced: keptMarker({ externalId: "device:2" })
+          })
+        ]
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown[0][0]).toBe('Adopt 2 servers kept from a removed inventory source into "My Source"?');
+      expect(shown[0][1].detail.split("\n")).toEqual([
+        '2 devices (e.g. "core-sw-01", "dist-rtr-01") were previously synced onto servers you kept from a removed inventory source.',
+        'Adopt Existing re-links those servers to "My Source" instead of adding copies — each keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source\'s Removed-Device Policy applies to them too, so a source set to Delete removes any one of them, and its saved credentials, if its device later disappears from the source.',
+        "Don't Adopt leaves those servers untouched and adds nothing: each still uses the id a new server for its device would need, so every one of these devices is skipped rather than added separately.",
+        "Nothing changes until you choose Apply on the sync preview."
+      ]);
+      expect(shown[0].slice(2)).toEqual(["Adopt Existing", "Don't Adopt"]);
+    });
+
+    it("MIXED — the question names the ONE device that cannot be added beside its server while still promising the add for the other, and the run then does exactly that (kills a fix that treats any blocked candidate as all of them: 'adds nothing' would be false about dist-rtr-01, which really is added — and kills leaving the blanket promise in place, which is false about core-sw-01, which really is not)", async () => {
+      const { core } = await harness({
+        devices: [DEVICE_1, DEVICE_2],
+        servers: [
+          // Blocked: this record already holds the id an add for device:1 would
+          // mint — the restored-backup shape.
+          keptServer({ id: ADD_PATH_ID }),
+          // Clean: a hand-chosen id, so nothing stands in the way of the add.
+          keptServer({ id: "kept-2", name: "spare-rtr", host: "10.0.0.12", formerlySynced: keptMarker({ externalId: "device:2" }) })
+        ]
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Add Separately").mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      expect(shown[0][0]).toBe('Adopt 2 servers kept from a removed inventory source into "My Source"?');
+      expect(shown[0][1].detail.split("\n")).toEqual([
+        '2 devices (e.g. "core-sw-01", "dist-rtr-01") were previously synced onto servers you kept from a removed inventory source.',
+        'Adopt Existing re-links those servers to "My Source" instead of adding copies — each keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source\'s Removed-Device Policy applies to them too, so a source set to Delete removes any one of them, and its saved credentials, if its device later disappears from the source.',
+        // NAMED, not averaged: one device of the two is the exception, and the
+        // user is told which. A count alone ("1 of them") would leave them
+        // choosing without knowing which server they are about to lose the add
+        // for. One name is the whole list, so it is not an "e.g.".
+        'Add Separately leaves those servers untouched and adds each device as a separate new server — except 1 device ("core-sw-01"), whose kept server still uses the id a new server for it would need, so that device is skipped rather than added separately.',
+        "Nothing changes until you choose Apply on the sync preview."
+      ]);
+      // The label stands here — it is true of dist-rtr-01, and the detail names
+      // the exception. A third label would be a third thing to learn for no gain.
+      expect(shown[0].slice(2)).toEqual(["Adopt Existing", "Add Separately"]);
+
+      // AND THE RUN DOES EXACTLY WHAT THE SENTENCE SAID. Three servers: both kept
+      // records untouched, and ONE new one — device:2's. device:1 produced
+      // nothing, which is the whole reason the sentence had to be written.
+      expect([...core.getSnapshot().servers].map((s) => s.id).sort()).toEqual(
+        [ADD_PATH_ID, "kept-2", deterministicServerId("src-1", "device:2")].sort()
+      );
+      expect(core.getServer(ADD_PATH_ID)?.origin).toBeUndefined();
+      expect(core.getServer(ADD_PATH_ID)?.name).toBe("old-lab-switch");
+      expect(core.getServer("kept-2")?.origin).toBeUndefined();
+      expect(core.getServer(deterministicServerId("src-1", "device:2"))?.name).toBe("dist-rtr-01");
+    });
+
+    it("MIXED, plural exception — two blocked among three are named as examples under the same cap and 'e.g.' the count line uses (kills a singular exception clause bolted on for the one-blocked case: 'whose kept server still uses the id' names one server for two devices)", async () => {
+      const DEVICE_3 = {
+        externalId: "device:3",
+        name: "edge-fw-01",
+        endpoints: [{ kind: "ssh" as const, host: "10.0.0.13", port: 22 }]
+      };
+      const { core } = await harness({
+        devices: [DEVICE_1, DEVICE_2, DEVICE_3],
+        servers: [
+          keptServer({ id: ADD_PATH_ID }),
+          keptServer({
+            id: deterministicServerId("src-1", "device:2"),
+            name: "spare-rtr",
+            host: "10.0.0.12",
+            formerlySynced: keptMarker({ externalId: "device:2" })
+          }),
+          keptServer({ id: "kept-3", name: "old-fw", host: "10.0.0.13", formerlySynced: keptMarker({ externalId: "device:3" }) })
+        ]
+      });
+      expect(core.getSnapshot().servers).toHaveLength(3);
+
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const detail = modals()[0][1].detail.split("\n");
+      expect(detail[0]).toBe('3 devices (e.g. "core-sw-01", "dist-rtr-01", "edge-fw-01") were previously synced onto servers you kept from a removed inventory source.');
+      expect(detail[2]).toBe(
+        'Add Separately leaves those servers untouched and adds each device as a separate new server — except 2 devices (e.g. "core-sw-01", "dist-rtr-01"), whose kept servers still use the ids new servers for them would need, so those devices are skipped rather than added separately.'
+      );
+      expect(modals()[0].slice(2)).toEqual(["Adopt Existing", "Add Separately"]);
+    });
+
+    it("RESTORED BACKUP, declined — the run reaches the preview and Show Warnings carries the engine's explanation, so the answer given before the run and the account given after it agree (kills a fix that only unblocks the Adopt branch: the decline cannot add this device either, and the sentence saying why has to survive to the warnings)", async () => {
+      const { core } = await harness({ servers: [keptServer({ id: ADD_PATH_ID })] });
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      // "Don't Adopt", not "Add Separately": every candidate in this run is
+      // blocked, so that is the label the question actually renders (see the
+      // detail-text test above). A run answering the OTHER string would be
+      // dismissing the modal, and the assertions below would then be about Esc.
+      mockShowInformationMessage.mockResolvedValueOnce("Don't Adopt").mockResolvedValueOnce("Show Warnings");
       await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
 
       const shown = modals();

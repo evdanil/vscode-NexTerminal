@@ -174,6 +174,24 @@ export interface InventoryAdoptionCandidate {
   externalId: string;
   /** `ServerConfig.id` of the kept server this device would reclaim — the record the adoption hands over. */
   serverId: string;
+  /**
+   * REVIEW FINDING (P2) — true when DECLINING adopts nothing AND adds nothing:
+   * the adoptee is itself the record holding `deterministicServerId(source.id,
+   * externalId)`, so the add this device would otherwise produce is skipped by
+   * the collision fall-through instead (with its own warning). The state a
+   * restored ID-preserving backup lands in, and the only state in which the
+   * "adds each device as a separate new server" half of the question would be
+   * false — which is why the fact rides on the candidate rather than being
+   * re-derived by whoever renders it. False means the decline genuinely adds:
+   * every other `continue` between here and `adds.push` is upstream of this
+   * push, so a candidate with no id collision always reaches the add.
+   *
+   * NOT part of `adoptionCandidateKeys`, and that is not an oversight: the flag
+   * is a pure function of the pair the key already carries (`serverId ===
+   * deterministicServerId(source.id, externalId)`), so it cannot change under a
+   * captured answer without the pair changing with it.
+   */
+  separateAddBlocked: boolean;
 }
 
 function joinTargetAndRel(targetFolder: string, rel: string | undefined): string | undefined {
@@ -1213,7 +1231,23 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // adoptee this device resolved to is known right here and nowhere else,
       // and a caller that had only the name could not tell one candidate set
       // from another with the same names in it.
-      adoptionCandidates.push({ deviceName: device.name, externalId: device.externalId, serverId: adoptee.id });
+      //
+      // THE THIRD HALF (REVIEW FINDING, P2) — whether declining actually yields
+      // the separate add the question offers. `collisionIsTheAdoptee` is the
+      // exemption evaluated a dozen lines up, reused verbatim rather than
+      // re-derived: reaching this push means the guard either found no collider
+      // or found this very adoptee holding the id, so the flag is exactly "the
+      // adoptee already owns the id an add for this device would need" — and
+      // that is precisely the state the fall-through below skips instead of
+      // adding. Carried on the candidate so the caller can say so BEFORE the
+      // choice, rather than leaving the engine's after-the-fact warning as the
+      // only account of a promise it could not keep.
+      adoptionCandidates.push({
+        deviceName: device.name,
+        externalId: device.externalId,
+        serverId: adoptee.id,
+        separateAddBlocked: collisionIsTheAdoptee
+      });
       if (adoptKeptServers) {
         // The adopted record: re-stamping plus ordinary source ownership, NEVER
         // a credential copy. `...adoptee` first is the whole field-ownership

@@ -2050,8 +2050,11 @@ describe("computeSyncPlan — adopt-on-add", () => {
     });
 
     expect(plan.adoptionCandidates).toEqual([
-      { deviceName: "core-sw-1", externalId: "device:1", serverId: "kept-1" },
-      { deviceName: "dist-rtr-1", externalId: "device:2", serverId: "kept-2" }
+      // `separateAddBlocked: false` on both — these kept servers carry
+      // hand-chosen ids, so nothing holds the id an add would mint and declining
+      // really does add them beside the originals.
+      { deviceName: "core-sw-1", externalId: "device:1", serverId: "kept-1", separateAddBlocked: false },
+      { deviceName: "dist-rtr-1", externalId: "device:2", serverId: "kept-2", separateAddBlocked: false }
     ]);
 
     // And an "adopt" run turns each candidate into the update its own pair
@@ -3093,6 +3096,34 @@ describe("computeSyncPlan — adopt-on-add", () => {
       // id that is already in use.
       expect(plan.updates).toHaveLength(0);
       expect(plan.adds).toHaveLength(0);
+      // REVIEW FINDING (P2) — the candidate CARRIES the fact that declining
+      // cannot add it, which is the same fact the exemption above evaluated. It
+      // has to be on the plan the question is asked from: the caller renders its
+      // copy from this object and from nothing else, and the DECLINE test below
+      // is what proves the flag is true of the outcome rather than merely set.
+      expect(plan.adoptionCandidates[0].separateAddBlocked).toBe(true);
+    });
+
+    it("a candidate whose adoptee holds a DIFFERENT id is not flagged — the decline really does add it (kills a flag hard-wired to true for every candidate, or derived from 'a kept server exists' rather than from the id collision: the caller would then withdraw the separate-add promise on the ordinary remove-and-re-add run this feature was built for)", () => {
+      const source = makeSource();
+      // The ordinary shape: a kept server under a hand-chosen id, so nothing
+      // holds the id the add path would mint for this device.
+      const adoptee = makeKeptServer({ id: "kept-1" });
+      expect(adoptee.id).not.toBe(deterministicServerId("source-1", "device:1"));
+
+      const unanswered = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [adoptee], now: 5000 });
+      expect(unanswered.adoptionCandidates.map((c) => [c.serverId, c.separateAddBlocked])).toEqual([["kept-1", false]]);
+
+      // THE CORROBORATION, not a second opinion: `false` is a claim about what
+      // declining does, so the declined plan has to actually make the add.
+      const declined = planFor({
+        source,
+        tree: makeTree([keptDevice()]),
+        currentServers: [adoptee],
+        now: 5000,
+        adoptionChoice: "decline"
+      });
+      expect(declined.adds.map((a) => a.id)).toEqual([deterministicServerId("source-1", "device:1")]);
     });
 
     it("keeps the unrelated-collision skip exactly as it was when nothing is adoptable (kills widening the exemption to every collision)", () => {
