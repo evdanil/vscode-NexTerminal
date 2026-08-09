@@ -1122,23 +1122,36 @@ function renderedOptionOrder(html: string): string[] {
   return out;
 }
 
-describe("sortFilterableOptions — pin sentinels, locale-sort the rest", () => {
-  it("pins (None)/empty and __create__ at the top in declared order, sorts the rest case-insensitively (falsifies a case-sensitive/code-unit sort, which puts Zeta before alpha)", () => {
+describe("sortFilterableOptions — (None) top, reals sorted, __create__ bottom", () => {
+  it("pins (None)/empty at the TOP and __create__ at the BOTTOM, sorts the rest case-insensitively (falsifies a case-sensitive/code-unit sort, which puts Zeta before alpha)", () => {
     const ordered = sortFilterableOptions([
       { label: "Zeta", value: "z" },
       { label: "alpha", value: "a" },
       { label: "(None)", value: "" },
       { label: "Create new…", value: "__create__x" }
     ]);
-    expect(ordered.map((o) => o.value)).toEqual(["", "__create__x", "a", "z"]);
+    // §B: create sits at the BOTTOM (its declared home), not at position 2.
+    expect(ordered.map((o) => o.value)).toEqual(["", "a", "z", "__create__x"]);
     // The load-bearing case-insensitivity: a code-unit sort (uppercase Z=90 <
-    // lowercase a=97) would order these ["", "__create__x", "z", "a"].
+    // lowercase a=97) would order these ["", "z", "a", "__create__x"].
     const alphaIdx = ordered.findIndex((o) => o.value === "a");
     const zetaIdx = ordered.findIndex((o) => o.value === "z");
     expect(alphaIdx).toBeLessThan(zetaIdx);
   });
 
-  it("reads the pin rule from the VALUE, not a hardcoded label — a reworded empty-value sentinel still pins", () => {
+  it("§B: pins __create__ at the BOTTOM, below every real option (falsifies the top-pin, which put create at position 2 above all reals)", () => {
+    const ordered = sortFilterableOptions([
+      { label: "alpha", value: "a" },
+      { label: "Create new…", value: "__create__x" },
+      { label: "beta", value: "b" }
+    ]);
+    // Create is LAST, after the sorted reals. The pre-fix top-pin would have
+    // produced ["__create__x", "a", "b"] — create above every real option.
+    expect(ordered.map((o) => o.value)).toEqual(["a", "b", "__create__x"]);
+    expect(ordered[ordered.length - 1].value).toBe("__create__x");
+  });
+
+  it("reads the pin rule from the VALUE, not a hardcoded label — a reworded empty-value sentinel still leads", () => {
     const ordered = sortFilterableOptions([
       { label: "web-server-1", value: "s1" },
       { label: "(Select jump host)", value: "" },
@@ -1150,13 +1163,14 @@ describe("sortFilterableOptions — pin sentinels, locale-sort the rest", () => 
     expect(ordered.slice(1).map((o) => o.label)).toEqual(["app-server-1", "web-server-1"]);
   });
 
-  it("keeps two pinned sentinels in their DECLARED order, not sorted among themselves", () => {
+  it("splits the two sentinel buckets by VALUE: (None) to the top, __create__ to the bottom, regardless of declared order", () => {
     const ordered = sortFilterableOptions([
       { label: "Create new…", value: "__create__x" },
       { label: "(None)", value: "" }
     ]);
-    // Declared __create__ before (None) — preserved, no reordering of pins.
-    expect(ordered.map((o) => o.value)).toEqual(["__create__x", ""]);
+    // Declared create-before-(None), but the buckets separate them: empty pins
+    // top, create pins bottom.
+    expect(ordered.map((o) => o.value)).toEqual(["", "__create__x"]);
   });
 });
 
@@ -1182,7 +1196,7 @@ describe("renderFormHtml — filterable select", () => {
   it("emits a filter input with placeholder, aria-label and no name (so it is never submitted)", () => {
     const html = renderFormHtml(filterableDef);
     expect(html).toContain('class="custom-select-filter"');
-    expect(html).toContain('placeholder="Type to filter…"');
+    expect(html).toContain('placeholder="Filter…"');
     expect(html).toContain('aria-label="Filter Jump Host Server options"');
     // The filter input must carry no name — otherwise the submit loop would
     // post the filter text as a form value.
@@ -1191,10 +1205,15 @@ describe("renderFormHtml — filterable select", () => {
     expect(filterMatch![0]).not.toContain("name=");
   });
 
-  it("marks the wrapper filterable and renders the No matches row hidden", () => {
+  it("marks the wrapper filterable and renders the No matches row hidden with a polite live region (C1 a11y)", () => {
     const html = renderFormHtml(filterableDef);
     expect(html).toContain('class="custom-select filterable"');
-    expect(html).toContain('<div class="custom-select-no-matches" style="display: none;">No matches</div>');
+    expect(html).toContain('<div class="custom-select-no-matches" style="display: none;" role="status" aria-live="polite">No matches</div>');
+  });
+
+  it("wraps the filter input in a search-glyph row (C2 affordance)", () => {
+    const html = renderFormHtml(filterableDef);
+    expect(html).toContain('<div class="custom-select-filter-row">');
   });
 
   it("renders options sorted with the empty-value sentinel pinned (falsifies dropping the sort: declared order z,a,'' would render unchanged)", () => {
@@ -1285,6 +1304,21 @@ describe("renderFormHtml — filterable client wiring is present in the emitted 
     expect(html).toContain("filterInput.addEventListener('keydown'");
     expect(html).toContain("if (target) chooseOption(target);");
     expect(html).toContain("setCustomSelectOpen(wrapper, false);");
+  });
+
+  it("§A: auto-highlights the first real match while filtering (mirrors computeFilterableSelectState)", () => {
+    // The shipped applyFilter must set the highlight from the first real visible
+    // option — proving the client carries the same decision the pure helper is
+    // tested against. Without this the highlight would only ever come from an
+    // explicit ArrowDown.
+    expect(html).toContain("setHighlight(q ? firstRealVisible : null);");
+  });
+
+  it("§A: Enter follows the highlight only — the lone-visible-picks-create fallback is GONE", () => {
+    // The removed misfire: pre-fix Enter fell back to `only.length === 1` and
+    // auto-picked the ever-present create row on a zero-match typo. Its absence
+    // is what guarantees a bare Enter can never launch the inline-create flow.
+    expect(html).not.toContain("only.length === 1");
   });
 
   it("shows the No matches row only when no real option matches and no create affordance exists", () => {

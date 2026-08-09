@@ -129,7 +129,12 @@ export function baseWebviewJs(): string {
 
           // ── FILTERABLE BEHAVIOR ─────────────────────────────────────────────
           // Everything below is inert for a plain select (no filter input), so
-          // the non-filterable path stays byte-for-byte the old one.
+          // a plain select's dropdown behavior is unchanged — with one
+          // deliberate exception noted at openSelect(): keyboard-opening any
+          // select now also closes any other open select (both paths route
+          // through openSelect), an intentional improvement over the pre-PR-F1
+          // direct setCustomSelectOpen. The emitted MARKUP for a plain select is
+          // still byte-for-byte the old one.
           function resetFilter() {}
           if (!filterInput) {
             return;
@@ -174,10 +179,15 @@ export function baseWebviewJs(): string {
             return out;
           }
 
+          // Mirrors computeFilterableSelectState in filterableSelectLogic.ts —
+          // the pure, unit-tested twin of this decision. Keep the two in
+          // lockstep; the DOM application (display, highlight, scrollIntoView)
+          // is the part that stays here and is smoke-checked by string tests.
           function applyFilter() {
             var q = (filterInput.value || '').trim().toLowerCase();
             var opts = dropdown.querySelectorAll('.custom-select-option');
             var realVisible = 0;
+            var firstRealVisible = null;
             for (var i = 0; i < opts.length; i++) {
               var opt = opts[i];
               // Match against label AND description — the option's full text.
@@ -188,7 +198,10 @@ export function baseWebviewJs(): string {
               // like any other option.
               var show = isCreateOption(opt) ? true : match;
               opt.style.display = show ? '' : 'none';
-              if (show && isRealOption(opt)) realVisible++;
+              if (show && isRealOption(opt)) {
+                realVisible++;
+                if (!firstRealVisible) firstRealVisible = opt;
+              }
             }
             if (noMatches) {
               // Only meaningful when there is no create affordance to fall back
@@ -196,8 +209,14 @@ export function baseWebviewJs(): string {
               // for the empty result itself.
               noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';
             }
-            var h = highlighted();
-            if (h && h.style.display === 'none') clearHighlight();
+            // AUTO-HIGHLIGHT (PR-F1 review §A, matches VS Code quick-pick / native
+            // datalist): while a query is active the FIRST REAL match is
+            // highlighted so a bare Enter commits it. An empty query clears the
+            // transient highlight (plain dropdown). A zero-match typo leaves
+            // firstRealVisible null, so nothing real is highlighted — Enter is
+            // then inert and the create/(None) sentinels are reachable only by an
+            // explicit ArrowDown or a click, never by a bare Enter.
+            setHighlight(q ? firstRealVisible : null);
           }
 
           resetFilter = function() {
@@ -220,11 +239,15 @@ export function baseWebviewJs(): string {
               setHighlight(vis[idx]);
             } else if (e.key === 'Enter') {
               e.preventDefault();
+              // Enter commits the current highlight and NOTHING else. With the
+              // auto-highlight in applyFilter a unique real match is already
+              // active, so this selects it; a zero-match typo leaves no
+              // highlight, so Enter is inert. There is deliberately no
+              // "lone visible option" fallback: it would auto-pick the
+              // ever-present create row on a typo (launching the inline-create
+              // flow) — choosing create by keyboard must be an explicit
+              // ArrowDown-to-highlight then Enter, or a click.
               var target = highlighted();
-              if (!target) {
-                var only = visibleOptions();
-                if (only.length === 1) target = only[0];
-              }
               if (target) chooseOption(target);
             } else if (e.key === 'Escape') {
               e.preventDefault();

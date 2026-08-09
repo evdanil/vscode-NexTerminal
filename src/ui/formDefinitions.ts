@@ -636,7 +636,7 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
   const serverOptions = [
     { label: "(Assign later)", value: "" },
     ...(options?.servers ?? []).map((s) => ({ label: s.name, value: s.id })),
-    { label: "Create new server...", value: "__create__server" }
+    { label: "Create new server…", value: "__create__server" }
   ];
 
   const localVw = { field: "tunnelType", value: "local" };

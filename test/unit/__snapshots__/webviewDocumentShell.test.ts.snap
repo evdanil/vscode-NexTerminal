@@ -164,17 +164,46 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
     .custom-select-option.highlighted {
       background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
-    /* The type-to-filter box pinned to the top of a filterable dropdown. Higher
-       specificity than the base input[type="text"] rule so its flat, borderless
-       look wins — it must read as a filter, not a value field. */
-    .custom-select-dropdown .custom-select-filter {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 5px 8px;
-      margin: 0;
+    /* A selected option that is ALSO the keyboard highlight keeps its
+       active-selection color (higher specificity than the .highlighted rule),
+       so the current value never loses its highlight when Enter would re-pick
+       it. */
+    .custom-select-option.selected.highlighted {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
+      color: var(--vscode-list-activeSelectionForeground, #fff);
+    }
+    /* The filter row pins the type-to-filter box to the top of a filterable
+       dropdown and hosts the leading search glyph. Sticky lives on the row so
+       both scroll-pin together. */
+    .custom-select-filter-row {
       position: sticky;
       top: 0;
       z-index: 1;
+    }
+    /* Leading search glyph — a monochrome, theme-tinted magnifier (inline SVG
+       mask, no external asset), matching the trigger chevron's flat glyph style
+       so the box reads unmistakably as a filter, not a value field. */
+    .custom-select-filter-row::before {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 12px;
+      height: 12px;
+      pointer-events: none;
+      opacity: 0.6;
+      background-color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+    }
+    /* Higher specificity than the base input[type="text"] rule so its flat,
+       borderless look wins. Left padding clears the search glyph. */
+    .custom-select-dropdown .custom-select-filter {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 5px 8px 5px 26px;
+      margin: 0;
       border: none;
       border-bottom: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
       border-radius: 0;
@@ -652,7 +681,12 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
 
           // ── FILTERABLE BEHAVIOR ─────────────────────────────────────────────
           // Everything below is inert for a plain select (no filter input), so
-          // the non-filterable path stays byte-for-byte the old one.
+          // a plain select's dropdown behavior is unchanged — with one
+          // deliberate exception noted at openSelect(): keyboard-opening any
+          // select now also closes any other open select (both paths route
+          // through openSelect), an intentional improvement over the pre-PR-F1
+          // direct setCustomSelectOpen. The emitted MARKUP for a plain select is
+          // still byte-for-byte the old one.
           function resetFilter() {}
           if (!filterInput) {
             return;
@@ -697,10 +731,15 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
             return out;
           }
 
+          // Mirrors computeFilterableSelectState in filterableSelectLogic.ts —
+          // the pure, unit-tested twin of this decision. Keep the two in
+          // lockstep; the DOM application (display, highlight, scrollIntoView)
+          // is the part that stays here and is smoke-checked by string tests.
           function applyFilter() {
             var q = (filterInput.value || '').trim().toLowerCase();
             var opts = dropdown.querySelectorAll('.custom-select-option');
             var realVisible = 0;
+            var firstRealVisible = null;
             for (var i = 0; i < opts.length; i++) {
               var opt = opts[i];
               // Match against label AND description — the option's full text.
@@ -711,7 +750,10 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
               // like any other option.
               var show = isCreateOption(opt) ? true : match;
               opt.style.display = show ? '' : 'none';
-              if (show && isRealOption(opt)) realVisible++;
+              if (show && isRealOption(opt)) {
+                realVisible++;
+                if (!firstRealVisible) firstRealVisible = opt;
+              }
             }
             if (noMatches) {
               // Only meaningful when there is no create affordance to fall back
@@ -719,8 +761,14 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
               // for the empty result itself.
               noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';
             }
-            var h = highlighted();
-            if (h && h.style.display === 'none') clearHighlight();
+            // AUTO-HIGHLIGHT (PR-F1 review §A, matches VS Code quick-pick / native
+            // datalist): while a query is active the FIRST REAL match is
+            // highlighted so a bare Enter commits it. An empty query clears the
+            // transient highlight (plain dropdown). A zero-match typo leaves
+            // firstRealVisible null, so nothing real is highlighted — Enter is
+            // then inert and the create/(None) sentinels are reachable only by an
+            // explicit ArrowDown or a click, never by a bare Enter.
+            setHighlight(q ? firstRealVisible : null);
           }
 
           resetFilter = function() {
@@ -743,11 +791,15 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
               setHighlight(vis[idx]);
             } else if (e.key === 'Enter') {
               e.preventDefault();
+              // Enter commits the current highlight and NOTHING else. With the
+              // auto-highlight in applyFilter a unique real match is already
+              // active, so this selects it; a zero-match typo leaves no
+              // highlight, so Enter is inert. There is deliberately no
+              // "lone visible option" fallback: it would auto-pick the
+              // ever-present create row on a typo (launching the inline-create
+              // flow) — choosing create by keyboard must be an explicit
+              // ArrowDown-to-highlight then Enter, or a click.
               var target = highlighted();
-              if (!target) {
-                var only = visibleOptions();
-                if (only.length === 1) target = only[0];
-              }
               if (target) chooseOption(target);
             } else if (e.key === 'Escape') {
               e.preventDefault();
@@ -1091,17 +1143,46 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
     .custom-select-option.highlighted {
       background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
-    /* The type-to-filter box pinned to the top of a filterable dropdown. Higher
-       specificity than the base input[type="text"] rule so its flat, borderless
-       look wins — it must read as a filter, not a value field. */
-    .custom-select-dropdown .custom-select-filter {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 5px 8px;
-      margin: 0;
+    /* A selected option that is ALSO the keyboard highlight keeps its
+       active-selection color (higher specificity than the .highlighted rule),
+       so the current value never loses its highlight when Enter would re-pick
+       it. */
+    .custom-select-option.selected.highlighted {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
+      color: var(--vscode-list-activeSelectionForeground, #fff);
+    }
+    /* The filter row pins the type-to-filter box to the top of a filterable
+       dropdown and hosts the leading search glyph. Sticky lives on the row so
+       both scroll-pin together. */
+    .custom-select-filter-row {
       position: sticky;
       top: 0;
       z-index: 1;
+    }
+    /* Leading search glyph — a monochrome, theme-tinted magnifier (inline SVG
+       mask, no external asset), matching the trigger chevron's flat glyph style
+       so the box reads unmistakably as a filter, not a value field. */
+    .custom-select-filter-row::before {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 12px;
+      height: 12px;
+      pointer-events: none;
+      opacity: 0.6;
+      background-color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+    }
+    /* Higher specificity than the base input[type="text"] rule so its flat,
+       borderless look wins. Left padding clears the search glyph. */
+    .custom-select-dropdown .custom-select-filter {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 5px 8px 5px 26px;
+      margin: 0;
       border: none;
       border-bottom: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
       border-radius: 0;
@@ -1516,7 +1597,12 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
 
           // ── FILTERABLE BEHAVIOR ─────────────────────────────────────────────
           // Everything below is inert for a plain select (no filter input), so
-          // the non-filterable path stays byte-for-byte the old one.
+          // a plain select's dropdown behavior is unchanged — with one
+          // deliberate exception noted at openSelect(): keyboard-opening any
+          // select now also closes any other open select (both paths route
+          // through openSelect), an intentional improvement over the pre-PR-F1
+          // direct setCustomSelectOpen. The emitted MARKUP for a plain select is
+          // still byte-for-byte the old one.
           function resetFilter() {}
           if (!filterInput) {
             return;
@@ -1561,10 +1647,15 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
             return out;
           }
 
+          // Mirrors computeFilterableSelectState in filterableSelectLogic.ts —
+          // the pure, unit-tested twin of this decision. Keep the two in
+          // lockstep; the DOM application (display, highlight, scrollIntoView)
+          // is the part that stays here and is smoke-checked by string tests.
           function applyFilter() {
             var q = (filterInput.value || '').trim().toLowerCase();
             var opts = dropdown.querySelectorAll('.custom-select-option');
             var realVisible = 0;
+            var firstRealVisible = null;
             for (var i = 0; i < opts.length; i++) {
               var opt = opts[i];
               // Match against label AND description — the option's full text.
@@ -1575,7 +1666,10 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
               // like any other option.
               var show = isCreateOption(opt) ? true : match;
               opt.style.display = show ? '' : 'none';
-              if (show && isRealOption(opt)) realVisible++;
+              if (show && isRealOption(opt)) {
+                realVisible++;
+                if (!firstRealVisible) firstRealVisible = opt;
+              }
             }
             if (noMatches) {
               // Only meaningful when there is no create affordance to fall back
@@ -1583,8 +1677,14 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
               // for the empty result itself.
               noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';
             }
-            var h = highlighted();
-            if (h && h.style.display === 'none') clearHighlight();
+            // AUTO-HIGHLIGHT (PR-F1 review §A, matches VS Code quick-pick / native
+            // datalist): while a query is active the FIRST REAL match is
+            // highlighted so a bare Enter commits it. An empty query clears the
+            // transient highlight (plain dropdown). A zero-match typo leaves
+            // firstRealVisible null, so nothing real is highlighted — Enter is
+            // then inert and the create/(None) sentinels are reachable only by an
+            // explicit ArrowDown or a click, never by a bare Enter.
+            setHighlight(q ? firstRealVisible : null);
           }
 
           resetFilter = function() {
@@ -1607,11 +1707,15 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
               setHighlight(vis[idx]);
             } else if (e.key === 'Enter') {
               e.preventDefault();
+              // Enter commits the current highlight and NOTHING else. With the
+              // auto-highlight in applyFilter a unique real match is already
+              // active, so this selects it; a zero-match typo leaves no
+              // highlight, so Enter is inert. There is deliberately no
+              // "lone visible option" fallback: it would auto-pick the
+              // ever-present create row on a typo (launching the inline-create
+              // flow) — choosing create by keyboard must be an explicit
+              // ArrowDown-to-highlight then Enter, or a click.
               var target = highlighted();
-              if (!target) {
-                var only = visibleOptions();
-                if (only.length === 1) target = only[0];
-              }
               if (target) chooseOption(target);
             } else if (e.key === 'Escape') {
               e.preventDefault();
@@ -2184,10 +2288,37 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
             newOpt.textContent = msg.label;
             var dropdown = wrapper.querySelector('.custom-select-dropdown');
             var createOpt = dropdown.querySelector('.custom-select-option[data-value^="__create__"]');
-            if (createOpt) {
-              dropdown.insertBefore(newOpt, createOpt);
-            } else {
-              dropdown.appendChild(newOpt);
+            var inserted = false;
+            // For a filterable select the reals are rendered in locale-aware
+            // sorted order (sortFilterableOptions), with (None) pinned top and
+            // the create row bottom. Slot the inline-created item into its
+            // alphabetical position among the reals rather than dropping it at
+            // the tail — so it lands where the user would next look for it.
+            if (wrapper.classList.contains('filterable')) {
+              var newLabel = msg.label || '';
+              var siblings = dropdown.querySelectorAll('.custom-select-option');
+              for (var soi = 0; soi < siblings.length; soi++) {
+                var sib = siblings[soi];
+                var sibVal = sib.dataset.value || '';
+                // Reals only: never order against the (None) or create sentinels.
+                if (sibVal === '' || sibVal.indexOf('__create__') === 0) continue;
+                var sibLabelEl = sib.querySelector('.custom-select-option-label');
+                var sibLabel = sibLabelEl ? sibLabelEl.textContent : sib.textContent;
+                if (newLabel.localeCompare(sibLabel, undefined, { sensitivity: 'base' }) < 0) {
+                  dropdown.insertBefore(newOpt, sib);
+                  inserted = true;
+                  break;
+                }
+              }
+            }
+            if (!inserted) {
+              // Non-filterable, or sorts after every existing real: land just
+              // before the create row (its declared tail slot), or append.
+              if (createOpt) {
+                dropdown.insertBefore(newOpt, createOpt);
+              } else {
+                dropdown.appendChild(newOpt);
+              }
             }
             selectCustomOption(wrapper, msg.value);
             wrapper.dataset.prev = msg.value;
@@ -2392,17 +2523,46 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
     .custom-select-option.highlighted {
       background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
-    /* The type-to-filter box pinned to the top of a filterable dropdown. Higher
-       specificity than the base input[type="text"] rule so its flat, borderless
-       look wins — it must read as a filter, not a value field. */
-    .custom-select-dropdown .custom-select-filter {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 5px 8px;
-      margin: 0;
+    /* A selected option that is ALSO the keyboard highlight keeps its
+       active-selection color (higher specificity than the .highlighted rule),
+       so the current value never loses its highlight when Enter would re-pick
+       it. */
+    .custom-select-option.selected.highlighted {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
+      color: var(--vscode-list-activeSelectionForeground, #fff);
+    }
+    /* The filter row pins the type-to-filter box to the top of a filterable
+       dropdown and hosts the leading search glyph. Sticky lives on the row so
+       both scroll-pin together. */
+    .custom-select-filter-row {
       position: sticky;
       top: 0;
       z-index: 1;
+    }
+    /* Leading search glyph — a monochrome, theme-tinted magnifier (inline SVG
+       mask, no external asset), matching the trigger chevron's flat glyph style
+       so the box reads unmistakably as a filter, not a value field. */
+    .custom-select-filter-row::before {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 12px;
+      height: 12px;
+      pointer-events: none;
+      opacity: 0.6;
+      background-color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+    }
+    /* Higher specificity than the base input[type="text"] rule so its flat,
+       borderless look wins. Left padding clears the search glyph. */
+    .custom-select-dropdown .custom-select-filter {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 5px 8px 5px 26px;
+      margin: 0;
       border: none;
       border-bottom: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
       border-radius: 0;
@@ -2817,7 +2977,12 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
 
           // ── FILTERABLE BEHAVIOR ─────────────────────────────────────────────
           // Everything below is inert for a plain select (no filter input), so
-          // the non-filterable path stays byte-for-byte the old one.
+          // a plain select's dropdown behavior is unchanged — with one
+          // deliberate exception noted at openSelect(): keyboard-opening any
+          // select now also closes any other open select (both paths route
+          // through openSelect), an intentional improvement over the pre-PR-F1
+          // direct setCustomSelectOpen. The emitted MARKUP for a plain select is
+          // still byte-for-byte the old one.
           function resetFilter() {}
           if (!filterInput) {
             return;
@@ -2862,10 +3027,15 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
             return out;
           }
 
+          // Mirrors computeFilterableSelectState in filterableSelectLogic.ts —
+          // the pure, unit-tested twin of this decision. Keep the two in
+          // lockstep; the DOM application (display, highlight, scrollIntoView)
+          // is the part that stays here and is smoke-checked by string tests.
           function applyFilter() {
             var q = (filterInput.value || '').trim().toLowerCase();
             var opts = dropdown.querySelectorAll('.custom-select-option');
             var realVisible = 0;
+            var firstRealVisible = null;
             for (var i = 0; i < opts.length; i++) {
               var opt = opts[i];
               // Match against label AND description — the option's full text.
@@ -2876,7 +3046,10 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
               // like any other option.
               var show = isCreateOption(opt) ? true : match;
               opt.style.display = show ? '' : 'none';
-              if (show && isRealOption(opt)) realVisible++;
+              if (show && isRealOption(opt)) {
+                realVisible++;
+                if (!firstRealVisible) firstRealVisible = opt;
+              }
             }
             if (noMatches) {
               // Only meaningful when there is no create affordance to fall back
@@ -2884,8 +3057,14 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
               // for the empty result itself.
               noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';
             }
-            var h = highlighted();
-            if (h && h.style.display === 'none') clearHighlight();
+            // AUTO-HIGHLIGHT (PR-F1 review §A, matches VS Code quick-pick / native
+            // datalist): while a query is active the FIRST REAL match is
+            // highlighted so a bare Enter commits it. An empty query clears the
+            // transient highlight (plain dropdown). A zero-match typo leaves
+            // firstRealVisible null, so nothing real is highlighted — Enter is
+            // then inert and the create/(None) sentinels are reachable only by an
+            // explicit ArrowDown or a click, never by a bare Enter.
+            setHighlight(q ? firstRealVisible : null);
           }
 
           resetFilter = function() {
@@ -2908,11 +3087,15 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
               setHighlight(vis[idx]);
             } else if (e.key === 'Enter') {
               e.preventDefault();
+              // Enter commits the current highlight and NOTHING else. With the
+              // auto-highlight in applyFilter a unique real match is already
+              // active, so this selects it; a zero-match typo leaves no
+              // highlight, so Enter is inert. There is deliberately no
+              // "lone visible option" fallback: it would auto-pick the
+              // ever-present create row on a typo (launching the inline-create
+              // flow) — choosing create by keyboard must be an explicit
+              // ArrowDown-to-highlight then Enter, or a click.
               var target = highlighted();
-              if (!target) {
-                var only = visibleOptions();
-                if (only.length === 1) target = only[0];
-              }
               if (target) chooseOption(target);
             } else if (e.key === 'Escape') {
               e.preventDefault();
@@ -3485,10 +3668,37 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
             newOpt.textContent = msg.label;
             var dropdown = wrapper.querySelector('.custom-select-dropdown');
             var createOpt = dropdown.querySelector('.custom-select-option[data-value^="__create__"]');
-            if (createOpt) {
-              dropdown.insertBefore(newOpt, createOpt);
-            } else {
-              dropdown.appendChild(newOpt);
+            var inserted = false;
+            // For a filterable select the reals are rendered in locale-aware
+            // sorted order (sortFilterableOptions), with (None) pinned top and
+            // the create row bottom. Slot the inline-created item into its
+            // alphabetical position among the reals rather than dropping it at
+            // the tail — so it lands where the user would next look for it.
+            if (wrapper.classList.contains('filterable')) {
+              var newLabel = msg.label || '';
+              var siblings = dropdown.querySelectorAll('.custom-select-option');
+              for (var soi = 0; soi < siblings.length; soi++) {
+                var sib = siblings[soi];
+                var sibVal = sib.dataset.value || '';
+                // Reals only: never order against the (None) or create sentinels.
+                if (sibVal === '' || sibVal.indexOf('__create__') === 0) continue;
+                var sibLabelEl = sib.querySelector('.custom-select-option-label');
+                var sibLabel = sibLabelEl ? sibLabelEl.textContent : sib.textContent;
+                if (newLabel.localeCompare(sibLabel, undefined, { sensitivity: 'base' }) < 0) {
+                  dropdown.insertBefore(newOpt, sib);
+                  inserted = true;
+                  break;
+                }
+              }
+            }
+            if (!inserted) {
+              // Non-filterable, or sorts after every existing real: land just
+              // before the create row (its declared tail slot), or append.
+              if (createOpt) {
+                dropdown.insertBefore(newOpt, createOpt);
+              } else {
+                dropdown.appendChild(newOpt);
+              }
             }
             selectCustomOption(wrapper, msg.value);
             wrapper.dataset.prev = msg.value;
@@ -3693,17 +3903,46 @@ exports[`webview document shell (byte-identity guard) > highlight rule editor 1`
     .custom-select-option.highlighted {
       background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
-    /* The type-to-filter box pinned to the top of a filterable dropdown. Higher
-       specificity than the base input[type="text"] rule so its flat, borderless
-       look wins — it must read as a filter, not a value field. */
-    .custom-select-dropdown .custom-select-filter {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 5px 8px;
-      margin: 0;
+    /* A selected option that is ALSO the keyboard highlight keeps its
+       active-selection color (higher specificity than the .highlighted rule),
+       so the current value never loses its highlight when Enter would re-pick
+       it. */
+    .custom-select-option.selected.highlighted {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
+      color: var(--vscode-list-activeSelectionForeground, #fff);
+    }
+    /* The filter row pins the type-to-filter box to the top of a filterable
+       dropdown and hosts the leading search glyph. Sticky lives on the row so
+       both scroll-pin together. */
+    .custom-select-filter-row {
       position: sticky;
       top: 0;
       z-index: 1;
+    }
+    /* Leading search glyph — a monochrome, theme-tinted magnifier (inline SVG
+       mask, no external asset), matching the trigger chevron's flat glyph style
+       so the box reads unmistakably as a filter, not a value field. */
+    .custom-select-filter-row::before {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 12px;
+      height: 12px;
+      pointer-events: none;
+      opacity: 0.6;
+      background-color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+    }
+    /* Higher specificity than the base input[type="text"] rule so its flat,
+       borderless look wins. Left padding clears the search glyph. */
+    .custom-select-dropdown .custom-select-filter {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 5px 8px 5px 26px;
+      margin: 0;
       border: none;
       border-bottom: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
       border-radius: 0;
@@ -4271,7 +4510,12 @@ DEBUG: packet sent 1024 bytes</div>
 
           // ── FILTERABLE BEHAVIOR ─────────────────────────────────────────────
           // Everything below is inert for a plain select (no filter input), so
-          // the non-filterable path stays byte-for-byte the old one.
+          // a plain select's dropdown behavior is unchanged — with one
+          // deliberate exception noted at openSelect(): keyboard-opening any
+          // select now also closes any other open select (both paths route
+          // through openSelect), an intentional improvement over the pre-PR-F1
+          // direct setCustomSelectOpen. The emitted MARKUP for a plain select is
+          // still byte-for-byte the old one.
           function resetFilter() {}
           if (!filterInput) {
             return;
@@ -4316,10 +4560,15 @@ DEBUG: packet sent 1024 bytes</div>
             return out;
           }
 
+          // Mirrors computeFilterableSelectState in filterableSelectLogic.ts —
+          // the pure, unit-tested twin of this decision. Keep the two in
+          // lockstep; the DOM application (display, highlight, scrollIntoView)
+          // is the part that stays here and is smoke-checked by string tests.
           function applyFilter() {
             var q = (filterInput.value || '').trim().toLowerCase();
             var opts = dropdown.querySelectorAll('.custom-select-option');
             var realVisible = 0;
+            var firstRealVisible = null;
             for (var i = 0; i < opts.length; i++) {
               var opt = opts[i];
               // Match against label AND description — the option's full text.
@@ -4330,7 +4579,10 @@ DEBUG: packet sent 1024 bytes</div>
               // like any other option.
               var show = isCreateOption(opt) ? true : match;
               opt.style.display = show ? '' : 'none';
-              if (show && isRealOption(opt)) realVisible++;
+              if (show && isRealOption(opt)) {
+                realVisible++;
+                if (!firstRealVisible) firstRealVisible = opt;
+              }
             }
             if (noMatches) {
               // Only meaningful when there is no create affordance to fall back
@@ -4338,8 +4590,14 @@ DEBUG: packet sent 1024 bytes</div>
               // for the empty result itself.
               noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';
             }
-            var h = highlighted();
-            if (h && h.style.display === 'none') clearHighlight();
+            // AUTO-HIGHLIGHT (PR-F1 review §A, matches VS Code quick-pick / native
+            // datalist): while a query is active the FIRST REAL match is
+            // highlighted so a bare Enter commits it. An empty query clears the
+            // transient highlight (plain dropdown). A zero-match typo leaves
+            // firstRealVisible null, so nothing real is highlighted — Enter is
+            // then inert and the create/(None) sentinels are reachable only by an
+            // explicit ArrowDown or a click, never by a bare Enter.
+            setHighlight(q ? firstRealVisible : null);
           }
 
           resetFilter = function() {
@@ -4362,11 +4620,15 @@ DEBUG: packet sent 1024 bytes</div>
               setHighlight(vis[idx]);
             } else if (e.key === 'Enter') {
               e.preventDefault();
+              // Enter commits the current highlight and NOTHING else. With the
+              // auto-highlight in applyFilter a unique real match is already
+              // active, so this selects it; a zero-match typo leaves no
+              // highlight, so Enter is inert. There is deliberately no
+              // "lone visible option" fallback: it would auto-pick the
+              // ever-present create row on a typo (launching the inline-create
+              // flow) — choosing create by keyboard must be an explicit
+              // ArrowDown-to-highlight then Enter, or a click.
               var target = highlighted();
-              if (!target) {
-                var only = visibleOptions();
-                if (only.length === 1) target = only[0];
-              }
               if (target) chooseOption(target);
             } else if (e.key === 'Escape') {
               e.preventDefault();
@@ -4969,17 +5231,46 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
     .custom-select-option.highlighted {
       background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
-    /* The type-to-filter box pinned to the top of a filterable dropdown. Higher
-       specificity than the base input[type="text"] rule so its flat, borderless
-       look wins — it must read as a filter, not a value field. */
-    .custom-select-dropdown .custom-select-filter {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 5px 8px;
-      margin: 0;
+    /* A selected option that is ALSO the keyboard highlight keeps its
+       active-selection color (higher specificity than the .highlighted rule),
+       so the current value never loses its highlight when Enter would re-pick
+       it. */
+    .custom-select-option.selected.highlighted {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
+      color: var(--vscode-list-activeSelectionForeground, #fff);
+    }
+    /* The filter row pins the type-to-filter box to the top of a filterable
+       dropdown and hosts the leading search glyph. Sticky lives on the row so
+       both scroll-pin together. */
+    .custom-select-filter-row {
       position: sticky;
       top: 0;
       z-index: 1;
+    }
+    /* Leading search glyph — a monochrome, theme-tinted magnifier (inline SVG
+       mask, no external asset), matching the trigger chevron's flat glyph style
+       so the box reads unmistakably as a filter, not a value field. */
+    .custom-select-filter-row::before {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 12px;
+      height: 12px;
+      pointer-events: none;
+      opacity: 0.6;
+      background-color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+    }
+    /* Higher specificity than the base input[type="text"] rule so its flat,
+       borderless look wins. Left padding clears the search glyph. */
+    .custom-select-dropdown .custom-select-filter {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 5px 8px 5px 26px;
+      margin: 0;
       border: none;
       border-bottom: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
       border-radius: 0;
@@ -5589,7 +5880,12 @@ echo hi</textarea>
 
           // ── FILTERABLE BEHAVIOR ─────────────────────────────────────────────
           // Everything below is inert for a plain select (no filter input), so
-          // the non-filterable path stays byte-for-byte the old one.
+          // a plain select's dropdown behavior is unchanged — with one
+          // deliberate exception noted at openSelect(): keyboard-opening any
+          // select now also closes any other open select (both paths route
+          // through openSelect), an intentional improvement over the pre-PR-F1
+          // direct setCustomSelectOpen. The emitted MARKUP for a plain select is
+          // still byte-for-byte the old one.
           function resetFilter() {}
           if (!filterInput) {
             return;
@@ -5634,10 +5930,15 @@ echo hi</textarea>
             return out;
           }
 
+          // Mirrors computeFilterableSelectState in filterableSelectLogic.ts —
+          // the pure, unit-tested twin of this decision. Keep the two in
+          // lockstep; the DOM application (display, highlight, scrollIntoView)
+          // is the part that stays here and is smoke-checked by string tests.
           function applyFilter() {
             var q = (filterInput.value || '').trim().toLowerCase();
             var opts = dropdown.querySelectorAll('.custom-select-option');
             var realVisible = 0;
+            var firstRealVisible = null;
             for (var i = 0; i < opts.length; i++) {
               var opt = opts[i];
               // Match against label AND description — the option's full text.
@@ -5648,7 +5949,10 @@ echo hi</textarea>
               // like any other option.
               var show = isCreateOption(opt) ? true : match;
               opt.style.display = show ? '' : 'none';
-              if (show && isRealOption(opt)) realVisible++;
+              if (show && isRealOption(opt)) {
+                realVisible++;
+                if (!firstRealVisible) firstRealVisible = opt;
+              }
             }
             if (noMatches) {
               // Only meaningful when there is no create affordance to fall back
@@ -5656,8 +5960,14 @@ echo hi</textarea>
               // for the empty result itself.
               noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';
             }
-            var h = highlighted();
-            if (h && h.style.display === 'none') clearHighlight();
+            // AUTO-HIGHLIGHT (PR-F1 review §A, matches VS Code quick-pick / native
+            // datalist): while a query is active the FIRST REAL match is
+            // highlighted so a bare Enter commits it. An empty query clears the
+            // transient highlight (plain dropdown). A zero-match typo leaves
+            // firstRealVisible null, so nothing real is highlighted — Enter is
+            // then inert and the create/(None) sentinels are reachable only by an
+            // explicit ArrowDown or a click, never by a bare Enter.
+            setHighlight(q ? firstRealVisible : null);
           }
 
           resetFilter = function() {
@@ -5680,11 +5990,15 @@ echo hi</textarea>
               setHighlight(vis[idx]);
             } else if (e.key === 'Enter') {
               e.preventDefault();
+              // Enter commits the current highlight and NOTHING else. With the
+              // auto-highlight in applyFilter a unique real match is already
+              // active, so this selects it; a zero-match typo leaves no
+              // highlight, so Enter is inert. There is deliberately no
+              // "lone visible option" fallback: it would auto-pick the
+              // ever-present create row on a typo (launching the inline-create
+              // flow) — choosing create by keyboard must be an explicit
+              // ArrowDown-to-highlight then Enter, or a click.
               var target = highlighted();
-              if (!target) {
-                var only = visibleOptions();
-                if (only.length === 1) target = only[0];
-              }
               if (target) chooseOption(target);
             } else if (e.key === 'Escape') {
               e.preventDefault();
@@ -6666,17 +6980,46 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
     .custom-select-option.highlighted {
       background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
-    /* The type-to-filter box pinned to the top of a filterable dropdown. Higher
-       specificity than the base input[type="text"] rule so its flat, borderless
-       look wins — it must read as a filter, not a value field. */
-    .custom-select-dropdown .custom-select-filter {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 5px 8px;
-      margin: 0;
+    /* A selected option that is ALSO the keyboard highlight keeps its
+       active-selection color (higher specificity than the .highlighted rule),
+       so the current value never loses its highlight when Enter would re-pick
+       it. */
+    .custom-select-option.selected.highlighted {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
+      color: var(--vscode-list-activeSelectionForeground, #fff);
+    }
+    /* The filter row pins the type-to-filter box to the top of a filterable
+       dropdown and hosts the leading search glyph. Sticky lives on the row so
+       both scroll-pin together. */
+    .custom-select-filter-row {
       position: sticky;
       top: 0;
       z-index: 1;
+    }
+    /* Leading search glyph — a monochrome, theme-tinted magnifier (inline SVG
+       mask, no external asset), matching the trigger chevron's flat glyph style
+       so the box reads unmistakably as a filter, not a value field. */
+    .custom-select-filter-row::before {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 12px;
+      height: 12px;
+      pointer-events: none;
+      opacity: 0.6;
+      background-color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+    }
+    /* Higher specificity than the base input[type="text"] rule so its flat,
+       borderless look wins. Left padding clears the search glyph. */
+    .custom-select-dropdown .custom-select-filter {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 5px 8px 5px 26px;
+      margin: 0;
       border: none;
       border-bottom: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
       border-radius: 0;
@@ -7733,7 +8076,12 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
 
           // ── FILTERABLE BEHAVIOR ─────────────────────────────────────────────
           // Everything below is inert for a plain select (no filter input), so
-          // the non-filterable path stays byte-for-byte the old one.
+          // a plain select's dropdown behavior is unchanged — with one
+          // deliberate exception noted at openSelect(): keyboard-opening any
+          // select now also closes any other open select (both paths route
+          // through openSelect), an intentional improvement over the pre-PR-F1
+          // direct setCustomSelectOpen. The emitted MARKUP for a plain select is
+          // still byte-for-byte the old one.
           function resetFilter() {}
           if (!filterInput) {
             return;
@@ -7778,10 +8126,15 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
             return out;
           }
 
+          // Mirrors computeFilterableSelectState in filterableSelectLogic.ts —
+          // the pure, unit-tested twin of this decision. Keep the two in
+          // lockstep; the DOM application (display, highlight, scrollIntoView)
+          // is the part that stays here and is smoke-checked by string tests.
           function applyFilter() {
             var q = (filterInput.value || '').trim().toLowerCase();
             var opts = dropdown.querySelectorAll('.custom-select-option');
             var realVisible = 0;
+            var firstRealVisible = null;
             for (var i = 0; i < opts.length; i++) {
               var opt = opts[i];
               // Match against label AND description — the option's full text.
@@ -7792,7 +8145,10 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
               // like any other option.
               var show = isCreateOption(opt) ? true : match;
               opt.style.display = show ? '' : 'none';
-              if (show && isRealOption(opt)) realVisible++;
+              if (show && isRealOption(opt)) {
+                realVisible++;
+                if (!firstRealVisible) firstRealVisible = opt;
+              }
             }
             if (noMatches) {
               // Only meaningful when there is no create affordance to fall back
@@ -7800,8 +8156,14 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
               // for the empty result itself.
               noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';
             }
-            var h = highlighted();
-            if (h && h.style.display === 'none') clearHighlight();
+            // AUTO-HIGHLIGHT (PR-F1 review §A, matches VS Code quick-pick / native
+            // datalist): while a query is active the FIRST REAL match is
+            // highlighted so a bare Enter commits it. An empty query clears the
+            // transient highlight (plain dropdown). A zero-match typo leaves
+            // firstRealVisible null, so nothing real is highlighted — Enter is
+            // then inert and the create/(None) sentinels are reachable only by an
+            // explicit ArrowDown or a click, never by a bare Enter.
+            setHighlight(q ? firstRealVisible : null);
           }
 
           resetFilter = function() {
@@ -7824,11 +8186,15 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
               setHighlight(vis[idx]);
             } else if (e.key === 'Enter') {
               e.preventDefault();
+              // Enter commits the current highlight and NOTHING else. With the
+              // auto-highlight in applyFilter a unique real match is already
+              // active, so this selects it; a zero-match typo leaves no
+              // highlight, so Enter is inert. There is deliberately no
+              // "lone visible option" fallback: it would auto-pick the
+              // ever-present create row on a typo (launching the inline-create
+              // flow) — choosing create by keyboard must be an explicit
+              // ArrowDown-to-highlight then Enter, or a click.
               var target = highlighted();
-              if (!target) {
-                var only = visibleOptions();
-                if (only.length === 1) target = only[0];
-              }
               if (target) chooseOption(target);
             } else if (e.key === 'Escape') {
               e.preventDefault();
@@ -8307,17 +8673,46 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
     .custom-select-option.highlighted {
       background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
-    /* The type-to-filter box pinned to the top of a filterable dropdown. Higher
-       specificity than the base input[type="text"] rule so its flat, borderless
-       look wins — it must read as a filter, not a value field. */
-    .custom-select-dropdown .custom-select-filter {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 5px 8px;
-      margin: 0;
+    /* A selected option that is ALSO the keyboard highlight keeps its
+       active-selection color (higher specificity than the .highlighted rule),
+       so the current value never loses its highlight when Enter would re-pick
+       it. */
+    .custom-select-option.selected.highlighted {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
+      color: var(--vscode-list-activeSelectionForeground, #fff);
+    }
+    /* The filter row pins the type-to-filter box to the top of a filterable
+       dropdown and hosts the leading search glyph. Sticky lives on the row so
+       both scroll-pin together. */
+    .custom-select-filter-row {
       position: sticky;
       top: 0;
       z-index: 1;
+    }
+    /* Leading search glyph — a monochrome, theme-tinted magnifier (inline SVG
+       mask, no external asset), matching the trigger chevron's flat glyph style
+       so the box reads unmistakably as a filter, not a value field. */
+    .custom-select-filter-row::before {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 12px;
+      height: 12px;
+      pointer-events: none;
+      opacity: 0.6;
+      background-color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+    }
+    /* Higher specificity than the base input[type="text"] rule so its flat,
+       borderless look wins. Left padding clears the search glyph. */
+    .custom-select-dropdown .custom-select-filter {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 5px 8px 5px 26px;
+      margin: 0;
       border: none;
       border-bottom: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
       border-radius: 0;
@@ -8945,7 +9340,12 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
 
           // ── FILTERABLE BEHAVIOR ─────────────────────────────────────────────
           // Everything below is inert for a plain select (no filter input), so
-          // the non-filterable path stays byte-for-byte the old one.
+          // a plain select's dropdown behavior is unchanged — with one
+          // deliberate exception noted at openSelect(): keyboard-opening any
+          // select now also closes any other open select (both paths route
+          // through openSelect), an intentional improvement over the pre-PR-F1
+          // direct setCustomSelectOpen. The emitted MARKUP for a plain select is
+          // still byte-for-byte the old one.
           function resetFilter() {}
           if (!filterInput) {
             return;
@@ -8990,10 +9390,15 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
             return out;
           }
 
+          // Mirrors computeFilterableSelectState in filterableSelectLogic.ts —
+          // the pure, unit-tested twin of this decision. Keep the two in
+          // lockstep; the DOM application (display, highlight, scrollIntoView)
+          // is the part that stays here and is smoke-checked by string tests.
           function applyFilter() {
             var q = (filterInput.value || '').trim().toLowerCase();
             var opts = dropdown.querySelectorAll('.custom-select-option');
             var realVisible = 0;
+            var firstRealVisible = null;
             for (var i = 0; i < opts.length; i++) {
               var opt = opts[i];
               // Match against label AND description — the option's full text.
@@ -9004,7 +9409,10 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
               // like any other option.
               var show = isCreateOption(opt) ? true : match;
               opt.style.display = show ? '' : 'none';
-              if (show && isRealOption(opt)) realVisible++;
+              if (show && isRealOption(opt)) {
+                realVisible++;
+                if (!firstRealVisible) firstRealVisible = opt;
+              }
             }
             if (noMatches) {
               // Only meaningful when there is no create affordance to fall back
@@ -9012,8 +9420,14 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
               // for the empty result itself.
               noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';
             }
-            var h = highlighted();
-            if (h && h.style.display === 'none') clearHighlight();
+            // AUTO-HIGHLIGHT (PR-F1 review §A, matches VS Code quick-pick / native
+            // datalist): while a query is active the FIRST REAL match is
+            // highlighted so a bare Enter commits it. An empty query clears the
+            // transient highlight (plain dropdown). A zero-match typo leaves
+            // firstRealVisible null, so nothing real is highlighted — Enter is
+            // then inert and the create/(None) sentinels are reachable only by an
+            // explicit ArrowDown or a click, never by a bare Enter.
+            setHighlight(q ? firstRealVisible : null);
           }
 
           resetFilter = function() {
@@ -9036,11 +9450,15 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
               setHighlight(vis[idx]);
             } else if (e.key === 'Enter') {
               e.preventDefault();
+              // Enter commits the current highlight and NOTHING else. With the
+              // auto-highlight in applyFilter a unique real match is already
+              // active, so this selects it; a zero-match typo leaves no
+              // highlight, so Enter is inert. There is deliberately no
+              // "lone visible option" fallback: it would auto-pick the
+              // ever-present create row on a typo (launching the inline-create
+              // flow) — choosing create by keyboard must be an explicit
+              // ArrowDown-to-highlight then Enter, or a click.
               var target = highlighted();
-              if (!target) {
-                var only = visibleOptions();
-                if (only.length === 1) target = only[0];
-              }
               if (target) chooseOption(target);
             } else if (e.key === 'Escape') {
               e.preventDefault();
@@ -9519,17 +9937,46 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
     .custom-select-option.highlighted {
       background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
-    /* The type-to-filter box pinned to the top of a filterable dropdown. Higher
-       specificity than the base input[type="text"] rule so its flat, borderless
-       look wins — it must read as a filter, not a value field. */
-    .custom-select-dropdown .custom-select-filter {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 5px 8px;
-      margin: 0;
+    /* A selected option that is ALSO the keyboard highlight keeps its
+       active-selection color (higher specificity than the .highlighted rule),
+       so the current value never loses its highlight when Enter would re-pick
+       it. */
+    .custom-select-option.selected.highlighted {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
+      color: var(--vscode-list-activeSelectionForeground, #fff);
+    }
+    /* The filter row pins the type-to-filter box to the top of a filterable
+       dropdown and hosts the leading search glyph. Sticky lives on the row so
+       both scroll-pin together. */
+    .custom-select-filter-row {
       position: sticky;
       top: 0;
       z-index: 1;
+    }
+    /* Leading search glyph — a monochrome, theme-tinted magnifier (inline SVG
+       mask, no external asset), matching the trigger chevron's flat glyph style
+       so the box reads unmistakably as a filter, not a value field. */
+    .custom-select-filter-row::before {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 12px;
+      height: 12px;
+      pointer-events: none;
+      opacity: 0.6;
+      background-color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E") no-repeat center / contain;
+    }
+    /* Higher specificity than the base input[type="text"] rule so its flat,
+       borderless look wins. Left padding clears the search glyph. */
+    .custom-select-dropdown .custom-select-filter {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 5px 8px 5px 26px;
+      margin: 0;
       border: none;
       border-bottom: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
       border-radius: 0;
@@ -10135,7 +10582,12 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
 
           // ── FILTERABLE BEHAVIOR ─────────────────────────────────────────────
           // Everything below is inert for a plain select (no filter input), so
-          // the non-filterable path stays byte-for-byte the old one.
+          // a plain select's dropdown behavior is unchanged — with one
+          // deliberate exception noted at openSelect(): keyboard-opening any
+          // select now also closes any other open select (both paths route
+          // through openSelect), an intentional improvement over the pre-PR-F1
+          // direct setCustomSelectOpen. The emitted MARKUP for a plain select is
+          // still byte-for-byte the old one.
           function resetFilter() {}
           if (!filterInput) {
             return;
@@ -10180,10 +10632,15 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
             return out;
           }
 
+          // Mirrors computeFilterableSelectState in filterableSelectLogic.ts —
+          // the pure, unit-tested twin of this decision. Keep the two in
+          // lockstep; the DOM application (display, highlight, scrollIntoView)
+          // is the part that stays here and is smoke-checked by string tests.
           function applyFilter() {
             var q = (filterInput.value || '').trim().toLowerCase();
             var opts = dropdown.querySelectorAll('.custom-select-option');
             var realVisible = 0;
+            var firstRealVisible = null;
             for (var i = 0; i < opts.length; i++) {
               var opt = opts[i];
               // Match against label AND description — the option's full text.
@@ -10194,7 +10651,10 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
               // like any other option.
               var show = isCreateOption(opt) ? true : match;
               opt.style.display = show ? '' : 'none';
-              if (show && isRealOption(opt)) realVisible++;
+              if (show && isRealOption(opt)) {
+                realVisible++;
+                if (!firstRealVisible) firstRealVisible = opt;
+              }
             }
             if (noMatches) {
               // Only meaningful when there is no create affordance to fall back
@@ -10202,8 +10662,14 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
               // for the empty result itself.
               noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';
             }
-            var h = highlighted();
-            if (h && h.style.display === 'none') clearHighlight();
+            // AUTO-HIGHLIGHT (PR-F1 review §A, matches VS Code quick-pick / native
+            // datalist): while a query is active the FIRST REAL match is
+            // highlighted so a bare Enter commits it. An empty query clears the
+            // transient highlight (plain dropdown). A zero-match typo leaves
+            // firstRealVisible null, so nothing real is highlighted — Enter is
+            // then inert and the create/(None) sentinels are reachable only by an
+            // explicit ArrowDown or a click, never by a bare Enter.
+            setHighlight(q ? firstRealVisible : null);
           }
 
           resetFilter = function() {
@@ -10226,11 +10692,15 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
               setHighlight(vis[idx]);
             } else if (e.key === 'Enter') {
               e.preventDefault();
+              // Enter commits the current highlight and NOTHING else. With the
+              // auto-highlight in applyFilter a unique real match is already
+              // active, so this selects it; a zero-match typo leaves no
+              // highlight, so Enter is inert. There is deliberately no
+              // "lone visible option" fallback: it would auto-pick the
+              // ever-present create row on a typo (launching the inline-create
+              // flow) — choosing create by keyboard must be an explicit
+              // ArrowDown-to-highlight then Enter, or a click.
               var target = highlighted();
-              if (!target) {
-                var only = visibleOptions();
-                if (only.length === 1) target = only[0];
-              }
               if (target) chooseOption(target);
             } else if (e.key === 'Escape') {
               e.preventDefault();

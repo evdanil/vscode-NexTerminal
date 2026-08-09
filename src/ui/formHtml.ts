@@ -7,23 +7,27 @@ import { baseWebviewJs } from "./shared/webviewScripts";
 type SelectOption = { label: string; value: string; description?: string };
 
 /**
- * Orders a FILTERABLE select's options. "Sentinel" options — the empty-value
- * `(None)` choice and any `__create__*` inline-create affordance — stay pinned
- * at the top in their DECLARED order; every other option is sorted by label,
- * case-insensitive and locale-aware. The pin rule reads the option's VALUE
- * shape, never a hardcoded label, so a differently-worded `(Select …)` /
- * `(Assign later)` sentinel (value `""`) still pins and a renamed create option
- * still leads. Non-filterable selects never reach here — their declared order
- * is emitted untouched.
+ * Orders a FILTERABLE select's options into two pinned buckets around the
+ * sorted real options. The empty-value `(None)` / `(Assign later)` sentinel
+ * pins at the TOP; any `__create__*` inline-create affordance pins at the
+ * BOTTOM — its declared home, where users expect "create" to live and where it
+ * sat before PR-F1 made these selects filterable. Everything between is sorted
+ * by label, case-insensitive and locale-aware. Each pin rule reads the option's
+ * VALUE shape, never a hardcoded label, so a differently-worded `(Select …)`
+ * sentinel (value `""`) still leads and a renamed create option still trails.
+ * Within a bucket declared order is preserved. Non-filterable selects never
+ * reach here — their declared order is emitted untouched.
  */
 export function sortFilterableOptions(options: SelectOption[]): SelectOption[] {
-  const isPinned = (value: string): boolean => value === "" || value.startsWith("__create__");
-  const pinned = options.filter((opt) => isPinned(opt.value));
-  const rest = options.filter((opt) => !isPinned(opt.value));
+  const isCreate = (value: string): boolean => value.startsWith("__create__");
+  const isEmptySentinel = (value: string): boolean => value === "";
+  const topPinned = options.filter((opt) => isEmptySentinel(opt.value));
+  const bottomPinned = options.filter((opt) => isCreate(opt.value));
+  const rest = options.filter((opt) => !isEmptySentinel(opt.value) && !isCreate(opt.value));
   // Copy before sort: `filter` already returned a fresh array, but keep the
   // intent explicit — the caller's `field.options` is never reordered in place.
   rest.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
-  return [...pinned, ...rest];
+  return [...topPinned, ...rest, ...bottomPinned];
 }
 
 function renderHint(field: FormFieldDescriptor): string {
@@ -150,9 +154,11 @@ function renderField(field: FormFieldDescriptor): string {
       <span class="custom-select-text">${escapeHtml(selectedLabel)}</span>
     </div>
     <div class="custom-select-dropdown">
-      <input type="text" class="custom-select-filter" placeholder="Type to filter…" aria-label="${filterLabel}" autocomplete="off" />
+      <div class="custom-select-filter-row">
+        <input type="text" class="custom-select-filter" placeholder="Filter…" aria-label="${filterLabel}" autocomplete="off" />
+      </div>
       ${optionsHtml}
-      <div class="custom-select-no-matches" style="display: none;">No matches</div>
+      <div class="custom-select-no-matches" style="display: none;" role="status" aria-live="polite">No matches</div>
     </div>
   </div>${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
@@ -795,10 +801,37 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             newOpt.textContent = msg.label;
             var dropdown = wrapper.querySelector('.custom-select-dropdown');
             var createOpt = dropdown.querySelector('.custom-select-option[data-value^="__create__"]');
-            if (createOpt) {
-              dropdown.insertBefore(newOpt, createOpt);
-            } else {
-              dropdown.appendChild(newOpt);
+            var inserted = false;
+            // For a filterable select the reals are rendered in locale-aware
+            // sorted order (sortFilterableOptions), with (None) pinned top and
+            // the create row bottom. Slot the inline-created item into its
+            // alphabetical position among the reals rather than dropping it at
+            // the tail — so it lands where the user would next look for it.
+            if (wrapper.classList.contains('filterable')) {
+              var newLabel = msg.label || '';
+              var siblings = dropdown.querySelectorAll('.custom-select-option');
+              for (var soi = 0; soi < siblings.length; soi++) {
+                var sib = siblings[soi];
+                var sibVal = sib.dataset.value || '';
+                // Reals only: never order against the (None) or create sentinels.
+                if (sibVal === '' || sibVal.indexOf('__create__') === 0) continue;
+                var sibLabelEl = sib.querySelector('.custom-select-option-label');
+                var sibLabel = sibLabelEl ? sibLabelEl.textContent : sib.textContent;
+                if (newLabel.localeCompare(sibLabel, undefined, { sensitivity: 'base' }) < 0) {
+                  dropdown.insertBefore(newOpt, sib);
+                  inserted = true;
+                  break;
+                }
+              }
+            }
+            if (!inserted) {
+              // Non-filterable, or sorts after every existing real: land just
+              // before the create row (its declared tail slot), or append.
+              if (createOpt) {
+                dropdown.insertBefore(newOpt, createOpt);
+              } else {
+                dropdown.appendChild(newOpt);
+              }
             }
             selectCustomOption(wrapper, msg.value);
             wrapper.dataset.prev = msg.value;
