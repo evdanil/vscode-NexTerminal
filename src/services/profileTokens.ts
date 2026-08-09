@@ -54,15 +54,18 @@ const PROFILE_TOKEN_FIELD_LOCATION: Record<ProfileTokenName, string> = {
  * fix it. Naming only what is forbidden leaves them guessing which of the
  * characters they typed was the problem.
  */
+const ADDRESS_GUIDANCE =
+  'Use the address only — letters, digits, ".", "-", "_" and ":" — without a scheme like https:// or a path. ' +
+  'Square brackets are accepted only as a whole bracketed IPv6 literal, e.g. [fe80::1] or [fe80::1]:623.';
+
 const PROFILE_TOKEN_CHARSET_GUIDANCE: Record<ProfileTokenName, string> = {
-  host: 'Use the address only — letters, digits, ".", "-", "_", ":" and "[]" for IPv6 — without a scheme like https:// or a path.',
-  ipmiHost:
-    'Use the address only — letters, digits, ".", "-", "_", ":" and "[]" for IPv6 — without a scheme like https:// or a path.',
+  host: ADDRESS_GUIDANCE,
+  ipmiHost: ADDRESS_GUIDANCE,
   port: "Use the port number only — digits, nothing else.",
   username: 'Use letters, digits, ".", "_", "-" and "@" only.',
   name:
-    'Remove $, `, %, "!", quotes, ";", "|", "&", "<", ">", "\\", parentheses and braces from the name — spaces, ' +
-    'square brackets, "/", "^" and accents are fine.'
+    'Remove $, `, %, "!", "~", "*", "?", quotes, ";", "|", "&", "<", ">", "\\", parentheses, square brackets and ' +
+    'braces from the name — spaces, "/", ".", "^" and accents are fine.'
 };
 
 /** The server-form label for a token, so pickers and errors name the same field. */
@@ -116,12 +119,114 @@ function isProfileTokenName(name: string): name is ProfileTokenName {
 }
 
 /**
- * Address charset for the host-like tokens: letters, digits, `.`, `-`, `_`, `:`
- * and `[` `]` (bracketed IPv6). Deliberately narrower than "valid hostname" —
- * the point is not to validate DNS, it is that nothing which survives this can
- * act as shell syntax.
+ * Address charset for the host-like tokens: letters, digits, `.`, `-`, `_` and
+ * `:`. Deliberately narrower than "valid hostname" — the point is not to
+ * validate DNS, it is that nothing which survives this can act as shell syntax.
+ *
+ * NOTE what is NOT in this set and never has been: `*`, `?` and `~`. The glob
+ * and tilde expansions that `NAME_FORBIDDEN_CHARS` now refuses were already
+ * unreachable here, because this is a positive charset rather than a blacklist.
+ * `[` and `]` are the exception that had to be handled separately — see
+ * `isAddressValue()`.
  */
-const ADDRESS_CHARSET = /^[A-Za-z0-9._:\-\[\]]+$/;
+const ADDRESS_CHARSET = /^[A-Za-z0-9._\-:]+$/;
+
+/**
+ * REVIEW FINDING (P1) — `[` and `]` USED TO BE PLAIN MEMBERS OF
+ * `ADDRESS_CHARSET`, anywhere in the value. They are there for bracketed IPv6
+ * (`[fe80::1]`), but "anywhere" also admits `[abc]`, which is a POSIX BRACKET
+ * EXPRESSION: substituted unquoted into a `localTerminal` macro it undergoes
+ * pathname expansion and, if a file named `a`, `b` or `c` exists in the
+ * terminal's working directory, the shell replaces the argument with that
+ * filename. At command position that selects what runs. A host arrives from
+ * inventory sync and from backup import, so this is attacker-supplied input.
+ *
+ * The fix keeps IPv6 working by accepting brackets ONLY as the whole value's
+ * shape — a bracketed IPv6 literal with an optional `:port` suffix — and
+ * refusing any other value that contains a bracket at all (`a[b]c`, `[abc]`,
+ * a stray `[`). The content inside the brackets is then STRUCTURALLY validated
+ * as IPv6 (`isIpv6Literal`) rather than merely charset-checked: `[abc]` is
+ * built entirely out of hex digits, so a charset of "hex digits, colons and
+ * dots" would have admitted the exact value this finding is about.
+ *
+ * THE OPTIONAL `:port` SUFFIX IS ACCEPTED, and that is a deliberate call rather
+ * than an oversight. `ServerConfig.port` is a separate numeric field, so the
+ * SSH `host` never needs one — but `ipmiHost` shares this rule and reaches a
+ * URL through the shipped `https://${profile.ipmiHost}/` browser macro, where a
+ * BMC on a non-standard port is ordinary. The unbracketed equivalent
+ * (`bmc.example.com:8443`) is accepted by `ADDRESS_CHARSET` today and stays
+ * accepted, so refusing `[fe80::1]:8443` would be arbitrary. A port suffix is
+ * digits — it adds no expansion surface.
+ *
+ * RESIDUAL, stated honestly: a strictly-validated bracketed IPv6 literal is
+ * still, character for character, a bracket expression — `[::1]` would match a
+ * file named `1` or `:` in the working directory. What that can do is bounded
+ * to swapping in a ONE-CHARACTER filename drawn from hex digits, `:` and `.`,
+ * as the value of an argument; it cannot introduce a metacharacter, a second
+ * word, or a path (the expansion result is a name from the directory listing,
+ * and this pattern can only ever match single-character names). Removing even
+ * that would mean refusing bracketed IPv6 outright, which breaks the field's
+ * documented purpose.
+ */
+const BRACKETED_ADDRESS = /^\[([^\[\]]+)\](?::([0-9]{1,5}))?$/;
+const IPV4_DOTTED_QUAD = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$/;
+const IPV6_HEXTET = /^[0-9A-Fa-f]{1,4}$/;
+
+/**
+ * Structural IPv6 check — groups of 1–4 hex digits, at most one `::`
+ * compression, and an optional trailing dotted-quad (`::ffff:10.0.0.1`) which
+ * occupies two groups. Uncompressed forms must have exactly 8 groups;
+ * compressed forms fewer than 8, since `::` has to stand for at least one.
+ *
+ * Written out rather than expressed as one regex because the regex for this is
+ * unreadable and this is a security boundary: the thing it exists to reject
+ * (`[abc]`, all hex digits, a valid bracket expression and not an address) is
+ * exactly the case a sloppy pattern lets through.
+ */
+function isIpv6Literal(value: string): boolean {
+  const halves = value.split("::");
+  if (halves.length > 2) return false;
+  const compressed = halves.length === 2;
+
+  // A dotted-quad tail is only legal at the very END of the address.
+  const countGroups = (side: string, isLast: boolean): number | null => {
+    if (side === "") return 0;
+    const groups = side.split(":");
+    let count = 0;
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      const atEnd = isLast && i === groups.length - 1;
+      if (group.includes(".")) {
+        if (!atEnd || !IPV4_DOTTED_QUAD.test(group)) return null;
+        count += 2;
+        continue;
+      }
+      if (!IPV6_HEXTET.test(group)) return null;
+      count += 1;
+    }
+    return count;
+  };
+
+  const left = countGroups(halves[0], !compressed);
+  if (left === null) return false;
+  if (!compressed) return left === 8;
+  const right = countGroups(halves[1], true);
+  if (right === null) return false;
+  return left + right < 8;
+}
+
+/**
+ * `host` / `ipmiHost`: the plain charset, plus bracketed IPv6 as a whole-value
+ * exception. A value carrying a bracket ANYWHERE has to be that exception in
+ * full — there is no "mostly a hostname with brackets in it" form to allow.
+ */
+function isAddressValue(value: string): boolean {
+  if (value.includes("[") || value.includes("]")) {
+    const match = BRACKETED_ADDRESS.exec(value);
+    return match !== null && isIpv6Literal(match[1]);
+  }
+  return ADDRESS_CHARSET.test(value);
+}
 const DIGITS_ONLY = /^[0-9]+$/;
 /**
  * Usernames: letters, digits, `.`, `_`, `-` and `@` — enough for every real
@@ -136,7 +241,7 @@ const USERNAME_CHARSET = /^[A-Za-z0-9._@\-]+$/;
 /**
  * `name` is a genuinely free-form label — "Rack 4 / Ünit 2" must keep working —
  * so it gets a blacklist rather than a charset: everything a shell would read as
- * syntax is refused, while spaces, accents, "/" and square brackets are not.
+ * syntax is refused, while spaces, accents, "/" and "." are not.
  *
  * REVIEW FINDING (P1) — PARENTHESES AND BRACES ARE REFUSED, which means
  * "Core Switch (DC1)" no longer resolves. The shell this list has to survive is
@@ -154,13 +259,42 @@ const USERNAME_CHARSET = /^[A-Za-z0-9._@\-]+$/;
  * `.{Start-Process calc}` executes wherever the token starts a statement, out of
  * characters this list used to permit. A display name needs neither form.
  *
- * SQUARE BRACKETS ARE NOT REFUSED, deliberately. `[Type]::Member` does put
+ * REVIEW FINDING (P1) — SQUARE BRACKETS ARE NOW REFUSED, REVERSING the decision
+ * this comment used to record. The earlier reasoning ran: "`[Type]::Member` puts
  * PowerShell into expression mode, but a type literal is not by itself an
- * invocation: reaching a method needs `(` (call) or `{` (scriptblock), and both
- * are now gone — what is left is at worst a name that resolves to a type, or a
- * glob pattern in a POSIX shell. Neither runs anything. "Rack A [Spare]" is as
- * ordinary a label as "Rack A - Spare", and `host`/`ipmiHost` keep `[]` for
- * bracketed IPv6, so the rules stay consistent about the same two characters.
+ * invocation — reaching a method needs `(` or `{`, and both are gone; what is
+ * left is at worst a glob pattern in a POSIX shell. Neither runs anything."
+ *
+ * The second half of that sentence is the mistake. It weighed a POSIX glob only
+ * as a PATTERN and never asked what pathname expansion DOES with one, which is
+ * to consult the working directory and REPLACE the word with the names it
+ * matched. No method call, no PowerShell, no second character needed: `[abc]`
+ * at command position in a `localTerminal` macro becomes the file `a`, `b` or
+ * `c` if one exists in the terminal's cwd, and the shell then executes it.
+ * "Neither runs anything" was true of the type literal and false of the glob,
+ * and the glob is the one that reaches a default bash.
+ *
+ * SO `*`, `?`, `[` AND `]` ALL GO — the whole of POSIX glob syntax, held to the
+ * same "one character causes expansion in a default shell" bar that took `%` and
+ * `!`. `*` and `?` are worse than brackets in argument position, where one word
+ * expands into as MANY operands as there are matching files: a name of `*`
+ * pasted after a command turns `cmd ${profile.name}` into `cmd` applied to every
+ * file in the directory.
+ *
+ * `~` GOES WITH THEM. Tilde expansion is not glob, but it is the same shape of
+ * bug: one character, at word start, in a default shell, expanding into a path
+ * that is not what the value says. A blacklist cannot condition on whether the
+ * value happens to land at a word start in the macro's text, so it goes
+ * unconditionally.
+ *
+ * `/`, `.`, SPACES AND ACCENTS STAY LEGAL. With glob syntax gone they are inert
+ * text — `Rack 4 / Ünit 2` is a label, not a path, because nothing expands it.
+ * A name that is a LITERAL path or command (`/bin/sh`, `reboot`) placed at
+ * command position still runs, but that is the macro author choosing to put a
+ * display name where a command goes; it is not this charset converting data into
+ * syntax, and refusing `/` or `.` would break every site-code label without
+ * closing anything. Out of scope here, as it is for `host` (`10.0.0.1` at
+ * command position is likewise just a template mistake).
  *
  * REVIEW FINDING (P1) — `%` IS REFUSED, because the third default shell had not
  * been accounted for. `terminal.integrated.defaultProfile.windows` can be
@@ -195,7 +329,7 @@ const USERNAME_CHARSET = /^[A-Za-z0-9._@\-]+$/;
  *   itself). In bash and PowerShell `^` is an ordinary character. Nothing it can
  *   do meets the bar, and "Rack 4 ^ Spare" stays a legal label.
  */
-const NAME_FORBIDDEN_CHARS = /["'$`;|&<>\\(){}%!]/;
+const NAME_FORBIDDEN_CHARS = /["'$`;|&<>\\(){}%!*?\[\]~]/;
 /**
  * Refused in EVERY token, no exceptions. `$` and a backtick are what turn a
  * substituted value into syntax rather than data — for the shell, and for this
@@ -248,7 +382,7 @@ function validateTokenValue(token: ProfileTokenName, value: string): boolean {
   switch (token) {
     case "host":
     case "ipmiHost":
-      return ADDRESS_CHARSET.test(value);
+      return isAddressValue(value);
     case "port":
       return DIGITS_ONLY.test(value);
     case "username":

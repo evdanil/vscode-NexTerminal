@@ -185,6 +185,16 @@ describe("resolveProfileTokens — injection defense", () => {
 
   it("accepts ordinary addresses: IPv4, bracketed IPv6, and FQDNs", () => {
     expect(resolved("-H ${profile.ipmiHost}", server({ ipmiHost: "[::1]" }))).toBe("-H [::1]");
+    expect(resolved("-H ${profile.ipmiHost}", server({ ipmiHost: "[fe80::1]" }))).toBe("-H [fe80::1]");
+    expect(resolved("-H ${profile.ipmiHost}", server({ ipmiHost: "[::ffff:10.0.0.1]" }))).toBe("-H [::ffff:10.0.0.1]");
+    // The port suffix is legitimate for THIS field: `ipmiHost` reaches a URL
+    // through the shipped `https://${profile.ipmiHost}/` browser macro, and the
+    // unbracketed equivalent (`bmc.example.com:8443`) has always been accepted
+    // by the same charset — refusing only the bracketed form would be arbitrary.
+    expect(resolved("-H ${profile.ipmiHost}", server({ ipmiHost: "[fe80::1]:623" }))).toBe("-H [fe80::1]:623");
+    expect(resolved("-H ${profile.ipmiHost}", server({ ipmiHost: "bmc.example.com:8443" }))).toBe(
+      "-H bmc.example.com:8443"
+    );
     expect(resolved("-H ${profile.ipmiHost}", server({ ipmiHost: "fe80::1" }))).toBe("-H fe80::1");
     expect(resolved("-H ${profile.ipmiHost}", server({ ipmiHost: "bmc-01.dc1.example.com" }))).toBe("-H bmc-01.dc1.example.com");
     expect(resolved("-H ${profile.ipmiHost}", server({ ipmiHost: "10.0.0.1" }))).toBe("-H 10.0.0.1");
@@ -206,12 +216,13 @@ describe("resolveProfileTokens — injection defense", () => {
 
   it("still allows a free-form display name — it is a label, not an address", () => {
     expect(resolved("# ${profile.name}", server({ name: "Core Switch DC1" }))).toBe("# Core Switch DC1");
-    // Spaces, accents, slashes and SQUARE BRACKETS stay legal: `name` is a
-    // blacklist, not a charset, and refusing these would break ordinary profile
-    // names. Brackets are kept on purpose — `[Type]::Member` needs `(` or `{` to
-    // become an invocation, and both of those are now refused (see below).
+    // Spaces, accents, slashes and dots stay legal: `name` is a blacklist, not a
+    // charset, and refusing these would break ordinary profile names. With glob
+    // syntax refused (see below) they are inert text — a "/" expands into
+    // nothing. Square brackets USED to be in this list and no longer are.
     expect(resolved("# ${profile.name}", server({ name: "Rack 4 / Ünit 2" }))).toBe("# Rack 4 / Ünit 2");
-    expect(resolved("# ${profile.name}", server({ name: "Rack A [Spare]" }))).toBe("# Rack A [Spare]");
+    expect(resolved("# ${profile.name}", server({ name: "Rack A - Spare" }))).toBe("# Rack A - Spare");
+    expect(resolved("# ${profile.name}", server({ name: "Ærø-Süd Ünit 2" }))).toBe("# Ærø-Süd Ünit 2");
   });
 
   it("refuses parentheses in a display name, which USED TO BE ACCEPTED as \"Core Switch (DC1)\"", () => {
@@ -308,9 +319,93 @@ describe("resolveProfileTokens — injection defense", () => {
       expect(resolveProfileTokens("x ${profile.name}", server({ name: bad })).ok, `name ${bad}`).toBe(false);
     }
     // `host`/`ipmiHost` never accepted these anyway (they are charsets, not
-    // blacklists) and MUST keep accepting `[]` for bracketed IPv6.
+    // blacklists) and MUST keep accepting bracketed IPv6.
     expect(resolveProfileTokens("-H ${profile.ipmiHost}", server({ ipmiHost: "(id)" })).ok).toBe(false);
     expect(resolved("-H ${profile.ipmiHost}", server({ ipmiHost: "[fe80::1]" }))).toBe("-H [fe80::1]");
+  });
+
+  it("refuses glob syntax in a display name, which USED TO ACCEPT `[abc]` and `*`", () => {
+    // DELIBERATE FLIP of the old "square brackets are fine" assertion. The old
+    // rationale only asked whether `[Type]::Member` could reach a PowerShell
+    // METHOD (it cannot without `(` or `{`, both refused). It never asked what a
+    // default bash does with the same characters: pathname expansion replaces
+    // the word with matching FILENAMES before the command runs.
+    const outcome = resolveProfileTokens("${profile.name}\n", server({ name: "./scripts/*" }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.kind).toBe("invalid");
+    expect(outcome.error.token).toBe("name");
+    // The exact line the pre-fix implementation produced — a glob at command
+    // position, which the shell resolves to a file it then executes.
+    expect(JSON.stringify(outcome)).not.toContain("./scripts/*\\n");
+    expect(outcome.error.message).toContain("*");
+
+    // Each glob metacharacter alone, including the bracket expression that the
+    // previous version of this file explicitly permitted as "Rack A [Spare]".
+    for (const bad of ["x?", "[abc]", "Rack A [Spare]", "*", "a*b", "log[0-9]", "]", "["]) {
+      expect(resolveProfileTokens("cmd ${profile.name}\n", server({ name: bad })).ok, `name ${bad}`).toBe(false);
+    }
+  });
+
+  it("refuses `~` in a display name — one character, one home-directory path, in a default shell", () => {
+    const outcome = resolveProfileTokens("ls ${profile.name}\n", server({ name: "~backup" }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.token).toBe("name");
+    expect(JSON.stringify(outcome)).not.toContain("ls ~backup\\n");
+    expect(outcome.error.message).toContain("~");
+    for (const bad of ["~", "DC1 ~", "~/dc1"]) {
+      expect(resolveProfileTokens("ls ${profile.name}\n", server({ name: bad })).ok, `name ${bad}`).toBe(false);
+    }
+  });
+
+  it("keeps a path-shaped name legal once globs are gone — literal text is not expansion", () => {
+    // The line the charset is NOT trying to draw: `/`, `.` and spaces cannot
+    // expand into anything, so they stay legal even though a name of `/bin/sh`
+    // at command position would run. That is the macro's template putting a
+    // display name where a command goes, not this charset turning data into
+    // syntax — and refusing `/` or `.` would break every site-code label.
+    expect(resolved("# ${profile.name}", server({ name: "Rack 4 / Unit 2" }))).toBe("# Rack 4 / Unit 2");
+    expect(resolved("# ${profile.name}", server({ name: "dc1.rack4.unit2" }))).toBe("# dc1.rack4.unit2");
+  });
+
+  it("refuses brackets in host/ipmiHost unless the WHOLE value is a bracketed IPv6 literal", () => {
+    // DELIBERATE FLIP: `[` and `]` used to be plain members of the address
+    // charset, accepted anywhere in the value. `[abc]` is then a POSIX bracket
+    // expression — unquoted in a localTerminal macro the shell replaces it with
+    // a file named `a`, `b` or `c` from the working directory, which at command
+    // position is what runs.
+    const outcome = resolveProfileTokens("${profile.ipmiHost}\n", server({ ipmiHost: "[abc]" }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.kind).toBe("invalid");
+    expect(outcome.error.token).toBe("ipmiHost");
+    expect(JSON.stringify(outcome)).not.toContain("[abc]\\n");
+
+    for (const bad of ["a[b]c", "[abc]", "10.0.0.[1-9]", "[]", "[fe80::1", "fe80::1]", "[[::1]]", "[::1]:99999999"]) {
+      expect(resolveProfileTokens("-H ${profile.host}", server({ host: bad })).ok, `host ${bad}`).toBe(false);
+      expect(resolveProfileTokens("-H ${profile.ipmiHost}", server({ ipmiHost: bad })).ok, `ipmiHost ${bad}`).toBe(
+        false
+      );
+    }
+    // The bracketed form the field exists to carry is untouched.
+    expect(resolved("-H ${profile.host}", server({ host: "[::1]" }))).toBe("-H [::1]");
+    expect(resolved("-H ${profile.host}", server({ host: "[fe80::1]:623" }))).toBe("-H [fe80::1]:623");
+    // …and so are the unbracketed addresses, which never went near this rule.
+    expect(resolved("-H ${profile.host}", server({ host: "10.0.0.1" }))).toBe("-H 10.0.0.1");
+    expect(resolved("-H ${profile.host}", server({ host: "bmc.example.com" }))).toBe("-H bmc.example.com");
+  });
+
+  it("pins that the address charset admits no glob or tilde character, bracket rule aside", () => {
+    // Assertion-style: `*`, `?` and `~` were never IN the positive charset, and
+    // this test exists so a later "let hostnames be more permissive" edit has to
+    // delete it on purpose rather than widen the class by accident.
+    for (const bad of ["10.0.0.*", "host?", "~/host", "a~b", "10.0.0.1 *", "*"]) {
+      expect(resolveProfileTokens("-H ${profile.host}", server({ host: bad })).ok, `host ${bad}`).toBe(false);
+      expect(resolveProfileTokens("-H ${profile.ipmiHost}", server({ ipmiHost: bad })).ok, `ipmiHost ${bad}`).toBe(
+        false
+      );
+    }
   });
 
   it("refuses a username carrying shell syntax — it reaches a local command line too", () => {

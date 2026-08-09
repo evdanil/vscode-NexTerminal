@@ -284,10 +284,10 @@ checked:
 
 | Token | Accepted |
 |---|---|
-| `${profile.host}`, `${profile.ipmiHost}` | letters, digits, `.`, `-`, `_`, `:`, and `[]` for IPv6 — the address only, no `https://` and no path |
+| `${profile.host}`, `${profile.ipmiHost}` | letters, digits, `.`, `-`, `_`, `:` — the address only, no `https://` and no path. `[` and `]` only as a whole bracketed IPv6 literal, with an optional port: `[fe80::1]`, `[::ffff:10.0.0.1]`, `[fe80::1]:623` |
 | `${profile.port}` | digits |
 | `${profile.username}` | letters, digits, `.`, `_`, `-`, `@` |
-| `${profile.name}` | anything except `$`, a backtick, `%`, `!`, quotes, `;`, `\|`, `&`, `<`, `>`, `\`, `(`, `)`, `{`, `}` — spaces, `[`, `]`, `/`, `^` and accents are fine |
+| `${profile.name}` | anything except `$`, a backtick, `%`, `!`, `~`, `*`, `?`, `[`, `]`, quotes, `;`, `\|`, `&`, `<`, `>`, `\`, `(`, `)`, `{`, `}` — spaces, `/`, `.`, `^` and accents are fine |
 
 No value may contain a `$` or a backtick, in any token. A profile carrying shell
 syntax — which can reach your config through an inventory sync or an imported
@@ -308,14 +308,30 @@ That is why a profile **name** may not contain:
   `%COMSPEC% /c calc` would run at command position;
 - **`!`** — interactive bash expands history references (`!!`, `!string`) by
   default, and what they splice in is a previous command line, punctuation
-  included.
+  included;
+- **`*`, `?`, `[`, `]`** — glob syntax. A default bash expands these against the
+  working directory *before* running anything, so a name of `./scripts/*` at
+  command position runs whatever file that matches, and a name of `*` in
+  argument position turns one operand into one per file in the directory. (An
+  earlier version of this page said square brackets were fine because
+  `[Type]::Member` needs a `(` or `{` to become a PowerShell invocation — true,
+  but it missed that `[abc]` is *also* a POSIX bracket expression, which
+  pathname expansion resolves to a filename with no method call involved.)
+- **`~`** — tilde expansion, for the same reason in one character: at the start
+  of a word a default shell replaces it with a home directory path.
 
-Rename the profile — `Core Switch DC1` rather than `Core Switch (DC1)` — or
-escape the token (`$${profile.name}`) if you only want the literal text. Square
-brackets stay legal in every token: `Rack A [Spare]` is fine, and
-`${profile.host}` needs them for bracketed IPv6. A caret (`^`) is legal too: it
-is cmd's escape character, and escaping can only ever *remove* a
-metacharacter's meaning.
+Rename the profile — `Core Switch DC1` rather than `Core Switch (DC1)`,
+`Rack A - Spare` rather than `Rack A [Spare]` — or escape the token
+(`$${profile.name}`) if you only want the literal text. Spaces, `/`, `.` and
+accents stay legal: with glob syntax gone they are plain text, so `Rack 4 / Ünit
+2` is fine. A caret (`^`) is legal too: it is cmd's escape character, and
+escaping can only ever *remove* a metacharacter's meaning.
+
+`${profile.host}` and `${profile.ipmiHost}` still accept square brackets, but
+only as a **whole bracketed IPv6 literal** — `[fe80::1]` or `[fe80::1]:623`, and
+the part inside the brackets has to parse as an IPv6 address. A value with a
+bracket anywhere else (`a[b]c`) or a bracket expression dressed up as an address
+(`[abc]`) is refused: unquoted in a local command it is a glob, not an address.
 
 A macro that uses profile tokens cannot auto-trigger, whichever **Run in** it
 has: a rule fired by terminal output has no server to resolve the tokens
