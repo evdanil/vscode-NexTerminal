@@ -155,16 +155,31 @@ export interface ServerOrigin {
    * Written ONLY where the sync writes `ipmiHost` — the add path always
    * (`undefined` included, so a source whose devices gain an `oob_ip` later
    * finds the stamps already there), the update path only when the write rule
-   * fires — and never inferred from the record's current value, which would
-   * launder a hand-edit into "as stamped" one sync later.
+   * fires — plus ONE stamp-only case, and never inferred from the record's
+   * current value alone, which would launder a hand-edit into "as stamped" one
+   * sync later.
+   *
+   * THE STAMP-ONLY CASE (matrix row 5a, see `syncOwnsIpmiHost` in the sync
+   * engine): a record whose `ipmiHost` ALREADY EQUALS the device's out-of-band
+   * address this fetch gains the stamp even though the value does not move. The
+   * stamp is still the DEVICE's value, so the "never inferred from the record"
+   * rule stands — equality with the device is the trigger, and a hand edit to
+   * some third value stamps nothing. Its purpose is that the likeliest hand
+   * entry there is (the user copied the address out of NetBox) would otherwise
+   * be permanently unstampable and would go silently stale the first time the
+   * BMC is re-addressed. Accepted residual: such a value is adopted into sync
+   * ownership without the user asking — the same trade `syncedUsername` makes,
+   * and the opt-out is unchanged (clear the field; absent value + present stamp
+   * is hands-off forever).
    *
    * Optional for backward compat, exactly like the two stamps above: servers
    * synced by a build before this field existed have none. Absent means
    * HANDS-OFF rather than "eligible", which is the one asymmetry against
    * `syncedUsername`: there is no source-level default IPMI host to fall back
    * to, so a record carrying an `ipmiHost` with NO stamp is a hand entry and is
-   * never overwritten. (A record carrying neither is the never-configured state
-   * the sync is free to fill.)
+   * never overwritten — unless that value is the device's own current address,
+   * per the stamp-only case above. (A record carrying neither is the
+   * never-configured state the sync is free to fill.)
    */
   syncedIpmiHost?: string;
 }
@@ -283,6 +298,39 @@ export interface DetachedServerOrigin {
    * nobody hand-configured out of retro-apply for good.
    */
   syncedAuthProfileId?: string;
+  /**
+   * OOB (PR-A REVIEW FINDING) — the out-of-band address the REMOVED SOURCE'S
+   * SYNC had last written into `ipmiHost` on this server, copied verbatim from
+   * the server's own `ServerOrigin.syncedIpmiHost` at detach time, and
+   * `undefined` when that sync had written none.
+   *
+   * NOT a matching input — like `syncedAuthProfileId` beside it, it decides
+   * nothing about adoption. It is preserved for exactly the same reason and
+   * against exactly the same failure: it is the only record of whether the
+   * `ipmiHost` the server still carries was the SYNC'S doing or the USER'S, and
+   * the write rule (`syncOwnsIpmiHost`) is decided on precisely that
+   * distinction.
+   *
+   * The failure it closes. Remove Source → Keep Servers → re-add the source →
+   * Adopt used to strip the origin and restore no OOB stamp, so an adopted
+   * server's sync-written address arrived looking hand-typed (matrix row 5) and
+   * the sync could never update it again — permanently, and silently, for a
+   * value the sync itself had put there. The earlier code framed that omission
+   * as inherent ("the marker carries no OOB stamp to restore"); it was a
+   * decision, and this field reverses it, on the same terms as the auth
+   * provenance marker that had already reversed the identical decision one field
+   * up. (The equal-value stamp-only rule, row 5a, softens the loss but does not
+   * close it: it only rescues records whose address STILL equals the device's
+   * current one, which is the opposite of the re-addressed BMC this receipt is
+   * for.)
+   *
+   * Optional and restored, never invented: adoption copies it back into the new
+   * `origin`, and a marker that carries none restores none — bit-identical to a
+   * server the sync never wrote an address on. Nothing clears it, unlike
+   * `syncedAuthProfileId`: an address names no other record, so it cannot dangle
+   * when something else is deleted.
+   */
+  syncedIpmiHost?: string;
   detachedAt: number;
 }
 
@@ -451,6 +499,12 @@ function detachedOriginsEqual(a: DetachedServerOrigin | undefined, b: DetachedSe
     // the forgetful one, and the adopted server would be back to carrying a
     // sync-applied profile nothing can prove the sync applied.
     a.syncedAuthProfileId === b.syncedAuthProfileId &&
+    // OOB (PR-A REVIEW FINDING) — compared one field down for the identical
+    // reason: a rollback that called two markers equal while one remembers the
+    // out-of-band address the removed source wrote and the other does not would
+    // restore the forgetful one, and the adopted server's BMC address would be
+    // back to looking hand-typed, which no later sync can repair.
+    a.syncedIpmiHost === b.syncedIpmiHost &&
     a.detachedAt === b.detachedAt
   );
 }

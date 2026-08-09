@@ -489,6 +489,32 @@ describe("createNetboxProvider", () => {
       }
     });
 
+    it("(OOB, PR-A REVIEW FINDING) a degenerate oob_ip that is NOTHING BUT a prefix emits no endpoint at all (kills checking emptiness BEFORE `stripCidr` rather than after, which puts `{ kind: \"redfish\", host: \"\" }` onto the tree)", async () => {
+      const fetchImpl = vi.fn(async () =>
+        makeResponse(200, {
+          count: 2,
+          results: [
+            // Non-empty going in, empty coming out — the one shape the
+            // pre-strip check cannot see.
+            { id: 1, name: "prefix-only", primary_ip: { address: "10.0.0.1/24" }, oob_ip: { address: "/24" } },
+            // The control: the same field with something in front of the slash.
+            { id: 2, name: "real-oob", primary_ip: { address: "10.0.0.2/24" }, oob_ip: { address: "10.9.9.9/24" } }
+          ]
+        })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      // Asserted as "no management endpoint at all", not as "its host is not
+      // empty": an empty-hosted endpoint must never reach the tree in the first
+      // place, and the sync engine's own selector skipping it downstream is a
+      // second line of defence rather than a reason to emit one.
+      const byName = new Map(tree.devices.map((d) => [d.name, d]));
+      expect(byName.get("prefix-only")!.endpoints).toEqual([{ kind: "ssh", host: "10.0.0.1", port: 22 }]);
+      expect(byName.get("real-oob")!.endpoints).toContainEqual({ kind: "redfish", host: "10.9.9.9" });
+    });
+
     it("(OOB) a device with an oob_ip but NO primary IP carries the redfish endpoint alone AND is still counted in the no-SSH warning (kills the stale `endpoints.length === 0` skip predicate, which silently drops exactly these devices out of the warning)", async () => {
       const fetchImpl = vi.fn(async () =>
         makeResponse(200, {

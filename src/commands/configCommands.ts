@@ -2356,6 +2356,13 @@ export function registerConfigCommands(
                       ...(rolledBackOrigin.syncedAuthProfileId !== undefined
                         ? { syncedAuthProfileId: rolledBackOrigin.syncedAuthProfileId }
                         : {}),
+                      // OOB (PR-A REVIEW FINDING) — copied from the origin being
+                      // stripped for the same reason the auth provenance above
+                      // is, and omitted rather than written as `undefined` for
+                      // the same reason: this object is persisted verbatim.
+                      ...(rolledBackOrigin.syncedIpmiHost !== undefined
+                        ? { syncedIpmiHost: rolledBackOrigin.syncedIpmiHost }
+                        : {}),
                       detachedAt
                     }
                   }

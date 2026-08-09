@@ -87,7 +87,7 @@ describe("serverConfigsEqual — formerlySynced (ADOPT 1)", () => {
     expect(serverConfigsEqual(a, server({ formerlySynced: { ...MARKER, detachedAt: 2000 } }))).toBe(false);
   });
 
-  it("two markers differing only in the PRESERVED FIELDS the detach copies off the origin are not equal (kills leaving `instanceKey` or `syncedAuthProfileId` out of the comparison — a rollback would then replace a marker that names its deployment, or remembers the removed source's own auth link, with one that does not, and call the two records identical while doing it)", () => {
+  it("two markers differing only in the PRESERVED FIELDS the detach copies off the origin are not equal (kills leaving `instanceKey`, `syncedAuthProfileId` or `syncedIpmiHost` out of the comparison — a rollback would then replace a marker that names its deployment, or remembers the removed source's own auth link or BMC address, with one that does not, and call the two records identical while doing it)", () => {
     const a = server({ formerlySynced: { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p1" } });
     // `instanceKey` is what makes a marker adoptable AT ALL.
     expect(serverConfigsEqual(a, server({ formerlySynced: { ...MARKER, instanceKey: "https://netbox-lab.example.com", syncedAuthProfileId: "p1" } }))).toBe(false);
@@ -97,6 +97,12 @@ describe("serverConfigsEqual — formerlySynced (ADOPT 1)", () => {
     // it, i.e. whether AUTH 2b may ever take that link back off.
     expect(serverConfigsEqual(a, server({ formerlySynced: { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p2" } }))).toBe(false);
     expect(serverConfigsEqual(a, server({ formerlySynced: { ...MARKER, instanceKey: "https://netbox.example.com" } }))).toBe(false);
+    // OOB (PR-A REVIEW FINDING) — the third preserved field, and the one that
+    // tells the sync's own BMC address apart from the user's once adoption
+    // restores it, i.e. whether any later sync may follow a re-addressed BMC.
+    const withOob = server({ formerlySynced: { ...MARKER, syncedIpmiHost: "10.9.9.9" } });
+    expect(serverConfigsEqual(withOob, server({ formerlySynced: { ...MARKER, syncedIpmiHost: "10.9.9.50" } }))).toBe(false);
+    expect(serverConfigsEqual(withOob, server({ formerlySynced: { ...MARKER } }))).toBe(false);
   });
 
   it("identical markers (distinct objects) still compare equal, and so do two records with no marker at all (kills a comparator that compares by reference, which would report every unchanged kept server as changed)", () => {
@@ -104,7 +110,7 @@ describe("serverConfigsEqual — formerlySynced (ADOPT 1)", () => {
     expect(serverConfigsEqual(server(), server())).toBe(true);
     // Including the optional members, so the clause added for them cannot be a
     // permanent "not equal".
-    const full = { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p1" };
+    const full = { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p1", syncedIpmiHost: "10.9.9.9" };
     expect(serverConfigsEqual(server({ formerlySynced: full }), server({ formerlySynced: { ...full } }))).toBe(true);
   });
 });

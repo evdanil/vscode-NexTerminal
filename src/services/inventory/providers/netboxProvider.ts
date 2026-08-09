@@ -510,8 +510,16 @@ function mapEntry(raw: unknown, endpointPath: string, index: number, template: s
   if (kind === "device") {
     const oobIp = obj.oob_ip as { address?: unknown } | null | undefined;
     const oobAddress = oobIp && typeof oobIp === "object" ? oobIp.address : undefined;
-    if (typeof oobAddress === "string" && oobAddress.length > 0) {
-      endpoints.push({ kind: "redfish", host: stripCidr(oobAddress) });
+    if (typeof oobAddress === "string") {
+      // Emptiness is checked AFTER `stripCidr`, not before: a degenerate address
+      // that is nothing BUT a prefix ("/24") is non-empty going in and empty
+      // coming out, and would otherwise put `{ kind: "redfish", host: "" }` onto
+      // the tree. The SSH path's `usable` gate has always tested the value it
+      // actually emits; this is the same gate on the value this one emits.
+      const host = stripCidr(oobAddress);
+      if (host) {
+        endpoints.push({ kind: "redfish", host });
+      }
     }
   }
   return {

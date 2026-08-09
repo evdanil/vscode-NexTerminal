@@ -138,6 +138,15 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
  * mirrors is checked by `isValidServerOrigin`: an `AuthProfile.id` is never
  * empty, and this value is restored into a real origin at adoption, where AUTH 2b
  * and retro-apply's opt-out both compare it against a live profile id.
+ *
+ * OOB (PR-A REVIEW FINDING) — `syncedIpmiHost` is the third optional member, on
+ * the same terms as `syncedAuthProfileId`: the detach copies it from the origin
+ * and a source that had written no out-of-band address leaves nothing to copy,
+ * so absent is the ordinary case. PRESENT it must be a non-empty string, exactly
+ * as `isValidServerOrigin` checks the origin stamp it mirrors — the sync writes
+ * that stamp only in the same breath as a non-empty address, and this value is
+ * restored into a real origin at adoption, where the write rule compares it
+ * against the record's own field.
  */
 export function isValidDetachedServerOrigin(value: unknown): value is DetachedServerOrigin {
   if (typeof value !== "object" || value === null) {
@@ -148,6 +157,9 @@ export function isValidDetachedServerOrigin(value: unknown): value is DetachedSe
     return false;
   }
   if (obj.syncedAuthProfileId !== undefined && !isNonEmptyString(obj.syncedAuthProfileId)) {
+    return false;
+  }
+  if (obj.syncedIpmiHost !== undefined && !isNonEmptyString(obj.syncedIpmiHost)) {
     return false;
   }
   return (

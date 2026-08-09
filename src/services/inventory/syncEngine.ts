@@ -275,18 +275,54 @@ function isValidPort(port: number): boolean {
  *     accepted asymmetry against `syncedUsername`, which falls back to the
  *     source's `defaultUsername` — there is no `defaultIpmiHost` to fall back
  *     to, so absent simply means hands-off.)
+ *  5a. cur === oob (whatever the stamp)      → the value is ALREADY the device's
+ *     address, so there is nothing to write — but the sync RECORDS THE STAMP, a
+ *     stamp-only change with no visible field change. This is a REFINEMENT of
+ *     rows 4 and 5, not a violation of them: neither row's value is touched, and
+ *     "leave the value alone" is exactly what happens. What changes is that
+ *     ownership is recorded, so the address follows the BMC the next time NetBox
+ *     re-addresses it (row 3) instead of going silently stale forever.
+ *
+ *     WHY THIS ROW EXISTS. Without it, the likeliest Phase-1 hand entry of all —
+ *     the user copied the address out of NetBox and typed it into the server
+ *     form — is the one case that can never be repaired: it can never gain a
+ *     stamp (rows 4/5 refuse), so when the BMC is later re-addressed the record
+ *     keeps the dead address and nothing in the product ever says so. It is also
+ *     what makes the `changed` clause's stamps-equal term reachable at all (AUTH
+ *     3a's shape: an `after` whose ONLY difference from `before` is a freshly
+ *     computed stamp).
+ *
+ *     THE STAMP IS STILL THE DEVICE'S VALUE, NEVER THE RECORD'S. The trigger is
+ *     equality WITH THE DEVICE — `mgmtHost` is what gets stamped, and it is only
+ *     stamped because the record already agrees with it. The models/config.ts
+ *     rule ("never inferred from the record's current value") therefore holds:
+ *     a hand edit to some THIRD value still stamps nothing (row 4).
+ *
+ *     RESIDUAL, ACCEPTED AND DOCUMENTED (m7 class, the same trade
+ *     `syncedUsername`/AUTH 3a makes): a hand-typed value that happens to equal
+ *     the device's current `oob_ip` is adopted into sync ownership without the
+ *     user asking. The cost is bounded — from then on that field tracks NetBox,
+ *     and the user's own value was NetBox's value at the moment they typed it —
+ *     and the opt-out is unchanged and one edit away: clear the field, and row 2
+ *     keeps it cleared forever.
+ *
+ *     ROW 2 IS UNREACHABLE FROM HERE BY CONSTRUCTION, which is what keeps the
+ *     opt-out intact: this row needs `cur === oob`, and `oob` is a non-empty
+ *     string by selection (`selectManagementEndpoint` skips empty hosts), so a
+ *     cleared `cur` can never equal it.
  *  6. anything,   anything,     oob ABSENT   → NEVER touch `ipmiHost`; carry the
  *     stamp forward (the caller's guard). Mirrors the provider's own never-drop
  *     stance: losing an address at the source is routine maintenance, not a
  *     deletion. Accepted staleness — a genuinely decommissioned BMC keeps its
  *     last-known address until the user clears it, which is row 2's opt-out.
  *
- * Rows 1 and 3 are the two the sync may write, and both reduce to one question:
- * is the record still carrying exactly what the sync last put there? Rows 2, 4
- * and 5 are the three ways the answer is no.
+ * Rows 1, 3 and 5a are the three this answers yes for, and they reduce to one
+ * question asked two ways: is the record still carrying exactly what the sync
+ * last put there, or exactly what the device says today? Rows 2, 4 and 5 are the
+ * ways the answer is no.
  */
-function syncOwnsIpmiHost(current: string | undefined, stamp: string | undefined): boolean {
-  return current === stamp;
+function syncOwnsIpmiHost(current: string | undefined, stamp: string | undefined, oob: string): boolean {
+  return current === stamp || current === oob;
 }
 
 /**
@@ -893,7 +929,8 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // branches is silently discarded when either fires. Every stamp the
       // update path writes therefore belongs in the one literal; see
       // `syncOwnsIpmiHost` for the write rule and the whole matrix.
-      const takesIpmiHost = mgmtHost !== undefined && syncOwnsIpmiHost(ownedServer.ipmiHost, ownedServer.origin?.syncedIpmiHost);
+      const takesIpmiHost =
+        mgmtHost !== undefined && syncOwnsIpmiHost(ownedServer.ipmiHost, ownedServer.origin?.syncedIpmiHost, mgmtHost);
       const afterOrigin: ServerOrigin = {
         sourceId: source.id,
         externalId: device.externalId,
@@ -1215,15 +1252,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // would report every owned server as an update on every single sync.
       //
       // OOB — `ipmiHost` joins for the same reason `authProfileId` did, and its
-      // stamp rides in on the `serverOriginStampsEqual` line, which is what
-      // catches AUTH 3a's shape here: an `after` whose only difference is a
-      // freshly computed `syncedIpmiHost` must not be discarded as "unchanged",
-      // or the server never gains a stamp and every later sync reads it as a
-      // hand entry. (Under the matrix the two clauses currently agree on every
-      // reachable input — the sync only rewrites a value it still owns, so a
-      // changed value implies a changed stamp — and the value clause is kept
-      // regardless: it states the plainly-visible half of the change and does
-      // not depend on that argument staying true.)
+      // stamp rides in on the `serverOriginStampsEqual` line. The two clauses do
+      // NOT agree on every input, and the disagreement is the whole point of the
+      // stamp half: matrix row 5a (`syncOwnsIpmiHost`) is a STAMP-ONLY change —
+      // a record whose `ipmiHost` already equals the device's out-of-band
+      // address gains a `syncedIpmiHost` while every user-visible field, that
+      // one included, stays byte-identical. That is AUTH 3a's shape exactly, and
+      // dropping such an `after` as "unchanged" would throw the computed stamp
+      // away, leaving the server unable to EVER gain one — the field then goes
+      // stale the first time NetBox re-addresses the BMC and nothing repairs it.
+      // The value clause is kept beside it because it states the plainly-visible
+      // half of the change (rows 1 and 3) and does not depend on the stamp
+      // comparator's membership list staying correct.
       const changed =
         ownedServer.name !== after.name ||
         ownedServer.host !== after.host ||
@@ -1519,16 +1559,29 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // Overwritten below if — and only if — retro-apply fires in this same
           // plan, i.e. where this sync actually writes the link itself; the value
           // it writes then is the one that is true of the record afterwards.
-          syncedAuthProfileId: adoptee.formerlySynced?.syncedAuthProfileId
-          // OOB — deliberately NO `syncedIpmiHost`, and the omission is the
-          // conservative answer in both directions. An adoptee is a record the
-          // USER kept, and its `ipmiHost` (if any) is a value this source has
-          // never written; claiming ownership of it here would be the one field
-          // adoption takes over that it has no receipt for — the marker carries
-          // no OOB stamp to restore, unlike `syncedAuthProfileId` above. So the
-          // record enters the ordinary update path stampless, where an unset
-          // `ipmiHost` is filled and stamped on the next sync (matrix row 1)
-          // and a value the adoptee brought with it is left alone (row 5).
+          syncedAuthProfileId: adoptee.formerlySynced?.syncedAuthProfileId,
+          // OOB (PR-A REVIEW FINDING) — RESTORED from the marker, exactly as the
+          // auth provenance one line up is, and for the same reason. An earlier
+          // revision stamped nothing here and framed that as inherent ("the
+          // marker carries no OOB stamp to restore"); it was a DECISION, and it
+          // is reversed — `DetachedServerOrigin.syncedIpmiHost` now preserves the
+          // removed source's own stamp across the detach, so there is a receipt
+          // to restore.
+          //
+          // Still never `adoptee.ipmiHost`, for the reason that was always
+          // given: a hand-typed address is history's doing and recording it
+          // would claim an ownership no sync ever had. The marker is a different
+          // thing — it is a SYNC's record of what a SYNC wrote — and losing it
+          // at the detach is what made an adopted server's BMC address
+          // unmaintainable: it arrived looking hand-typed (matrix row 5), so no
+          // later sync could follow the BMC when NetBox re-addressed it.
+          //
+          // A marker carrying none restores none, which is bit-identical to a
+          // server the sync never wrote an address on — an unset `ipmiHost` is
+          // then filled and stamped on the next sync (row 1) and a value the
+          // adoptee brought with it is left alone (row 5), which is the whole of
+          // the previous behavior, kept for exactly the records it was right for.
+          syncedIpmiHost: adoptee.formerlySynced?.syncedIpmiHost
         };
         const after: ServerConfig = {
           ...adoptee,
