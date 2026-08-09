@@ -13,6 +13,7 @@ import { ProxiedSshConnection, jumpHostCleanup, socketCleanup, socketCloseRelay 
 import type { SilentAuthSshFactory } from "./silentAuth";
 import { proxyPasswordSecretKey } from "./silentAuth";
 import { isSameAuthenticatedEndpoint } from "../inventory/proxySecretHygiene";
+import { configMutationLock } from "../configMutationLock";
 
 const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT headers
 
@@ -279,6 +280,34 @@ export class ProxySshFactory implements ContextAwareSshFactory {
    * must never abort an already-established connection. `connectionProxy` is
    * password-bearing socks5/http (we only reach the prompt/store path for a
    * username-bearing proxy), so `isSameAuthenticatedEndpoint` compares like-for-like.
+   *
+   * SECURITY (issue #48 PR-T1b / PR #62 Codex round 9) — the round-8 re-read closed
+   * the ordering hole but not the ATOMICITY hole: the sync `serverLookup` re-read +
+   * `isSameAuthenticatedEndpoint` check and the async `await this.vault.store(...)`
+   * were two separate steps, not one critical section. A template apply's
+   * clear-then-publish (`clearStaleProxyPasswordSecretsBeforeApply` → publish new
+   * endpoint) could land in the await window BETWEEN a passing check and the store
+   * completing: the check saw the still-old endpoint and passed, then the apply
+   * cleared `proxy-password-{id}` and published the NEW proxy, then the pending
+   * store wrote the OLD endpoint's credential back under the server-only key — sent
+   * to the new proxy = the same leak, again. Fix: run the re-read + check + store as
+   * a single critical section under `configMutationLock` — the SAME lock the template
+   * apply (manual and sync) holds across its clear+publish. With them mutually
+   * exclusive, both orderings are safe: (a) store-then-apply — the store writes while
+   * the endpoint is still old, then the apply's pre-publish clear deletes it before
+   * publishing the new proxy; (b) apply-then-store — the apply clears+publishes first,
+   * then the store re-reads the NEW endpoint, `isSameAuthenticatedEndpoint` is false,
+   * and it skips. No interleaving leaves a mismatched secret.
+   *
+   * NO REENTRANCY: `configMutationLock` is NOT re-entrant, but the proxy connect/store
+   * path is otherwise lock-free — it runs AFTER `authFactory.connect` resolved and
+   * never itself holds the lock (mirrors the command-layer discipline: the connect
+   * path is a lock-free consumer that briefly takes the lock only for this store), so
+   * acquiring it here cannot deadlock. Accepted cost: a first-time proxy-authenticated
+   * connection's password store briefly waits for any in-flight config mutation
+   * (sync/apply) to release the lock before the connection object is returned — rare
+   * (only the first prompt for a server's proxy), short, and the correctness win is
+   * the point. The whole thing stays best-effort inside the try/catch.
    */
   private async persistProxyPasswordIfEndpointUnchanged(
     target: ServerConfig,
@@ -286,10 +315,15 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     storeOnSuccess: { key: string; value: string }
   ): Promise<void> {
     try {
-      const live = this.serverLookup(target.id);
-      if (live && isSameAuthenticatedEndpoint(live.proxy, connectionProxy)) {
-        await this.vault.store(storeOnSuccess.key, storeOnSuccess.value);
-      }
+      // Atomic w.r.t. the template apply's clear+publish (which holds the same lock):
+      // re-read + endpoint check + store are one critical section, so no apply can
+      // interleave between the check passing and the store completing.
+      await configMutationLock.runExclusive(async () => {
+        const live = this.serverLookup(target.id);
+        if (live && isSameAuthenticatedEndpoint(live.proxy, connectionProxy)) {
+          await this.vault.store(storeOnSuccess.key, storeOnSuccess.value);
+        }
+      });
     } catch {
       /* best-effort — a keychain-store failure must not abort an established connection */
     }

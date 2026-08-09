@@ -1164,6 +1164,53 @@ describe("ProxySshFactory", () => {
     expect(vault.store).not.toHaveBeenCalled();
   });
 
+  // Fix D (issue #48 PR-T1b / PR #62 Codex round 9, SECURITY) — round 8's re-read
+  // closed the ordering hole but not the ATOMICITY hole: the sync serverLookup
+  // check and the async vault.store were two steps, not one critical section, so a
+  // template apply's clear+publish could land in the await window between them and
+  // the pending store would write the OLD credential back. The check+store now run
+  // inside configMutationLock.runExclusive — the SAME lock the template apply holds.
+  // This test holds that real singleton lock and asserts the store cannot run while
+  // it is held (falsifies 5273fbc, where the store took no lock → fired immediately).
+  it("Fix D — the endpoint re-check + store is serialized under configMutationLock (does not store while the lock is held; stores after release)", async () => {
+    const { configMutationLock } = await import("../../src/services/configMutationLock");
+
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    servers.set(server.id, server); // endpoint unchanged → the store WOULD fire once the lock is free
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+
+    // Hold the real singleton lock via a deferred runExclusive body, mimicking an
+    // in-flight template apply's clear+publish critical section.
+    let releaseLock!: () => void;
+    const lockHeld = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const lockDone = configMutationLock.runExclusive(() => lockHeld);
+
+    // Drive the connect. authFactory.connect resolves, the deferred store is reached,
+    // and it must queue behind the held lock rather than firing.
+    const connectPromise = factory.connect(server);
+
+    // Drain macrotasks (the sockFactory's setImmediate/resume gap) so the connect
+    // fully reaches the post-connect store. On 5273fbc the store runs here without
+    // taking any lock; with the fix it queues behind the held configMutationLock.
+    for (let i = 0; i < 10; i++) {
+      await new Promise<void>((r) => setImmediate(r));
+    }
+    expect(vault.store).not.toHaveBeenCalled(); // FAILS on 5273fbc: store ran without the lock
+
+    // Release the apply's critical section; the store's runExclusive body now runs.
+    releaseLock();
+    await lockDone;
+    await connectPromise;
+
+    expect(vault.store).toHaveBeenCalledTimes(1);
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
   it("emits onClose when a SOCKS5 proxy socket closes after connection", async () => {
     const server = makeServer({
       proxy: { type: "socks5", host: "proxy.local", port: 1080 }
