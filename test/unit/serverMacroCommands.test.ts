@@ -262,6 +262,26 @@ describe("nexus.server.runMacro — dispatch", () => {
     expect(executeCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
   });
 
+  it("unescapes $${profile.host} EXACTLY ONCE on the server path — never twice", async () => {
+    // The other side of the P2 fix. `unescapeProfileTokens()` was added to every
+    // send path that does NOT go through `resolveProfileTokens()`; this path
+    // does, so applying it again (e.g. by moving the unescape into the shared
+    // `resolveMacroText`) would turn `$$${profile.host}` into a resolved VALUE
+    // instead of the literal token the escape promises.
+    await setMacros([
+      { id: "a", name: "Docs", text: "echo $${profile.host} / $$${profile.host}\n", runIn: "localTerminal" }
+    ]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(context(), { server: server({ host: "10.1.2.3" }) });
+
+    expect(createdTerminals).toHaveLength(1);
+    // One `$` dropped per token, once. A second pass would yield
+    // `echo 10.1.2.3 / ${profile.host}`.
+    expect(createdTerminals[0].sent).toEqual(["echo ${profile.host} / $${profile.host}\n"]);
+    expect(createdTerminals[0].sent[0]).not.toContain("10.1.2.3");
+  });
+
   it("refuses a macro whose ipmiHost the server lacks, and offers Edit Server", async () => {
     await setMacros([{ id: "a", name: "SOL", text: "ipmitool -H ${profile.ipmiHost}\n", runIn: "localTerminal" }]);
     showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);

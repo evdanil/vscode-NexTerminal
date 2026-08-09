@@ -4,6 +4,7 @@ import {
   profileTokenLabel,
   profileTokensUsed,
   resolveProfileTokens,
+  unescapeProfileTokens,
   PROFILE_TOKEN_WHITELIST
 } from "../../src/services/profileTokens";
 import { scanPlaceholders, substituteMacroVariables } from "../../src/services/macroVariables";
@@ -490,6 +491,55 @@ describe("profile tokens vs. declared macro variables", () => {
 
   it("leaves the existing bare-name grammar alone — $profile.host is not a profile token", () => {
     expect(resolved("$profile.host", server())).toBe("$profile.host");
+  });
+});
+
+describe("unescapeProfileTokens — the server-independent half of the escape rule", () => {
+  it("rewrites $${profile.host} to the literal token", () => {
+    // REVIEW FINDING (P2) — the behavior `$${profile.…}` is documented to have,
+    // on every send path rather than only inside `resolveProfileTokens()`.
+    expect(unescapeProfileTokens("echo $${profile.host}")).toBe("echo ${profile.host}");
+  });
+
+  it("leaves an UNESCAPED token completely alone — it has no server to resolve against", () => {
+    // The property that makes this safe to run on paths that know no server:
+    // it never substitutes, so a real token still reaches
+    // `resolveProfileTokens()` (or is refused/redirected) unchanged.
+    expect(unescapeProfileTokens("ping ${profile.host}")).toBe("ping ${profile.host}");
+    expect(unescapeProfileTokens("$${profile.host} = ${profile.host}")).toBe("${profile.host} = ${profile.host}");
+  });
+
+  it("leaves an escaped UNKNOWN token verbatim, exactly as resolveProfileTokens does", () => {
+    // Shared walker, shared rule: an unknown token is verbatim escaped or not,
+    // so the two functions cannot disagree about `$${profile.keyPath}`.
+    expect(unescapeProfileTokens("echo $${profile.keyPath}")).toBe("echo $${profile.keyPath}");
+    expect(resolved("echo $${profile.keyPath}", server())).toBe("echo $${profile.keyPath}");
+  });
+
+  it("agrees with resolveProfileTokens on every escaped form, character for character", () => {
+    // The single-source-of-truth claim, asserted rather than asserted-in-a-comment:
+    // for text whose ONLY tokens are escaped, the server path and the
+    // server-independent path must produce the identical string. `$$$` included —
+    // an odd run of dollars leaves one behind, and both must leave the same one.
+    for (const text of [
+      "echo $${profile.host}",
+      "echo $${profile.ipmiHost}\n",
+      "$${profile.name} $${profile.port} $${profile.username}",
+      "$$${profile.host}",
+      "echo $${profile.keyPath}",
+      "no tokens here\n"
+    ]) {
+      expect(unescapeProfileTokens(text), text).toBe(resolved(text, server()));
+    }
+  });
+
+  it("leaves text with no profile tokens byte-identical, macro variables included", () => {
+    // The variable grammar has no dots, so nothing here can be mistaken for a
+    // profile token — `$host` / `${host}` / `$$host` must survive untouched for
+    // the variable engine that runs after this pass.
+    for (const text of ["show version\n", "$host ${host} $$host", "$profile.host", "100% $ok"]) {
+      expect(unescapeProfileTokens(text), text).toBe(text);
+    }
   });
 });
 

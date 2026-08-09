@@ -4,7 +4,7 @@ import { MacroEditorPanel } from "../ui/macroEditorPanel";
 import type { MacroProfileOptionInput } from "../ui/macroProfileOptions";
 import type { TerminalMacro } from "../models/terminalMacro";
 import { macroRunTargetBadge, resolveMacroRunTarget } from "../models/terminalMacro";
-import { hasProfileTokens } from "../services/profileTokens";
+import { hasProfileTokens, unescapeProfileTokens } from "../services/profileTokens";
 import {
   bindingToContextKey,
   bindingToDisplayLabel,
@@ -194,10 +194,29 @@ async function runOrSendMacro(macro: TerminalMacro): Promise<void> {
     }
     return;
   }
+  // REVIEW FINDING (P2) — `$${profile.host}` is documented to send the literal
+  // `${profile.host}`, but that unescape lived only in `resolveProfileTokens()`,
+  // which only `nexus.server.runMacro` calls. The redirect above (correctly)
+  // ignores escaped tokens — an escaped token names no field, so it constrains
+  // nothing about which server the macro can run on — so a macro whose text
+  // contains ONLY escaped tokens lands here, and BOTH dollars used to go out.
+  //
+  // PROFILE-UNESCAPE FIRST, then the variable engine — the same order
+  // `runMacroOnServer` uses, and safe in both directions because the two
+  // grammars cannot overlap: a macro variable's name is
+  // `/^[A-Za-z_][A-Za-z0-9_]*$/` with NO DOTS, so the variable engine can never
+  // match `${profile.x}` (before or after this pass), and this pass only ever
+  // deletes one `$` from a `$${profile.…}` run, which cannot manufacture a
+  // dotless placeholder for the second pass to expand.
+  const text = unescapeProfileTokens(macro.text);
+  // Identity preserved when there was nothing to unescape (the overwhelmingly
+  // common case): `runMacro`'s re-entrancy guard keys id-less macros on
+  // name+text, and a needless copy is a needless difference.
+  const toRun = text === macro.text ? macro : { ...macro, text };
   if (hasMacroVariables(macro)) {
-    await runMacro(macro);
+    await runMacro(toRun);
   } else {
-    sendMacroText(macro.text);
+    sendMacroText(text);
   }
 }
 

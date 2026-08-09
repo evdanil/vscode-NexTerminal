@@ -4,7 +4,7 @@ import { clamp } from "../utils/helpers";
 import { validateRegexSafety } from "../utils/regexSafety";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
 import { resolveMacroRunTarget } from "../models/terminalMacro";
-import { hasProfileTokens } from "./profileTokens";
+import { hasProfileTokens, unescapeProfileTokens } from "./profileTokens";
 import { hasMacroVariables } from "./macroVariables";
 import type { ScriptMacroFilter } from "./scripts/scriptMacroFilter";
 import { getMacros } from "../macroSettings";
@@ -302,7 +302,14 @@ export class MacroAutoTrigger implements vscode.Disposable {
         const intervalSeconds = compiledTriggerIntervalSeconds(macro.triggerInterval);
         const rule: CompiledTriggerRule = {
           regex,
-          macroText: macro.text,
+          // REVIEW FINDING (P2) — unescaped HERE, at compile, because a fired
+          // rule writes `macroText` straight to the pty with nothing in between.
+          // `triggerCompileBlocker()` above already refused every macro naming
+          // an UNESCAPED `${profile.…}` (a rule fires from terminal output,
+          // which names no server), so what survives to this line can only carry
+          // the `$${profile.…}` escape — which is documented to send the literal
+          // token and, without this, sent both dollars.
+          macroText: unescapeProfileTokens(macro.text),
           cooldownMs: cooldownSeconds !== undefined ? cooldownSeconds * 1000 : this.defaultCooldownMs,
           intervalMs: intervalSeconds !== undefined ? intervalSeconds * 1000 : undefined,
           stateKey,

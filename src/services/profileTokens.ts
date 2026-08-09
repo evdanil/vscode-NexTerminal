@@ -439,12 +439,124 @@ function invalidError(token: ProfileTokenName, serverName: string, value: string
 }
 
 /**
+ * One matched `${profile.…}` / `$${profile.…}` occurrence, as the shared walker
+ * below hands it to a rewriter.
+ */
+interface ProfileTokenMatch {
+  /** The whole matched token, the escape `$` included. */
+  full: string;
+  /** True for the `$${profile.x}` form — the documented "send the literal token" escape. */
+  escaped: boolean;
+  /** The dotted name as written, whitelisted or not. */
+  name: string;
+  /** The whitelisted token this names, or `undefined` when it names none. */
+  token?: ProfileTokenName;
+  /**
+   * THE SINGLE DEFINITION OF WHAT UNESCAPING MEANS — `full` with one leading `$`
+   * removed. Both rewriters below take it from here rather than each computing
+   * their own `slice(1)`, so "what an escape turns into" cannot drift between
+   * the server path (`resolveProfileTokens`) and every other send path
+   * (`unescapeProfileTokens`).
+   */
+  unescaped: string;
+}
+
+/** A rewriter's refusal, carrying whatever the caller wants to report. */
+interface ProfileTokenRefusal<E> {
+  refuse: E;
+}
+
+type ProfileTokenRewrite<E> = { ok: true; text: string } | { ok: false; error: E };
+
+/**
+ * Walks every `${profile.…}` occurrence in `text` and rebuilds the string from
+ * what `rewrite` returns for each one. The ONE place the scan lives, so every
+ * caller inherits the same discipline:
+ *
+ *   - a FRESH regex per call — a shared `lastIndex` across calls is a bug
+ *     factory;
+ *   - output built by APPENDING TO AN ARRAY and joining, never
+ *     `text.replace(re, value)` (JavaScript expands `$&`, `` $` ``, `$'`, `$1`
+ *     and `$$` inside a string replacement, so a stored value could splice
+ *     surrounding text into the result);
+ *   - whatever a rewriter pushes is never rescanned.
+ *
+ * A rewriter returning `{ refuse }` ABORTS the walk — nothing after the
+ * offending token is examined, which is what makes "refuse the whole run" a
+ * single early return rather than a post-hoc check.
+ */
+function rewriteProfileTokens<E>(
+  text: string,
+  rewrite: (match: ProfileTokenMatch) => string | ProfileTokenRefusal<E>
+): ProfileTokenRewrite<E> {
+  const out: string[] = [];
+  let lastIndex = 0;
+
+  const re = profileTokenRegex();
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const full = match[0];
+    const name = match[2];
+    const replacement = rewrite({
+      full,
+      escaped: match[1] === "$",
+      name,
+      token: isProfileTokenName(name) ? name : undefined,
+      unescaped: full.slice(1)
+    });
+
+    out.push(text.slice(lastIndex, match.index));
+    lastIndex = match.index + full.length;
+
+    if (typeof replacement !== "string") {
+      return { ok: false, error: replacement.refuse };
+    }
+    out.push(replacement);
+  }
+  out.push(text.slice(lastIndex));
+
+  return { ok: true, text: out.join("") };
+}
+
+/**
+ * Rewrites `$${profile.x}` → `${profile.x}` and touches nothing else — the
+ * server-INDEPENDENT half of `resolveProfileTokens`, for every send path that
+ * has no server to resolve against.
+ *
+ * WHY THIS EXISTS. `$${profile.host}` is documented to send the literal
+ * `${profile.host}`, but that unescape used to live only inside
+ * `resolveProfileTokens`, which only `runMacroOnServer` calls. A macro whose
+ * text contains ONLY escaped tokens is (correctly) not redirected to that
+ * command — `hasProfileTokens()` ignores escapes, because an escaped token
+ * constrains nothing about which server the macro can run on — so it went out
+ * through the ordinary session path with BOTH dollars intact. The macro variable
+ * engine cannot fix that either: its placeholder grammar has no dots, so
+ * `$${profile.host}` matches nothing there.
+ *
+ * AN UNESCAPED `${profile.x}` IS LEFT ALONE, and so is an escaped token that
+ * names nothing whitelisted (`$${profile.keyPath}` stays as written). Both
+ * rules are `resolveProfileTokens`'s, reached through the same walker: an
+ * unknown token is verbatim whether escaped or not, so a name outside the
+ * whitelist reads identically on every path.
+ */
+export function unescapeProfileTokens(text: string): string {
+  const rewritten = rewriteProfileTokens<never>(text, (match) =>
+    match.escaped && match.token !== undefined ? match.unescaped : match.full
+  );
+  // The rewriter above never refuses; the branch exists only to satisfy the
+  // shared return type.
+  return rewritten.ok ? rewritten.text : text;
+}
+
+/**
  * Substitutes `${profile.*}` tokens in `text` against `server`.
  *
- * The algorithm mirrors `substituteMacroVariables()` line for line, and for the
- * same security reason: the output is built by APPENDING TO AN ARRAY and
- * joining, never `text.replace(re, value)`. In string-replacement mode
- * JavaScript interprets `$&`, `` $` ``, `$'`, `$1` and `$$` inside the
+ * The scan itself is `rewriteProfileTokens()` — shared with
+ * `unescapeProfileTokens()` so the two cannot disagree about what an escape (or
+ * an unknown token) means. It mirrors `substituteMacroVariables()` line for
+ * line, and for the same security reason: the output is built by APPENDING TO
+ * AN ARRAY and joining, never `text.replace(re, value)`. In string-replacement
+ * mode JavaScript interprets `$&`, `` $` ``, `$'`, `$1` and `$$` inside the
  * REPLACEMENT — a stored value containing those would splice surrounding text
  * into the result. Array-append treats every profile value as opaque and never
  * rescans it.
@@ -472,50 +584,38 @@ export function resolveProfileTokens(
   server: Pick<ServerConfig, ProfileTokenName>
 ): ProfileTokenOutcome {
   const serverName = typeof server.name === "string" && server.name.trim() !== "" ? server.name : "this server";
-  const out: string[] = [];
   const unknownTokens: string[] = [];
   const seenUnknown = new Set<string>();
-  let lastIndex = 0;
 
-  const re = profileTokenRegex();
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const full = match[0];
-    const escaped = match[1] === "$";
-    const name = match[2];
-
-    out.push(text.slice(lastIndex, match.index));
-    lastIndex = match.index + full.length;
-
-    if (!isProfileTokenName(name)) {
+  const rewritten = rewriteProfileTokens<ProfileTokenError>(text, (match) => {
+    if (match.token === undefined) {
       // Verbatim whether escaped or not — the same rule the variable engine
       // applies to an undeclared name, so an unknown token reads identically in
-      // both passes.
-      out.push(full);
-      if (!seenUnknown.has(name)) {
-        seenUnknown.add(name);
-        unknownTokens.push(name);
+      // both passes (and in `unescapeProfileTokens`, which shares this walker).
+      if (!seenUnknown.has(match.name)) {
+        seenUnknown.add(match.name);
+        unknownTokens.push(match.name);
       }
-      continue;
+      return match.full;
     }
 
-    if (escaped) {
-      out.push(full.slice(1));
-      continue;
+    if (match.escaped) {
+      return match.unescaped;
     }
 
-    const value = rawTokenValue(name, server);
+    const value = rawTokenValue(match.token, server);
     if (value === "") {
-      return { ok: false, error: missingError(name, serverName) };
+      return { refuse: missingError(match.token, serverName) };
     }
-    if (!validateTokenValue(name, value)) {
-      return { ok: false, error: invalidError(name, serverName, value) };
+    if (!validateTokenValue(match.token, value)) {
+      return { refuse: invalidError(match.token, serverName, value) };
     }
-    out.push(value);
-  }
-  out.push(text.slice(lastIndex));
+    return value;
+  });
 
-  return { ok: true, text: out.join(""), unknownTokens };
+  return rewritten.ok
+    ? { ok: true, text: rewritten.text, unknownTokens }
+    : { ok: false, error: rewritten.error };
 }
 
 /**

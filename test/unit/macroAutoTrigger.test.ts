@@ -1162,9 +1162,15 @@ describe("MacroAutoTrigger", () => {
       obs.dispose();
     });
 
-    it("an ESCAPED profile token is just text, so that macro still auto-fires", () => {
-      // `$${profile.host}` resolves to the literal string in every path, so it
-      // constrains nothing — suppressing it would kill a working trigger.
+    it("an ESCAPED profile token is just text, so that macro still auto-fires — UNESCAPED", () => {
+      // `$${profile.host}` resolves to the literal `${profile.host}` in every
+      // path, so it constrains nothing — suppressing it would kill a working
+      // trigger.
+      //
+      // REVIEW FINDING (P2) — and what fires must be the UNESCAPED text. The
+      // unescape used to live only in `resolveProfileTokens()` (the Run Macro on
+      // Server path), so this rule compiled `macro.text` verbatim and the device
+      // received both dollars.
       setConfig([
         { name: "literal", text: "echo $${profile.host}\n", triggerPattern: "router#" }
       ]);
@@ -1175,7 +1181,25 @@ describe("MacroAutoTrigger", () => {
       obs.onOutput("router#");
       flush();
 
-      expect(sent).toEqual(["echo $${profile.host}\n"]);
+      expect(sent).toEqual(["echo ${profile.host}\n"]);
+      obs.dispose();
+    });
+
+    it("an escaped token naming NO whitelisted field is left exactly as written", () => {
+      // `unescapeProfileTokens()` shares `resolveProfileTokens()`'s rule that an
+      // unknown token is verbatim escaped or not, so the trigger path and the
+      // server path cannot disagree about `$${profile.keyPath}`.
+      setConfig([
+        { name: "typo", text: "echo $${profile.keyPath}\n", triggerPattern: "router#" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual(["echo $${profile.keyPath}\n"]);
       obs.dispose();
     });
 
@@ -2031,7 +2055,15 @@ describe("MacroAutoTrigger", () => {
       }
       obs.dispose();
 
-      const compiledNames = macros.filter((m) => sent.includes(m.text)).map((m) => m.name);
+      // A compiled rule carries the macro's text with `$${profile.…}` UNESCAPED
+      // (PR #55 review, P2), so the `escaped` macro is recognised by the text the
+      // rule actually sends rather than by its stored source. Spelled out rather
+      // than run through `unescapeProfileTokens()`: this test is about the two
+      // compile predicates agreeing, and must not inherit the unescape helper's
+      // own behaviour as its definition of "compiled".
+      const firedText = (m: { name: string; text: string }): string =>
+        m.name === "escaped" ? "echo ${profile.host}\n" : m.text;
+      const compiledNames = macros.filter((m) => sent.includes(firedText(m))).map((m) => m.name);
       const predictedNames = macros
         .filter((m) => isCompilableTriggerMacro(m as TerminalMacro))
         .map((m) => m.name);
