@@ -256,9 +256,17 @@ function isValidPort(port: number): boolean {
  * origin.syncedIpmiHost, `oob` = this fetch's management host), and what each
  * row is defending against:
  *
- *  1. cur unset,  stamp unset,  oob present  → WRITE + stamp. Never configured:
+ *  1. cur ABSENT, stamp unset,  oob present  → WRITE + stamp. Never configured:
  *     the fill-it-in state, exactly as `syncedAuthProfileId === undefined &&
- *     authProfileId === undefined` is for retro-apply.
+ *     authProfileId === undefined` is for retro-apply. "ABSENT" here means
+ *     `undefined` OR blank/whitespace-only (REVIEW FINDING, P2): validation
+ *     deliberately tolerates that shape (`validateServerConfig`,
+ *     utils/validation.ts) and every use site reads a blank as absent
+ *     (`resolveProfileTokens` refuses `""` and `undefined` with the same "not
+ *     set" error), so this predicate must too — otherwise the one field state
+ *     that LOOKS unset everywhere else is the one state the sync can never
+ *     repair, misfiling a functionally-unset field as a hand edit (row 4) and
+ *     leaving it blank and stampless forever.
  *  2. cur unset,  stamp set,    oob present  → LEAVE ALONE. The user CLEARED a
  *     value the sync wrote — the per-server opt-out, verbatim from retro-apply's
  *     opt-out clause. Without it, clearing the field is impossible: the next
@@ -322,7 +330,16 @@ function isValidPort(port: number): boolean {
  * ways the answer is no.
  */
 function syncOwnsIpmiHost(current: string | undefined, stamp: string | undefined, oob: string): boolean {
-  return current === stamp || current === oob;
+  // Blank/whitespace-only reads as absent (row 1's note above). Normalized on
+  // ONE side only, and only for blankness: a non-blank value is compared
+  // VERBATIM, so a hand edit that merely differs from the stamp by stray
+  // whitespace stays a hand edit (row 4) rather than being trimmed into a
+  // match. The stamp needs no normalization — it is only ever written from a
+  // `selectManagementEndpoint` host, which is non-empty by selection — so a
+  // blank `cur` WITH a stamp still equals neither the stamp nor `oob` and row
+  // 2's cleared-forever opt-out survives a user who empties the field to `""`.
+  const cur = current !== undefined && current.trim() === "" ? undefined : current;
+  return cur === stamp || cur === oob;
 }
 
 /**

@@ -3594,6 +3594,60 @@ describe("computeSyncPlan — oob_ip -> ipmiHost (OOB)", () => {
     expect(plan.unchangedCount).toBe(1);
   });
 
+  it("MATRIX ROW 1, BLANK VALUE (REVIEW FINDING) — an empty-string ipmiHost with no stamp is ABSENT, not hand-configured: it is filled and stamped (kills the strict `cur === stamp` comparison, under which `\"\"` matches neither the absent stamp nor the non-empty device address and the field is misfiled as a hand edit forever)", () => {
+    const owned = makeOwnedServer({
+      // The shape `validateServerConfig` deliberately accepts and every use site
+      // reads as "not set" — a persisted or imported record whose ipmiHost was
+      // emptied to `""` rather than removed. No stamp, so nothing was ever
+      // synced here: row 1's state wearing a different spelling.
+      ipmiHost: ""
+    });
+
+    const after = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithOob()]), currentServers: [owned], now: 2000 })
+    );
+
+    expect(after.ipmiHost).toBe("10.9.9.9");
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
+  });
+
+  it("MATRIX ROW 1, WHITESPACE-ONLY VALUE (REVIEW FINDING) — same as the blank one: filled and stamped (kills a fix that only special-cases the exact empty string, leaving a field the user cleared to a stray space unrepairable)", () => {
+    const owned = makeOwnedServer({ ipmiHost: "   " });
+
+    const after = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithOob()]), currentServers: [owned], now: 2000 })
+    );
+
+    expect(after.ipmiHost).toBe("10.9.9.9");
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
+  });
+
+  it("MATRIX ROW 2, BLANK VALUE (REVIEW FINDING) — a blank value WITH a stamp is still the opt-out: left blank, stamp carried forward (kills the over-fix `blank cur → the sync owns it`, which would refill the field of a user who emptied it to `\"\"` instead of removing it)", () => {
+    const owned = makeOwnedServer({
+      // The one difference from the row-1 blank fixture above: a stamp, which is
+      // what makes this "the user emptied a value the sync wrote".
+      ipmiHost: "",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.1.1.1" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      // Renamed, so the plan carries an update whatever the rule does and the
+      // assertions below observe the FIELD rather than the mere presence of a
+      // plan entry — the vacuous version of this fixture.
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed", endpoints: [SSH, OOB] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = onlyUpdate(plan);
+    expect(after.name).toBe("core-sw-1-renamed");
+    expect(after.ipmiHost).toBe("");
+    expect(after.ipmiHost).not.toBe("10.9.9.9");
+    // Carried forward verbatim: the stamp is never refreshed where nothing was written.
+    expect(after.origin?.syncedIpmiHost).toBe("10.1.1.1");
+  });
+
   it("MATRIX ROW 3 — value still equals the stamp, endpoint moved: overwrites and re-stamps (kills 'never overwrite', which strands a re-addressed BMC on its old address)", () => {
     const owned = makeOwnedServer({
       ipmiHost: "10.9.9.9",
