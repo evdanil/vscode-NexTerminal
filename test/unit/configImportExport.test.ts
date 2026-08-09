@@ -6236,7 +6236,14 @@ describe("backup export round-trip", () => {
       exportType: "backup",
       exportedAt: new Date().toISOString(),
       servers: [
-        makeServer({ id: "srv-owned", name: "Owned", origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1 } }),
+        makeServer({
+          id: "srv-owned",
+          name: "Owned",
+          // OOB (PR-A REVIEW FINDING) — the sync's own record that IT wrote this
+          // server's BMC address, which this detach path has to preserve for the
+          // same reason it preserves the instance and the auth provenance.
+          origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1, syncedIpmiHost: "10.9.9.9" }
+        }),
         makeServer({ id: "srv-manual", name: "Manual" })
       ],
       tunnels: [],
@@ -6268,6 +6275,10 @@ describe("backup export round-trip", () => {
       sourceName: "Source One",
       providerId: "netbox",
       externalId: "dev-a",
+      // OOB (PR-A REVIEW FINDING) — copied off the stripped origin, so an
+      // adoption can tell this sync-written address apart from a hand-typed one
+      // and go on updating it.
+      syncedIpmiHost: "10.9.9.9",
       detachedAt: expect.any(Number)
     });
     // …and it is a marker the adoption rule can actually act on, not a partial one.
@@ -6383,6 +6394,11 @@ describe("backup export round-trip", () => {
     const withoutStamp = await rollbackMarkerWith(undefined);
     expect(withoutStamp?.externalId).toBe("dev-a");
     expect(withoutStamp).not.toHaveProperty("instanceKey");
+    // OOB (PR-A REVIEW FINDING) — same discipline for the out-of-band receipt:
+    // neither origin in this helper carries one, so neither marker may invent
+    // one (an invented stamp would hand the sync ownership of an address it
+    // never wrote).
+    expect(withoutStamp).not.toHaveProperty("syncedIpmiHost");
   });
 
   /**

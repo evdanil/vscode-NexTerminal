@@ -61,7 +61,8 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     return false;
   }
   const obj = value as Record<string, unknown>;
-  // `syncedInstanceKey`, `syncedUsername` and `syncedAuthProfileId` are optional
+  // `syncedInstanceKey`, `syncedUsername`, `syncedAuthProfileId` and
+  // `syncedIpmiHost` are optional
   // (absent on every server synced before each field existed) but shape-checked
   // like the rest:
   // this guard is the ONLY thing standing between a hand-edited backup /
@@ -83,7 +84,13 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     typeof obj.syncedAt === "number" &&
     isOptionalNonEmptyString(obj.syncedInstanceKey) &&
     isOptionalNonEmptyString(obj.syncedUsername) &&
-    isOptionalNonEmptyString(obj.syncedAuthProfileId)
+    isOptionalNonEmptyString(obj.syncedAuthProfileId) &&
+    // Empty is rejected here for the same reason it is above: the sync writes
+    // this stamp only in the same breath as a non-empty `ipmiHost` (an endpoint
+    // with an empty host is not selected at all), and the server form stores a
+    // cleared address as `undefined`, so an empty string could not have come
+    // from either — it can only be a hand-edited backup or a version-skewed row.
+    isOptionalNonEmptyString(obj.syncedIpmiHost)
   );
 }
 
@@ -131,6 +138,15 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
  * mirrors is checked by `isValidServerOrigin`: an `AuthProfile.id` is never
  * empty, and this value is restored into a real origin at adoption, where AUTH 2b
  * and retro-apply's opt-out both compare it against a live profile id.
+ *
+ * OOB (PR-A REVIEW FINDING) — `syncedIpmiHost` is the third optional member, on
+ * the same terms as `syncedAuthProfileId`: the detach copies it from the origin
+ * and a source that had written no out-of-band address leaves nothing to copy,
+ * so absent is the ordinary case. PRESENT it must be a non-empty string, exactly
+ * as `isValidServerOrigin` checks the origin stamp it mirrors — the sync writes
+ * that stamp only in the same breath as a non-empty address, and this value is
+ * restored into a real origin at adoption, where the write rule compares it
+ * against the record's own field.
  */
 export function isValidDetachedServerOrigin(value: unknown): value is DetachedServerOrigin {
   if (typeof value !== "object" || value === null) {
@@ -141,6 +157,9 @@ export function isValidDetachedServerOrigin(value: unknown): value is DetachedSe
     return false;
   }
   if (obj.syncedAuthProfileId !== undefined && !isNonEmptyString(obj.syncedAuthProfileId)) {
+    return false;
+  }
+  if (obj.syncedIpmiHost !== undefined && !isNonEmptyString(obj.syncedIpmiHost)) {
     return false;
   }
   return (

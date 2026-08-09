@@ -136,6 +136,52 @@ export interface ServerOrigin {
    * the USER moved.
    */
   syncedAuthProfileId?: string;
+  /**
+   * The out-of-band address the sync itself last WROTE into `ipmiHost` — the
+   * management endpoint the provider supplied as of that write (NetBox's
+   * `oob_ip`), and `undefined` when the sync wrote none.
+   *
+   * Follows the `syncedAuthProfileId` discipline, NOT the `host`/`port` "the
+   * device always wins" one, and that choice is the whole design: `ipmiHost`
+   * shipped as a HAND-EDITED field before any sync could write it, so "device
+   * always wins" would clobber every early adopter's manual entry on the first
+   * post-upgrade sync — and a device that has no OOB endpoint at all would read
+   * as "this field should be empty". The stamp records what the sync put there,
+   * so the sync only ever fills an untouched field or overwrites one still
+   * carrying exactly its own last value; a hand-typed value (no stamp, or a
+   * stamp the value no longer equals) is left alone, and so is a value whose
+   * device merely stopped reporting an address this fetch.
+   *
+   * Written ONLY where the sync writes `ipmiHost` — the add path always
+   * (`undefined` included, so a source whose devices gain an `oob_ip` later
+   * finds the stamps already there), the update path only when the write rule
+   * fires — plus ONE stamp-only case, and never inferred from the record's
+   * current value alone, which would launder a hand-edit into "as stamped" one
+   * sync later.
+   *
+   * THE STAMP-ONLY CASE (matrix row 5a, see `syncOwnsIpmiHost` in the sync
+   * engine): a record whose `ipmiHost` ALREADY EQUALS the device's out-of-band
+   * address this fetch gains the stamp even though the value does not move. The
+   * stamp is still the DEVICE's value, so the "never inferred from the record"
+   * rule stands — equality with the device is the trigger, and a hand edit to
+   * some third value stamps nothing. Its purpose is that the likeliest hand
+   * entry there is (the user copied the address out of NetBox) would otherwise
+   * be permanently unstampable and would go silently stale the first time the
+   * BMC is re-addressed. Accepted residual: such a value is adopted into sync
+   * ownership without the user asking — the same trade `syncedUsername` makes,
+   * and the opt-out is unchanged (clear the field; absent value + present stamp
+   * is hands-off forever).
+   *
+   * Optional for backward compat, exactly like the two stamps above: servers
+   * synced by a build before this field existed have none. Absent means
+   * HANDS-OFF rather than "eligible", which is the one asymmetry against
+   * `syncedUsername`: there is no source-level default IPMI host to fall back
+   * to, so a record carrying an `ipmiHost` with NO stamp is a hand entry and is
+   * never overwritten — unless that value is the device's own current address,
+   * per the stamp-only case above. (A record carrying neither is the
+   * never-configured state the sync is free to fill.)
+   */
+  syncedIpmiHost?: string;
 }
 
 /**
@@ -252,6 +298,39 @@ export interface DetachedServerOrigin {
    * nobody hand-configured out of retro-apply for good.
    */
   syncedAuthProfileId?: string;
+  /**
+   * OOB (PR-A REVIEW FINDING) — the out-of-band address the REMOVED SOURCE'S
+   * SYNC had last written into `ipmiHost` on this server, copied verbatim from
+   * the server's own `ServerOrigin.syncedIpmiHost` at detach time, and
+   * `undefined` when that sync had written none.
+   *
+   * NOT a matching input — like `syncedAuthProfileId` beside it, it decides
+   * nothing about adoption. It is preserved for exactly the same reason and
+   * against exactly the same failure: it is the only record of whether the
+   * `ipmiHost` the server still carries was the SYNC'S doing or the USER'S, and
+   * the write rule (`syncOwnsIpmiHost`) is decided on precisely that
+   * distinction.
+   *
+   * The failure it closes. Remove Source → Keep Servers → re-add the source →
+   * Adopt used to strip the origin and restore no OOB stamp, so an adopted
+   * server's sync-written address arrived looking hand-typed (matrix row 5) and
+   * the sync could never update it again — permanently, and silently, for a
+   * value the sync itself had put there. The earlier code framed that omission
+   * as inherent ("the marker carries no OOB stamp to restore"); it was a
+   * decision, and this field reverses it, on the same terms as the auth
+   * provenance marker that had already reversed the identical decision one field
+   * up. (The equal-value stamp-only rule, row 5a, softens the loss but does not
+   * close it: it only rescues records whose address STILL equals the device's
+   * current one, which is the opposite of the re-addressed BMC this receipt is
+   * for.)
+   *
+   * Optional and restored, never invented: adoption copies it back into the new
+   * `origin`, and a marker that carries none restores none — bit-identical to a
+   * server the sync never wrote an address on. Nothing clears it, unlike
+   * `syncedAuthProfileId`: an address names no other record, so it cannot dangle
+   * when something else is deleted.
+   */
+  syncedIpmiHost?: string;
   detachedAt: number;
 }
 
@@ -323,8 +402,8 @@ function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefine
 
 /**
  * Every member of ServerOrigin EXCEPT `syncedAt` — i.e. the ownership key plus
- * the two stamps the sync writes as decision INPUTS for its own next run
- * (`syncedUsername`, `syncedAuthProfileId`).
+ * the stamps the sync writes as decision INPUTS for its own next run
+ * (`syncedUsername`, `syncedAuthProfileId`, `syncedIpmiHost`).
  *
  * Exists for computeSyncPlan's `changed` check, which must be able to ask "did
  * this sync compute a stamp the record does not already carry?" without asking
@@ -352,7 +431,15 @@ export function serverOriginStampsEqual(a: ServerOrigin | undefined, b: ServerOr
     // stamps it owns on the very sync that first reads from the new one.
     a.syncedInstanceKey === b.syncedInstanceKey &&
     a.syncedUsername === b.syncedUsername &&
-    a.syncedAuthProfileId === b.syncedAuthProfileId
+    a.syncedAuthProfileId === b.syncedAuthProfileId &&
+    // The `ipmiHost` stamp joins for the same reason the two above it do, and
+    // AUTH 3a's shape reaches it too: a server whose device supplies an
+    // `oob_ip` EQUAL to the value the record already carries computes this
+    // stamp for the first time and changes nothing else, and an `after`
+    // discarded as "unchanged" there would throw the new stamp away — leaving
+    // that server permanently stampless, i.e. read as a hand entry by every
+    // later sync and never updated when the BMC is re-addressed.
+    a.syncedIpmiHost === b.syncedIpmiHost
   );
 }
 
@@ -360,12 +447,13 @@ function serverOriginsEqual(a: ServerOrigin | undefined, b: ServerOrigin | undef
   if (a === b) return true;
   if (!a || !b) return false;
   // Every member of ServerOrigin is compared, the `syncedUsername` /
-  // `syncedAuthProfileId` stamps included: they are what the retro-apply rule
-  // reads, so an origin that differs only there is a materially different
-  // record. Leaving either out would let the rollback merge in
-  // mergeServerConfigFields call two origins "equal" and drop a freshly written
-  // stamp back to the pre-batch one — after which the next sync would compare
-  // against a username, or a profile link, the record no longer carries.
+  // `syncedAuthProfileId` / `syncedIpmiHost` stamps included: they are what the
+  // retro-apply and OOB write rules read, so an origin that differs only there
+  // is a materially different record. Leaving any of them out would let the
+  // rollback merge in mergeServerConfigFields call two origins "equal" and drop
+  // a freshly written stamp back to the pre-batch one — after which the next
+  // sync would compare against a username, a profile link, or a BMC address the
+  // record no longer carries.
   return serverOriginStampsEqual(a, b) && a.syncedAt === b.syncedAt;
 }
 
@@ -411,6 +499,12 @@ function detachedOriginsEqual(a: DetachedServerOrigin | undefined, b: DetachedSe
     // the forgetful one, and the adopted server would be back to carrying a
     // sync-applied profile nothing can prove the sync applied.
     a.syncedAuthProfileId === b.syncedAuthProfileId &&
+    // OOB (PR-A REVIEW FINDING) — compared one field down for the identical
+    // reason: a rollback that called two markers equal while one remembers the
+    // out-of-band address the removed source wrote and the other does not would
+    // restore the forgetful one, and the adopted server's BMC address would be
+    // back to looking hand-typed, which no later sync can repair.
+    a.syncedIpmiHost === b.syncedIpmiHost &&
     a.detachedAt === b.detachedAt
   );
 }

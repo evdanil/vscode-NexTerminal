@@ -441,6 +441,120 @@ describe("createNetboxProvider", () => {
       expect(tree.devices[0]).toMatchObject({ externalId: "device:42", name: "no-primary-ip-device", endpoints: [] });
     });
 
+    /**
+     * OOB (issue #48, Phase 2) — `oob_ip` becomes a SECOND endpoint beside the
+     * SSH one, which the sync engine maps onto `ServerConfig.ipmiHost`. The
+     * bookkeeping trap these fixtures exist for: the "devices without a primary
+     * IP were skipped" warning used to be keyed on `endpoints.length === 0`, and
+     * an OOB-only device has a non-empty endpoints array while being exactly as
+     * unmappable to SSH as before.
+     */
+    it("(OOB) emits a second `redfish` endpoint from oob_ip, CIDR-stripped, without disturbing the ssh one (kills reading oob_ip into the ssh endpoint, and kills ignoring it)", async () => {
+      const fetchImpl = vi.fn(async () =>
+        makeResponse(200, {
+          count: 1,
+          results: [{ id: 1, name: "core-sw", primary_ip: { address: "10.0.0.1/24" }, oob_ip: { address: "10.9.9.9/24" } }]
+        })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      expect(tree.devices[0].endpoints).toEqual([
+        { kind: "ssh", host: "10.0.0.1", port: 22 },
+        { kind: "redfish", host: "10.9.9.9" }
+      ]);
+      expect(tree.warnings).toEqual([]);
+    });
+
+    it("(OOB) emits nothing extra when oob_ip is null, absent, or malformed (kills a non-defensive read that would throw, or emit an endpoint with an undefined host)", async () => {
+      const fetchImpl = vi.fn(async () =>
+        makeResponse(200, {
+          count: 4,
+          results: [
+            { id: 1, name: "null-oob", primary_ip: { address: "10.0.0.1/24" }, oob_ip: null },
+            { id: 2, name: "no-oob-key", primary_ip: { address: "10.0.0.2/24" } },
+            { id: 3, name: "oob-not-an-object", primary_ip: { address: "10.0.0.3/24" }, oob_ip: "10.9.9.9" },
+            { id: 4, name: "oob-empty-address", primary_ip: { address: "10.0.0.4/24" }, oob_ip: { address: "" } }
+          ]
+        })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      for (const device of tree.devices) {
+        expect(device.endpoints).toHaveLength(1);
+        expect(device.endpoints[0].kind).toBe("ssh");
+      }
+    });
+
+    it("(OOB, PR-A REVIEW FINDING) a degenerate oob_ip that is NOTHING BUT a prefix emits no endpoint at all (kills checking emptiness BEFORE `stripCidr` rather than after, which puts `{ kind: \"redfish\", host: \"\" }` onto the tree)", async () => {
+      const fetchImpl = vi.fn(async () =>
+        makeResponse(200, {
+          count: 2,
+          results: [
+            // Non-empty going in, empty coming out — the one shape the
+            // pre-strip check cannot see.
+            { id: 1, name: "prefix-only", primary_ip: { address: "10.0.0.1/24" }, oob_ip: { address: "/24" } },
+            // The control: the same field with something in front of the slash.
+            { id: 2, name: "real-oob", primary_ip: { address: "10.0.0.2/24" }, oob_ip: { address: "10.9.9.9/24" } }
+          ]
+        })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      // Asserted as "no management endpoint at all", not as "its host is not
+      // empty": an empty-hosted endpoint must never reach the tree in the first
+      // place, and the sync engine's own selector skipping it downstream is a
+      // second line of defence rather than a reason to emit one.
+      const byName = new Map(tree.devices.map((d) => [d.name, d]));
+      expect(byName.get("prefix-only")!.endpoints).toEqual([{ kind: "ssh", host: "10.0.0.1", port: 22 }]);
+      expect(byName.get("real-oob")!.endpoints).toContainEqual({ kind: "redfish", host: "10.9.9.9" });
+    });
+
+    it("(OOB) a device with an oob_ip but NO primary IP carries the redfish endpoint alone AND is still counted in the no-SSH warning (kills the stale `endpoints.length === 0` skip predicate, which silently drops exactly these devices out of the warning)", async () => {
+      const fetchImpl = vi.fn(async () =>
+        makeResponse(200, {
+          count: 2,
+          results: [
+            { id: 1, name: "bmc-only", primary_ip: null, oob_ip: { address: "10.9.9.9/24" } },
+            // A second, ordinary unmappable device so the warning's COUNT is the
+            // thing under test: the broken predicate reports 1 here, not 2.
+            { id: 2, name: "nothing-at-all", primary_ip: null }
+          ]
+        })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      const byExternalId = new Map(tree.devices.map((d) => [d.externalId, d]));
+      expect(byExternalId.get("device:1")?.endpoints).toEqual([{ kind: "redfish", host: "10.9.9.9" }]);
+      expect(byExternalId.get("device:2")?.endpoints).toEqual([]);
+      expect(tree.warnings).toEqual(["2 devices without a primary IP were skipped."]);
+    });
+
+    it("(OOB) VMs never get a management endpoint, even when the payload carries oob_ip (kills applying the device-only field to the VM branch)", async () => {
+      const fetchImpl = vi.fn(async (url: string) => {
+        if (String(url).includes("virtual-machines")) {
+          return makeResponse(200, {
+            count: 1,
+            results: [{ id: 7, name: "vm-seven", primary_ip: { address: "10.0.1.7/24" }, oob_ip: { address: "10.9.9.7/24" } }]
+          });
+        }
+        return makeResponse(200, { count: 0, results: [] });
+      });
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local", includeVms: true }, { apiToken: "tok" });
+
+      expect(tree.devices).toHaveLength(1);
+      expect(tree.devices[0].endpoints).toEqual([{ kind: "ssh", host: "10.0.1.7", port: 22 }]);
+    });
+
     it("FINDING 1 — throws a protocol error (not a silent drop) when a page contains a null row (kills silently dropping the row while pagination still believes the count was fully collected)", async () => {
       const fetchImpl = vi.fn(async () => makeResponse(200, { count: 1, results: [null] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);

@@ -2684,6 +2684,16 @@ export function registerInventoryCommands(
                     // so nothing could ever take it back off. Omitted rather than
                     // written as `undefined` for the reason `instanceKey` is.
                     ...(origin.syncedAuthProfileId !== undefined ? { syncedAuthProfileId: origin.syncedAuthProfileId } : {}),
+                    // OOB (PR-A REVIEW FINDING) — the second part of the origin
+                    // that has to SURVIVE the strip, on exactly the terms of the
+                    // auth provenance above. It says whether the `ipmiHost` this
+                    // server keeps was the SYNC'S doing or the USER'S, which is
+                    // the whole of the OOB write rule. Dropped here, an adopted
+                    // server's sync-written BMC address arrived looking
+                    // hand-typed and no later sync could ever update it. Omitted
+                    // rather than written as `undefined` for the reason
+                    // `instanceKey` is.
+                    ...(origin.syncedIpmiHost !== undefined ? { syncedIpmiHost: origin.syncedIpmiHost } : {}),
                     detachedAt
                   }
                 } as ServerConfig)

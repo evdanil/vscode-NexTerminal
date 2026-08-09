@@ -6073,6 +6073,48 @@ describe("inventoryCommands", () => {
       expect(core.getServer("owned-2")?.formerlySynced).not.toHaveProperty("syncedAuthProfileId");
     });
 
+    it("Keep Servers carries the source's OWN out-of-band address record into the marker (PR-A REVIEW FINDING — kills a detach that drops `syncedIpmiHost`, after which an adopted server's sync-written BMC address reads as hand-typed and no later sync can follow the BMC when NetBox re-addresses it)", async () => {
+      const { core } = await harness({
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "sw1",
+            host: "10.0.0.11",
+            ipmiHost: "10.9.9.9",
+            origin: {
+              sourceId: "src-1",
+              externalId: "device:1",
+              syncedAt: 1,
+              syncedInstanceKey: DEFAULT_INSTANCE,
+              // The sync's own record that IT wrote 10.9.9.9.
+              syncedIpmiHost: "10.9.9.9"
+            }
+          }),
+          // The near-miss beside it: the same address in the same field, but the
+          // USER typed it, so there is no receipt to carry and none must be
+          // invented from the record's own value.
+          makeServer({
+            id: "owned-2",
+            name: "sw2",
+            host: "10.0.0.12",
+            ipmiHost: "10.9.9.9",
+            origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1, syncedInstanceKey: DEFAULT_INSTANCE }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+
+      // The address itself stays on both records — a detach removes ownership,
+      // not configuration.
+      expect(core.getServer("owned-1")?.ipmiHost).toBe("10.9.9.9");
+      expect(core.getServer("owned-2")?.ipmiHost).toBe("10.9.9.9");
+      // Only the sync's own write leaves a receipt.
+      expect(core.getServer("owned-1")?.formerlySynced?.syncedIpmiHost).toBe("10.9.9.9");
+      expect(core.getServer("owned-2")?.formerlySynced).not.toHaveProperty("syncedIpmiHost");
+    });
+
     it("a provider that reports no instance at all writes a receipt-only marker and adopts nothing (kills stamping an instance key the provider never supplied, and kills falling back to the provider id when it has none)", async () => {
       const { core } = await harness({
         provider: { instanceKey: undefined },

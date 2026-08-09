@@ -255,7 +255,7 @@ do not retype what Nexus already knows. Write them as `${profile.<field>}`:
 | `${profile.host}` | its SSH host |
 | `${profile.port}` | its SSH port |
 | `${profile.username}` | the username it connects as — the linked **auth profile**'s where one supplies it, the server's own otherwise |
-| `${profile.ipmiHost}` | its **IPMI / BMC Host** (Advanced section of the server form) |
+| `${profile.ipmiHost}` | its **IPMI / BMC Host** (Advanced section of the server form — filled in automatically on servers synced from a NetBox device that carries an out-of-band IP) |
 
 Nothing else is exposed — key paths, ids and inventory bookkeeping are
 deliberately not addressable.

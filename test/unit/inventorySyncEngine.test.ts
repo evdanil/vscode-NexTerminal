@@ -3035,6 +3035,146 @@ describe("computeSyncPlan — adopt-on-add", () => {
       expect(nextPlan.updates.every((u) => u.after.authProfileId === undefined)).toBe(true);
       expect(nextPlan.adds).toHaveLength(0);
     });
+
+    /** The kept device with an out-of-band endpoint beside its SSH one. */
+    function keptDeviceWithOob(oob: string, overrides: Partial<InventoryDevice> = {}): InventoryDevice {
+      return keptDevice({ endpoints: [{ kind: "ssh", host: "lab-sw-01" }, { kind: "redfish", host: oob }], ...overrides });
+    }
+
+    it("OOB (PR-A REVIEW FINDING) — an adoption RESTORES `syncedIpmiHost` from the marker, and a marker carrying none restores none (kills the receipt-less implementation, under which Remove Source → Keep Servers → re-add → Adopt leaves a SYNC-WRITTEN BMC address looking hand-typed forever)", () => {
+      const source = makeSource();
+
+      // What "Keep Servers" leaves behind for a server whose BMC address the
+      // removed source's sync had written: the value, and a marker remembering
+      // that the SYNC — not the user — put it there.
+      const withReceipt = makeKeptServer({ ipmiHost: "10.9.9.9", formerlySynced: keptMarker({ syncedIpmiHost: "10.9.9.9" }) });
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithOob("10.9.9.9")]),
+        currentServers: [withReceipt],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.ipmiHost).toBe("10.9.9.9");
+      expect(adopted.origin?.syncedIpmiHost).toBe("10.9.9.9");
+
+      // THE NEAR-MISS, and what keeps the assertion above from being satisfied
+      // by an implementation that simply stamps `adoptee.ipmiHost`: an identical
+      // record whose marker carries NO receipt holds a hand-typed address, so
+      // the adoption must restore nothing and leave it hands-off.
+      const handTyped = makeKeptServer({
+        id: "kept-2",
+        ipmiHost: "192.168.50.5",
+        formerlySynced: keptMarker({ externalId: "device:2" })
+      });
+      const handAdopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithOob("10.9.9.9", { externalId: "device:2" })]),
+        currentServers: [handTyped],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+      expect(handAdopted.ipmiHost).toBe("192.168.50.5");
+      expect(handAdopted.origin?.syncedIpmiHost).toBeUndefined();
+    });
+
+    it("OOB (PR-A REVIEW FINDING) — an adopted server whose restored stamp still names its address FOLLOWS the BMC to a new one on the next sync (matrix row 3 — the behaviour the receipt exists to enable; kills the receipt-less implementation on behaviour rather than on data, since the record lands in row 5 and the new address is simply never written)", () => {
+      const source = makeSource();
+      const withReceipt = makeKeptServer({ ipmiHost: "10.9.9.9", formerlySynced: keptMarker({ syncedIpmiHost: "10.9.9.9" }) });
+
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithOob("10.9.9.9")]),
+        currentServers: [withReceipt],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      // The BMC is re-addressed in NetBox. Deliberately to a THIRD value rather
+      // than back to the adoptee's own: an address that still matched would
+      // self-heal through matrix row 5a and the receipt would prove nothing.
+      const next = planFor({
+        source,
+        tree: makeTree([keptDeviceWithOob("10.9.9.50")]),
+        currentServers: [adopted],
+        now: 6000
+      });
+
+      expect(next.updates).toHaveLength(1);
+      expect(next.updates[0].after.ipmiHost).toBe("10.9.9.50");
+      expect(next.updates[0].after.origin?.syncedIpmiHost).toBe("10.9.9.50");
+    });
+
+    it("OOB (CODEX ROUND-2 FINDING) — a BMC re-addressed WHILE THE SOURCE WAS DETACHED is applied BY the adoption, not one sync later (kills the restore-only adoption, which put the receipt back and left the record pointing at the dead address for the whole run the user actually approved)", () => {
+      const source = makeSource();
+
+      // The receipt matches the record: the removed source's sync wrote
+      // 10.1.1.1 and the detach preserved the proof. Matrix row 3 — the sync
+      // still owns this field — and the device now says something else.
+      const withReceipt = makeKeptServer({
+        ipmiHost: "10.1.1.1",
+        formerlySynced: keptMarker({ syncedIpmiHost: "10.1.1.1" })
+      });
+
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithOob("10.2.2.2")]),
+        currentServers: [withReceipt],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.ipmiHost).toBe("10.2.2.2");
+      expect(adopted.origin?.syncedIpmiHost).toBe("10.2.2.2");
+    });
+
+    it("OOB (CODEX ROUND-2 FINDING) — a hand-typed address with NO receipt survives the adoption untouched and unstamped (kills the over-broad fix `takesIpmiHost = mgmtHost !== undefined`, which would let adoption clobber the one value the whole matrix exists to protect)", () => {
+      const source = makeSource();
+
+      // No `syncedIpmiHost` on the marker: nothing ever proved a sync wrote
+      // this, so it is a hand entry (matrix row 5) and the device's own address
+      // being on offer changes nothing.
+      const handTyped = makeKeptServer({
+        ipmiHost: "192.168.0.9",
+        formerlySynced: keptMarker()
+      });
+
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithOob("10.2.2.2")]),
+        currentServers: [handTyped],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.ipmiHost).toBe("192.168.0.9");
+      expect(adopted.origin?.syncedIpmiHost).toBeUndefined();
+    });
+
+    it("OOB (CODEX ROUND-2 FINDING) — a device offering NO out-of-band endpoint leaves the field alone AND still carries the receipt (matrix row 6; kills the half-fix `syncedIpmiHost: takesIpmiHost ? mgmtHost : undefined`, which drops the restore on every row the matrix answers no for and re-strands the very server the receipt was added to rescue)", () => {
+      const source = makeSource();
+      const withReceipt = makeKeptServer({
+        ipmiHost: "10.1.1.1",
+        formerlySynced: keptMarker({ syncedIpmiHost: "10.1.1.1" })
+      });
+
+      // `keptDevice()` — SSH endpoint only, no redfish/ipmi-sol beside it.
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDevice()]),
+        currentServers: [withReceipt],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.ipmiHost).toBe("10.1.1.1");
+      expect(adopted.origin?.syncedIpmiHost).toBe("10.1.1.1");
+    });
   });
 
   /**
@@ -3427,5 +3567,431 @@ describe("prunedServerIdsForSecretCleanup", () => {
       adoptionCandidates: []
     };
     expect(prunedServerIdsForSecretCleanup(plan)).toEqual(["d1"]);
+  });
+});
+
+/**
+ * OOB (issue #48, Phase 2) — NetBox's `oob_ip` reaching `ServerConfig.ipmiHost`
+ * through a management endpoint, and the `ServerOrigin.syncedIpmiHost` stamp
+ * that decides when the sync may write it.
+ *
+ * `ipmiHost` is NOT on the host/port "the device always wins" discipline: it
+ * shipped as a hand-edited field before any sync could write it, so the rule is
+ * the `syncedAuthProfileId` one — the stamp records what the SYNC wrote, and
+ * the sync writes only where the record still carries exactly that. There is
+ * one fixture per row of that matrix below, each built so the WRONG rule
+ * produces a visibly different plan rather than the same one by luck.
+ */
+describe("computeSyncPlan — oob_ip -> ipmiHost (OOB)", () => {
+  const OOB = { kind: "redfish" as const, host: "10.9.9.9" };
+  const SSH = { kind: "ssh" as const, host: "10.0.0.1" };
+
+  function deviceWithOob(host = "10.9.9.9"): InventoryDevice {
+    return makeDevice({ endpoints: [SSH, { kind: "redfish", host }] });
+  }
+
+  /** The one update this plan is expected to contain. */
+  function onlyUpdate(plan: InventorySyncPlan) {
+    expect(plan.updates).toHaveLength(1);
+    return plan.updates[0].after;
+  }
+
+  it("ADD PATH: writes the management endpoint into ipmiHost and stamps it, and stamps `undefined` when the device offers none (kills a stampless add, which reads as a hand entry on the very next sync and is never updated again)", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([deviceWithOob(), makeDevice({ externalId: "device:2", name: "no-bmc" })]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds).toHaveLength(2);
+    const [withBmc, withoutBmc] = plan.adds;
+    expect(withBmc.ipmiHost).toBe("10.9.9.9");
+    expect(withBmc.origin?.syncedIpmiHost).toBe("10.9.9.9");
+    // The SSH mapping is untouched by any of this.
+    expect(withBmc.host).toBe("10.0.0.1");
+    expect(withoutBmc.ipmiHost).toBeUndefined();
+    expect(withoutBmc.origin?.syncedIpmiHost).toBeUndefined();
+  });
+
+  it("selects `ipmi-sol` endpoints too, and takes the FIRST management endpoint with a non-empty host (kills a redfish-only selector, and kills one that accepts an empty host)", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        makeDevice({
+          endpoints: [SSH, { kind: "redfish", host: "" }, { kind: "ipmi-sol", host: "10.9.9.9" }, { kind: "redfish", host: "10.9.9.10" }]
+        })
+      ]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds[0].ipmiHost).toBe("10.9.9.9");
+  });
+
+  it("MATRIX ROW 1 — unset value, unset stamp, endpoint present: writes and stamps (kills 'never write', which leaves the whole feature inert)", () => {
+    const owned = makeOwnedServer();
+    expect(owned.ipmiHost).toBeUndefined();
+
+    const after = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithOob()]), currentServers: [owned], now: 2000 })
+    );
+
+    expect(after.ipmiHost).toBe("10.9.9.9");
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
+  });
+
+  it("MATRIX ROW 2 — unset value, stamp SET (the user cleared a synced address): leaves it cleared and carries the stamp forward (kills an implementation missing the opt-out clause, which refills the field on every sync forever)", () => {
+    const owned = makeOwnedServer({
+      // Deliberately NOT `ipmiHost: undefined` by accident: the stamp is what
+      // makes this "the user emptied a value the sync wrote" rather than "never
+      // configured", and it is the only difference from row 1's fixture.
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.9.9.9" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([deviceWithOob()]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    // Nothing else about this device changed either, so a correct plan reports
+    // it as unchanged — and a broken one has to write the address back to be
+    // an update at all.
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("MATRIX ROW 1, BLANK VALUE (REVIEW FINDING) — an empty-string ipmiHost with no stamp is ABSENT, not hand-configured: it is filled and stamped (kills the strict `cur === stamp` comparison, under which `\"\"` matches neither the absent stamp nor the non-empty device address and the field is misfiled as a hand edit forever)", () => {
+    const owned = makeOwnedServer({
+      // The shape `validateServerConfig` deliberately accepts and every use site
+      // reads as "not set" — a persisted or imported record whose ipmiHost was
+      // emptied to `""` rather than removed. No stamp, so nothing was ever
+      // synced here: row 1's state wearing a different spelling.
+      ipmiHost: ""
+    });
+
+    const after = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithOob()]), currentServers: [owned], now: 2000 })
+    );
+
+    expect(after.ipmiHost).toBe("10.9.9.9");
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
+  });
+
+  it("MATRIX ROW 1, WHITESPACE-ONLY VALUE (REVIEW FINDING) — same as the blank one: filled and stamped (kills a fix that only special-cases the exact empty string, leaving a field the user cleared to a stray space unrepairable)", () => {
+    const owned = makeOwnedServer({ ipmiHost: "   " });
+
+    const after = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithOob()]), currentServers: [owned], now: 2000 })
+    );
+
+    expect(after.ipmiHost).toBe("10.9.9.9");
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
+  });
+
+  it("MATRIX ROW 2, BLANK VALUE (REVIEW FINDING) — a blank value WITH a stamp is still the opt-out: left blank, stamp carried forward (kills the over-fix `blank cur → the sync owns it`, which would refill the field of a user who emptied it to `\"\"` instead of removing it)", () => {
+    const owned = makeOwnedServer({
+      // The one difference from the row-1 blank fixture above: a stamp, which is
+      // what makes this "the user emptied a value the sync wrote".
+      ipmiHost: "",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.1.1.1" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      // Renamed, so the plan carries an update whatever the rule does and the
+      // assertions below observe the FIELD rather than the mere presence of a
+      // plan entry — the vacuous version of this fixture.
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed", endpoints: [SSH, OOB] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = onlyUpdate(plan);
+    expect(after.name).toBe("core-sw-1-renamed");
+    expect(after.ipmiHost).toBe("");
+    expect(after.ipmiHost).not.toBe("10.9.9.9");
+    // Carried forward verbatim: the stamp is never refreshed where nothing was written.
+    expect(after.origin?.syncedIpmiHost).toBe("10.1.1.1");
+  });
+
+  it("MATRIX ROW 3 — value still equals the stamp, endpoint moved: overwrites and re-stamps (kills 'never overwrite', which strands a re-addressed BMC on its old address)", () => {
+    const owned = makeOwnedServer({
+      ipmiHost: "10.9.9.9",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.9.9.9" }
+    });
+
+    const after = onlyUpdate(
+      computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([deviceWithOob("10.9.9.50")]),
+        currentServers: [owned],
+        now: 2000
+      })
+    );
+
+    expect(after.ipmiHost).toBe("10.9.9.50");
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.50");
+  });
+
+  it("MATRIX ROW 4 — value HAND-EDITED away from the stamp: the hand edit survives and is never laundered into the stamp (kills 'the device always wins', which is the host/port rule and would clobber the edit)", () => {
+    const owned = makeOwnedServer({
+      // The sync wrote 10.9.9.9; the user has since retyped it. The device now
+      // reports a third value, so all three are distinct and every wrong rule
+      // lands on a different one.
+      ipmiHost: "192.168.50.5",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.9.9.9" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      // The device is ALSO renamed, so an update is pushed regardless and the
+      // assertion below is about the field rather than about whether the plan
+      // contains anything at all — the vacuous version of this fixture.
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed", endpoints: [SSH, { kind: "redfish", host: "10.9.9.50" }] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = onlyUpdate(plan);
+    expect(after.name).toBe("core-sw-1-renamed");
+    expect(after.ipmiHost).toBe("192.168.50.5");
+    // Carried forward VERBATIM — recording the hand-edited value here would make
+    // the very next sync read it as "still exactly what I stamped" and overwrite it.
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
+  });
+
+  it("MATRIX ROW 5 — legacy hand-set value with NO stamp: untouched, and it does not acquire a stamp (kills 'absent stamp means the sync owns it', which clobbers every Phase-1 manual entry on the first post-upgrade sync)", () => {
+    const owned = makeOwnedServer({
+      ipmiHost: "192.168.50.5",
+      // A server synced before the stamp existed: the origin has no OOB member
+      // at all.
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed", endpoints: [SSH, OOB] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = onlyUpdate(plan);
+    expect(after.ipmiHost).toBe("192.168.50.5");
+    expect(after.origin?.syncedIpmiHost).toBeUndefined();
+  });
+
+  it("MATRIX ROW 5a — a hand-typed value that ALREADY EQUALS the device's out-of-band address gains the stamp while the value stays put: a GENUINE stamp-only update (kills the `cur === stamp`-only gate, under which the likeliest Phase-1 hand entry of all — the address copied out of the NetBox UI — can never be stamped and goes silently stale the first time the BMC is re-addressed)", () => {
+    const owned = makeOwnedServer({
+      // Typed by hand into the Phase-1 server form, straight out of NetBox, so
+      // it is byte-identical to what the device reports — and it carries NO
+      // stamp, because no sync ever wrote it. That is row 5's exact shape, and
+      // row 5a is the refinement that rescues it.
+      ipmiHost: "10.9.9.9",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      // Nothing else about this device moved: same name, same SSH address, same
+      // port, same folder, same out-of-band address. The STAMP is the entire
+      // difference between `before` and `after`, which is what makes this AUTH
+      // 3a's shape rather than row 1's — row 1's fixture changes the value too,
+      // so it passes even against an implementation that forgot the stamps-equal
+      // term entirely.
+      tree: makeTree([deviceWithOob()]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.unchangedCount).toBe(0);
+    const { before, after } = plan.updates[0];
+    // The VALUE does not move — row 5a refines "leave the value alone", it does
+    // not license an overwrite.
+    expect(before.ipmiHost).toBe("10.9.9.9");
+    expect(after.ipmiHost).toBe("10.9.9.9");
+    // ...and OWNERSHIP is now recorded, which is the whole of the change.
+    expect(before.origin?.syncedIpmiHost).toBeUndefined();
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
+  });
+
+  it("MATRIX ROW 5a, WHAT THE STAMP THEN BUYS — once stamped, the same record follows the BMC to its new address on the next sync (row 3); without the stamp it is stuck on the old one forever", () => {
+    const owned = makeOwnedServer({
+      ipmiHost: "10.9.9.9",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+
+    // Sync one: the value matches, so the stamp is recorded.
+    const stamped = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithOob()]), currentServers: [owned], now: 2000 })
+    );
+    expect(stamped.origin?.syncedIpmiHost).toBe("10.9.9.9");
+
+    // Sync two, with the BMC re-addressed in NetBox. Feeding sync one's OUTPUT
+    // back in is the point: the repair has to survive into the next run's input.
+    const followed = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithOob("10.9.9.50")]), currentServers: [stamped], now: 3000 })
+    );
+    expect(followed.ipmiHost).toBe("10.9.9.50");
+    expect(followed.origin?.syncedIpmiHost).toBe("10.9.9.50");
+  });
+
+  it("MATRIX ROW 5a, THE ACCEPTED RESIDUAL — a hand edit that lands on the device's own current address IS adopted into sync ownership (the documented m7-class trade, stated as a fixture so the next reader meets it here rather than in the field)", () => {
+    const owned = makeOwnedServer({
+      // The sync wrote 10.9.9.9 and the user retyped the field — but retyped it
+      // to what the device reports TODAY (NetBox moved the BMC, the user
+      // followed it by hand before the next sync ran).
+      ipmiHost: "10.9.9.50",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.9.9.9" }
+    });
+
+    const after = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithOob("10.9.9.50")]), currentServers: [owned], now: 2000 })
+    );
+
+    // The value is untouched (it already agreed with the device) and the stamp
+    // now names it, so the sync owns the field from here. The opt-out is
+    // unchanged and one edit away: clearing the field lands in row 2 forever.
+    expect(after.ipmiHost).toBe("10.9.9.50");
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.50");
+  });
+
+  it("MATRIX ROW 5a NEVER REACHES THE OPT-OUT — a CLEARED value stays cleared whether or not the device still reports the address the stamp names (kills an equal-value rule written against the STAMP — `stamp === oob`, or the blunter `stamp !== undefined` — instead of against the record's own value, either of which re-owns and refills the field the user deliberately emptied)", () => {
+    // BOTH shapes of the opt-out in one plan, because the two wrong rules fail
+    // on different ones: `stamp === oob` only misfires while the device still
+    // reports the old address, and `stamp !== undefined` misfires on both. A
+    // fixture carrying only one of them leaves the other rule alive.
+    const stampMatchesDevice = makeOwnedServer({
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.9.9.9" }
+    });
+    const stampIsStale = makeOwnedServer({
+      id: deterministicServerId("source-1", "device:2"),
+      name: "core-sw-2",
+      origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 1000, syncedIpmiHost: "10.9.9.9" }
+    });
+    expect(stampMatchesDevice.ipmiHost).toBeUndefined();
+    expect(stampIsStale.ipmiHost).toBeUndefined();
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        deviceWithOob("10.9.9.9"),
+        makeDevice({ externalId: "device:2", name: "core-sw-2", endpoints: [SSH, { kind: "redfish", host: "10.9.9.50" }] })
+      ]),
+      currentServers: [stampMatchesDevice, stampIsStale],
+      now: 2000
+    });
+
+    // A correct plan has nothing to say about either server; a broken one has to
+    // write the address back to produce an update at all.
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(2);
+  });
+
+  it("MATRIX ROW 6 — endpoint ABSENT this fetch: the sync-owned value is carried forward with its stamp intact (kills 'an absent endpoint clears the field', which erases a BMC address on any NetBox data-quality blip)", () => {
+    const owned = makeOwnedServer({
+      ipmiHost: "10.9.9.9",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.9.9.9" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      // Renamed, so the plan carries an update whatever the rule does — the
+      // fixture observes the FIELD, not the presence of a plan entry.
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed", endpoints: [SSH] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = onlyUpdate(plan);
+    expect(after.ipmiHost).toBe("10.9.9.9");
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
+  });
+
+  it("an ipmiHost write is enough to make an otherwise-identical server an UPDATE rather than unchanged (kills forgetting `ipmiHost` in the `changed` comparison entirely, which would compute a row-1 write and then discard it as 'unchanged')", () => {
+    // Nothing else differs: same name, host, port, group, username, no auth
+    // profile anywhere. The address and its stamp are the entire change.
+    //
+    // NOT AUTH 3a's shape, despite an earlier label saying so — the VALUE moves
+    // here (undefined -> 10.9.9.9), so the value clause alone carries this
+    // fixture and it would pass against an implementation that forgot the
+    // stamps-equal term. AUTH 3a's genuine stamp-only shape is the row 5a
+    // fixture above, where the value is identical on both sides.
+    const owned = makeOwnedServer();
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([deviceWithOob()]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.unchangedCount).toBe(0);
+    expect(plan.updates[0].before.ipmiHost).toBeUndefined();
+    expect(plan.updates[0].after.ipmiHost).toBe("10.9.9.9");
+  });
+
+  it("the OOB write survives a retro-apply in the same plan (kills writing the stamp onto `after.origin` after the literal, which the retro-apply branch's `{ ...afterOrigin }` rebuild silently drops)", () => {
+    const profile: AuthProfile = { id: "p1", name: "Fleet", username: "admin", authType: "password" };
+    const owned = makeOwnedServer({ origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" } });
+
+    const after = onlyUpdate(
+      computeSyncPlan({
+        source: makeSource({ authProfileId: "p1" }),
+        tree: makeTree([deviceWithOob()]),
+        currentServers: [owned],
+        now: 2000,
+        authProfile: profile
+      })
+    );
+
+    // Retro-apply fired...
+    expect(after.authProfileId).toBe("p1");
+    expect(after.origin?.syncedAuthProfileId).toBe("p1");
+    // ...and did not take the OOB stamp with it.
+    expect(after.ipmiHost).toBe("10.9.9.9");
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
+  });
+
+  it("SYNC-TIME VALIDATION: an out-of-band address the substitution chokepoint would refuse is warned about and NOT written, while the device's SSH mapping proceeds (kills storing a value that can never be used, and kills skipping the whole device over it)", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      // `https://10.9.9.9/` fails the address rule outright (`/` is not in the
+      // charset, and a scheme is meaningless in a field substituted into a
+      // command line) — the shape a NetBox custom field or a hand-edited
+      // `oob_ip` can produce.
+      tree: makeTree([makeDevice({ endpoints: [SSH, { kind: "redfish", host: "https://10.9.9.9/" }] })]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].host).toBe("10.0.0.1");
+    expect(plan.adds[0].ipmiHost).toBeUndefined();
+    expect(plan.adds[0].origin?.syncedIpmiHost).toBeUndefined();
+    expect(plan.warnings.some((w) => w.includes("out-of-band address that cannot be used") && w.includes("https://10.9.9.9/"))).toBe(true);
+  });
+
+  it("SYNC-TIME VALIDATION on an owned server: a bad address leaves the existing sync-owned value alone rather than clearing it (kills treating a refused address as 'the device has none, so wipe it')", () => {
+    const owned = makeOwnedServer({
+      ipmiHost: "10.9.9.9",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.9.9.9" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed", endpoints: [SSH, { kind: "redfish", host: "10.9.9.9 && rm -rf /" }] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = onlyUpdate(plan);
+    expect(after.ipmiHost).toBe("10.9.9.9");
+    expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
+    expect(plan.warnings.some((w) => w.includes("out-of-band address that cannot be used"))).toBe(true);
   });
 });

@@ -5,9 +5,13 @@ export const INVENTORY_CONTRACT_VERSION = 1 as const;
 export type InventoryEndpointKind = "ssh" | "redfish" | "url" | "ipmi-sol";
 
 /**
- * One way to reach a device. Phase 1 only maps the FIRST endpoint with
- * kind === "ssh"; all other kinds (and extra ssh endpoints) are accepted,
- * preserved on the tree, and otherwise unused.
+ * One way to reach a device. The sync engine maps the FIRST endpoint with
+ * kind === "ssh" onto `ServerConfig.host`/`port`, and the FIRST with kind
+ * "redfish" or "ipmi-sol" onto `ServerConfig.ipmiHost` (see
+ * `selectManagementEndpoint` in services/inventory/syncEngine.ts, and the stamp
+ * rules on `ServerOrigin.syncedIpmiHost`). All other kinds — and extra
+ * endpoints of either group — are accepted, preserved on the tree, and
+ * otherwise unused.
  */
 export interface InventoryEndpoint {
   kind: InventoryEndpointKind;

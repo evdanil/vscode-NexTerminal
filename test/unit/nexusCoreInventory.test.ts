@@ -4017,3 +4017,122 @@ describe("serverConfigsEqual / mergeServerConfigFields — origin.syncedUsername
     expect(core.getServer("kept-2")?.formerlySynced?.syncedAuthProfileId).toBe("p1");
   });
 });
+
+/**
+ * OOB (issue #48, Phase 2) — `ServerOrigin.syncedIpmiHost`, the stamp that
+ * records the out-of-band address the SYNC wrote into `ServerConfig.ipmiHost`.
+ *
+ * The stamp is the whole of the ownership rule: the sync writes `ipmiHost` only
+ * where the record still carries exactly what the stamp says, so a comparator
+ * or a merge that cannot SEE the stamp silently loses the write that created it
+ * — after which the server reads as hand-edited (never updated again) or as
+ * never-configured (refilled after the user cleared it). Both fixtures below
+ * are built so the broken implementation produces a visibly different record,
+ * never merely an identical one.
+ */
+describe("serverOriginStampsEqual / mergeServerConfigFields — origin.syncedIpmiHost (OOB)", () => {
+  function server(overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id: "s1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      ...overrides
+    };
+  }
+
+  it("counts syncedIpmiHost in both directions while still ignoring syncedAt (kills leaving the OOB stamp out of the sync engine's `changed` check, which discards the very write that gives the sync ownership of the field)", () => {
+    // Built IDENTICAL in every other member on purpose — same sourceId,
+    // externalId, instance key and username stamps — so nothing but the OOB
+    // stamp can decide these assertions.
+    const legacy = {
+      sourceId: "src-1",
+      externalId: "device:1",
+      syncedAt: 1000,
+      syncedInstanceKey: "https://netbox.example.com",
+      syncedUsername: "admin"
+    };
+    const stamped = { ...legacy, syncedIpmiHost: "10.9.9.9" };
+
+    // Gaining the stamp is a change. A comparator that shrugs here lets
+    // computeSyncPlan discard an `after` whose only difference is the new stamp,
+    // and that server never gains one: every later sync then reads it as a hand
+    // entry (matrix row 5) and leaves its BMC address stale forever.
+    expect(serverOriginStampsEqual(legacy, stamped)).toBe(false);
+    expect(serverOriginStampsEqual(stamped, legacy)).toBe(false);
+    // Moving to another address is a change — a re-addressed BMC following at
+    // the source.
+    expect(serverOriginStampsEqual(stamped, { ...stamped, syncedIpmiHost: "10.9.9.10" })).toBe(false);
+    // ...and an unchanged stamp is not, or every owned server would be reported
+    // as an update on every single sync.
+    expect(serverOriginStampsEqual(stamped, { ...stamped })).toBe(true);
+    expect(serverOriginStampsEqual(stamped, { ...stamped, syncedAt: 9999 })).toBe(true);
+    // serverConfigsEqual inherits the term through serverOriginsEqual.
+    expect(serverConfigsEqual(server({ origin: legacy }), server({ origin: stamped }))).toBe(false);
+    expect(serverConfigsEqual(server({ origin: stamped }), server({ origin: { ...stamped } }))).toBe(true);
+  });
+
+  it("the rollback merge keeps a CONCURRENT system clear of the OOB stamp instead of resurrecting the pre-batch one (kills leaving syncedIpmiHost out of the origin comparison the merge branches on)", () => {
+    // The fixture has to be built with care: `current` and `batchSnapshot` must
+    // differ ONLY in `syncedIpmiHost`, or some other member carries the merge
+    // and the test says nothing about this one. `syncedAt` is therefore equal in
+    // both, and the concurrent write is a system-initiated CLEAR of the stamp
+    // (the shape a dangling-reference sweep or an equivalent repair produces)
+    // that landed while this batch's persist was still in flight.
+    const originBase = {
+      sourceId: "src-1",
+      externalId: "device:1",
+      syncedInstanceKey: "https://netbox.example.com",
+      syncedUsername: "admin"
+    };
+    const prior = server({
+      ipmiHost: "10.9.9.9",
+      origin: { ...originBase, syncedAt: 1000, syncedIpmiHost: "10.9.9.9" }
+    });
+    const batchSnapshot = server({
+      name: "renamed-by-batch",
+      ipmiHost: "10.9.9.9",
+      origin: { ...originBase, syncedAt: 2000, syncedIpmiHost: "10.9.9.9" }
+    });
+    const current = server({
+      name: "renamed-by-batch",
+      ipmiHost: "10.9.9.9",
+      origin: { ...originBase, syncedAt: 2000 }
+    });
+
+    const merged = mergeServerConfigFields(prior, batchSnapshot, current);
+
+    // A comparator missing the member calls current's and batchSnapshot's
+    // origins EQUAL, so the merge falls back to `prior` and restores the stamp
+    // the concurrent clear just removed — resurrecting sync ownership of a field
+    // the system deliberately handed back, after which the next sync overwrites
+    // the address.
+    expect(merged.origin?.syncedIpmiHost).toBeUndefined();
+    expect(merged.origin?.syncedAt).toBe(2000);
+    // The origin is COPIED, not aliased, like every other nested member.
+    expect(merged.origin).not.toBe(current.origin);
+    // ...while the rejected batch's own unrelated write still rolls back.
+    expect(merged.name).toBe("core-sw");
+  });
+
+  it("rolls the batch's OWN OOB stamp write back to prior when nothing concurrent touched it (pins the merge to 'concurrent change wins', not 'always keep current')", () => {
+    const originBase = { sourceId: "src-1", externalId: "device:1", syncedUsername: "admin" };
+    const prior = server({ origin: { ...originBase, syncedAt: 1000 } });
+    const batchSnapshot = server({
+      ipmiHost: "10.9.9.9",
+      origin: { ...originBase, syncedAt: 2000, syncedIpmiHost: "10.9.9.9" }
+    });
+    const current = server({
+      ipmiHost: "10.9.9.9",
+      origin: { ...originBase, syncedAt: 2000, syncedIpmiHost: "10.9.9.9" }
+    });
+
+    const merged = mergeServerConfigFields(prior, batchSnapshot, current);
+
+    expect(merged.ipmiHost).toBeUndefined();
+    expect(merged.origin?.syncedIpmiHost).toBeUndefined();
+  });
+});
